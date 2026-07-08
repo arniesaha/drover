@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drover"
+version = "0.1.0"
+description = "Drover — local-first cockpit and context layer for driving a personal fleet of CLI coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "click>=8.1",
+    "duckdb>=1.0",
+    "pyarrow>=15.0",
+    "watchdog>=4.0",
+    "opentelemetry-proto>=1.30",
+    "grpcio>=1.60",
+    "mcp>=1.0",
+    "pytz",
+    "anthropic>=0.40",
+    "requests",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+drover-server = "drover.server.__main__:main"
+drover-harnessd = "drover.server.harness.cli:main"
+drover-collect = "drover.collect.__main__:main"
+drover-hook = "drover.hook.__main__:main"
+drover-dogfood-smoke = "drover.server.dogfood_smoke:main"
+# Transition shims (Drover, formerly Nexus) — print a deprecation line, then
+# run the real entry point. Remove in the post-cutover cleanup (§7.6).
+nexus-server = "drover.compat:nexus_server"
+nexus-harnessd = "drover.compat:nexus_harnessd"
+nexus-collect = "drover.compat:nexus_collect"
+nexus-hook = "drover.compat:nexus_hook"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "isort"
+]
+redis = [
+    "redis>=5.0",
+]
+
+[tool.setuptools.package-data]
+drover = ["prompts/*.md", "server/web/static/*.html"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]

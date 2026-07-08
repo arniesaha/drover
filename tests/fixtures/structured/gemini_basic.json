@@ -1,0 +1,8 @@
+{
+  "session_id": "39f02d66-e12d-4f27-9cd7-4ccd68716220",
+  "error": {
+    "type": "Error",
+    "message": "When using Gemini API, you must specify the GEMINI_API_KEY environment variable.\nUpdate your environment and try again (no reload needed if using .env)!",
+    "code": 41
+  }
+}

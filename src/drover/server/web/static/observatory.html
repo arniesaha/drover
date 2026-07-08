@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drover Observatory</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef2f5;
+      --text: #171b1f;
+      --muted: #65717d;
+      --line: #d9e0e7;
+      --ok: #16834a;
+      --warn: #a56300;
+      --bad: #b42318;
+      --accent: #1769aa;
+      --violet: #6f42c1;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101316;
+        --panel: #171b20;
+        --panel-2: #20262d;
+        --text: #eef2f6;
+        --muted: #9aa6b2;
+        --line: #303943;
+        --ok: #4fc078;
+        --warn: #d89a33;
+        --bad: #ff6b5f;
+        --accent: #6cb6ff;
+        --violet: #b794f4;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 700; }
+    h2 { margin: 0 0 12px; font-size: 15px; font-weight: 700; }
+    main { padding: 20px 24px 32px; max-width: 1440px; margin: 0 auto; }
+    .statusline { color: var(--muted); font-size: 13px; }
+    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    button {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    .grid { display: grid; gap: 16px; }
+    .metrics { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    .two { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+    .flow {
+      grid-template-columns: repeat(7, minmax(150px, 1fr));
+      align-items: stretch;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-width: 0;
+    }
+    .metric { min-height: 92px; }
+    .metric .label { color: var(--muted); font-size: 12px; }
+    .metric .value { font-size: 28px; font-weight: 750; margin-top: 6px; }
+    .metric .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .stage {
+      min-height: 156px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      position: relative;
+    }
+    .stage::after {
+      content: "->";
+      position: absolute;
+      right: -13px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .stage:last-child::after { content: ""; }
+    .stage .label { color: var(--muted); font-size: 12px; }
+    .stage .title { font-size: 15px; font-weight: 750; }
+    .stage .primary { font-size: 24px; font-weight: 750; line-height: 1; }
+    .stage .detail { color: var(--muted); font-size: 12px; }
+    .stage .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .accent { color: var(--accent); }
+    .violet { color: var(--violet); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left;
+      padding: 9px 8px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    td { font-size: 13px; }
+    .truncate {
+      max-width: 420px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 12px;
+      color: var(--muted);
+      background: var(--panel-2);
+      white-space: nowrap;
+    }
+    .stack { display: flex; flex-direction: column; gap: 12px; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .muted { color: var(--muted); }
+    .empty { color: var(--muted); padding: 18px 0; }
+    .error { border-color: color-mix(in srgb, var(--bad), var(--line)); }
+    @media (max-width: 980px) {
+      header { position: static; align-items: flex-start; flex-direction: column; }
+      main { padding: 16px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: 1fr; }
+      .stage::after { content: ""; }
+      .two { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Drover Observatory</h1>
+      <div class="statusline" id="statusline">Loading live pipeline state...</div>
+    </div>
+    <div class="toolbar">
+      <button id="refresh" type="button">Refresh</button>
+      <a class="pill" href="/observability">JSON</a>
+      <a class="pill" href="/metrics">Prometheus</a>
+    </div>
+  </header>
+  <main class="grid">
+    <section class="grid metrics" id="metrics"></section>
+    <section class="panel">
+      <h2>Pipeline Flow</h2>
+      <div class="grid flow" id="flow"></div>
+    </section>
+    <section class="grid two">
+      <div class="panel">
+        <h2>Project Readiness</h2>
+        <div id="projects"></div>
+      </div>
+      <div class="panel">
+        <h2>Agent Adoption</h2>
+        <div id="adoption"></div>
+      </div>
+    </section>
+    <section class="grid two">
+      <div class="panel">
+        <h2>Saved Summaries</h2>
+        <div id="summaries"></div>
+      </div>
+      <div class="panel">
+        <h2>Project Briefs</h2>
+        <div id="briefs"></div>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Warnings</h2>
+      <div id="warnings"></div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmtPct = (v) => v == null ? "n/a" : `${Number(v).toFixed(1)}%`;
+    const fmtScore = (v) => v == null ? "n/a" : Number(v).toFixed(3);
+    const cls = (status) => status === "ok" ? "ok" : status === "critical" ? "bad" : "warn";
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+
+    function metric(label, value, hint, tone = "") {
+      return `<div class="panel metric"><div class="label">${esc(label)}</div><div class="value ${tone}">${esc(value)}</div><div class="hint">${esc(hint || "")}</div></div>`;
+    }
+
+    function queue(redis, name) {
+      return (redis || {})[name] || {};
+    }
+
+    function queueHint(q) {
+      if (q.error) return `queue scrape failed: ${q.error}`;
+      const pending = q.pending ?? 0;
+      const undelivered = q.undelivered ?? 0;
+      const dead = q.dead ?? 0;
+      return `${pending} pending, ${undelivered} new, ${dead} dead`;
+    }
+
+    function stageStatus(opts) {
+      if (opts.dead > 0 || opts.errors > 0 || opts.status === "critical") return "critical";
+      if (opts.pending > 0 || opts.undelivered > 0 || opts.missing > 0 || opts.status === "warn") return "warn";
+      return "ok";
+    }
+
+    function stage(title, label, primary, detail, status, meta) {
+      const tone = cls(status);
+      return `<div class="panel stage">
+        <div class="label">${esc(label)}</div>
+        <div class="title">${esc(title)}</div>
+        <div class="primary ${tone}">${esc(primary)}</div>
+        <div class="detail">${esc(detail || "")}</div>
+        <div class="meta">${(meta || []).map(item => `<span class="pill">${esc(item)}</span>`).join("")}</div>
+      </div>`;
+    }
+
+    function table(headers, rows, empty) {
+      if (!rows || rows.length === 0) return `<div class="empty">${esc(empty)}</div>`;
+      return `<table><thead><tr>${headers.map(h => `<th>${esc(h.label)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map(h => `<td>${h.render(row)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    }
+
+    function render(data) {
+      const q = data.quality || {};
+      const cats = q.categories || {};
+      const obs = data.observatory || {};
+      const artifacts = obs.artifacts || {};
+      const summaries = artifacts.session_summaries || {};
+      const briefs = artifacts.project_briefs || {};
+      const summaryCoverage = cats.summary_coverage?.details || {};
+      const embedding = cats.embedding_coverage?.details || {};
+      const bundle = cats.bundle_quality?.details || {};
+      const adoption = cats.agent_adoption?.details || obs.agent_adoption || {};
+      const spanCoverage = embedding.span_embedding_coverage || {};
+      const freshness = cats.freshness?.details || {};
+      const redis = data.redis_streams || {};
+      const summarizeQ = queue(redis, "summarize");
+      const briefQ = queue(redis, "brief");
+      const sessionEmbedQ = queue(redis, "embed_session");
+      const spanEmbedQ = queue(redis, "embed_span");
+
+      $("statusline").textContent = `Updated ${new Date().toLocaleTimeString()} from ${q.generated_at || "live endpoint"}`;
+      $("metrics").innerHTML = [
+        metric("Quality", fmtScore(q.score), q.status || "unknown", cls(q.status)),
+        metric("Summary Coverage", fmtPct(summaryCoverage.coverage_percent), `${summaryCoverage.event_sessions_without_summary || 0} missing`, "ok"),
+        metric("Bundle Ready", fmtPct(bundle.bundle_ready_percent), `${summaries.bundle_ready || 0}/${summaries.total || 0} saved`, "warn"),
+        metric("Session Embeddings", fmtPct(embedding.session_embedding_coverage_percent), "summary vectors", "ok"),
+        metric("Span Embeddings", fmtPct(spanCoverage.coverage_percent), `${spanCoverage.pending_jobs || 0} pending`, "ok"),
+        metric("Adoption", cats.agent_adoption?.status || "unknown", `${(adoption.high_volume_unready_runtimes || []).length} high-volume gaps`, cls(cats.agent_adoption?.status)),
+      ].join("");
+
+      const ingestMissing = Number(freshness.unprocessed_incoming_files || 0);
+      const summarizePending = Number(summaryCoverage.pending_summarize_jobs || 0);
+      const summarizeErrors = Number(summaryCoverage.errored_summarize_jobs || 0);
+      const missingSummaries = Number(summaryCoverage.event_sessions_without_summary || 0);
+      const sessionPending = Number(sessionEmbedQ.backlog ?? sessionEmbedQ.length ?? 0);
+      const spanPending = Number(spanCoverage.pending_jobs || spanEmbedQ.backlog || 0);
+      const adoptionGaps = (adoption.high_volume_unready_runtimes || []).length
+        + (adoption.unmatched_high_volume_agent_ids || []).length;
+      $("flow").innerHTML = [
+        stage(
+          "Ingestion",
+          "raw events",
+          ingestMissing === 0 ? "clear" : ingestMissing,
+          `${freshness.latest_span_age_hours ?? "n/a"}h latest span age`,
+          stageStatus({missing: ingestMissing, status: cats.freshness?.status}),
+          [`incoming ${ingestMissing}`]
+        ),
+        stage(
+          "Summarize",
+          "session context",
+          fmtPct(summaryCoverage.coverage_percent),
+          `${missingSummaries} sessions missing summaries`,
+          stageStatus({
+            pending: summarizePending + Number(summarizeQ.backlog || 0),
+            errors: summarizeErrors + Number(summarizeQ.dead || 0),
+            missing: missingSummaries,
+            status: cats.summary_coverage?.status,
+          }),
+          [queueHint(summarizeQ), `${summarizeErrors} errors`]
+        ),
+        stage(
+          "Brief",
+          "project synthesis",
+          briefs.total || 0,
+          `${(obs.projects || []).filter(p => !p.project_brief_ready).length} projects missing briefs`,
+          stageStatus({
+            pending: Number(briefQ.backlog || 0),
+            errors: Number(briefQ.dead || 0),
+            missing: (obs.projects || []).filter(p => !p.project_brief_ready).length,
+          }),
+          [queueHint(briefQ), `${briefs.total || 0} saved`]
+        ),
+        stage(
+          "Embed Session",
+          "summary recall",
+          fmtPct(embedding.session_embedding_coverage_percent),
+          `${sessionPending} queued session vectors`,
+          stageStatus({
+            pending: sessionPending,
+            errors: Number(sessionEmbedQ.dead || 0),
+            status: cats.embedding_coverage?.status,
+          }),
+          [queueHint(sessionEmbedQ)]
+        ),
+        stage(
+          "Embed Span",
+          "trace recall",
+          fmtPct(spanCoverage.coverage_percent),
+          `${spanPending} queued span vectors`,
+          stageStatus({
+            pending: spanPending,
+            errors: Number(spanEmbedQ.dead || 0),
+            status: cats.embedding_coverage?.status,
+          }),
+          [queueHint(spanEmbedQ)]
+        ),
+        stage(
+          "Quality",
+          "operational gate",
+          fmtScore(q.score),
+          `${q.status || "unknown"} with ${(q.warnings || []).length} warnings`,
+          q.status || "warn",
+          [`bundle ${fmtPct(bundle.bundle_ready_percent)}`]
+        ),
+        stage(
+          "Adoption",
+          "runtime rollout",
+          cats.agent_adoption?.status || "unknown",
+          `${adoptionGaps} rollout gaps`,
+          stageStatus({missing: adoptionGaps, status: cats.agent_adoption?.status}),
+          [`${(adoption.runtimes || []).length} runtimes`]
+        ),
+      ].join("");
+
+      $("projects").innerHTML = table([
+        {label: "Project", render: r => `<strong>${esc(r.project_key)}</strong>`},
+        {label: "Ready", render: r => `<span class="${r.ready ? "ok" : "warn"}">${r.ready ? "yes" : "no"}</span>`},
+        {label: "Summaries", render: r => esc(r.summary_count || 0)},
+        {label: "Brief", render: r => `<span class="${r.project_brief_ready ? "ok" : "warn"}">${r.project_brief_ready ? "ready" : "missing"}</span>`},
+        {label: "Spans", render: r => esc(`${r.span_embedding_count || 0}/${r.span_count || 0}`)},
+      ], obs.projects || [], "No project rows available.");
+
+      $("adoption").innerHTML = table([
+        {label: "Runtime", render: r => `<strong>${esc(r.runtime)}</strong><div class="muted">${esc((r.observed_agent_ids || []).join(", ") || "not observed")}</div>`},
+        {label: "Ready", render: r => `<span class="${r.ready ? "ok" : "warn"}">${r.ready ? "yes" : "no"}</span>`},
+        {label: "Events", render: r => esc(r.observed_events || 0)},
+        {label: "Status", render: r => `<span class="pill">${esc(r.status)}</span>`},
+      ], adoption.runtimes || [], "No adoption matrix available.");
+
+      $("summaries").innerHTML = table([
+        {label: "Session", render: r => `<strong>${esc(r.session_id)}</strong><div class="muted">${esc(r.agent_id || "")}</div>`},
+        {label: "Project", render: r => esc([r.repo_owner, r.repo_name].filter(Boolean).join("/") || "unknown")},
+        {label: "Bundle", render: r => `<span class="${r.bundle_ready ? "ok" : "warn"}">${r.bundle_ready ? "ready" : "partial"}</span>`},
+        {label: "Model", render: r => esc(r.generator_model || "unknown")},
+        {label: "Summary", render: r => `<div class="truncate" title="${esc(r.summary_preview || "")}">${esc(r.summary_preview || "")}</div>`},
+      ], summaries.latest || [], "No saved summaries available.");
+
+      $("briefs").innerHTML = table([
+        {label: "Project", render: r => `<strong>${esc(r.project_key)}</strong>`},
+        {label: "Sessions", render: r => esc(r.session_count || 0)},
+        {label: "Model", render: r => esc(r.generator_model || "unknown")},
+        {label: "Brief", render: r => `<div class="truncate" title="${esc(r.brief_preview || "")}">${esc(r.brief_preview || "")}</div>`},
+      ], briefs.latest || [], "No project briefs available.");
+
+      const warnings = [...(q.warnings || []), ...((adoption.warnings || []))];
+      $("warnings").innerHTML = warnings.length
+        ? `<div class="stack">${warnings.slice(0, 30).map(w => `<div class="row"><span class="pill warn">warn</span><span>${esc(w)}</span></div>`).join("")}</div>`
+        : `<div class="empty">No current warnings.</div>`;
+    }
+
+    async function load() {
+      $("statusline").textContent = "Refreshing live pipeline state...";
+      try {
+        const res = await fetch("/observability", {cache: "no-store"});
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        render(await res.json());
+      } catch (err) {
+        $("statusline").textContent = `Failed to load: ${err.message}`;
+        $("metrics").innerHTML = `<div class="panel metric error"><div class="label">Endpoint</div><div class="value bad">offline</div><div class="hint">${esc(err.message)}</div></div>`;
+      }
+    }
+    $("refresh").addEventListener("click", load);
+    load();
+    setInterval(load, 60000);
+  </script>
+</body>
+</html>

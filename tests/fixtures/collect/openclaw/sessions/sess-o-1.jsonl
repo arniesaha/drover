@@ -1,0 +1,3 @@
+{"type":"session","id":"oc-sess-1"}
+{"type":"message","id":"m-1","timestamp":"2026-05-08T12:00:00Z","message":{"role":"user","content":"hi from openclaw"}}
+{"type":"message","id":"m-2","timestamp":"2026-05-08T12:00:05Z","message":{"role":"assistant","content":"hello"}}

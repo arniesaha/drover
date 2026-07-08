@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drover — Sign in</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           background: #0d1117; color: #e6edf3; display: grid; place-items: center;
+           min-height: 100vh; margin: 0; }
+    form { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+           padding: 2rem; width: min(90vw, 22rem); }
+    h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+    input { width: 100%; box-sizing: border-box; padding: .6rem; margin: 0 0 1rem;
+            background: #0d1117; color: inherit; border: 1px solid #30363d;
+            border-radius: 6px; }
+    button { width: 100%; padding: .6rem; background: #238636; color: #fff;
+             border: 0; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+    .error { color: #f85149; font-size: .85rem; margin-bottom: 1rem; display: none; }
+  </style>
+</head>
+<body>
+  <form method="post" action="/auth/login">
+    <h1>Drover</h1>
+    <p class="error" id="error">Invalid token — check ~/.drover/api_token on the server.</p>
+    <input type="password" name="token" placeholder="API token" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+  <script>
+    if (new URLSearchParams(location.search).has("error")) {
+      document.getElementById("error").style.display = "block";
+    }
+  </script>
+</body>
+</html>

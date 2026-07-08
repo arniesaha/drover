@@ -1,0 +1,284 @@
+"""Tests for the Meta Harness registry."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import duckdb
+
+from drover.schema import bootstrap
+from drover.server.harness.registry import HarnessRegistry
+
+
+def _registry(tmp_path):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    return HarnessRegistry(duckdb_path), duckdb_path
+
+
+def test_bootstrap_creates_harness_tables(tmp_path):
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        }
+
+    assert {
+        "harness_hosts",
+        "harness_sessions",
+        "harness_events",
+        "harness_transcript_chunks",
+    }.issubset(tables)
+
+
+def test_register_host_upserts_capabilities_and_heartbeat(tmp_path):
+    registry, _ = _registry(tmp_path)
+
+    first = registry.register_host(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        local_url="http://192.168.1.70:7081",
+        capabilities={"harnesses": ["shell"]},
+    )
+    second = registry.register_host(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        local_url="http://192.168.1.70:7081",
+        tailscale_url="http://100.64.0.10:7081",
+        capabilities={"harnesses": ["shell", "codex"]},
+    )
+
+    hosts = registry.list_hosts()
+    assert len(hosts) == 1
+    assert first.host_id == second.host_id == "nas"
+    assert second.status == "online"
+    assert second.tailscale_url == "http://100.64.0.10:7081"
+    assert second.capabilities == {"harnesses": ["shell", "codex"]}
+    assert second.last_seen_at is not None
+
+
+def test_create_and_update_session_lifecycle(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        capabilities={"harnesses": ["shell", "claude-code"]},
+    )
+
+    session = registry.create_session(
+        session_id="harness-session-1",
+        host_id="mac-mini",
+        harness="shell",
+        command="/bin/zsh",
+        repo_owner="arniesaha",
+        repo_name="nexus",
+        branch="main",
+        cwd="/Users/arnabmac/jenny/nexus",
+        status="running",
+        started_at=datetime(2026, 6, 21, 22, tzinfo=timezone.utc),
+    )
+    updated = registry.update_session_status(
+        session.session_id,
+        "ended",
+        ended_at=datetime(2026, 6, 21, 23, tzinfo=timezone.utc),
+        summary_session_id="summary-1",
+    )
+
+    assert updated.status == "ended"
+    assert updated.summary_session_id == "summary-1"
+    assert registry.get_session("harness-session-1") == updated
+    assert registry.list_sessions(host_id="mac-mini", status="ended") == [updated]
+    assert registry.list_sessions(status="running") == []
+
+
+def test_append_events_and_transcript_chunks_in_order(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.register_host(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        capabilities={"harnesses": ["shell", "gemini"]},
+    )
+    registry.create_session(
+        session_id="harness-session-2",
+        host_id="gpu-pc",
+        harness="shell",
+        command="/bin/bash",
+    )
+
+    event = registry.append_event(
+        session_id="harness-session-2",
+        event_type="session.started",
+        payload={"pid": 1234},
+    )
+    registry.append_transcript_chunk(
+        session_id="harness-session-2",
+        sequence=2,
+        content_redacted="second",
+    )
+    registry.append_transcript_chunk(
+        session_id="harness-session-2",
+        sequence=1,
+        content_redacted="first",
+        byte_count=5,
+    )
+    auto = registry.append_transcript_chunk(
+        session_id="harness-session-2",
+        content_redacted="third",
+    )
+
+    assert registry.list_events("harness-session-2")[0].payload == {"pid": 1234}
+    assert event.event_type == "session.started"
+    assert event.normalized_type == "status"
+    assert event.normalized_source == "structured"
+    assert event.content_preview == "session started"
+    chunks = registry.list_transcript_chunks("harness-session-2")
+    assert [chunk.content_redacted for chunk in chunks] == ["first", "second", "third"]
+    assert auto.sequence == 3
+    assert auto.byte_count == len("third".encode("utf-8"))
+
+
+def test_structured_session_fields_roundtrip(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(
+        host_id="h1", harness="claude-code", command="claude -p", mode="structured"
+    )
+    assert session.mode == "structured"
+    assert session.awaiting is None
+    registry.update_session_activity(session.session_id, awaiting="approval")
+    updated = registry.get_session(session.session_id)
+    assert updated.awaiting == "approval"
+    assert updated.last_activity is not None
+    registry.update_session_activity(session.session_id, awaiting=None)
+    assert registry.get_session(session.session_id).awaiting is None
+
+
+def test_default_mode_is_pty(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(host_id="h1", harness="shell", command="/bin/sh")
+    assert session.mode == "pty"
+    assert session.last_activity is None
+
+
+def test_event_seq_ordering(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(host_id="h1", harness="claude-code", command="c")
+    sid = session.session_id
+    assert registry.max_event_seq(sid) == 0
+    for seq in (1, 2, 3):
+        registry.append_event(
+            session_id=sid,
+            event_type="assistant_output",
+            payload={"seq": seq},
+            seq=seq,
+        )
+    assert registry.max_event_seq(sid) == 3
+    tail = registry.list_events_after(sid, 1)
+    assert [event.seq for event in tail] == [2, 3]
+    # events without seq (PTY mirror path) are excluded from seq listings
+    registry.append_event(session_id=sid, event_type="terminal.output", payload={})
+    assert [e.seq for e in registry.list_events_after(sid, 0)] == [1, 2, 3]
+
+
+def test_append_event_stores_queryable_normalized_terminal_metadata(tmp_path):
+    registry, duckdb_path = _registry(tmp_path)
+    registry.register_host(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        capabilities={"harnesses": ["shell"]},
+    )
+    registry.create_session(
+        session_id="harness-session-normalized",
+        host_id="nas",
+        harness="shell",
+        command="/bin/sh",
+    )
+
+    event = registry.append_event(
+        session_id="harness-session-normalized",
+        event_type="terminal.input",
+        harness="shell",
+        payload={"text": "ls -la\n", "byte_count": 7},
+    )
+
+    assert event.normalized_type == "command"
+    assert event.normalized_source == "inferred_terminal"
+    assert event.content_preview == "ls -la"
+    with duckdb.connect(str(duckdb_path)) as con:
+        rows = con.execute(
+            """
+            SELECT event_type, normalized_type, normalized_source, content_preview
+            FROM harness_events
+            WHERE session_id = ?
+            """,
+            ["harness-session-normalized"],
+        ).fetchall()
+    assert rows == [("terminal.input", "command", "inferred_terminal", "ls -la")]
+
+
+def test_concurrent_writes_across_registry_instances_are_serialized(tmp_path):
+    """Regression test: DuckDB raises "Unique file handle conflict" when two
+    threads call duckdb.connect() on the same file at nearly the same
+    instant. HarnessRegistry._connect() must serialize the whole
+    connect->use->close window per resolved db path -- across INSTANCES too,
+    since central builds a fresh HarnessRegistry per request. Before the
+    fix, this test failed intermittently with BinderException.
+    """
+    import threading
+
+    _, duckdb_path = _registry(tmp_path)
+    # Two separate instances pointing at the same file, exercised from many
+    # threads: per-instance locking would not be enough here.
+    registries = [HarnessRegistry(duckdb_path), HarnessRegistry(duckdb_path)]
+    for index, registry in enumerate(registries):
+        registry.create_session(
+            session_id=f"harness-conc-{index}",
+            host_id="nas",
+            harness="shell",
+            command="/bin/sh",
+        )
+
+    barrier = threading.Barrier(4)
+    errors: list[Exception] = []
+
+    def hammer(registry: HarnessRegistry, session_id: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            for seq in range(1, 26):
+                registry.append_event(
+                    session_id=session_id,
+                    event_type="assistant_output",
+                    payload={"text": f"{session_id}-{seq}"},
+                    seq=seq,
+                )
+                registry.update_session_activity(session_id, awaiting=None)
+        except Exception as exc:  # noqa: BLE001 - surfaced via errors list
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(
+            target=hammer, args=(registries[i % 2], f"harness-conc-{i % 2}")
+        )
+        for i in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    for index in range(2):
+        events = registries[index].list_events_after(f"harness-conc-{index}", 0)
+        # Two threads per session each wrote seqs 1..25; the second thread's
+        # duplicate-seq rows still land (no unique constraint) -- the point
+        # here is purely that no connect ever raised.
+        assert len(events) == 50

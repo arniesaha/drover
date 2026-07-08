@@ -1,0 +1,78 @@
+{
+  "batches": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "agentweave-openclaw-bridge"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "11111111111111111111111111111111",
+              "spanId": "2222222222222222",
+              "name": "agent.turn",
+              "startTimeUnixNano": "1715200000000000000",
+              "endTimeUnixNano": "1715200001000000000",
+              "attributes": [
+                {"key": "prov.harness", "value": {"stringValue": "openclaw"}},
+                {"key": "prov.session.id", "value": {"stringValue": "018f-openclaw-main-0001"}},
+                {"key": "prov.session.key", "value": {"stringValue": "agent:main:main"}},
+                {"key": "prov.cwd", "value": {"stringValue": "/tmp/nexus-demo"}},
+                {"key": "prov.repository", "value": {"stringValue": "https://github.com/example/nexus-demo.git"}},
+                {"key": "prov.project", "value": {"stringValue": "example/nexus-demo"}},
+                {"key": "prov.repo.owner", "value": {"stringValue": "example"}},
+                {"key": "prov.repo.name", "value": {"stringValue": "nexus-demo"}},
+                {"key": "prov.git.branch", "value": {"stringValue": "feature/demo"}},
+                {"key": "prov.task.label", "value": {"stringValue": "fake OpenClaw handoff"}},
+                {"key": "redaction.level", "value": {"stringValue": "preview"}},
+                {"key": "sensitivity", "value": {"stringValue": "unknown"}}
+              ]
+            },
+            {
+              "traceId": "11111111111111111111111111111111",
+              "spanId": "3333333333333333",
+              "parentSpanId": "2222222222222222",
+              "name": "llm.call",
+              "startTimeUnixNano": "1715200001100000000",
+              "endTimeUnixNano": "1715200002500000000",
+              "attributes": [
+                {"key": "prov.harness", "value": {"stringValue": "openclaw"}},
+                {"key": "session.id", "value": {"stringValue": "018f-openclaw-main-0001"}},
+                {"key": "prov.session.key", "value": {"stringValue": "agent:main:main"}},
+                {"key": "prov.activity.type", "value": {"stringValue": "llm_call"}},
+                {"key": "prov.agent.id", "value": {"stringValue": "nix-v1"}},
+                {"key": "prov.routing.provider", "value": {"stringValue": "fake-provider"}},
+                {"key": "prov.routing.model", "value": {"stringValue": "fake-model-small"}},
+                {"key": "prov.routing.reason", "value": {"stringValue": "low-latency-test-route"}},
+                {"key": "prov.llm.prompt_preview", "value": {"stringValue": "Review the fake demo repository and produce a bounded handoff preview."}},
+                {"key": "prov.llm.response_preview", "value": {"stringValue": "The fake demo repository has a local-first context store."}},
+                {"key": "redaction.level", "value": {"stringValue": "redacted"}},
+                {"key": "sensitivity", "value": {"stringValue": "none"}}
+              ]
+            },
+            {
+              "traceId": "11111111111111111111111111111111",
+              "spanId": "4444444444444444",
+              "parentSpanId": "2222222222222222",
+              "name": "tool.call",
+              "startTimeUnixNano": "1715200002600000000",
+              "endTimeUnixNano": "1715200003000000000",
+              "attributes": [
+                {"key": "prov.harness", "value": {"stringValue": "openclaw"}},
+                {"key": "prov.session.key", "value": {"stringValue": "agent:main:main"}},
+                {"key": "prov.activity.type", "value": {"stringValue": "tool_call"}},
+                {"key": "prov.llm.prompt_preview", "value": {"stringValue": "short tool input preview"}},
+                {"key": "prov.tool.output_preview", "value": {"stringValue": "short tool output preview"}},
+                {"key": "mux.provider", "value": {"stringValue": "fake-tool-provider"}},
+                {"key": "mux.model", "value": {"stringValue": "fake-tool-model"}},
+                {"key": "mux.reason", "value": {"stringValue": "tool-span-route"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+{"type":"user_message","sessionId":"cc-sess-1","timestamp":"2026-05-08T10:00:00Z","uuid":"u-1","message":{"role":"user","content":"hello"}}
+{"type":"assistant_message","sessionId":"cc-sess-1","timestamp":"2026-05-08T10:00:05Z","uuid":"u-2","message":{"role":"assistant","content":"hi"}}

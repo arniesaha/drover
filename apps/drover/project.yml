@@ -1,0 +1,74 @@
+name: Drover
+options:
+  bundleIdPrefix: com.arnab
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+packages:
+  NexusKit:
+    path: NexusKit
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    exactVersion: "1.13.0"
+targets:
+  Drover:
+    type: application
+    platform: iOS
+    sources: [Drover]
+    dependencies:
+      - package: NexusKit
+      - package: SwiftTerm
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.arnab.drover
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 0.1.0
+        SWIFT_VERSION: 6.0
+    info:
+      path: Drover/Info.plist
+      properties:
+        CFBundleShortVersionString: "0.1.0"
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UIBackgroundModes: [fetch]
+        BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
+  DroverTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [NexusKitTests]
+    dependencies:
+      - target: Drover
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: 6.0
+  # UI smoke harness (Settings onboarding against the live server with a
+  # deliberately wrong token). Separate scheme so unit runs stay fast.
+  DroverUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [DroverUITests]
+    dependencies:
+      - target: Drover
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: 6.0
+schemes:
+  Drover:
+    build:
+      targets:
+        Drover: all
+    test:
+      targets: [DroverTests]
+  DroverUITests:
+    build:
+      targets:
+        DroverUITests: all
+    test:
+      targets: [DroverUITests]

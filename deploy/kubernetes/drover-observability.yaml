@@ -1,0 +1,61 @@
+# renamed from nexus-*; live cluster still runs the nexus-* objects until cutover (§5b)
+apiVersion: v1
+kind: Service
+metadata:
+  name: drover-metrics
+  namespace: monitoring
+  labels:
+    app: drover-metrics
+spec:
+  ports:
+    - name: http
+      port: 7080
+      protocol: TCP
+      targetPort: 7080
+---
+# renamed from nexus-*; live cluster still runs the nexus-* objects until cutover (§5b)
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: drover-metrics
+  namespace: monitoring
+  labels:
+    app: drover-metrics
+subsets:
+  - addresses:
+      - ip: 192.168.1.149
+    ports:
+      - name: http
+        port: 7080
+        protocol: TCP
+---
+# renamed from nexus-*; live cluster still runs the nexus-* objects until cutover (§5b)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: drover-metrics
+  namespace: monitoring
+  labels:
+    app: drover-metrics
+    release: kube-prometheus-stack
+spec:
+  endpoints:
+    - interval: 30s
+      path: /metrics
+      port: http
+      scrapeTimeout: 10s
+      # Central requires the shared cluster token (see README Authentication).
+      # Create the secret from the token file on the scraping cluster:
+      #   kubectl -n monitoring create secret generic drover-api-token \
+      #     --from-file=token=$HOME/.drover/api_token
+      authorization:
+        type: Bearer
+        credentials:
+          name: drover-api-token
+          key: token
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  selector:
+    matchLabels:
+      app: drover-metrics

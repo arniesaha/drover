@@ -1,0 +1,13 @@
+[paths]
+incoming_dir = "/tmp/nexus-test/incoming"
+parquet_dir  = "/tmp/nexus-test/parquet"
+duckdb_path  = "/tmp/nexus-test/nexus.duckdb"
+processed_retention_days = 7
+
+[server]
+otlp_grpc_port = 4317
+mcp_http_port  = 7077
+
+[agent]
+agent_id     = "test-agent"
+principal_id = "test-user"

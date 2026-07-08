@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drover Harness Console</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef2f5;
+      --text: #171b1f;
+      --muted: #65717d;
+      --line: #d9e0e7;
+      --ok: #16834a;
+      --warn: #a56300;
+      --bad: #b42318;
+      --accent: #1769aa;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101316;
+        --panel: #171b20;
+        --panel-2: #20262d;
+        --text: #eef2f6;
+        --muted: #9aa6b2;
+        --line: #303943;
+        --ok: #4fc078;
+        --warn: #d89a33;
+        --bad: #ff6b5f;
+        --accent: #6cb6ff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 750; }
+    h2 { margin: 0 0 4px; font-size: 15px; font-weight: 750; }
+    .section-hint { color: var(--muted); margin: 0 0 12px; font-size: 13px; }
+    main { padding: 18px 20px 32px; max-width: 1280px; margin: 0 auto; }
+    button, a.button {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button:hover, a.button:hover { border-color: var(--accent); }
+    button:disabled { cursor: not-allowed; opacity: 0.55; }
+    input, select {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      min-width: 0;
+    }
+    .toolbar, .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .grid { display: grid; gap: 14px; }
+    .hosts { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .workspaces { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .workspace {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      text-align: left;
+      padding: 14px;
+      width: 100%;
+      align-items: stretch;
+    }
+    .workspace:hover:not(:disabled) { border-color: var(--accent); }
+    .workspace .repo { font-size: 15px; font-weight: 750; overflow-wrap: anywhere; }
+    .workspace .path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .workspace .meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+    .workspace .cta { margin-top: auto; font-weight: 650; color: var(--accent); }
+    .workspace:disabled .cta { color: var(--bad); font-weight: 500; }
+    .advanced { margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 12px; }
+    .advanced summary { cursor: pointer; color: var(--muted); font-weight: 650; }
+    .advanced summary:hover { color: var(--accent); }
+    .launch {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(140px, 0.7fr) minmax(220px, 1.3fr) auto;
+      gap: 10px;
+      align-items: end;
+      margin-top: 12px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-width: 0;
+    }
+    .host-title { display: flex; justify-content: space-between; gap: 10px; }
+    .muted { color: var(--muted); }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 12px;
+      color: var(--muted);
+      background: var(--panel-2);
+      white-space: nowrap;
+    }
+    .pill.fav { color: var(--warn); border-color: var(--warn); }
+    .online { color: var(--ok); }
+    .offline { color: var(--bad); }
+    .disabled { opacity: 0.65; }
+    .state { display: inline-flex; align-items: center; gap: 6px; font-weight: 650; white-space: nowrap; }
+    .state::before { content: ""; width: 8px; height: 8px; border-radius: 999px; background: currentColor; flex: none; }
+    .state.ok { color: var(--ok); }
+    .state.warn { color: var(--warn); }
+    .state.bad { color: var(--bad); }
+    .state.muted { color: var(--muted); }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 11px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .reason { color: var(--muted); font-size: 12px; margin-top: 3px; max-width: 52ch; }
+    .ctx-main { font-weight: 600; overflow-wrap: anywhere; }
+    .ctx-sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    td .stack { display: flex; flex-direction: column; gap: 2px; }
+    a.button.resume { border-color: var(--accent); color: var(--accent); font-weight: 650; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left;
+      padding: 9px 8px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    code {
+      background: var(--panel-2);
+      border-radius: 5px;
+      padding: 2px 5px;
+      overflow-wrap: anywhere;
+    }
+    .empty { color: var(--muted); padding: 18px 0; }
+    @media (max-width: 760px) {
+      header { position: static; align-items: flex-start; flex-direction: column; }
+      main { padding: 14px; }
+      .launch { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Drover Harness Console</h1>
+      <div class="muted" id="statusline">Loading your workspaces...</div>
+    </div>
+    <div class="toolbar">
+      <button id="refresh" type="button">Refresh</button>
+      <a class="button" href="/ui">Observatory</a>
+      <a class="button" href="/harness">JSON</a>
+    </div>
+  </header>
+  <main class="grid">
+    <section class="panel">
+      <h2>Start working</h2>
+      <p class="section-hint" id="launch-intro">Pick a workspace to start a session &mdash; Drover connects to the right machine for you.</p>
+      <div class="grid workspaces" id="workspaces"></div>
+      <div class="muted" id="launch-status" style="margin-top:10px"></div>
+      <details class="advanced" id="advanced">
+        <summary>Advanced &mdash; choose host, harness, and path manually</summary>
+        <div class="launch">
+          <label>
+            <div class="muted">Host</div>
+            <select id="launch-host"></select>
+          </label>
+          <label>
+            <div class="muted">Harness</div>
+            <select id="launch-harness"></select>
+          </label>
+          <label>
+            <div class="muted">Working directory</div>
+            <input id="launch-cwd" placeholder="/path/to/repo" list="cwd-suggestions" autocomplete="off">
+            <datalist id="cwd-suggestions"></datalist>
+          </label>
+          <button id="launch" type="button">Launch</button>
+        </div>
+        <div class="muted" id="advanced-status" style="margin-top:8px">Select a registered host to launch a session.</div>
+      </details>
+    </section>
+    <section>
+      <h2>Hosts</h2>
+      <p class="section-hint">Machines Drover can start sessions on.</p>
+      <div class="grid hosts" id="hosts"></div>
+    </section>
+    <section class="panel">
+      <h2>Recent Sessions</h2>
+      <div id="sessions"></div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let harnessState = {hosts: [], sessions: [], cwd_suggestions: []};
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+    const HARNESS_PREFERENCE = ["claude-code", "codex", "gemini", "openclaw", "shell"];
+
+    function endpoint(host) {
+      return host && (host.tailscale_url || host.local_url) || "";
+    }
+
+    function enabledHarnesses(host) {
+      return (((host?.capabilities || {}).harnesses) || []).filter((cap) => cap.enabled);
+    }
+
+    function hostById(id) {
+      return (harnessState.hosts || []).find((host) => host.host_id === id);
+    }
+
+    function selectedHost() {
+      const id = $("launch-host").value;
+      return hostById(id);
+    }
+
+    function preferredHarness(host) {
+      const enabled = enabledHarnesses(host).map((cap) => cap.name);
+      const pick = HARNESS_PREFERENCE.find((name) => enabled.includes(name));
+      return pick || enabled[0] || "shell";
+    }
+
+    function inferHostForPath(path) {
+      const hosts = harnessState.hosts || [];
+      const recent = (harnessState.cwd_suggestions || []).find(
+        (item) => item.host_id && item.path === path
+      );
+      if (recent) return hostById(recent.host_id);
+      const onlineFirst = (kind) =>
+        hosts.find((h) => h.kind === kind && h.status === "online") ||
+        hosts.find((h) => h.kind === kind);
+      if (path.startsWith("/Users/")) return onlineFirst("macos");
+      if (path.startsWith("/home/") || path.startsWith("/root") || path.startsWith("/tmp")) {
+        return onlineFirst("linux");
+      }
+      return null;
+    }
+
+    function repoName(path) {
+      const parts = String(path || "").split("/").filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : String(path || "");
+    }
+
+    function launchableReason(host) {
+      if (!host) return "No connected machine for this path";
+      if (host.status !== "online") return `${host.display_name || host.host_id} is offline`;
+      if (!endpoint(host)) return "No reachable URL for this machine";
+      if (!enabledHarnesses(host).length) return "No harness enabled on this machine";
+      return "";
+    }
+
+    function buildWorkspaces() {
+      const suggestions = harnessState.cwd_suggestions || [];
+      const ordered = [
+        ...suggestions.filter((s) => s.source === "favorite"),
+        ...suggestions.filter((s) => s.source !== "favorite"),
+      ];
+      const seen = new Set();
+      const items = [];
+      for (const s of ordered) {
+        const host = s.host_id ? hostById(s.host_id) : inferHostForPath(s.path);
+        const hostId = host ? host.host_id : "";
+        const key = `${hostId}
+${s.path}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({ path: s.path, host, source: s.source });
+      }
+      return items.slice(0, 12);
+    }
+
+    function renderWorkspaces() {
+      const items = buildWorkspaces();
+      if (!items.length) {
+        $("workspaces").innerHTML =
+          '<div class="empty">No recent or favorite workspaces yet. Use <strong>Advanced</strong> below to start a session by path.</div>';
+        return;
+      }
+      $("workspaces").innerHTML = items.map((item, index) => {
+        const host = item.host;
+        const reason = launchableReason(host);
+        const ready = !reason;
+        const harness = ready ? preferredHarness(host) : "";
+        const fav = item.source === "favorite";
+        const where = host ? (host.display_name || host.host_id) : "unknown machine";
+        return `<button class="workspace panel" type="button"
+            data-index="${index}" ${ready ? "" : "disabled"}
+            title="${esc(item.path)}">
+          <div class="repo">${esc(repoName(item.path))}</div>
+          <div class="path">${esc(item.path)}</div>
+          <div class="meta">
+            <span class="pill ${fav ? "fav" : ""}">${fav ? "★ Favorite" : "Recent"}</span>
+            <span class="pill">${esc(where)}</span>
+            ${ready ? `<span class="pill">via ${esc(harness)}</span>` : ""}
+          </div>
+          <div class="cta">${ready ? `Start session on ${esc(where)} →` : esc(reason)}</div>
+        </button>`;
+      }).join("");
+      $("workspaces").dataset.items = JSON.stringify(items.map((item) => ({
+        path: item.path,
+        host_id: item.host ? item.host.host_id : "",
+        ready: !launchableReason(item.host),
+      })));
+    }
+
+    function startWorkspaceByIndex(index) {
+      const items = JSON.parse($("workspaces").dataset.items || "[]");
+      const item = items[index];
+      if (!item || !item.ready) return;
+      const host = hostById(item.host_id);
+      doLaunch(host, preferredHarness(host), item.path, $("launch-status"));
+    }
+
+    function renderLaunchForm(hosts) {
+      $("launch-host").innerHTML = hosts.map((host) =>
+        `<option value="${esc(host.host_id)}">${esc(host.display_name || host.host_id)}</option>`
+      ).join("");
+      updateHarnessOptions();
+    }
+
+    function updateHarnessOptions() {
+      const host = selectedHost();
+      const harnesses = enabledHarnesses(host);
+      const suggestions = (harnessState.cwd_suggestions || []).filter(
+        (item) => !item.host_id || item.host_id === (host ? host.host_id : "")
+      ).slice(0, 10);
+      $("launch-harness").innerHTML = harnesses.map((cap) =>
+        `<option value="${esc(cap.name)}">${esc(cap.name)}</option>`
+      ).join("");
+      $("cwd-suggestions").innerHTML = suggestions.map((item) =>
+        `<option value="${esc(item.path)}" label="${esc(item.source || "")}"></option>`
+      ).join("");
+      $("launch").disabled = !host || !endpoint(host) || harnesses.length === 0;
+      const reason = launchableReason(host);
+      $("advanced-status").textContent = reason
+        ? reason
+        : `Ready to launch on ${host.display_name || host.host_id}.`;
+    }
+
+    function focusNextLaunchField(event) {
+      if (event.key !== "Enter") return;
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        launchFromForm();
+        return;
+      }
+      const fields = [$("launch-host"), $("launch-harness"), $("launch-cwd"), $("launch")];
+      const index = fields.indexOf(event.target);
+      if (index >= 0 && index < fields.length - 1) {
+        event.preventDefault();
+        fields[index + 1].focus();
+      }
+    }
+
+    function launchFromForm() {
+      const host = selectedHost();
+      if (!host) return;
+      const harness = $("launch-harness").value || "shell";
+      const cwd = $("launch-cwd").value.trim();
+      doLaunch(host, harness, cwd, $("advanced-status"));
+    }
+
+    async function doLaunch(host, harness, cwd, statusEl) {
+      if (!host) return;
+      const where = host.display_name || host.host_id;
+      const what = repoName(cwd) || "session";
+      statusEl.textContent = `Starting ${harness} in ${what} on ${where}...`;
+      try {
+        const res = await fetch(`/harness/hosts/${encodeURIComponent(host.host_id)}/sessions`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            harness,
+            cwd: cwd || undefined,
+            rows: 32,
+            cols: 100,
+          }),
+        });
+        const contentType = res.headers.get("content-type") || "";
+        if (res.redirected || !contentType.includes("application/json")) {
+          throw new Error(
+            "public route returned a login/HTML response; refresh the page and re-authenticate"
+          );
+        }
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `launch failed: ${res.status}`);
+        location.href = `/ui/harness/sessions/${encodeURIComponent(payload.session_id)}`;
+      } catch (err) {
+        statusEl.textContent = `Could not start session: ${err}`;
+      }
+    }
+
+    function renderHosts(hosts) {
+      if (!hosts.length) {
+        $("hosts").innerHTML = '<div class="empty">No harness hosts registered yet.</div>';
+        return;
+      }
+      $("hosts").innerHTML = hosts.map((host) => {
+        const caps = (((host.capabilities || {}).harnesses) || []);
+        const enabled = caps.filter((cap) => cap.enabled).map((cap) => cap.name);
+        const declared = caps.filter((cap) => !cap.enabled).map((cap) => cap.name);
+        const url = endpoint(host);
+        return `<article class="panel">
+          <div class="host-title">
+            <div>
+              <strong>${esc(host.display_name || host.host_id)}</strong>
+              <div class="muted">${esc(host.kind || "host")} · ${esc(host.host_id)}</div>
+            </div>
+            <span class="${host.status === "online" ? "online" : "offline"}">${esc(host.status)}</span>
+          </div>
+          <div class="row" style="margin-top:12px">
+            ${enabled.map((name) => `<span class="pill">${esc(name)}</span>`).join("")}
+            ${declared.map((name) => `<span class="pill disabled">${esc(name)}</span>`).join("")}
+          </div>
+          <div style="margin-top:12px">${url ? `<code>${esc(url)}</code>` : '<span class="muted">No URL registered</span>'}</div>
+        </article>`;
+      }).join("");
+    }
+
+    const STALE_AFTER_MS = 30 * 60 * 1000;
+
+    function parseTs(value) {
+      if (!value) return null;
+      let iso = String(value).trim().replace(" ", "T");
+      if (!/[zZ]$/.test(iso) && !/[+-]\d\d:?\d\d$/.test(iso)) iso += "Z";
+      const ms = Date.parse(iso);
+      return Number.isNaN(ms) ? null : ms;
+    }
+
+    function relativeAge(ms) {
+      if (ms == null) return null;
+      const sec = Math.max(0, Math.round(ms / 1000));
+      if (sec < 60) return `${sec}s ago`;
+      const min = Math.round(sec / 60);
+      if (min < 60) return `${min}m ago`;
+      const hr = Math.round(min / 60);
+      if (hr < 48) return `${hr}h ago`;
+      return `${Math.round(hr / 24)}d ago`;
+    }
+
+    function sessionState(session, nowMs) {
+      const started = parseTs(session.started_at);
+      const updated = parseTs(session.updated_at);
+      const ageMs = updated == null ? null : nowMs - updated;
+      const note = session.last_error ? ` ${session.last_error}` : "";
+
+      if (session.status === "completed") {
+        return {label: "Completed", tone: "ok",
+          reason: session.last_error ? `Finished with note:${note}` : "Finished cleanly."};
+      }
+      if (session.status === "terminated") {
+        return {label: "Terminated", tone: "muted",
+          reason: session.last_error ? `Ended:${note}` : "Process exited or was killed."};
+      }
+      if (session.status === "created" || session.status === "starting") {
+        if (ageMs != null && ageMs > STALE_AFTER_MS) {
+          return {label: "Stale - launch incomplete", tone: "warn",
+            reason: `Launch was ${session.status} but has had no activity for ${relativeAge(ageMs)}.${note}`};
+        }
+        return {label: session.status === "starting" ? "Starting" : "Waiting to start", tone: "warn",
+          reason: ageMs == null
+            ? `Launch is ${session.status}; no activity timestamp has been recorded yet.${note}`
+            : `Launch is ${session.status}; last update ${relativeAge(ageMs)}.${note}`};
+      }
+      if (session.status === "running") {
+        if (started == null) {
+          return {label: "Stale - never started", tone: "bad",
+            reason: `Marked running but has no recorded start time; likely never launched or lost before start was confirmed.${note}`};
+        }
+        if (ageMs == null) {
+          return {label: "Running - unconfirmed", tone: "warn",
+            reason: `Marked running but has no last-activity time to confirm it is alive.${note}`};
+        }
+        if (ageMs > STALE_AFTER_MS) {
+          return {label: "Stale - no recent activity", tone: "warn",
+            reason: `Marked running but silent for ${relativeAge(ageMs)}; likely crashed or disconnected.${note}`};
+        }
+        return {label: "Active", tone: "ok",
+          reason: `Live; last activity ${relativeAge(ageMs)}.${note}`};
+      }
+      return {label: session.status || "Unknown", tone: "muted",
+        reason: session.last_error ? note.trim() : "Unrecognized state."};
+    }
+
+    function resumeInfo(session) {
+      const label = session.native_resume_label || session.native_session_id;
+      if (!label) return null;
+      return {label: session.native_resume_label || "", id: session.native_session_id || ""};
+    }
+
+    function sessionContext(session) {
+      const repo = session.repo_name
+        ? (session.repo_owner ? `${session.repo_owner}/${session.repo_name}` : session.repo_name)
+        : (session.cwd || session.command || "session");
+      const showCwd = session.cwd && session.repo_name;
+      const sub = [session.branch, showCwd ? session.cwd : null].filter(Boolean).join(" · ");
+      return {repo, sub};
+    }
+
+    function renderSessions(sessions) {
+      if (!sessions.length) {
+        $("sessions").innerHTML = '<div class="empty">No sessions yet.</div>';
+        return;
+      }
+      const nowMs = Date.now();
+      $("sessions").innerHTML = `<table>
+        <thead><tr><th>Status</th><th>Context</th><th>Harness</th><th>Host</th><th>Updated</th><th></th></tr></thead>
+        <tbody>${sessions.map((session) => {
+          const state = sessionState(session, nowMs);
+          const context = sessionContext(session);
+          const resume = resumeInfo(session);
+          const isRunning = ["created", "starting", "running"].includes(session.status);
+          const updated = parseTs(session.updated_at);
+          const updatedLabel = updated == null ? "no timestamp" : relativeAge(nowMs - updated);
+          return `<tr>
+          <td>
+            <div class="stack">
+              <span class="state ${esc(state.tone)}">${esc(state.label)}</span>
+              ${resume ? `<span class="badge" title="${esc(resume.id)}">resumable${resume.label ? `: ${esc(resume.label)}` : ""}</span>` : ""}
+              <div class="reason">${esc(state.reason)}</div>
+            </div>
+          </td>
+          <td>
+            <div class="ctx-main">${esc(context.repo)}</div>
+            ${context.sub ? `<div class="ctx-sub">${esc(context.sub)}</div>` : ""}
+          </td>
+          <td>${esc(session.harness)}</td>
+          <td>${esc(session.host_id)}</td>
+          <td><div>${esc(updatedLabel || "")}</div><div class="ctx-sub">${esc(session.updated_at || "")}</div></td>
+          <td class="row">
+            <a class="button" href="/ui/harness/sessions/${encodeURIComponent(session.session_id)}">Open</a>
+            <a class="button${resume ? " resume" : ""}"
+               href="/ui/harness/sessions/${encodeURIComponent(session.session_id)}#continue"
+               title="${resume ? esc("Native resume available - " + (resume.label || resume.id)) : "Continue this session in a CLI (Drover handoff)"}"
+              >${resume ? "Resume" : "Continue"}</a>
+            ${isRunning ? `<button type="button" data-kill="${esc(session.session_id)}">Kill</button>` : ""}
+          </td>
+        </tr>`;
+        }).join("")}</tbody>
+      </table>`;
+      document.querySelectorAll("[data-kill]").forEach((button) => {
+        button.addEventListener("click", () => terminateSession(button.dataset.kill || ""));
+      });
+    }
+
+    async function terminateSession(sessionId) {
+      $("statusline").textContent = `Killing ${sessionId}...`;
+      try {
+        const res = await fetch(`/harness/sessions/${encodeURIComponent(sessionId)}/terminate`, {
+          method: "POST",
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `kill failed: ${res.status}`);
+        await load();
+      } catch (err) {
+        $("statusline").textContent = `Kill failed: ${err}`;
+      }
+    }
+
+    async function load() {
+      $("statusline").textContent = "Refreshing...";
+      const res = await fetch("/harness", {cache: "no-store"});
+      const data = await res.json();
+      harnessState = data;
+      renderWorkspaces();
+      renderLaunchForm(data.hosts || []);
+      renderHosts(data.hosts || []);
+      renderSessions(data.sessions || []);
+      const hostCount = (data.hosts || []).length;
+      const wsCount = buildWorkspaces().length;
+      $("statusline").textContent =
+        `${wsCount} workspace${wsCount === 1 ? "" : "s"} ready · ${hostCount} machine${hostCount === 1 ? "" : "s"} connected`;
+    }
+
+    $("refresh").addEventListener("click", load);
+    $("launch-host").addEventListener("change", updateHarnessOptions);
+    $("launch").addEventListener("click", launchFromForm);
+    ["launch-host", "launch-harness", "launch-cwd"].forEach((id) => {
+      $(id).addEventListener("keydown", focusNextLaunchField);
+    });
+    $("workspaces").addEventListener("click", (event) => {
+      const card = event.target.closest("button.workspace");
+      if (!card || card.disabled) return;
+      startWorkspaceByIndex(Number(card.dataset.index));
+    });
+    load().catch((err) => {
+      $("statusline").textContent = `Failed to load harness state: ${err}`;
+    });
+  </script>
+</body>
+</html>

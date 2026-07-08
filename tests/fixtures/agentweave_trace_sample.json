@@ -1,0 +1,58 @@
+{
+  "batches": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "agentweave-proxy"}},
+          {"key": "telemetry.sdk.language", "value": {"stringValue": "python"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {"name": "agentweave"},
+          "spans": [
+            {
+              "traceId": "7b15218059664734d870ec48b999e97f",
+              "spanId": "aaaaaaaaaaaaaaaa",
+              "parentSpanId": "",
+              "name": "agent.turn",
+              "startTimeUnixNano": "1777141319000000000",
+              "endTimeUnixNano": "1777141323988000000",
+              "attributes": [
+                {"key": "prov.activity.type", "value": {"stringValue": "agent_turn"}},
+                {"key": "prov.agent.id", "value": {"stringValue": "claude-code-nas"}},
+                {"key": "prov.agent.type", "value": {"stringValue": "main"}},
+                {"key": "session.id", "value": {"stringValue": "claude-code-nas-main"}},
+                {"key": "prov.project", "value": {"stringValue": "claude-code"}},
+                {"key": "prov.task.label", "value": {"stringValue": "review repo"}}
+              ]
+            },
+            {
+              "traceId": "7b15218059664734d870ec48b999e97f",
+              "spanId": "bbbbbbbbbbbbbbbb",
+              "parentSpanId": "aaaaaaaaaaaaaaaa",
+              "name": "llm.claude-opus-4-7",
+              "startTimeUnixNano": "1777141319843328862",
+              "endTimeUnixNano": "1777141323831328862",
+              "attributes": [
+                {"key": "prov.activity.type", "value": {"stringValue": "llm_call"}},
+                {"key": "prov.agent.id", "value": {"stringValue": "claude-code-nas"}},
+                {"key": "session.id", "value": {"stringValue": "claude-code-nas-main"}},
+                {"key": "prov.llm.provider", "value": {"stringValue": "anthropic"}},
+                {"key": "prov.llm.model", "value": {"stringValue": "claude-opus-4-7"}},
+                {"key": "prov.llm.prompt_tokens", "value": {"intValue": "1234"}},
+                {"key": "prov.llm.completion_tokens", "value": {"intValue": "567"}},
+                {"key": "prov.llm.total_tokens", "value": {"intValue": "1801"}},
+                {"key": "tokens.cache_read", "value": {"intValue": "800"}},
+                {"key": "tokens.cache_write", "value": {"intValue": "100"}},
+                {"key": "cost.usd", "value": {"doubleValue": 0.0234}},
+                {"key": "prov.llm.prompt_preview", "value": {"stringValue": "Review this repo and propose..."}},
+                {"key": "prov.llm.response_preview", "value": {"stringValue": "Here is a plan..."}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

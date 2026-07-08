@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019f38e0-c232-7233-85d0-980957a5f7f1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello nexus"}}
+{"type":"turn.completed","usage":{"input_tokens":18240,"cached_input_tokens":4992,"output_tokens":67,"reasoning_output_tokens":59}}

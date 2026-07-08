@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drover Harness Session</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f14;
+      --panel: #111820;
+      --panel-2: #18222d;
+      --text: #eef2f6;
+      --muted: #93a4b7;
+      --line: #263341;
+      --accent: #6cb6ff;
+      --bad: #ff6b5f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1 { margin: 0; font-size: 17px; font-weight: 750; }
+    main {
+      display: grid;
+      grid-template-rows: auto auto auto auto minmax(220px, 1fr) auto auto;
+      min-height: calc(100vh - 58px);
+      gap: 10px;
+      padding: 10px;
+    }
+    button, a.button {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button:hover, a.button:hover { border-color: var(--accent); }
+    .toolbar, .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .muted { color: var(--muted); }
+    select {
+      min-width: 150px;
+      border: 1px solid var(--line);
+      background: #071018;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      min-width: 0;
+    }
+    code { overflow-wrap: anywhere; color: var(--accent); }
+    #terminal {
+      overflow: hidden;
+      background: #05080c;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      min-height: 360px;
+      padding: 6px;
+    }
+    #terminal .xterm { height: 100%; }
+    #terminal .xterm-viewport { overflow-y: auto; }
+    textarea {
+      width: 100%;
+      min-height: 70px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #071018;
+      color: var(--text);
+      padding: 10px;
+      font: 15px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .bad { color: var(--bad); }
+    .view-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .view-tabs button[aria-pressed="true"] {
+      border-color: var(--accent);
+      background: #10263a;
+    }
+    #events {
+      display: grid;
+      gap: 8px;
+      max-height: 45vh;
+      overflow-y: auto;
+    }
+    .event {
+      display: grid;
+      gap: 6px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    .event-meta {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .event-kind {
+      color: var(--text);
+      font-weight: 750;
+      text-transform: capitalize;
+    }
+    .event-source {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+    }
+    .event-source.inferred_terminal {
+      color: #ffd166;
+      border-color: #8a6d22;
+    }
+    .event-body {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .event-body.formatted {
+      white-space: normal;
+      line-height: 1.5;
+    }
+    .event-body.formatted p,
+    .event-body.formatted ul,
+    .event-body.formatted ol,
+    .event-body.formatted pre {
+      margin: 0 0 0.75em;
+    }
+    .event-body.formatted > :last-child { margin-bottom: 0; }
+    .event-body.formatted ul,
+    .event-body.formatted ol { padding-left: 1.25em; }
+    .event-body.formatted code {
+      background: #071018;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 0 3px;
+    }
+    .event-body.formatted pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #071018;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    .event-body.empty { color: var(--muted); font-style: italic; }
+    .handoff-summary {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: grid;
+      gap: 8px;
+    }
+    .handoff-summary h2 { margin: 0; font-size: 14px; font-weight: 750; }
+    .handoff-lead { color: var(--text); }
+    .handoff-kv {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 6px 16px;
+    }
+    .handoff-kv div { display: flex; gap: 6px; font-size: 12px; min-width: 0; }
+    .handoff-kv .k { color: var(--muted); flex: none; }
+    .handoff-kv .v { color: var(--text); overflow-wrap: anywhere; }
+    .help { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .help strong { color: var(--text); }
+    details.transcript { margin-top: 4px; }
+    details.transcript > summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      list-style: none;
+      user-select: none;
+    }
+    details.transcript > summary::-webkit-details-marker { display: none; }
+    details.transcript > summary::before { content: "> "; }
+    details.transcript[open] > summary::before { content: "v "; }
+    details.transcript .event-body { margin-top: 6px; font-size: 12px; color: var(--muted); }
+    .continue-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+    .continue-grid .field { display: grid; gap: 4px; min-width: 0; }
+    .continue-grid .field > .muted { font-size: 12px; }
+    .continue-grid select { width: 100%; min-width: 0; }
+    .continue-grid .field.action { align-self: end; }
+    .continue-grid .field.action button { width: 100%; }
+    .hidden { display: none !important; }
+    .shortcut-grid {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(48px, 1fr));
+      gap: 7px;
+    }
+    .shortcut-grid button {
+      min-height: 42px;
+      padding: 8px 6px;
+      font-weight: 700;
+    }
+    @media (max-width: 760px) {
+      header { align-items: flex-start; flex-direction: column; }
+      main { min-height: calc(100vh - 96px); }
+      #events { max-height: 42vh; }
+      #terminal { min-height: 42vh; }
+      .toolbar button, .toolbar a.button { flex: 1; }
+      .shortcut-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .continue-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Harness Session</h1>
+      <div class="muted" id="statusline">Loading session...</div>
+    </div>
+    <div class="toolbar">
+      <a class="button" href="/ui/harness">Sessions</a>
+      <button id="connect" type="button">Connect</button>
+      <button id="interrupt" type="button">Ctrl-C</button>
+      <button id="detach" type="button">Detach</button>
+      <button id="terminate" type="button">Kill</button>
+    </div>
+  </header>
+  <main>
+    <section class="meta" id="meta"></section>
+    <section id="handoff-summary" class="handoff-summary hidden" aria-label="Handoff context"></section>
+    <section class="panel view-tabs" aria-label="Session view">
+      <button id="show-events" type="button" aria-pressed="true">Transcript</button>
+      <button id="show-terminal" type="button" aria-pressed="false">Raw terminal</button>
+    </section>
+    <section class="panel" id="continue">
+      <strong>Continue this session</strong>
+      <div class="continue-grid" style="margin-top:10px">
+        <label class="field">
+          <span class="muted">Host</span>
+          <select id="continue-host" aria-label="Continue on host"></select>
+        </label>
+        <label class="field">
+          <span class="muted">CLI / harness</span>
+          <select id="continue-harness" aria-label="Continue with harness"></select>
+        </label>
+        <label class="field">
+          <span class="muted">Resume mode</span>
+          <select id="continue-native" aria-label="Native resume session"></select>
+        </label>
+        <div class="field action">
+          <button id="continue-session" type="button">Continue in selected CLI</button>
+        </div>
+      </div>
+      <div class="help" style="margin-top:8px">
+        <strong>Drover handoff</strong> starts a fresh CLI and hands it a written summary of this
+        session's context, so you can pick up the work even on a different harness or host.
+        <strong>Native resume</strong> reopens the provider's own saved session, with full native
+        history, when one is found for this repo. If none is found, Drover handoff is used automatically.
+      </div>
+      <div class="muted" id="continue-status" style="margin-top:8px">Load a session to choose handoff targets.</div>
+    </section>
+    <section id="events" aria-live="polite"></section>
+    <section id="terminal" class="hidden"></section>
+    <section class="panel">
+      <textarea id="input" placeholder="Type input, then Send. Use newline for commands."></textarea>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="send" type="button">Send</button>
+        <button id="newline" type="button">Send newline</button>
+        <button id="paste" type="button">Paste</button>
+      </div>
+    </section>
+    <section class="panel shortcut-grid" aria-label="Terminal shortcuts">
+      <button type="button" data-shortcut="ctrl-c">Ctrl-C</button>
+      <button type="button" data-shortcut="ctrl-d">Ctrl-D</button>
+      <button type="button" data-shortcut="tab">Tab</button>
+      <button type="button" data-shortcut="esc">Esc</button>
+      <button type="button" data-shortcut="up">Up</button>
+      <button type="button" data-shortcut="down">Down</button>
+      <button type="button" data-shortcut="left">Left</button>
+      <button type="button" data-shortcut="right">Right</button>
+    </section>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+
+    function sanitizeTerminal(input) {
+      let text = String(input ?? "");
+      text = text
+        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+        .replace(/\x1b[@-Z\-_]/g, "")
+        .replace(/\x1b/g, "");
+      text = text
+        .replace(/\^\[\[[0-9;?]*[ -/]*[@-~]/g, "")
+        .replace(/\^\[/g, "");
+      text = text
+        .replace(/\[[0-9;?]*[ -/]*[A-Za-z]/g, "")
+        .replace(/(?:^|(?<=[^0-9]))\d{1,4};\d{1,4}[Hf]/g, "");
+      text = text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+      return text
+        .replace(/[^\S\n]{3,}/g, " ")
+        .split("\n").map((line) => line.replace(/[^\S\n]+$/g, "")).join("\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }
+
+    function parseHandoffMarker(input) {
+      const text = String(input ?? "");
+      const splitAt = text.search(/^\s*Recent transcript:\s*$/m);
+      const headerPart = splitAt >= 0 ? text.slice(0, splitAt) : text;
+      const transcriptPart = splitAt >= 0
+        ? text.slice(splitAt).replace(/^\s*Recent transcript:\s*\n?/, "")
+        : "";
+      const fields = [];
+      let intro = "";
+      for (const rawLine of headerPart.split("\n")) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const m = line.match(/^([A-Za-z][A-Za-z .\/]*?):\s*(.+)$/);
+        if (m) fields.push([m[1].trim(), m[2].trim()]);
+        else if (!intro) intro = line;
+      }
+      return {intro, fields, transcript: sanitizeTerminal(transcriptPart)};
+    }
+
+    const sessionId = decodeURIComponent(location.pathname.split("/").pop());
+    const params = new URLSearchParams(location.search);
+    const hostUrlParam = params.get("host_url") || "";
+    const shortcuts = {
+      "ctrl-c": "\u0003",
+      "ctrl-d": "\u0004",
+      "tab": "\t",
+      "esc": "\u001b",
+      "up": "\u001b[A",
+      "down": "\u001b[B",
+      "left": "\u001b[D",
+      "right": "\u001b[C",
+    };
+    let ws = null;
+    let attachUrl = "";
+    let hostHttpUrl = "";
+    let sessionData = null;
+    let harnessState = {hosts: []};
+    let nativeCandidates = [];
+    let nativeTranscript = null;
+    let normalizedEvents = [];
+    let term = null;
+    let fitAddon = null;
+    let terminalInitAttempted = false;
+    let nativeRefreshTimer = null;
+    let reconnectTimer = null;
+    let reconnectAttempts = 0;
+    let manualDetach = false;
+
+    function terminalSize() {
+      return {rows: term?.rows || 32, cols: term?.cols || 100};
+    }
+
+    function terminalUnavailableMessage() {
+      $("terminal").textContent = [
+        "Raw terminal UI did not load.",
+        "Session summary, events, and continue controls are still available.",
+        "Try reloading if you need an interactive shell.",
+      ].join("\n");
+    }
+
+    function ensureTerminal() {
+      if (term) return true;
+      if (!window.Terminal || !window.FitAddon?.FitAddon) {
+        if (!terminalInitAttempted) terminalUnavailableMessage();
+        terminalInitAttempted = true;
+        return false;
+      }
+      terminalInitAttempted = true;
+      term = new Terminal({
+        cursorBlink: true,
+        convertEol: true,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        fontSize: 13,
+        scrollback: 1000,
+        theme: {
+          background: "#05080c",
+          foreground: "#dbe7f3",
+          cursor: "#6cb6ff",
+          selectionBackground: "#27415f",
+        },
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open($("terminal"));
+      term.onData((data) => sendNow({type: "input", data}));
+      term.onResize(({cols, rows}) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({type: "resize", rows, cols}));
+        }
+      });
+      return true;
+    }
+
+    function fitTerminal() {
+      if (!ensureTerminal()) return;
+      try { fitAddon.fit(); } catch (err) {}
+    }
+
+    function append(text, cls = "") {
+      if (!ensureTerminal()) {
+        const current = $("terminal").textContent || "";
+        $("terminal").textContent = `${current}\n${text}`.trim();
+        return;
+      }
+      if (cls === "bad") {
+        term.write(`\r\n\x1b[31m${text}\x1b[0m`);
+        return;
+      }
+      term.write(text);
+    }
+
+    function bodySource(event) {
+      const payloadText = event?.payload && typeof event.payload.text === "string"
+        ? event.payload.text
+        : "";
+      return payloadText || event.content_preview || event.event_type || "";
+    }
+
+    function renderInlineMarkdown(text) {
+      return esc(text)
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    }
+
+    function renderFormattedBody(text) {
+      const cleaned = String(text || "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      if (!cleaned) return '<div class="event-body empty">terminal repaint with no readable text</div>';
+      const blocks = cleaned.split(/\n{2,}/);
+      const html = blocks.map((block) => {
+        const lines = block.split("\n").filter((line) => line.trim());
+        if (!lines.length) return "";
+        if (lines.every((line) => /^[-*]\s+/.test(line.trim()))) {
+          return `<ul>${lines.map((line) => `<li>${renderInlineMarkdown(line.trim().replace(/^[-*]\s+/, ""))}</li>`).join("")}</ul>`;
+        }
+        if (lines.every((line) => /^[0-9]+[.)]\s+/.test(line.trim()))) {
+          return `<ol>${lines.map((line) => `<li>${renderInlineMarkdown(line.trim().replace(/^[0-9]+[.)]\s+/, ""))}</li>`).join("")}</ol>`;
+        }
+        if (lines.length === 1 && /^#{1,4}\s+/.test(lines[0].trim())) {
+          return `<p><strong>${renderInlineMarkdown(lines[0].trim().replace(/^#{1,4}\s+/, ""))}</strong></p>`;
+        }
+        if (block.startsWith("```") && block.endsWith("```")) {
+          return `<pre><code>${esc(block.replace(/^```[^\n]*\n?/, "").replace(/\n?```$/, ""))}</code></pre>`;
+        }
+        return `<p>${lines.map((line) => renderInlineMarkdown(line.trim())).join("<br>")}</p>`;
+      }).filter(Boolean).join("");
+      return `<div class="event-body formatted">${html}</div>`;
+    }
+
+    function displayEvent(event) {
+        const kind = event.normalized_type || event.event_type || "status";
+        const source = event.normalized_source || "structured";
+        const inferred = source === "inferred_terminal"
+          ? "Inferred from terminal text"
+          : source === "nexus_control"
+            ? "Drover control event"
+            : "Structured provider/Drover event";
+        const rawBody = bodySource(event);
+        let body = rawBody;
+        let transcript = "";
+        if (source === "inferred_terminal") {
+          body = sanitizeTerminal(rawBody);
+        }
+        if (kind === "handoff_marker" || rawBody.includes("Recent transcript:")) {
+          const parsed = parseHandoffMarker(rawBody);
+          body = [
+            parsed.intro,
+            ...parsed.fields.map(([key, value]) => `${key}: ${value}`),
+          ].filter(Boolean).join("\n");
+          transcript = parsed.transcript;
+        }
+        const cleanBody = body.trim();
+        const placeholderOnly = source === "inferred_terminal"
+          && ["terminal.output", "terminal.input"].includes(cleanBody);
+        if (placeholderOnly) return null;
+        const terminalDerivedNoise = source === "inferred_terminal" && kind !== "handoff_marker";
+        if (terminalDerivedNoise) return null;
+        return {
+          kind,
+          source,
+          inferred,
+          body: cleanBody,
+          transcript,
+          created_at: event.created_at || "",
+          streamGroup: source === "structured" && kind === "assistant_output"
+            ? "assistant_structured"
+            : "",
+        };
+    }
+
+    function groupDisplayEvents(events) {
+      const grouped = [];
+      for (const event of events) {
+        const item = displayEvent(event);
+        if (!item) continue;
+        const last = grouped[grouped.length - 1];
+        if (item.streamGroup && last?.streamGroup === item.streamGroup) {
+          last.body = [last.body, item.body].filter(Boolean).join("\n");
+          last.created_at = item.created_at || last.created_at;
+          if (item.transcript) last.transcript = [last.transcript, item.transcript].filter(Boolean).join("\n");
+          continue;
+        }
+        grouped.push(item);
+      }
+      return grouped;
+    }
+
+    function renderEvents() {
+      const nativeMessages = (nativeTranscript?.messages || []).filter((message) => message?.text);
+      if (nativeMessages.length) {
+        $("events").innerHTML = [
+          `<div class="panel event-note"><strong>Native transcript</strong><p class="muted">${esc(nativeTranscript.source || "provider transcript")} · ${esc(nativeTranscript.native_session_id || nativeTranscript.session_id || "latest")}</p></div>`,
+          ...nativeMessages.map((message) => {
+            const role = message.role || "message";
+            const title = message.title || role.replaceAll("_", " ");
+            return `<article class="event native-message ${esc(role)}">
+              <div class="event-meta">
+                <span class="event-kind">${esc(title)}</span>
+                <span class="event-source structured" title="Provider-native transcript">Native</span>
+                <span>${esc(message.created_at || "")}</span>
+              </div>
+              ${renderFormattedBody(message.text || "")}
+            </article>`;
+          }),
+        ].join("");
+        $("events").scrollTop = $("events").scrollHeight;
+        return;
+      }
+      const items = groupDisplayEvents(normalizedEvents.slice(-120));
+      if (!items.length) {
+        $("events").innerHTML = [
+          '<div class="panel event-note">',
+          '<strong>Native transcript not available yet.</strong>',
+          '<p class="muted">This session only has terminal-derived output, so Summary hides repaint/spinner noise. Use Raw terminal for the live CLI until provider-native messages are attached.</p>',
+          '</div>',
+        ].join("");
+        return;
+      }
+      $("events").innerHTML = items.map((event) => {
+        const empty = !event.body.trim();
+        return `<article class="event">
+          <div class="event-meta">
+            <span class="event-kind">${esc(event.kind.replaceAll("_", " "))}</span>
+            <span class="event-source ${esc(event.source)}" title="${esc(event.inferred)}">${esc(event.inferred)}</span>
+            <span>${esc(event.created_at)}</span>
+          </div>
+          ${empty ? '<div class="event-body empty">terminal repaint with no readable text</div>' : renderFormattedBody(event.body)}
+          ${event.transcript ? `<details class="transcript"><summary>Show recovered terminal transcript</summary>${renderFormattedBody(event.transcript)}</details>` : ""}
+        </article>`;
+      }).join("");
+      $("events").scrollTop = $("events").scrollHeight;
+    }
+
+    async function refreshNativeTranscript() {
+      try {
+        const res = await fetch(`/harness/sessions/${encodeURIComponent(sessionId)}/native-transcript`, {cache: "no-store"});
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `native transcript failed: ${res.status}`);
+        nativeTranscript = payload;
+        renderEvents();
+      } catch (err) {
+        if (!nativeTranscript) nativeTranscript = null;
+      }
+    }
+
+    function scheduleNativeTranscriptRefresh() {
+      if (document.hidden) return;
+      if (nativeRefreshTimer) return;
+      nativeRefreshTimer = setTimeout(() => {
+        nativeRefreshTimer = null;
+        refreshNativeTranscript();
+      }, 4000);
+    }
+
+    function renderHandoffSummary() {
+      const session = sessionData?.session || {};
+      const marker = normalizedEvents.find((event) =>
+        (event.normalized_type || event.event_type) === "handoff_marker"
+      );
+      if (!session.source_session_id && !marker) {
+        $("handoff-summary").classList.add("hidden");
+        $("handoff-summary").innerHTML = "";
+        return;
+      }
+      const parsed = marker ? parseHandoffMarker(marker.content_preview || "") : {intro: "", fields: []};
+      const fieldMap = new Map(parsed.fields || []);
+      const rows = [
+        ["Mode", session.handoff_mode || fieldMap.get("Mode") || "nexus_handoff"],
+        ["Current harness", session.harness || ""],
+        ["Host", session.host_id || ""],
+        ["Working directory", session.cwd || fieldMap.get("Working directory") || ""],
+        ["Source session", session.source_session_id || fieldMap.get("Source session") || ""],
+      ].filter(([, value]) => value);
+      $("handoff-summary").innerHTML = `
+        <h2>Handoff context</h2>
+        <div class="handoff-lead">${esc(parsed.intro || "This session is continuing prior work.")}</div>
+        <div class="handoff-kv">${rows.map(([key, value]) =>
+          `<div><span class="k">${esc(key)}:</span><span class="v">${esc(value)}</span></div>`
+        ).join("")}</div>`;
+      $("handoff-summary").classList.remove("hidden");
+    }
+
+    function addEvent(event) {
+      if (!event || !event.event_id) return;
+      if (normalizedEvents.some((item) => item.event_id === event.event_id)) return;
+      normalizedEvents.push(event);
+      renderEvents();
+    }
+
+    function setView(mode) {
+      const raw = mode === "terminal";
+      $("terminal").classList.toggle("hidden", !raw);
+      $("events").classList.toggle("hidden", raw);
+      $("show-events").setAttribute("aria-pressed", raw ? "false" : "true");
+      $("show-terminal").setAttribute("aria-pressed", raw ? "true" : "false");
+      if (raw) {
+        fitTerminal();
+        if (term) term.focus();
+      }
+    }
+
+    function writeStatus(text) {
+      if (!ensureTerminal()) {
+        append(text);
+        return;
+      }
+      term.write(`\r\n${text}\r\n`);
+    }
+
+    function endpoint(host) {
+      return host?.tailscale_url || host?.local_url || "";
+    }
+
+    function toWsUrl(base, id) {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      return `${protocol}//${location.host}/harness/sessions/${encodeURIComponent(id)}/terminal`;
+    }
+
+    function enabledHarnesses(host) {
+      return (((host.capabilities || {}).harnesses) || []).filter((item) => item.enabled);
+    }
+
+    function renderContinueControls() {
+      const hosts = harnessState.hosts || [];
+      $("continue-host").innerHTML = hosts.map((host) => (
+        `<option value="${esc(host.host_id)}">${esc(host.display_name || host.host_id)}</option>`
+      )).join("");
+      if (sessionData?.session?.host_id) $("continue-host").value = sessionData.session.host_id;
+      updateContinueHarnessOptions();
+    }
+
+    async function updateContinueHarnessOptions() {
+      const hosts = harnessState.hosts || [];
+      const host = hosts.find((item) => item.host_id === $("continue-host").value) || hosts[0];
+      const harnesses = enabledHarnesses(host || {});
+      $("continue-harness").innerHTML = harnesses.map((item) => (
+        `<option value="${esc(item.name)}">${esc(item.name)}</option>`
+      )).join("");
+      if (sessionData?.session?.harness && harnesses.some((item) => item.name === sessionData.session.harness)) {
+        $("continue-harness").value = sessionData.session.harness;
+      }
+      $("continue-session").disabled = !host || !harnesses.length;
+      $("continue-status").textContent = host && harnesses.length
+        ? "Loading native resume candidates..."
+        : "No enabled harnesses are available on this host.";
+      await loadNativeCandidates();
+    }
+
+    async function loadNativeCandidates() {
+      const hostId = $("continue-host").value;
+      const harness = $("continue-harness").value;
+      nativeCandidates = [];
+      $("continue-native").innerHTML = '<option value="">Drover handoff only</option>';
+      if (!hostId || !harness) return;
+      const cwd = sessionData?.session?.cwd || "";
+      const query = new URLSearchParams({harness, limit: "12"});
+      if (cwd) query.set("cwd", cwd);
+      try {
+        const res = await fetch(`/harness/hosts/${encodeURIComponent(hostId)}/native-sessions?${query}`, {cache: "no-store"});
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `native sessions failed: ${res.status}`);
+        nativeCandidates = payload.sessions || [];
+        $("continue-native").innerHTML = [
+          '<option value="">Drover handoff only</option>',
+          ...nativeCandidates.map((item, index) => (
+            `<option value="${index}">Native: ${esc(item.label || item.session_id)}${item.cwd ? ` · ${esc(item.cwd)}` : ""}</option>`
+          )),
+        ].join("");
+        $("continue-status").textContent = nativeCandidates.length
+          ? `${nativeCandidates.length} native resume candidate(s) found.`
+          : "No native resume candidates found for this target; Drover handoff will be used.";
+      } catch (err) {
+        $("continue-status").textContent = `Native resume lookup failed: ${err}. Drover handoff still works.`;
+      }
+    }
+
+    function selectedNativeResume() {
+      const value = $("continue-native").value;
+      if (value === "") return null;
+      const candidate = nativeCandidates[Number(value)];
+      return candidate?.native_resume || null;
+    }
+
+    async function load() {
+      const [sessionRes, harnessRes] = await Promise.all([
+        fetch(`/harness/sessions/${encodeURIComponent(sessionId)}`, {cache: "no-store"}),
+        fetch("/harness", {cache: "no-store"}),
+      ]);
+      const data = await sessionRes.json();
+      if (data.error) throw new Error(data.error);
+      sessionData = data;
+      harnessState = await harnessRes.json();
+      nativeTranscript = data.native_transcript || null;
+      normalizedEvents = data.events || [];
+      const session = data.session || {};
+      const host = data.host || {};
+      const url = endpoint(host) || hostUrlParam;
+      const attachable = ["created", "starting", "running"].includes(session.status);
+      hostHttpUrl = url || "";
+      attachUrl = url && attachable ? toWsUrl(url, session.session_id) : "";
+      $("statusline").textContent = `${session.harness || "session"} on ${host.display_name || session.host_id || "host"}`;
+      $("meta").innerHTML = [
+        ["Session", session.session_id],
+        ["Status", session.status],
+        ["Host", `${host.display_name || host.host_id || ""} (${host.kind || "host"})`],
+        ["Handoff", session.handoff_mode || "original"],
+        ["Source", session.source_session_id || "none"],
+        ["Attach", attachUrl || (attachable ? "No host URL registered" : "Session is no longer running")],
+      ].map(([label, value]) => `<div class="panel"><div class="muted">${esc(label)}</div><code>${esc(value)}</code></div>`).join("");
+      renderContinueControls();
+      renderHandoffSummary();
+      renderEvents();
+      (data.transcript_chunks || []).forEach((chunk) => append(chunk.content_redacted || ""));
+    }
+
+    async function continueSession() {
+      const targetHost = $("continue-host").value;
+      const targetHarness = $("continue-harness").value;
+      if (!targetHost || !targetHarness) return;
+      $("continue-status").textContent = `Continuing in ${targetHarness} on ${targetHost}...`;
+      try {
+        const nativeResume = selectedNativeResume();
+        const size = terminalSize();
+        const body = {
+          target_host_id: targetHost,
+          target_harness: targetHarness,
+          rows: size.rows,
+          cols: size.cols,
+        };
+        if (nativeResume) body.native_resume = nativeResume;
+        const res = await fetch(`/harness/sessions/${encodeURIComponent(sessionId)}/continue`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body),
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `continue failed: ${res.status}`);
+        location.href = `/ui/harness/sessions/${encodeURIComponent(payload.session_id)}`;
+      } catch (err) {
+        $("continue-status").textContent = `Continue failed: ${err}`;
+      }
+    }
+
+    function connect() {
+      if (!attachUrl) {
+        append("No active terminal is available for this session.", "bad");
+        return;
+      }
+      if (!ensureTerminal()) {
+        $("statusline").textContent = "Raw terminal unavailable";
+        return;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      if (ws && ws.readyState === WebSocket.CONNECTING) return;
+      manualDetach = false;
+      fitTerminal();
+      ws = new WebSocket(attachUrl);
+      ws.onopen = () => {
+        reconnectAttempts = 0;
+        $("statusline").textContent = "Connected";
+        fitTerminal();
+        const size = terminalSize();
+        ws.send(JSON.stringify({type: "resize", rows: size.rows, cols: size.cols}));
+        term.focus();
+      };
+      ws.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === "output") {
+          term.write(message.data || "");
+          scheduleNativeTranscriptRefresh();
+        }
+        if (message.type === "event") addEvent(message.event);
+        if (message.type === "attached") $("statusline").textContent = "Attached";
+        if (message.type === "exit") writeStatus("[process exited]");
+        if (message.type === "error") append(`[error] ${message.error}`, "bad");
+      };
+      ws.onclose = () => {
+        $("statusline").textContent = "Detached";
+        scheduleReconnect();
+      };
+      ws.onerror = () => {
+        $("statusline").textContent = "WebSocket interrupted";
+      };
+    }
+
+    function scheduleReconnect() {
+      if (manualDetach || !attachUrl || document.hidden) return;
+      if (reconnectTimer) return;
+      const delay = Math.min(5000, 500 * Math.max(1, reconnectAttempts + 1));
+      reconnectAttempts += 1;
+      $("statusline").textContent = `Reconnecting in ${Math.round(delay / 1000)}s...`;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    }
+
+    function sendNow(payload) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+      }
+    }
+
+    function send(payload) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+        return;
+      }
+      connect();
+      setTimeout(() => sendNow(payload), 80);
+    }
+
+    function submitSuffix() {
+      return sessionData?.session?.harness === "codex" ? "\n" : "\r";
+    }
+
+    async function terminateSession() {
+      if (!hostHttpUrl) {
+        append("No host URL registered for this session.", "bad");
+        return;
+      }
+      try {
+        manualDetach = true;
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        const res = await fetch(`/harness/sessions/${encodeURIComponent(sessionId)}/terminate`, {
+          method: "POST",
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `kill failed: ${res.status}`);
+        $("statusline").textContent = "Terminated";
+        writeStatus("[process terminated]");
+      } catch (err) {
+        append(`[kill failed] ${err}`, "bad");
+      }
+    }
+
+    window.addEventListener("resize", () => fitTerminal());
+    window.addEventListener("focus", () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+      scheduleNativeTranscriptRefresh();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        connect();
+        scheduleNativeTranscriptRefresh();
+      }
+    });
+    $("terminal").addEventListener("click", () => {
+      if (ensureTerminal()) term.focus();
+    });
+
+    $("connect").addEventListener("click", connect);
+    $("show-events").addEventListener("click", () => setView("events"));
+    $("show-terminal").addEventListener("click", () => setView("terminal"));
+    $("continue-host").addEventListener("change", updateContinueHarnessOptions);
+    $("continue-harness").addEventListener("change", loadNativeCandidates);
+    $("continue-session").addEventListener("click", continueSession);
+    $("interrupt").addEventListener("click", () => send({type: "interrupt"}));
+    $("detach").addEventListener("click", () => {
+      manualDetach = true;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type: "detach"}));
+    });
+    $("terminate").addEventListener("click", terminateSession);
+    $("send").addEventListener("click", () => {
+      let data = $("input").value;
+      const suffix = submitSuffix();
+      data = data.replace(/\r?\n/g, "\r");
+      if (data && !data.endsWith(suffix)) data += suffix;
+      send({type: "input", data});
+      $("input").value = "";
+    });
+    $("newline").addEventListener("click", () => send({type: "input", data: "\r"}));
+    $("paste").addEventListener("click", async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) $("input").value += text;
+      } catch (err) {
+        append("[paste requires browser clipboard permission]", "bad");
+      }
+    });
+    $("input").addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        $("send").click();
+      }
+    });
+    document.querySelector(".shortcut-grid").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-shortcut]");
+      if (button) send({type: "input", data: shortcuts[button.dataset.shortcut] || ""});
+    });
+
+    load().catch((err) => {
+      if (hostUrlParam) {
+        hostHttpUrl = hostUrlParam;
+        attachUrl = toWsUrl(hostUrlParam, sessionId);
+        $("statusline").textContent = "Loaded direct host attach fallback";
+        $("meta").innerHTML = [
+          ["Session", sessionId],
+          ["Status", "unknown"],
+          ["Host", "direct URL fallback"],
+          ["Attach", attachUrl],
+        ].map(([label, value]) => `<div class="panel"><div class="muted">${esc(label)}</div><code>${esc(value)}</code></div>`).join("");
+        return;
+      }
+      $("statusline").textContent = "Failed to load session";
+      append(`Failed to load session: ${err}\n`, "bad");
+    });
+  </script>
+</body>
+</html>

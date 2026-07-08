@@ -1,0 +1,9 @@
+[Unit]
+Description=Nexus tempo-relay — pull AgentWeave spans into the lakehouse
+
+[Service]
+Type=oneshot
+WorkingDirectory=@@REPO_DIR@@
+ExecStart=@@HOME@@/.local/bin/uv run --quiet nexus-collect tempo-relay
+StandardOutput=append:/tmp/nexus-tempo-relay.log
+StandardError=append:/tmp/nexus-tempo-relay.log

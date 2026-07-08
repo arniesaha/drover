@@ -1,0 +1,51 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# OS
+.DS_Store
+
+# GCP Key
+gcp-key.json
+
+# Local lakehouse data (too large for git)
+local_backup/
+parquet/
+*.duckdb
+*.duckdb-wal
+*.duckdb-shm
+
+# Drover runtime state (per-host home dir, not in repo; .nexus is legacy)
+.drover/
+.nexus/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+
+# Local git worktrees
+.worktrees/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+.codex
