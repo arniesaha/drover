@@ -213,7 +213,24 @@ Cutover:
 5. Only then `launchctl bootout` the `com.nexus.*` units and stop the orphan
    Nexus harnessd. Keep the plists (`.bak`) for rollback.
 
-### 5b. NAS (192.168.1.70, NixOS — a harnessd host)
+### 5b. NAS (192.168.1.70 — a harnessd host)
+
+> **STATUS: executed 2026-07-07/08.** Repo shipped to
+> `/home/Arnab/dev/drover-harness-prod` via base64-tar-over-stdin (the ssh
+> exec-arg path is truly dead on this box — data must ride inside the stdin
+> script); venv built with `uv venv --python /usr/bin/python3` (system
+> python 3.11.2, no ensurepip — plain `python3 -m venv` fails).
+> `~/.drover` is a real dir (migrated 22 tables / 2,653 rows verified;
+> `nexus.duckdb → drover.duckdb`); old `~/.nexus` dir renamed
+> `~/.nexus.pre-drover-20260707` (rollback) and replaced with a symlink to
+> `~/.drover`. Units `drover-nas-harnessd.service`, `drover-collect.timer`,
+> `drover-tempo-relay.timer` enabled+running from the new checkout; old
+> `nexus-*` units stopped and disabled (files kept). Verified: healthz +
+> 401/200 from the Mac, host online in central, collect shipped and the Mac
+> ingested it, and central created a live PTY session on the NAS through
+> the advertised **Tailscale URL** — which launchd pythons CAN reach
+> (Tailscale utun is not gated by Local Network privacy), so the
+> central→NAS action gap closed with no extra tunnel.
 
 Runs today (systemd **user** units; see the NAS-ops runbook — ssh exec is
 broken, pipe scripts via stdin to `/bin/sh`):
