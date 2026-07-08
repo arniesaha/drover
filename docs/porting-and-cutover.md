@@ -171,6 +171,20 @@ DuckDB.
 
 ### 5a. Mac Mini (this machine — central + a harnessd host)
 
+> **STATUS: executed 2026-07-07.** Data migrated to
+> `/Volumes/M2 1/drover-data` (22 tables / 310,408 rows verified identical);
+> `~/.drover` and `~/.nexus` both symlink there; all seven `com.drover.*`
+> units live (server, redis, harnessd — now a real plist, collect,
+> ollama-tunnel, mac-ollama-embeddings, mac-ollama-idle-reaper); old
+> `com.nexus.*`/`com.arnab.nexus-collect` plists renamed
+> `*.bak-cutover-20260707` and booted out. Verified: healthz, 401/200 auth
+> gate, UI redirect, both hosts online (NAS re-registered with same token),
+> MCP drover_*+nexus_* dispatch, workers started, two-turn structured session
+> lifecycle (turn→stream→complete). Outstanding: Local Network grant for the
+> Drover python (see §6) before claude sessions can reach the AgentWeave
+> proxy. `/Volumes/M2 1/nexus` untouched — rollback = flip symlinks back +
+> restore .bak plists.
+
 Runs today (launchd + one orphan process):
 - `com.nexus.server` (central: metrics 7080, MCP 7077, OTLP 4317)
 - `com.nexus.redis`, `com.arnab.nexus-collect`,
@@ -261,6 +275,25 @@ cutover must preserve them:
   at boot, services crash-loop until it mounts. `com.arnab.mount-m2` handles
   this on the Mac — ensure the Drover plists don't race it (add a mount check
   or launchd dependency).
+- **launchd cannot exec from the M2 volume (learned during the 2026-07-07 Mac
+  cutover):** macOS TCC denies `launchd` agents executing binaries/scripts on
+  `/Volumes/M2 1` ("Operation not permitted"). Reads/writes of data there are
+  fine. Hence the split: repo on `/Volumes/M2 1/drover`, but the **runtime
+  venv lives at `~/.drover-venv`** (editable install of the repo) and the
+  reaper script is copied to `~/.local/bin/`. All `com.drover.*` plists exec
+  from home paths only.
+- **macOS Local Network privacy denies LAN egress to launchd pythons (learned
+  2026-07-07):** any launchd-spawned python (old Nexus venv AND new Drover
+  venv — verified both) gets `EHOSTUNREACH` connecting to LAN IPs like the
+  NAS (`192.168.1.70`); localhost and internet egress are unaffected. This is
+  why the old Mac harnessd "worked" as a terminal-launched orphan: it
+  inherited the terminal's Local Network grant, so its claude children could
+  reach the AgentWeave proxy (`ANTHROPIC_BASE_URL=http://192.168.1.70:30400`
+  in `~/.claude/settings.json`). Under the new `com.drover.harnessd` plist,
+  claude sessions fail with `FailedToOpenSocket` until the Drover python is
+  granted **System Settings → Privacy & Security → Local Network** (or the
+  AgentWeave proxy env is removed/relocated). Central→NAS session-action
+  proxying is subject to the same gate — on the OLD fleet too (latent).
 
 ## 7. Suggested cutover sequence (one line each)
 
