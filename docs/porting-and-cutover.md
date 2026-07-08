@@ -290,10 +290,18 @@ cutover must preserve them:
   inherited the terminal's Local Network grant, so its claude children could
   reach the AgentWeave proxy (`ANTHROPIC_BASE_URL=http://192.168.1.70:30400`
   in `~/.claude/settings.json`). Under the new `com.drover.harnessd` plist,
-  claude sessions fail with `FailedToOpenSocket` until the Drover python is
-  granted **System Settings → Privacy & Security → Local Network** (or the
-  AgentWeave proxy env is removed/relocated). Central→NAS session-action
-  proxying is subject to the same gate — on the OLD fleet too (latent).
+  claude sessions failed with `FailedToOpenSocket`. The System Settings →
+  Local Network toggle for a bare `python3` binary does NOT stick (known
+  macOS behavior for non-bundled executables) — do not waste time on it.
+  **Resolution (2026-07-07):** Apple-signed `/usr/bin/ssh` is exempt from
+  the gate, so `com.drover.agentweave-tunnel` forwards `127.0.0.1:30400 →
+  192.168.1.70:30400` and `~/.claude/settings.json` now points
+  `ANTHROPIC_BASE_URL`/`AGENTWEAVE_PROXY_URL` at `http://127.0.0.1:30400`
+  (localhost is exempt). Verified end-to-end: structured claude session
+  through central returned a model reply, and the interrupt action proxied
+  correctly. Central→NAS session-action proxying remains gated (latent on
+  the OLD fleet too) — address during the NAS cutover (advertise a
+  tunneled/tailscale URL, or the same ssh-forward trick for :7081).
 
 ## 7. Suggested cutover sequence (one line each)
 
