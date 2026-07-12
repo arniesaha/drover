@@ -132,6 +132,33 @@ struct ClientTests {
     try await client().terminate(sessionID: "s1")
 }
 
+@Test func continueSessionPostsTargetsAndReturnsNewID() async throws {
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        #expect(request.url?.path == "/harness/sessions/s1/continue")
+        #expect(request.httpMethod == "POST")
+        #expect(body["target_host_id"] as? String == "nas")
+        #expect(body["target_harness"] as? String == "codex")
+        return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
+    }
+    let id = try await client().continueSession(sessionID: "s1",
+                                                targetHostID: "nas",
+                                                targetHarness: "codex")
+    #expect(id == "harness-continued")
+}
+
+@Test func continueSessionDefaultsToEmptyBody() async throws {
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        #expect(body.isEmpty)
+        return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
+    }
+    let id = try await client().continueSession(sessionID: "s1")
+    #expect(id == "harness-continued")
+}
+
 @Test func healthzSendsNoAuthHeaderAndReturnsTrue() async throws {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/healthz")

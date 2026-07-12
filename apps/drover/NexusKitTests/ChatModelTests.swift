@@ -45,6 +45,27 @@ struct ChatModelTests {
     #expect(model.composerText == "next thing")   // preserved for retry
 }
 
+@Test @MainActor func handOffReturnsNewSessionID() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness/sessions/s1/continue")
+        return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    let newID = await model.handOff()
+    #expect(newID == "harness-continued")
+    #expect(model.hint == nil)
+}
+
+@Test @MainActor func handOffFailureBecomesHint() async throws {
+    MockURLProtocol.handler = { _ in
+        (409, Data(#"{"error": "host offline"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    let newID = await model.handOff()
+    #expect(newID == nil)
+    #expect(model.hint == "host offline")
+}
+
 @Test @MainActor func sentTurnClearsComposer() async throws {
     MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "t9"}"#.utf8)) }
     let model = ChatModel(client: client(), sessionID: "s1")

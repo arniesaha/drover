@@ -7,10 +7,13 @@ import NexusKit
 /// composer. Interrupt/terminate live in the toolbar. All state and network
 /// calls are delegated to `ChatModel` — this view only renders it.
 struct ChatView: View {
+    private let client: NexusClient
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
+    @State private var handoffSession: HandoffSession?
 
     init(client: NexusClient, sessionID: String) {
+        self.client = client
         _model = State(initialValue: ChatModel(client: client, sessionID: sessionID))
     }
 
@@ -58,6 +61,12 @@ struct ChatView: View {
         }
         .task { model.start() }
         .onDisappear { model.stop() }
+        // A handoff (`/continue`) always creates a PTY session seeded with the
+        // summarized context, not a structured one — so it opens in the
+        // terminal, where the harness CLI (and the typed-in context) is shown.
+        .navigationDestination(item: $handoffSession) { handoff in
+            TerminalScreen(client: client, sessionID: handoff.id)
+        }
     }
 
     private var transcript: some View {
@@ -101,6 +110,15 @@ struct ChatView: View {
                 } label: {
                     Label("Interrupt", systemImage: "stop.circle")
                 }
+                Button {
+                    Task {
+                        if let newSessionID = await model.handOff() {
+                            handoffSession = HandoffSession(id: newSessionID)
+                        }
+                    }
+                } label: {
+                    Label("Hand off to a terminal", systemImage: "arrow.triangle.branch")
+                }
                 Button(role: .destructive) {
                     showTerminateConfirm = true
                 } label: {
@@ -109,6 +127,14 @@ struct ChatView: View {
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
+            .accessibilityLabel("Session actions")
+            .accessibilityIdentifier("chat-menu")
         }
     }
+}
+
+/// Identifiable wrapper for `.navigationDestination(item:)` — the PTY session
+/// a "Hand off to a terminal" action created.
+private struct HandoffSession: Identifiable, Hashable {
+    let id: String
 }

@@ -182,6 +182,20 @@ public final class ChatModel {
         }
     }
 
+    /// Hands this session off to a fresh one seeded with the server-built
+    /// handoff context. Returns the new session's id, or nil on failure
+    /// (with the server's explanation surfaced as a hint).
+    public func handOff() async -> String? {
+        do {
+            let newSessionID = try await client.continueSession(sessionID: sessionID)
+            hint = nil
+            return newSessionID
+        } catch {
+            applyHint(for: error, action: "hand off")
+            return nil
+        }
+    }
+
     public func interrupt() async {
         do {
             try await client.interrupt(sessionID: sessionID)

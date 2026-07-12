@@ -29,6 +29,11 @@ struct SettingsView: View {
                 SecureField("API token", text: $token)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    // A shared cluster bearer token is not a website password;
+                    // .oneTimeCode keeps iOS from offering to "Save Password"
+                    // (and from autofilling unrelated Keychain entries) every
+                    // time the user reconfigures.
+                    .textContentType(.oneTimeCode)
                 if environment.hasTokenConfigured {
                     Text("Token configured ✓")
                         .font(.caption)

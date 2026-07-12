@@ -58,8 +58,17 @@ struct SessionRow: View {
         }
     }
 
+    /// Row title: the cwd's last path component when we have one, else a
+    /// human harness label instead of the raw `harness-<uuid>` session id
+    /// (which is unreadable and identical-looking across shell sessions).
     private var cwdLastComponent: String {
-        guard let cwd = session.cwd, !cwd.isEmpty else { return session.id }
-        return URL(fileURLWithPath: cwd).lastPathComponent
+        if let cwd = session.cwd, !cwd.isEmpty {
+            return URL(fileURLWithPath: cwd).lastPathComponent
+        }
+        switch session.harness {
+        case "shell": return "Shell session"
+        case "": return "Session"
+        default: return "\(session.harness) session"
+        }
     }
 }

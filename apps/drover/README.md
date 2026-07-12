@@ -89,7 +89,7 @@ Release (`#if DEBUG` / `#else return nil #endif`), so it can never affect a
 device-installed Release build:
 
 - `DROVER_BASE_URL` — e.g. `http://192.168.1.149:7080`
-- `DROVER_TOKEN` — the bearer token, e.g. `$(cat ~/.nexus/api_token)`
+- `DROVER_TOKEN` — the bearer token, e.g. `$(cat ~/.drover/api_token)`
 
 `xcrun simctl launch` has no `--setenv` flag. To inject environment
 variables into a simulator-launched app you must prefix them with
@@ -97,7 +97,7 @@ variables into a simulator-launched app you must prefix them with
 
 ```bash
 SIMCTL_CHILD_DROVER_BASE_URL="http://192.168.1.149:7080" \
-SIMCTL_CHILD_DROVER_TOKEN="$(cat ~/.nexus/api_token)" \
+SIMCTL_CHILD_DROVER_TOKEN="$(cat ~/.drover/api_token)" \
 xcrun simctl launch --terminate-running-process booted com.arnab.drover
 ```
 
@@ -110,7 +110,7 @@ launching the app themselves (`app.launch()`).
 
 Never commit a real token, and never pass it via `-setenv`-style flags that
 end up in shell history you might paste elsewhere — prefer `$(cat
-~/.nexus/api_token)` inline as shown above.
+~/.drover/api_token)` inline as shown above.
 
 ## Install on a physical device
 
@@ -136,7 +136,7 @@ In the app's Settings screen:
 
 1. Server URL — your Mac's Tailscale IP and port, e.g. `100.x.y.z:7080`
    (see Tailscale note below), or a plain LAN IP/port for same-network use.
-2. Token — paste the contents of `~/.nexus/api_token` from the machine
+2. Token — paste the contents of `~/.drover/api_token` from the machine
    running `nexus-server`.
 3. Tap "Test & Save". Allow notifications when prompted (needed for
    background "needs you" alerts).

@@ -18,6 +18,8 @@ struct Composer: View {
                     .font(.title)
             }
             .disabled(isEmpty)
+            .accessibilityLabel("Send")
+            .accessibilityIdentifier("composer-send")
         }
         .padding(.horizontal)
         .padding(.vertical, 8)

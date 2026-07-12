@@ -68,6 +68,23 @@ public actor NexusClient {
         _ = try await request(path: path, method: "POST", body: body)
     }
 
+    /// Continues a session as a fresh one seeded with a server-built handoff
+    /// prompt (the central's `nexus_handoff` mode): the server summarizes the
+    /// source transcript into the new session's initial input. Optionally
+    /// retargets a different host and/or harness; both default to the
+    /// source session's own. Returns the new session's id.
+    public func continueSession(sessionID: String, targetHostID: String? = nil,
+                                targetHarness: String? = nil) async throws -> String {
+        var payload: [String: Any] = [:]
+        if let targetHostID { payload["target_host_id"] = targetHostID }
+        if let targetHarness { payload["target_harness"] = targetHarness }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let path = "/harness/sessions/\(encodePathComponent(sessionID))/continue"
+        let data = try await request(path: path, method: "POST", body: body)
+        let decoded = try decode(CreateSessionResponse.self, from: data)
+        return decoded.sessionID
+    }
+
     public func interrupt(sessionID: String) async throws {
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/interrupt"
         _ = try await request(path: path, method: "POST", body: nil)
