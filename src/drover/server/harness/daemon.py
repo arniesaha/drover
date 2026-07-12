@@ -1116,6 +1116,16 @@ def _version_key(version: str) -> tuple[int | str, ...]:
     return tuple(parts)
 
 
+# Handoff-seed delivery timing. The seed is typed into the harness once its
+# startup output settles, instead of after a blind fixed delay at spawn (which
+# raced the CLI's cold start and was frequently swallowed). "Settled" = the
+# PTY has been quiet for _SEED_SETTLE_S after producing at least some output;
+# if the CLI stays silent, deliver anyway _SEED_COLD_QUIET_S after attach so a
+# genuinely quiet-but-ready REPL still gets seeded.
+_SEED_SETTLE_S = 0.4
+_SEED_COLD_QUIET_S = 1.5
+
+
 @dataclass
 class HarnessDaemonState:
     host_id: str
@@ -1133,6 +1143,12 @@ class HarnessDaemonState:
     host_token: str | None = None
     api_token: str = ""
     terminated_session_ids: set[str] = field(default_factory=set)
+    # Handoff seeds ("initial_input") waiting to be typed into a PTY session
+    # once its harness CLI has actually started. Keyed by session_id; consumed
+    # (pop) by the terminal loop when the CLI's startup output settles. See
+    # _create_session / _maybe_deliver_pending_seed for why this is deferred
+    # rather than written with a fixed delay at spawn time.
+    pending_initial_input: dict[str, str] = field(default_factory=dict)
     # run_harnessd() replaces this with EventPusher.push when a central URL
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
@@ -1368,7 +1384,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         )
         initial_input = body.get("initial_input")
         if initial_input:
-            self._write_initial_input(session_id, str(initial_input))
+            # Don't type the handoff seed here: the harness CLI has only just
+            # been spawned and isn't reading its stdin yet, so a fixed-delay
+            # write races its cold start and is usually lost. Queue it instead;
+            # the terminal loop types it once the CLI's startup output settles.
+            self.server.state.pending_initial_input[session_id] = str(initial_input)
         self._write_json(
             {
                 "session_id": session_id,
@@ -1381,23 +1401,48 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             status=HTTPStatus.CREATED,
         )
 
-    def _write_initial_input(self, session_id: str, initial_input: str) -> None:
+    def _maybe_deliver_pending_seed(
+        self,
+        session_id: str,
+        *,
+        attach_ts: float,
+        last_output_ts: float | None,
+    ) -> None:
+        """Type a queued handoff seed into the PTY once the harness CLI looks
+        ready — i.e. its startup output has been quiet for _SEED_SETTLE_S, or
+        (if it produced nothing) _SEED_COLD_QUIET_S have passed since attach.
+
+        Called each terminal-loop iteration. The seed is claimed with an atomic
+        ``pop`` so that exactly one delivery happens even if several clients
+        attach to the same session.
+        """
+        if session_id not in self.server.state.pending_initial_input:
+            return
+        now = monotonic()
+        if last_output_ts is not None:
+            ready = (now - last_output_ts) >= _SEED_SETTLE_S
+        else:
+            ready = (now - attach_ts) >= _SEED_COLD_QUIET_S
+        if not ready:
+            return
+        seed = self.server.state.pending_initial_input.pop(session_id, None)
+        if not seed:
+            return
         try:
-            time.sleep(0.15)
-            self.server.state.pty.write(session_id, initial_input)
-            self._safe_append_event(
-                session_id=session_id,
-                event_type="terminal.initial_input",
-                payload={
-                    "byte_count": len(initial_input.encode("utf-8")),
-                    "text": _redact_terminal_text(initial_input),
-                },
-                normalized_type="handoff_marker",
-                normalized_source="inferred_terminal",
-                content_preview=_redact_terminal_text(initial_input),
-            )
+            self.server.state.pty.write(session_id, seed)
         except Exception:
             return
+        self._safe_append_event(
+            session_id=session_id,
+            event_type="terminal.initial_input",
+            payload={
+                "byte_count": len(seed.encode("utf-8")),
+                "text": _redact_terminal_text(seed),
+            },
+            normalized_type="handoff_marker",
+            normalized_source="inferred_terminal",
+            content_preview=_redact_terminal_text(seed),
+        )
 
     def _create_structured_session(self, body: dict[str, Any]) -> None:
         harness = str(body.get("harness") or "")
@@ -1853,6 +1898,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         try:
             send_json(sock, {"type": "attached", "session_id": session_id})
             last_exit_check = monotonic()
+            attach_ts = monotonic()
+            last_output_ts: float | None = None
             while True:
                 output = self.server.state.pty.read(
                     session_id,
@@ -1860,6 +1907,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     timeout_s=0.02,
                 )
                 if output:
+                    last_output_ts = monotonic()
                     text = output.decode("utf-8", errors="replace")
                     content = _redact_terminal_text(text)
                     self._safe_append_transcript_chunk(
@@ -1880,6 +1928,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     send_json(sock, {"type": "output", "data": text})
                     if event is not None:
                         send_json(sock, {"type": "event", "event": _event_json(event)})
+
+                # Type any queued handoff seed once the CLI's output settles.
+                self._maybe_deliver_pending_seed(
+                    session_id,
+                    attach_ts=attach_ts,
+                    last_output_ts=last_output_ts,
+                )
 
                 try:
                     message = recv_json(sock)
@@ -2060,6 +2115,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         *,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        # An undelivered handoff seed (session ended before any terminal
+        # attached) has nowhere to go now — drop it so it can't leak.
+        self.server.state.pending_initial_input.pop(session_id, None)
         self._safe_update_session_status(
             session_id,
             status,

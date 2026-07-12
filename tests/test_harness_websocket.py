@@ -264,3 +264,73 @@ def test_terminal_websocket_streams_when_registry_writes_fail(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_handoff_seed_is_queued_then_typed_in_once_the_cli_settles(tmp_path):
+    """The handoff seed must NOT be written at spawn (it races the CLI's cold
+    start and is lost). It is queued and typed in by the terminal loop once the
+    session's output settles, so it reliably lands in a ready shell."""
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _, created = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "shell",
+                "cwd": str(tmp_path),
+                # Executed output ("SEED_42") differs from the echoed command
+                # text, so matching it proves the shell actually ran the seed
+                # rather than merely line-echoing it.
+                "initial_input": "echo SEED_$((6 * 7))\n",
+            },
+        )
+        session_id = created["session_id"]
+        # Queued at create, not written — nothing has driven the PTY yet.
+        assert session_id in state.pending_initial_input
+
+        sock = _connect_ws(base_url, f"/sessions/{session_id}/terminal")
+        try:
+            assert _recv_json(sock)["type"] == "attached"
+            # Attaching drives the terminal loop, which types the seed in once
+            # the shell settles; the shell then executes it.
+            assert "SEED_42" in _wait_for_output(sock, "SEED_42")
+            client_send_json(sock, {"type": "detach"})
+            _wait_for_close(sock)
+        finally:
+            sock.close()
+
+        # Consumed exactly once, and recorded as a handoff marker.
+        assert session_id not in state.pending_initial_input
+        _wait_for_event(state, session_id, "terminal.initial_input")
+        normalized = {
+            event.event_type: event.normalized_type
+            for event in state.registry.list_events(session_id)
+        }
+        assert normalized["terminal.initial_input"] == "handoff_marker"
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_handoff_seed_dropped_when_session_ends_before_any_attach(tmp_path):
+    """A queued seed whose session is terminated before a terminal ever
+    attaches is discarded, not leaked."""
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _, created = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "shell",
+                "cwd": str(tmp_path),
+                "initial_input": "echo NEVER_DELIVERED\n",
+            },
+        )
+        session_id = created["session_id"]
+        assert session_id in state.pending_initial_input
+
+        _json_request(f"{base_url}/sessions/{session_id}/terminate", payload={})
+        assert session_id not in state.pending_initial_input
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
