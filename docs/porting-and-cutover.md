@@ -355,9 +355,28 @@ cutover must preserve them:
 > been silently falling back to DuckDB queues since cutover; installed
 > `redis==8.0.1` — server now logs "Redis job streams enabled …
 > prefix=drover:jobs".
-> **Pending:** NAS redeploy of the cleaned tree, NAS `~/.nexus` symlink
-> removal, token rotation (Mac + NAS + k8s secret + iOS in lockstep), k8s
-> `nexus-metrics` object rename, iOS end-to-end check from the phone.
+> **NAS + rotation executed same day (2026-07-11):** cleaned tree shipped to
+> `/home/Arnab/dev/drover-harness-prod` (base64-tar-over-stdin; prior tree
+> kept as `drover-harness-prod.bak-cleanup-20260711`), venv reinstalled
+> (nexus-* bin scripts gone), `~/.nexus` symlink removed
+> (`~/.nexus.pre-drover-20260707` backup dir retained). NAS units are
+> **systemd user units** (`~/.config/systemd/user/`), not system —
+> `systemctl --user` via `XDG_RUNTIME_DIR=/run/user/$(id -u)`; system-scope
+> restart needs a sudo password.
+> Token rotated across Mac + NAS + k8s in lockstep: new token in
+> `~/.drover/api_token` on both hosts (old token backed up beside it as
+> `api_token.pre-rotation-20260711`), verified 401 bare / 200 bearer, both
+> hosts re-registered online, NAS collect + tempo-relay green on the new
+> token. k8s: applied `deploy/kubernetes/drover-observability.yaml`
+> (drover-metrics service/endpoints/servicemonitor), created
+> `secret/drover-api-token` (via `--from-literal`, newline-stripped), deleted
+> `nexus-metrics` objects + `secret/nexus-api-token`; Prometheus target
+> `serviceMonitor/monitoring/drover-metrics/0` is **up** with no scrape
+> error. Gotcha: `kubectl delete type1 name1 type2 name2` treats later args
+> as names of type1 — use `type/name` form.
+> **Pending:** paste the new token into the iOS app (it 401s until then) and
+> do the end-to-end check from the phone; NexusKit→DroverKit rename stays
+> deferred to the OSS flip (#177).
 
 ## 8. Open questions for the fresh session
 
