@@ -3,11 +3,6 @@
 Single source of truth: ~/.drover/config.toml.  Falls back to sensible
 defaults for any missing field so a brand-new install Just Works after
 `drover-server init` writes the default file.
-
-Transition compat (Drover, formerly Nexus): for one release the loader also
-resolves the legacy locations — ~/.nexus/config.toml, ~/.nexus/api_token,
-and the NEXUS_API_TOKEN env var — preferring the Drover names when both
-exist. Remove in the post-cutover cleanup (porting-and-cutover.md §7.6).
 """
 
 from __future__ import annotations
@@ -21,68 +16,24 @@ except ImportError:
     import tomli as tomllib  # type: ignore[no-redef]
 
 
-def _home_drover() -> Path:
+def config_home() -> Path:
     return Path(os.path.expanduser("~/.drover"))
 
 
-def _home_nexus() -> Path:
-    """Legacy config home (transition compat only)."""
-    return Path(os.path.expanduser("~/.nexus"))
-
-
-def config_home() -> Path:
-    """Active config home: ~/.drover, else legacy ~/.nexus, else ~/.drover."""
-    drover = _home_drover()
-    if drover.exists():
-        return drover
-    legacy = _home_nexus()
-    if legacy.exists():
-        return legacy
-    return drover
-
-
 def default_config_file(name: str) -> Path:
-    """~/.drover/<name>, falling back to legacy ~/.nexus/<name>."""
-    new = _home_drover() / name
-    if new.exists():
-        return new
-    legacy = _home_nexus() / name
-    if legacy.exists():
-        return legacy
-    return new
+    return config_home() / name
 
 
 def default_config_path() -> Path:
-    """~/.drover/config.toml, falling back to legacy ~/.nexus/config.toml."""
     return default_config_file("config.toml")
 
 
 def resolve_api_token_env() -> str:
-    """DROVER_API_TOKEN, falling back to legacy NEXUS_API_TOKEN."""
-    return (
-        os.environ.get("DROVER_API_TOKEN", "").strip()
-        or os.environ.get("NEXUS_API_TOKEN", "").strip()
-    )
+    return os.environ.get("DROVER_API_TOKEN", "").strip()
 
 
 def default_token_file() -> Path:
-    """~/.drover/api_token, falling back to legacy ~/.nexus/api_token."""
-    new = _home_drover() / "api_token"
-    if new.exists():
-        return new
-    legacy = _home_nexus() / "api_token"
-    if legacy.exists():
-        return legacy
-    return new
-
-
-def _default_duckdb_path(home: Path) -> Path:
-    """drover.duckdb, honoring a pre-migration legacy nexus.duckdb if present."""
-    new = home / "drover.duckdb"
-    legacy = home / "nexus.duckdb"
-    if not new.exists() and legacy.exists():
-        return legacy
-    return new
+    return config_home() / "api_token"
 
 
 @dataclass(frozen=True)
@@ -129,8 +80,7 @@ class DroverConfig:
     redis_jobs_maxlen: int
     redis_jobs_high_water: int
     # Central API auth (see drover.server.web.auth). Token resolution order:
-    # DROVER_API_TOKEN env > legacy NEXUS_API_TOKEN env > this field >
-    # auto-generated ~/.drover/api_token (legacy ~/.nexus/api_token honored).
+    # DROVER_API_TOKEN env > this field > auto-generated ~/.drover/api_token.
     auth_enabled: bool
     auth_api_token: str
 
@@ -139,7 +89,7 @@ _DEFAULTS = {
     "paths": {
         "incoming_dir": str(config_home() / "incoming"),
         "parquet_dir": str(config_home() / "parquet"),
-        "duckdb_path": str(_default_duckdb_path(config_home())),
+        "duckdb_path": str(config_home() / "drover.duckdb"),
         "processed_retention_days": 7,
     },
     "server": {
@@ -258,7 +208,3 @@ def load_config(path: Path) -> DroverConfig:
         loaded = tomllib.load(f)
     merged = _merge(_DEFAULTS, loaded)
     return _from_dict(merged)
-
-
-# Transition compat: legacy class name (remove in post-cutover cleanup).
-NexusConfig = DroverConfig

@@ -48,12 +48,9 @@ def open_duckdb_connection(
     fallback_prefix = "DUCKDB_DIAGNOSTIC" if role == "diagnostic" else "DUCKDB_WORKER"
 
     def _env_setting(suffix: str, default: str) -> str:
-        # DROVER_* is canonical; legacy NEXUS_* honored during the transition.
         for name in (
             f"DROVER_{prefix}_{suffix}",
-            f"NEXUS_{prefix}_{suffix}",
             f"DROVER_{fallback_prefix}_{suffix}",
-            f"NEXUS_{fallback_prefix}_{suffix}",
         ):
             value = os.environ.get(name)
             if value is not None:

@@ -38,6 +38,7 @@ parquet/
 .idea/
 .vscode/
 .claude/
+.swiftpm/
 
 # Local git worktrees
 .worktrees/

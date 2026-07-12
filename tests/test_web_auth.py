@@ -43,7 +43,6 @@ def test_load_auth_prefers_env(monkeypatch, tmp_path):
 
 def test_load_auth_generates_and_persists_token(monkeypatch, tmp_path):
     monkeypatch.delenv("DROVER_API_TOKEN", raising=False)
-    monkeypatch.delenv("NEXUS_API_TOKEN", raising=False)
     cfg = default_config()  # auth_api_token == ""
     settings = load_auth(cfg, token_home=tmp_path)
     token_file = tmp_path / "api_token"
@@ -58,7 +57,6 @@ def test_load_auth_generates_and_persists_token(monkeypatch, tmp_path):
 
 def test_load_auth_disabled(monkeypatch, tmp_path):
     monkeypatch.delenv("DROVER_API_TOKEN", raising=False)
-    monkeypatch.delenv("NEXUS_API_TOKEN", raising=False)
     cfg = dataclasses.replace(default_config(), auth_enabled=False)
     settings = load_auth(cfg, token_home=tmp_path)
     assert settings.enabled is False

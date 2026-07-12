@@ -73,11 +73,7 @@ def _agent_id_set(values: Iterable[str] | None) -> set[str]:
 
 def _required_agent_ids(values: Iterable[str] | None = None) -> set[str]:
     required = _agent_id_set(values)
-    env_value = (
-        os.environ.get("DROVER_QUALITY_REQUIRED_AGENTS")
-        or os.environ.get("NEXUS_QUALITY_REQUIRED_AGENTS")
-        or ""
-    )
+    env_value = os.environ.get("DROVER_QUALITY_REQUIRED_AGENTS") or ""
     if env_value:
         required.update(
             part.strip()

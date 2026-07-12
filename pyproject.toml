@@ -29,12 +29,6 @@ drover-harnessd = "drover.server.harness.cli:main"
 drover-collect = "drover.collect.__main__:main"
 drover-hook = "drover.hook.__main__:main"
 drover-dogfood-smoke = "drover.server.dogfood_smoke:main"
-# Transition shims (Drover, formerly Nexus) — print a deprecation line, then
-# run the real entry point. Remove in the post-cutover cleanup (§7.6).
-nexus-server = "drover.compat:nexus_server"
-nexus-harnessd = "drover.compat:nexus_harnessd"
-nexus-collect = "drover.compat:nexus_collect"
-nexus-hook = "drover.compat:nexus_hook"
 
 [project.optional-dependencies]
 dev = [

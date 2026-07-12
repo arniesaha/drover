@@ -102,7 +102,7 @@ def run_harnessd_from_options(
     "--host-token",
     default=None,
     help=(
-        "Shared Drover API token (falls back to DROVER_API_TOKEN/NEXUS_API_TOKEN, "
+        "Shared Drover API token (falls back to DROVER_API_TOKEN, "
         "then ~/.drover/api_token)"
     ),
 )

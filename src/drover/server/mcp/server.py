@@ -8,48 +8,12 @@ over the configured path so callers don't need to pass it.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from drover.server.mcp import tools as t
 from drover.server.summarizer.backends import SummarizerBackendConfig
-
-# Legacy nexus_* tool names accepted on tools/call for one release
-# (docs/porting-and-cutover.md §3). Only the drover_* names are listed
-# via tools/list so the tool surface shown to agents is not doubled.
-NEXUS_TOOL_ALIASES: dict[str, str] = {
-    f"nexus_{suffix}": f"drover_{suffix}"
-    for suffix in (
-        "handoff",
-        "session_replay",
-        "session_summary",
-        "active_sessions",
-        "search",
-        "files_touched",
-        "session_close",
-        "project_brief",
-        "recent_sessions",
-        "recent_contexts",
-        "context_brief",
-        "open_loops",
-        "resume_context",
-        "recall",
-        "task_status",
-        "project_activity",
-        "active_handoff",
-        "fleet_status",
-        "data_quality",
-        "pipeline_observatory",
-    )
-}
-
-
-class _AliasedFastMCP(FastMCP):
-    """FastMCP that resolves legacy ``nexus_*`` tool names at dispatch time."""
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        return await super().call_tool(NEXUS_TOOL_ALIASES.get(name, name), arguments)
 
 
 def build_mcp_server(
@@ -65,12 +29,8 @@ def build_mcp_server(
     ``backend_config`` is optional — it's only needed by tools that call
     out to an LLM on demand (currently ``drover_active_handoff``). If
     unset, those tools will raise at call-time.
-
-    Tools are listed under their ``drover_*`` names only, but the server
-    also accepts the legacy ``nexus_*`` names on invocation for one
-    release (see ``NEXUS_TOOL_ALIASES``).
     """
-    mcp = _AliasedFastMCP(name, host=host, port=port)
+    mcp = FastMCP(name, host=host, port=port)
     db = Path(duckdb_path)
     bcfg = backend_config
 

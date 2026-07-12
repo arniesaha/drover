@@ -336,6 +336,29 @@ cutover must preserve them:
    `~/.nexus` symlink, and `NEXUS_API_TOKEN` acceptance in a cleanup commit.
 7. (Separate spec) OSS sanitization + public repo flip (#177).
 
+### 7.6 Post-cutover cleanup — execution record
+
+> **STATUS: Mac side executed 2026-07-11** (after a 3–4 day soak).
+> Code: deleted `src/drover/compat.py` + the four `nexus-*` console scripts
+> (pyproject), removed the `~/.nexus`/`NEXUS_API_TOKEN`/`nexus.duckdb`
+> fallbacks in `config.py`, the `NexusConfig` alias, the `nexus_*` MCP
+> dispatch aliases (`_AliasedFastMCP`), and the legacy `NEXUS_*` env names in
+> `db.py`/`quality.py`. 850 tests green. Deliberately unchanged: span
+> attribute keys (`nexus.decision.*` etc.), stored data values
+> (`nexus_handoff`, `nexus_control`), and test fixture data — those are data
+> schema, not compat.
+> Mac runtime: `~/.drover-venv` reinstalled (nexus-* bin scripts gone),
+> `~/.nexus` symlink removed, redis prefix flipped `nexus:jobs` →
+> `drover:jobs` in both live configs (drain was a no-op: redis is in-memory
+> and came up empty at cutover). **Found+fixed while here:** the `redis`
+> python package was never installed in `~/.drover-venv`, so job streams had
+> been silently falling back to DuckDB queues since cutover; installed
+> `redis==8.0.1` — server now logs "Redis job streams enabled …
+> prefix=drover:jobs".
+> **Pending:** NAS redeploy of the cleaned tree, NAS `~/.nexus` symlink
+> removal, token rotation (Mac + NAS + k8s secret + iOS in lockstep), k8s
+> `nexus-metrics` object rename, iOS end-to-end check from the phone.
+
 ## 8. Open questions for the fresh session
 
 - Runtime data path: `/Volumes/M2 1/drover-data` (beside repo) vs

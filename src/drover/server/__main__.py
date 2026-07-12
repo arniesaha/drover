@@ -103,10 +103,9 @@ mcp_http_port  = 7077
 metrics_http_port = 0  # set to 7080 to expose /metrics for Prometheus
 
 [auth]
-# Central API auth. Token resolution order: DROVER_API_TOKEN env var (legacy
-# NEXUS_API_TOKEN accepted for one release), then api_token below, then
-# auto-generated ~/.drover/api_token (created 0600 on first start). Set
-# enabled = false only for local development.
+# Central API auth. Token resolution order: DROVER_API_TOKEN env var,
+# then api_token below, then auto-generated ~/.drover/api_token (created
+# 0600 on first start). Set enabled = false only for local development.
 enabled = true
 api_token = ""
 
@@ -357,7 +356,7 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
     "--host-token",
     default=None,
     help=(
-        "Shared Drover API token (falls back to DROVER_API_TOKEN/NEXUS_API_TOKEN, "
+        "Shared Drover API token (falls back to DROVER_API_TOKEN, "
         "then ~/.drover/api_token)"
     ),
 )
@@ -2029,7 +2028,7 @@ def runtime_audit_cmd(
     multiple=True,
     help=(
         "Agent ID expected to be actively producing events; may be repeated. "
-        "Also accepts DROVER_QUALITY_REQUIRED_AGENTS (legacy NEXUS_QUALITY_REQUIRED_AGENTS) as comma-separated defaults."
+        "Also accepts DROVER_QUALITY_REQUIRED_AGENTS as comma-separated defaults."
     ),
 )
 @click.option(

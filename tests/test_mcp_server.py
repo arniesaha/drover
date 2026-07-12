@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.mcp.server import NEXUS_TOOL_ALIASES, build_mcp_server
+from drover.server.mcp.server import build_mcp_server
 
 
 def test_server_registers_all_tools(tmp_path: Path) -> None:
@@ -47,24 +47,6 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
         # Rolling handoff brief for OPEN sessions:
         "drover_active_handoff",
     }
-
-
-def test_legacy_nexus_aliases_resolve(tmp_path: Path) -> None:
-    """Compat contract: nexus_* names stay callable for one release but are
-    not listed, so the tool surface shown to agents is not doubled
-    (docs/porting-and-cutover.md §3)."""
-    parquet_dir = tmp_path / "parquet"
-    duckdb_path = tmp_path / "nexus.duckdb"
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-
-    server = build_mcp_server(duckdb_path=duckdb_path)
-    listed = {t.name for t in asyncio.run(server.list_tools())}
-    # Every legacy alias points at a listed drover_* tool, and covers all of them.
-    assert set(NEXUS_TOOL_ALIASES.values()) == listed
-    assert not any(name.startswith("nexus_") for name in listed)
-    # An aliased call dispatches to the underlying tool instead of erroring.
-    result = asyncio.run(server.call_tool("nexus_fleet_status", {}))
-    assert result is not None
 
 
 def test_each_tool_has_a_description(tmp_path: Path) -> None:

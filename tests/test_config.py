@@ -2,7 +2,7 @@
 
 from pathlib import Path
 import pytest
-from drover.config import NexusConfig, load_config, default_config
+from drover.config import load_config, default_config
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nexus_config.toml"
 
@@ -32,8 +32,7 @@ def test_load_from_path():
 def test_default_config_uses_home_dir():
     cfg = default_config()
     assert cfg.incoming_dir.is_absolute()
-    # config_home() prefers ~/.drover and falls back to legacy ~/.nexus
-    assert (".drover" in str(cfg.incoming_dir)) or (".nexus" in str(cfg.incoming_dir))
+    assert ".drover" in str(cfg.incoming_dir)
     assert cfg.otlp_grpc_port == 4317
     assert cfg.mcp_http_port == 7077
     assert cfg.metrics_http_port == 0

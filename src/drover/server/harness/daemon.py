@@ -2202,8 +2202,7 @@ def _post_central_json(
 
 
 def resolve_daemon_token(host_token: str | None) -> str:
-    """--host-token flag > DROVER_API_TOKEN (legacy NEXUS_API_TOKEN) env >
-    ~/.drover/api_token (legacy ~/.nexus/api_token) file > ''."""
+    """--host-token flag > DROVER_API_TOKEN env > ~/.drover/api_token file > ''."""
     if host_token:
         return host_token
     env = resolve_api_token_env()

@@ -3,10 +3,8 @@
 One shared cluster token. Machine clients send ``Authorization: Bearer
 <token>``; browsers exchange the token at /auth/login for an HMAC-signed
 HttpOnly cookie (stateless: value is ``<expiry-epoch>.<hmac>``). Token
-resolution order: DROVER_API_TOKEN env var (legacy NEXUS_API_TOKEN
-accepted for one release), then ``[auth] api_token`` in config.toml, then
-an auto-generated ``~/.drover/api_token`` file (0600; a legacy
-``~/.nexus/api_token`` is honored during the transition).
+resolution order: DROVER_API_TOKEN env var, then ``[auth] api_token``
+in config.toml, then an auto-generated ``~/.drover/api_token`` file (0600).
 """
 
 from __future__ import annotations
