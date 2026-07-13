@@ -12,6 +12,7 @@ from drover.schema import bootstrap
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
+    HarnessPreset,
     create_harness_server,
     register_daemon_host,
 )
@@ -56,7 +57,7 @@ def _json_request(url: str, *, payload: dict | None = None):
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
-def _start_test_server(tmp_path):
+def _start_test_server(tmp_path, presets=None):
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -67,7 +68,7 @@ def _start_test_server(tmp_path):
         kind="linux",
         registry=registry,
         pty=PtySessionManager(),
-        presets=DEFAULT_PRESETS,
+        presets=presets or DEFAULT_PRESETS,
         local_url="http://127.0.0.1:0",
     )
     register_daemon_host(state)
@@ -306,6 +307,64 @@ def test_handoff_seed_is_queued_then_typed_in_once_the_cli_settles(tmp_path):
             for event in state.registry.list_events(session_id)
         }
         assert normalized["terminal.initial_input"] == "handoff_marker"
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_handoff_seed_waits_for_startup_gate_to_be_answered(tmp_path):
+    """A harness whose CLI opens on a startup gate (claude-code's trust-folder
+    prompt) must have the gate answered before the seed is typed. Without gate
+    handling, the settle-based delivery types the seed INTO the gate, which
+    discards it — the handed-off agent starts with no context."""
+    # Fake gated CLI: shows the trust prompt, and only reaches its "REPL"
+    # (a real shell) if the gate is answered with exactly "1". Anything else
+    # (e.g. the seed text) is reported as swallowed, mirroring claude-code.
+    script = tmp_path / "gated_cli.sh"
+    script.write_text(
+        'echo "Do you trust the files in this folder?"\n'
+        "read answer\n"
+        'if [ "$answer" = "1" ]; then\n'
+        '  echo "REPL_READY"\n'
+        "  exec /bin/sh\n"
+        "else\n"
+        '  echo "GATE_SWALLOWED:$answer"\n'
+        "fi\n"
+    )
+    presets = dict(DEFAULT_PRESETS)
+    presets["gated"] = HarnessPreset(
+        name="gated",
+        command=("/bin/sh", str(script)),
+        enabled=True,
+        description="fake CLI with a startup trust gate",
+        startup_gate_marker="Do you trust the files in this folder?",
+        startup_gate_answer="1\n",
+    )
+    server, state, base_url = _start_test_server(tmp_path, presets=presets)
+    try:
+        _, created = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "gated",
+                "cwd": str(tmp_path),
+                "initial_input": "echo SEED_$((6 * 7))\n",
+            },
+        )
+        session_id = created["session_id"]
+        sock = _connect_ws(base_url, f"/sessions/{session_id}/terminal")
+        try:
+            assert _recv_json(sock)["type"] == "attached"
+            # The daemon must answer the gate ("1") first, then deliver the
+            # seed into the shell behind it.
+            collected = _wait_for_output(sock, "SEED_42")
+            assert "REPL_READY" in collected
+            assert "GATE_SWALLOWED" not in collected
+            client_send_json(sock, {"type": "detach"})
+            _wait_for_close(sock)
+        finally:
+            sock.close()
+        assert session_id not in state.pending_initial_input
     finally:
         state.pty.close_all()
         server.shutdown()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hmac
 from http import HTTPStatus
@@ -59,6 +59,14 @@ class HarnessPreset:
     command: tuple[str, ...]
     enabled: bool
     description: str
+    # Startup gate: some CLIs open on an interactive prompt before reaching
+    # their REPL (claude-code's "Do you trust the files in this folder?").
+    # When the marker appears in PTY output while a handoff seed is pending,
+    # the daemon types `startup_gate_answer` and waits for the REPL to settle
+    # before delivering the seed — otherwise the seed answers the gate and is
+    # discarded. None means the harness has no gate (shell, codex, gemini).
+    startup_gate_marker: str | None = None
+    startup_gate_answer: str = "1\n"
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -81,6 +89,8 @@ DEFAULT_PRESETS = {
         command=("claude",),
         enabled=False,
         description="Claude Code CLI",
+        startup_gate_marker="Do you trust the files in this folder?",
+        startup_gate_answer="1\n",
     ),
     "codex": HarnessPreset(
         name="codex",
@@ -117,9 +127,8 @@ def resolve_harness_presets(
             continue
         executable = _resolve_executable(preset.command[0], login_shell=login_shell)
         if executable is None:
-            resolved[name] = HarnessPreset(
-                name=preset.name,
-                command=preset.command,
+            resolved[name] = replace(
+                preset,
                 enabled=False,
                 description=f"{preset.description}; executable not found on this host",
             )
@@ -135,8 +144,8 @@ def resolve_harness_presets(
                 + "; "
                 + shell_command
             )
-        resolved[name] = HarnessPreset(
-            name=preset.name,
+        resolved[name] = replace(
+            preset,
             command=(login_shell, "-lc", shell_command),
             enabled=True,
             description=f"{preset.description}; available at {executable}",
@@ -1127,6 +1136,18 @@ _SEED_COLD_QUIET_S = 1.5
 
 
 @dataclass
+class PendingSeed:
+    """A queued handoff seed plus the startup-gate handling its harness needs
+    (from the preset at session create). `gate_answered` flips once the gate
+    has been typed at, so a redrawn marker is never answered twice."""
+
+    text: str
+    gate_marker: str | None = None
+    gate_answer: str = "1\n"
+    gate_answered: bool = False
+
+
+@dataclass
 class HarnessDaemonState:
     host_id: str
     display_name: str
@@ -1148,7 +1169,7 @@ class HarnessDaemonState:
     # (pop) by the terminal loop when the CLI's startup output settles. See
     # _create_session / _maybe_deliver_pending_seed for why this is deferred
     # rather than written with a fixed delay at spawn time.
-    pending_initial_input: dict[str, str] = field(default_factory=dict)
+    pending_initial_input: dict[str, PendingSeed] = field(default_factory=dict)
     # run_harnessd() replaces this with EventPusher.push when a central URL
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
@@ -1387,8 +1408,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             # Don't type the handoff seed here: the harness CLI has only just
             # been spawned and isn't reading its stdin yet, so a fixed-delay
             # write races its cold start and is usually lost. Queue it instead;
-            # the terminal loop types it once the CLI's startup output settles.
-            self.server.state.pending_initial_input[session_id] = str(initial_input)
+            # the terminal loop types it once the CLI's startup output settles
+            # (answering the preset's startup gate first, if one appears).
+            self.server.state.pending_initial_input[session_id] = PendingSeed(
+                text=str(initial_input),
+                gate_marker=preset.startup_gate_marker,
+                gate_answer=preset.startup_gate_answer,
+            )
         self._write_json(
             {
                 "session_id": session_id,
@@ -1407,16 +1433,24 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         *,
         attach_ts: float,
         last_output_ts: float | None,
+        recent_output: str = "",
     ) -> None:
         """Type a queued handoff seed into the PTY once the harness CLI looks
         ready — i.e. its startup output has been quiet for _SEED_SETTLE_S, or
         (if it produced nothing) _SEED_COLD_QUIET_S have passed since attach.
 
+        If the settled output is the harness's startup gate (claude-code's
+        trust-folder prompt on an untrusted cwd), typing the seed now would
+        answer the gate with garbage and discard the context — so the gate is
+        answered instead, and delivery waits for the next settle once the REPL
+        behind it has drawn.
+
         Called each terminal-loop iteration. The seed is claimed with an atomic
         ``pop`` so that exactly one delivery happens even if several clients
         attach to the same session.
         """
-        if session_id not in self.server.state.pending_initial_input:
+        pending = self.server.state.pending_initial_input.get(session_id)
+        if pending is None:
             return
         now = monotonic()
         if last_output_ts is not None:
@@ -1425,23 +1459,34 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             ready = (now - attach_ts) >= _SEED_COLD_QUIET_S
         if not ready:
             return
+        if (
+            pending.gate_marker
+            and not pending.gate_answered
+            and pending.gate_marker in recent_output
+        ):
+            pending.gate_answered = True
+            try:
+                self.server.state.pty.write(session_id, pending.gate_answer)
+            except Exception:
+                pass
+            return
         seed = self.server.state.pending_initial_input.pop(session_id, None)
-        if not seed:
+        if seed is None:
             return
         try:
-            self.server.state.pty.write(session_id, seed)
+            self.server.state.pty.write(session_id, seed.text)
         except Exception:
             return
         self._safe_append_event(
             session_id=session_id,
             event_type="terminal.initial_input",
             payload={
-                "byte_count": len(seed.encode("utf-8")),
-                "text": _redact_terminal_text(seed),
+                "byte_count": len(seed.text.encode("utf-8")),
+                "text": _redact_terminal_text(seed.text),
             },
             normalized_type="handoff_marker",
             normalized_source="inferred_terminal",
-            content_preview=_redact_terminal_text(seed),
+            content_preview=_redact_terminal_text(seed.text),
         )
 
     def _create_structured_session(self, body: dict[str, Any]) -> None:
@@ -1900,6 +1945,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             last_exit_check = monotonic()
             attach_ts = monotonic()
             last_output_ts: float | None = None
+            # Rolling tail of startup output, kept only while a handoff seed
+            # is pending so _maybe_deliver_pending_seed can spot a startup
+            # gate (e.g. claude-code's trust prompt). Bounded: the gate text
+            # always fits well inside the last 4 KiB of a startup screen.
+            seed_watch = ""
             while True:
                 output = self.server.state.pty.read(
                     session_id,
@@ -1909,6 +1959,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 if output:
                     last_output_ts = monotonic()
                     text = output.decode("utf-8", errors="replace")
+                    if session_id in self.server.state.pending_initial_input:
+                        seed_watch = (seed_watch + text)[-4096:]
                     content = _redact_terminal_text(text)
                     self._safe_append_transcript_chunk(
                         session_id=session_id,
@@ -1929,11 +1981,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     if event is not None:
                         send_json(sock, {"type": "event", "event": _event_json(event)})
 
-                # Type any queued handoff seed once the CLI's output settles.
+                # Type any queued handoff seed once the CLI's output settles
+                # (answering a startup gate first if one is on screen).
                 self._maybe_deliver_pending_seed(
                     session_id,
                     attach_ts=attach_ts,
                     last_output_ts=last_output_ts,
+                    recent_output=seed_watch,
                 )
 
                 try:
