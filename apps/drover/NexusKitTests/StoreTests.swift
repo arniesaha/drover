@@ -34,4 +34,28 @@ struct StoreTests {
     #expect(fresh.map(\.id) == ["b"])
 }
 
+@Test @MainActor func continueSessionReturnsNewIDOnSuccess() async throws {
+    MockURLProtocol.handler = { _ in (200, Data(#"{"session_id": "harness-9"}"#.utf8)) }
+    let store = SessionStore(client: client())
+    let newID = await store.continueSession("harness-1")
+    #expect(newID == "harness-9")
+    #expect(store.lastError == nil)
+}
+
+@Test @MainActor func continueSessionSurfacesServerExplanation() async throws {
+    MockURLProtocol.handler = { _ in (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8)) }
+    let store = SessionStore(client: client())
+    let newID = await store.continueSession("harness-1")
+    #expect(newID == nil)
+    #expect(store.lastError == "host mac-mini is offline")
+}
+
+@Test @MainActor func continueSessionNonServerFailureGetsGenericError() async throws {
+    MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
+    let store = SessionStore(client: client())
+    let newID = await store.continueSession("harness-1")
+    #expect(newID == nil)
+    #expect(store.lastError == "Couldn't start handoff — is the host online?")
+}
+
 }

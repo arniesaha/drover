@@ -123,11 +123,10 @@ struct SessionsView: View {
     /// Server-side handoff: launches a fresh PTY session seeded with this
     /// one's transcript context (the `/continue` endpoint always creates a
     /// terminal session), then navigates into it. Works on finished sessions
-    /// too — the real "resume a dead session" path. Errors surface through the
-    /// store's banner on the next refresh; the common failure (host offline)
-    /// simply leaves the user on the list.
+    /// too — the real "resume a dead session" path. Failures surface through
+    /// the store's `lastError` banner at the top of the list.
     private func continueSession(_ session: SessionSummary) async {
-        guard let newSessionID = try? await client.continueSession(sessionID: session.id) else {
+        guard let newSessionID = await store.continueSession(session.id) else {
             return
         }
         launchedSession = LaunchedSession(id: newSessionID, isStructured: false)

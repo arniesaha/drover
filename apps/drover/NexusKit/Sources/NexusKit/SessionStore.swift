@@ -67,6 +67,29 @@ public final class SessionStore {
         }
     }
 
+    // MARK: - Handoff
+
+    /// Server-side handoff from the session list: returns the new session's
+    /// id, or nil on failure with the explanation routed through `lastError`
+    /// (the same banner refresh failures use). 409/400 carry a server-authored
+    /// message surfaced verbatim; anything else gets a generic hint.
+    public func continueSession(_ sessionID: String) async -> String? {
+        guard let client else { return nil }
+        do {
+            let newSessionID = try await client.continueSession(sessionID: sessionID)
+            lastError = nil
+            return newSessionID
+        } catch {
+            switch error {
+            case NexusError.conflict(let message), NexusError.badRequest(let message):
+                lastError = message
+            default:
+                lastError = "Couldn't start handoff — is the host online?"
+            }
+            return nil
+        }
+    }
+
     // MARK: - Polling
 
     public func startPolling(every seconds: Double = 5) {
