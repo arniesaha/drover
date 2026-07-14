@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import select
@@ -21,11 +21,20 @@ class PtySession:
     pid: int
 
 
+# Bounded per-session scrollback: enough for a few screenfuls of TUI
+# repaints, small enough that a hundred sessions cost ~25 MB worst case.
+SCROLLBACK_MAX_BYTES = 256 * 1024
+
+
 @dataclass
 class _RunningPty:
     public: PtySession
     process: subprocess.Popen[bytes]
     master_fd: int
+    # Rolling tail of everything read() has returned, replayed to a client
+    # on (re)attach so a reattached terminal isn't blank until the process
+    # happens to emit its next byte.
+    scrollback: bytearray = field(default_factory=bytearray)
 
 
 class PtySessionManager:
@@ -136,13 +145,25 @@ class PtySessionManager:
         if not readable:
             return b""
         try:
-            return os.read(running.master_fd, max_bytes)
+            output = os.read(running.master_fd, max_bytes)
         except BlockingIOError:
             return b""
         except OSError:
             if running.process.poll() is not None:
                 self._cleanup_running(session_id, running)
             return b""
+        if output:
+            running.scrollback += output
+            if len(running.scrollback) > SCROLLBACK_MAX_BYTES:
+                del running.scrollback[:-SCROLLBACK_MAX_BYTES]
+        return output
+
+    def scrollback(self, session_id: str) -> bytes:
+        """The buffered output tail for replay on attach; b"" if unknown."""
+        running = self._sessions.get(session_id)
+        if running is None:
+            return b""
+        return bytes(running.scrollback)
 
     def terminate(self, session_id: str, *, timeout_s: float = 2.0) -> bool:
         running = self._sessions.pop(session_id, None)

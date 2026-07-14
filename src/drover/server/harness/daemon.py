@@ -1942,6 +1942,19 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         )
         try:
             send_json(sock, {"type": "attached", "session_id": session_id})
+            # Replay buffered scrollback so a reattach isn't a blank screen
+            # until the process emits its next byte. Not appended to the
+            # transcript/events — it already went through both when first
+            # read; this is purely a client-side repaint.
+            scrollback = self.server.state.pty.scrollback(session_id)
+            if scrollback:
+                send_json(
+                    sock,
+                    {
+                        "type": "output",
+                        "data": scrollback.decode("utf-8", errors="replace"),
+                    },
+                )
             last_exit_check = monotonic()
             attach_ts = monotonic()
             last_output_ts: float | None = None

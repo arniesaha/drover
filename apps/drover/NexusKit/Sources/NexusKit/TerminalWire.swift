@@ -94,7 +94,11 @@ public enum TerminalWire {
     }
 
     private static func encode(_ value: some Encodable) -> String {
-        guard let data = try? JSONEncoder().encode(value),
+        // .sortedKeys purely for determinism: JSONEncoder's default key
+        // order can differ call-to-call, and tests compare frames as strings.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(value),
               let string = String(data: data, encoding: .utf8) else {
             return "{}"
         }

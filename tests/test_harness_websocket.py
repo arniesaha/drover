@@ -267,6 +267,44 @@ def test_terminal_websocket_streams_when_registry_writes_fail(tmp_path):
         server.server_close()
 
 
+def test_terminal_reattach_replays_scrollback(tmp_path):
+    """A detach leaves the PTY running; a later attach must replay the
+    buffered scrollback so the client is not staring at a blank terminal
+    until the process happens to emit its next byte."""
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _, created = _json_request(
+            f"{base_url}/sessions",
+            payload={"harness": "shell", "cwd": str(tmp_path)},
+        )
+        session_id = created["session_id"]
+
+        sock = _connect_ws(base_url, f"/sessions/{session_id}/terminal")
+        try:
+            attached = _recv_json(sock)
+            assert attached["type"] == "attached"
+            client_send_json(sock, {"type": "input", "data": "echo SCROLLBACK_OK\n"})
+            _wait_for_output(sock, "SCROLLBACK_OK")
+            client_send_json(sock, {"type": "detach"})
+            _wait_for_close(sock)
+        finally:
+            sock.close()
+
+        # Second attach: nothing new is typed, so the only way SCROLLBACK_OK
+        # can arrive is the daemon replaying buffered output on attach.
+        sock = _connect_ws(base_url, f"/sessions/{session_id}/terminal")
+        try:
+            attached = _recv_json(sock)
+            assert attached["type"] == "attached"
+            assert "SCROLLBACK_OK" in _wait_for_output(sock, "SCROLLBACK_OK")
+        finally:
+            sock.close()
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_handoff_seed_is_queued_then_typed_in_once_the_cli_settles(tmp_path):
     """The handoff seed must NOT be written at spawn (it races the CLI's cold
     start and is lost). It is queued and typed in by the terminal loop once the

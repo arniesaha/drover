@@ -4,8 +4,9 @@ import NexusKit
 
 /// PTY escape hatch: renders a live shell session over the harness's
 /// terminal WebSocket using SwiftTerm. All wire handling and socket
-/// lifecycle live in `TerminalBridge`; this file is purely the SwiftUI/
-/// UIKit glue plus a small "session ended" overlay.
+/// lifecycle live in `TerminalBridge`/`TerminalStream`; this file is purely
+/// the SwiftUI/UIKit glue plus the "session ended" overlay and the
+/// "Reconnecting…" pill.
 ///
 /// The Ctrl-key accessory bar the brief calls for (Esc, Tab, Ctrl-C, arrows)
 /// is not hand-built here: SwiftTerm's `TerminalView` wires up its own
@@ -21,23 +22,76 @@ struct TerminalScreen: View {
     let client: NexusClient
     let sessionID: String
 
+    @Environment(\.scenePhase) private var scenePhase
+
     /// Set once, on the main actor, by `TerminalBridge.onSessionEnded` — the
-    /// remote process exited, the daemon detached us, or the socket simply
-    /// dropped. Drawn as a dismissible overlay rather than an automatic pop
-    /// so the user can still read whatever last output is on screen.
+    /// remote process really exited (the daemon's `exit` frame). Socket
+    /// drops no longer end the session; they show `isReconnecting` instead
+    /// while `TerminalStream` reattaches. Drawn as a dismissible overlay
+    /// rather than an automatic pop so the user can still read whatever last
+    /// output is on screen.
     @State private var sessionEnded = false
+    /// True while the terminal socket is down and the stream is retrying.
+    /// Suppressed during the initial connect (nothing to *re*-connect to
+    /// yet) by only flipping on after the first successful connection —
+    /// `TerminalStream` emits `.connection(true)` before any drop can.
+    @State private var isReconnecting = false
+    @State private var hasConnectedOnce = false
+    @State private var bridgeHolder = BridgeHolder()
 
     var body: some View {
-        TerminalRepresentable(client: client, sessionID: sessionID, onSessionEnded: { sessionEnded = true })
-            .navigationTitle("Terminal")
-            .navigationBarTitleDisplayMode(.inline)
-            .ignoresSafeArea(.container, edges: .bottom)
-            .overlay {
-                if sessionEnded {
-                    SessionEndedOverlay()
-                }
+        VStack(spacing: 0) {
+            if hasConnectedOnce && isReconnecting && !sessionEnded {
+                reconnectingPill
             }
+            TerminalRepresentable(
+                client: client,
+                sessionID: sessionID,
+                holder: bridgeHolder,
+                onSessionEnded: { sessionEnded = true },
+                onConnectionChanged: { up in
+                    if up { hasConnectedOnce = true }
+                    isReconnecting = !up
+                }
+            )
+        }
+        .navigationTitle("Terminal")
+        .navigationBarTitleDisplayMode(.inline)
+        .ignoresSafeArea(.container, edges: .bottom)
+        .overlay {
+            if sessionEnded {
+                SessionEndedOverlay()
+            }
+        }
+        // Returning to the foreground: iOS suspended the socket while
+        // backgrounded, and the stream may be mid-backoff. Nudge it so the
+        // reattach happens now instead of after up to 30s.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                bridgeHolder.bridge?.reconnectNow()
+            }
+        }
     }
+
+    private var reconnectingPill: some View {
+        HStack(spacing: 6) {
+            ProgressView().scaleEffect(0.7)
+            Text("Reconnecting…")
+        }
+        .font(.caption)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(.secondary.opacity(0.15), in: Capsule())
+        .padding(.vertical, 6)
+        .accessibilityIdentifier("terminal-reconnecting")
+    }
+}
+
+/// Lets the SwiftUI screen reach the representable's coordinator (for the
+/// foreground `reconnectNow()` nudge) without owning its lifecycle.
+@MainActor
+private final class BridgeHolder {
+    weak var bridge: TerminalBridge?
 }
 
 private struct SessionEndedOverlay: View {
@@ -59,7 +113,9 @@ private struct SessionEndedOverlay: View {
 private struct TerminalRepresentable: UIViewRepresentable {
     let client: NexusClient
     let sessionID: String
+    let holder: BridgeHolder
     let onSessionEnded: () -> Void
+    let onConnectionChanged: (Bool) -> Void
 
     func makeCoordinator() -> TerminalBridge {
         TerminalBridge(request: client.terminalRequest(sessionID: sessionID))
@@ -75,6 +131,8 @@ private struct TerminalRepresentable: UIViewRepresentable {
         view.nativeBackgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.05, alpha: 1.0)
         view.nativeForegroundColor = UIColor(red: 0.86, green: 0.91, blue: 0.95, alpha: 1.0)
         context.coordinator.onSessionEnded = onSessionEnded
+        context.coordinator.onConnectionChanged = onConnectionChanged
+        holder.bridge = context.coordinator
         context.coordinator.attach(view)
         DispatchQueue.main.async { view.becomeFirstResponder() }
         return view

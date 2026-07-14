@@ -2,38 +2,43 @@ import Foundation
 import SwiftTerm
 import NexusKit
 
-/// Bridges SwiftTerm's `TerminalView` to the harness's terminal WebSocket
-/// (`NexusClient.terminalRequest`): runs the `URLSessionWebSocketTask`
-/// receive loop, decodes frames via `TerminalWire`, feeds `output` text into
-/// the terminal, and forwards keystrokes/resizes back out as `input`/
-/// `resize` frames. Also doubles as the `UIViewRepresentable`'s
-/// `Coordinator` (see `TerminalView.swift`).
+/// Bridges SwiftTerm's `TerminalView` to the harness's terminal WebSocket:
+/// pumps `TerminalStream`'s events (output/exit/connection state) into the
+/// terminal, and forwards keystrokes/resizes back out as `input`/`resize`
+/// frames. Also doubles as the `UIViewRepresentable`'s `Coordinator` (see
+/// `TerminalView.swift`).
+///
+/// All socket lifecycle — including reconnecting with backoff after a drop —
+/// lives in `TerminalStream` (NexusKit, unit-tested). The daemon keeps the
+/// PTY alive when a client vanishes, so a network blip or iOS suspending the
+/// socket in the background is survivable: the stream reattaches and the
+/// re-sent resize makes full-screen TUIs repaint. Only the daemon's `exit`
+/// frame (the process really died) ends the session for good.
 ///
 /// SwiftTerm's `TerminalViewDelegate` protocol carries no actor isolation,
 /// so nothing here can assume its callbacks land on the main actor even
-/// though in practice UIKit invokes them from the main run loop. The
-/// WebSocket receive loop runs on a plain background `Task` by
-/// construction, so every touch of the (weak, main-actor-isolated)
-/// `TerminalView` is explicitly hopped via `@MainActor` — see `handle(_:)`
-/// and the `onSessionEnded` invocation in the catch branch of
-/// `runReceiveLoop()`. This class is `@unchecked Sendable` the same way the
-/// test-only `FakeConnector` in `NexusKitTests/StreamTests.swift` is: a
-/// class handed across an isolation boundary with manually-verified safe
-/// access patterns rather than actor isolation.
+/// though in practice UIKit invokes them from the main run loop. The event
+/// pump runs on a plain background `Task` by construction, so every touch of
+/// the (weak, main-actor-isolated) `TerminalView` is explicitly hopped via
+/// `@MainActor` — see `apply(_:)`. This class is `@unchecked Sendable` the
+/// same way the test-only fakes in NexusKitTests are: a class handed across
+/// an isolation boundary with manually-verified safe access patterns rather
+/// than actor isolation.
 final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable {
-    private let webSocketTask: URLSessionWebSocketTask
+    private let stream: TerminalStream
     private weak var terminalView: SwiftTerm.TerminalView?
-    private var receiveTask: Task<Void, Never>?
+    private var pumpTask: Task<Void, Never>?
 
     /// Fired once, always on the main actor, when the remote process exits
-    /// (`TerminalEvent.exited`), the daemon sends a detach frame
-    /// (`TerminalEvent.detached` — not currently sent by the deployed
-    /// daemon, but decoded defensively), or the WebSocket simply closes/
-    /// errors (the daemon's actual way of signaling a detach).
+    /// (the daemon's `exit` frame). Socket drops no longer fire this — they
+    /// reconnect instead (see `onConnectionChanged`).
     var onSessionEnded: (() -> Void)?
+    /// Fired on the main actor whenever the connection comes up or drops —
+    /// drives the "Reconnecting…" pill.
+    var onConnectionChanged: ((Bool) -> Void)?
 
-    init(request: URLRequest, urlSession: URLSession = URLSession(configuration: .default)) {
-        webSocketTask = urlSession.webSocketTask(with: request)
+    init(request: URLRequest) {
+        stream = TerminalStream(request: request)
         super.init()
     }
 
@@ -42,75 +47,52 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     /// `deinit` even though callers are also expected to call the explicit
     /// teardown method. Guards against a dropped `TerminalBridge` (e.g. the
     /// owning view going away without `dismantleUIView` running) leaking the
-    /// WebSocket and receive loop.
+    /// WebSocket and pump.
     deinit {
         detach()
     }
 
-    /// Starts the socket and its receive loop. Call once, right after
+    /// Starts the stream and its event pump. Call once, right after
     /// `makeUIView` creates the terminal.
     func attach(_ terminalView: SwiftTerm.TerminalView) {
         self.terminalView = terminalView
-        webSocketTask.resume()
-        receiveTask = Task { [weak self] in
-            await self?.runReceiveLoop()
+        pumpTask = Task { [weak self] in
+            guard let stream = self?.stream else { return }
+            for await event in await stream.events() {
+                guard !Task.isCancelled, let self else { break }
+                await MainActor.run { self.apply(event) }
+            }
         }
     }
 
-    /// Tears down the socket and cancels the receive loop. Call from
+    /// Tears down the socket and cancels the pump. Call from
     /// `UIViewRepresentable.dismantleUIView` so leaving the screen doesn't
     /// leak an open connection to the harness.
     func detach() {
-        receiveTask?.cancel()
-        receiveTask = nil
-        webSocketTask.cancel(with: .goingAway, reason: nil)
+        pumpTask?.cancel()
+        pumpTask = nil
+        let stream = stream
+        Task { await stream.stop() }
     }
 
-    // MARK: - Receive loop
-
-    private func runReceiveLoop() async {
-        while !Task.isCancelled {
-            let message: URLSessionWebSocketTask.Message
-            do {
-                message = try await webSocketTask.receive()
-            } catch {
-                // Socket closed or errored — the daemon's only actual way
-                // of signaling a detach (it never sends a "detached" JSON
-                // frame; see TerminalWire's doc comment).
-                await MainActor.run { [weak self] in self?.onSessionEnded?() }
-                return
-            }
-
-            let frame: String?
-            switch message {
-            case .string(let text):
-                frame = text
-            case .data(let data):
-                frame = String(data: data, encoding: .utf8)
-            @unknown default:
-                frame = nil
-            }
-            guard let frame, let event = TerminalWire.decodeOutput(frame) else { continue }
-            await handle(event)
-        }
+    /// Wakes a pending reconnect backoff — called when the app returns to
+    /// the foreground so a suspended terminal reattaches immediately instead
+    /// of waiting out up to 30s of backoff.
+    func reconnectNow() {
+        let stream = stream
+        Task { await stream.nudge() }
     }
 
     @MainActor
-    private func handle(_ event: TerminalEvent) {
+    private func apply(_ event: TerminalStreamEvent) {
         switch event {
         case .output(let text):
             terminalView?.feed(text: text)
-        case .exited, .detached:
+        case .exited:
             onSessionEnded?()
-        case .other:
-            break  // "attached"/"event"/"error"/"pong" chatter — not rendered
+        case .connection(let up):
+            onConnectionChanged?(up)
         }
-    }
-
-    // MARK: - Outgoing frames
-
-    private func sendFrame(_ frame: String) {
-        webSocketTask.send(.string(frame)) { _ in }
     }
 
     // MARK: - TerminalViewDelegate
@@ -123,12 +105,16 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     // than left unimplemented (the protocol has no default for most of
     // them on iOS).
 
+    // Synchronous by design: TerminalStream.send/sendResize are nonisolated,
+    // so per-keystroke calls stay in order (an unstructured Task per
+    // keystroke would not).
+
     func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
-        sendFrame(TerminalWire.inputFrame(String(decoding: data, as: UTF8.self)))
+        stream.send(TerminalWire.inputFrame(String(decoding: data, as: UTF8.self)))
     }
 
     func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {
-        sendFrame(TerminalWire.resizeFrame(rows: newRows, cols: newCols))
+        stream.sendResize(rows: newRows, cols: newCols)
     }
 
     func setTerminalTitle(source: SwiftTerm.TerminalView, title: String) {}
