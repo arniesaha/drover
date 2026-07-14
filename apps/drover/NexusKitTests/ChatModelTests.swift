@@ -35,13 +35,16 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func conflictBecomesHintNotError() async throws {
+    // Note: the specific "turn already in flight" conflict queues instead
+    // (see inFlightConflictQueuesTurnAndAutoSendsOnTurnComplete); every
+    // other 409 still surfaces verbatim as a hint.
     MockURLProtocol.handler = { _ in
-        (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        (409, Data(#"{"error": "session is terminating"}"#.utf8))
     }
     let model = ChatModel(client: client(), sessionID: "s1")
     model.composerText = "next thing"
     await model.sendTurn()
-    #expect(model.hint == "turn already in flight")
+    #expect(model.hint == "session is terminating")
     #expect(model.composerText == "next thing")   // preserved for retry
 }
 
@@ -51,9 +54,19 @@ struct ChatModelTests {
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
     let model = ChatModel(client: client(), sessionID: "s1")
-    let newID = await model.handOff()
-    #expect(newID == "harness-continued")
+    let continued = await model.handOff()
+    #expect(continued?.sessionID == "harness-continued")
+    #expect(continued?.isStructured == false)
     #expect(model.hint == nil)
+}
+
+@Test @MainActor func handOffSurfacesStructuredModeForNavigation() async throws {
+    MockURLProtocol.handler = { _ in
+        (201, Data(#"{"session_id": "harness-continued", "mode": "structured"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    let continued = await model.handOff(targetHarness: "codex")
+    #expect(continued?.isStructured == true)
 }
 
 @Test @MainActor func handOffWithTargetHarnessPostsTarget() async throws {
@@ -65,8 +78,8 @@ struct ChatModelTests {
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
     let model = ChatModel(client: client(), sessionID: "s1")
-    let newID = await model.handOff(targetHarness: "codex")
-    #expect(newID == "harness-continued")
+    let continued = await model.handOff(targetHarness: "codex")
+    #expect(continued?.sessionID == "harness-continued")
     #expect(sentTarget == "codex")
 }
 
@@ -90,9 +103,66 @@ struct ChatModelTests {
         (409, Data(#"{"error": "host offline"}"#.utf8))
     }
     let model = ChatModel(client: client(), sessionID: "s1")
-    let newID = await model.handOff()
-    #expect(newID == nil)
+    let continued = await model.handOff()
+    #expect(continued == nil)
     #expect(model.hint == "host offline")
+}
+
+// MARK: - Turn queueing (409 "turn already in flight")
+
+@Test @MainActor func inFlightConflictQueuesTurnAndAutoSendsOnTurnComplete() async throws {
+    nonisolated(unsafe) var turnPosts: [String] = []
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        turnPosts.append(body["text"] as? String ?? "")
+        if turnPosts.count == 1 {
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        }
+        return (202, Data(#"{"turn_id": "t2"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "follow-up question"
+    await model.sendTurn()
+
+    // Rejected turn is queued, not lost — composer clears, soft hint shows.
+    #expect(model.queuedTurn == "follow-up question")
+    #expect(model.composerText.isEmpty)
+    #expect(model.hint == "Queued — sends when the current response finishes.")
+
+    // The harness finishing its turn (status event with turn_complete)
+    // dispatches the queued text automatically.
+    model.ingest(.message(.fixture(seq: 9, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await waitUntil { turnPosts.count == 2 }
+    #expect(turnPosts[1] == "follow-up question")
+    try await waitUntil { model.queuedTurn == nil }
+    #expect(model.hint == nil)
+}
+
+@Test @MainActor func otherConflictsStillSurfaceAsHintNotQueue() async throws {
+    MockURLProtocol.handler = { _ in
+        (409, Data(#"{"error": "approval pending; answer it first"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "do it anyway"
+    await model.sendTurn()
+    #expect(model.queuedTurn == nil)
+    #expect(model.composerText == "do it anyway")   // preserved for retry
+    #expect(model.hint == "approval pending; answer it first")
+}
+
+@Test @MainActor func turnCompleteWithoutQueueIsANoOp() async throws {
+    nonisolated(unsafe) var posts = 0
+    MockURLProtocol.handler = { _ in
+        posts += 1
+        return (202, Data(#"{"turn_id": "t"}"#.utf8))
+    }
+    let model = ChatModel.fixture()
+    model.ingest(.message(.fixture(seq: 1, type: .status,
+                                   payload: ["turn_complete": .bool(true)])))
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(posts == 0)
 }
 
 @Test @MainActor func sentTurnClearsComposer() async throws {

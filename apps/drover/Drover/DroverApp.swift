@@ -2,17 +2,35 @@ import SwiftUI
 import UserNotifications
 import NexusKit
 
+/// Without a `UNUserNotificationCenterDelegate`, iOS silently drops any
+/// local notification that fires while the app is foregrounded — which is
+/// exactly when the near-real-time "response completed" alerts from the
+/// polling path arrive. Presenting as a banner (not an alert) keeps them
+/// glanceable.
+private final class ForegroundNotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound, .badge]
+    }
+}
+
 @main
 struct DroverApp: App {
     @State private var environment = AppEnvironment()
     @Environment(\.scenePhase) private var scenePhase
     private let notifier: Notifying = LocalNotifier()
+    // The notification center holds its delegate weakly — keep it alive for
+    // the app's lifetime.
+    private let notificationPresenter = ForegroundNotificationPresenter()
 
     init() {
         // Must happen before the app finishes launching, so this lives in
         // `init()` rather than an `.onAppear`/`.task` (BGTaskScheduler's
         // documented requirement).
         BackgroundRefresh.register(notifier: notifier)
+        UNUserNotificationCenter.current().delegate = notificationPresenter
     }
 
     var body: some Scene {

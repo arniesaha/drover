@@ -157,25 +157,29 @@ final class E2EValidationUITests: XCTestCase {
                       "reopening the session should replay the transcript")
         shoot(app, "08-chat-resumed")
 
-        // ── 6. Hand off to a terminal via the toolbar menu ────────────────
-        // A handoff (`/continue`) creates a fresh PTY session seeded with the
-        // summarized context, so it opens the Terminal screen — not another
-        // structured chat.
+        // ── 6. Continue the session via the toolbar menu ──────────────────
+        // Continuing a structured-capable session creates a fresh structured
+        // session whose first turn is the server-built handoff context — it
+        // opens another Chat screen, not a terminal.
         app.buttons["chat-menu"].tap()
-        let handOff = app.buttons["Hand off to a terminal"]
+        let handOff = app.buttons["Continue in a new session"]
         XCTAssertTrue(handOff.waitForExistence(timeout: 5))
         shoot(app, "09-chat-menu")
         handOff.tap()
 
-        let terminalBar = app.navigationBars["Terminal"]
-        XCTAssertTrue(terminalBar.waitForExistence(timeout: 60),
-                      "handoff should open the seeded PTY session in the Terminal screen")
-        shoot(app, "10-handoff-terminal")
+        let handoffContext = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS 'Continue this Drover Harness session'")
+        ).firstMatch
+        XCTAssertTrue(handoffContext.waitForExistence(timeout: 60),
+                      "handoff should open a structured chat seeded with the handoff context")
+        XCTAssertFalse(app.navigationBars["Terminal"].exists,
+                       "structured handoff must not land in the Terminal screen")
+        shoot(app, "10-handoff-chat")
 
         // ── 7. Back out; original session is still reachable ──────────────
-        terminalBar.buttons.firstMatch.tap()
+        app.navigationBars["Chat"].buttons.firstMatch.tap()
         XCTAssertTrue(chatBar.waitForExistence(timeout: 10),
-                      "backing out of the handoff terminal returns to the source chat")
+                      "backing out of the handoff chat returns to the source chat")
         shoot(app, "11-back-on-source-chat")
 
         // Hold briefly so external screenshots can catch the final state.

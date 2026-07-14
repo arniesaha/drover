@@ -65,11 +65,16 @@ struct ChatView: View {
             await model.loadHandoffTargets()
         }
         .onDisappear { model.stop() }
-        // A handoff (`/continue`) always creates a PTY session seeded with the
-        // summarized context, not a structured one — so it opens in the
-        // terminal, where the harness CLI (and the typed-in context) is shown.
+        // A handoff (`/continue`) creates a structured session for
+        // structured-capable targets (chat UI, handoff context as the first
+        // turn) and a seeded PTY for shell/native-resume — navigate to
+        // whichever the server actually created.
         .navigationDestination(item: $handoffSession) { handoff in
-            TerminalScreen(client: client, sessionID: handoff.id)
+            if handoff.isStructured {
+                ChatView(client: client, sessionID: handoff.id)
+            } else {
+                TerminalScreen(client: client, sessionID: handoff.id)
+            }
         }
     }
 
@@ -131,10 +136,14 @@ struct ChatView: View {
                 } label: {
                     Label("Interrupt", systemImage: "stop.circle")
                 }
+                // nil target = same harness. Structured-capable harnesses now
+                // continue into a fresh structured chat (the handoff context
+                // becomes its first turn); only shell sources land in a
+                // terminal.
                 Button {
                     Task { await handOff(to: nil) }
                 } label: {
-                    Label("Hand off to a terminal", systemImage: "arrow.triangle.branch")
+                    Label("Continue in a new session", systemImage: "arrow.triangle.branch")
                 }
                 // Per-harness targets from the session's host. "shell" is
                 // deliberately excluded: the seed gets typed into the PTY,
@@ -172,14 +181,16 @@ struct ChatView: View {
     }
 
     private func handOff(to targetHarness: String?) async {
-        if let newSessionID = await model.handOff(targetHarness: targetHarness) {
-            handoffSession = HandoffSession(id: newSessionID)
+        if let continued = await model.handOff(targetHarness: targetHarness) {
+            handoffSession = HandoffSession(id: continued.sessionID,
+                                            isStructured: continued.isStructured)
         }
     }
 }
 
-/// Identifiable wrapper for `.navigationDestination(item:)` — the PTY session
-/// a "Hand off to a terminal" action created.
+/// Identifiable wrapper for `.navigationDestination(item:)` — the session a
+/// handoff created, and which screen it belongs on.
 private struct HandoffSession: Identifiable, Hashable {
     let id: String
+    let isStructured: Bool
 }

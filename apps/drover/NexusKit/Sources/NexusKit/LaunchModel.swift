@@ -49,8 +49,13 @@ public final class LaunchModel {
         Self.ordered(harnesses(forHostID: hostID))
     }
 
+    /// Suggestion paths scoped to the selected host — host-tagged entries
+    /// from other hosts are dropped, host-agnostic favorites always pass.
+    /// Mirrors the web client's datalist filtering.
     public var cwdSuggestions: [String] {
-        snapshot?.cwdSuggestions ?? []
+        (snapshot?.cwdSuggestions ?? [])
+            .filter { $0.hostID == nil || $0.hostID == hostID }
+            .map(\.path)
     }
 
     /// False only for "shell" — every other harness runs in structured mode.

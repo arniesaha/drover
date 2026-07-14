@@ -237,12 +237,43 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     }
 }
 
+// MARK: - CwdSuggestion
+
+/// One working-directory suggestion for the launch sheet. The server sends
+/// objects ({path, source, host_id}), not bare strings — `source` is
+/// "recent session" or "favorite", and `host_id` (absent for favorites)
+/// scopes a suggestion to the host it was seen on.
+public struct CwdSuggestion: Sendable, Equatable, Decodable {
+    public var path: String
+    public var source: String
+    public var hostID: String?
+
+    public init(path: String, source: String = "", hostID: String? = nil) {
+        self.path = path
+        self.source = source
+        self.hostID = hostID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case path
+        case source
+        case hostID = "host_id"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        source = (try? container.decode(String.self, forKey: .source)) ?? ""
+        hostID = try? container.decode(String.self, forKey: .hostID)
+    }
+}
+
 // MARK: - HarnessSnapshot
 
 public struct HarnessSnapshot: Sendable, Decodable {
     public var hosts: [HostSummary]
     public var sessions: [SessionSummary]
-    public var cwdSuggestions: [String]
+    public var cwdSuggestions: [CwdSuggestion]
 
     private enum CodingKeys: String, CodingKey {
         case hosts
@@ -256,7 +287,8 @@ public struct HarnessSnapshot: Sendable, Decodable {
         hosts = lenientDecode(HostSummary.self, from: hostsWrapped)
         let sessionsWrapped = (try? container.decode([LenientElement<SessionSummary>].self, forKey: .sessions)) ?? []
         sessions = lenientDecode(SessionSummary.self, from: sessionsWrapped)
-        cwdSuggestions = (try? container.decode([String].self, forKey: .cwdSuggestions)) ?? []
+        let suggestionsWrapped = (try? container.decode([LenientElement<CwdSuggestion>].self, forKey: .cwdSuggestions)) ?? []
+        cwdSuggestions = lenientDecode(CwdSuggestion.self, from: suggestionsWrapped)
     }
 
     public static func decode(from data: Data) throws -> HarnessSnapshot {

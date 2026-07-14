@@ -140,12 +140,13 @@ struct ClientTests {
         #expect(request.httpMethod == "POST")
         #expect(body["target_host_id"] as? String == "nas")
         #expect(body["target_harness"] as? String == "codex")
-        return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
+        return (201, Data(#"{"session_id": "harness-continued", "mode": "structured"}"#.utf8))
     }
-    let id = try await client().continueSession(sessionID: "s1",
-                                                targetHostID: "nas",
-                                                targetHarness: "codex")
-    #expect(id == "harness-continued")
+    let continued = try await client().continueSession(sessionID: "s1",
+                                                       targetHostID: "nas",
+                                                       targetHarness: "codex")
+    #expect(continued.sessionID == "harness-continued")
+    #expect(continued.isStructured)   // daemon's structured-create response carries mode
 }
 
 @Test func continueSessionDefaultsToEmptyBody() async throws {
@@ -155,8 +156,9 @@ struct ClientTests {
         #expect(body.isEmpty)
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
-    let id = try await client().continueSession(sessionID: "s1")
-    #expect(id == "harness-continued")
+    let continued = try await client().continueSession(sessionID: "s1")
+    #expect(continued.sessionID == "harness-continued")
+    #expect(continued.isStructured == false)   // no mode on the wire → PTY
 }
 
 @Test func healthzSendsNoAuthHeaderAndReturnsTrue() async throws {

@@ -14,7 +14,9 @@ struct LaunchModelTests {
     #expect(model.hostID == "mac-mini")
     #expect(model.harness == "claude-code")
     #expect(model.availableHosts.map(\.id) == ["mac-mini"])
-    #expect(model.cwdSuggestions == ["/Users/arnabmac/jenny/nexus"])
+    // Suggestions are filtered to the selected host (host-agnostic
+    // favorites always pass); the fixture's "nas" entry must not leak in.
+    #expect(model.cwdSuggestions == ["/Users/arnabmac/jenny/nexus", "/Volumes/M2 1/drover"])
     #expect(model.isStructured == true)
 }
 

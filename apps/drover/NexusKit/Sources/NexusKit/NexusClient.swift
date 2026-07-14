@@ -69,12 +69,14 @@ public actor NexusClient {
     }
 
     /// Continues a session as a fresh one seeded with a server-built handoff
-    /// prompt (the central's `nexus_handoff` mode): the server summarizes the
-    /// source transcript into the new session's initial input. Optionally
-    /// retargets a different host and/or harness; both default to the
-    /// source session's own. Returns the new session's id.
+    /// prompt: for structured-capable targets the server creates a structured
+    /// session with the handoff context as its first turn; for shell targets
+    /// (and native resume) it creates a PTY session with a typed-in seed.
+    /// Optionally retargets a different host and/or harness; both default to
+    /// the source session's own. The returned `isStructured` tells the caller
+    /// which screen to open (chat vs terminal).
     public func continueSession(sessionID: String, targetHostID: String? = nil,
-                                targetHarness: String? = nil) async throws -> String {
+                                targetHarness: String? = nil) async throws -> ContinuedSession {
         var payload: [String: Any] = [:]
         if let targetHostID { payload["target_host_id"] = targetHostID }
         if let targetHarness { payload["target_harness"] = targetHarness }
@@ -82,7 +84,8 @@ public actor NexusClient {
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/continue"
         let data = try await request(path: path, method: "POST", body: body)
         let decoded = try decode(CreateSessionResponse.self, from: data)
-        return decoded.sessionID
+        return ContinuedSession(sessionID: decoded.sessionID,
+                                isStructured: decoded.mode == "structured")
     }
 
     public func interrupt(sessionID: String) async throws {
@@ -211,13 +214,30 @@ public actor NexusClient {
     }
 }
 
+// MARK: - ContinuedSession
+
+/// Result of a `/continue` handoff: the new session's id plus whether it is
+/// structured (chat UI) or a PTY (terminal). `mode` is absent on the wire
+/// for PTY creates and older daemons — both mean terminal.
+public struct ContinuedSession: Sendable, Equatable {
+    public let sessionID: String
+    public let isStructured: Bool
+
+    public init(sessionID: String, isStructured: Bool) {
+        self.sessionID = sessionID
+        self.isStructured = isStructured
+    }
+}
+
 // MARK: - Wire response shapes
 
 private struct CreateSessionResponse: Decodable {
     let sessionID: String
+    let mode: String?
 
     private enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
+        case mode
     }
 }
 

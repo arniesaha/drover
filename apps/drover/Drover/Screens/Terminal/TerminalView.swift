@@ -23,6 +23,7 @@ struct TerminalScreen: View {
     let sessionID: String
 
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dismiss) private var dismiss
 
     /// Set once, on the main actor, by `TerminalBridge.onSessionEnded` — the
     /// remote process really exited (the daemon's `exit` frame). Socket
@@ -38,11 +39,19 @@ struct TerminalScreen: View {
     @State private var isReconnecting = false
     @State private var hasConnectedOnce = false
     @State private var bridgeHolder = BridgeHolder()
+    @State private var showTerminateConfirm = false
+    @State private var terminateHint: String?
 
     var body: some View {
         VStack(spacing: 0) {
             if hasConnectedOnce && isReconnecting && !sessionEnded {
                 reconnectingPill
+            }
+            if let terminateHint {
+                Text(terminateHint)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.vertical, 4)
             }
             TerminalRepresentable(
                 client: client,
@@ -57,10 +66,17 @@ struct TerminalScreen: View {
         }
         .navigationTitle("Terminal")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar { toolbarContent }
+        .confirmationDialog("Terminate this session?", isPresented: $showTerminateConfirm,
+                            titleVisibility: .visible) {
+            Button("Terminate", role: .destructive) {
+                Task { await terminateSession() }
+            }
+        }
         .ignoresSafeArea(.container, edges: .bottom)
         .overlay {
             if sessionEnded {
-                SessionEndedOverlay()
+                SessionEndedOverlay { dismiss() }
             }
         }
         // Returning to the foreground: iOS suspended the socket while
@@ -70,6 +86,46 @@ struct TerminalScreen: View {
             if phase == .active {
                 bridgeHolder.bridge?.reconnectNow()
             }
+        }
+    }
+
+    /// Escape hatches for a wedged CLI (e.g. a self-update that hung the
+    /// process): one-tap Ctrl-C over the WebSocket, and a real terminate
+    /// (SIGTERM→SIGKILL to the process group) over REST. Parity with the
+    /// web client's Ctrl-C/Kill buttons.
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                Button {
+                    bridgeHolder.bridge?.sendInterrupt()
+                } label: {
+                    Label("Interrupt (Ctrl-C)", systemImage: "stop.circle")
+                }
+                Button(role: .destructive) {
+                    showTerminateConfirm = true
+                } label: {
+                    Label("Terminate", systemImage: "xmark.octagon")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .accessibilityLabel("Terminal actions")
+            .accessibilityIdentifier("terminal-menu")
+        }
+    }
+
+    private func terminateSession() async {
+        do {
+            try await client.terminate(sessionID: sessionID)
+            // The daemon sends an `exit` frame to attached clients, which
+            // flips the overlay; if none arrives (already-gone session on a
+            // restarted daemon), don't leave the user staring at a frozen
+            // screen — just leave.
+            try? await Task.sleep(for: .seconds(2))
+            if !sessionEnded { dismiss() }
+        } catch {
+            terminateHint = "Could not terminate — try again."
         }
     }
 
@@ -95,13 +151,18 @@ private final class BridgeHolder {
 }
 
 private struct SessionEndedOverlay: View {
+    let onClose: () -> Void
+
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 12) {
             Text("Session ended")
                 .font(.headline)
             Text("The terminal session was closed.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+            Button("Close") { onClose() }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("terminal-session-ended-close")
         }
         .padding()
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))

@@ -40,6 +40,15 @@ struct TerminalWireTests {
         #expect(decoded["cols"] as? Int == 100)
     }
 
+    @Test func interruptFrameEncodesType() throws {
+        // The daemon's `interrupt` frame writes Ctrl-C into the PTY —
+        // the web client's Ctrl-C button uses it; iOS needs parity.
+        let frame = TerminalWire.interruptFrame()
+        let decoded = try #require(decodeJSON(frame))
+        #expect(decoded["type"] as? String == "interrupt")
+        #expect(decoded.count == 1)
+    }
+
     @Test func decodesOutputFrame() {
         let event = TerminalWire.decodeOutput(#"{"type": "output", "data": "hello\r\n"}"#)
         #expect(event == .output("hello\r\n"))

@@ -58,6 +58,12 @@ public enum TerminalWire {
         encode(ResizeFrame(rows: rows, cols: cols))
     }
 
+    /// `{"type": "interrupt"}` — the daemon writes Ctrl-C (0x03) into the
+    /// PTY. Same wire frame the web client's Ctrl-C button sends.
+    public static func interruptFrame() -> String {
+        encode(InterruptFrame())
+    }
+
     public static func decodeOutput(_ frame: String) -> TerminalEvent? {
         guard let data = frame.data(using: .utf8),
               let incoming = try? JSONDecoder().decode(IncomingFrame.self, from: data) else {
@@ -86,6 +92,10 @@ public enum TerminalWire {
         let type = "resize"
         let rows: Int
         let cols: Int
+    }
+
+    private struct InterruptFrame: Encodable {
+        let type = "interrupt"
     }
 
     private struct IncomingFrame: Decodable {

@@ -56,12 +56,16 @@ struct SessionsView: View {
                 store.stopPolling()
             }
         }
-        // Foreground polling keeps the badge in sync through the same
-        // `Notifying` instance the background refresh uses — no new local
-        // alerts here (the list itself is the up-to-date view), just the
-        // app-icon badge count.
-        .onChange(of: store.needsYou) { _, current in
-            Task { await notifier.setBadge(current.count) }
+        // Foreground polling drives the same AttentionWatcher diff the
+        // background refresh uses: newly-needy sessions (a response
+        // completed → "your turn", or an approval appeared) fire a banner
+        // near-real-time, the badge stays in sync, and the shared persisted
+        // seen-set means the BGTask path never double-alerts for the same
+        // transition.
+        .onChange(of: store.needsYou) { _, _ in
+            guard let snapshot = store.snapshot else { return }
+            let watcher = AttentionWatcher(notifier: notifier)
+            Task { await watcher.evaluate(snapshot) }
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -115,7 +119,7 @@ struct SessionsView: View {
             Button {
                 Task { await continueSession(session) }
             } label: {
-                Label("Continue in a terminal", systemImage: "arrow.triangle.branch")
+                Label("Continue session", systemImage: "arrow.triangle.branch")
             }
             // Cross-harness targets from the session's host (via the polled
             // snapshot). "shell" is excluded — the handoff seed gets typed
@@ -137,17 +141,19 @@ struct SessionsView: View {
         return harnesses.filter { $0 != "shell" }
     }
 
-    /// Server-side handoff: launches a fresh PTY session seeded with this
-    /// one's transcript context (the `/continue` endpoint always creates a
-    /// terminal session), then navigates into it. Works on finished sessions
-    /// too — the real "resume a dead session" path. `targetHarness` picks the
-    /// new session's harness (nil keeps the source's). Failures surface
-    /// through the store's `lastError` banner at the top of the list.
+    /// Server-side handoff: continues this session's context in a fresh one
+    /// (structured chat for structured-capable targets, seeded PTY for
+    /// shell), then navigates into whichever the server created. Works on
+    /// finished sessions too — the real "resume a dead session" path.
+    /// `targetHarness` picks the new session's harness (nil keeps the
+    /// source's). Failures surface through the store's `lastError` banner at
+    /// the top of the list.
     private func continueSession(_ session: SessionSummary, targetHarness: String? = nil) async {
-        guard let newSessionID = await store.continueSession(session.id, targetHarness: targetHarness) else {
+        guard let continued = await store.continueSession(session.id, targetHarness: targetHarness) else {
             return
         }
-        launchedSession = LaunchedSession(id: newSessionID, isStructured: false)
+        launchedSession = LaunchedSession(id: continued.sessionID,
+                                          isStructured: continued.isStructured)
     }
 }
 

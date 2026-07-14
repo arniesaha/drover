@@ -83,6 +83,13 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
         Task { await stream.nudge() }
     }
 
+    /// Sends the daemon's `interrupt` frame (Ctrl-C into the PTY) — the
+    /// toolbar's one-tap alternative to the accessory bar's Ctrl-toggle+C
+    /// two-tap sequence.
+    func sendInterrupt() {
+        stream.send(TerminalWire.interruptFrame())
+    }
+
     @MainActor
     private func apply(_ event: TerminalStreamEvent) {
         switch event {

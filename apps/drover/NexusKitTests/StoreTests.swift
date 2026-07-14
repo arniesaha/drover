@@ -37,9 +37,19 @@ struct StoreTests {
 @Test @MainActor func continueSessionReturnsNewIDOnSuccess() async throws {
     MockURLProtocol.handler = { _ in (200, Data(#"{"session_id": "harness-9"}"#.utf8)) }
     let store = SessionStore(client: client())
-    let newID = await store.continueSession("harness-1")
-    #expect(newID == "harness-9")
+    let continued = await store.continueSession("harness-1")
+    #expect(continued?.sessionID == "harness-9")
+    #expect(continued?.isStructured == false)
     #expect(store.lastError == nil)
+}
+
+@Test @MainActor func continueSessionSurfacesStructuredMode() async throws {
+    MockURLProtocol.handler = { _ in
+        (200, Data(#"{"session_id": "harness-9", "mode": "structured"}"#.utf8))
+    }
+    let store = SessionStore(client: client())
+    let continued = await store.continueSession("harness-1", targetHarness: "gemini")
+    #expect(continued?.isStructured == true)
 }
 
 @Test @MainActor func continueSessionPostsTargetHarness() async throws {
@@ -50,8 +60,8 @@ struct StoreTests {
         return (200, Data(#"{"session_id": "harness-9"}"#.utf8))
     }
     let store = SessionStore(client: client())
-    let newID = await store.continueSession("harness-1", targetHarness: "gemini")
-    #expect(newID == "harness-9")
+    let continued = await store.continueSession("harness-1", targetHarness: "gemini")
+    #expect(continued?.sessionID == "harness-9")
     #expect(sentTarget == "gemini")
 }
 

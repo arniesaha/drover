@@ -19,7 +19,10 @@ let snapshotJSON = Data("""
    "status": "running", "awaiting": null, "cwd": null,
    "last_activity": null},
   {"bogus": true}],
- "cwd_suggestions": ["/Users/arnabmac/jenny/nexus"]}
+ "cwd_suggestions": [
+  {"path": "/Users/arnabmac/jenny/nexus", "source": "recent session", "host_id": "mac-mini"},
+  {"path": "/Volumes/M2 1/drover", "source": "favorite"},
+  {"path": "/home/arnab/elsewhere", "source": "recent session", "host_id": "nas"}]}
 """.utf8)
 
 /// Multi-host snapshot for host-switch tests (Task 8). Kept separate from

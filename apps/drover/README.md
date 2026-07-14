@@ -1,10 +1,10 @@
 # Drover
 
-Native iOS client for Nexus's harness API: browse sessions across hosts, see
+Native iOS client for Drover's harness API: browse sessions across hosts, see
 which ones need you, launch new structured sessions, chat with them, and
 attach a real terminal over the WebSocket proxy when you need one. Talks to
-`nexus-server` (default port 7080) over the `/harness` REST + WebSocket
-surface described in the repo-root `README.md`.
+`drover-server` (typically port 7080) over its `/harness` REST + WebSocket
+surface (see the repo-root `README.md` for an overview of the server side).
 
 - App target: `Drover` (`com.arnab.drover`), iOS 18.0+.
 - Unit tests: `DroverTests` is the xcodegen bundle target, but it sources
@@ -13,7 +13,8 @@ surface described in the repo-root `README.md`.
   screens have no unit test target; they're verified live (simulator run)
   instead. Run via the `Drover` scheme.
 - UI tests: `DroverUITests`, run via the separate `DroverUITests` scheme.
-- Local Swift package: `NexusKit` (the `NexusClient` actor + models, no UI).
+- Local Swift package: `NexusKit` (the `NexusClient` actor + models, no UI;
+  package and test target rename to Drover naming is tracked in issue #4).
 - Remote dependency: `SwiftTerm` (terminal emulation for the Terminal tab).
 
 ## Prerequisites
@@ -23,7 +24,7 @@ surface described in the repo-root `README.md`.
   The `.xcodeproj` is generated from `project.yml` and is not committed —
   you must run `xcodegen generate` before the first build and again any time
   `project.yml` or the source file layout changes.
-- A running `nexus-server` reachable from wherever you build/run (simulator
+- A running `drover-server` reachable from wherever you build/run (simulator
   reaches `localhost`/LAN directly; a physical device needs the server
   reachable over Tailscale or your LAN — see the Tailscale note below).
 
@@ -137,7 +138,7 @@ In the app's Settings screen:
 1. Server URL — your Mac's Tailscale IP and port, e.g. `100.x.y.z:7080`
    (see Tailscale note below), or a plain LAN IP/port for same-network use.
 2. Token — paste the contents of `~/.drover/api_token` from the machine
-   running `nexus-server`.
+   running `drover-server`.
 3. Tap "Test & Save". Allow notifications when prompted (needed for
    background "needs you" alerts).
 
@@ -145,7 +146,7 @@ In the app's Settings screen:
 
 Drover has no concept of pairing codes or discovery — it just needs an
 HTTP(S) URL it can reach. Installing [Tailscale](https://tailscale.com) on
-both the Mac running `nexus-server` and the iPhone gives you a stable,
+both the Mac running `drover-server` and the iPhone gives you a stable,
 private URL (the Mac's Tailscale IP) that works over cellular from
 anywhere, without opening any ports on your home network. Note the Mac's
 Tailscale IP (`tailscale ip -4`) and use `http://<that-ip>:7080` as the

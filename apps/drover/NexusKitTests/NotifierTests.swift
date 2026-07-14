@@ -115,6 +115,29 @@ struct NotifierTests {
     #expect(badges == [1, 0, 1])
 }
 
+@Test func evaluateDiffsAProvidedSnapshotWithoutFetching() async throws {
+    // Foreground polling already holds a fresh snapshot — evaluate() must
+    // diff/notify from it directly, no second network fetch. Handler would
+    // fail the test loudly if a fetch happened.
+    MockURLProtocol.handler = { _ in
+        Issue.record("evaluate() must not fetch")
+        return (500, Data())
+    }
+    let snapshot = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-input", harness: "gemini", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
+    ]))
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    await watcher.evaluate(snapshot)
+
+    let notifications = await spy.notifications
+    #expect(notifications.count == 1)
+    #expect(notifications[0].id == "sess-input")
+    #expect(notifications[0].body == "other — your turn")
+    let badges = await spy.badgeCounts
+    #expect(badges == [1])
+}
+
 @Test func fetchFailureChangesNothing() async throws {
     let spy = SpyNotifier()
     let defaults = testDefaults()

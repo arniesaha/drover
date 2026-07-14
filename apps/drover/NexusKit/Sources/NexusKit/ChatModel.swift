@@ -25,6 +25,12 @@ public final class ChatModel {
     public private(set) var pendingApproval: HarnessMessage?
     public private(set) var hint: String?
     public var composerText = ""
+    /// Text the user sent while the harness was mid-turn (codex/gemini
+    /// reject overlapping turns with 409 "turn already in flight"). Held
+    /// here and auto-dispatched when the turn-complete status arrives.
+    /// Claude never 409s on overlap (mid-turn input is steering), so this
+    /// only ever fills for harnesses that actually reject.
+    public private(set) var queuedTurn: String?
 
     // `nonisolated(unsafe)` solely so `deinit` (nonisolated in Swift 6) can
     // cancel it; every other access is from `@MainActor` methods, and deinit
@@ -119,6 +125,7 @@ public final class ChatModel {
         case .message(let message):
             messages.append(message)
             recomputePendingApproval()
+            dispatchQueuedTurnIfComplete(message)
         case .connection(let connected):
             isConnected = connected
             if connected { hasConnectedOnce = true }
@@ -161,9 +168,43 @@ public final class ChatModel {
             _ = try await client.sendTurn(sessionID: sessionID, text: text)
             composerText = ""
             hint = nil
+        } catch NexusError.conflict(let message) where message == "turn already in flight" {
+            // The harness rejects overlapping turns — queue instead of
+            // erroring, and dispatch when the turn-complete status arrives.
+            queuedTurn = queuedTurn.map { "\($0)\n\(text)" } ?? text
+            composerText = ""
+            hint = "Queued — sends when the current response finishes."
         } catch {
-            // Preserve composerText on failure (409 or otherwise) so the
-            // user can retry without retyping.
+            // Preserve composerText on failure (other 409s or transport) so
+            // the user can retry without retyping.
+            applyHint(for: error, action: "send")
+        }
+    }
+
+    /// Every harness driver marks end-of-turn with a `status` message whose
+    /// payload carries `turn_complete: true`. If a turn is queued, this is
+    /// the moment it can be accepted — dispatch it.
+    private func dispatchQueuedTurnIfComplete(_ message: HarnessMessage) {
+        guard message.type == .status,
+              message.payload["turn_complete"]?.boolValue == true,
+              let queued = queuedTurn
+        else { return }
+        queuedTurn = nil
+        Task { await sendQueued(queued) }
+    }
+
+    private func sendQueued(_ text: String) async {
+        do {
+            _ = try await client.sendTurn(sessionID: sessionID, text: text)
+            hint = nil
+        } catch NexusError.conflict(let message) where message == "turn already in flight" {
+            // Raced a new turn (e.g. an approval resumed it) — keep waiting
+            // for the next turn-complete.
+            queuedTurn = queuedTurn.map { "\(text)\n\($0)" } ?? text
+        } catch {
+            // Anything else: hand the text back to the composer for a
+            // manual retry rather than dropping it silently.
+            composerText = composerText.isEmpty ? text : "\(text)\n\(composerText)"
             applyHint(for: error, action: "send")
         }
     }
@@ -184,14 +225,15 @@ public final class ChatModel {
 
     /// Hands this session off to a fresh one seeded with the server-built
     /// handoff context, optionally retargeting a different harness (nil
-    /// keeps the source session's own). Returns the new session's id, or
-    /// nil on failure (with the server's explanation surfaced as a hint).
-    public func handOff(targetHarness: String? = nil) async -> String? {
+    /// keeps the source session's own). Returns the new session (id plus
+    /// whether it's structured, for navigation), or nil on failure (with
+    /// the server's explanation surfaced as a hint).
+    public func handOff(targetHarness: String? = nil) async -> ContinuedSession? {
         do {
-            let newSessionID = try await client.continueSession(sessionID: sessionID,
-                                                                targetHarness: targetHarness)
+            let continued = try await client.continueSession(sessionID: sessionID,
+                                                             targetHarness: targetHarness)
             hint = nil
-            return newSessionID
+            return continued
         } catch {
             applyHint(for: error, action: "hand off")
             return nil

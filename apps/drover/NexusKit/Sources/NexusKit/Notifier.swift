@@ -67,7 +67,15 @@ public struct AttentionWatcher: Sendable {
         } catch {
             return  // silence: never a false alert, never a lost seen-set
         }
+        await evaluate(snapshot)
+    }
 
+    /// Diff/notify from a snapshot the caller already holds — the foreground
+    /// polling path (SessionStore refreshes every few seconds) drives this so
+    /// "response completed" alerts arrive near-real-time without a second
+    /// fetch. Shares the persisted seen-set with the BGTask path, so the two
+    /// never double-alert for the same transition.
+    public func evaluate(_ snapshot: HarnessSnapshot) async {
         let needsYou = snapshot.sessions.filter {
             $0.attention == .needsApproval || $0.attention == .needsInput
         }

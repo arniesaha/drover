@@ -61,6 +61,18 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(s.attention == expected)
 }
 
+/// The server sends cwd suggestions as objects ({path, source, host_id}) —
+/// regression guard for the silent [] that decoding them as [String]
+/// produced (the launch sheet's suggestion menu was always empty).
+@Test func cwdSuggestionsDecodeTheServerObjectShape() throws {
+    let snap = try HarnessSnapshot.decode(from: snapshotJSON)
+    #expect(snap.cwdSuggestions.count == 3)
+    #expect(snap.cwdSuggestions[0].path == "/Users/arnabmac/jenny/nexus")
+    #expect(snap.cwdSuggestions[0].source == "recent session")
+    #expect(snap.cwdSuggestions[0].hostID == "mac-mini")
+    #expect(snap.cwdSuggestions[1].hostID == nil)   // favorites are host-agnostic
+}
+
 @Test func messagesDecodeLeniently() throws {
     let batch = try MessageBatch.decode(from: messagesJSON)
     #expect(batch.maxSeq == 3)
