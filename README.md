@@ -2,66 +2,57 @@
 
 > Drive your whole agent fleet — from your pocket.
 
-**Drover** is the local-first cockpit for driving a personal fleet of CLI
+**Drover** is a local-first cockpit for driving a personal fleet of CLI
 coding agents (Claude Code, Codex, Gemini) across your own machines, from
-anywhere. It is the rebrand and clean re-seed of the project formerly called
-**Nexus**.
+anywhere. Agent sessions and traces land in a local DuckDB context store; a
+harness control plane lets you watch, chat with, and hand off running
+sessions from a native iOS app or a phone-friendly web UI. There is no cloud
+component — everything runs on hardware you own.
 
-This directory (`/Volumes/M2 1/drover`) is the **new home** for Drover. It
-starts as a handoff-docs seed; a fresh working session in this path will turn
-it into the real repository and execute the port from Nexus.
+## Components
 
----
+The server side lives in `src/drover/` and installs as console scripts (see
+`pyproject.toml`):
 
-## Start here (for the fresh session)
+- **`drover-server`** — central control plane: event ingest into the DuckDB
+  context store, plus the `/harness` REST + WebSocket API (session list,
+  chat, terminal proxy) and the web UI that clients talk to.
+- **`drover-harnessd`** — per-host data plane: owns the PTY/tmux processes
+  that run the actual CLI agents and registers them with the central server.
+- **`drover-collect`** — per-host shipper: parses agent CLI logs and ships
+  events to the server.
+- **`drover-hook`** — lifecycle hook CLI invoked by agent harness hooks
+  (e.g. Claude Code SessionStart/SessionEnd).
+- **iOS app** — native client in [`apps/drover/`](apps/drover/README.md):
+  browse sessions across hosts, chat with them, attach a real terminal.
 
-Read these in order, then decide what to build first:
+## Repository layout
 
-1. **[docs/north-star.md](docs/north-star.md)** — philosophy, positioning,
-   audience, the four capability pillars, brand identity (name, tagline,
-   mascot, voice), and visual direction. The umbrella every downstream
-   decision pulls from.
-2. **[docs/porting-and-cutover.md](docs/porting-and-cutover.md)** — what
-   migrates from Nexus (the DuckDB context layer + every interface worth
-   keeping), the `nexus→drover` rename map with compatibility aliases, and
-   the device-by-device cutover plan for the Mac Mini and the NAS. Includes
-   the destructive/live-service steps clearly flagged.
+```
+src/drover/     Python package: server, harness daemon, collector, hooks
+apps/drover/    Native iOS client (SwiftUI, XcodeGen project)
+docs/           Architecture and design docs
+deploy/         Kubernetes manifests and Grafana dashboards
+scripts/        Install scripts, launchd/systemd units, operational tooling
+tests/          Python test suite (pytest)
+```
 
-The design decisions and their rationale are recorded inline in both docs
-(look for **Decision:** callouts) so nothing is re-litigated.
+## Getting started
 
-## Repo strategy (decided)
+Requires Python 3.11+.
 
-**New repository, cleanly seeded from Nexus — not a rename-in-place.**
+```bash
+uv sync            # or: pip install -e .
+uv run pytest      # run the test suite
+```
 
-Rationale (full version in porting-and-cutover.md §1):
-- The OSS release (Nexus issue #177) *requires* a sanitized-history reset —
-  the Nexus git history carries private hostnames, personal paths, dogfood
-  memory, and possibly tokens in old commits, which can never be made public.
-- We are relocating to `/Volumes/M2 1/drover` regardless (fresh clone + venv
-  rebuild happens either way), so this is the cheapest moment to do the clean
-  seed — once, now, instead of twice later.
-- A new repo lets Drover be branded from commit 1 with the new package
-  structure (`src/drover/`, `apps/drover/`) and no legacy baggage.
-- Nothing is lost: the `arniesaha/nexus` repo stays as a **private archive**
-  and keeps running the live fleet until each device is cut over.
+## Documentation
 
-The runtime "compat aliases" (`nexus-*` CLI shims, `NEXUS_API_TOKEN`
-acceptance, `~/.nexus` symlink) are code/config in the new repo — unrelated
-to git history — and exist only to make the device cutover non-breaking.
+- [docs/north-star.md](docs/north-star.md) — philosophy, positioning,
+  audience, and the capability pillars.
+- [docs/architecture.md](docs/architecture.md) — system architecture: the
+  context store, ingest pipeline, and harness control plane.
 
-## What is NOT in this handoff
+## License
 
-- No code, no migration, no service changes have been executed. These are
-  design + porting **specifications**. The fresh session implements them,
-  gated behind the usual plan→build→review flow.
-- Live services still run from the Nexus checkout (`~/jenny/nexus`) against
-  `/Volumes/M2 1/nexus`. Do not decommission them until the cutover steps in
-  porting-and-cutover.md §5 are done and verified per device.
-
-## Provenance
-
-Seeded 2026-07-07 from Nexus at `~/jenny/nexus` (main @ `27588ed`, the merge
-of `worktree-drover-ios-cockpit` — supersedes the `5614750` pin in the first
-draft of these docs; the merge carries the iOS-cockpit fixes this spec says to
-keep). Git author for all Drover work: `arniesaha <arniesaha@gmail.com>`.
+Apache-2.0 — see [LICENSE](LICENSE).
