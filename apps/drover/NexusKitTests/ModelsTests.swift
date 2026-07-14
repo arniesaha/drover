@@ -71,6 +71,32 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(batch.messages[2].type == .unknown)  // future type degrades
 }
 
+// The chat transcript renders `displayText`, parsed from markdown exactly
+// once per message (at decode/init) — parsing per render pass (what
+// `Text(LocalizedStringKey)` does) saturates the main thread during long
+// streams and contributes to the LazyVStack blanking.
+
+@Test func displayTextParsesInlineMarkdown() {
+    let message = HarnessMessage(seq: 1, type: .assistantOutput,
+                                 text: "hello **bold** world")
+    #expect(String(message.displayText.characters) == "hello bold world")
+    let hasBold = message.displayText.runs.contains { run in
+        run.inlinePresentationIntent?.contains(.stronglyEmphasized) == true
+    }
+    #expect(hasBold)
+}
+
+@Test func displayTextPreservesNewlinesAndPlainText() {
+    let message = HarnessMessage(seq: 1, type: .assistantOutput,
+                                 text: "line one\nline two")
+    #expect(String(message.displayText.characters) == "line one\nline two")
+}
+
+@Test func displayTextSurvivesDecoding() throws {
+    let batch = try MessageBatch.decode(from: messagesJSON)
+    #expect(String(batch.messages[0].displayText.characters) == "hi")
+}
+
 @Test func jsonValueRoundTrip() throws {
     let data = Data(#"{"a": 1, "b": [true, null, "x"], "c": {"d": 2.5}}"#.utf8)
     let value = try JSONDecoder().decode([String: JSONValue].self, from: data)

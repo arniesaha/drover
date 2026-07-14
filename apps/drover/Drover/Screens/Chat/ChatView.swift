@@ -11,6 +11,7 @@ struct ChatView: View {
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
     @State private var handoffSession: HandoffSession?
+    @State private var pendingScroll: Task<Void, Never>?
 
     init(client: NexusClient, sessionID: String) {
         self.client = client
@@ -83,12 +84,29 @@ struct ChatView: View {
                 }
                 .padding()
             }
+            // Auto-scroll is coalesced and unanimated on purpose: firing an
+            // animated scrollTo per appended message piles up overlapping
+            // animations faster than they can finish, and a LazyVStack under
+            // that load de-materializes the visible rows — the screen goes
+            // blank until the subtree is rebuilt (the "leave and come back"
+            // workaround). One unanimated scroll per ~120ms window, always
+            // to whatever is newest by the time it fires, keeps the
+            // transcript following the stream without the animation storm.
             .onChange(of: model.messages.last?.id) { _, newestID in
-                guard let newestID else { return }
-                withAnimation {
-                    proxy.scrollTo(newestID, anchor: .bottom)
-                }
+                guard newestID != nil else { return }
+                scheduleScroll(with: proxy)
             }
+            .onDisappear { pendingScroll?.cancel() }
+        }
+    }
+
+    private func scheduleScroll(with proxy: ScrollViewProxy) {
+        guard pendingScroll == nil else { return }
+        pendingScroll = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(120))
+            pendingScroll = nil
+            guard !Task.isCancelled, let newestID = model.messages.last?.id else { return }
+            proxy.scrollTo(newestID, anchor: .bottom)
         }
     }
 

@@ -41,7 +41,10 @@ struct MessageBubble: View {
                 }
                 .font(.callout)
             } else {
-                Text(.init(message.text))
+                // displayText is markdown parsed once at decode —
+                // `Text(.init(...))` would re-parse on every render pass,
+                // which is measurable during long streams.
+                Text(message.displayText)
                     .padding(10)
                     .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
             }
@@ -52,7 +55,7 @@ struct MessageBubble: View {
     private var userBubble: some View {
         HStack {
             Spacer(minLength: 32)
-            Text(.init(message.text))
+            Text(message.displayText)
                 .padding(10)
                 .foregroundStyle(.white)
                 .background(.tint, in: RoundedRectangle(cornerRadius: 12))

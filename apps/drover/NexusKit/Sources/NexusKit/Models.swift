@@ -292,6 +292,18 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
     public var turnID: String?
     public var timestamp: Date?
     public var payload: [String: JSONValue]  // tolerant free-form
+    /// `text` with inline markdown parsed, computed exactly once here so the
+    /// transcript never re-parses on render passes — `Text(LocalizedStringKey)`
+    /// parses markdown on every pass, which saturates the main thread during
+    /// long streams (a contributor to the LazyVStack blanking).
+    public var displayText: AttributedString
+
+    private static func parseDisplayText(_ text: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return (try? AttributedString(markdown: text, options: options))
+            ?? AttributedString(text)
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id = "event_id"
@@ -316,6 +328,7 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         let rawTimestamp = try? container.decode(String.self, forKey: .timestamp)
         timestamp = WireDate.parse(rawTimestamp)
         payload = (try? container.decode([String: JSONValue].self, forKey: .payload)) ?? [:]
+        displayText = Self.parseDisplayText(text)
     }
 
     /// Test-only direct construction, bypassing JSON decoding entirely. Not
@@ -340,6 +353,7 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         self.turnID = turnID
         self.timestamp = timestamp
         self.payload = payload
+        self.displayText = Self.parseDisplayText(text)
     }
 }
 
