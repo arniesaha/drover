@@ -976,6 +976,83 @@ def test_harnessd_reconciles_orphaned_structured_sessions_on_startup(tmp_path):
         server.server_close()
 
 
+def test_harnessd_reconciles_orphaned_pty_sessions_on_startup(tmp_path):
+    # Simulate a killed daemon process: PTY-mode rows left "running" (or
+    # created/starting) in the registry with no live PTY behind them anymore
+    # (the PtySessionManager that owned them died with the old process; the
+    # fresh one is always empty at boot). create_harness_server must finalize
+    # them as completed before serving a single request, while leaving other
+    # hosts' rows alone.
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(host_id="test-host", display_name="Test Host", kind="linux")
+    registry.register_host(host_id="other-host", display_name="Other", kind="linux")
+    registry.create_session(
+        host_id="test-host",
+        harness="shell",
+        command="/bin/sh",
+        session_id="harness-pty-orphan",
+        status="running",
+        mode="pty",
+    )
+    registry.create_session(
+        host_id="test-host",
+        harness="claude-code",
+        command="claude",
+        session_id="harness-pty-orphan-starting",
+        status="starting",
+        mode="pty",
+    )
+    registry.create_session(
+        host_id="test-host",
+        harness="shell",
+        command="/bin/sh",
+        session_id="harness-pty-done",
+        status="completed",
+        mode="pty",
+    )
+    registry.create_session(
+        host_id="other-host",
+        harness="shell",
+        command="/bin/sh",
+        session_id="harness-pty-elsewhere",
+        status="running",
+        mode="pty",
+    )
+    state = HarnessDaemonState(
+        host_id="test-host",
+        display_name="Test Host",
+        kind="linux",
+        registry=registry,
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        local_url="http://127.0.0.1:0",
+    )
+    server = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
+    try:
+        for session_id in ("harness-pty-orphan", "harness-pty-orphan-starting"):
+            session = registry.get_session(session_id)
+            assert session is not None
+            assert session.status == "completed"
+            assert session.last_error == "daemon restarted; PTY session lost"
+            assert session.ended_at is not None
+
+        done = registry.get_session("harness-pty-done")
+        assert done is not None
+        assert done.status == "completed"
+        assert done.last_error is None
+
+        elsewhere = registry.get_session("harness-pty-elsewhere")
+        assert elsewhere is not None
+        assert elsewhere.status == "running"
+        assert elsewhere.ended_at is None
+    finally:
+        state.pty.close_all()
+        server.server_close()
+
+
 def test_harnessd_terminates_live_session_and_updates_registry(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     try:

@@ -2207,36 +2207,45 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
 
 _ORPHANED_STRUCTURED_ERROR = "daemon restarted; structured session lost"
+_ORPHANED_PTY_ERROR = "daemon restarted; PTY session lost"
+_ORPHANED_STATUSES = ("created", "starting", "running")
 
 
 def reconcile_structured_sessions(state: HarnessDaemonState) -> None:
-    """Finalize structured sessions orphaned by a killed daemon process.
+    """Finalize sessions orphaned by a killed daemon process.
 
     A daemon restart (crash, deploy, `systemctl restart`, ...) kills every
-    driver subprocess without any chance to finalize its registry row: the
-    in-memory StructuredSessionManager that owned it is gone too, so no
-    /turns or /permission call can ever reach it again. Any mode="structured"
-    row for this host still "starting"/"running" from before this process
-    started is therefore stale -- mark it errored so it stops looking like a
-    live session (see _list_sessions, which now surfaces registry-only
-    structured rows precisely so a reconciled row like this stays visible
-    instead of silently vanishing).
+    driver subprocess and PTY child without any chance to finalize their
+    registry rows: the in-memory StructuredSessionManager and
+    PtySessionManager that owned them are gone too, so no /turns,
+    /permission, or terminal attach can ever reach them again. Any row for
+    this host still "created"/"starting"/"running" from before this process
+    started is therefore stale:
+
+    - mode="structured" rows are marked errored so they stop looking like a
+      live session (see _list_sessions, which now surfaces registry-only
+      structured rows precisely so a reconciled row like this stays visible
+      instead of silently vanishing).
+    - PTY rows (mode="pty" or unset) are finalized as completed -- the fresh
+      PtySessionManager is always empty at boot, so none of them can have a
+      live PTY behind them.
     """
     try:
         sessions = state.registry.list_sessions(host_id=state.host_id)
     except Exception:
         return
     for session in sessions:
-        if session.mode != "structured" or session.status not in (
-            "starting",
-            "running",
-        ):
+        if session.status not in _ORPHANED_STATUSES:
             continue
+        if session.mode == "structured":
+            status, last_error = "errored", _ORPHANED_STRUCTURED_ERROR
+        else:
+            status, last_error = "completed", _ORPHANED_PTY_ERROR
         try:
             state.registry.update_session_status(
                 session.session_id,
-                "errored",
-                last_error=_ORPHANED_STRUCTURED_ERROR,
+                status,
+                last_error=last_error,
                 ended_at=datetime.now(timezone.utc),
             )
         except Exception:

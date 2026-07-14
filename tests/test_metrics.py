@@ -211,6 +211,10 @@ class _FakeHarnessHandler(BaseHTTPRequestHandler):
                 "harness": body.get("harness"),
                 "cwd": body.get("cwd"),
             }
+            # Mirror harnessd: the structured create response advertises its
+            # mode so clients can route to the structured UI.
+            if body.get("mode") == "structured":
+                response["mode"] = "structured"
         elif self.path == "/sessions/harness-running/terminate":
             response = {"session_id": "harness-running", "status": "terminated"}
         elif self.path == "/sessions/harness-running/turns":
@@ -840,6 +844,131 @@ def test_metrics_http_server_proxies_harness_launch_and_terminate(tmp_path):
     assert terminated.ended_at is not None
 
 
+def test_terminate_tombstones_session_missing_on_daemon(tmp_path):
+    # Daemon restarted: the registry row is still "running" but harnessd
+    # answers 404 for the session id. Central terminate must tombstone the
+    # row and report success instead of proxying the 404 to the client.
+    _FakeHarnessHandler.requests = []
+    harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
+    harness_thread = metrics.threading.Thread(
+        target=harness_server.serve_forever, daemon=True
+    )
+    harness_thread.start()
+    harness_port = harness_server.server_address[1]
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        local_url=f"http://127.0.0.1:{harness_port}",
+        capabilities={"harnesses": [{"name": "shell", "enabled": True}]},
+    )
+    registry.create_session(
+        session_id="harness-stale",
+        host_id="mac-mini",
+        harness="shell",
+        command="/bin/sh",
+        status="running",
+    )
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        terminate = Request(
+            f"http://127.0.0.1:{port}/harness/sessions/harness-stale/terminate",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json", **_AUTH_HEADERS},
+        )
+        with urlopen(terminate, timeout=3) as res:
+            status = res.status
+            payload = json.loads(res.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        harness_server.shutdown()
+        harness_server.server_close()
+
+    assert status == 200
+    assert payload["session_id"] == "harness-stale"
+    assert payload["status"] == "terminated"
+    assert payload["stale"] is True
+    session = HarnessRegistry(duckdb_path).get_session("harness-stale")
+    assert session is not None
+    assert session.status == "terminated"
+    assert session.ended_at is not None
+
+
+def test_terminate_tombstones_session_on_unreachable_host(tmp_path):
+    # Host offline: proxying the terminate fails outright (connection
+    # refused). Central terminate must still tombstone the row and report
+    # success instead of surfacing a 502.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        local_url=f"http://127.0.0.1:{dead_port}",
+        capabilities={"harnesses": [{"name": "shell", "enabled": True}]},
+    )
+    registry.create_session(
+        session_id="harness-unreachable",
+        host_id="nas",
+        harness="shell",
+        command="/bin/sh",
+        status="running",
+    )
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        terminate = Request(
+            f"http://127.0.0.1:{port}/harness/sessions/harness-unreachable/terminate",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json", **_AUTH_HEADERS},
+        )
+        with urlopen(terminate, timeout=5) as res:
+            status = res.status
+            payload = json.loads(res.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert payload["session_id"] == "harness-unreachable"
+    assert payload["status"] == "terminated"
+    assert payload["stale"] is True
+    session = HarnessRegistry(duckdb_path).get_session("harness-unreachable")
+    assert session is not None
+    assert session.status == "terminated"
+    assert session.ended_at is not None
+
+
 def test_proxy_forwards_bearer_to_harnessd(tmp_path):
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
@@ -1068,18 +1197,102 @@ def test_metrics_http_server_continues_session_with_nexus_handoff(tmp_path):
         harness_server.server_close()
 
     assert payload["session_id"] == "harness-proxied"
+    # Structured-capable target: the client needs mode=structured in the
+    # response body to navigate to the structured session UI.
+    assert payload["mode"] == "structured"
     launch = _FakeHarnessHandler.requests[0]["body"]
     assert launch["harness"] == "codex"
     assert launch["cwd"] == "/Users/arnabmac/jenny/nexus"
     assert launch["source_session_id"] == "harness-source"
     assert launch["handoff_mode"] == "nexus_handoff"
-    assert "Continue this Drover Harness session" in launch["initial_input"]
-    assert "We just implemented central host heartbeats." in launch["initial_input"]
+    # Handoff to a structured-capable harness launches a structured session
+    # and delivers the handoff text as the first turn ("prompt"), never as a
+    # typed PTY seed ("initial_input") racing the CLI's cold start.
+    assert launch["mode"] == "structured"
+    assert "initial_input" not in launch
+    assert "rows" not in launch
+    assert "cols" not in launch
+    assert "Continue this Drover Harness session" in launch["prompt"]
+    assert "We just implemented central host heartbeats." in launch["prompt"]
     created = HarnessRegistry(duckdb_path).get_session("harness-proxied")
     assert created is not None
     assert created.source_session_id == "harness-source"
     assert created.handoff_mode == "nexus_handoff"
     assert created.cwd == "/Users/arnabmac/jenny/nexus"
+    assert created.mode == "structured"
+
+
+def test_metrics_http_server_continue_to_shell_target_keeps_pty_seed(tmp_path):
+    _FakeHarnessHandler.requests = []
+    harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
+    harness_thread = metrics.threading.Thread(
+        target=harness_server.serve_forever, daemon=True
+    )
+    harness_thread.start()
+    harness_port = harness_server.server_address[1]
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        local_url=f"http://127.0.0.1:{harness_port}",
+        capabilities={
+            "harnesses": [
+                {"name": "claude-code", "enabled": True},
+                {"name": "shell", "enabled": True},
+            ]
+        },
+    )
+    source = registry.create_session(
+        session_id="harness-source",
+        host_id="mac-mini",
+        harness="claude-code",
+        command="claude",
+        status="running",
+        cwd="/Users/arnabmac/jenny/nexus",
+    )
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        request = Request(
+            f"http://127.0.0.1:{port}/harness/sessions/{source.session_id}/continue",
+            data=json.dumps(
+                {"target_host_id": "mac-mini", "target_harness": "shell"}
+            ).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", **_AUTH_HEADERS},
+        )
+        with urlopen(request, timeout=3) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        harness_server.shutdown()
+        harness_server.server_close()
+
+    assert payload["session_id"] == "harness-proxied"
+    assert "mode" not in payload
+    launch = _FakeHarnessHandler.requests[0]["body"]
+    assert launch["harness"] == "shell"
+    assert launch["handoff_mode"] == "nexus_handoff"
+    # Shell has no structured driver: the handoff still goes through the PTY
+    # typed-seed path.
+    assert "mode" not in launch
+    assert "prompt" not in launch
+    assert launch["rows"] == 32
+    assert launch["cols"] == 100
+    assert "Continue this Drover Harness session" in launch["initial_input"]
 
 
 def test_metrics_http_server_continues_session_with_native_resume(tmp_path):
@@ -1149,6 +1362,10 @@ def test_metrics_http_server_continues_session_with_native_resume(tmp_path):
     assert launch["handoff_mode"] == "native_resume"
     assert launch["native_resume"]["session_id"] == "claude-native-1"
     assert "initial_input" not in launch
+    # Native resume stays on the PTY path: the harness CLI replays its own
+    # native session, so no structured first-turn prompt is involved.
+    assert "mode" not in launch
+    assert "prompt" not in launch
     created = HarnessRegistry(duckdb_path).get_session("harness-proxied")
     assert created is not None
     assert created.native_session_id == "claude-native-1"

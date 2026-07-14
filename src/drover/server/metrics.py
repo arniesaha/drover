@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlencode, urlparse
 
-from drover.server.harness.daemon import native_transcript_for_session
+from drover.server.harness.daemon import (
+    _STRUCTURED_DEFAULT_COMMANDS,
+    native_transcript_for_session,
+)
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.jobs import RedisJobStream
 from drover.server.observatory import pipeline_observatory_snapshot
@@ -33,6 +36,12 @@ _HARNESS_FAVORITE_CWDS = (
 )
 
 _HARNESS_STALE_AFTER_SECONDS = 45
+
+# Harnesses harnessd can drive as structured sessions (claude-code, codex,
+# gemini). A nexus handoff to one of these launches mode="structured" and
+# delivers the handoff text as the first turn -- strictly more reliable than
+# typing it into a cold PTY (no startup-gate race).
+_STRUCTURED_HANDOFF_HARNESSES = frozenset(_STRUCTURED_DEFAULT_COMMANDS)
 
 
 def _label_value(value: object) -> str:
@@ -509,6 +518,21 @@ class MetricsCollector:
         )
         if 200 <= status < 300:
             self._sync_terminated_harness_session(session_id, body)
+            return status, body
+        if status in (404, 502):
+            # The daemon no longer knows this session (restart lost it) or
+            # the host is unreachable entirely. Either way there is nothing
+            # left to terminate on the host -- tombstone the registry row so
+            # it stops looking alive, and report success to the client.
+            self._tombstone_stale_harness_session(session_id)
+            return _json_response(
+                200,
+                {
+                    "session_id": session_id,
+                    "status": "terminated",
+                    "stale": True,
+                },
+            )
         return status, body
 
     def proxy_harness_session_action(
@@ -644,6 +668,29 @@ class MetricsCollector:
         target_harness = str(payload.get("target_harness") or source.harness)
         native_resume = payload.get("native_resume")
         handoff_mode = "native_resume" if native_resume else "nexus_handoff"
+        if not native_resume and target_harness in _STRUCTURED_HANDOFF_HARNESSES:
+            # Nexus handoff to a structured-capable harness: launch a
+            # structured session and deliver the handoff text as the first
+            # turn ("prompt"). The daemon sends it once the driver is up, so
+            # there is no typed-seed race against the CLI's cold start (and
+            # no rows/cols/initial_input -- those are PTY concepts).
+            structured_payload: dict[str, Any] = {
+                "mode": "structured",
+                "harness": target_harness,
+                "cwd": source.cwd,
+                "repo_owner": source.repo_owner,
+                "repo_name": source.repo_name,
+                "branch": source.branch,
+                "source_session_id": source.session_id,
+                "handoff_mode": "nexus_handoff",
+                "prompt": self._build_handoff_prompt(
+                    source,
+                    target_harness=target_harness,
+                ),
+            }
+            return self.proxy_create_harness_session(
+                target_host_id, structured_payload
+            )
         launch_payload: dict[str, Any] = {
             "harness": target_harness,
             "cwd": source.cwd,
@@ -711,6 +758,22 @@ class MetricsCollector:
             body.strip()[:300],
         )
         return True
+
+    def _tombstone_stale_harness_session(self, session_id: str) -> None:
+        # Mirrors _sync_terminated_harness_session's terminal status so the
+        # row buckets as done on clients, but records why the daemon never
+        # acknowledged the terminate.
+        try:
+            HarnessRegistry(self.duckdb_path).update_session_status(
+                session_id,
+                "terminated",
+                ended_at=datetime.now(timezone.utc),
+                last_error="session missing on host; tombstoned by central terminate",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "failed to tombstone stale harness session %s: %s", session_id, exc
+            )
 
     def _mark_harness_session_missing_on_host(self, session_id: str) -> None:
         try:
