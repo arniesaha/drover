@@ -42,6 +42,19 @@ struct StoreTests {
     #expect(store.lastError == nil)
 }
 
+@Test @MainActor func continueSessionPostsTargetHarness() async throws {
+    nonisolated(unsafe) var sentTarget: String?
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentTarget = body["target_harness"] as? String
+        return (200, Data(#"{"session_id": "harness-9"}"#.utf8))
+    }
+    let store = SessionStore(client: client())
+    let newID = await store.continueSession("harness-1", targetHarness: "gemini")
+    #expect(newID == "harness-9")
+    #expect(sentTarget == "gemini")
+}
+
 @Test @MainActor func continueSessionSurfacesServerExplanation() async throws {
     MockURLProtocol.handler = { _ in (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8)) }
     let store = SessionStore(client: client())

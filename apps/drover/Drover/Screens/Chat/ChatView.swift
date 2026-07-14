@@ -59,7 +59,10 @@ struct ChatView: View {
                 Task { await model.terminate() }
             }
         }
-        .task { model.start() }
+        .task {
+            model.start()
+            await model.loadHandoffTargets()
+        }
         .onDisappear { model.stop() }
         // A handoff (`/continue`) always creates a PTY session seeded with the
         // summarized context, not a structured one — so it opens in the
@@ -111,13 +114,27 @@ struct ChatView: View {
                     Label("Interrupt", systemImage: "stop.circle")
                 }
                 Button {
-                    Task {
-                        if let newSessionID = await model.handOff() {
-                            handoffSession = HandoffSession(id: newSessionID)
-                        }
-                    }
+                    Task { await handOff(to: nil) }
                 } label: {
                     Label("Hand off to a terminal", systemImage: "arrow.triangle.branch")
+                }
+                // Per-harness targets from the session's host. "shell" is
+                // deliberately excluded: the seed gets typed into the PTY,
+                // and a bare shell would execute the handoff summary as
+                // commands. The nil-target button above already covers the
+                // same-harness case.
+                if !crossHarnessTargets.isEmpty {
+                    Menu {
+                        ForEach(crossHarnessTargets, id: \.self) { harness in
+                            Button {
+                                Task { await handOff(to: harness) }
+                            } label: {
+                                Label(harness, systemImage: "arrow.triangle.branch")
+                            }
+                        }
+                    } label: {
+                        Label("Hand off to another harness", systemImage: "arrow.triangle.swap")
+                    }
                 }
                 Button(role: .destructive) {
                     showTerminateConfirm = true
@@ -129,6 +146,16 @@ struct ChatView: View {
             }
             .accessibilityLabel("Session actions")
             .accessibilityIdentifier("chat-menu")
+        }
+    }
+
+    private var crossHarnessTargets: [String] {
+        model.handoffHarnesses.filter { $0 != "shell" }
+    }
+
+    private func handOff(to targetHarness: String?) async {
+        if let newSessionID = await model.handOff(targetHarness: targetHarness) {
+            handoffSession = HandoffSession(id: newSessionID)
         }
     }
 }

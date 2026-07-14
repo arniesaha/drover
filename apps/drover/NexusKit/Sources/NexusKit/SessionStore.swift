@@ -73,10 +73,13 @@ public final class SessionStore {
     /// id, or nil on failure with the explanation routed through `lastError`
     /// (the same banner refresh failures use). 409/400 carry a server-authored
     /// message surfaced verbatim; anything else gets a generic hint.
-    public func continueSession(_ sessionID: String) async -> String? {
+    /// `targetHarness` retargets the new session's harness; nil keeps the
+    /// source session's own.
+    public func continueSession(_ sessionID: String, targetHarness: String? = nil) async -> String? {
         guard let client else { return nil }
         do {
-            let newSessionID = try await client.continueSession(sessionID: sessionID)
+            let newSessionID = try await client.continueSession(sessionID: sessionID,
+                                                                targetHarness: targetHarness)
             lastError = nil
             return newSessionID
         } catch {

@@ -56,6 +56,35 @@ struct ChatModelTests {
     #expect(model.hint == nil)
 }
 
+@Test @MainActor func handOffWithTargetHarnessPostsTarget() async throws {
+    nonisolated(unsafe) var sentTarget: String?
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness/sessions/s1/continue")
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentTarget = body["target_harness"] as? String
+        return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    let newID = await model.handOff(targetHarness: "codex")
+    #expect(newID == "harness-continued")
+    #expect(sentTarget == "codex")
+}
+
+@Test @MainActor func loadHandoffTargetsListsHostHarnesses() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let model = ChatModel(client: client(), sessionID: "harness-1")
+    #expect(model.handoffHarnesses.isEmpty)
+    await model.loadHandoffTargets()
+    #expect(model.handoffHarnesses == ["shell", "claude-code", "gemini"])
+}
+
+@Test @MainActor func loadHandoffTargetsUnknownSessionLeavesListEmpty() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let model = ChatModel(client: client(), sessionID: "not-in-snapshot")
+    await model.loadHandoffTargets()
+    #expect(model.handoffHarnesses.isEmpty)
+}
+
 @Test @MainActor func handOffFailureBecomesHint() async throws {
     MockURLProtocol.handler = { _ in
         (409, Data(#"{"error": "host offline"}"#.utf8))

@@ -183,17 +183,35 @@ public final class ChatModel {
     }
 
     /// Hands this session off to a fresh one seeded with the server-built
-    /// handoff context. Returns the new session's id, or nil on failure
-    /// (with the server's explanation surfaced as a hint).
-    public func handOff() async -> String? {
+    /// handoff context, optionally retargeting a different harness (nil
+    /// keeps the source session's own). Returns the new session's id, or
+    /// nil on failure (with the server's explanation surfaced as a hint).
+    public func handOff(targetHarness: String? = nil) async -> String? {
         do {
-            let newSessionID = try await client.continueSession(sessionID: sessionID)
+            let newSessionID = try await client.continueSession(sessionID: sessionID,
+                                                                targetHarness: targetHarness)
             hint = nil
             return newSessionID
         } catch {
             applyHint(for: error, action: "hand off")
             return nil
         }
+    }
+
+    /// Enabled harnesses on this session's host, for the handoff target
+    /// picker. Loaded on demand by `loadHandoffTargets()`; empty until then
+    /// (the UI falls back to the plain same-harness handoff).
+    public private(set) var handoffHarnesses: [String] = []
+
+    /// Resolves this session's host from the snapshot and publishes its
+    /// enabled harness list. Failures (or an unknown session) leave the
+    /// list as-is — the picker just doesn't gain per-harness options.
+    public func loadHandoffTargets() async {
+        guard let snapshot = try? await client.snapshot(),
+              let session = snapshot.sessions.first(where: { $0.id == sessionID }),
+              let host = snapshot.hosts.first(where: { $0.id == session.hostID })
+        else { return }
+        handoffHarnesses = host.harnesses
     }
 
     public func interrupt() async {

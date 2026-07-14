@@ -117,16 +117,34 @@ struct SessionsView: View {
             } label: {
                 Label("Continue in a terminal", systemImage: "arrow.triangle.branch")
             }
+            // Cross-harness targets from the session's host (via the polled
+            // snapshot). "shell" is excluded — the handoff seed gets typed
+            // into the PTY, and a bare shell would execute it as commands.
+            ForEach(crossHarnessTargets(for: session), id: \.self) { harness in
+                Button {
+                    Task { await continueSession(session, targetHarness: harness) }
+                } label: {
+                    Label("Continue with \(harness)", systemImage: "arrow.triangle.swap")
+                }
+            }
         }
+    }
+
+    private func crossHarnessTargets(for session: SessionSummary) -> [String] {
+        let harnesses = store.snapshot?.hosts
+            .first { $0.id == session.hostID }?
+            .harnesses ?? []
+        return harnesses.filter { $0 != "shell" }
     }
 
     /// Server-side handoff: launches a fresh PTY session seeded with this
     /// one's transcript context (the `/continue` endpoint always creates a
     /// terminal session), then navigates into it. Works on finished sessions
-    /// too — the real "resume a dead session" path. Failures surface through
-    /// the store's `lastError` banner at the top of the list.
-    private func continueSession(_ session: SessionSummary) async {
-        guard let newSessionID = await store.continueSession(session.id) else {
+    /// too — the real "resume a dead session" path. `targetHarness` picks the
+    /// new session's harness (nil keeps the source's). Failures surface
+    /// through the store's `lastError` banner at the top of the list.
+    private func continueSession(_ session: SessionSummary, targetHarness: String? = nil) async {
+        guard let newSessionID = await store.continueSession(session.id, targetHarness: targetHarness) else {
             return
         }
         launchedSession = LaunchedSession(id: newSessionID, isStructured: false)
