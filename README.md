@@ -1,5 +1,9 @@
 # Drover
 
+<p align="center">
+  <img src="docs/assets/drover-hero.png" alt="Drover — a drover's dog watching over a small herd of terminals" width="480">
+</p>
+
 > Drive your whole agent fleet — from your pocket.
 
 **Drover** is a local-first cockpit for driving a personal fleet of CLI
