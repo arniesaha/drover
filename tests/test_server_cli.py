@@ -1092,3 +1092,27 @@ def test_cli_retry_summarize_jobs_apply_resets_matching_jobs(tmp_path):
     finally:
         con.close()
     assert status == "pending"
+
+
+def test_summarizer_backend_config_forwards_launchd_overrides(tmp_path, monkeypatch):
+    for var in (
+        "DROVER_LOCAL_OLLAMA_LAUNCHD_LABEL",
+        "NEXUS_LOCAL_OLLAMA_LAUNCHD_LABEL",
+        "DROVER_LOCAL_OLLAMA_LAUNCHD_PLIST",
+        "NEXUS_LOCAL_OLLAMA_LAUNCHD_PLIST",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    from drover.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        "[summarizer]\n"
+        "backend_policy = 'local'\n"
+        "local_ollama_url = 'http://127.0.0.1:11435'\n"
+        "local_ollama_launchd_label = 'com.custom.ollama'\n"
+        "local_ollama_launchd_plist = '/tmp/com.custom.ollama.plist'\n"
+    )
+    cfg = load_config(cfg_file)
+    backend_cfg = server_main._summarizer_backend_config(cfg)
+    assert backend_cfg.local_ollama_launchd_label == "com.custom.ollama"
+    assert backend_cfg.local_ollama_launchd_plist == "/tmp/com.custom.ollama.plist"

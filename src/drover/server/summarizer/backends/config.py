@@ -14,9 +14,9 @@ from drover.server.wol import GpuRig
 
 DEFAULT_API_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_LOCAL_MODEL = "qwen3.5:35b-a3b"
-DEFAULT_LOCAL_OLLAMA_LAUNCHD_LABEL = "com.nexus.mac-ollama-embeddings"
+DEFAULT_LOCAL_OLLAMA_LAUNCHD_LABEL = "com.drover.mac-ollama-embeddings"
 DEFAULT_LOCAL_OLLAMA_LAUNCHD_PLIST = (
-    "/Users/arnabmac/Library/LaunchAgents/com.nexus.mac-ollama-embeddings.plist"
+    "/Users/arnabmac/Library/LaunchAgents/com.drover.mac-ollama-embeddings.plist"
 )
 
 DEFAULT_CLAUDE_CREDENTIALS_PATH = "~/.claude/.credentials.json"

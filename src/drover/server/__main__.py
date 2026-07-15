@@ -231,6 +231,8 @@ def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
         gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
         gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
         wake_timeout_s=cfg.summarizer_wake_timeout_s,
+        local_ollama_launchd_label=cfg.summarizer_local_ollama_launchd_label or None,
+        local_ollama_launchd_plist=cfg.summarizer_local_ollama_launchd_plist or None,
     )
 
 

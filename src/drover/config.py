@@ -57,6 +57,9 @@ class DroverConfig:
     summarizer_mac_ollama_url: str  # empty string = disabled
     summarizer_wake_timeout_s: float
     summarizer_batch_size: int
+    # launchd unit backing the Mac-local Ollama; empty string = code default
+    summarizer_local_ollama_launchd_label: str
+    summarizer_local_ollama_launchd_plist: str
     # Embedding backend knobs: remote API first, Mac-local Ollama, then GPU fallback.
     embeddings_api_base_url: str
     embeddings_api_key: str
@@ -111,6 +114,8 @@ _DEFAULTS = {
         "mac_ollama_url": "",
         "wake_timeout_s": 120.0,
         "batch_size": 8,
+        "local_ollama_launchd_label": "",
+        "local_ollama_launchd_plist": "",
     },
     "embeddings": {
         "api_base_url": "",
@@ -173,6 +178,8 @@ def _from_dict(d: dict) -> DroverConfig:
         summarizer_mac_ollama_url=s["mac_ollama_url"],
         summarizer_wake_timeout_s=float(s["wake_timeout_s"]),
         summarizer_batch_size=int(s["batch_size"]),
+        summarizer_local_ollama_launchd_label=s["local_ollama_launchd_label"],
+        summarizer_local_ollama_launchd_plist=s["local_ollama_launchd_plist"],
         embeddings_api_base_url=e["api_base_url"],
         embeddings_api_key=e["api_key"],
         embeddings_api_model=e["api_model"],

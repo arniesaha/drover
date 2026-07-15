@@ -158,3 +158,21 @@ def test_missing_optional_field_uses_default(tmp_path):
 def test_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_config(tmp_path / "nope.toml")
+
+
+def test_summarizer_launchd_overrides_default_empty():
+    cfg = default_config()
+    assert cfg.summarizer_local_ollama_launchd_label == ""
+    assert cfg.summarizer_local_ollama_launchd_plist == ""
+
+
+def test_loads_summarizer_launchd_overrides(tmp_path):
+    cfg_file = tmp_path / "summarizer.toml"
+    cfg_file.write_text(
+        "[summarizer]\n"
+        "local_ollama_launchd_label = 'com.custom.ollama'\n"
+        "local_ollama_launchd_plist = '/tmp/com.custom.ollama.plist'\n"
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.summarizer_local_ollama_launchd_label == "com.custom.ollama"
+    assert cfg.summarizer_local_ollama_launchd_plist == "/tmp/com.custom.ollama.plist"

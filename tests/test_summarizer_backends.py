@@ -413,7 +413,7 @@ def test_select_backend_local_ollama_kickstarts_launchd_when_no_api() -> None:
     assert b.name == "ollama"
     assert isinstance(b, OllamaBackend)
     assert b.wake_on_first_call is True
-    assert b.launchd_label == "com.nexus.mac-ollama-embeddings"
+    assert b.launchd_label == "com.drover.mac-ollama-embeddings"
 
 
 def test_select_backend_raises_when_neither_configured() -> None:
@@ -445,7 +445,11 @@ def test_from_runtime_builds_local_ollama_with_launchd_wake() -> None:
     assert cfg.gpu_rig.relay_url == ""
     assert cfg.gpu_rig.ollama_url == "http://127.0.0.1:11435"
     assert cfg.wake_on_first_call is True
-    assert cfg.local_ollama_launchd_label == "com.nexus.mac-ollama-embeddings"
+    assert cfg.local_ollama_launchd_label == "com.drover.mac-ollama-embeddings"
+    assert (
+        cfg.local_ollama_launchd_plist
+        == "/Users/arnabmac/Library/LaunchAgents/com.drover.mac-ollama-embeddings.plist"
+    )
 
 
 def test_from_runtime_no_rig_when_only_one_url(monkeypatch) -> None:
@@ -573,3 +577,40 @@ def test_effective_auth_token_skipped_when_api_key_set(tmp_path, monkeypatch) ->
     cfg = SummarizerBackendConfig(api_key="sk-x", auth_token=None)
     assert cfg.effective_auth_token() is None
     assert cfg.has_anthropic_creds is True
+
+
+def test_from_runtime_defaults_launchd_label_to_drover_service(monkeypatch) -> None:
+    for var in (
+        "DROVER_LOCAL_OLLAMA_LAUNCHD_LABEL",
+        "NEXUS_LOCAL_OLLAMA_LAUNCHD_LABEL",
+        "DROVER_LOCAL_OLLAMA_LAUNCHD_PLIST",
+        "NEXUS_LOCAL_OLLAMA_LAUNCHD_PLIST",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    cfg = SummarizerBackendConfig.from_runtime(
+        local_ollama_url="http://127.0.0.1:11435"
+    )
+    assert cfg.local_ollama_launchd_label == "com.drover.mac-ollama-embeddings"
+    assert cfg.local_ollama_launchd_plist is not None
+    assert cfg.local_ollama_launchd_plist.endswith(
+        "com.drover.mac-ollama-embeddings.plist"
+    )
+
+
+def test_from_runtime_explicit_launchd_overrides_win(monkeypatch) -> None:
+    for var in (
+        "DROVER_LOCAL_OLLAMA_LAUNCHD_LABEL",
+        "NEXUS_LOCAL_OLLAMA_LAUNCHD_LABEL",
+        "DROVER_LOCAL_OLLAMA_LAUNCHD_PLIST",
+        "NEXUS_LOCAL_OLLAMA_LAUNCHD_PLIST",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    cfg = SummarizerBackendConfig.from_runtime(
+        local_ollama_url="http://127.0.0.1:11435",
+        local_ollama_launchd_label="com.custom.ollama",
+        local_ollama_launchd_plist="/tmp/com.custom.ollama.plist",
+    )
+    assert cfg.local_ollama_launchd_label == "com.custom.ollama"
+    assert cfg.local_ollama_launchd_plist == "/tmp/com.custom.ollama.plist"
