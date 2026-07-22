@@ -40,6 +40,13 @@ parquet/
 .claude/
 .swiftpm/
 
+# Local Swift/Xcode build caches
+apps/drover/.derivedData/
+apps/drover/.xcode-home/
+apps/drover/NexusKit/.build/
+apps/drover/NexusKit/.clang-cache/
+apps/drover/NexusKit/.swift-cache/
+
 # Local git worktrees
 .worktrees/
 
