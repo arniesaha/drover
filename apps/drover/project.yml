@@ -36,6 +36,12 @@ targets:
           NSAllowsArbitraryLoads: true
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
+    entitlements:
+      path: Drover/Drover.entitlements
+      properties:
+        # Lets "needs you" alerts break through Focus/lock-screen deferral
+        # (LocalNotifier marks them .timeSensitive).
+        com.apple.developer.usernotifications.time-sensitive: true
   DroverTests:
     type: bundle.unit-test
     platform: iOS
