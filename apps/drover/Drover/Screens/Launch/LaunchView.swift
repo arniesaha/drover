@@ -9,6 +9,8 @@ struct LaunchView: View {
     @State private var model: LaunchModel
     @Environment(\.dismiss) private var dismiss
     @State private var isLaunching = false
+    @State private var showAuth = false
+    private let client: NexusClient
 
     /// Called once `launch()` succeeds, with the new session's id and
     /// whether it's structured (so the caller knows Chat vs. terminal).
@@ -16,6 +18,7 @@ struct LaunchView: View {
 
     init(client: NexusClient, snapshot: HarnessSnapshot?, onLaunched: @escaping (String, Bool) -> Void) {
         _model = State(initialValue: LaunchModel(client: client, snapshot: snapshot))
+        self.client = client
         self.onLaunched = onLaunched
     }
 
@@ -38,6 +41,13 @@ struct LaunchView: View {
                         Text(name).tag(name)
                     }
                 }
+
+                Button {
+                    showAuth = true
+                } label: {
+                    Label("Sign in to \(model.harness)", systemImage: "person.badge.key")
+                }
+                .disabled(model.hostID.isEmpty || model.harness == "shell")
             }
 
             Section("Working directory") {
@@ -90,6 +100,11 @@ struct LaunchView: View {
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
+            }
+        }
+        .sheet(isPresented: $showAuth) {
+            NavigationStack {
+                HarnessAuthSheet(client: client, hostID: model.hostID, harness: model.harness)
             }
         }
     }
