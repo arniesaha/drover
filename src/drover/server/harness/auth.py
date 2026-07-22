@@ -21,8 +21,19 @@ _SECRET_QUERY_KEYS = {
     "key",
     "secret",
 }
+_SECRET_KEY_PATTERN = "|".join(
+    re.escape(key) for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True)
+)
 _URL_RE = re.compile(r"https?://[^\s)'\"]+")
 _USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}(?:-[A-Z0-9]{4})+\b")
+_BEARER_RE = re.compile(r"(?i)(\bauthorization\s*:\s*bearer\s+)[^\s,;]+")
+_JSON_SECRET_RE = re.compile(
+    rf'(?i)("(?:{_SECRET_KEY_PATTERN})"\s*:\s*)"[^"]*"'
+)
+_COLON_SECRET_RE = re.compile(
+    rf"(?i)(?<![\"\w])({_SECRET_KEY_PATTERN})(\s*:\s*)"
+    r'(?:"[^"]*"|\'[^\']*\'|[^\s,}]+)'
+)
 _TERMINAL_FLOW_STATES = {"authenticated", "failed", "expired", "cancelled"}
 
 
@@ -102,7 +113,9 @@ class StaticAuthAdapter:
 
 
 def redact_auth_text(text: str) -> str:
-    redacted = text
+    redacted = _BEARER_RE.sub(r"\1<redacted>", text)
+    redacted = _JSON_SECRET_RE.sub(r'\1"<redacted>"', redacted)
+    redacted = _COLON_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True):
         redacted = re.sub(
             rf"(?i)({re.escape(key)}=)[^&\s]+",
@@ -154,8 +167,8 @@ class AuthFlowManager:
         self,
         adapters: dict[str, HarnessAuthAdapter],
         *,
-        timeout_s: float = 300,
-        retention_s: float = 300,
+        timeout_s: float = 600,
+        retention_s: float = 600,
     ) -> None:
         self._adapters = adapters
         self._timeout_s = timeout_s
@@ -164,6 +177,8 @@ class AuthFlowManager:
         self._lock = threading.Lock()
 
     def status(self, harness: str) -> dict[str, Any]:
+        with self._lock:
+            self._discard_expired_flows()
         return self._adapter(harness).status().as_json()
 
     def start(self, harness: str) -> dict[str, Any]:
@@ -215,6 +230,7 @@ class AuthFlowManager:
 
     def _flow(self, harness: str, flow_id: str) -> _AuthFlow:
         with self._lock:
+            self._discard_expired_flows()
             flow = self._flows.get(harness)
         if flow is None or flow.flow_id != flow_id:
             raise KeyError(f"unknown auth flow: {harness}/{flow_id}")

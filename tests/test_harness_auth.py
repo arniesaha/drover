@@ -3,12 +3,25 @@ from __future__ import annotations
 import sys
 import time
 
+import pytest
+
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
     StaticAuthAdapter,
     redact_auth_text,
 )
+
+
+def wait_for_state(manager, harness, flow_id, state, timeout_s=2):
+    deadline = time.time() + timeout_s
+    current = manager.snapshot(harness, flow_id)
+    while time.time() < deadline:
+        current = manager.snapshot(harness, flow_id)
+        if current["state"] == state:
+            return current
+        time.sleep(0.01)
+    pytest.fail(f"flow did not reach {state}: {current}")
 
 
 def test_redact_auth_text_removes_secret_query_values():
@@ -25,6 +38,28 @@ def test_redact_auth_text_removes_secret_query_values():
     assert "state=ok" in redacted
     assert "code=<redacted>" in redacted
     assert "access_token=<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Authorization: Bearer bearer-secret", "bearer-secret"),
+        ("token: colon-secret", "colon-secret"),
+        ('{"access_token":"json-secret","state":"ok"}', "json-secret"),
+    ],
+)
+def test_redact_auth_text_removes_non_query_secret_values(text, secret):
+    redacted = redact_auth_text(text)
+
+    assert secret not in redacted
+    assert "<redacted>" in redacted
+
+
+def test_manager_defaults_to_ten_minute_timeout_and_retention():
+    manager = AuthFlowManager({})
+
+    assert manager._timeout_s == 600
+    assert manager._retention_s == 600
 
 
 def test_static_adapter_reports_unavailable_status():
@@ -68,3 +103,72 @@ def test_manager_starts_and_polls_successful_flow(tmp_path):
     assert current["state"] == "authenticated"
     assert current["login_url"] == "https://example.test/device"
     assert current["user_code"] == "ABCD-EFGH"
+
+
+def test_manager_reuses_active_flow_for_duplicate_start():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "import time; time.sleep(5)"],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    first = manager.start("codex")
+    second = manager.start("codex")
+
+    assert second["flow_id"] == first["flow_id"]
+    assert manager.cancel("codex", first["flow_id"])["state"] == "cancelled"
+
+
+def test_manager_marks_nonzero_exit_as_failed():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "raise SystemExit(3)"],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+    failed = wait_for_state(manager, "codex", flow["flow_id"], "failed")
+
+    assert failed["last_error"] == "authentication process exited with code 3"
+
+
+def test_manager_cancels_active_flow():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "import time; time.sleep(5)"],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+
+    assert manager.cancel("codex", flow["flow_id"])["state"] == "cancelled"
+
+
+def test_manager_expires_timed_out_flow():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "import time; time.sleep(5)"],
+    )
+    manager = AuthFlowManager({"codex": adapter}, timeout_s=0.01)
+
+    flow = manager.start("codex")
+    expired = wait_for_state(manager, "codex", flow["flow_id"], "expired")
+
+    assert expired["last_error"] == "authentication flow expired"
+
+
+def test_manager_discards_terminal_flows_when_snapshot_is_read():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "pass"],
+    )
+    manager = AuthFlowManager({"codex": adapter}, retention_s=60)
+
+    flow = manager.start("codex")
+    wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
+    managed_flow = manager._flows["codex"]
+    with managed_flow.lock:
+        managed_flow.completed_at = time.time() - 61
+
+    with pytest.raises(KeyError, match="unknown auth flow"):
+        manager.snapshot("codex", flow["flow_id"])
