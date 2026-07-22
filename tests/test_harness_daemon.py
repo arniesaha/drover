@@ -375,6 +375,7 @@ def test_harnessd_auth_start_poll_and_cancel(tmp_path):
             headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=5) as response:
+            assert response.status == 200
             started = json.loads(response.read().decode("utf-8"))
         flow_id = started["flow_id"]
 
@@ -404,6 +405,90 @@ def test_harnessd_auth_start_poll_and_cancel(tmp_path):
     assert started["host_id"] == "test-host"
     assert started["harness"] == "codex"
     assert cancelled["state"] == "cancelled"
+
+
+def test_harnessd_auth_routes_require_bearer_token(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {
+            "codex": StaticAuthAdapter(
+                "codex",
+                status_value=HarnessAuthStatus("codex", "unauthenticated"),
+            )
+        }
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"{base_url}/auth/codex/status", timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert exc_info.value.code == 401
+
+
+def test_harnessd_auth_status_unknown_harness_returns_404(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager({})
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/auth/unknown/status",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert exc_info.value.code == 404
+
+
+def test_harnessd_auth_flow_unknown_id_returns_404(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {
+            "codex": StaticAuthAdapter(
+                "codex",
+                status_value=HarnessAuthStatus("codex", "unauthenticated"),
+            )
+        }
+    )
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/auth/codex/flows/missing",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert exc_info.value.code == 404
+
+
+def test_harnessd_auth_start_unsupported_returns_400(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager({"gemini": StaticAuthAdapter("gemini")})
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/auth/gemini/start",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert exc_info.value.code == 400
 
 
 def test_resolve_harness_presets_enables_available_login_shell_clis(
