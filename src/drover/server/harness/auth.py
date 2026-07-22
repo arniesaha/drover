@@ -29,7 +29,8 @@ _URL_RE = re.compile(r"https?://[^\s)'\"]+")
 _USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}(?:-[A-Z0-9]{4})+\b")
 _AUTHORIZATION_RE = re.compile(r"(?i)(\bauthorization\s*:\s*)[^\r\n,;]+")
 _JSON_SECRET_RE = re.compile(
-    rf'(?i)("(?:{_SECRET_KEY_PATTERN})"\s*:\s*)"[^"]*"'
+    rf'(?i)("(?:{_SECRET_KEY_PATTERN})"\s*:\s*)'
+    r'(?:"(?:\\.|[^"\\])*"|[^,\s}\]]+)'
 )
 _COLON_SECRET_RE = re.compile(
     rf"(?i)(?<![\"\w])((?:x[-_])?(?:{_SECRET_KEY_PATTERN}))(\s*:\s*)"
@@ -331,7 +332,8 @@ class AuthFlowManager:
 
     def _expire_flow(self, flow: _AuthFlow) -> None:
         try:
-            flow.process.wait(timeout=flow.timeout_s)
+            remaining_s = max(flow.started_at + flow.timeout_s - time.time(), 0)
+            flow.process.wait(timeout=remaining_s)
             return
         except subprocess.TimeoutExpired:
             pass

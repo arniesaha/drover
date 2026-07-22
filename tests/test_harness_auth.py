@@ -48,6 +48,8 @@ def test_redact_auth_text_removes_secret_query_values():
         ("token: colon-secret", "colon-secret"),
         ("X-Api-Key: header-secret", "header-secret"),
         ('{"access_token":"json-secret","state":"ok"}', "json-secret"),
+        ('{"access_token":12345,"state":"ok"}', "12345"),
+        (r'{"access_token":"escaped-\"secret","state":"ok"}', "escaped"),
         ("https://example.test?api-key=query-secret&state=ok", "query-secret"),
     ],
 )
