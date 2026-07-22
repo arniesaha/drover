@@ -168,8 +168,7 @@ public actor NexusClient {
     }
 
     private nonisolated func encodePathComponent(_ raw: String) -> String {
-        var allowed = CharacterSet.urlPathAllowed
-        allowed.remove(charactersIn: "/?#[]@!$&'()*+,;=")
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
     }
 

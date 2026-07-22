@@ -139,3 +139,16 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(flow.loginURL?.absoluteString == "https://example.test")
     #expect(flow.userCode == "ABCD-EFGH")
 }
+
+@Test func harnessAuthFlowDecodesExpiryAndMalformedURL() throws {
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1",
+     "state":"expired","login_url":"not a url",
+     "expires_at":"2026-07-21T12:34:56Z"}
+    """.utf8)
+    let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
+    #expect(flow.state == .expired)
+    #expect(flow.loginURL == nil)
+    #expect(flow.expiresAt != nil)
+    #expect(flow.isTerminal)
+}
