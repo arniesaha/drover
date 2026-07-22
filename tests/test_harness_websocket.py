@@ -8,6 +8,8 @@ import threading
 from time import monotonic
 import urllib.request
 
+import pytest
+
 from drover.schema import bootstrap
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
@@ -351,17 +353,31 @@ def test_handoff_seed_is_queued_then_typed_in_once_the_cli_settles(tmp_path):
         server.server_close()
 
 
-def test_handoff_seed_waits_for_startup_gate_to_be_answered(tmp_path):
+@pytest.mark.parametrize(
+    "gate_prompt",
+    [
+        # Old claude-code trust-gate wording…
+        "Do you trust the files in this folder?",
+        # …and the reworded gate shipped around claude-code v2.1.x, which
+        # resurrected the seed-swallow live on 2026-07-22 because only the
+        # old wording was matched.
+        "Is this a project you created or one you trust?",
+    ],
+)
+def test_handoff_seed_waits_for_startup_gate_to_be_answered(tmp_path, gate_prompt):
     """A harness whose CLI opens on a startup gate (claude-code's trust-folder
     prompt) must have the gate answered before the seed is typed. Without gate
     handling, the settle-based delivery types the seed INTO the gate, which
-    discards it — the handed-off agent starts with no context."""
+    discards it — the handed-off agent starts with no context.
+
+    The gate markers come from the real claude-code preset so this pins the
+    production config against every known wording of the gate."""
     # Fake gated CLI: shows the trust prompt, and only reaches its "REPL"
     # (a real shell) if the gate is answered with exactly "1". Anything else
     # (e.g. the seed text) is reported as swallowed, mirroring claude-code.
     script = tmp_path / "gated_cli.sh"
     script.write_text(
-        'echo "Do you trust the files in this folder?"\n'
+        f'echo "{gate_prompt}"\n'
         "read answer\n"
         'if [ "$answer" = "1" ]; then\n'
         '  echo "REPL_READY"\n'
@@ -376,7 +392,7 @@ def test_handoff_seed_waits_for_startup_gate_to_be_answered(tmp_path):
         command=("/bin/sh", str(script)),
         enabled=True,
         description="fake CLI with a startup trust gate",
-        startup_gate_marker="Do you trust the files in this folder?",
+        startup_gate_markers=DEFAULT_PRESETS["claude-code"].startup_gate_markers,
         startup_gate_answer="1\n",
     )
     server, state, base_url = _start_test_server(tmp_path, presets=presets)
