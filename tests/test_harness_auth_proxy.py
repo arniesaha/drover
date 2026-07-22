@@ -84,13 +84,34 @@ def _start_central(tmp_path, upstream_url: str):
     return server, f"http://{host}:{port}"
 
 
-def test_central_proxies_auth_status(tmp_path):
+def _start_proxy_pair(tmp_path):
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _HarnessAuthHandler)
     _HarnessAuthHandler.requests = []
-    threading.Thread(target=upstream.serve_forever, daemon=True).start()
-    central, base = _start_central(
-        tmp_path, f"http://127.0.0.1:{upstream.server_address[1]}"
-    )
+    central = None
+    try:
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        central, base = _start_central(
+            tmp_path, f"http://127.0.0.1:{upstream.server_address[1]}"
+        )
+        return upstream, central, base
+    except Exception:
+        if central is not None:
+            central.shutdown()
+            central.server_close()
+        upstream.shutdown()
+        upstream.server_close()
+        raise
+
+
+def _close_proxy_pair(upstream, central):
+    central.shutdown()
+    central.server_close()
+    upstream.shutdown()
+    upstream.server_close()
+
+
+def test_central_proxies_auth_status(tmp_path):
+    upstream, central, base = _start_proxy_pair(tmp_path)
     try:
         req = urllib.request.Request(
             f"{base}/harness/hosts/mac-mini/auth/codex/status",
@@ -99,25 +120,18 @@ def test_central_proxies_auth_status(tmp_path):
         with urllib.request.urlopen(req, timeout=5) as response:
             body = json.loads(response.read().decode())
     finally:
-        central.shutdown()
-        central.server_close()
-        upstream.shutdown()
-        upstream.server_close()
+        _close_proxy_pair(upstream, central)
 
     assert response.status == 200
     assert body["host_id"] == "mac-mini"
     assert body["state"] == "unauthenticated"
+    assert _HarnessAuthHandler.requests[0]["method"] == "GET"
     assert _HarnessAuthHandler.requests[0]["path"] == "/auth/codex/status"
     assert _HarnessAuthHandler.requests[0]["authorization"] == "Bearer secret"
 
 
 def test_central_proxies_auth_start(tmp_path):
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _HarnessAuthHandler)
-    _HarnessAuthHandler.requests = []
-    threading.Thread(target=upstream.serve_forever, daemon=True).start()
-    central, base = _start_central(
-        tmp_path, f"http://127.0.0.1:{upstream.server_address[1]}"
-    )
+    upstream, central, base = _start_proxy_pair(tmp_path)
     try:
         req = urllib.request.Request(
             f"{base}/harness/hosts/mac-mini/auth/codex/start",
@@ -128,15 +142,56 @@ def test_central_proxies_auth_start(tmp_path):
         with urllib.request.urlopen(req, timeout=5) as response:
             body = json.loads(response.read().decode())
     finally:
-        central.shutdown()
-        central.server_close()
-        upstream.shutdown()
-        upstream.server_close()
+        _close_proxy_pair(upstream, central)
 
     assert response.status == 200
     assert body["host_id"] == "mac-mini"
     assert body["state"] == "waiting_for_user"
+    assert _HarnessAuthHandler.requests[0]["method"] == "POST"
     assert _HarnessAuthHandler.requests[0]["path"] == "/auth/codex/start"
+    assert _HarnessAuthHandler.requests[0]["authorization"] == "Bearer secret"
+
+
+def test_central_proxies_auth_flow_poll(tmp_path):
+    upstream, central, base = _start_proxy_pair(tmp_path)
+    try:
+        req = urllib.request.Request(
+            f"{base}/harness/hosts/mac-mini/auth/codex/flows/auth-flow-1",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = json.loads(response.read().decode())
+    finally:
+        _close_proxy_pair(upstream, central)
+
+    assert response.status == 200
+    assert body["host_id"] == "mac-mini"
+    assert _HarnessAuthHandler.requests[0]["method"] == "GET"
+    assert _HarnessAuthHandler.requests[0]["path"] == "/auth/codex/flows/auth-flow-1"
+    assert _HarnessAuthHandler.requests[0]["authorization"] == "Bearer secret"
+
+
+def test_central_proxies_auth_flow_cancel(tmp_path):
+    upstream, central, base = _start_proxy_pair(tmp_path)
+    try:
+        req = urllib.request.Request(
+            f"{base}/harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel",
+            data=b"{}",
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = json.loads(response.read().decode())
+    finally:
+        _close_proxy_pair(upstream, central)
+
+    assert response.status == 200
+    assert body["host_id"] == "mac-mini"
+    assert _HarnessAuthHandler.requests[0]["method"] == "POST"
+    assert (
+        _HarnessAuthHandler.requests[0]["path"]
+        == "/auth/codex/flows/auth-flow-1/cancel"
+    )
     assert _HarnessAuthHandler.requests[0]["authorization"] == "Bearer secret"
 
 
