@@ -227,4 +227,57 @@ struct ClientTests {
     #expect(id == "harness-abc")
 }
 
+@Test func authStatusRouteShape() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/status")
+        #expect(request.httpMethod == "GET")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        return (200, Data(#"{"host_id":"mac-mini","harness":"codex","state":"unauthenticated"}"#.utf8))
+    }
+    let status = try await client().authStatus(hostID: "mac-mini", harness: "codex")
+    #expect(status.state == .unauthenticated)
+}
+
+@Test func startAuthFlowPostsAndDecodes() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/start")
+        #expect(request.httpMethod == "POST")
+        return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"waiting_for_user","user_code":"ABCD-EFGH"}"#.utf8))
+    }
+    let flow = try await client().startAuthFlow(hostID: "mac-mini", harness: "codex")
+    #expect(flow.flowID == "auth-flow-1")
+    #expect(flow.state == .waitingForUser)
+}
+
+@Test func pollAndCancelAuthFlowRoutes() async throws {
+    var seen: [String] = []
+    MockURLProtocol.handler = { request in
+        seen.append("\(request.httpMethod ?? "") \(request.url?.path ?? "")")
+        return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"cancelled"}"#.utf8))
+    }
+    _ = try await client().authFlow(hostID: "mac-mini", harness: "codex", flowID: "auth-flow-1")
+    _ = try await client().cancelAuthFlow(hostID: "mac-mini", harness: "codex", flowID: "auth-flow-1")
+    #expect(seen == [
+        "GET /harness/hosts/mac-mini/auth/codex/flows/auth-flow-1",
+        "POST /harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel",
+    ])
+}
+
+@Test func authRoutesPercentEncodePathComponents() async throws {
+    var seen: [String] = []
+    MockURLProtocol.handler = { request in
+        seen.append("\(request.httpMethod ?? "") \(request.url?.path ?? "")")
+        return (200, Data(#"{"host_id":"mac/mini","harness":"provider/test","flow_id":"flow/1","state":"waiting_for_user"}"#.utf8))
+    }
+    _ = try await client().authStatus(hostID: "mac/mini", harness: "provider/test")
+    _ = try await client().authFlow(
+        hostID: "mac/mini",
+        harness: "provider/test",
+        flowID: "flow/1")
+    #expect(seen == [
+        "GET /harness/hosts/mac%2Fmini/auth/provider%2Ftest/status",
+        "GET /harness/hosts/mac%2Fmini/auth/provider%2Ftest/flows/flow%2F1",
+    ])
+}
+
 }

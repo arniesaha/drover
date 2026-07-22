@@ -115,3 +115,27 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(value["a"]?.stringValue == nil)
     #expect(value["c"]?.objectValue?["d"] == .number(2.5))
 }
+
+@Test func harnessAuthStatusDecodes() throws {
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"codex","state":"unauthenticated",
+     "label":null,"detail":"Not logged in"}
+    """.utf8)
+    let status = try JSONDecoder().decode(HarnessAuthStatus.self, from: data)
+    #expect(status.hostID == "mac-mini")
+    #expect(status.harness == "codex")
+    #expect(status.state == .unauthenticated)
+    #expect(status.detail == "Not logged in")
+}
+
+@Test func harnessAuthFlowDecodesUnknownStateLeniently() throws {
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"gemini","flow_id":"auth-flow-1",
+     "state":"provider_weird","login_url":"https://example.test",
+     "user_code":"ABCD-EFGH","message":"Open browser"}
+    """.utf8)
+    let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
+    #expect(flow.state == .unknown)
+    #expect(flow.loginURL?.absoluteString == "https://example.test")
+    #expect(flow.userCode == "ABCD-EFGH")
+}

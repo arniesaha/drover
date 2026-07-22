@@ -50,6 +50,88 @@ public enum AttentionState: String, Sendable {
     case needsApproval, needsInput, working, done, errored
 }
 
+// MARK: - Harness auth
+
+public enum HarnessAuthState: String, Sendable, Equatable, Decodable {
+    case authenticated
+    case unauthenticated
+    case unknown
+    case unavailable
+    case starting
+    case waitingForUser = "waiting_for_user"
+    case failed
+    case cancelled
+    case expired
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = HarnessAuthState(rawValue: raw) ?? .unknown
+    }
+}
+
+public struct HarnessAuthStatus: Sendable, Equatable, Decodable {
+    public var hostID: String
+    public var harness: String
+    public var state: HarnessAuthState
+    public var label: String?
+    public var detail: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID = "host_id"
+        case harness
+        case state
+        case label
+        case detail
+    }
+}
+
+public struct HarnessAuthFlow: Sendable, Equatable, Decodable {
+    public var hostID: String
+    public var harness: String
+    public var flowID: String
+    public var state: HarnessAuthState
+    public var loginURL: URL?
+    public var deviceCode: String?
+    public var userCode: String?
+    public var message: String?
+    public var expiresAt: Date?
+    public var lastError: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID = "host_id"
+        case harness
+        case flowID = "flow_id"
+        case state
+        case loginURL = "login_url"
+        case deviceCode = "device_code"
+        case userCode = "user_code"
+        case message
+        case expiresAt = "expires_at"
+        case lastError = "last_error"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hostID = (try? container.decode(String.self, forKey: .hostID)) ?? ""
+        harness = try container.decode(String.self, forKey: .harness)
+        flowID = try container.decode(String.self, forKey: .flowID)
+        state = try container.decode(HarnessAuthState.self, forKey: .state)
+        if let raw = try? container.decode(String.self, forKey: .loginURL) {
+            loginURL = URL(string: raw)
+        }
+        deviceCode = try? container.decode(String.self, forKey: .deviceCode)
+        userCode = try? container.decode(String.self, forKey: .userCode)
+        message = try? container.decode(String.self, forKey: .message)
+        let rawExpires = try? container.decode(String.self, forKey: .expiresAt)
+        expiresAt = WireDate.parse(rawExpires)
+        lastError = try? container.decode(String.self, forKey: .lastError)
+    }
+
+    public var isTerminal: Bool {
+        state == .authenticated || state == .failed || state == .cancelled || state == .expired
+    }
+}
+
 // MARK: - JSONValue
 
 public enum JSONValue: Sendable, Equatable, Decodable {

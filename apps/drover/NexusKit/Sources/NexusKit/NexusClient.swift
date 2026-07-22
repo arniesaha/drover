@@ -33,6 +33,30 @@ public actor NexusClient {
         return try decode(HarnessSnapshot.self, from: data)
     }
 
+    public func authStatus(hostID: String, harness: String) async throws -> HarnessAuthStatus {
+        let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/status"
+        let data = try await request(path: path, method: "GET", body: nil)
+        return try decode(HarnessAuthStatus.self, from: data)
+    }
+
+    public func startAuthFlow(hostID: String, harness: String) async throws -> HarnessAuthFlow {
+        let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/start"
+        let data = try await request(path: path, method: "POST", body: Data("{}".utf8))
+        return try decode(HarnessAuthFlow.self, from: data)
+    }
+
+    public func authFlow(hostID: String, harness: String, flowID: String) async throws -> HarnessAuthFlow {
+        let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/flows/\(encodePathComponent(flowID))"
+        let data = try await request(path: path, method: "GET", body: nil)
+        return try decode(HarnessAuthFlow.self, from: data)
+    }
+
+    public func cancelAuthFlow(hostID: String, harness: String, flowID: String) async throws -> HarnessAuthFlow {
+        let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/flows/\(encodePathComponent(flowID))/cancel"
+        let data = try await request(path: path, method: "POST", body: Data("{}".utf8))
+        return try decode(HarnessAuthFlow.self, from: data)
+    }
+
     public func messages(sessionID: String, afterSeq: Int) async throws -> MessageBatch {
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/messages?after_seq=\(afterSeq)"
         let data = try await request(path: path, method: "GET", body: nil)
@@ -144,7 +168,9 @@ public actor NexusClient {
     }
 
     private nonisolated func encodePathComponent(_ raw: String) -> String {
-        raw.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? raw
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#[]@!$&'()*+,;=")
+        return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
     }
 
     /// Builds the request, sends it, and maps non-2xx responses to
@@ -248,4 +274,3 @@ private struct TurnResponse: Decodable {
         case turnID = "turn_id"
     }
 }
-
