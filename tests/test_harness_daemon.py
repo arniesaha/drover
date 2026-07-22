@@ -543,6 +543,30 @@ def test_harnessd_auth_start_unsupported_returns_400(tmp_path):
     assert exc_info.value.code == 400
 
 
+def test_harnessd_auth_start_launch_failure_returns_structured_500(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {"codex": StaticAuthAdapter("codex", start_command=["missing-cli"])}
+    )
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/auth/codex/start",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=5)
+        body = json.loads(exc_info.value.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert exc_info.value.code == 500
+    assert body == {"error": "authentication command could not start"}
+
+
 def test_resolve_harness_presets_enables_available_login_shell_clis(
     monkeypatch, tmp_path
 ):
@@ -557,8 +581,8 @@ def test_resolve_harness_presets_enables_available_login_shell_clis(
             return _Completed(returncode=0, stdout="/opt/homebrew/bin/codex\n")
         return _Completed(returncode=1, stdout="")
 
-    monkeypatch.setattr("drover.server.harness.daemon.subprocess.run", fake_run)
-    monkeypatch.setattr("drover.server.harness.daemon.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("drover.server.harness.auth.subprocess.run", fake_run)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
     presets = resolve_harness_presets(
         {
             "shell": DEFAULT_PRESETS["shell"],
@@ -592,9 +616,9 @@ def test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path(
     codex.write_text("#!/usr/bin/env node\n")
     codex.chmod(0o755)
 
-    monkeypatch.setattr("drover.server.harness.daemon.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
     monkeypatch.setattr(
-        "drover.server.harness.daemon.subprocess.run",
+        "drover.server.harness.auth.subprocess.run",
         lambda *args, **kwargs: _Completed(),
     )
 
@@ -607,7 +631,7 @@ def test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path(
     assert presets["codex"].command == (
         "/bin/zsh",
         "-lc",
-        f"export PATH='{nvm_bin}:$PATH'; exec {codex}",
+        f"export PATH={nvm_bin}:$PATH; exec {codex}",
     )
 
 
@@ -625,9 +649,9 @@ def test_resolve_harness_presets_enables_versioned_claude_cli(monkeypatch, tmp_p
     older.chmod(0o755)
     newer.chmod(0o755)
 
-    monkeypatch.setattr("drover.server.harness.daemon.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
     monkeypatch.setattr(
-        "drover.server.harness.daemon.subprocess.run",
+        "drover.server.harness.auth.subprocess.run",
         lambda *args, **kwargs: _Completed(),
     )
 

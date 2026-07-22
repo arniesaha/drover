@@ -36,6 +36,17 @@ struct LaunchModelTests {
     #expect(model.isStructured == false)
 }
 
+@Test @MainActor func interactiveAuthIsLimitedToSupportedProviders() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
+    let model = LaunchModel(client: client(), snapshot: snapshot)
+
+    #expect(model.supportsInteractiveAuth == true)
+    model.harness = "gemini"
+    #expect(model.supportsInteractiveAuth == false)
+    model.harness = "shell"
+    #expect(model.supportsInteractiveAuth == false)
+}
+
 @Test @MainActor func noSnapshotYieldsEmptyDefaults() async throws {
     let model = LaunchModel(client: client(), snapshot: nil)
     #expect(model.hostID == "")

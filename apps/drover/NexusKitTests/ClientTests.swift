@@ -212,6 +212,24 @@ struct ClientTests {
     }
 }
 
+@Test func unavailableAuthResponsePreservesStructured404Error() async {
+    MockURLProtocol.handler = { _ in
+        (404, Data(#"{"error": "auth is not supported for openclaw"}"#.utf8))
+    }
+    await #expect(throws: NexusError.unavailable("auth is not supported for openclaw")) {
+        try await client().startAuthFlow(hostID: "mac-mini", harness: "openclaw")
+    }
+}
+
+@Test func unavailableAuthResponseUsesDetailWhenErrorIsAbsent() async {
+    MockURLProtocol.handler = { _ in
+        (404, Data(#"{"host_id":"mac-mini","harness":"openclaw","state":"unavailable","detail":"auth is not supported for openclaw"}"#.utf8))
+    }
+    await #expect(throws: NexusError.unavailable("auth is not supported for openclaw")) {
+        try await client().authStatus(hostID: "mac-mini", harness: "openclaw")
+    }
+}
+
 @Test func createSessionOmitsNilCwdAndPromptFromBody() async throws {
     MockURLProtocol.handler = { request in
         let body = try! JSONSerialization.jsonObject(

@@ -42,12 +42,14 @@ struct LaunchView: View {
                     }
                 }
 
-                Button {
-                    showAuth = true
-                } label: {
-                    Label("Sign in to \(model.harness)", systemImage: "person.badge.key")
+                if model.supportsInteractiveAuth {
+                    Button {
+                        showAuth = true
+                    } label: {
+                        Label("Sign in to \(model.harness)", systemImage: "person.badge.key")
+                    }
+                    .disabled(model.hostID.isEmpty)
                 }
-                .disabled(model.hostID.isEmpty || model.harness == "shell")
             }
 
             Section("Working directory") {

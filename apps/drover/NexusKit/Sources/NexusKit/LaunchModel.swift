@@ -63,6 +63,12 @@ public final class LaunchModel {
         harness != "shell"
     }
 
+    /// Local snapshots lack auth capability metadata, so only known
+    /// interactive providers expose the sign-in flow.
+    public var supportsInteractiveAuth: Bool {
+        harness == "claude-code" || harness == "codex"
+    }
+
     /// Posts `createSession` for the current selection. On success returns
     /// the new session id; on failure sets `launchError` (server-authored
     /// text when available) and returns nil.

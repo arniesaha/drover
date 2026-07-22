@@ -6,6 +6,7 @@ public enum NexusError: Error, Equatable {
     case unauthorized                    // 401
     case conflict(String)                // 409 body "error" text
     case badRequest(String)              // 400 body "error" text
+    case unavailable(String)             // 404 body "error" text
     case transport(String)               // URLError etc.
     case decoding(String)
 }
@@ -207,6 +208,8 @@ public actor NexusClient {
             throw NexusError.conflict(errorText(from: data))
         case 400:
             throw NexusError.badRequest(errorText(from: data))
+        case 404:
+            throw NexusError.unavailable(errorText(from: data))
         default:
             throw NexusError.transport("unexpected status \(http.statusCode)")
         }
@@ -217,6 +220,9 @@ public actor NexusClient {
     private nonisolated func errorText(from data: Data) -> String {
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let text = object["error"] as? String {
+            return text
+        } else if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let text = object["detail"] as? String {
             return text
         }
         return String(data: data, encoding: .utf8) ?? ""

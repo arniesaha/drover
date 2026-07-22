@@ -26,7 +26,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 from drover.config import default_token_file, resolve_api_token_env
-from drover.server.harness.auth import AuthFlowManager, default_auth_adapters
+from drover.server.harness.auth import (
+    AuthFlowLaunchError,
+    AuthFlowManager,
+    default_auth_adapters,
+    default_login_shell,
+    executable_path_prefix,
+    resolve_executable,
+)
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.structured import claude as _structured_claude
@@ -121,12 +128,12 @@ def resolve_harness_presets(
 ) -> dict[str, HarnessPreset]:
     """Enable CLI presets that are available in the user's login shell."""
     resolved: dict[str, HarnessPreset] = {}
-    login_shell = shell or _default_login_shell()
+    login_shell = shell or default_login_shell()
     for name, preset in (presets or DEFAULT_PRESETS).items():
         if name == "shell":
             resolved[name] = preset
             continue
-        executable = _resolve_executable(preset.command[0], login_shell=login_shell)
+        executable = resolve_executable(preset.command[0], login_shell=login_shell)
         if executable is None:
             resolved[name] = replace(
                 preset,
@@ -134,15 +141,13 @@ def resolve_harness_presets(
                 description=f"{preset.description}; executable not found on this host",
             )
             continue
-        path_prefix = _executable_path_prefix(executable)
+        path_prefix = executable_path_prefix(executable)
         shell_command = "exec " + " ".join(
             shlex.quote(part) for part in (executable, *preset.command[1:])
         )
         if path_prefix:
             shell_command = (
-                "export PATH="
-                + shlex.quote(f"{path_prefix}{os.pathsep}$PATH")
-                + "; "
+                f"export PATH={shlex.quote(path_prefix)}{os.pathsep}$PATH; "
                 + shell_command
             )
         resolved[name] = replace(
@@ -1023,109 +1028,6 @@ def _path_hint(path: Path) -> str:
         return str(path)
 
 
-def _default_login_shell() -> str:
-    for candidate in ("/bin/zsh", "/bin/bash", "/bin/sh"):
-        if Path(candidate).exists():
-            return candidate
-    return "/bin/sh"
-
-
-def _resolve_executable(binary: str, *, login_shell: str) -> str | None:
-    if binary.startswith("/") and Path(binary).exists():
-        return binary
-    try:
-        result = subprocess.run(
-            [login_shell, "-lc", f"command -v {shlex.quote(binary)}"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=3,
-        )
-    except Exception:
-        return None
-    executable = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-    if result.returncode != 0 or not executable:
-        return _resolve_known_versioned_cli(binary)
-    return executable
-
-
-def _resolve_known_versioned_cli(binary: str) -> str | None:
-    if binary == "claude":
-        versions_dir = Path.home() / ".local/share/claude/versions"
-        if not versions_dir.is_dir():
-            return None
-        candidates = [
-            path
-            for path in versions_dir.iterdir()
-            if path.is_file() and os.access(path, os.X_OK)
-        ]
-        candidates.sort(key=lambda path: _version_key(path.name), reverse=True)
-        return str(candidates[0]) if candidates else None
-
-    nvm_versions = Path.home() / ".nvm/versions/node"
-    if not nvm_versions.is_dir():
-        return None
-    candidates = [
-        executable
-        for version_dir in nvm_versions.iterdir()
-        for executable in [version_dir / "bin" / binary]
-        if executable.exists() and os.access(executable, os.X_OK)
-    ]
-    candidates.sort(key=lambda path: _version_key(path.parents[1].name), reverse=True)
-    return str(candidates[0]) if candidates else None
-
-
-def _executable_path_prefix(executable: str) -> str | None:
-    """Return a PATH prefix needed by env-based CLI launchers.
-
-    npm-installed CLIs usually have a `#!/usr/bin/env node` shebang. When the
-    daemon is started by systemd, the user's nvm bin directory is often absent
-    from PATH, so the launcher can resolve to an older system Node even though
-    the CLI itself was discovered under nvm.
-    """
-    raw_path = Path(executable)
-    for path in (raw_path, raw_path.resolve()):
-        parts = path.parts
-        for index in range(len(parts) - 3):
-            if parts[index : index + 3] == (".nvm", "versions", "node"):
-                version_root = Path(*parts[: index + 4])
-                bin_dir = version_root / "bin"
-                if bin_dir.is_dir():
-                    return str(bin_dir)
-    if _uses_env_node(raw_path):
-        return _latest_nvm_node_bin()
-    return None
-
-
-def _uses_env_node(path: Path) -> bool:
-    try:
-        first_line = path.read_text(errors="ignore").splitlines()[0]
-    except (IndexError, OSError):
-        return False
-    return first_line.startswith("#!") and "env node" in first_line
-
-
-def _latest_nvm_node_bin() -> str | None:
-    nvm_versions = Path.home() / ".nvm/versions/node"
-    if not nvm_versions.is_dir():
-        return None
-    candidates = [
-        version_dir / "bin"
-        for version_dir in nvm_versions.iterdir()
-        if (version_dir / "bin" / "node").exists()
-    ]
-    candidates.sort(key=lambda path: _version_key(path.parent.name), reverse=True)
-    return str(candidates[0]) if candidates else None
-
-
-def _version_key(version: str) -> tuple[int | str, ...]:
-    parts: list[int | str] = []
-    for part in version.replace("-", ".").split("."):
-        parts.append(int(part) if part.isdigit() else part)
-    return tuple(parts)
-
-
 # Handoff-seed delivery timing. The seed is typed into the harness once its
 # startup output settles, instead of after a blind fixed delay at spawn (which
 # raced the CLI's cold start and was frequently swallowed). "Settled" = the
@@ -1319,6 +1221,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         status["host_id"] = self.server.state.host_id
         if status.get("state") == "unavailable":
+            status.setdefault(
+                "error", status.get("detail") or f"auth is not supported for {harness}"
+            )
             self._write_json(status, status=HTTPStatus.NOT_FOUND)
             return
         self._write_json(status)
@@ -1331,6 +1236,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             snapshot = self.server.state.auth.start(harness)
         except KeyError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        except AuthFlowLaunchError as exc:
+            self._write_json(
+                {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
             return
         except RuntimeError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)

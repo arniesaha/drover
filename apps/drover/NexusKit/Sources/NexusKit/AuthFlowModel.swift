@@ -100,7 +100,8 @@ public final class AuthFlowModel {
 
     private static func errorMessage(for error: Error) -> String {
         switch error {
-        case NexusError.badRequest(let message), NexusError.conflict(let message):
+        case NexusError.badRequest(let message), NexusError.conflict(let message),
+             NexusError.unavailable(let message):
             return message
         case NexusError.unauthorized:
             return "token rejected - check Settings"
