@@ -63,6 +63,50 @@ def _derive_awaiting(
     return current
 
 
+def _parse_host_auth_route(path: str) -> dict[str, str] | None:
+    parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if (
+        len(parts) == 6
+        and parts[:2] == ["harness", "hosts"]
+        and parts[3] == "auth"
+        and parts[5] in {"status", "start"}
+    ):
+        return {
+            "host_id": parts[2],
+            "harness": parts[4],
+            "action": parts[5],
+            "method": "GET" if parts[5] == "status" else "POST",
+        }
+    if (
+        len(parts) == 7
+        and parts[:2] == ["harness", "hosts"]
+        and parts[3] == "auth"
+        and parts[5] == "flows"
+    ):
+        return {
+            "host_id": parts[2],
+            "harness": parts[4],
+            "flow_id": parts[6],
+            "action": "flow",
+            "method": "GET",
+        }
+    if (
+        len(parts) == 8
+        and parts[:2] == ["harness", "hosts"]
+        and parts[3] == "auth"
+        and parts[5] == "flows"
+        and parts[7] == "cancel"
+    ):
+        return {
+            "host_id": parts[2],
+            "harness": parts[4],
+            "flow_id": parts[6],
+            "action": "cancel",
+            "method": "POST",
+        }
+    return None
+
+
 class _MetricsHandler(BaseHTTPRequestHandler):
     collector: "MetricsCollector"
     auth: AuthSettings = DISABLED
@@ -131,6 +175,16 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 "application/json",
                 self.collector.render_harness_json(include_sessions=False),
             )
+            return
+        auth_route = _parse_host_auth_route(path)
+        if auth_route and auth_route["method"] == "GET":
+            status, body = self.collector.proxy_harness_auth(
+                auth_route["host_id"],
+                auth_route["harness"],
+                auth_route["action"],
+                flow_id=auth_route.get("flow_id"),
+            )
+            self._send(status, "application/json", body)
             return
         if path.startswith("/harness/hosts/") and path.endswith("/native-sessions"):
             host_id = unquote(
@@ -269,6 +323,16 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             body["host_id"] = host_id
             status, payload = self.collector.register_harness_host(body)
             self._send(status, "application/json", payload)
+            return
+        auth_route = _parse_host_auth_route(path)
+        if auth_route and auth_route["method"] == "POST":
+            status, body = self.collector.proxy_harness_auth(
+                auth_route["host_id"],
+                auth_route["harness"],
+                auth_route["action"],
+                flow_id=auth_route.get("flow_id"),
+            )
+            self._send(status, "application/json", body)
             return
         if path.startswith("/harness/hosts/") and path.endswith("/sessions"):
             host_id = unquote(

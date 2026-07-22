@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from drover.server.harness.daemon import (
     _STRUCTURED_DEFAULT_COMMANDS,
@@ -597,6 +597,46 @@ class MetricsCollector:
             method="GET",
             payload={},
         )
+
+    def proxy_harness_auth(
+        self,
+        host_id: str,
+        harness: str,
+        action: str,
+        *,
+        flow_id: str | None = None,
+    ) -> tuple[int, str]:
+        host = self._harness_host(host_id)
+        if host is None:
+            return _json_response(404, {"error": f"unknown harness host: {host_id}"})
+        endpoint = _harness_endpoint(host)
+        if not endpoint:
+            return _json_response(
+                502, {"error": f"harness host has no registered endpoint: {host_id}"}
+            )
+
+        if action in {"status", "start"}:
+            path = f"/auth/{quote(harness, safe='')}/{action}"
+        elif action in {"flow", "cancel"} and flow_id:
+            suffix = "" if action == "flow" else "/cancel"
+            path = f"/auth/{quote(harness, safe='')}/flows/{quote(flow_id, safe='')}{suffix}"
+        else:
+            return _json_response(400, {"error": "invalid auth action"})
+
+        status, body = self._proxy_harness_request(
+            f"{endpoint}{path}",
+            method="GET" if action in {"status", "flow"} else "POST",
+            payload={},
+        )
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return status, body
+        if isinstance(payload, dict):
+            payload.setdefault("host_id", host_id)
+            payload.setdefault("harness", harness)
+            return _json_response(status, payload)
+        return status, body
 
     def proxy_harness_native_transcript(self, session_id: str) -> tuple[int, str]:
         session = self._harness_session(session_id)
