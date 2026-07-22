@@ -11,7 +11,7 @@ struct AuthFlowModelTests {
             #expect(request.httpMethod == "POST")
             #expect(request.httpBody == Data("{}".utf8))
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
-            return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"waiting_for_user","login_url":"https://example.test","user_code":"ABCD-EFGH"}"#.utf8))
+            return (202, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"waiting_for_user","login_url":"https://example.test","user_code":"ABCD-EFGH"}"#.utf8))
         }
         let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "codex")
 
