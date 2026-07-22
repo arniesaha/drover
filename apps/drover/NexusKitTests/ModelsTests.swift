@@ -149,6 +149,6 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
     #expect(flow.state == .expired)
     #expect(flow.loginURL == nil)
-    #expect(flow.expiresAt != nil)
+    #expect(flow.expiresAt == ISO8601DateFormatter().date(from: "2026-07-21T12:34:56Z"))
     #expect(flow.isTerminal)
 }

@@ -117,7 +117,10 @@ public struct HarnessAuthFlow: Sendable, Equatable, Decodable {
         flowID = try container.decode(String.self, forKey: .flowID)
         state = try container.decode(HarnessAuthState.self, forKey: .state)
         if let raw = try? container.decode(String.self, forKey: .loginURL) {
-            loginURL = URL(string: raw)
+            let parsed = URL(string: raw)
+            if parsed?.scheme == "http" || parsed?.scheme == "https" {
+                loginURL = parsed
+            }
         }
         deviceCode = try? container.decode(String.self, forKey: .deviceCode)
         userCode = try? container.decode(String.self, forKey: .userCode)
