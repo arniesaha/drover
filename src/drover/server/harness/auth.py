@@ -173,7 +173,8 @@ class AuthFlowManager:
         self._adapters = adapters
         self._timeout_s = timeout_s
         self._retention_s = retention_s
-        self._flows: dict[str, _AuthFlow] = {}
+        self._flows_by_id: dict[str, _AuthFlow] = {}
+        self._active_flow_ids: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def status(self, harness: str) -> dict[str, Any]:
@@ -184,7 +185,8 @@ class AuthFlowManager:
     def start(self, harness: str) -> dict[str, Any]:
         with self._lock:
             self._discard_expired_flows()
-            existing = self._flows.get(harness)
+            existing_id = self._active_flow_ids.get(harness)
+            existing = self._flows_by_id.get(existing_id) if existing_id else None
             if existing is not None and not self._is_terminal(existing):
                 return existing.snapshot().as_json()
 
@@ -202,7 +204,8 @@ class AuthFlowManager:
                 started_at=time.time(),
                 timeout_s=self._timeout_s,
             )
-            self._flows[harness] = flow
+            self._flows_by_id[flow.flow_id] = flow
+            self._active_flow_ids[harness] = flow.flow_id
 
         threading.Thread(target=self._consume_output, args=(flow,), daemon=True).start()
         threading.Thread(target=self._expire_flow, args=(flow,), daemon=True).start()
@@ -231,8 +234,8 @@ class AuthFlowManager:
     def _flow(self, harness: str, flow_id: str) -> _AuthFlow:
         with self._lock:
             self._discard_expired_flows()
-            flow = self._flows.get(harness)
-        if flow is None or flow.flow_id != flow_id:
+            flow = self._flows_by_id.get(flow_id)
+        if flow is None or flow.harness != harness:
             raise KeyError(f"unknown auth flow: {harness}/{flow_id}")
         return flow
 
@@ -243,7 +246,7 @@ class AuthFlowManager:
 
     def _discard_expired_flows(self) -> None:
         now = time.time()
-        for harness, flow in list(self._flows.items()):
+        for flow_id, flow in list(self._flows_by_id.items()):
             with flow.lock:
                 completed_at = flow.completed_at
                 should_discard = (
@@ -251,7 +254,9 @@ class AuthFlowManager:
                     and now - completed_at >= self._retention_s
                 )
             if should_discard:
-                del self._flows[harness]
+                del self._flows_by_id[flow_id]
+                if self._active_flow_ids.get(flow.harness) == flow_id:
+                    del self._active_flow_ids[flow.harness]
 
     def _consume_output(self, flow: _AuthFlow) -> None:
         assert flow.process.stdout is not None

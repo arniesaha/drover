@@ -166,9 +166,24 @@ def test_manager_discards_terminal_flows_when_snapshot_is_read():
 
     flow = manager.start("codex")
     wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
-    managed_flow = manager._flows["codex"]
+    managed_flow = manager._flows_by_id[flow["flow_id"]]
     with managed_flow.lock:
         managed_flow.completed_at = time.time() - 61
 
     with pytest.raises(KeyError, match="unknown auth flow"):
         manager.snapshot("codex", flow["flow_id"])
+
+
+def test_manager_retains_terminal_flow_after_new_flow_starts_for_same_harness():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "pass"],
+    )
+    manager = AuthFlowManager({"codex": adapter}, retention_s=60)
+
+    first = manager.start("codex")
+    completed = wait_for_state(manager, "codex", first["flow_id"], "authenticated")
+    second = manager.start("codex")
+
+    assert second["flow_id"] != first["flow_id"]
+    assert manager.snapshot("codex", first["flow_id"]) == completed
