@@ -14,6 +14,7 @@ public final class AuthFlowModel {
     // `nonisolated(unsafe)` lets `deinit` cancel the task under Swift 6;
     // every other access is isolated to the main actor.
     private nonisolated(unsafe) var pollTask: Task<Void, Never>?
+    private var pollGeneration = 0
 
     public var status: HarnessAuthStatus?
     public var flow: HarnessAuthFlow?
@@ -54,12 +55,12 @@ public final class AuthFlowModel {
 
     public func cancel() async {
         guard let flow else { return }
+        stopPolling()
 
         do {
             self.flow = try await client.cancelAuthFlow(
                 hostID: hostID, harness: harness, flowID: flow.flowID)
             errorMessage = nil
-            stopPolling()
         } catch {
             errorMessage = Self.errorMessage(for: error)
         }
@@ -67,28 +68,32 @@ public final class AuthFlowModel {
 
     public func startPolling(every seconds: Double = 1.5) {
         stopPolling()
+        let generation = pollGeneration
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
-                    guard let self, let flow = self.flow, !flow.isTerminal else { return }
+                    guard let self, self.pollGeneration == generation,
+                          let flow = self.flow, !flow.isTerminal else { return }
                     let fresh = try await self.client.authFlow(
                         hostID: self.hostID, harness: self.harness, flowID: flow.flowID)
+                    guard !Task.isCancelled, self.pollGeneration == generation else { return }
                     self.flow = fresh
                     self.errorMessage = nil
                     if fresh.isTerminal { return }
                 } catch {
-                    guard let self else { return }
+                    guard !Task.isCancelled, let self, self.pollGeneration == generation else { return }
                     self.errorMessage = Self.errorMessage(for: error)
                     return
                 }
 
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self?.pollGeneration == generation else { return }
                 try? await Task.sleep(for: .seconds(seconds))
             }
         }
     }
 
     public func stopPolling() {
+        pollGeneration &+= 1
         pollTask?.cancel()
         pollTask = nil
     }
