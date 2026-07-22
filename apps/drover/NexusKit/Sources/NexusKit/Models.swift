@@ -118,7 +118,8 @@ public struct HarnessAuthFlow: Sendable, Equatable, Decodable {
         state = try container.decode(HarnessAuthState.self, forKey: .state)
         if let raw = try? container.decode(String.self, forKey: .loginURL) {
             let parsed = URL(string: raw)
-            if parsed?.scheme == "http" || parsed?.scheme == "https" {
+            let scheme = parsed?.scheme?.lowercased()
+            if (scheme == "http" || scheme == "https"), parsed?.host?.isEmpty == false {
                 loginURL = parsed
             }
         }

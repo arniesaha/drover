@@ -152,3 +152,13 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(flow.expiresAt == ISO8601DateFormatter().date(from: "2026-07-21T12:34:56Z"))
     #expect(flow.isTerminal)
 }
+
+@Test(arguments: ["not a url", "https:relative", "https:/missing-host"])
+func harnessAuthFlowDropsNonAbsoluteLoginURL(rawURL: String) throws {
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1",
+     "state":"waiting_for_user","login_url":"\(rawURL)"}
+    """.utf8)
+    let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
+    #expect(flow.loginURL == nil)
+}
