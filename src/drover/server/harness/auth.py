@@ -142,6 +142,7 @@ class _AuthFlow:
     output_tail: list[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     completed_at: float | None = None
+    cleanup_scheduled: bool = False
 
     def snapshot(self) -> HarnessAuthFlowSnapshot:
         with self.lock:
@@ -223,6 +224,7 @@ class AuthFlowManager:
                 flow.message = "authentication flow cancelled"
                 if flow.process.poll() is None:
                     flow.process.terminate()
+                self._schedule_discard_locked(flow)
         return flow.snapshot().as_json()
 
     def _adapter(self, harness: str) -> HarnessAuthAdapter:
@@ -258,6 +260,31 @@ class AuthFlowManager:
                 if self._active_flow_ids.get(flow.harness) == flow_id:
                     del self._active_flow_ids[flow.harness]
 
+    def _schedule_discard_locked(self, flow: _AuthFlow) -> None:
+        if flow.cleanup_scheduled:
+            return
+        flow.cleanup_scheduled = True
+        threading.Thread(
+            target=self._discard_flow_after_retention,
+            args=(flow.flow_id,),
+            daemon=True,
+        ).start()
+
+    def _discard_flow_after_retention(self, flow_id: str) -> None:
+        time.sleep(max(self._retention_s, 0))
+        with self._lock:
+            flow = self._flows_by_id.get(flow_id)
+            if flow is None:
+                return
+            with flow.lock:
+                if flow.completed_at is None:
+                    return
+                if time.time() - flow.completed_at < self._retention_s:
+                    return
+                del self._flows_by_id[flow_id]
+                if self._active_flow_ids.get(flow.harness) == flow_id:
+                    del self._active_flow_ids[flow.harness]
+
     def _consume_output(self, flow: _AuthFlow) -> None:
         assert flow.process.stdout is not None
         for raw_line in flow.process.stdout:
@@ -286,6 +313,7 @@ class AuthFlowManager:
             else:
                 flow.state = "failed"
                 flow.last_error = f"authentication process exited with code {return_code}"
+            self._schedule_discard_locked(flow)
 
     def _expire_flow(self, flow: _AuthFlow) -> None:
         try:
@@ -302,3 +330,4 @@ class AuthFlowManager:
             flow.last_error = "authentication flow expired"
             if flow.process.poll() is None:
                 flow.process.terminate()
+            self._schedule_discard_locked(flow)

@@ -187,3 +187,22 @@ def test_manager_retains_terminal_flow_after_new_flow_starts_for_same_harness():
 
     assert second["flow_id"] != first["flow_id"]
     assert manager.snapshot("codex", first["flow_id"]) == completed
+
+
+def test_manager_discards_terminal_flow_without_followup_api_call():
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "pass"],
+    )
+    manager = AuthFlowManager({"codex": adapter}, retention_s=0.2)
+
+    flow = manager.start("codex")
+    wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
+
+    deadline = time.time() + 1
+    while time.time() < deadline:
+        if flow["flow_id"] not in manager._flows_by_id:
+            break
+        time.sleep(0.01)
+
+    assert flow["flow_id"] not in manager._flows_by_id
