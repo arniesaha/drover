@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -126,6 +130,102 @@ def redact_auth_text(text: str) -> str:
         )
     redacted = re.sub(r"(?i)client_secret(?==)", "client_<redacted>", redacted)
     return redacted
+
+
+@dataclass(frozen=True)
+class CommandAuthAdapter:
+    harness: str
+    status_command: list[str]
+    login_command: list[str]
+
+    def status(self) -> HarnessAuthStatus:
+        try:
+            result = subprocess.run(
+                self.status_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except FileNotFoundError:
+            return HarnessAuthStatus(self.harness, "unavailable", detail="CLI not found")
+        except subprocess.TimeoutExpired:
+            return HarnessAuthStatus(self.harness, "unknown", detail="status timed out")
+
+        output = redact_auth_text(result.stdout or "").strip()
+        if self.harness == "claude-code":
+            return _parse_claude_status(output, result.returncode)
+        if self.harness == "codex":
+            return _parse_codex_status(output, result.returncode)
+        if self.harness == "gemini":
+            return _parse_gemini_status(output, result.returncode)
+        return HarnessAuthStatus(self.harness, "unknown", detail=output or None)
+
+    def command(self) -> list[str]:
+        return self.login_command
+
+
+def _parse_claude_status(output: str, returncode: int) -> HarnessAuthStatus:
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        data = {}
+    if data.get("loggedIn") is True:
+        return HarnessAuthStatus(
+            "claude-code",
+            "authenticated",
+            label=data.get("email"),
+            detail=data.get("subscriptionType") or data.get("authMethod"),
+        )
+    if data.get("loggedIn") is False or returncode != 0:
+        return HarnessAuthStatus("claude-code", "unauthenticated", detail=output or None)
+    return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
+
+
+def _parse_codex_status(output: str, returncode: int) -> HarnessAuthStatus:
+    lowered = output.lower()
+    if "not logged in" in lowered or "logged out" in lowered or returncode != 0:
+        return HarnessAuthStatus("codex", "unauthenticated", detail=output or None)
+    if "logged in" in lowered:
+        return HarnessAuthStatus("codex", "authenticated", detail=output or None)
+    return HarnessAuthStatus("codex", "unknown", detail=output or None)
+
+
+def _parse_gemini_status(output: str, returncode: int) -> HarnessAuthStatus:
+    if os.environ.get("GEMINI_API_KEY"):
+        return HarnessAuthStatus("gemini", "authenticated", detail="GEMINI_API_KEY set")
+    settings = Path.home() / ".gemini/settings.json"
+    accounts = Path.home() / ".gemini/google_accounts.json"
+    if settings.exists() or accounts.exists():
+        return HarnessAuthStatus("gemini", "unknown", detail="Gemini config present")
+    return HarnessAuthStatus("gemini", "unknown", detail=output or None)
+
+
+def default_auth_adapters() -> dict[str, HarnessAuthAdapter]:
+    adapters: dict[str, HarnessAuthAdapter] = {}
+    claude = shutil.which("claude")
+    if claude:
+        adapters["claude-code"] = CommandAuthAdapter(
+            "claude-code",
+            [claude, "auth", "status", "--json"],
+            [claude, "auth", "login"],
+        )
+    codex = shutil.which("codex")
+    if codex:
+        adapters["codex"] = CommandAuthAdapter(
+            "codex",
+            [codex, "login", "status"],
+            [codex, "login", "--device-auth"],
+        )
+    gemini = shutil.which("gemini")
+    if gemini:
+        adapters["gemini"] = CommandAuthAdapter(
+            "gemini",
+            [gemini, "--version"],
+            [gemini],
+        )
+    return adapters
 
 
 @dataclass

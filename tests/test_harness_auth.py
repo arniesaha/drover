@@ -7,8 +7,10 @@ import pytest
 
 from drover.server.harness.auth import (
     AuthFlowManager,
+    CommandAuthAdapter,
     HarnessAuthStatus,
     StaticAuthAdapter,
+    default_auth_adapters,
     redact_auth_text,
 )
 
@@ -78,6 +80,55 @@ def test_static_adapter_reports_unavailable_status():
         "label": None,
         "detail": "auth is not supported for openclaw",
     }
+
+
+def test_claude_status_parses_logged_in_json(tmp_path):
+    cli = tmp_path / "claude"
+    cli.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' '{\"loggedIn\":true,\"email\":\"a@example.test\",\"subscriptionType\":\"max\"}'\n"
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="claude-code",
+        status_command=[str(cli), "auth", "status", "--json"],
+        login_command=[str(cli), "auth", "login"],
+    )
+
+    status = adapter.status()
+
+    assert status.state == "authenticated"
+    assert status.label == "a@example.test"
+    assert status.detail == "max"
+    assert adapter.command() == [str(cli), "auth", "login"]
+
+
+def test_codex_status_parses_logged_out_text(tmp_path):
+    cli = tmp_path / "codex"
+    cli.write_text("#!/bin/sh\nprintf '%s\\n' 'Not logged in'\n")
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="codex",
+        status_command=[str(cli), "login", "status"],
+        login_command=[str(cli), "login", "--device-auth"],
+    )
+
+    assert adapter.status().state == "unauthenticated"
+    assert adapter.command() == [str(cli), "login", "--device-auth"]
+
+
+def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("claude", "codex", "gemini"):
+        path = bindir / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+
+    adapters = default_auth_adapters()
+
+    assert sorted(adapters) == ["claude-code", "codex", "gemini"]
 
 
 def test_manager_starts_and_polls_successful_flow(tmp_path):
