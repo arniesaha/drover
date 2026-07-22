@@ -22,10 +22,11 @@ from time import monotonic
 from typing import Any, Callable, Mapping
 from urllib.error import URLError
 from urllib.request import Request, urlopen
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 from drover.config import default_token_file, resolve_api_token_env
+from drover.server.harness.auth import AuthFlowManager, default_auth_adapters
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.structured import claude as _structured_claude
@@ -1155,6 +1156,9 @@ class HarnessDaemonState:
     registry: HarnessRegistry
     pty: PtySessionManager
     presets: dict[str, HarnessPreset]
+    auth: AuthFlowManager = field(
+        default_factory=lambda: AuthFlowManager(default_auth_adapters())
+    )
     structured: StructuredSessionManager = field(
         default_factory=StructuredSessionManager
     )
@@ -1235,6 +1239,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/native-sessions":
             self._list_native_sessions(parsed.query)
             return
+        auth_route = _parse_auth_route(parsed.path)
+        if auth_route and auth_route[2] == "status":
+            self._auth_status(auth_route[0])
+            return
+        if auth_route and auth_route[2] == "flow":
+            self._auth_flow(auth_route[0], auth_route[1] or "")
+            return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith(
             "/native-transcript"
         ):
@@ -1257,6 +1268,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path != "/healthz" and not self._gate():
+            return
+        auth_route = _parse_auth_route(parsed.path)
+        if auth_route and auth_route[2] == "start":
+            self._auth_start(auth_route[0])
+            return
+        if auth_route and auth_route[2] == "cancel":
+            self._auth_cancel(auth_route[0], auth_route[1] or "")
             return
         if parsed.path == "/sessions":
             self._create_session()
@@ -1292,6 +1310,51 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._interrupt_session(session_id)
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _auth_status(self, harness: str) -> None:
+        try:
+            status = self.server.state.auth.status(harness)
+        except KeyError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        status["host_id"] = self.server.state.host_id
+        self._write_json(status)
+
+    def _auth_start(self, harness: str) -> None:
+        if self._read_json() is None:
+            self._write_json({"error": "invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            snapshot = self.server.state.auth.start(harness)
+        except KeyError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        except RuntimeError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        snapshot["host_id"] = self.server.state.host_id
+        self._write_json(snapshot)
+
+    def _auth_flow(self, harness: str, flow_id: str) -> None:
+        try:
+            snapshot = self.server.state.auth.snapshot(harness, flow_id)
+        except KeyError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        snapshot["host_id"] = self.server.state.host_id
+        self._write_json(snapshot)
+
+    def _auth_cancel(self, harness: str, flow_id: str) -> None:
+        if self._read_json() is None:
+            self._write_json({"error": "invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            snapshot = self.server.state.auth.cancel(harness, flow_id)
+        except KeyError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        snapshot["host_id"] = self.server.state.host_id
+        self._write_json(snapshot)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -2250,6 +2313,22 @@ def reconcile_structured_sessions(state: HarnessDaemonState) -> None:
             )
         except Exception:
             continue
+
+
+def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
+    parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if len(parts) == 3 and parts[0] == "auth" and parts[2] in {"status", "start"}:
+        return parts[1], None, parts[2]
+    if len(parts) == 4 and parts[0] == "auth" and parts[2] == "flows":
+        return parts[1], parts[3], "flow"
+    if (
+        len(parts) == 5
+        and parts[0] == "auth"
+        and parts[2] == "flows"
+        and parts[4] == "cancel"
+    ):
+        return parts[1], parts[3], "cancel"
+    return None
 
 
 def create_harness_server(

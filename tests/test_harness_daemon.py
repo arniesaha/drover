@@ -16,6 +16,11 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.harness.cli import main as harnessd_cli
+from drover.server.harness.auth import (
+    AuthFlowManager,
+    HarnessAuthStatus,
+    StaticAuthAdapter,
+)
 from drover.server.__main__ import main
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
@@ -314,6 +319,91 @@ def test_harnessd_health_and_capabilities(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_harnessd_auth_status_route(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {
+            "claude-code": StaticAuthAdapter(
+                "claude-code",
+                status_value=HarnessAuthStatus("claude-code", "unauthenticated"),
+            )
+        }
+    )
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/auth/claude-code/status",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert response.status == 200
+    assert body["host_id"] == "test-host"
+    assert body["harness"] == "claude-code"
+    assert body["state"] == "unauthenticated"
+
+
+def test_harnessd_auth_start_poll_and_cancel(tmp_path):
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import time\n"
+        "print('Open https://example.test/device and enter WXYZ-1234', flush=True)\n"
+        "time.sleep(5)\n"
+    )
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {
+            "codex": StaticAuthAdapter(
+                "codex",
+                status_value=HarnessAuthStatus("codex", "unauthenticated"),
+                start_command=[sys.executable, str(script)],
+            )
+        },
+        timeout_s=30,
+    )
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/auth/codex/start",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            started = json.loads(response.read().decode("utf-8"))
+        flow_id = started["flow_id"]
+
+        poll_req = urllib.request.Request(
+            f"{base_url}/auth/codex/flows/{flow_id}",
+            headers={"Authorization": "Bearer secret"},
+        )
+        _wait_until(
+            lambda: json.loads(
+                urllib.request.urlopen(poll_req, timeout=5).read().decode("utf-8")
+            ).get("login_url")
+        )
+
+        cancel_req = urllib.request.Request(
+            f"{base_url}/auth/codex/flows/{flow_id}/cancel",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(cancel_req, timeout=5) as response:
+            cancelled = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()
+
+    assert started["host_id"] == "test-host"
+    assert started["harness"] == "codex"
+    assert cancelled["state"] == "cancelled"
 
 
 def test_resolve_harness_presets_enables_available_login_shell_clis(
