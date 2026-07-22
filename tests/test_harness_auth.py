@@ -44,8 +44,11 @@ def test_redact_auth_text_removes_secret_query_values():
     ("text", "secret"),
     [
         ("Authorization: Bearer bearer-secret", "bearer-secret"),
+        ("Authorization: Basic basic-secret", "basic-secret"),
         ("token: colon-secret", "colon-secret"),
+        ("X-Api-Key: header-secret", "header-secret"),
         ('{"access_token":"json-secret","state":"ok"}', "json-secret"),
+        ("https://example.test?api-key=query-secret&state=ok", "query-secret"),
     ],
 )
 def test_redact_auth_text_removes_non_query_secret_values(text, secret):
@@ -103,6 +106,30 @@ def test_manager_starts_and_polls_successful_flow(tmp_path):
     assert current["state"] == "authenticated"
     assert current["login_url"] == "https://example.test/device"
     assert current["user_code"] == "ABCD-EFGH"
+
+
+def test_manager_replaces_malformed_output_bytes(tmp_path):
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write("
+        "b'Open https://example.test/device and enter WXYZ-1234 \\xff\\n'"
+        ")\n"
+        "sys.stdout.flush()\n"
+    )
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, str(script)],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+    current = wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
+
+    assert current["message"] is not None
+    assert "\ufffd" in current["message"]
+    assert current["login_url"] == "https://example.test/device"
+    assert current["user_code"] == "WXYZ-1234"
 
 
 def test_manager_reuses_active_flow_for_duplicate_start():

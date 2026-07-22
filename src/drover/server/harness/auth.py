@@ -22,16 +22,17 @@ _SECRET_QUERY_KEYS = {
     "secret",
 }
 _SECRET_KEY_PATTERN = "|".join(
-    re.escape(key) for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True)
+    re.escape(key).replace("_", r"[-_]")
+    for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True)
 )
 _URL_RE = re.compile(r"https?://[^\s)'\"]+")
 _USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}(?:-[A-Z0-9]{4})+\b")
-_BEARER_RE = re.compile(r"(?i)(\bauthorization\s*:\s*bearer\s+)[^\s,;]+")
+_AUTHORIZATION_RE = re.compile(r"(?i)(\bauthorization\s*:\s*)[^\r\n,;]+")
 _JSON_SECRET_RE = re.compile(
     rf'(?i)("(?:{_SECRET_KEY_PATTERN})"\s*:\s*)"[^"]*"'
 )
 _COLON_SECRET_RE = re.compile(
-    rf"(?i)(?<![\"\w])({_SECRET_KEY_PATTERN})(\s*:\s*)"
+    rf"(?i)(?<![\"\w])((?:x[-_])?(?:{_SECRET_KEY_PATTERN}))(\s*:\s*)"
     r'(?:"[^"]*"|\'[^\']*\'|[^\s,}]+)'
 )
 _TERMINAL_FLOW_STATES = {"authenticated", "failed", "expired", "cancelled"}
@@ -113,12 +114,12 @@ class StaticAuthAdapter:
 
 
 def redact_auth_text(text: str) -> str:
-    redacted = _BEARER_RE.sub(r"\1<redacted>", text)
+    redacted = _AUTHORIZATION_RE.sub(r"\1<redacted>", text)
     redacted = _JSON_SECRET_RE.sub(r'\1"<redacted>"', redacted)
     redacted = _COLON_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True):
         redacted = re.sub(
-            rf"(?i)({re.escape(key)}=)[^&\s]+",
+            rf"(?i)({re.escape(key).replace('_', r'[-_]')}=)[^&\s]+",
             rf"\1<redacted>",
             redacted,
         )
@@ -196,6 +197,7 @@ class AuthFlowManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                errors="replace",
                 bufsize=1,
             )
             flow = _AuthFlow(
@@ -286,22 +288,34 @@ class AuthFlowManager:
                     del self._active_flow_ids[flow.harness]
 
     def _consume_output(self, flow: _AuthFlow) -> None:
-        assert flow.process.stdout is not None
-        for raw_line in flow.process.stdout:
-            line = redact_auth_text(raw_line.rstrip())
+        try:
+            assert flow.process.stdout is not None
+            for raw_line in flow.process.stdout:
+                line = redact_auth_text(raw_line.rstrip())
+                with flow.lock:
+                    if flow.state in _TERMINAL_FLOW_STATES:
+                        continue
+                    flow.output_tail.append(line)
+                    del flow.output_tail[:-20]
+                    flow.message = line
+                    url = _URL_RE.search(line)
+                    if url is not None and flow.login_url is None:
+                        flow.login_url = url.group(0)
+                    user_code = _USER_CODE_RE.search(line)
+                    if user_code is not None and flow.user_code is None:
+                        flow.user_code = user_code.group(0)
+                    flow.state = "waiting_for_user"
+        except Exception:
             with flow.lock:
                 if flow.state in _TERMINAL_FLOW_STATES:
-                    continue
-                flow.output_tail.append(line)
-                del flow.output_tail[:-20]
-                flow.message = line
-                url = _URL_RE.search(line)
-                if url is not None and flow.login_url is None:
-                    flow.login_url = url.group(0)
-                user_code = _USER_CODE_RE.search(line)
-                if user_code is not None and flow.user_code is None:
-                    flow.user_code = user_code.group(0)
-                flow.state = "waiting_for_user"
+                    return
+                flow.state = "failed"
+                flow.completed_at = time.time()
+                flow.last_error = "authentication output read failed"
+                if flow.process.poll() is None:
+                    flow.process.terminate()
+                self._schedule_discard_locked(flow)
+            return
 
         return_code = flow.process.wait()
         with flow.lock:
