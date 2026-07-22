@@ -103,6 +103,40 @@ def test_claude_status_parses_logged_in_json(tmp_path):
     assert adapter.command() == [str(cli), "auth", "login"]
 
 
+@pytest.mark.parametrize("output", ["not-json", "[]", "null"])
+def test_claude_status_handles_malformed_or_non_object_json(tmp_path, output):
+    cli = tmp_path / "claude"
+    cli.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n")
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="claude-code",
+        status_command=[str(cli), "auth", "status", "--json"],
+        login_command=[str(cli), "auth", "login"],
+    )
+
+    status = adapter.status()
+
+    assert status.state == "unknown"
+    assert status.detail == output
+
+
+def test_claude_status_reports_nonzero_exit_as_unauthenticated(tmp_path):
+    cli = tmp_path / "claude"
+    cli.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' '{\"loggedIn\":true}'\n"
+        "exit 1\n"
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="claude-code",
+        status_command=[str(cli), "auth", "status", "--json"],
+        login_command=[str(cli), "auth", "login"],
+    )
+
+    assert adapter.status().state == "unauthenticated"
+
+
 def test_codex_status_parses_logged_out_text(tmp_path):
     cli = tmp_path / "codex"
     cli.write_text("#!/bin/sh\nprintf '%s\\n' 'Not logged in'\n")
@@ -117,6 +151,39 @@ def test_codex_status_parses_logged_out_text(tmp_path):
     assert adapter.command() == [str(cli), "login", "--device-auth"]
 
 
+def test_codex_status_parses_logged_in_text(tmp_path):
+    cli = tmp_path / "codex"
+    cli.write_text("#!/bin/sh\nprintf '%s\\n' 'Logged in as a@example.test'\n")
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="codex",
+        status_command=[str(cli), "login", "status"],
+        login_command=[str(cli), "login", "--device-auth"],
+    )
+
+    assert adapter.status().state == "authenticated"
+
+
+def test_command_adapter_redacts_status_output_and_replaces_invalid_bytes(tmp_path):
+    cli = tmp_path / "codex"
+    cli.write_text(
+        "#!/bin/sh\n"
+        "printf 'token: super-secret '\n"
+        "printf '\\377'\n"
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="codex",
+        status_command=[str(cli), "login", "status"],
+        login_command=[str(cli), "login", "--device-auth"],
+    )
+
+    status = adapter.status()
+
+    assert status.state == "unknown"
+    assert status.detail == "token: <redacted> \ufffd"
+
+
 def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -129,6 +196,23 @@ def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_pat
     adapters = default_auth_adapters()
 
     assert sorted(adapters) == ["claude-code", "codex", "gemini"]
+
+
+def test_gemini_auth_is_non_authoritative_and_non_startable(monkeypatch, tmp_path):
+    gemini = tmp_path / "gemini"
+    gemini.write_text("#!/bin/sh\nexit 0\n")
+    gemini.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "test-secret")
+
+    adapter = default_auth_adapters()["gemini"]
+
+    status = adapter.status()
+
+    assert status.state == "unknown"
+    assert status.detail == "GEMINI_API_KEY set"
+    with pytest.raises(RuntimeError, match="auth is not supported for gemini"):
+        adapter.command()
 
 
 def test_manager_starts_and_polls_successful_flow(tmp_path):

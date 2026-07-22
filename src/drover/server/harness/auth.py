@@ -145,6 +145,7 @@ class CommandAuthAdapter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                errors="replace",
                 timeout=5,
                 check=False,
             )
@@ -170,7 +171,11 @@ def _parse_claude_status(output: str, returncode: int) -> HarnessAuthStatus:
     try:
         data = json.loads(output)
     except json.JSONDecodeError:
-        data = {}
+        return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
+    if returncode != 0:
+        return HarnessAuthStatus("claude-code", "unauthenticated", detail=output or None)
+    if not isinstance(data, dict):
+        return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
     if data.get("loggedIn") is True:
         return HarnessAuthStatus(
             "claude-code",
@@ -178,7 +183,7 @@ def _parse_claude_status(output: str, returncode: int) -> HarnessAuthStatus:
             label=data.get("email"),
             detail=data.get("subscriptionType") or data.get("authMethod"),
         )
-    if data.get("loggedIn") is False or returncode != 0:
+    if data.get("loggedIn") is False:
         return HarnessAuthStatus("claude-code", "unauthenticated", detail=output or None)
     return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
 
@@ -194,7 +199,7 @@ def _parse_codex_status(output: str, returncode: int) -> HarnessAuthStatus:
 
 def _parse_gemini_status(output: str, returncode: int) -> HarnessAuthStatus:
     if os.environ.get("GEMINI_API_KEY"):
-        return HarnessAuthStatus("gemini", "authenticated", detail="GEMINI_API_KEY set")
+        return HarnessAuthStatus("gemini", "unknown", detail="GEMINI_API_KEY set")
     settings = Path.home() / ".gemini/settings.json"
     accounts = Path.home() / ".gemini/google_accounts.json"
     if settings.exists() or accounts.exists():
@@ -220,10 +225,9 @@ def default_auth_adapters() -> dict[str, HarnessAuthAdapter]:
         )
     gemini = shutil.which("gemini")
     if gemini:
-        adapters["gemini"] = CommandAuthAdapter(
+        adapters["gemini"] = StaticAuthAdapter(
             "gemini",
-            [gemini, "--version"],
-            [gemini],
+            status_value=_parse_gemini_status("", 0),
         )
     return adapters
 
