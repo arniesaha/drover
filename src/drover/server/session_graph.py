@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import duckdb
+from drover.server.db import open_duckdb_connection
 
 
 def _iso(value: Any) -> str | None:
@@ -38,7 +38,7 @@ def load_session_spans(
     if not partitions:
         return [], False
 
-    con = duckdb.connect(str(duckdb_path), read_only=True)
+    con = open_duckdb_connection(duckdb_path, role="diagnostic")
     try:
         rows = []
         for partition_date in partitions:

@@ -13,9 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import duckdb
-
 from drover.schema import bootstrap
+from drover.server.db import open_duckdb_connection
 
 # "nexus.*" span attribute keys are data schema — do not rename (porting-and-cutover.md §4).
 _DECISION_ID_KEYS = (
@@ -193,7 +192,7 @@ def derive_decisions(*, duckdb_path: Path, parquet_dir: Path) -> int:
     """
 
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
+    con = open_duckdb_connection(duckdb_path)
     try:
         rows = con.execute("""
             SELECT trace_id, span_id, parent_span_id, name, start_time,
