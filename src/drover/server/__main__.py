@@ -1233,6 +1233,7 @@ def run(
                 ),
                 job_streams=job_streams,
                 api_token=auth.api_token if auth.enabled else "",
+                favorite_cwds=cfg.harness_favorite_cwds,
             )
             metrics_server = start_metrics_server(
                 host=metrics_host,

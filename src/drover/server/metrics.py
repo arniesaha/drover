@@ -26,15 +26,6 @@ from drover.server.quality import format_prometheus, quality_snapshot
 
 log = logging.getLogger("drover.metrics")
 
-_HARNESS_FAVORITE_CWDS = (
-    "/home/Arnab/dev/nexus",
-    "/home/Arnab/dev/drover-harness-prod",
-    "/Users/arnabmac/jenny/nexus",
-    "/home/Arnab/clawd",
-    "/home/Arnab/dev",
-    "/Users/arnabmac/jenny",
-)
-
 _HARNESS_STALE_AFTER_SECONDS = 45
 
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
@@ -270,7 +261,9 @@ def _redis_stream_snapshots(
     return snapshots
 
 
-def _harness_cwd_suggestions(sessions: list[Any]) -> list[dict[str, str]]:
+def _harness_cwd_suggestions(
+    sessions: list[Any], favorite_cwds: tuple[str, ...] = ()
+) -> list[dict[str, str]]:
     suggestions: list[dict[str, str]] = []
     seen: set[tuple[str | None, str]] = set()
 
@@ -293,7 +286,7 @@ def _harness_cwd_suggestions(sessions: list[Any]) -> list[dict[str, str]]:
             source="recent session",
             host_id=getattr(session, "host_id", None),
         )
-    for path in _HARNESS_FAVORITE_CWDS:
+    for path in favorite_cwds:
         add(path, source="favorite")
     return suggestions[:24]
 
@@ -416,6 +409,9 @@ class MetricsCollector:
     job_streams: Mapping[str, RedisJobStream] = field(default_factory=dict)
     ttl_seconds: float = 60.0
     api_token: str = ""
+    # New Session sheet "favorite" cwd suggestions, from [harness].favorite_cwds
+    # in ~/.drover/config.toml (empty by default — no hardcoded paths).
+    favorite_cwds: tuple[str, ...] = ()
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -809,7 +805,9 @@ class MetricsCollector:
                 return {
                     "hosts": [_harness_host_dict(host) for host in hosts],
                     "sessions": [session.__dict__ for session in sessions],
-                    "cwd_suggestions": _harness_cwd_suggestions(sessions),
+                    "cwd_suggestions": _harness_cwd_suggestions(
+                        sessions, self.favorite_cwds
+                    ),
                 }
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render harness snapshot: %s", exc)

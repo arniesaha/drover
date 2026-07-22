@@ -525,6 +525,7 @@ def test_metrics_collector_harness_cwd_suggestions_are_recent_then_favorites(tmp
         incoming_dir=tmp_path / "incoming",
         summarizer_report={},
         ttl_seconds=60,
+        favorite_cwds=("/home/Arnab/clawd", "/home/Arnab/dev"),
     )
 
     payload = json.loads(collector.render_harness_json())
@@ -542,6 +543,24 @@ def test_metrics_collector_harness_cwd_suggestions_are_recent_then_favorites(tmp
     assert {"path": "/home/Arnab/clawd", "source": "favorite"} in payload[
         "cwd_suggestions"
     ]
+    assert {"path": "/home/Arnab/dev", "source": "favorite"} in payload[
+        "cwd_suggestions"
+    ]
+
+
+def test_metrics_collector_cwd_suggestions_no_favorites_by_default(tmp_path):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+    payload = json.loads(collector.render_harness_json())
+
+    assert payload["cwd_suggestions"] == []
 
 
 def test_metrics_collector_harness_session_json(tmp_path):
