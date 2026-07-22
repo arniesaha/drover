@@ -1318,6 +1318,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
             return
         status["host_id"] = self.server.state.host_id
+        if status.get("state") == "unavailable":
+            self._write_json(status, status=HTTPStatus.NOT_FOUND)
+            return
         self._write_json(status)
 
     def _auth_start(self, harness: str) -> None:
