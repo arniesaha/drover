@@ -31,6 +31,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
 
 from drover.event_identity import canonical_agent_events_cte
 from drover.parsers import parse_agentweave_trace
+from drover.server.parquet_io import atomic_write_table
 from drover.attribution import derive_repo_attribution
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
@@ -262,7 +263,7 @@ def _write_partition(rows: list[dict], parquet_dir: Path) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"part-{uuid.uuid4().hex[:12]}.parquet"
         table = _coerce_to_arrow(part_rows)
-        pq.write_table(table, out_path, compression="zstd")
+        atomic_write_table(table, out_path, compression="zstd")
 
 
 def _upsert_tasks(con, rows: list[dict]) -> None:

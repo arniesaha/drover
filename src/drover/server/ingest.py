@@ -27,6 +27,7 @@ from drover.attribution import enrich_raw_repo_attribution
 from drover.dedup import make_dedup_key
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
+from drover.server.parquet_io import atomic_write_table
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.rollup import rollup_tasks
 from drover.task_id import compute_task_id
@@ -209,7 +210,7 @@ def _write_partition(rows: list[dict], parquet_dir: Path) -> None:
             for r in part_rows
         ]
         table = pa.Table.from_pylist(payload)
-        pq.write_table(table, out_path, compression="zstd")
+        atomic_write_table(table, out_path, compression="zstd")
 
 
 def _is_valid_title(content: str) -> bool:
