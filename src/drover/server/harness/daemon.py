@@ -1143,6 +1143,22 @@ _SEED_SETTLE_S = 0.4
 _SEED_COLD_QUIET_S = 1.5
 
 
+# claude-code's ink renderer emits UI text word-by-word with cursor-position
+# escapes between words, so a gate sentence never appears contiguously in the
+# raw PTY stream. Strip escape sequences AND whitespace from both sides before
+# substring-matching gate markers.
+_TERMINAL_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]"  # CSI sequences (colors, cursor moves)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences (titles)
+    r"|\x1b[=>()][0-9A-Za-z]?"  # charset / keypad-mode selects
+    r"|[\x00-\x08\x0b-\x1f\x7f]"  # other control bytes (keep \n via \s below)
+)
+
+
+def _normalize_gate_text(text: str) -> str:
+    return re.sub(r"\s+", "", _TERMINAL_ESCAPE_RE.sub("", text))
+
+
 @dataclass
 class PendingSeed:
     """A queued handoff seed plus the startup-gate handling its harness needs
@@ -1467,10 +1483,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             ready = (now - attach_ts) >= _SEED_COLD_QUIET_S
         if not ready:
             return
+        watched = _normalize_gate_text(recent_output) if pending.gate_markers else ""
         if (
             pending.gate_markers
             and not pending.gate_answered
-            and any(marker in recent_output for marker in pending.gate_markers)
+            and any(
+                _normalize_gate_text(marker) in watched
+                for marker in pending.gate_markers
+            )
         ):
             pending.gate_answered = True
             try:

@@ -358,10 +358,15 @@ def test_handoff_seed_is_queued_then_typed_in_once_the_cli_settles(tmp_path):
     [
         # Old claude-code trust-gate wording…
         "Do you trust the files in this folder?",
-        # …and the reworded gate shipped around claude-code v2.1.x, which
+        # …the reworded gate shipped around claude-code v2.1.x, which
         # resurrected the seed-swallow live on 2026-07-22 because only the
-        # old wording was matched.
+        # old wording was matched…
         "Is this a project you created or one you trust?",
+        # …and that same wording as claude-code's ink renderer actually emits
+        # it: words separated by cursor-positioning escapes instead of spaces,
+        # so the sentence never appears contiguously in the raw PTY stream.
+        "Is\x1b[1C\x1b[39mthis\x1b[1Ca\x1b[1Cproject\x1b[1Cyou\x1b[1C"
+        "created\x1b[1Cor\x1b[1Cone\x1b[1Cyou\x1b[1Ctrust?",
     ],
 )
 def test_handoff_seed_waits_for_startup_gate_to_be_answered(tmp_path, gate_prompt):
