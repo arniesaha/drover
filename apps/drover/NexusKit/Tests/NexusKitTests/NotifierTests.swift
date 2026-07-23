@@ -46,6 +46,7 @@ private func testDefaults() -> UserDefaults {
 
 /// `.serialized`: every test in this file mutates the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment.
+extension MockNetworkTests {
 @Suite(.serialized)
 struct NotifierTests {
 
@@ -159,3 +160,5 @@ struct NotifierTests {
 }
 
 }
+
+}  // extension MockNetworkTests

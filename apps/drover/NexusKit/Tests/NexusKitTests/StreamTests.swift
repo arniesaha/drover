@@ -27,6 +27,7 @@ private func wireMessage(seq: Int, text: String) -> String {
 /// `.serialized`: every test in this file mutates the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment for why that
 /// requires serialization rather than Swift Testing's default parallelism.
+extension MockNetworkTests {
 @Suite(.serialized)
 struct StreamTests {
 
@@ -146,3 +147,5 @@ struct StreamTests {
 }
 
 }
+
+}  // extension MockNetworkTests

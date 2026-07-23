@@ -4,6 +4,7 @@ import Testing
 
 /// `.serialized`: two tests here mutate the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment.
+extension MockNetworkTests {
 @Suite(.serialized)
 struct StoreTests {
 
@@ -82,3 +83,5 @@ struct StoreTests {
 }
 
 }
+
+}  // extension MockNetworkTests

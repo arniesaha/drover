@@ -21,6 +21,7 @@ private func waitUntil(
 
 /// `.serialized`: several tests here mutate the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment.
+extension MockNetworkTests {
 @Suite(.serialized)
 struct ChatModelTests {
 
@@ -340,3 +341,5 @@ struct ChatModelTests {
 }
 
 }
+
+}  // extension MockNetworkTests

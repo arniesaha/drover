@@ -6,6 +6,7 @@ import Testing
 /// `MockURLProtocol.handler` — without serialization, Swift Testing's
 /// default parallel execution could let one test's handler answer another
 /// test's in-flight request.
+extension MockNetworkTests {
 @Suite(.serialized)
 struct ClientTests {
 
@@ -318,3 +319,5 @@ private final class RequestLog: @unchecked Sendable {
 }
 
 }
+
+}  // extension MockNetworkTests

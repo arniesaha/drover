@@ -1,8 +1,17 @@
 import Foundation
+import Testing
 @testable import NexusKit
 
 // Shared fixtures/factories reused across NexusKit test files.
 // Real wire shapes captured from the deployed backend.
+
+/// Root suite for every test that installs `MockURLProtocol.handler`. The
+/// handler is a single global slot, and Swift Testing runs suites from
+/// different files concurrently — so a request issued by one suite can land
+/// in another suite's handler (a bodyless auth-poll GET arriving in a POST
+/// handler crashes its `try!` body parse). `.serialized` applies recursively,
+/// so nesting every handler-using suite here keeps them mutually exclusive.
+@Suite(.serialized) enum MockNetworkTests {}
 
 let snapshotJSON = Data("""
 {"hosts": [{"host_id": "mac-mini", "status": "online",

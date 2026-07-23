@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import NexusKit
 
+extension MockNetworkTests {
 @Suite(.serialized)
 struct AuthFlowModelTests {
 
@@ -216,3 +217,5 @@ struct AuthFlowModelTests {
         }
     }
 }
+
+}  // extension MockNetworkTests

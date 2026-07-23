@@ -13,6 +13,7 @@ private func validate() async -> String? {
 /// `.serialized`: several tests here mutate the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment for why that
 /// requires serialization rather than Swift Testing's default parallelism.
+extension MockNetworkTests {
 @Suite(.serialized)
 struct EnvironmentTests {
 
@@ -60,3 +61,5 @@ struct EnvironmentTests {
 }
 
 }
+
+}  // extension MockNetworkTests
