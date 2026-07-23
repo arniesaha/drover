@@ -1502,7 +1502,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if seed is None:
             return
         try:
-            self.server.state.pty.write(session_id, seed.text)
+            # Type as a keyboard would: Enter is CR, not LF. Raw-mode ink
+            # inputs (claude-code) never submit on "\n" — the seed would sit
+            # unsent in the input box — while canonical-mode shells map CR
+            # back to NL via icrnl, so "\r" submits everywhere.
+            self.server.state.pty.write(session_id, seed.text.replace("\n", "\r"))
         except Exception:
             return
         self._safe_append_event(
