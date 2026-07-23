@@ -3,7 +3,13 @@ import PackageDescription
 
 let package = Package(
     name: "NexusKit",
-    platforms: [.iOS(.v18)],
+    platforms: [.iOS(.v18), .macOS(.v14)],
     products: [.library(name: "NexusKit", targets: ["NexusKit"])],
-    targets: [.target(name: "NexusKit")]
+    targets: [
+        .target(name: "NexusKit"),
+        .testTarget(
+            name: "NexusKitTests",
+            dependencies: ["NexusKit"]
+        ),
+    ]
 )

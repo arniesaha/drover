@@ -16,6 +16,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.harness.cli import main as harnessd_cli
+from drover.server.harness import daemon as harness_daemon
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
@@ -55,6 +56,54 @@ class _FailingRegistry:
 
     def append_transcript_chunk(self, **kwargs):
         raise RuntimeError("locked")
+
+
+def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
+    calls = []
+
+    class _Closer:
+        def __init__(self, name):
+            self.name = name
+
+        def close_all(self):
+            calls.append(self.name)
+
+    class _State:
+        api_token = ""
+        host_token = None
+        pty = _Closer("pty")
+        auth = _Closer("auth")
+
+    class _Server:
+        def serve_forever(self):
+            raise RuntimeError("stop")
+
+        def server_close(self):
+            calls.append("server")
+
+    monkeypatch.setattr(harness_daemon, "HarnessDaemonState", lambda **kwargs: _State())
+    monkeypatch.setattr(harness_daemon, "resolve_daemon_token", lambda token: "token")
+    monkeypatch.setattr(harness_daemon, "wire_event_pusher", lambda state: None)
+    monkeypatch.setattr(harness_daemon, "register_daemon_host", lambda state: None)
+    monkeypatch.setattr(
+        harness_daemon, "register_daemon_host_remote", lambda state: True
+    )
+    monkeypatch.setattr(harness_daemon, "start_remote_heartbeat", lambda state: None)
+    monkeypatch.setattr(
+        harness_daemon, "create_harness_server", lambda **kwargs: _Server()
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        harness_daemon.run_harnessd(
+            host_id="test-host",
+            display_name="Test Host",
+            kind="mac",
+            duckdb_path=tmp_path / "drover.duckdb",
+            listen_host="127.0.0.1",
+            listen_port=0,
+        )
+
+    assert calls == ["pty", "auth", "server"]
 
 
 class _CentralRegistrationHandler(BaseHTTPRequestHandler):

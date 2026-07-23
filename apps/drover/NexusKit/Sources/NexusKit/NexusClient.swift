@@ -8,6 +8,7 @@ public enum NexusError: Error, Equatable {
     case badRequest(String)              // 400 body "error" text
     case unavailable(String)             // 404 body "error" text
     case transport(String)               // URLError etc.
+    case httpStatus(Int, String)         // Other HTTP statuses
     case decoding(String)
 }
 
@@ -211,7 +212,11 @@ public actor NexusClient {
         case 404:
             throw NexusError.unavailable(errorText(from: data))
         default:
-            throw NexusError.transport("unexpected status \(http.statusCode)")
+            let text = errorText(from: data)
+            throw NexusError.httpStatus(
+                http.statusCode,
+                text.isEmpty ? "unexpected status \(http.statusCode)" : text
+            )
         }
     }
 

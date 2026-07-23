@@ -40,6 +40,11 @@ _SECRET_KEY_PATTERN = "|".join(
     re.escape(key).replace("_", r"[-_]")
     for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True)
 )
+_SPACE_SECRET_KEYS = _SECRET_QUERY_KEYS - {"code"}
+_SPACE_SECRET_KEY_PATTERN = "|".join(
+    re.escape(key).replace("_", r"[-_]")
+    for key in sorted(_SPACE_SECRET_KEYS, key=len, reverse=True)
+)
 _SECRET_KEY_NAME_RE = (
     r"[A-Z0-9][A-Z0-9_-]*"
     r"(?:AUTHORIZATION|BEARER|COOKIE|TOKEN|CODE|ACCESS[-_]TOKEN|REFRESH[-_]TOKEN|"
@@ -67,6 +72,27 @@ _SPACED_ASSIGN_SECRET_RE = re.compile(
     rf"(?i)(?<![\"\w])((?:x[-_])?(?:{_SECRET_KEY_PATTERN}|{_SECRET_KEY_NAME_RE}))(\s*=\s*)"
     r'(?:"[^"]*"|\'[^\']*\'|[^&\s,}]+)'
 )
+_ENV_SPACE_SECRET_RE = re.compile(
+    rf"(?<![\"\w])((?:X[-_])?{_SECRET_KEY_NAME_RE})([ \t]+)"
+    r'(?:"[^"]*"|\'[^\']*\'|[^\s,;}]+)'
+)
+_KEY_SPACE_SECRET_RE = re.compile(
+    rf"(?i)(?<![\"\w])((?:x[-_])?(?:{_SPACE_SECRET_KEY_PATTERN}))([ \t]+)"
+    r'(?:"[^"]*"|\'[^\']*\'|[^\s,;}]+)'
+)
+_PHRASE_SPACE_SECRET_RE = re.compile(
+    r"(?i)(?<![\"\w])((?:access|refresh|id|oauth|session|authorization)\s+token|"
+    r"api\s+key|client\s+secret|bearer\s+token|credentials?|password|passwd)"
+    r"([ \t]+)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
+_PROVIDER_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"sk-(?:(?:ant-(?:api|oat)\d*|proj|svcacct)-[A-Za-z0-9_-]{16,}|[A-Za-z0-9_-]{20,})|"
+    r"AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9._-]{10,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r")(?![A-Za-z0-9_-])"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/\s?#@]+@")
 _TERMINAL_FLOW_STATES = {"authenticated", "failed", "expired", "cancelled"}
 _PROCESS_STOP_TIMEOUT_S = 0.2
 
@@ -151,12 +177,17 @@ class StaticAuthAdapter:
 
 
 def redact_auth_text(text: str) -> str:
-    redacted = _AUTHORIZATION_RE.sub(r"\1<redacted>", text)
+    redacted = _URL_USERINFO_RE.sub(r"\1<redacted>@", text)
+    redacted = _AUTHORIZATION_RE.sub(r"\1<redacted>", redacted)
     redacted = _BEARER_TOKEN_RE.sub(r"\1<redacted>", redacted)
     redacted = _JWT_RE.sub("<redacted>", redacted)
+    redacted = _PROVIDER_TOKEN_RE.sub("<redacted>", redacted)
     redacted = _JSON_SECRET_RE.sub(r'\1"<redacted>"', redacted)
     redacted = _COLON_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     redacted = _SPACED_ASSIGN_SECRET_RE.sub(r"\1\2<redacted>", redacted)
+    redacted = _ENV_SPACE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
+    redacted = _KEY_SPACE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
+    redacted = _PHRASE_SPACE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True):
         redacted = re.sub(
             rf"(?i)({re.escape(key).replace('_', r'[-_]')}=)[^&\s]+",
@@ -380,9 +411,10 @@ def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthA
         )
     gemini = _resolve_login_command("gemini", shell=shell)
     if gemini is not None:
-        adapters["gemini"] = StaticAuthAdapter(
+        adapters["gemini"] = CommandAuthAdapter(
             "gemini",
-            status_value=_parse_gemini_status("", 0),
+            _command_with_args(gemini, "--version"),
+            list(gemini),
         )
     return adapters
 
@@ -478,6 +510,11 @@ class AuthFlowManager:
             self._active_flow_ids[harness] = flow.flow_id
 
         threading.Thread(target=self._consume_output, args=(flow,), daemon=True).start()
+        threading.Thread(
+            target=self._stop_descendants_after_leader_exit,
+            args=(flow,),
+            daemon=True,
+        ).start()
         threading.Thread(target=self._expire_flow, args=(flow,), daemon=True).start()
         return flow.snapshot().as_json()
 
@@ -494,6 +531,18 @@ class AuthFlowManager:
                 self._stop_process(flow.process, flow.pgid)
                 self._schedule_discard_locked(flow)
         return flow.snapshot().as_json()
+
+    def close_all(self) -> None:
+        with self._lock:
+            flows = list(self._flows_by_id.values())
+        for flow in flows:
+            with flow.lock:
+                if flow.state not in _TERMINAL_FLOW_STATES:
+                    flow.state = "cancelled"
+                    flow.completed_at = time.time()
+                    flow.message = "authentication flow closed"
+                    self._schedule_discard_locked(flow)
+            self._stop_process(flow.process, flow.pgid)
 
     def _adapter(self, harness: str) -> HarnessAuthAdapter:
         try:
@@ -586,6 +635,10 @@ class AuthFlowManager:
                 if self._active_flow_ids.get(flow.harness) == flow_id:
                     del self._active_flow_ids[flow.harness]
 
+    def _stop_descendants_after_leader_exit(self, flow: _AuthFlow) -> None:
+        flow.process.wait()
+        self._stop_process(flow.process, flow.pgid)
+
     def _consume_output(self, flow: _AuthFlow) -> None:
         try:
             assert flow.process.stdout is not None
@@ -620,12 +673,34 @@ class AuthFlowManager:
             return
 
         return_code = flow.process.wait()
+        status: HarnessAuthStatus | None = None
+        if return_code == 0:
+            try:
+                status = self._adapter(flow.harness).status()
+            except Exception as exc:
+                status = HarnessAuthStatus(
+                    flow.harness,
+                    "unknown",
+                    detail=redact_auth_text(str(exc)) or "status check failed",
+                )
         with flow.lock:
             if flow.state in _TERMINAL_FLOW_STATES:
                 return
             flow.completed_at = time.time()
-            if return_code == 0:
+            if (
+                return_code == 0
+                and status is not None
+                and status.state == "authenticated"
+            ):
                 flow.state = "authenticated"
+            elif return_code == 0 and status is not None:
+                flow.state = "failed"
+                diagnostic = (
+                    f"authentication status is {status.state} after successful login"
+                )
+                if status.detail:
+                    diagnostic += f": {status.detail}"
+                flow.last_error = redact_auth_text(diagnostic)
             else:
                 flow.state = "failed"
                 flow.last_error = f"authentication process exited with code {return_code}"

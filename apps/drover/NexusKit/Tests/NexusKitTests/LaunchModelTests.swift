@@ -42,7 +42,7 @@ struct LaunchModelTests {
 
     #expect(model.supportsInteractiveAuth == true)
     model.harness = "gemini"
-    #expect(model.supportsInteractiveAuth == false)
+    #expect(model.supportsInteractiveAuth == true)
     model.harness = "shell"
     #expect(model.supportsInteractiveAuth == false)
 }

@@ -2399,6 +2399,7 @@ def run_harnessd(
         server.serve_forever()
     finally:
         state.pty.close_all()
+        state.auth.close_all()
         if pusher is not None:
             pusher.stop()
         server.server_close()

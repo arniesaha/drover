@@ -86,6 +86,49 @@ def test_redact_auth_text_removes_common_auth_secret_formats(text, secret):
     assert "<redacted>" in redacted
 
 
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("OPENAI_API_KEY sk-secret", "sk-secret"),
+        ("token abc123", "abc123"),
+        ("Cookie cookie-secret", "cookie-secret"),
+        ("secret quoted-secret", "quoted-secret"),
+        ("api_key lower-secret", "lower-secret"),
+        ("api-key hyphen-secret", "hyphen-secret"),
+        ("access token abc123", "abc123"),
+        (
+            "provider returned sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "provider returned sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "provider returned AIzaSyabcdefghijklmnopqrstuvwxyz12345",
+            "AIzaSyabcdefghijklmnopqrstuvwxyz12345",
+        ),
+        ("open https://user:password@example.test/device", "user:password"),
+    ],
+)
+def test_redact_auth_text_removes_space_delimited_and_provider_secrets(text, secret):
+    redacted = redact_auth_text(text)
+
+    assert secret not in redacted
+    assert "<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Enter device code ABCD-EFGH",
+        "Enter user code WXYZ-1234",
+    ],
+)
+def test_redact_auth_text_preserves_device_and_user_codes(text):
+    assert redact_auth_text(text) == text
+
+
 def test_manager_defaults_to_ten_minute_timeout_and_retention():
     manager = AuthFlowManager({})
 
@@ -256,12 +299,15 @@ def test_default_auth_adapters_use_login_shell_command_and_nvm_path(
     ]
 
 
-def test_gemini_auth_is_non_authoritative_and_non_startable(monkeypatch, tmp_path):
+def test_gemini_auth_is_non_authoritative_but_startable(monkeypatch, tmp_path):
     gemini = tmp_path / "gemini"
     gemini.write_text("#!/bin/sh\nexit 0\n")
     gemini.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setenv("GEMINI_API_KEY", "test-secret")
+    monkeypatch.setattr(
+        "drover.server.harness.auth.resolve_executable",
+        lambda binary, *, login_shell: str(gemini) if binary == "gemini" else None,
+    )
 
     adapter = default_auth_adapters()["gemini"]
 
@@ -269,8 +315,7 @@ def test_gemini_auth_is_non_authoritative_and_non_startable(monkeypatch, tmp_pat
 
     assert status.state == "unknown"
     assert status.detail == "GEMINI_API_KEY set"
-    with pytest.raises(RuntimeError, match="auth is not supported for gemini"):
-        adapter.command()
+    assert adapter.command()[-1].endswith(f"exec {gemini}")
 
 
 def test_manager_starts_and_polls_successful_flow(tmp_path):
@@ -282,7 +327,7 @@ def test_manager_starts_and_polls_successful_flow(tmp_path):
     )
     adapter = StaticAuthAdapter(
         "codex",
-        status_value=HarnessAuthStatus("codex", "unauthenticated"),
+        status_value=HarnessAuthStatus("codex", "authenticated"),
         start_command=[sys.executable, str(script)],
     )
     manager = AuthFlowManager({"codex": adapter}, timeout_s=5, retention_s=60)
@@ -312,7 +357,7 @@ def test_manager_extracts_pairing_code_before_redacting_message(tmp_path):
     )
     adapter = StaticAuthAdapter(
         "codex",
-        status_value=HarnessAuthStatus("codex", "unauthenticated"),
+        status_value=HarnessAuthStatus("codex", "authenticated"),
         start_command=[sys.executable, str(script)],
     )
     manager = AuthFlowManager({"codex": adapter}, timeout_s=5, retention_s=60)
@@ -343,6 +388,7 @@ def test_manager_replaces_malformed_output_bytes(tmp_path):
     )
     adapter = StaticAuthAdapter(
         "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
         start_command=[sys.executable, str(script)],
     )
     manager = AuthFlowManager({"codex": adapter})
@@ -381,6 +427,24 @@ def test_manager_marks_nonzero_exit_as_failed():
     failed = wait_for_state(manager, "codex", flow["flow_id"], "failed")
 
     assert failed["last_error"] == "authentication process exited with code 3"
+
+
+def test_manager_requires_authenticated_status_after_zero_exit():
+    adapter = StaticAuthAdapter(
+        "codex",
+        status_value=HarnessAuthStatus(
+            "codex", "unauthenticated", detail="access token status-secret"
+        ),
+        start_command=[sys.executable, "-c", "pass"],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+    failed = wait_for_state(manager, "codex", flow["flow_id"], "failed")
+
+    assert "unauthenticated" in failed["last_error"]
+    assert "status-secret" not in failed["last_error"]
+    assert "<redacted>" in failed["last_error"]
 
 
 def test_manager_cancels_active_flow():
@@ -459,7 +523,7 @@ def test_manager_kills_descendant_after_launcher_exits(tmp_path):
     heartbeat = tmp_path / "orphan-heartbeat"
     script = tmp_path / "spawn_orphan.py"
     script.write_text(
-        "import subprocess, sys, textwrap\n"
+        "import pathlib, subprocess, sys, textwrap, time\n"
         f"heartbeat = {str(heartbeat)!r}\n"
         "child_code = textwrap.dedent(f'''\n"
         "    import pathlib, signal, time\n"
@@ -470,10 +534,15 @@ def test_manager_kills_descendant_after_launcher_exits(tmp_path):
         "        time.sleep(0.05)\n"
         "''')\n"
         "subprocess.Popen([sys.executable, '-c', child_code], stdout=sys.stdout, stderr=subprocess.DEVNULL)\n"
+        "deadline = time.time() + 2\n"
+        "while not pathlib.Path(heartbeat).exists() and time.time() < deadline:\n"
+        "    time.sleep(0.01)\n"
         "print('Open https://example.test/device and enter ORPH-0001', flush=True)\n"
     )
     adapter = StaticAuthAdapter(
-        "codex", start_command=[sys.executable, str(script)]
+        "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
+        start_command=[sys.executable, str(script)],
     )
     manager = AuthFlowManager({"codex": adapter})
 
@@ -483,14 +552,32 @@ def test_manager_kills_descendant_after_launcher_exits(tmp_path):
         time.sleep(0.01)
     assert heartbeat.exists()
 
-    manager._stop_process(
-        manager._flows_by_id[flow["flow_id"]].process,
-        manager._flows_by_id[flow["flow_id"]].pgid,
-    )
+    wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
     heartbeat.unlink(missing_ok=True)
     time.sleep(0.2)
 
     assert not heartbeat.exists()
+
+
+def test_manager_close_all_terminates_active_flows():
+    adapters = {
+        harness: StaticAuthAdapter(
+            harness,
+            start_command=[sys.executable, "-c", "import time; time.sleep(10)"],
+        )
+        for harness in ("claude-code", "codex")
+    }
+    manager = AuthFlowManager(adapters)
+    flows = [manager.start(harness) for harness in adapters]
+
+    manager.close_all()
+
+    for flow in flows:
+        managed = manager._flows_by_id[flow["flow_id"]]
+        assert managed.process.poll() is not None
+        assert (
+            manager.snapshot(flow["harness"], flow["flow_id"])["state"] == "cancelled"
+        )
 
 
 def test_manager_expires_timed_out_flow():
@@ -506,11 +593,11 @@ def test_manager_expires_timed_out_flow():
     assert expired["last_error"] == "authentication flow expired"
 
 
-def test_manager_expires_descendant_output_after_launcher_exits(tmp_path):
+def test_manager_expires_descendant_output(tmp_path):
     heartbeat = tmp_path / "timeout-heartbeat"
     script = tmp_path / "spawn_child.py"
     script.write_text(
-        "import subprocess, sys, textwrap\n"
+        "import pathlib, subprocess, sys, textwrap, time\n"
         f"heartbeat = {str(heartbeat)!r}\n"
         "child_code = textwrap.dedent(f'''\n"
         "    import pathlib, signal, time\n"
@@ -523,6 +610,10 @@ def test_manager_expires_descendant_output_after_launcher_exits(tmp_path):
         "''')\n"
         "subprocess.Popen([sys.executable, '-c', child_code], stdout=sys.stdout, stderr=subprocess.DEVNULL)\n"
         "print('Open https://example.test/device', flush=True)\n"
+        "deadline = time.time() + 2\n"
+        "while not pathlib.Path(heartbeat).exists() and time.time() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(10)\n"
     )
     adapter = StaticAuthAdapter(
         "codex", start_command=[sys.executable, str(script)]
@@ -553,6 +644,7 @@ def test_manager_expires_descendant_output_after_launcher_exits(tmp_path):
 def test_manager_discards_terminal_flows_when_snapshot_is_read():
     adapter = StaticAuthAdapter(
         "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
         start_command=[sys.executable, "-c", "pass"],
     )
     manager = AuthFlowManager({"codex": adapter}, retention_s=60)
@@ -570,6 +662,7 @@ def test_manager_discards_terminal_flows_when_snapshot_is_read():
 def test_manager_retains_terminal_flow_after_new_flow_starts_for_same_harness():
     adapter = StaticAuthAdapter(
         "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
         start_command=[sys.executable, "-c", "pass"],
     )
     manager = AuthFlowManager({"codex": adapter}, retention_s=60)
@@ -585,6 +678,7 @@ def test_manager_retains_terminal_flow_after_new_flow_starts_for_same_harness():
 def test_manager_discards_terminal_flow_without_followup_api_call():
     adapter = StaticAuthAdapter(
         "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
         start_command=[sys.executable, "-c", "pass"],
     )
     manager = AuthFlowManager({"codex": adapter}, retention_s=0.2)

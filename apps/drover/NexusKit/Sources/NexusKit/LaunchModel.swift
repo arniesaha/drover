@@ -66,7 +66,7 @@ public final class LaunchModel {
     /// Local snapshots lack auth capability metadata, so only known
     /// interactive providers expose the sign-in flow.
     public var supportsInteractiveAuth: Bool {
-        harness == "claude-code" || harness == "codex"
+        Self.structuredCapableHarnesses.contains(harness)
     }
 
     /// Posts `createSession` for the current selection. On success returns

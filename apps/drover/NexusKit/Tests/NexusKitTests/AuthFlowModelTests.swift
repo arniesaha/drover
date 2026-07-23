@@ -9,7 +9,7 @@ struct AuthFlowModelTests {
         MockURLProtocol.handler = { request in
             #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/start")
             #expect(request.httpMethod == "POST")
-            #expect(request.httpBody == Data("{}".utf8))
+            #expect(request.bodyStreamData() == Data("{}".utf8))
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
             return (202, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"waiting_for_user","login_url":"https://example.test","user_code":"ABCD-EFGH"}"#.utf8))
         }
@@ -26,7 +26,7 @@ struct AuthFlowModelTests {
         MockURLProtocol.handler = { request in
             #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel")
             #expect(request.httpMethod == "POST")
-            #expect(request.httpBody == Data("{}".utf8))
+            #expect(request.bodyStreamData() == Data("{}".utf8))
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
             return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"cancelled"}"#.utf8))
         }
@@ -54,11 +54,11 @@ struct AuthFlowModelTests {
         #expect(state.requestCount == 1)
     }
 
-    @Test @MainActor func pollingRequestErrorStopsPolling() async throws {
+    @Test @MainActor func pollingPermanentRequestErrorStopsPolling() async throws {
         let state = PollTestState()
         MockURLProtocol.handler = { _ in
             state.incrementRequests()
-            return (500, Data(#"{"error":"poll failed"}"#.utf8))
+            return (400, Data(#"{"error":"poll failed"}"#.utf8))
         }
         let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "codex")
         model.flow = try waitingFlow()
@@ -68,6 +68,60 @@ struct AuthFlowModelTests {
         try await waitUntil { model.errorMessage != nil }
         try await Task.sleep(for: .milliseconds(50))
         #expect(state.requestCount == 1)
+    }
+
+    @Test @MainActor func pollingUnhandledClientErrorStopsPolling() async throws {
+        let state = PollTestState()
+        MockURLProtocol.handler = { _ in
+            state.incrementRequests()
+            return (422, Data(#"{"error":"poll rejected"}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "codex")
+        model.flow = try waitingFlow()
+
+        model.startPolling(every: 0.01)
+
+        try await waitUntil { model.errorMessage != nil }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(state.requestCount == 1)
+        #expect(model.errorMessage == "poll rejected")
+    }
+
+    @Test @MainActor func pollingRetriesTransientErrorsAndRecovers() async throws {
+        let state = PollTestState()
+        MockURLProtocol.handler = { _ in
+            if state.incrementRequests() < 3 {
+                return (500, Data(#"{"error":"poll failed"}"#.utf8))
+            }
+            return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"authenticated"}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "codex")
+        model.flow = try waitingFlow()
+
+        model.startPolling(every: 0.01)
+
+        try await waitUntil { model.flow?.state == .authenticated }
+        #expect(state.requestCount == 3)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test @MainActor func failedCancellationResumesPolling() async throws {
+        let state = PollTestState()
+        MockURLProtocol.handler = { request in
+            state.incrementRequests()
+            if request.url?.path.hasSuffix("/cancel") == true {
+                return (500, Data(#"{"error":"cancel failed"}"#.utf8))
+            }
+            return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"authenticated"}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "codex")
+        model.flow = try waitingFlow()
+
+        await model.cancel()
+
+        try await waitUntil { model.flow?.state == .authenticated }
+        #expect(state.requestCount == 2)
+        #expect(model.errorMessage == nil)
     }
 
     @Test @MainActor func stoppedPollingIgnoresAnInFlightPollResponse() async throws {
@@ -150,7 +204,8 @@ struct AuthFlowModelTests {
         var didStart: Bool { withLock { started } }
         var didReturn: Bool { withLock { returned } }
 
-        func incrementRequests() { withLock { requests += 1 } }
+        @discardableResult
+        func incrementRequests() -> Int { withLock { requests += 1; return requests } }
         func markStarted() { withLock { started = true } }
         func markReturned() { withLock { returned = true } }
 

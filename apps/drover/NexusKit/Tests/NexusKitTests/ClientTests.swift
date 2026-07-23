@@ -260,7 +260,7 @@ struct ClientTests {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/start")
         #expect(request.httpMethod == "POST")
-        #expect(request.httpBody == Data("{}".utf8))
+        #expect(request.bodyStreamData() == Data("{}".utf8))
         #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
         return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"waiting_for_user","user_code":"ABCD-EFGH"}"#.utf8))
     }
@@ -270,25 +270,25 @@ struct ClientTests {
 }
 
 @Test func pollAndCancelAuthFlowRoutes() async throws {
-    var seen: [String] = []
+    let seen = RequestLog()
     MockURLProtocol.handler = { request in
         seen.append("\(request.httpMethod ?? "") \(request.url?.path ?? "")")
         if request.url?.path.hasSuffix("/cancel") == true {
-            #expect(request.httpBody == Data("{}".utf8))
+            #expect(request.bodyStreamData() == Data("{}".utf8))
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
         }
         return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"cancelled"}"#.utf8))
     }
     _ = try await client().authFlow(hostID: "mac-mini", harness: "codex", flowID: "auth-flow-1")
     _ = try await client().cancelAuthFlow(hostID: "mac-mini", harness: "codex", flowID: "auth-flow-1")
-    #expect(seen == [
+    #expect(seen.values == [
         "GET /harness/hosts/mac-mini/auth/codex/flows/auth-flow-1",
         "POST /harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel",
     ])
 }
 
 @Test func authRoutesPercentEncodePathComponents() async throws {
-    var seen: [String] = []
+    let seen = RequestLog()
     MockURLProtocol.handler = { request in
         seen.append("\(request.httpMethod ?? "") \(request.url?.absoluteString ?? "")")
         return (200, Data(#"{"host_id":"mac/mini","harness":"provider/test","flow_id":"flow%2F1","state":"waiting_for_user"}"#.utf8))
@@ -298,10 +298,23 @@ struct ClientTests {
         hostID: "mac%2Fmini",
         harness: "provider/test",
         flowID: "flow%2F1")
-    #expect(seen == [
+    #expect(seen.values == [
         "GET http://test.local:7080/harness/hosts/mac%252Fmini/auth/provider%2Ftest/status",
         "GET http://test.local:7080/harness/hosts/mac%252Fmini/auth/provider%2Ftest/flows/flow%252F1",
     ])
+}
+
+private final class RequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+
+    var values: [String] {
+        lock.withLock { entries }
+    }
+
+    func append(_ entry: String) {
+        lock.withLock { entries.append(entry) }
+    }
 }
 
 }

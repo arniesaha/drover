@@ -63,6 +63,9 @@ public final class AuthFlowModel {
             errorMessage = nil
         } catch {
             errorMessage = Self.errorMessage(for: error)
+            if self.flow?.isTerminal == false {
+                startPolling()
+            }
         }
     }
 
@@ -70,6 +73,7 @@ public final class AuthFlowModel {
         stopPolling()
         let generation = pollGeneration
         pollTask = Task { [weak self] in
+            var transientFailureCount = 0
             while !Task.isCancelled {
                 do {
                     guard let self, self.pollGeneration == generation,
@@ -79,11 +83,17 @@ public final class AuthFlowModel {
                     guard !Task.isCancelled, self.pollGeneration == generation else { return }
                     self.flow = fresh
                     self.errorMessage = nil
+                    transientFailureCount = 0
                     if fresh.isTerminal { return }
                 } catch {
                     guard !Task.isCancelled, let self, self.pollGeneration == generation else { return }
                     self.errorMessage = Self.errorMessage(for: error)
-                    return
+                    guard Self.isRetryablePollingError(error) else { return }
+                    let multiplier = pow(2.0, Double(min(transientFailureCount, 10)))
+                    let delay = min(max(seconds, 0.01) * multiplier, 10)
+                    transientFailureCount += 1
+                    try? await Task.sleep(for: .seconds(delay))
+                    continue
                 }
 
                 guard !Task.isCancelled, self?.pollGeneration == generation else { return }
@@ -103,10 +113,22 @@ public final class AuthFlowModel {
         case NexusError.badRequest(let message), NexusError.conflict(let message),
              NexusError.unavailable(let message):
             return message
+        case NexusError.httpStatus(_, let message):
+            return message
         case NexusError.unauthorized:
             return "token rejected - check Settings"
         default:
             return "\(error)"
         }
+    }
+
+    private static func isRetryablePollingError(_ error: Error) -> Bool {
+        if case NexusError.transport = error {
+            return true
+        }
+        if case NexusError.httpStatus(let status, _) = error {
+            return status == 429 || (500..<600).contains(status)
+        }
+        return false
     }
 }
