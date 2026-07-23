@@ -32,10 +32,46 @@ def test_default_command_shape():
     assert "--output-format" in command and "stream-json" in command
 
 
-def test_default_command_falls_back_to_which(monkeypatch):
+def test_default_command_falls_back_to_which(monkeypatch, tmp_path):
     monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     command = default_command(None)
     assert command[0] == "claude"
+
+
+def test_default_command_uses_versioned_claude_when_path_lookup_fails(
+    monkeypatch, tmp_path
+):
+    versions_dir = tmp_path / ".local/share/claude/versions"
+    versions_dir.mkdir(parents=True)
+    older = versions_dir / "2.1.196"
+    newer = versions_dir / "2.1.201"
+    older.write_text("#!/bin/sh\n")
+    newer.write_text("#!/bin/sh\n")
+    older.chmod(0o755)
+    newer.chmod(0o755)
+
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    command = default_command(None)
+    assert command[0] == str(newer)
+    assert "--output-format" in command
+
+
+def test_versioned_claude_lookup_survives_non_numeric_entries(monkeypatch, tmp_path):
+    versions_dir = tmp_path / ".local/share/claude/versions"
+    versions_dir.mkdir(parents=True)
+    for name in ("latest", "2.1.196", "2.1.201"):
+        path = versions_dir / name
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    command = default_command(None)
+    assert command[0] == str(versions_dir / "2.1.201")
 
 
 def test_parse_assistant_text_block():

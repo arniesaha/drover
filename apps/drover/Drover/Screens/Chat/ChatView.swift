@@ -12,6 +12,10 @@ struct ChatView: View {
     @State private var showTerminateConfirm = false
     @State private var handoffSession: HandoffSession?
     @State private var pendingScroll: Task<Void, Never>?
+    /// True while the user is at (or within ~80pt of) the transcript's end.
+    /// Auto-scroll only runs while pinned; scrolling up unpins (so reading
+    /// is never yanked back down) and shows the scroll-to-bottom button.
+    @State private var isPinnedToBottom = true
 
     init(client: NexusClient, sessionID: String) {
         self.client = client
@@ -80,14 +84,32 @@ struct ChatView: View {
 
     private var transcript: some View {
         ScrollViewReader { proxy in
+            // Consecutive thinking messages fold into one ThinkingBlock row
+            // (TranscriptItem.group); everything else renders 1:1.
+            let items = TranscriptItem.group(model.messages)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.messages) { message in
-                        MessageBubble(message: message)
-                            .id(message.id)
+                    ForEach(items) { item in
+                        row(for: item, isNewest: item.id == items.last?.id)
+                            .id(item.id)
                     }
                 }
                 .padding()
+            }
+            // Pinned means "within 80pt of the end" — close enough that the
+            // user is following the stream, far enough that the last row's
+            // own growth doesn't flap the state.
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.contentOffset.y + geometry.containerSize.height
+                    >= geometry.contentSize.height + geometry.contentInsets.bottom - 80
+            } action: { _, isNearBottom in
+                guard isNearBottom != isPinnedToBottom else { return }
+                withAnimation(.snappy(duration: 0.2)) { isPinnedToBottom = isNearBottom }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !isPinnedToBottom {
+                    scrollToBottomButton(proxy)
+                }
             }
             // Auto-scroll is coalesced and unanimated on purpose: firing an
             // animated scrollTo per appended message piles up overlapping
@@ -97,12 +119,48 @@ struct ChatView: View {
             // workaround). One unanimated scroll per ~120ms window, always
             // to whatever is newest by the time it fires, keeps the
             // transcript following the stream without the animation storm.
+            // Gated on pinning so it never fights the user's finger.
             .onChange(of: model.messages.last?.id) { _, newestID in
-                guard newestID != nil else { return }
+                guard newestID != nil, isPinnedToBottom else { return }
                 scheduleScroll(with: proxy)
             }
             .onDisappear { pendingScroll?.cancel() }
         }
+    }
+
+    @ViewBuilder
+    private func row(for item: TranscriptItem, isNewest: Bool) -> some View {
+        switch item {
+        case .message(let message):
+            MessageBubble(message: message)
+        case .thinkingRun(let run):
+            ThinkingBlock(
+                run: run,
+                isStreaming: isNewest && (model.messages.last?.isThinking ?? false)
+            )
+        }
+    }
+
+    private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            guard let rowID = TranscriptItem.latestRowID(of: model.messages) else { return }
+            // A single user-initiated scroll may animate — the storm problem
+            // above only applies to per-message auto-scrolls.
+            withAnimation(.snappy) { proxy.scrollTo(rowID, anchor: .bottom) }
+        } label: {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.primary)
+                .padding(12)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(.secondary.opacity(0.2)))
+                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+        }
+        .padding(.trailing, 16)
+        .padding(.bottom, 12)
+        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+        .accessibilityLabel("Scroll to bottom")
+        .accessibilityIdentifier("chat-scroll-to-bottom")
     }
 
     private func scheduleScroll(with proxy: ScrollViewProxy) {
@@ -110,8 +168,13 @@ struct ChatView: View {
         pendingScroll = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
             pendingScroll = nil
-            guard !Task.isCancelled, let newestID = model.messages.last?.id else { return }
-            proxy.scrollTo(newestID, anchor: .bottom)
+            // Re-check pinning at fire time — the user may have started
+            // scrolling up during the coalescing window. The scroll target
+            // is the newest *row* (a trailing thinking run's row id is its
+            // first message, not the newest message).
+            guard !Task.isCancelled, isPinnedToBottom,
+                  let rowID = TranscriptItem.latestRowID(of: model.messages) else { return }
+            proxy.scrollTo(rowID, anchor: .bottom)
         }
     }
 

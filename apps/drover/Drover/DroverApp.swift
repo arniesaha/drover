@@ -87,7 +87,15 @@ private struct RootView: View {
         // bumps): request once a client exists, either way. Re-requesting is
         // harmless — the system only prompts the user once and just returns
         // the existing authorization afterward.
-        .task { await requestNotificationPermissionIfConfigured() }
+        .task {
+            await requestNotificationPermissionIfConfigured()
+            // Keep a refresh request pending from launch, not just from the
+            // next background transition — a force-quit cancels pending
+            // BGTasks, and without this the gap lasts until the user
+            // backgrounds the app again. Submitting is idempotent (replaces
+            // any pending request for the same identifier).
+            BackgroundRefresh.schedule()
+        }
         .onChange(of: environment.generation) { _, _ in
             Task { await requestNotificationPermissionIfConfigured() }
         }

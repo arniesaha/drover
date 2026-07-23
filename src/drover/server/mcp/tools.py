@@ -18,6 +18,7 @@ import duckdb
 
 from drover.context_containers import normalize_context_type
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.db import open_duckdb_connection
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import quality_snapshot
 from drover.task_id import compute_task_id
@@ -26,7 +27,9 @@ log = logging.getLogger("drover.mcp.tools")
 
 
 def _connect(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(duckdb_path), read_only=True)
+    # Read-write open even for read paths: a read_only connection has a
+    # different config and DuckDB rejects it beside live writers (issue #2).
+    return open_duckdb_connection(duckdb_path, role="diagnostic")
 
 
 def _row_to_dict(cursor: duckdb.DuckDBPyConnection) -> list[dict]:
@@ -372,7 +375,7 @@ def drover_session_close(
     Idempotent: if a row already exists in any non-terminal state, no-op.
     Returns ``{"session_id": ..., "status": "queued"|"already_queued"|"already_done"}``.
     """
-    con = duckdb.connect(str(duckdb_path))  # read+write
+    con = open_duckdb_connection(duckdb_path)
     try:
         existing = con.execute(
             "SELECT status FROM summarize_jobs WHERE session_id=?",

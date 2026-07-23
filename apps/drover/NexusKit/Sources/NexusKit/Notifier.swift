@@ -26,6 +26,11 @@ public struct LocalNotifier: Notifying {
         content.title = title
         content.body = body
         content.sound = .default
+        // "Needs you" is exactly the time-sensitive case: the harness is
+        // blocked on the user. Breaks through Focus modes and lock-screen
+        // deferral (requires the time-sensitive entitlement; without it iOS
+        // silently downgrades to .active, so this is safe either way).
+        content.interruptionLevel = .timeSensitive
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         try? await UNUserNotificationCenter.current().add(request)
     }

@@ -14,6 +14,8 @@ from uuid import uuid4
 import duckdb
 import yaml
 
+from drover.server.db import open_duckdb_connection
+
 ALLOWED_SOURCE_STAGES = frozenset({"generated", "edited"})
 SUPPORTED_SUFFIXES = frozenset({".md", ".markdown", ".yaml", ".yml"})
 
@@ -199,7 +201,7 @@ def import_bundle(
     applied = 0
     provenance_rows = 0
 
-    con = duckdb.connect(str(duckdb_path))
+    con = open_duckdb_connection(duckdb_path)
     try:
         con.execute("BEGIN")
         for entry in entries:
@@ -503,7 +505,7 @@ def _scan_for_secrets(
 
 
 def _load_existing_records(duckdb_path: Path) -> dict[str, dict[str, str]]:
-    con = duckdb.connect(str(duckdb_path), read_only=True)
+    con = open_duckdb_connection(duckdb_path, role="diagnostic")
     try:
         rows = con.execute("""
             SELECT record_id, content_hash, normalized_json

@@ -20,6 +20,8 @@ from typing import Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from drover.server.parquet_io import atomic_write_table
+
 log = logging.getLogger("drover.compact")
 
 
@@ -53,7 +55,7 @@ def compact_partition(
         combined = _dedup(combined, dedup_column)
 
     out_path = partition_dir / f"part-compact-{uuid.uuid4().hex[:8]}.parquet"
-    pq.write_table(combined, out_path, compression="zstd")
+    atomic_write_table(combined, out_path, compression="zstd")
 
     # Remove the originals only after the new file is on disk
     for f in files:

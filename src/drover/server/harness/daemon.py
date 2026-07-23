@@ -68,12 +68,14 @@ class HarnessPreset:
     enabled: bool
     description: str
     # Startup gate: some CLIs open on an interactive prompt before reaching
-    # their REPL (claude-code's "Do you trust the files in this folder?").
-    # When the marker appears in PTY output while a handoff seed is pending,
-    # the daemon types `startup_gate_answer` and waits for the REPL to settle
-    # before delivering the seed — otherwise the seed answers the gate and is
-    # discarded. None means the harness has no gate (shell, codex, gemini).
-    startup_gate_marker: str | None = None
+    # their REPL (claude-code's trust-folder prompt). When any marker appears
+    # in PTY output while a handoff seed is pending, the daemon types
+    # `startup_gate_answer` and waits for the REPL to settle before delivering
+    # the seed — otherwise the seed answers the gate and is discarded. The
+    # markers are plural because claude-code has reworded the gate across
+    # versions; every wording seen in the wild must stay matched. Empty means
+    # the harness has no gate (shell, codex, gemini).
+    startup_gate_markers: tuple[str, ...] = ()
     startup_gate_answer: str = "1\n"
 
     def as_json(self) -> dict[str, Any]:
@@ -97,7 +99,13 @@ DEFAULT_PRESETS = {
         command=("claude",),
         enabled=False,
         description="Claude Code CLI",
-        startup_gate_marker="Do you trust the files in this folder?",
+        startup_gate_markers=(
+            # Wordings by claude-code version, oldest first. The answer "1"
+            # confirms the trust option in every known variant (verified live
+            # 2026-07-22 on v2.1.217: bare "1" confirms immediately).
+            "Do you trust the files in this folder?",
+            "Is this a project you created or one you trust?",
+        ),
         startup_gate_answer="1\n",
     ),
     "codex": HarnessPreset(
@@ -1038,6 +1046,22 @@ _SEED_SETTLE_S = 0.4
 _SEED_COLD_QUIET_S = 1.5
 
 
+# claude-code's ink renderer emits UI text word-by-word with cursor-position
+# escapes between words, so a gate sentence never appears contiguously in the
+# raw PTY stream. Strip escape sequences AND whitespace from both sides before
+# substring-matching gate markers.
+_TERMINAL_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]"  # CSI sequences (colors, cursor moves)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences (titles)
+    r"|\x1b[=>()][0-9A-Za-z]?"  # charset / keypad-mode selects
+    r"|[\x00-\x08\x0b-\x1f\x7f]"  # other control bytes (keep \n via \s below)
+)
+
+
+def _normalize_gate_text(text: str) -> str:
+    return re.sub(r"\s+", "", _TERMINAL_ESCAPE_RE.sub("", text))
+
+
 @dataclass
 class PendingSeed:
     """A queued handoff seed plus the startup-gate handling its harness needs
@@ -1045,7 +1069,7 @@ class PendingSeed:
     has been typed at, so a redrawn marker is never answered twice."""
 
     text: str
-    gate_marker: str | None = None
+    gate_markers: tuple[str, ...] = ()
     gate_answer: str = "1\n"
     gate_answered: bool = False
 
@@ -1388,7 +1412,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             # (answering the preset's startup gate first, if one appears).
             self.server.state.pending_initial_input[session_id] = PendingSeed(
                 text=str(initial_input),
-                gate_marker=preset.startup_gate_marker,
+                gate_markers=preset.startup_gate_markers,
                 gate_answer=preset.startup_gate_answer,
             )
         self._write_json(
@@ -1435,10 +1459,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             ready = (now - attach_ts) >= _SEED_COLD_QUIET_S
         if not ready:
             return
+        watched = _normalize_gate_text(recent_output) if pending.gate_markers else ""
         if (
-            pending.gate_marker
+            pending.gate_markers
             and not pending.gate_answered
-            and pending.gate_marker in recent_output
+            and any(
+                _normalize_gate_text(marker) in watched
+                for marker in pending.gate_markers
+            )
         ):
             pending.gate_answered = True
             try:
@@ -1450,7 +1478,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if seed is None:
             return
         try:
-            self.server.state.pty.write(session_id, seed.text)
+            # Type as a keyboard would: Enter is CR, not LF. Raw-mode ink
+            # inputs (claude-code) never submit on "\n" — the seed would sit
+            # unsent in the input box — while canonical-mode shells map CR
+            # back to NL via icrnl, so "\r" submits everywhere.
+            self.server.state.pty.write(session_id, seed.text.replace("\n", "\r"))
         except Exception:
             return
         self._safe_append_event(

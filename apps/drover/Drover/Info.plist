@@ -27,6 +27,8 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Drover connects to your Drover server on your local network to manage agent sessions.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

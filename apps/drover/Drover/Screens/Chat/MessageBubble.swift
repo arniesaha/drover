@@ -30,24 +30,16 @@ struct MessageBubble: View {
         }
     }
 
+    // Thinking messages never reach this view — ChatView groups consecutive
+    // ones into a `TranscriptItem.thinkingRun` rendered by `ThinkingBlock`.
     private var assistantBubble: some View {
         HStack {
-            if message.payload["thinking"]?.boolValue == true {
-                DisclosureGroup("Thinking…") {
-                    Text(message.text)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .font(.callout)
-            } else {
-                // displayText is markdown parsed once at decode —
-                // `Text(.init(...))` would re-parse on every render pass,
-                // which is measurable during long streams.
-                Text(message.displayText)
-                    .padding(10)
-                    .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-            }
+            // displayText is markdown parsed once at decode —
+            // `Text(.init(...))` would re-parse on every render pass,
+            // which is measurable during long streams.
+            Text(message.displayText)
+                .padding(10)
+                .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
             Spacer(minLength: 32)
         }
     }

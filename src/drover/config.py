@@ -86,6 +86,9 @@ class DroverConfig:
     # DROVER_API_TOKEN env > this field > auto-generated ~/.drover/api_token.
     auth_enabled: bool
     auth_api_token: str
+    # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
+    # recent-session cwds. Empty by default — set per install, never in code.
+    harness_favorite_cwds: tuple[str, ...]
 
 
 _DEFAULTS = {
@@ -144,6 +147,9 @@ _DEFAULTS = {
         "enabled": True,
         "api_token": "",
     },
+    "harness": {
+        "favorite_cwds": [],
+    },
 }
 
 
@@ -199,6 +205,9 @@ def _from_dict(d: dict) -> DroverConfig:
         redis_jobs_high_water=int(j["high_water"]),
         auth_enabled=bool(d["auth"]["enabled"]),
         auth_api_token=d["auth"]["api_token"],
+        harness_favorite_cwds=tuple(
+            str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
+        ),
     )
 
 

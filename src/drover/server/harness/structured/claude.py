@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import shutil
 from typing import Any
 
@@ -21,8 +22,9 @@ from drover.server.harness.structured.driver import ProcessDriver, StructuredMes
 
 
 def default_command(binary: str | None = None) -> list[str]:
+    resolved_binary = binary or shutil.which("claude") or _versioned_claude_binary()
     return [
-        binary or shutil.which("claude") or "claude",
+        resolved_binary or "claude",
         "-p",
         "--input-format",
         "stream-json",
@@ -44,6 +46,31 @@ def child_env() -> dict[str, str]:
     return {
         key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")
     }
+
+
+def _versioned_claude_binary(home: Path | None = None) -> str | None:
+    versions_dir = (home or Path.home()) / ".local/share/claude/versions"
+    if not versions_dir.is_dir():
+        return None
+    candidates = [
+        path
+        for path in versions_dir.iterdir()
+        if path.is_file() and os.access(path, os.X_OK)
+    ]
+    candidates.sort(key=lambda path: _version_key(path.name), reverse=True)
+    return str(candidates[0]) if candidates else None
+
+
+def _version_key(version: str) -> tuple[tuple[int, int, str], ...]:
+    # Numeric parts sort above non-numeric ones so mixed names (e.g. a
+    # "latest" symlink next to "2.1.201") never compare int against str.
+    parts: list[tuple[int, int, str]] = []
+    for part in version.replace("-", ".").split("."):
+        if part.isdigit():
+            parts.append((1, int(part), ""))
+        else:
+            parts.append((0, 0, part))
+    return tuple(parts)
 
 
 class ClaudeDriver(ProcessDriver):

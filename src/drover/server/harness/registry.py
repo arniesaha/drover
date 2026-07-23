@@ -7,12 +7,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import threading
 from typing import Any
 from uuid import uuid4
 
 import duckdb
 
+from drover.server.db import duckdb_connect_lock
 from drover.server.harness.models import (
     HarnessEvent,
     HarnessHost,
@@ -27,21 +27,10 @@ from drover.server.harness.events import normalize_harness_event
 # instead of waiting (observed live in the structured-session E2E when two
 # sessions' pump threads wrote to one registry concurrently -- see
 # tests/test_structured_e2e.py). Serialize the ENTIRE connect->use->close
-# window per resolved database path, process-wide: the lock table is
-# module-level (not per-instance) because central constructs a fresh
-# HarnessRegistry per request, so per-instance locks would not stop
-# cross-instance collisions on the same file.
-_DB_LOCKS: dict[str, threading.Lock] = {}
-_DB_LOCKS_GUARD = threading.Lock()
-
-
-def _db_lock(duckdb_path: Path) -> threading.Lock:
-    key = str(duckdb_path.expanduser().resolve())
-    with _DB_LOCKS_GUARD:
-        lock = _DB_LOCKS.get(key)
-        if lock is None:
-            lock = _DB_LOCKS[key] = threading.Lock()
-        return lock
+# window per resolved database path, process-wide. The lock table lives in
+# drover.server.db so worker/diagnostic connects (which only serialize the
+# connect call) contend on the same lock as registry windows.
+_db_lock = duckdb_connect_lock
 
 
 def _now() -> datetime:

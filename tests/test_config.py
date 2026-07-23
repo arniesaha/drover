@@ -87,6 +87,19 @@ def test_loads_metrics_port(tmp_path):
     assert cfg.metrics_http_port == 7080
 
 
+def test_harness_favorite_cwds_default_empty():
+    assert default_config().harness_favorite_cwds == ()
+
+
+def test_loads_harness_favorite_cwds(tmp_path):
+    cfg_file = tmp_path / "harness.toml"
+    cfg_file.write_text(
+        "[harness]\nfavorite_cwds = ['/home/me/dev', '/home/me/projects', '  ']\n"
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.harness_favorite_cwds == ("/home/me/dev", "/home/me/projects")
+
+
 def test_loads_redis_jobs_config(tmp_path):
     cfg_file = tmp_path / "redis-jobs.toml"
     cfg_file.write_text(

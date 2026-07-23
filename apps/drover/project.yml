@@ -34,8 +34,23 @@ targets:
         CFBundleShortVersionString: "0.1.0"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # Required on physical devices to reach the central server over the
+        # LAN (192.168.1.x): without this key iOS never shows the Local
+        # Network prompt and silently blocks the connection ("Server did not
+        # respond to health check"). The Simulator does not enforce Local
+        # Network privacy, so sim runs work either way. Tailscale URLs bypass
+        # the gate entirely (utun is not treated as local network).
+        NSLocalNetworkUsageDescription: >-
+          Drover connects to your Drover server on your local network to
+          manage agent sessions.
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
+    # No entitlements: the time-sensitive notifications capability
+    # (com.apple.developer.usernotifications.time-sensitive) is not supported
+    # by personal development teams, so requesting it breaks on-device deploys
+    # with a free Apple ID. LocalNotifier still marks "needs you" alerts
+    # .timeSensitive — iOS silently downgrades them to .active without the
+    # entitlement. Paid-team builds can re-add it here to break through Focus.
   DroverTests:
     type: bundle.unit-test
     platform: iOS
