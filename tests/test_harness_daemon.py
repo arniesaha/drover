@@ -5,6 +5,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -207,6 +208,7 @@ def _start_test_server(tmp_path, *, api_token: str = ""):
         presets=DEFAULT_PRESETS,
         local_url="http://127.0.0.1:0",
         api_token=api_token,
+        worktrees_dir=tmp_path / "worktrees",
     )
     register_daemon_host(state)
     server = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
@@ -1790,6 +1792,137 @@ def test_structured_terminate_closes_driver_and_marks_terminated(tmp_path):
             assert exc.code == 404
         else:
             raise AssertionError("turns after terminate should 404")
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+# -- per-session worktrees for approval-less harnesses (codex/gemini) --------
+
+
+def _init_git_repo(root) -> None:
+    root.mkdir()
+    for args in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "test@example.com"),
+        ("config", "user.name", "Test"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(root), *args], check=True, capture_output=True
+        )
+    (root / "file.txt").write_text("hello\n")
+    subprocess.run(
+        ["git", "-C", str(root), "add", "file.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_structured_codex_session_runs_in_worktree(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    try:
+        # CodexDriver spawns nothing until the first turn, so the command is
+        # never executed here -- the session only needs to exist.
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": ["codex-never-invoked"],
+                "cwd": str(repo),
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+
+        worktree_path = tmp_path / "worktrees" / sid
+        assert (worktree_path / "file.txt").is_file()
+        session = state.registry.get_session(sid)
+        assert session is not None
+        assert session.cwd == str(worktree_path)
+
+        started = next(
+            event
+            for event in state.registry.list_events(sid)
+            if event.event_type == "session.started"
+        )
+        assert started.payload["worktree"]["path"] == str(worktree_path)
+        assert started.payload["worktree"]["branch"] == f"drover/{sid}"
+
+        # Terminating an untouched session reclaims the worktree and branch.
+        status, _ = _json_request(f"{base_url}/sessions/{sid}/terminate", payload={})
+        assert status == 200
+        assert not worktree_path.exists()
+        branches = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--list", f"drover/{sid}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert branches == ""
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_structured_codex_session_non_git_cwd_runs_in_place(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": ["codex-never-invoked"],
+                "cwd": str(plain),
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+        session = state.registry.get_session(sid)
+        assert session is not None
+        assert session.cwd == str(plain)
+        assert not (tmp_path / "worktrees" / sid).exists()
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_structured_claude_session_stays_in_place(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(repo),
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+        session = state.registry.get_session(sid)
+        assert session is not None
+        assert session.cwd == str(repo)
+        assert not (tmp_path / "worktrees" / sid).exists()
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()

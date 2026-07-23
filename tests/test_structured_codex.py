@@ -212,6 +212,8 @@ def test_first_turn_argv_has_exec_not_resume(tmp_path, monkeypatch):
     assert "exec" in argv1
     assert "resume" not in argv1
     assert argv1[-1] == "do it"
+    sandbox_flag = argv1.index("--sandbox")
+    assert argv1[sandbox_flag + 1] == "danger-full-access"
     driver.close()
 
 
@@ -238,6 +240,8 @@ def test_second_turn_argv_has_resume_and_captured_thread_id(tmp_path, monkeypatc
     assert "resume" in argv2
     assert "thread-abc" in argv2
     assert argv2[-1] == "second"
+    sandbox_flag = argv2.index("--sandbox")
+    assert argv2[sandbox_flag + 1] == "danger-full-access"
     driver.close()
 
 

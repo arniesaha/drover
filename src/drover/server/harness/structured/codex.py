@@ -19,9 +19,15 @@ supersede):
    ``command_execution`` result, rather than emitting an
    ``exec_approval_request``-shaped event. Sandbox escalation flags (e.g.
    ``-s workspace-write``, ``-s danger-full-access``) are how a caller
-   would get write access instead -- that flag selection is explicitly out
-   of scope for this driver; the default read-only sandbox is used as-is.
-   ``answer_permission`` therefore always raises.
+   gets write access instead. This driver passes
+   ``--sandbox danger-full-access``: the default resolved sandbox
+   (workspace-write for trusted projects) keeps ``.git`` read-only and
+   network off, which silently breaks every commit/push a session
+   attempts, and with ``approval_policy: never`` there is no prompt to
+   escalate through. Filesystem isolation is provided one level up by the
+   daemon, which runs codex sessions in per-session git worktrees (see
+   ``drover.server.harness.worktree``). ``answer_permission`` still always
+   raises.
 """
 
 from __future__ import annotations
@@ -138,13 +144,22 @@ class CodexDriver:
 
     def _argv_for(self, text: str) -> list[str]:
         if self._thread_id is None:
-            return self.command + ["exec", "--json", "--skip-git-repo-check", text]
+            return self.command + [
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "danger-full-access",
+                text,
+            ]
         return self.command + [
             "exec",
             "resume",
             self._thread_id,
             "--json",
             "--skip-git-repo-check",
+            "--sandbox",
+            "danger-full-access",
             text,
         ]
 

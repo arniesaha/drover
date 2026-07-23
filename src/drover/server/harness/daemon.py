@@ -41,6 +41,11 @@ from drover.server.harness.structured import codex as _structured_codex
 from drover.server.harness.structured import gemini as _structured_gemini
 from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.structured.pusher import EventPusher
+from drover.server.harness.worktree import (
+    SessionWorktree,
+    cleanup_session_worktree,
+    create_session_worktree,
+)
 from drover.server.harness.websocket import (
     WebSocketClosed,
     accept_key,
@@ -57,6 +62,14 @@ _STRUCTURED_DEFAULT_COMMANDS: dict[str, Callable[[], list[str]]] = {
     "codex": _structured_codex.default_command,
     "gemini": _structured_gemini.default_command,
 }
+
+# Harnesses whose structured drivers run full-auto with no wire-level
+# approval channel (codex: --sandbox danger-full-access; gemini:
+# --approval-mode yolo). These get a per-session git worktree so a broad
+# `git add -A` inside the session can never sweep unrelated in-flight
+# changes from the user's main checkout. Claude keeps its interactive
+# approval flow and runs in place.
+_WORKTREE_HARNESSES = frozenset({"codex", "gemini"})
 
 log = logging.getLogger("drover.harnessd")
 
@@ -1094,6 +1107,13 @@ class HarnessDaemonState:
     host_token: str | None = None
     api_token: str = ""
     terminated_session_ids: set[str] = field(default_factory=set)
+    worktrees_dir: Path = field(
+        default_factory=lambda: Path.home() / ".drover" / "worktrees"
+    )
+    # Live sessions running in a per-session worktree, for cleanup at
+    # finalize/terminate time. Lost on daemon restart, in which case the
+    # worktree simply stays on disk (git worktree list still shows it).
+    session_worktrees: dict[str, SessionWorktree] = field(default_factory=dict)
     # Handoff seeds ("initial_input") waiting to be typed into a PTY session
     # once its harness CLI has actually started. Keyed by session_id; consumed
     # (pop) by the terminal loop when the CLI's startup output settles. See
@@ -1511,6 +1531,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
         label_source = command or (default_command_fn() if default_command_fn else None)
         session_id = f"harness-{uuid4()}"
+
+        session_cwd = str(cwd) if cwd is not None else None
+        session_worktree: SessionWorktree | None = None
+        if harness in _WORKTREE_HARNESSES and session_cwd is not None:
+            session_worktree = create_session_worktree(
+                session_cwd, session_id, self.server.state.worktrees_dir
+            )
+            if session_worktree is not None:
+                session_cwd = session_worktree.path
+
         registry_created = False
         try:
             session = self.server.state.registry.create_session(
@@ -1521,7 +1551,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 repo_owner=body.get("repo_owner"),
                 repo_name=body.get("repo_name"),
                 branch=body.get("branch"),
-                cwd=str(cwd) if cwd is not None else None,
+                cwd=session_cwd,
                 status="starting",
                 started_at=datetime.now(timezone.utc),
                 source_session_id=_optional_text(body.get("source_session_id")),
@@ -1532,6 +1562,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             registry_created = True
         except Exception:
             registry_created = False
+        if session_worktree is not None:
+            self.server.state.session_worktrees[session_id] = session_worktree
 
         # Write the "running" status and session.started event BEFORE the
         # driver starts: once structured.start() returns, the driver's pump
@@ -1542,17 +1574,24 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # emit() path. If start() raises, the except handler below still
         # overwrites the status with "errored".
         self._safe_update_session_status(session_id, "running")
+        started_payload: dict[str, Any] = {"command": command or [], "mode": "structured"}
+        if session_worktree is not None:
+            started_payload["worktree"] = {
+                "path": session_worktree.path,
+                "branch": session_worktree.branch,
+                "repo_root": session_worktree.repo_root,
+            }
         self._safe_append_event(
             session_id=session_id,
             event_type="session.started",
-            payload={"command": command or [], "mode": "structured"},
+            payload=started_payload,
         )
 
         try:
             self.server.state.structured.start(
                 session_id,
                 harness=harness,
-                cwd=str(cwd) if cwd is not None else None,
+                cwd=session_cwd,
                 command=command,
                 registry=self.server.state.registry,
                 on_message=self.server.state.push_event,
@@ -1566,6 +1605,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     last_error=str(exc),
                     ended_at=datetime.now(timezone.utc),
                 )
+            self._cleanup_session_worktree(session_id)
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
@@ -1688,6 +1728,21 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             event_type="session.exited",
             payload={"exited": returncode},
             normalized_source="structured",
+        )
+        self._cleanup_session_worktree(session_id)
+
+    def _cleanup_session_worktree(self, session_id: str) -> None:
+        """Reclaim an untouched session worktree; keep one holding work."""
+        wt = self.server.state.session_worktrees.pop(session_id, None)
+        if wt is None:
+            return
+        outcome = cleanup_session_worktree(wt)
+        log.info(
+            "session %s worktree %s (%s): %s",
+            session_id,
+            wt.path,
+            wt.branch,
+            outcome,
         )
 
     def _safe_get_session(self, session_id: str) -> Any:
@@ -1890,6 +1945,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             event_type="session.terminated",
             normalized_source="structured",
         )
+        self._cleanup_session_worktree(session_id)
         self._write_json(
             {
                 "session_id": session_id,
