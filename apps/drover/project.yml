@@ -36,12 +36,12 @@ targets:
           NSAllowsArbitraryLoads: true
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
-    entitlements:
-      path: Drover/Drover.entitlements
-      properties:
-        # Lets "needs you" alerts break through Focus/lock-screen deferral
-        # (LocalNotifier marks them .timeSensitive).
-        com.apple.developer.usernotifications.time-sensitive: true
+    # No entitlements: the time-sensitive notifications capability
+    # (com.apple.developer.usernotifications.time-sensitive) is not supported
+    # by personal development teams, so requesting it breaks on-device deploys
+    # with a free Apple ID. LocalNotifier still marks "needs you" alerts
+    # .timeSensitive — iOS silently downgrades them to .active without the
+    # entitlement. Paid-team builds can re-add it here to break through Focus.
   DroverTests:
     type: bundle.unit-test
     platform: iOS
