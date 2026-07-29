@@ -18,6 +18,11 @@ from typing import Any
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# Bound on the handshake response header, which is read a byte at a time and
+# so needs its own stop condition against a peer that never sends the blank
+# line.
+MAX_HANDSHAKE_HEAD_BYTES = 65536
+
 OPCODE_CONTINUATION = 0x0
 OPCODE_TEXT = 0x1
 OPCODE_CLOSE = 0x8
@@ -113,16 +118,35 @@ def client_handshake(
         "\r\n"
     )
     sock.sendall(request.encode("ascii"))
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise WebSocketClosed("socket closed during handshake")
-        response += chunk
-    head = response.decode("iso-8859-1")
+    head = _recv_handshake_head(sock)
     if " 101 " not in head.split("\r\n", 1)[0]:
         raise RuntimeError(f"websocket handshake failed: {head.splitlines()[0]}")
     return key
+
+
+def _recv_handshake_head(sock: socket.socket) -> str:
+    """Read the response header block and NOT one byte more.
+
+    Byte at a time on purpose. A bulk ``recv(4096)`` also swallows whatever
+    the peer wrote immediately behind its 101, and there is nowhere to put
+    those bytes: ``recv_frame`` reads straight from the socket, so anything
+    this function buffers past the header is gone. harnessd greets every new
+    terminal attach with a frame in its very next write, so on a fast link
+    (loopback, or a segment that coalesces) the first thing the user was
+    meant to see is silently dropped.
+
+    Handshakes happen once per connection or channel, so the extra syscalls
+    cost nothing next to a load-dependent hole at the head of every stream.
+    """
+    buffer = bytearray()
+    while not buffer.endswith(b"\r\n\r\n"):
+        if len(buffer) >= MAX_HANDSHAKE_HEAD_BYTES:
+            raise WebSocketClosed("websocket handshake response header too large")
+        chunk = sock.recv(1)
+        if not chunk:
+            raise WebSocketClosed("socket closed during handshake")
+        buffer += chunk
+    return buffer.decode("iso-8859-1")
 
 
 def client_send_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:

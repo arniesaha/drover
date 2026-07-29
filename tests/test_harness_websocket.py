@@ -452,3 +452,90 @@ def test_handoff_seed_dropped_when_session_ends_before_any_attach(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def _serve_101_then_frame(server: socket.socket, payload: bytes) -> None:
+    """Answer a handshake and write the 101 + a frame in a single send.
+
+    This is what harnessd does on every terminal attach: it upgrades and
+    greets with "attached" immediately, so on loopback the two land together.
+    """
+    from drover.server.harness.websocket import accept_key
+
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = server.recv(4096)
+        if not chunk:
+            return
+        head += chunk
+    key = ""
+    for line in head.decode("iso-8859-1").split("\r\n"):
+        if line.lower().startswith("sec-websocket-key:"):
+            key = line.split(":", 1)[1].strip()
+    response = (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept_key(key)}\r\n\r\n"
+    ).encode("ascii")
+    server.sendall(response + bytes([0x81, len(payload)]) + payload)
+
+
+def test_client_handshake_does_not_swallow_the_first_frame():
+    """A bulk header read eats whatever shares the 101's segment.
+
+    recv_frame reads straight from the socket, so anything the handshake
+    buffers past the header block is unrecoverable -- and the frame most
+    likely to share that segment is the daemon's "attached" greeting, i.e.
+    the first thing the user sees.
+    """
+    server, client = socket.socketpair()
+    payload = json.dumps({"type": "attached"}, sort_keys=True).encode("utf-8")
+    thread = threading.Thread(
+        target=_serve_101_then_frame, args=(server, payload), daemon=True
+    )
+    thread.start()
+    try:
+        client_handshake(client, host="127.0.0.1:1", path="/sessions/s1/terminal")
+        thread.join(timeout=5)
+        client.settimeout(5)
+        frame = recv_frame(client)
+        assert json.loads(frame.payload.decode("utf-8")) == {"type": "attached"}
+    finally:
+        client.close()
+        server.close()
+
+
+def test_client_handshake_rejects_an_endless_header():
+    """Byte-at-a-time reading needs its own bound against a peer that dribbles."""
+    from drover.server.harness import websocket as websocket_module
+
+    server, client = socket.socketpair()
+
+    def flood() -> None:
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = server.recv(4096)
+            if not chunk:
+                return
+            head += chunk
+        try:
+            # A 101 line, then headers forever and never the blank line.
+            server.sendall(b"HTTP/1.1 101 Switching Protocols\r\n")
+            while True:
+                server.sendall(b"X-Pad: " + b"a" * 512 + b"\r\n")
+        except OSError:
+            return
+
+    thread = threading.Thread(target=flood, daemon=True)
+    thread.start()
+    try:
+        client.settimeout(30)
+        with pytest.raises(WebSocketClosed):
+            client_handshake(client, host="127.0.0.1:1", path="/relay")
+    finally:
+        client.close()
+        server.close()
+        thread.join(timeout=5)
+
+    assert websocket_module.MAX_HANDSHAKE_HEAD_BYTES <= 1 << 20
