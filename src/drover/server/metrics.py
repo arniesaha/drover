@@ -725,9 +725,7 @@ class MetricsCollector:
                     target_harness=target_harness,
                 ),
             }
-            return self.proxy_create_harness_session(
-                target_host_id, structured_payload
-            )
+            return self.proxy_create_harness_session(target_host_id, structured_payload)
         launch_payload: dict[str, Any] = {
             "harness": target_harness,
             "cwd": source.cwd,
