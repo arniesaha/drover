@@ -32,6 +32,21 @@ log = logging.getLogger("drover.metrics")
 
 _HARNESS_STALE_AFTER_SECONDS = 45
 
+# Floor on any hub->harnessd budget that rides a relay connection.
+#
+# The tightest budgets in the system (1.0s reconcile, 2.0s native transcript)
+# were chosen for a LAN dial, where they are generous. Over a funnel from
+# cellular they are not budgets at all: they expire while the spoke's loopback
+# call is still running, the hub 502s, and -- because the transcript endpoint
+# is polled -- each expiry leaves another orphaned thread on the laptop.
+#
+# 5s rather than more: this floor stacks with RelayManager.open_channel's own
+# 10s on the terminal-attach path (reconcile, then open), so it has to stay
+# small enough that the worst case is still a wait a user will sit through.
+# Presence is now trustworthy within a minute, so a live relay socket is
+# decent evidence the host is really there and worth waiting for.
+RELAY_MIN_TIMEOUT_S = 5.0
+
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
 # gemini). A nexus handoff to one of these launches mode="structured" and
 # delivers the handoff text as the first turn -- strictly more reliable than
@@ -1041,7 +1056,11 @@ class MetricsCollector:
         """
         if self.relay_manager is not None and self.relay_manager.is_live(host.host_id):
             return self.relay_manager.request(
-                host.host_id, method, path, dict(payload or {}), timeout_s=timeout_s
+                host.host_id,
+                method,
+                path,
+                dict(payload or {}),
+                timeout_s=max(timeout_s, RELAY_MIN_TIMEOUT_S),
             )
         if getattr(host, "connection_kind", "direct") == "relay":
             # A relay host is behind NAT by definition: it has no meaningful

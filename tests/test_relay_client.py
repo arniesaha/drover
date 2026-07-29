@@ -300,3 +300,68 @@ def test_websocket_schemes_map_to_their_http_equivalents():
     assert (
         relay_client._Target("https://hub.example/base").path == "/base/harness/relay"
     )
+
+
+def test_inflight_reqs_are_bounded_and_excess_is_refused(harnessd_server, monkeypatch):
+    """Unbounded req spawn is a thread bomb under a polled endpoint.
+
+    The transcript endpoint is polled roughly once a second, and over a WAN
+    relay each poll's budget can expire while the spoke's loopback call is
+    still running. Unbounded, that is one live thread per expired poll, each
+    holding a DuckDB-contending loopback call on a laptop.
+    """
+    monkeypatch.setattr(relay_client, "MAX_INFLIGHT_REQS", 2)
+    client = RelayClient(
+        central_url="https://unused.example",
+        host_id="laptop",
+        token="test-token",
+        loopback_port=harnessd_server.server_port,
+    )
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def _slow_loopback(method, path, body):
+        started.release()
+        release.wait(30)
+        return 200, "{}"
+
+    monkeypatch.setattr(client, "_loopback_request", _slow_loopback)
+
+    hub_side, spoke_side = socket.socketpair()
+    threading.Thread(
+        target=client.serve_connection, args=(spoke_side,), daemon=True
+    ).start()
+    try:
+        # Fill both slots and wait until they are genuinely occupied, so the
+        # third request cannot win a race against them.
+        send_json(hub_side, req_frame("r1", "GET", "/sessions", None))
+        send_json(hub_side, req_frame("r2", "GET", "/sessions", None))
+        assert started.acquire(timeout=10)
+        assert started.acquire(timeout=10)
+
+        send_json(hub_side, req_frame("r3", "GET", "/sessions", None))
+        refused = _wait_for(hub_side, {"res"})
+        assert refused["id"] == "r3", "an occupied slot answered before the refusal"
+        assert refused["status"] == 503
+        assert "saturated" in refused["body"]
+
+        # Freeing the slots must let work flow again -- the cap is a ceiling,
+        # not a latch.
+        release.set()
+        answered = {_wait_for(hub_side, {"res"})["id"] for _ in range(2)}
+        assert answered == {"r1", "r2"}
+        send_json(hub_side, req_frame("r4", "GET", "/sessions", None))
+        assert _wait_for(hub_side, {"res"})["status"] == 200
+    finally:
+        release.set()
+        hub_side.close()
+
+
+def test_loopback_timeout_does_not_outlive_the_hub_budget():
+    """Orphaned work must die near the hub's deadline, not long after it."""
+    from drover.server.metrics import RELAY_MIN_TIMEOUT_S
+
+    assert relay_client.LOOPBACK_TIMEOUT_S >= RELAY_MIN_TIMEOUT_S
+    # 15s is RelayManager.request's own default budget: work outlives the
+    # tightest relay budgets but is not left running long past the widest.
+    assert relay_client.LOOPBACK_TIMEOUT_S <= 15.0

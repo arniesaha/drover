@@ -63,7 +63,17 @@ CONNECT_TIMEOUT_S = 15.0
 # signal, and a missing pong is explicitly not proof of death (the hub drops
 # pongs when its own write path is busy).
 READ_TIMEOUT_S = 90.0
-LOOPBACK_TIMEOUT_S = 30.0
+# Matched to the hub's default request budget rather than exceeding it by 2x.
+# Work the hub has already given up on is work nobody will ever read, and on
+# a polled endpoint every second past the hub's deadline is another orphaned
+# loopback call holding a DuckDB-contending connection open on this machine.
+LOOPBACK_TIMEOUT_S = 15.0
+# Ceiling on concurrent ``req`` workers. Each one is a loopback HTTP call, so
+# unbounded spawn under a hub burst - or under a polled endpoint whose budget
+# keeps expiring - turns into unbounded threads and unbounded database
+# contention on a laptop. Refusing fast is strictly better than accepting work
+# that will miss its deadline anyway.
+MAX_INFLIGHT_REQS = 16
 WRITE_TIMEOUT_S = 10.0
 # The frame loop skips a pong rather than stall on a busy write path: a
 # dropped pong is harmless, a stalled reader sits on frames already buffered.
@@ -232,6 +242,10 @@ class RelayClient:
         self._thread: threading.Thread | None = None
         self._conn: _Conn | None = None
         self._logged_failure = False
+        # Per client, not per connection: it bounds this machine's total
+        # loopback load, which a reconnect does not reset.
+        self._req_slots = threading.BoundedSemaphore(MAX_INFLIGHT_REQS)
+        self._refused_reqs = 0
 
     # -- lifecycle -----------------------------------------------------
 
@@ -384,7 +398,7 @@ class RelayClient:
         kind = frame["kind"]
         if kind == "req":
             # Own thread: a slow session create must not stall terminal data.
-            self._spawn(self._handle_req, connection, frame, name="relay-req")
+            self._start_req(connection, frame)
         elif kind == "open":
             self._handle_open(connection, frame)
         elif kind == "data":
@@ -417,19 +431,50 @@ class RelayClient:
 
     # -- req/res -------------------------------------------------------
 
+    def _start_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
+        """Take a worker slot, or answer 503 without taking a thread."""
+        if not self._req_slots.acquire(blocking=False):
+            self._refused_reqs += 1
+            if self._refused_reqs == 1 or self._refused_reqs % 100 == 0:
+                log.warning(
+                    "relay refused %d request(s): %d already in flight",
+                    self._refused_reqs,
+                    MAX_INFLIGHT_REQS,
+                )
+            self._send(
+                connection,
+                res_frame(
+                    str(frame.get("id")),
+                    503,
+                    json.dumps(
+                        {"error": "harness host is saturated"},
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            return
+        try:
+            self._spawn(self._handle_req, connection, frame, name="relay-req")
+        except Exception:  # noqa: BLE001 - a thread that never started holds nothing
+            self._req_slots.release()
+            raise
+
     def _handle_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
         request_id = str(frame.get("id"))
         method = str(frame.get("method") or "GET").upper()
         path = str(frame.get("path") or "/")
         try:
-            status, body = self._loopback_request(method, path, frame.get("body"))
-        except Exception as exc:  # noqa: BLE001 - never crash the frame loop
-            log.warning("relay loopback %s %s failed: %s", method, path, exc)
-            status = 502
-            body = json.dumps(
-                {"error": f"loopback request failed: {exc}"}, sort_keys=True
-            )
-        self._send(connection, res_frame(request_id, status, body))
+            try:
+                status, body = self._loopback_request(method, path, frame.get("body"))
+            except Exception as exc:  # noqa: BLE001 - never crash the frame loop
+                log.warning("relay loopback %s %s failed: %s", method, path, exc)
+                status = 502
+                body = json.dumps(
+                    {"error": f"loopback request failed: {exc}"}, sort_keys=True
+                )
+            self._send(connection, res_frame(request_id, status, body))
+        finally:
+            self._req_slots.release()
 
     def _loopback_request(
         self, method: str, path: str, body: dict[str, Any] | None

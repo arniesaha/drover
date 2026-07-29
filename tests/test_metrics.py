@@ -1035,12 +1035,14 @@ def collector_with_hosts(tmp_path) -> MetricsCollector:
 class _FakeRelay:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.timeouts: list[float] = []
 
     def is_live(self, host_id: str) -> bool:
         return host_id == "laptop"
 
     def request(self, host_id, method, path, body, timeout_s=15):
         self.calls.append((host_id, method, path, body))
+        self.timeouts.append(timeout_s)
         return 200, '{"ok": true}\n'
 
 
@@ -1072,6 +1074,33 @@ def test_harness_request_no_endpoint_no_relay_is_502(collector_with_hosts) -> No
     status, body = collector._harness_request(host, "/sessions", method="GET")
     assert status == 502
     assert "no reachable endpoint" in body
+
+
+def test_harness_request_raises_tight_budgets_over_a_relay(
+    collector_with_hosts,
+) -> None:
+    """LAN-shaped budgets are not budgets at all over a funnel from cellular.
+
+    The 1.0s reconcile and 2.0s transcript budgets were chosen for a LAN dial.
+    Over a relay they expire while the spoke's loopback call is still running,
+    the hub 502s, and -- the transcript endpoint being polled -- each expiry
+    leaves another orphaned thread on the laptop.
+    """
+    collector = collector_with_hosts
+    fake = _FakeRelay()
+    collector.relay_manager = fake
+    host = collector._harness_host("laptop")
+
+    collector._harness_request(host, "/sessions/s1", method="GET", timeout_s=1.0)
+    collector._harness_request(host, "/transcript", method="GET", timeout_s=2.0)
+    # A caller asking for more than the floor keeps its own budget.
+    collector._harness_request(host, "/slow", method="GET", timeout_s=30.0)
+
+    assert fake.timeouts == [
+        metrics.RELAY_MIN_TIMEOUT_S,
+        metrics.RELAY_MIN_TIMEOUT_S,
+        30.0,
+    ]
 
 
 def test_harness_request_never_dials_a_relay_host_by_url(collector_with_hosts) -> None:
