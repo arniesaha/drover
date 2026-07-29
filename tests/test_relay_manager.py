@@ -17,6 +17,7 @@ from drover.server.harness.relay_protocol import (
 from drover.server.harness.websocket import (
     OPCODE_PING,
     OPCODE_PONG,
+    WebSocketClosed,
     client_recv_json,
     client_send_frame,
     client_send_json,
@@ -324,6 +325,60 @@ def test_reader_still_dispatches_while_write_path_is_wedged() -> None:
     finally:
         connection.write_lock.release()
     assert result["value"] == (200, "answered")
+
+
+def test_a_mute_spoke_flips_offline(monkeypatch) -> None:
+    """A peer that vanishes without a FIN must not stay "online" for 15min.
+
+    This is the lid-close case, and it is the one presence claim the e2e test
+    cannot reach: sendall into a vanished peer succeeds into the send buffer,
+    so the ping thread never fails on its own. Only the absence of inbound
+    frames gives it away.
+    """
+    monkeypatch.setattr(relay_manager, "PING_INTERVAL_S", 0.1)
+    monkeypatch.setattr(relay_manager, "SILENCE_TIMEOUT_S", 0.3)
+    manager = RelayManager()
+    spoke = _attach(manager)  # keep a reference: a GC'd spoke closes the socket
+    assert manager.is_live("laptop")
+
+    # The spoke stays connected but answers nothing - exactly what a laptop
+    # whose Wi-Fi went away looks like from here.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and manager.is_live("laptop"):
+        time.sleep(0.05)
+    assert not manager.is_live("laptop"), "mute spoke was still reported online"
+    assert manager.live_host_ids() == set()
+    spoke.close()
+
+
+def test_a_ponging_spoke_stays_live_past_the_silence_timeout(monkeypatch) -> None:
+    """The watchdog must not tear down a healthy but idle connection."""
+    monkeypatch.setattr(relay_manager, "PING_INTERVAL_S", 0.05)
+    monkeypatch.setattr(relay_manager, "SILENCE_TIMEOUT_S", 0.2)
+    manager = RelayManager()
+    spoke = _attach(manager)
+    stop = threading.Event()
+
+    def spoke_loop() -> None:
+        # client_recv_json answers each ping with a pong; no data ever flows.
+        spoke.settimeout(0.1)
+        while not stop.is_set():
+            try:
+                client_recv_json(spoke)
+            except (OSError, WebSocketClosed):
+                return
+
+    thread = threading.Thread(target=spoke_loop, daemon=True)
+    thread.start()
+    try:
+        # Several silence windows' worth of a connection carrying nothing but
+        # ping/pong.
+        time.sleep(1.0)
+        assert manager.is_live("laptop"), "watchdog killed an idle-but-healthy peer"
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        spoke.close()
 
 
 def test_channel_queue_drops_oldest_instead_of_growing() -> None:

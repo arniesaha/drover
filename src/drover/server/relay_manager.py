@@ -48,6 +48,24 @@ from drover.server.harness.websocket import (
 log = logging.getLogger("drover.relay")
 
 PING_INTERVAL_S = 20.0
+# How long a connection may go completely silent before it is presumed dead.
+#
+# Presence is the whole point of a relay host - "online iff the socket is
+# connected" - but a peer that vanishes (lid closed, out of Wi-Fi) sends no
+# FIN, and sendall into its socket keeps *succeeding* into the send buffer
+# while TCP retransmits for ~15 minutes. Pings alone therefore detect nothing.
+#
+# The spoke solves its half with a 90s socket read timeout; the hub cannot use
+# one, because settimeout() also bounds sendall and a timed-out sendall leaves
+# a half-written frame on a stream every other session is sharing. So the ping
+# thread doubles as the watchdog instead, against a timestamp the reader
+# stamps on every inbound frame.
+#
+# 3x the ping interval: the hub is the pinger, so it knows a pong is due every
+# 20s and can be tighter than the spoke, which only knows pings arrive
+# eventually. Any inbound frame counts, so a busy connection re-stamps
+# constantly and only a genuinely mute peer runs the clock down.
+SILENCE_TIMEOUT_S = 3 * PING_INTERVAL_S
 # Budget for grabbing the write lock when the caller has no deadline of its own.
 WRITE_TIMEOUT_S = 10.0
 # The reader's budget. It skips the pong rather than stall: a dropped pong is
@@ -179,6 +197,12 @@ class _Connection:
         # Inverse of ``alive``, so the ping thread can wait with a timeout and
         # still wake immediately on teardown.
         self.dead = threading.Event()
+        # Monotonic stamp of the last frame read off this socket. Deliberately
+        # a bare float rather than lock-guarded state: it is written on the
+        # reader's hot path and a single attribute store/load needs no lock,
+        # while taking state_lock per inbound frame would put the reader in
+        # contention with every dispatch it performs.
+        self.last_rx = time.monotonic()
 
     @contextlib.contextmanager
     def write_access(self, timeout_s: float) -> Iterator[None]:
@@ -255,6 +279,12 @@ class RelayManager:
         Newest wins: a reconnecting spoke must never be blocked by its own
         zombie connection, so any prior connection is torn down.
         """
+        # Belt and braces under the silence watchdog: TCP keepalives give the
+        # kernel its own way to notice a peer that vanished without a FIN.
+        # Suppressed rather than required - a socketpair (tests) and some
+        # platforms reject it, and the watchdog is the real guarantee.
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         connection = _Connection(self, host_id, sock)
         with self._lock:
             previous = self._connections.get(host_id)
@@ -416,6 +446,9 @@ class RelayManager:
     def _read_loop(self, connection: _Connection) -> None:
         while connection.alive.is_set():
             frame = recv_frame(connection.sock)
+            # Every frame counts as proof of life, pongs included - see
+            # SILENCE_TIMEOUT_S.
+            connection.last_rx = time.monotonic()
             if frame.opcode == OPCODE_CLOSE:
                 raise WebSocketClosed()
             if frame.opcode == OPCODE_PING:
@@ -476,8 +509,20 @@ class RelayManager:
             )
 
     def _ping_forever(self, connection: _Connection) -> None:
-        """Turn a silently-dead TCP path into a detected disconnect."""
+        """Turn a silently-dead TCP path into a detected disconnect.
+
+        Doubles as the read watchdog: a successful ``sendall`` proves only
+        that the local send buffer accepted bytes, so liveness is decided by
+        what came *back* (see SILENCE_TIMEOUT_S). Tearing down here also
+        unblocks the reader, which is parked in a blocking ``recv``.
+        """
         while not connection.dead.wait(PING_INTERVAL_S):
+            silent_for = time.monotonic() - connection.last_rx
+            if silent_for > SILENCE_TIMEOUT_S:
+                self._teardown(
+                    connection, f"no frames from spoke for {silent_for:.0f}s"
+                )
+                return
             try:
                 connection.send_control(OPCODE_PING, b"hb")
             except _WriteTimeout as exc:
