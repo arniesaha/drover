@@ -1057,8 +1057,12 @@ def test_harness_request_falls_back_to_direct_url(collector_with_hosts) -> None:
     collector = collector_with_hosts
     collector.relay_manager = _FakeRelay()  # not live for "mini"
     host = collector._harness_host("mini")
-    status, _ = collector._harness_request(host, "/sessions", method="GET", timeout_s=0.2)
-    assert status == 502  # tried the direct URL and it refused -- proves the direct path ran
+    status, _ = collector._harness_request(
+        host, "/sessions", method="GET", timeout_s=0.2
+    )
+    assert (
+        status == 502
+    )  # tried the direct URL and it refused -- proves the direct path ran
 
 
 def test_harness_request_no_endpoint_no_relay_is_502(collector_with_hosts) -> None:

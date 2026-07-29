@@ -636,14 +636,14 @@ class MetricsCollector:
         path = f"/sessions/{session_id}/native-transcript"
         if params:
             path = f"{path}?{urlencode(params)}"
-        # No custom timeout here: a sub-several-second timeout must never
-        # reach RelayManager.request (it would tear down the shared
-        # connection on write-budget expiry), so this rides the default.
+        # 2.0s: the transcript endpoint is polled, and the sub-second-only
+        # rule for RelayManager.request permits any timeout >= 1s.
         status, body = self._harness_request(
             host,
             path,
             method="GET",
             payload={},
+            timeout_s=2.0,
         )
         if status == 404 and session.host_id in {"mac-mini", "localhost"}:
             transcript = native_transcript_for_session(
@@ -747,14 +747,15 @@ class MetricsCollector:
         host = self._harness_host(session.host_id)
         if host is None:
             return True
-        # No custom timeout here: a sub-several-second timeout must never
-        # reach RelayManager.request (it would tear down the shared
-        # connection on write-budget expiry), so this rides the default.
+        # 1.0s: this gates every terminal attach, so it must fail fast on a
+        # hung host; the sub-second-only rule for RelayManager.request
+        # permits any timeout >= 1s.
         status, body = self._harness_request(
             host,
             f"/sessions/{session_id}",
             method="GET",
             payload={},
+            timeout_s=1.0,
         )
         if 200 <= status < 300:
             return True
@@ -1008,9 +1009,7 @@ class MetricsCollector:
         and is forwarded verbatim to both the relay and the direct-dial
         path -- callers must not pre-join it to an endpoint.
         """
-        if self.relay_manager is not None and self.relay_manager.is_live(
-            host.host_id
-        ):
+        if self.relay_manager is not None and self.relay_manager.is_live(host.host_id):
             return self.relay_manager.request(
                 host.host_id, method, path, dict(payload or {}), timeout_s=timeout_s
             )
