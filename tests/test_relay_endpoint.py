@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import socket
+import threading
 import time
 from dataclasses import dataclass
 
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.harness.relay_protocol import hello_frame
-from drover.server.harness.websocket import client_handshake, client_send_json
+from drover.server.harness.relay_protocol import hello_frame, req_frame, res_frame
+from drover.server.harness.websocket import (
+    WebSocketClosed,
+    client_handshake,
+    client_recv_json,
+    client_send_json,
+)
 from drover.server.metrics import MetricsCollector
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
@@ -52,7 +59,7 @@ def metrics_server(tmp_path):
         server.server_close()
 
 
-def test_relay_upgrade_registers_live_host(metrics_server):
+def _connect_and_hello(metrics_server, host_id: str) -> socket.socket:
     host, port, token = metrics_server.host, metrics_server.port, metrics_server.token
     sock = socket.create_connection((host, port), timeout=5)
     client_handshake(
@@ -61,7 +68,20 @@ def test_relay_upgrade_registers_live_host(metrics_server):
         path="/harness/relay",
         headers={"Authorization": f"Bearer {token}"},
     )
-    client_send_json(sock, hello_frame("work-laptop"))
+    client_send_json(sock, hello_frame(host_id))
+    return sock
+
+
+def _spoke_recv(sock: socket.socket) -> dict:
+    """Read frames, skipping pong/ping Nones, like test_relay_manager.py does."""
+    while True:
+        frame = client_recv_json(sock)
+        if frame is not None:
+            return frame
+
+
+def test_relay_upgrade_registers_live_host(metrics_server):
+    sock = _connect_and_hello(metrics_server, "work-laptop")
     # attach is async from the client's perspective; poll briefly
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -69,7 +89,35 @@ def test_relay_upgrade_registers_live_host(metrics_server):
             break
         time.sleep(0.05)
     assert metrics_server.collector.relay_manager.is_live("work-laptop")
-    sock.close()
+
+    # is_live() only proves a flag flipped. Prove the hijacked fd actually
+    # survived the handler's finish()/shutdown_request() cleanup and still
+    # works bidirectionally by driving one real req/res round-trip through
+    # RelayManager.request(), with this test playing the spoke -- mirrors
+    # test_relay_manager.py's test_request_round_trip.
+    result: dict[str, object] = {}
+
+    def _issue_request() -> None:
+        status, body = metrics_server.collector.relay_manager.request(
+            "work-laptop", "GET", "/sessions", None, timeout_s=5
+        )
+        result["status"] = status
+        result["body"] = body
+
+    thread = threading.Thread(target=_issue_request, daemon=True)
+    thread.start()
+    try:
+        frame = _spoke_recv(sock)
+        assert frame["kind"] == "req"
+        assert frame["method"] == "GET"
+        assert frame["path"] == "/sessions"
+        client_send_json(sock, res_frame(frame["id"], 200, '{"sessions": []}\n'))
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert result["status"] == 200
+        assert json.loads(result["body"]) == {"sessions": []}
+    finally:
+        sock.close()
 
 
 def test_relay_upgrade_requires_token(metrics_server):
@@ -78,5 +126,45 @@ def test_relay_upgrade_requires_token(metrics_server):
     try:
         with pytest.raises(RuntimeError):  # handshake sees non-101 status
             client_handshake(sock, host=f"{host}:{port}", path="/harness/relay")
+    finally:
+        sock.close()
+
+
+def test_relay_upgrade_rejects_wrong_kind_frame(metrics_server):
+    host, port, token = metrics_server.host, metrics_server.port, metrics_server.token
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        client_handshake(
+            sock,
+            host=f"{host}:{port}",
+            path="/harness/relay",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        # A well-formed but non-hello frame must be rejected: the endpoint
+        # only ever accepts a hello as the first frame.
+        client_send_json(sock, req_frame("req-1", "GET", "/sessions", None))
+        sock.settimeout(5)
+        with pytest.raises(WebSocketClosed):
+            _spoke_recv(sock)
+        assert metrics_server.collector.relay_manager.live_host_ids() == set()
+    finally:
+        sock.close()
+
+
+def test_relay_upgrade_rejects_empty_host_id(metrics_server):
+    host, port, token = metrics_server.host, metrics_server.port, metrics_server.token
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        client_handshake(
+            sock,
+            host=f"{host}:{port}",
+            path="/harness/relay",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        client_send_json(sock, hello_frame(""))
+        sock.settimeout(5)
+        with pytest.raises(WebSocketClosed):
+            _spoke_recv(sock)
+        assert metrics_server.collector.relay_manager.live_host_ids() == set()
     finally:
         sock.close()
