@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   kind              VARCHAR NOT NULL,
   local_url         VARCHAR,
   tailscale_url     VARCHAR,
+  connection_kind   VARCHAR,
   status            VARCHAR NOT NULL,
   capabilities_json VARCHAR NOT NULL,
   last_seen_at      TIMESTAMP,
@@ -78,6 +79,11 @@ CREATE TABLE IF NOT EXISTS harness_transcript_chunks (
 def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     """Create Meta Harness control-plane tables. Idempotent."""
     con.execute(_HARNESS_HOSTS_DDL)
+    _ensure_harness_columns(
+        con,
+        "harness_hosts",
+        {"connection_kind": "VARCHAR"},
+    )
     con.execute(_HARNESS_SESSIONS_DDL)
     _ensure_harness_columns(
         con,

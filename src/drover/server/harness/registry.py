@@ -80,6 +80,7 @@ class HarnessRegistry:
         kind: str,
         local_url: str | None = None,
         tailscale_url: str | None = None,
+        connection_kind: str = "direct",
         capabilities: dict[str, Any] | None = None,
         status: str = "online",
     ) -> HarnessHost:
@@ -88,15 +89,17 @@ class HarnessRegistry:
             con.execute(
                 """
                 INSERT INTO harness_hosts (
-                  host_id, display_name, kind, local_url, tailscale_url, status,
-                  capabilities_json, last_seen_at, created_at, updated_at
+                  host_id, display_name, kind, local_url, tailscale_url,
+                  connection_kind, status, capabilities_json, last_seen_at,
+                  created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host_id) DO UPDATE SET
                   display_name = excluded.display_name,
                   kind = excluded.kind,
                   local_url = excluded.local_url,
                   tailscale_url = excluded.tailscale_url,
+                  connection_kind = excluded.connection_kind,
                   status = excluded.status,
                   capabilities_json = excluded.capabilities_json,
                   last_seen_at = excluded.last_seen_at,
@@ -108,6 +111,7 @@ class HarnessRegistry:
                     kind,
                     local_url,
                     tailscale_url,
+                    connection_kind,
                     status,
                     _json_dumps(capabilities),
                     now,

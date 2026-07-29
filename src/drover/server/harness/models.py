@@ -26,6 +26,7 @@ class HarnessHost:
     capabilities: dict[str, Any] = field(default_factory=dict)
     local_url: str | None = None
     tailscale_url: str | None = None
+    connection_kind: str = "direct"
     last_seen_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -39,6 +40,7 @@ class HarnessHost:
             status=row["status"],
             local_url=row.get("local_url"),
             tailscale_url=row.get("tailscale_url"),
+            connection_kind=row.get("connection_kind") or "direct",
             capabilities=_loads_object(row.get("capabilities_json")),
             last_seen_at=row.get("last_seen_at"),
             created_at=row.get("created_at"),

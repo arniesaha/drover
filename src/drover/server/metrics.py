@@ -460,6 +460,7 @@ class MetricsCollector:
                 kind=kind,
                 local_url=_optional_str(payload.get("local_url")),
                 tailscale_url=_optional_str(payload.get("tailscale_url")),
+                connection_kind=str(payload.get("connection_kind") or "direct"),
                 status=status,
                 capabilities=capabilities,
             )

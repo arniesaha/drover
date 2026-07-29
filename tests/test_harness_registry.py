@@ -64,6 +64,27 @@ def test_register_host_upserts_capabilities_and_heartbeat(tmp_path):
     assert second.last_seen_at is not None
 
 
+def test_register_host_persists_connection_kind(tmp_path):
+    registry, _ = _registry(tmp_path)
+    host = registry.register_host(
+        host_id="work-laptop",
+        display_name="Work Laptop",
+        kind="mac",
+        connection_kind="relay",
+    )
+    assert host.connection_kind == "relay"
+    fetched = registry.get_host("work-laptop")
+    assert fetched is not None and fetched.connection_kind == "relay"
+
+
+def test_register_host_defaults_connection_kind_direct(tmp_path):
+    registry, _ = _registry(tmp_path)
+    host = registry.register_host(
+        host_id="mini", display_name="Mac Mini", kind="mac"
+    )
+    assert host.connection_kind == "direct"
+
+
 def test_create_and_update_session_lifecycle(tmp_path):
     registry, _ = _registry(tmp_path)
     registry.register_host(
