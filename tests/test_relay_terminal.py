@@ -19,11 +19,16 @@ from drover.server.harness.relay_protocol import (
     res_frame,
 )
 from drover.server.harness.websocket import (
+    OPCODE_PING,
+    OPCODE_PONG,
     client_handshake,
     client_recv_json,
+    client_send_frame,
     client_send_json,
+    recv_frame,
 )
 from drover.server.metrics import MetricsCollector
+from drover.server.web import app as app_module
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
 
@@ -208,6 +213,72 @@ def test_terminal_attach_bridges_over_relay(metrics_server_with_relay_host):
     assert mirrored is not None
     assert mirrored.event_type == "terminal.output"
     assert mirrored.payload == {"data": "$ "}
+
+
+def test_browser_pong_is_sent_under_the_write_lock(metrics_server_with_relay_host):
+    """Pin the invariant: a pong must never interleave with a terminal frame.
+
+    The app socket has two writers -- the forwarding thread and whichever
+    thread answers a ping. Unsynchronized they desync the stream to the app
+    permanently. The iOS client never pings, so today's trigger would be
+    Tailscale Funnel, a new and unverified intermediary on this exact path.
+
+    Rather than race it, this drives a ping through and asserts the pong went
+    out holding the lock -- a refactor back to the module-level ``recv_json``
+    (which pongs unlocked) leaves ``observed`` empty and fails here.
+    """
+    env = metrics_server_with_relay_host
+    spoke = env.spoke_sock
+    observed: list[tuple[int, bool]] = []
+    sockets: list[app_module._BrowserSocket] = []
+    real_init = app_module._BrowserSocket.__init__
+    real_send_frame = app_module.send_frame
+
+    def spy_init(self, sock):
+        real_init(self, sock)
+        sockets.append(self)
+
+    def spy_send_frame(sock, opcode, payload=b""):
+        locked = any(
+            wrapper._write_lock.locked() for wrapper in sockets if wrapper.sock is sock
+        )
+        observed.append((opcode, locked))
+        real_send_frame(sock, opcode, payload)
+
+    def spoke_loop() -> None:
+        reconcile = _spoke_recv(spoke)
+        client_send_json(spoke, res_frame(reconcile["id"], 200, "{}"))
+        frame = _spoke_recv(spoke)
+        client_send_json(spoke, opened_frame(frame["chan"]))
+
+    thread = threading.Thread(target=spoke_loop, daemon=True)
+    thread.start()
+
+    app_module._BrowserSocket.__init__ = spy_init
+    app_module.send_frame = spy_send_frame
+    try:
+        app = socket.create_connection((env.host, env.port), timeout=5)
+        try:
+            client_handshake(
+                app,
+                host=f"{env.host}:{env.port}",
+                path="/harness/sessions/s1/terminal",
+                headers={"Authorization": f"Bearer {env.token}"},
+            )
+            thread.join(timeout=5)
+            client_send_frame(app, OPCODE_PING, b"hb")
+            app.settimeout(10)
+            while recv_frame(app).opcode != OPCODE_PONG:
+                pass
+        finally:
+            app.close()
+    finally:
+        app_module._BrowserSocket.__init__ = real_init
+        app_module.send_frame = real_send_frame
+
+    pongs = [locked for opcode, locked in observed if opcode == OPCODE_PONG]
+    assert pongs, "the proxy answered the ping without going through send_frame"
+    assert all(pongs), "pong was written to the app socket without the write lock"
 
 
 def test_terminal_attach_never_dials_a_relay_host_by_url(

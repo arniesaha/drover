@@ -22,6 +22,8 @@ from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_protocol import RelayProtocolError, parse_frame
 from drover.server.harness.websocket import (
     OPCODE_CLOSE,
+    OPCODE_PING,
+    OPCODE_PONG,
     OPCODE_TEXT,
     WebSocketClosed,
     accept_key,
@@ -51,13 +53,13 @@ log = logging.getLogger("drover.metrics")
 
 _PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login"}
 
-# Mirror records buffered for one relay terminal attach before the oldest are
-# dropped. Generous, because the worker below amortizes a whole backlog into a
-# single DuckDB window: filling this means the database has been unavailable
-# for a long time, not that a burst arrived.
 # Total budget for a spoke to send its hello after the 101, across every
 # frame it sends -- not per recv. See _accept_relay_websocket.
 RELAY_HELLO_TIMEOUT_S = 10.0
+# Mirror records buffered for one relay terminal attach before the newest are
+# dropped. Generous, because the worker below amortizes a whole backlog into a
+# single DuckDB window: filling this means the database has been unavailable
+# for a long time, not that a burst arrived.
 MIRROR_QUEUE_MAX = 2048
 # Cap on one batched write, so a huge backlog is drained in several bounded
 # windows rather than one that holds the connect lock for seconds.
@@ -178,6 +180,58 @@ class _EventMirror:
                 break
             batch.append(item)
         return batch, stopping
+
+
+class _BrowserSocket:
+    """The app-facing websocket of a terminal proxy, with a write lock.
+
+    Two threads write here: the forwarding thread sends terminal messages
+    while the reader thread answers pings. Unsynchronized, those interleave
+    mid-frame and desync the stream to the app permanently -- the exact
+    hazard every other socket in this codebase is meticulous about (see the
+    relay_client module docstring). It was the one socket left unguarded, and
+    the trigger becomes materially more likely once this path runs through
+    Tailscale Funnel: a new intermediary that has not been verified not to
+    ping. The iOS client itself never sends one.
+
+    Acquiring the lock is bounded without a timeout parameter because the
+    socket carries one (``settimeout(0.25)``), so no holder can sit in
+    ``sendall`` indefinitely.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self._write_lock = threading.Lock()
+
+    def send_json(self, payload: dict[str, Any]) -> None:
+        with self._write_lock:
+            send_json(self.sock, payload)
+
+    def send_frame(self, opcode: int, payload: bytes = b"") -> None:
+        with self._write_lock:
+            send_frame(self.sock, opcode, payload)
+
+    def send_close(self) -> None:
+        with self._write_lock:
+            send_close(self.sock)
+
+    def recv_json(self) -> dict[str, Any] | None:
+        """``recv_json``, except the pong goes through the write lock.
+
+        Reads with ``recv_frame`` rather than delegating, because the module
+        level ``recv_json`` answers a ping by writing unlocked -- which is the
+        whole bug.
+        """
+        frame = recv_frame(self.sock)
+        if frame.opcode == OPCODE_CLOSE:
+            raise WebSocketClosed()
+        if frame.opcode == OPCODE_PING:
+            self.send_frame(OPCODE_PONG, frame.payload)
+            return None
+        if frame.opcode != OPCODE_TEXT:
+            return None
+        loaded = json.loads(frame.payload.decode("utf-8"))
+        return loaded if isinstance(loaded, dict) else None
 
 
 def _derive_awaiting(
@@ -648,20 +702,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
 
-        browser = self._upgrade_browser_websocket()
-        if browser is None:
+        raw_browser = self._upgrade_browser_websocket()
+        if raw_browser is None:
             upstream.close()
             return
 
         stop = threading.Event()
-        browser.settimeout(0.25)
+        raw_browser.settimeout(0.25)
         upstream.settimeout(0.25)
+        browser = _BrowserSocket(raw_browser)
 
         def browser_to_upstream() -> None:
             try:
                 while not stop.is_set():
                     try:
-                        message = recv_json(browser)
+                        message = browser.recv_json()
                     except socket.timeout:
                         continue
                     if message is not None:
@@ -677,7 +732,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     except socket.timeout:
                         continue
                     self._mirror_harness_event_frame(session_id, frame)
-                    send_frame(browser, frame.opcode, frame.payload)
+                    browser.send_frame(frame.opcode, frame.payload)
                     if frame.opcode == OPCODE_CLOSE:
                         stop.set()
                         return
@@ -712,12 +767,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 
         mirror: _EventMirror | None = None
         try:
-            browser = self._upgrade_browser_websocket()
-            if browser is None:
+            raw_browser = self._upgrade_browser_websocket()
+            if raw_browser is None:
                 return
 
             stop = threading.Event()
-            browser.settimeout(0.25)
+            raw_browser.settimeout(0.25)
+            browser = _BrowserSocket(raw_browser)
             # Off-thread and batched: mirroring inline here is what let a slow
             # DuckDB write turn into dropped terminal output (see _EventMirror).
             mirror = _EventMirror(self._harness_registry())
@@ -726,7 +782,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 try:
                     while not stop.is_set():
                         try:
-                            message = recv_json(browser)
+                            message = browser.recv_json()
                         except socket.timeout:
                             continue
                         if message is not None:
@@ -742,7 +798,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                             if channel.closed:
                                 stop.set()
                                 try:
-                                    send_close(browser)
+                                    browser.send_close()
                                 except Exception:  # noqa: BLE001
                                     pass
                                 return
@@ -750,7 +806,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         record = _harness_event_record(session_id, message)
                         if record is not None:
                             mirror.offer(record)
-                        send_json(browser, message)
+                        browser.send_json(message)
                 except Exception:
                     stop.set()
 
