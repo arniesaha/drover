@@ -125,18 +125,40 @@ def client_handshake(
     return key
 
 
-def client_send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
-    data = json.dumps(payload, sort_keys=True).encode("utf-8")
+def client_send_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:
+    """Send a masked frame (client role). RFC 6455 requires masking client->server."""
     mask = os.urandom(4)
-    length = len(data)
+    length = len(payload)
     if length < 126:
-        header = bytes([0x80 | OPCODE_TEXT, 0x80 | length])
+        header = bytes([0x80 | opcode, 0x80 | length])
     elif length < 65536:
-        header = bytes([0x80 | OPCODE_TEXT, 0x80 | 126]) + struct.pack("!H", length)
+        header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", length)
     else:
-        header = bytes([0x80 | OPCODE_TEXT, 0x80 | 127]) + struct.pack("!Q", length)
-    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
+        header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", length)
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     sock.sendall(header + mask + masked)
+
+
+def client_recv_json(sock: socket.socket) -> dict[str, Any] | None:
+    """recv_json for the client role: pongs pings with a masked frame."""
+    frame = recv_frame(sock)
+    if frame.opcode == OPCODE_CLOSE:
+        raise WebSocketClosed()
+    if frame.opcode == OPCODE_PING:
+        client_send_frame(sock, OPCODE_PONG, frame.payload)
+        return None
+    if frame.opcode == OPCODE_PONG:
+        return None
+    if frame.opcode != OPCODE_TEXT:
+        return None
+    loaded = json.loads(frame.payload.decode("utf-8"))
+    return loaded if isinstance(loaded, dict) else None
+
+
+def client_send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
+    client_send_frame(
+        sock, OPCODE_TEXT, json.dumps(payload, sort_keys=True).encode("utf-8")
+    )
 
 
 def _recv_exact(sock: socket.socket, length: int) -> bytes:
