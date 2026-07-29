@@ -1077,17 +1077,37 @@ def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> 
     # Top-level key confirmed by reading render_harness_json / harness_snapshot:
     # it emits {"hosts": [...], "sessions": [...], "cwd_suggestions": [...]}.
     collector = collector_with_hosts  # "laptop" registered connection_kind="relay", status "online"
+    # Second relay host, stored "online", but _FakeRelay.is_live only recognizes
+    # "laptop" -- this is the realistic production case: hub up, some other
+    # relay host's socket has dropped. Registered directly against the
+    # fixture's duckdb so we don't disturb collector_with_hosts for other tests.
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.register_host(
+        host_id="phone",
+        display_name="Phone",
+        kind="ios",
+        connection_kind="relay",
+    )
     collector.relay_manager = _FakeRelay()  # is_live: only "laptop"
 
     payload = json.loads(collector.render_harness_json(include_sessions=False))
     hosts = {h["host_id"]: h for h in payload["hosts"]}
     assert hosts["laptop"]["connection_kind"] == "relay"
     assert hosts["laptop"]["status"] == "online"
+    assert hosts["phone"]["connection_kind"] == "relay"
+    assert hosts["phone"]["status"] == "offline"  # stored "online" must not leak
+
+    # Same override holds when sessions are included in the render.
+    payload = json.loads(collector.render_harness_json(include_sessions=True))
+    hosts = {h["host_id"]: h for h in payload["hosts"]}
+    assert hosts["laptop"]["status"] == "online"
+    assert hosts["phone"]["status"] == "offline"
 
     collector.relay_manager = None  # no live sockets at all
     payload = json.loads(collector.render_harness_json(include_sessions=False))
     hosts = {h["host_id"]: h for h in payload["hosts"]}
     assert hosts["laptop"]["status"] == "offline"  # stored "online" must not leak
+    assert hosts["phone"]["status"] == "offline"
     assert hosts["mini"]["status"] == "online"  # direct host keeps stored status
 
 
