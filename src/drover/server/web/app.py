@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.relay_protocol import RelayProtocolError, parse_frame
 from drover.server.harness.websocket import (
     OPCODE_CLOSE,
     OPCODE_TEXT,
@@ -208,6 +209,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 "application/json",
                 self.collector.render_harness_json(include_hosts=False),
             )
+            return
+        if path == "/harness/relay":
+            self._accept_relay_websocket()
             return
         if path.startswith("/harness/sessions/") and path.endswith("/terminal"):
             session_id = unquote(
@@ -521,6 +525,75 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         stop.set()
         upstream.close()
 
+    def _accept_relay_websocket(self) -> None:
+        """Upgrade a spoke's connection and hand it to RelayManager.
+
+        The Bearer check already ran in ``_gate`` (called at the top of
+        ``do_GET``) -- this route is never reachable without it, same as
+        every other non-public path.
+        """
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self._send(
+                426,
+                "application/json",
+                '{"error": "relay attach requires websocket upgrade"}\n',
+            )
+            return
+        websocket_key = self.headers.get("Sec-WebSocket-Key")
+        if not websocket_key:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "missing Sec-WebSocket-Key"}\n',
+            )
+            return
+
+        # See _proxy_terminal_websocket: HTTP/1.1 status line required by
+        # strict WebSocket clients; scoped to this hijacked upgrade only.
+        self.protocol_version = "HTTP/1.1"
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept_key(websocket_key))
+        self.end_headers()
+        self.close_connection = True
+
+        sock = self.connection
+        sock.settimeout(10.0)
+        try:
+            frame = None
+            while frame is None:
+                frame = recv_json(sock)
+            parsed = parse_frame(frame)
+            if parsed.get("kind") != "hello":
+                raise RelayProtocolError(
+                    f"expected hello frame, got kind={parsed.get('kind')!r}"
+                )
+            host_id = str(parsed.get("host_id") or "").strip()
+            if not host_id:
+                raise RelayProtocolError("hello frame missing host_id")
+        except (OSError, WebSocketClosed, RelayProtocolError, ValueError) as exc:
+            log.info("relay handshake for %s failed: %s", self.client_address, exc)
+            sock.close()
+            return
+
+        # RelayManager owns a blocking socket -- a leftover read timeout
+        # would tear a healthy idle connection down (socket.timeout is an
+        # OSError, indistinguishable from a real failure to the reader).
+        sock.settimeout(None)
+
+        # The socket must outlive this handler: BaseRequestHandler.finish()
+        # (called when this method returns) closes rfile/wfile, and
+        # ThreadingHTTPServer's shutdown_request() then calls shutdown()
+        # and close() on the *same* socket object RelayManager is about to
+        # own. detach() extracts the live fd without closing it and marks
+        # this socket object closed, so those later calls become no-ops
+        # (shutdown raises EBADF, caught by socketserver; close is a
+        # no-op) while the fd itself, rewrapped below, keeps working.
+        fd = sock.detach()
+        relay_sock = socket.socket(fileno=fd)
+        self.collector.relay_manager.attach(host_id, relay_sock)
+
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)
 
@@ -759,6 +832,9 @@ def start_metrics_server(
     auth: AuthSettings | None = None,
 ) -> ThreadingHTTPServer:
     """Start the Drover metrics HTTP server in a daemon thread."""
+    from drover.server.relay_manager import RelayManager
+
+    collector.relay_manager = RelayManager()
     handler = type(
         "DroverMetricsHandler",
         (_MetricsHandler,),

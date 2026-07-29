@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 from urllib.parse import quote, urlencode, urlparse
 
 from drover.server.harness.daemon import (
@@ -23,6 +23,9 @@ from drover.server.harness.registry import HarnessRegistry
 from drover.server.jobs import RedisJobStream
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
+
+if TYPE_CHECKING:
+    from drover.server.relay_manager import RelayManager
 
 log = logging.getLogger("drover.metrics")
 
@@ -412,6 +415,8 @@ class MetricsCollector:
     # New Session sheet "favorite" cwd suggestions, from [harness].favorite_cwds
     # in ~/.drover/config.toml (empty by default — no hardcoded paths).
     favorite_cwds: tuple[str, ...] = ()
+    # Set by start_metrics_server; owns live hub<->harnessd relay connections.
+    relay_manager: "RelayManager | None" = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
