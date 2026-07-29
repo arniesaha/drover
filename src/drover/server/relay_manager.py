@@ -357,6 +357,15 @@ class RelayManager:
             connection.forget(key)
             connection.forget_channel(chan)
             channel._mark_closed()
+            # The spoke has almost certainly registered this channel already
+            # and may be mid-dial or already pumping. Without a close it would
+            # keep a live terminal attach open until the whole connection dies
+            # - and harnessd reads the PTY through a single shared fd, so a
+            # zombie attacher silently steals half the output from every later
+            # attach to that session. Its ``close`` branch and the
+            # ``closed.is_set()`` check after dialling both already handle
+            # this; they were simply never reachable.
+            self._cancel_open(connection, chan)
             raise RelayUnavailable(
                 f"relay channel open to {host_id} timed out after {timeout_s}s"
             ) from None
@@ -365,6 +374,20 @@ class RelayManager:
             channel._mark_closed()
             raise RelayUnavailable(str(detail) if detail else "relay channel refused")
         return channel
+
+    def _cancel_open(self, connection: _Connection, chan: str) -> None:
+        """Best-effort ``close`` for a channel the hub gave up on.
+
+        Never raises and never tears the connection down: losing this frame
+        costs one zombie channel, while dropping a healthy connection over a
+        1s lock timeout costs every session riding it.
+        """
+        if not connection.alive.is_set():
+            return
+        try:
+            connection.send(close_frame(chan), timeout_s=CLOSE_WRITE_TIMEOUT_S)
+        except (OSError, WebSocketClosed, _WriteTimeout) as exc:
+            log.debug("relay open-cancel close for %s failed: %s", chan, exc)
 
     # -- internals -----------------------------------------------------
 

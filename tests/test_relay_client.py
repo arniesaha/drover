@@ -20,7 +20,7 @@ from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness import relay_client
 from drover.server.harness.relay_client import RelayClient
-from drover.server.harness.relay_protocol import open_frame, req_frame
+from drover.server.harness.relay_protocol import close_frame, open_frame, req_frame
 from drover.server.harness.websocket import recv_json, send_json
 
 
@@ -163,6 +163,51 @@ def test_channel_pumps_terminal_and_closes_when_the_session_dies(
         if "res" in seen:
             assert 200 <= seen["res"]["status"] < 300, seen["res"]["body"]
     assert seen["close"]["chan"] == "c1"
+    hub_side.close()
+
+
+def test_hub_close_tears_down_a_live_channel(harnessd_server, tmp_path):
+    """The other half of the hub's open-timeout cancel (RelayManager C1).
+
+    Until the hub started sending a close on that path this branch was dead
+    code, and the pump held a live PTY attach until the whole connection died.
+    """
+    client = RelayClient(
+        central_url="https://unused.example",
+        host_id="laptop",
+        token="test-token",
+        loopback_port=harnessd_server.server_port,
+    )
+    hub_side, spoke_side = socket.socketpair()
+    threading.Thread(
+        target=client.serve_connection, args=(spoke_side,), daemon=True
+    ).start()
+
+    send_json(
+        hub_side,
+        req_frame(
+            "r1", "POST", "/sessions", {"harness": "shell", "cwd": str(tmp_path)}
+        ),
+    )
+    created = _wait_for(hub_side, {"res"})
+    assert created["status"] == 201
+    session_id = json.loads(created["body"])["session_id"]
+
+    send_json(hub_side, open_frame("c1", f"/sessions/{session_id}/terminal"))
+    assert _wait_for(hub_side, {"opened", "open_error"})["kind"] == "opened"
+    assert _wait_for(hub_side, {"data"})["message"]["type"] == "attached"
+
+    send_json(hub_side, close_frame("c1"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if client._conn is not None and client._conn.get_channel("c1") is None:
+            break
+        time.sleep(0.05)
+    assert client._conn.get_channel("c1") is None, "channel survived the hub close"
+    # A hub-initiated close must not be echoed back, and the connection itself
+    # stays serviceable: another request still answers.
+    send_json(hub_side, req_frame("r2", "GET", "/sessions", None))
+    assert _wait_for(hub_side, {"res", "close"})["kind"] == "res"
     hub_side.close()
 
 

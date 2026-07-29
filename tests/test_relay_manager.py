@@ -3,6 +3,7 @@
 import json
 import socket
 import threading
+import time
 
 import pytest
 
@@ -96,6 +97,70 @@ def test_channel_open_data_close() -> None:
     thread.join(timeout=5)
     channel.close()
     assert channel.closed
+
+
+def test_open_timeout_tells_the_spoke_to_close_the_channel() -> None:
+    """A hub that gives up must not leave the spoke pumping into the void.
+
+    The spoke registers the channel the moment it sees ``open`` and starts
+    dialling; if the hub's wait expires and it says nothing, that attach lives
+    until the whole connection dies. harnessd reads each PTY through one
+    shared fd, so the zombie then steals half the output from every later
+    attach to that session.
+    """
+    manager = RelayManager()
+    spoke = _attach(manager)
+
+    frames: list[dict] = []
+
+    def spoke_loop() -> None:
+        # Deliberately never answers the open: this is the timeout path.
+        frames.append(_spoke_recv(spoke))
+        frames.append(_spoke_recv(spoke))
+
+    thread = threading.Thread(target=spoke_loop, daemon=True)
+    thread.start()
+    with pytest.raises(RelayUnavailable):
+        manager.open_channel("laptop", "/sessions/s1/terminal", timeout_s=0.5)
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "hub sent no close after the open timed out"
+    assert [frame["kind"] for frame in frames] == ["open", "close"]
+    assert frames[1]["chan"] == frames[0]["chan"]
+    # The connection itself survives: one abandoned channel is not a reason to
+    # drop every other session riding this socket.
+    assert manager.is_live("laptop")
+
+
+def test_open_timeout_close_does_not_drop_a_wedged_connection() -> None:
+    """The cancel is best-effort: it must never raise out of open_channel."""
+    manager = RelayManager()
+    spoke = _attach(manager)  # keep a reference: a GC'd spoke closes the socket
+    connection = manager._connections["laptop"]
+
+    def spoke_loop() -> None:
+        _spoke_recv(spoke)  # consume the open, answer nothing
+
+    threading.Thread(target=spoke_loop, daemon=True).start()
+
+    result: dict[str, BaseException | None] = {}
+
+    def caller() -> None:
+        try:
+            manager.open_channel("laptop", "/sessions/s1/terminal", timeout_s=0.5)
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = threading.Thread(target=caller, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    connection.write_lock.acquire()  # wedge the write path before the cancel
+    try:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "the best-effort close swallowed the timeout"
+    finally:
+        connection.write_lock.release()
+    assert isinstance(result.get("error"), RelayUnavailable)
+    spoke.close()
 
 
 def test_channel_open_error_raises() -> None:
