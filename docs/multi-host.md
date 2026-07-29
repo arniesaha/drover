@@ -63,14 +63,38 @@ Installs `~/Library/LaunchAgents/com.drover.harnessd.plist` (see
 
 ### 2. NAS direct (systemd host)
 
-`enroll-host.sh` is launchd-only (macOS). On a systemd host, install a unit
-by hand following the shape of the existing `scripts/systemd/*.template`
-units (e.g. `nexus-server.service.template`): render
-`ExecStart=<repo>/.venv/bin/drover-harnessd --host-id nas --central-url
-<hub-url> --listen 127.0.0.1:7081`, `WantedBy=default.target`, and validate
-the token the same way the enroll script does
-(`curl -H "Authorization: Bearer $(cat ~/.drover/api_token)"
-<hub-url>/harness/hosts`) before enabling the unit.
+`enroll-host.sh` is launchd-only (macOS) — **no `drover-harnessd` systemd
+unit exists in this repo yet.** One needs to be written and tested when the
+NAS actually moves to running harnessd; until then this is guidance for
+writing that unit, not a ready-to-copy file.
+
+Follow the shape of the existing `scripts/systemd/*.template` units (e.g.
+`nexus-server.service.template`, `nexus-tempo-relay.service.template`),
+which invoke console scripts via `uv run` rather than an absolute venv
+path:
+
+```
+ExecStart=@@HOME@@/.local/bin/uv run --quiet drover-harnessd --host-id nas --central-url @@CENTRAL_URL@@ --listen 127.0.0.1:7081
+WorkingDirectory=@@REPO_DIR@@
+```
+
+with `WantedBy=default.target`, matching the other `*.template` units'
+`[Install]` section. (`<repo>/.venv/bin/drover-harnessd` — the same
+absolute-venv-binary shape `enroll-host.sh`/the launchd template use on
+macOS — also works once `uv sync` has populated `.venv`, since it's the
+same console script either way; `uv run` is just what every other unit in
+`scripts/systemd/` already does, so match that for consistency rather than
+introducing a second invocation style on the NAS.)
+
+Validate the token the same way the enroll script does, before enabling the
+unit:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $(cat ~/.drover/api_token)" \
+  <hub-url>/harness/hosts
+# must print 200 before you `systemctl enable --now` anything
+```
 
 ### 3. Laptop (relay)
 
