@@ -55,6 +55,9 @@ _PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login"}
 # dropped. Generous, because the worker below amortizes a whole backlog into a
 # single DuckDB window: filling this means the database has been unavailable
 # for a long time, not that a burst arrived.
+# Total budget for a spoke to send its hello after the 101, across every
+# frame it sends -- not per recv. See _accept_relay_websocket.
+RELAY_HELLO_TIMEOUT_S = 10.0
 MIRROR_QUEUE_MAX = 2048
 # Cap on one batched write, so a huge backlog is drained in several bounded
 # windows rather than one that holds the connect lock for seconds.
@@ -824,10 +827,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         sock = self.connection
-        sock.settimeout(10.0)
+        # One deadline for the whole handshake, not per recv. settimeout() is
+        # per socket operation, and recv_json returns None for a ping, a pong,
+        # or any non-text opcode -- so a peer sending a ping every 9 seconds
+        # used to loop here forever, pinning a ThreadingHTTPServer thread with
+        # no cap on how many. Reachable from the internet by anyone holding
+        # the shared token once the funnel is up, and unbounded thread growth
+        # takes the whole hub down, not just the relay.
+        deadline = time.monotonic() + RELAY_HELLO_TIMEOUT_S
         try:
             frame = None
             while frame is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RelayProtocolError(
+                        f"no hello frame within {RELAY_HELLO_TIMEOUT_S}s"
+                    )
+                sock.settimeout(max(0.1, remaining))
                 frame = recv_json(sock)
             parsed = parse_frame(frame)
             if parsed.get("kind") != "hello":

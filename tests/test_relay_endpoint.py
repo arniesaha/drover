@@ -13,12 +13,15 @@ import pytest
 from drover.schema import bootstrap
 from drover.server.harness.relay_protocol import hello_frame, req_frame, res_frame
 from drover.server.harness.websocket import (
+    OPCODE_PING,
     WebSocketClosed,
     client_handshake,
     client_recv_json,
+    client_send_frame,
     client_send_json,
 )
 from drover.server.metrics import MetricsCollector
+from drover.server.web import app as app_module
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
 
@@ -165,6 +168,43 @@ def test_relay_upgrade_rejects_empty_host_id(metrics_server):
         sock.settimeout(5)
         with pytest.raises(WebSocketClosed):
             _spoke_recv(sock)
+        assert metrics_server.collector.relay_manager.live_host_ids() == set()
+    finally:
+        sock.close()
+
+
+def test_hello_budget_is_total_not_per_recv(metrics_server, monkeypatch):
+    """A pinger must not hold a handler thread open indefinitely.
+
+    settimeout() is per socket operation, and recv_json answers a ping and
+    returns None -- so a client pinging faster than the timeout used to reset
+    the clock forever. On ThreadingHTTPServer that is one pinned thread per
+    connection with no cap, reachable from the internet by anyone holding the
+    shared token once the funnel is up.
+    """
+    monkeypatch.setattr(app_module, "RELAY_HELLO_TIMEOUT_S", 1.0)
+    host, port, token = metrics_server.host, metrics_server.port, metrics_server.token
+    sock = socket.create_connection((host, port), timeout=10)
+    try:
+        client_handshake(
+            sock,
+            host=f"{host}:{port}",
+            path="/harness/relay",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        sock.settimeout(20)
+        started = time.monotonic()
+        # Ping steadily and never say hello. Under the per-recv bug this loop
+        # runs until the test's own deadline; under a total budget the server
+        # gives up and closes.
+        with pytest.raises((WebSocketClosed, OSError)):
+            while time.monotonic() - started < 15:
+                client_send_frame(sock, OPCODE_PING, b"stall")
+                time.sleep(0.2)
+                # Drains the pong, and raises once the server hangs up.
+                client_recv_json(sock)
+        elapsed = time.monotonic() - started
+        assert elapsed < 10, f"handler stayed pinned for {elapsed:.1f}s"
         assert metrics_server.collector.relay_manager.live_host_ids() == set()
     finally:
         sock.close()
