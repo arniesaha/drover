@@ -539,3 +539,47 @@ def test_client_handshake_rejects_an_endless_header():
         thread.join(timeout=5)
 
     assert websocket_module.MAX_HANDSHAKE_HEAD_BYTES <= 1 << 20
+
+
+def test_recv_frame_refuses_an_oversized_announced_length():
+    """A 64-bit length taken on trust is an allocation primitive.
+
+    _recv_exact grows a bytearray until satisfied, so a peer announcing a
+    multi-gigabyte frame exhausts hub memory without ever sending the bytes.
+    Post-auth, but the shared token is the only gate on a public funnel.
+    """
+    from drover.server.harness.websocket import MAX_FRAME_BYTES
+
+    server, client = socket.socketpair()
+    try:
+        # Header only: 8-byte extended length announcing 8 GiB, no payload.
+        server.sendall(bytes([0x81, 127]) + (8 * 1024**3).to_bytes(8, "big"))
+        client.settimeout(5)
+        with pytest.raises(WebSocketClosed) as caught:
+            recv_frame(client)
+        assert "exceeds" in str(caught.value)
+    finally:
+        client.close()
+        server.close()
+
+    assert MAX_FRAME_BYTES >= 65536, "must still clear real PTY and JSON frames"
+
+
+def test_recv_frame_still_accepts_a_large_but_legal_frame():
+    """The cap must not clip anything these sockets legitimately carry."""
+    from drover.server.harness.websocket import MAX_FRAME_BYTES, send_frame
+
+    server, client = socket.socketpair()
+    payload = b"x" * 65536  # 8x the daemon's PTY read size
+    assert len(payload) <= MAX_FRAME_BYTES
+    thread = threading.Thread(
+        target=lambda: send_frame(server, 0x1, payload), daemon=True
+    )
+    thread.start()
+    try:
+        client.settimeout(5)
+        assert recv_frame(client).payload == payload
+    finally:
+        thread.join(timeout=5)
+        client.close()
+        server.close()

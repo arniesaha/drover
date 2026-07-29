@@ -23,6 +23,11 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # line.
 MAX_HANDSHAKE_HEAD_BYTES = 65536
 
+# Largest frame we will read. Generous by two orders of magnitude for what
+# actually crosses these sockets: JSON control frames, and PTY chunks the
+# daemon caps at 8192 bytes.
+MAX_FRAME_BYTES = 1 << 20
+
 OPCODE_CONTINUATION = 0x0
 OPCODE_TEXT = 0x1
 OPCODE_CLOSE = 0x8
@@ -91,6 +96,17 @@ def recv_frame(sock: socket.socket) -> WebSocketFrame:
         length = struct.unpack("!H", _recv_exact(sock, 2))[0]
     elif length == 127:
         length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    if length > MAX_FRAME_BYTES:
+        # A 64-bit length field taken on trust is an allocation primitive:
+        # _recv_exact grows a bytearray until satisfied, so a peer announcing
+        # a multi-gigabyte frame exhausts hub memory, and one that announces
+        # it and then dribbles holds a thread and a growing buffer. Relevant
+        # now that the hub is on a public funnel where the shared token is the
+        # only gate. Close rather than skip: we cannot resynchronize a stream
+        # without consuming the payload we just refused to read.
+        raise WebSocketClosed(
+            f"websocket frame of {length} bytes exceeds {MAX_FRAME_BYTES}"
+        )
     mask = _recv_exact(sock, 4) if masked else b""
     payload = _recv_exact(sock, length) if length else b""
     if masked:
