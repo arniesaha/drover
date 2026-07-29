@@ -38,28 +38,34 @@ hub's requests reach the harness daemon*:
 
 ## The three host shapes
 
-All three are enrolled with the same script:
+`scripts/enroll-host.sh` enrolls **relay hosts only** (`--relay`). Direct hosts
+use the pre-existing launchd/systemd units — see below for why.
+
+Before running it on a fresh clone:
 
 ```bash
-./scripts/enroll-host.sh --host-id <id> --central-url <url> [--relay]
+cd <repo> && uv sync     # creates .venv/bin/drover-harnessd, which the plist runs
 ```
 
-It validates the fleet API token against `<central-url>/harness/hosts`
-*before* touching launchd, renders
+The script refuses rather than installing anything if that binary is missing,
+if the token is wrong, or if the hub turns out not to be gating requests at
+all. Only once all three pass does it render
 `scripts/launchd/com.drover.harnessd-relay.plist.template` into
-`~/Library/LaunchAgents/com.drover.harnessd.plist`, and loads it.
+`~/Library/LaunchAgents/com.drover.harnessd.plist` and load it.
 
 ### 1. Mac direct (hub-local or LAN-adjacent Mac)
 
-Reachable by the hub over LAN/tailnet; no `--relay`.
+Reachable by the hub over LAN/tailnet. **Not enrollable with
+`enroll-host.sh`** — the plist it renders listens on `127.0.0.1:7081` and
+advertises no `--local-url`, so the hub would have no URL to dial and every
+request would return `harness host has no reachable endpoint`. The script
+refuses without `--relay` for exactly this reason.
 
-```bash
-./scripts/enroll-host.sh --host-id mac-mini-2 --central-url http://mini.local:7080
-```
-
-Installs `~/Library/LaunchAgents/com.drover.harnessd.plist` (see
-`scripts/launchd/README-nexus-server.md` for the equivalent hub-side
-`launchctl load`/`unload`/log-tail pattern this template follows).
+Use the existing launchd unit shape instead (see
+`scripts/launchd/README-nexus-server.md` for the hub-side
+`launchctl load`/`unload`/log-tail pattern), passing `--listen` on a
+LAN-reachable address and a matching `--local-url`. Teaching the script the
+direct shape is tracked work, not something to improvise at enroll time.
 
 ### 2. NAS direct (systemd host)
 
@@ -102,6 +108,7 @@ Not inbound-reachable — dials out through `--relay` to the hub's public
 Tailscale Funnel URL:
 
 ```bash
+cd <repo> && uv sync   # the plist runs .venv/bin/drover-harnessd by absolute path
 ./scripts/enroll-host.sh --host-id work-laptop --central-url https://mini.tailnet.ts.net --relay
 ```
 
@@ -128,14 +135,45 @@ The hub's metrics/API port (`7080`) is what needs to be reachable from the
 public internet for relay hosts to dial in and for the iOS app to work off
 the tailnet (e.g. on cellular).
 
+**Do these in order. Step 1 is not optional.**
+
+1. **Prove auth is actually on, before anything is public.** The funnel makes
+   `/harness/*` — including `/harness/relay` and terminal attach — reachable
+   from the whole internet, and the bearer token is the only gate. If the
+   hub's config has auth disabled, every one of those endpoints is world
+   writable the instant the funnel comes up.
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7080/harness/hosts
+   # must print 401 (or 403). A 200 means auth is OFF -- fix that first.
+   ```
+
+   `enroll-host.sh` runs this same check and refuses to enroll a host against
+   an ungated hub, but the funnel can go up without it, so check here too.
+
+2. **Turn the hub's :7080 into a public HTTPS URL.**
+
+   ```bash
+   tailscale funnel --bg 7080
+   ```
+
+3. **Read back the assigned URL and confirm it is live.**
+
+   ```bash
+   tailscale funnel status
+   ```
+
+4. **Re-run the bare check against the public URL**, since that is the surface
+   that actually matters:
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' https://<machine>.<tailnet>.ts.net/harness/hosts
+   # must print 401 (or 403)
+   ```
+
+To take it back down:
+
 ```bash
-# Turn the hub's :7080 into a public HTTPS URL
-tailscale funnel --bg 7080
-
-# See the assigned public URL and current funnel state
-tailscale funnel status
-
-# Turn it off
 tailscale funnel --https=443 off
 ```
 
