@@ -6,16 +6,24 @@ host over that single socket, so many hub threads share one connection: each
 connection therefore owns a write lock (all outbound frames hold it), a
 pending-request table for req/res correlation, and a channel table for
 terminal streams.
+
+Every acquisition of that write lock is bounded. A blocking ``sendall`` to a
+peer that has stopped draining never returns on its own, so an unbounded
+acquire would let one wedged writer swallow every caller's timeout and stall
+the reader along with them.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
 import socket
 import threading
+import time
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 from drover.server.harness.relay_protocol import (
@@ -40,15 +48,32 @@ from drover.server.harness.websocket import (
 log = logging.getLogger("drover.relay")
 
 PING_INTERVAL_S = 20.0
+# Budget for grabbing the write lock when the caller has no deadline of its own.
+WRITE_TIMEOUT_S = 10.0
+# The reader's budget. It skips the pong rather than stall: a dropped pong is
+# harmless, a stalled reader is not - it would sit on frames already buffered.
+PONG_WRITE_TIMEOUT_S = 0.5
+# Best effort only; closing a channel must never hang on a busy write path.
+CLOSE_WRITE_TIMEOUT_S = 1.0
+# Per-channel inbound backlog before the oldest messages are dropped.
+CHANNEL_QUEUE_MAX = 1024
 
 
 class RelayUnavailable(RuntimeError):
     """No live relay connection can satisfy this call."""
 
 
+class _WriteTimeout(RuntimeError):
+    """The connection's write path did not free up in time (internal)."""
+
+
 def _error(message: str) -> tuple[int, str]:
     """Mirror ``_proxy_harness_request``'s error convention."""
     return 502, json.dumps({"error": message}, sort_keys=True) + "\n"
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
 
 
 class RelayChannel:
@@ -57,7 +82,10 @@ class RelayChannel:
     def __init__(self, connection: "_Connection", chan: str) -> None:
         self.chan = chan
         self._connection = connection
-        self._incoming: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._incoming: queue.Queue[dict[str, Any] | None] = queue.Queue(
+            maxsize=CHANNEL_QUEUE_MAX
+        )
+        self._dropped = 0
         self._closed = threading.Event()
         self._close_lock = threading.Lock()
 
@@ -65,13 +93,19 @@ class RelayChannel:
     def closed(self) -> bool:
         return self._closed.is_set()
 
-    def send(self, message: dict[str, Any]) -> None:
+    def send(self, message: dict[str, Any], timeout_s: float = WRITE_TIMEOUT_S) -> None:
         if self._closed.is_set():
             raise RelayUnavailable(f"relay channel closed: {self.chan}")
-        if not self._connection.alive.is_set():
-            raise RelayUnavailable(f"relay connection lost: {self._connection.host_id}")
+        connection = self._connection
+        if not connection.alive.is_set():
+            raise RelayUnavailable(f"relay connection lost: {connection.host_id}")
         try:
-            self._connection.send(data_frame(self.chan, message))
+            connection.send(data_frame(self.chan, message), timeout_s=timeout_s)
+        except _WriteTimeout as exc:
+            # The write path is wedged mid-frame; this connection can never
+            # resume cleanly, so drop it rather than leave a zombie behind.
+            connection.teardown(str(exc))
+            raise RelayUnavailable(str(exc)) from exc
         except (OSError, WebSocketClosed) as exc:
             raise RelayUnavailable(f"relay channel send failed: {exc}") from exc
 
@@ -90,9 +124,34 @@ class RelayChannel:
         connection.forget_channel(self.chan)
         if connection.alive.is_set():
             try:
-                connection.send(close_frame(self.chan))
-            except (OSError, WebSocketClosed) as exc:
+                connection.send(close_frame(self.chan), timeout_s=CLOSE_WRITE_TIMEOUT_S)
+            except (OSError, WebSocketClosed, _WriteTimeout) as exc:
                 log.debug("relay close frame for %s failed: %s", self.chan, exc)
+
+    def _offer(self, item: dict[str, Any] | None) -> None:
+        """Enqueue inbound data, dropping the oldest message when full.
+
+        Terminal streams are bursty and a stalled consumer must not grow the
+        hub without bound. Dropping the oldest (rather than closing the
+        channel) keeps a working session alive through a transient burst and
+        leaves the newest output - the current screen state - intact.
+        """
+        while True:
+            try:
+                self._incoming.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self._incoming.get_nowait()
+                except queue.Empty:  # pragma: no cover - drained concurrently
+                    pass
+                self._dropped += 1
+                if self._dropped == 1 or self._dropped % 1000 == 0:
+                    log.warning(
+                        "relay channel %s dropped %d message(s): consumer behind",
+                        self.chan,
+                        self._dropped,
+                    )
 
     def _mark_closed(self) -> bool:
         """Flip to closed exactly once; wake a blocked ``recv``."""
@@ -100,14 +159,15 @@ class RelayChannel:
             if self._closed.is_set():
                 return False
             self._closed.set()
-        self._incoming.put(None)
+        self._offer(None)
         return True
 
 
 class _Connection:
     """One live relay websocket plus everything multiplexed over it."""
 
-    def __init__(self, host_id: str, sock: socket.socket) -> None:
+    def __init__(self, manager: "RelayManager", host_id: str, sock: socket.socket):
+        self.manager = manager
         self.host_id = host_id
         self.sock = sock
         self.write_lock = threading.Lock()
@@ -120,9 +180,28 @@ class _Connection:
         # still wake immediately on teardown.
         self.dead = threading.Event()
 
-    def send(self, payload: dict[str, Any]) -> None:
-        with self.write_lock:
+    @contextlib.contextmanager
+    def write_access(self, timeout_s: float) -> Iterator[None]:
+        """Hold the write lock, or give up. Never blocks forever."""
+        if not self.write_lock.acquire(timeout=max(timeout_s, 0.0)):
+            raise _WriteTimeout(f"relay write path wedged for {self.host_id}")
+        try:
+            yield
+        finally:
+            self.write_lock.release()
+
+    def send(self, payload: dict[str, Any], timeout_s: float = WRITE_TIMEOUT_S) -> None:
+        with self.write_access(timeout_s):
             send_json(self.sock, payload)
+
+    def send_control(
+        self, opcode: int, payload: bytes = b"", timeout_s: float = WRITE_TIMEOUT_S
+    ) -> None:
+        with self.write_access(timeout_s):
+            send_frame(self.sock, opcode, payload)
+
+    def teardown(self, reason: str) -> None:
+        self.manager._teardown(self, reason)
 
     def register(self, key: str, waiter: queue.Queue[Any]) -> bool:
         with self.state_lock:
@@ -176,7 +255,7 @@ class RelayManager:
         Newest wins: a reconnecting spoke must never be blocked by its own
         zombie connection, so any prior connection is torn down.
         """
-        connection = _Connection(host_id, sock)
+        connection = _Connection(self, host_id, sock)
         with self._lock:
             previous = self._connections.get(host_id)
             self._connections[host_id] = connection
@@ -214,6 +293,7 @@ class RelayManager:
         body: dict[str, Any] | None,
         timeout_s: float = 15,
     ) -> tuple[int, str]:
+        deadline = time.monotonic() + timeout_s
         connection = self._live(host_id)
         if connection is None:
             return _error(f"relay host not connected: {host_id}")
@@ -222,13 +302,20 @@ class RelayManager:
         if not connection.register(request_id, waiter):
             return _error(f"relay host not connected: {host_id}")
         try:
-            connection.send(req_frame(request_id, method, path, body))
+            connection.send(
+                req_frame(request_id, method, path, body),
+                timeout_s=_remaining(deadline),
+            )
+        except _WriteTimeout as exc:
+            connection.forget(request_id)
+            self._teardown(connection, str(exc))
+            return _error(f"{exc}; connection dropped")
         except (OSError, WebSocketClosed) as exc:
             connection.forget(request_id)
             self._teardown(connection, f"request send failed: {exc}")
             return _error(f"relay request failed: {exc}")
         try:
-            return waiter.get(timeout=timeout_s)
+            return waiter.get(timeout=_remaining(deadline))
         except queue.Empty:
             connection.forget(request_id)
             return _error(f"relay request to {host_id} timed out after {timeout_s}s")
@@ -238,6 +325,7 @@ class RelayManager:
     def open_channel(
         self, host_id: str, path: str, timeout_s: float = 10
     ) -> RelayChannel:
+        deadline = time.monotonic() + timeout_s
         connection = self._live(host_id)
         if connection is None:
             raise RelayUnavailable(f"relay host not connected: {host_id}")
@@ -252,14 +340,19 @@ class RelayManager:
             connection.forget(key)
             raise RelayUnavailable(f"relay connection lost: {host_id}")
         try:
-            connection.send(open_frame(chan, path))
+            connection.send(open_frame(chan, path), timeout_s=_remaining(deadline))
+        except _WriteTimeout as exc:
+            connection.forget(key)
+            connection.forget_channel(chan)
+            self._teardown(connection, str(exc))
+            raise RelayUnavailable(f"{exc}; connection dropped") from exc
         except (OSError, WebSocketClosed) as exc:
             connection.forget(key)
             connection.forget_channel(chan)
             self._teardown(connection, f"channel open send failed: {exc}")
             raise RelayUnavailable(f"relay channel open failed: {exc}") from exc
         try:
-            kind, detail = waiter.get(timeout=timeout_s)
+            kind, detail = waiter.get(timeout=_remaining(deadline))
         except queue.Empty:
             connection.forget(key)
             connection.forget_channel(chan)
@@ -303,10 +396,7 @@ class RelayManager:
             if frame.opcode == OPCODE_CLOSE:
                 raise WebSocketClosed()
             if frame.opcode == OPCODE_PING:
-                # Same behaviour as ``recv_json``, but the pong takes the
-                # write lock: hub threads share this socket.
-                with connection.write_lock:
-                    send_frame(connection.sock, OPCODE_PONG, frame.payload)
+                self._pong(connection, frame.payload)
                 continue
             if frame.opcode != OPCODE_TEXT:
                 continue  # pongs and anything else we do not speak
@@ -314,6 +404,23 @@ class RelayManager:
             if not isinstance(payload, dict):
                 continue
             self._dispatch(connection, parse_frame(payload))
+
+    def _pong(self, connection: _Connection, payload: bytes) -> None:
+        """Answer a ping under the write lock, but never wait long for it.
+
+        The pong must hold the lock - hub threads share this socket, and pong
+        bytes landing mid-frame desync the stream. It must also never block
+        the reader, which would leave already-buffered ``res`` frames
+        undispatched while the write path is busy.
+        """
+        try:
+            connection.send_control(
+                OPCODE_PONG, payload, timeout_s=PONG_WRITE_TIMEOUT_S
+            )
+        except _WriteTimeout:
+            log.warning(
+                "relay pong for %s dropped: write path busy", connection.host_id
+            )
 
     def _dispatch(self, connection: _Connection, frame: dict[str, Any]) -> None:
         kind = frame["kind"]
@@ -327,7 +434,7 @@ class RelayManager:
         elif kind == "data":
             channel = connection.get_channel(str(frame.get("chan")))
             if channel is not None and not channel.closed:
-                channel._incoming.put(frame.get("message"))
+                channel._offer(frame.get("message"))
         elif kind == "opened":
             connection.resolve(f"open:{frame.get('chan')}", ("opened", None))
         elif kind == "open_error":
@@ -349,8 +456,10 @@ class RelayManager:
         """Turn a silently-dead TCP path into a detected disconnect."""
         while not connection.dead.wait(PING_INTERVAL_S):
             try:
-                with connection.write_lock:
-                    send_frame(connection.sock, OPCODE_PING, b"hb")
+                connection.send_control(OPCODE_PING, b"hb")
+            except _WriteTimeout as exc:
+                self._teardown(connection, str(exc))
+                return
             except (OSError, WebSocketClosed) as exc:
                 self._teardown(connection, f"ping failed: {exc}")
                 return
@@ -371,6 +480,8 @@ class RelayManager:
         with self._lock:
             if self._connections.get(connection.host_id) is connection:
                 del self._connections[connection.host_id]
+        # shutdown() before close() so a thread wedged in sendall is released
+        # rather than leaked holding the write lock forever.
         try:
             connection.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
