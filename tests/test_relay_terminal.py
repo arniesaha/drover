@@ -35,6 +35,7 @@ class _MetricsServerWithRelayHost:
     collector: MetricsCollector
     server: object
     spoke_sock: socket.socket
+    duckdb_path: object
 
 
 def _spoke_recv(sock: socket.socket) -> dict:
@@ -103,6 +104,7 @@ def metrics_server_with_relay_host(tmp_path):
             collector=collector,
             server=server,
             spoke_sock=spoke,
+            duckdb_path=duckdb_path,
         )
     finally:
         spoke.close()
@@ -111,28 +113,52 @@ def metrics_server_with_relay_host(tmp_path):
 
 
 def test_terminal_attach_bridges_over_relay(metrics_server_with_relay_host):
-    env = metrics_server_with_relay_host  # server + connected fake spoke + session "s1" on host "laptop"
+    # env: server + connected fake spoke + session "s1" on host "laptop".
+    env = metrics_server_with_relay_host
     spoke = env.spoke_sock
+    errors: list[BaseException] = []
 
     def spoke_loop() -> None:
-        # harness_terminal_route reconciles "created"/"starting"/"running"
-        # sessions against the host before handing back a route -- for a
-        # relay-connected host that reconcile GET rides the same socket, so
-        # the fake spoke must answer it before the terminal "open" frame.
-        reconcile = _spoke_recv(spoke)
-        assert reconcile["kind"] == "req"
-        assert reconcile["method"] == "GET"
-        assert reconcile["path"] == "/sessions/s1"
-        client_send_json(spoke, res_frame(reconcile["id"], 200, "{}"))
+        try:
+            # harness_terminal_route reconciles "created"/"starting"/"running"
+            # sessions against the host before handing back a route -- for a
+            # relay-connected host that reconcile GET rides the same socket,
+            # so the fake spoke must answer it before the terminal "open"
+            # frame.
+            reconcile = _spoke_recv(spoke)
+            assert reconcile["kind"] == "req"
+            assert reconcile["method"] == "GET"
+            assert reconcile["path"] == "/sessions/s1"
+            client_send_json(spoke, res_frame(reconcile["id"], 200, "{}"))
 
-        frame = _spoke_recv(spoke)
-        assert frame["kind"] == "open"
-        assert frame["path"] == "/sessions/s1/terminal"
-        chan = frame["chan"]
-        client_send_json(spoke, opened_frame(chan))
-        client_send_json(spoke, data_frame(chan, {"type": "output", "data": "$ "}))
-        echo = _spoke_recv(spoke)
-        assert echo["message"] == {"type": "stdin", "data": "ls\n"}
+            frame = _spoke_recv(spoke)
+            assert frame["kind"] == "open"
+            assert frame["path"] == "/sessions/s1/terminal"
+            chan = frame["chan"]
+            client_send_json(spoke, opened_frame(chan))
+            client_send_json(spoke, data_frame(chan, {"type": "output", "data": "$ "}))
+            # A PTY event frame, same shape the daemon's terminal loop sends
+            # over a direct connection -- proves the relay flow mirrors it
+            # into the hub's own event log via _mirror_harness_event_message.
+            client_send_json(
+                spoke,
+                data_frame(
+                    chan,
+                    {
+                        "type": "event",
+                        "event": {
+                            "event_id": "evt-relay-1",
+                            "event_type": "terminal.output",
+                            "payload": {"data": "$ "},
+                        },
+                    },
+                ),
+            )
+            echo = _spoke_recv(spoke)
+            assert echo["message"] == {"type": "stdin", "data": "ls\n"}
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            raise
 
     thread = threading.Thread(target=spoke_loop, daemon=True)
     thread.start()
@@ -150,8 +176,25 @@ def test_terminal_attach_bridges_over_relay(metrics_server_with_relay_host):
         while first is None:
             first = client_recv_json(app)
         assert first == {"type": "output", "data": "$ "}
+        second = None
+        while second is None:
+            second = client_recv_json(app)
+        assert second == {
+            "type": "event",
+            "event": {
+                "event_id": "evt-relay-1",
+                "event_type": "terminal.output",
+                "payload": {"data": "$ "},
+            },
+        }
         client_send_json(app, {"type": "stdin", "data": "ls\n"})
         thread.join(timeout=5)
         assert not thread.is_alive()
+        assert not errors, f"spoke_loop raised: {errors}"
     finally:
         app.close()
+
+    mirrored = HarnessRegistry(env.duckdb_path).get_event("evt-relay-1")
+    assert mirrored is not None
+    assert mirrored.event_type == "terminal.output"
+    assert mirrored.payload == {"data": "$ "}

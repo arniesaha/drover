@@ -27,6 +27,7 @@ from drover.server.harness.websocket import (
     client_send_json,
     recv_frame,
     recv_json,
+    send_close,
     send_frame,
     send_json,
 )
@@ -566,44 +567,50 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
 
-        browser = self._upgrade_browser_websocket()
-        if browser is None:
+        try:
+            browser = self._upgrade_browser_websocket()
+            if browser is None:
+                return
+
+            stop = threading.Event()
+            browser.settimeout(0.25)
+
+            def browser_to_channel() -> None:
+                try:
+                    while not stop.is_set():
+                        try:
+                            message = recv_json(browser)
+                        except socket.timeout:
+                            continue
+                        if message is not None:
+                            channel.send(message)
+                except Exception:
+                    stop.set()
+
+            def channel_to_browser() -> None:
+                try:
+                    while not stop.is_set():
+                        message = channel.recv(timeout_s=0.25)
+                        if message is None:
+                            if channel.closed:
+                                stop.set()
+                                try:
+                                    send_close(browser)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                return
+                            continue
+                        self._mirror_harness_event_message(session_id, message)
+                        send_json(browser, message)
+                except Exception:
+                    stop.set()
+
+            thread = threading.Thread(target=browser_to_channel, daemon=True)
+            thread.start()
+            channel_to_browser()
+            stop.set()
+        finally:
             channel.close()
-            return
-
-        stop = threading.Event()
-        browser.settimeout(0.25)
-
-        def browser_to_channel() -> None:
-            try:
-                while not stop.is_set():
-                    try:
-                        message = recv_json(browser)
-                    except socket.timeout:
-                        continue
-                    if message is not None:
-                        channel.send(message)
-            except Exception:
-                stop.set()
-
-        def channel_to_browser() -> None:
-            try:
-                while not stop.is_set():
-                    message = channel.recv(timeout_s=0.25)
-                    if message is None:
-                        if channel.closed:
-                            stop.set()
-                            return
-                        continue
-                    send_json(browser, message)
-            except Exception:
-                stop.set()
-
-        thread = threading.Thread(target=browser_to_channel, daemon=True)
-        thread.start()
-        channel_to_browser()
-        stop.set()
-        channel.close()
 
     def _upgrade_browser_websocket(self) -> socket.socket | None:
         """Send the browser-side 101 upgrade and hijack the connection.
@@ -758,14 +765,27 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             pass
 
     def _mirror_harness_event_frame(self, session_id: str, frame) -> None:
-        from drover.server.metrics import _optional_str, _parse_event_timestamp
-
         if frame.opcode != OPCODE_TEXT:
             return
         try:
             message = json.loads(frame.payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return
+        self._mirror_harness_event_message(session_id, message)
+
+    def _mirror_harness_event_message(self, session_id: str, message: object) -> None:
+        """Persist a parsed harness terminal event message into the hub log.
+
+        Shared by both terminal-proxy flavors: the direct flow decodes a raw
+        websocket frame first (`_mirror_harness_event_frame`, above) and
+        delegates here; the relay flow already has a parsed dict (from
+        `RelayChannel.recv()`) and calls this directly. This is the sole
+        delivery path for PTY terminal events into the hub's own DuckDB
+        event log -- the daemon's local registry write never reaches the
+        hub on its own.
+        """
+        from drover.server.metrics import _optional_str, _parse_event_timestamp
+
         if not isinstance(message, dict) or message.get("type") != "event":
             return
         event = message.get("event")
