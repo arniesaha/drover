@@ -18,6 +18,7 @@ from drover.server.harness.daemon import (
 )
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness import relay_client
 from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.relay_protocol import open_frame, req_frame
 from drover.server.harness.websocket import recv_json, send_json
@@ -75,9 +76,7 @@ def test_req_frame_dispatches_to_loopback_and_answers(harnessd_server):
     )
     thread.start()
     send_json(hub_side, req_frame("r1", "GET", "/sessions", None))
-    frame = None
-    while frame is None or frame.get("kind") != "res":
-        frame = recv_json(hub_side)
+    frame = _wait_for(hub_side, {"res"})
     assert frame["id"] == "r1"
     assert frame["status"] == 200
     assert "sessions" in json.loads(frame["body"])
@@ -96,16 +95,10 @@ def test_req_frame_loopback_failure_is_502_not_crash(harnessd_server):
         target=client.serve_connection, args=(spoke_side,), daemon=True
     ).start()
     send_json(hub_side, req_frame("r1", "GET", "/sessions", None))
-    frame = None
-    while frame is None or frame.get("kind") != "res":
-        frame = recv_json(hub_side)
-    assert frame["status"] == 502
+    assert _wait_for(hub_side, {"res"})["status"] == 502
     # loop must still be alive: a second request also answers
     send_json(hub_side, req_frame("r2", "GET", "/sessions", None))
-    frame = None
-    while frame is None or frame.get("kind") != "res":
-        frame = recv_json(hub_side)
-    assert frame["id"] == "r2"
+    assert _wait_for(hub_side, {"res"})["id"] == "r2"
     hub_side.close()
 
 
@@ -121,9 +114,7 @@ def test_open_frame_against_missing_session_reports_open_error(harnessd_server):
         target=client.serve_connection, args=(spoke_side,), daemon=True
     ).start()
     send_json(hub_side, open_frame("c1", "/sessions/nope/terminal"))
-    frame = None
-    while frame is None or frame.get("kind") not in {"opened", "open_error"}:
-        frame = recv_json(hub_side)
+    frame = _wait_for(hub_side, {"opened", "open_error"})
     assert frame["kind"] == "open_error"
     assert frame["chan"] == "c1"
     hub_side.close()
@@ -162,5 +153,105 @@ def test_channel_pumps_terminal_and_closes_when_the_session_dies(
     send_json(
         hub_side, req_frame("r2", "POST", f"/sessions/{session_id}/terminate", {})
     )
-    assert _wait_for(hub_side, {"close"})["chan"] == "c1"
+    # The res and the close race, so collect both. Checking the res as soon as
+    # it lands makes a failed terminate fail as itself rather than as a
+    # generic "timed out waiting for close".
+    seen: dict[str, dict] = {}
+    while len(seen) < 2:
+        frame = _wait_for(hub_side, {"res", "close"})
+        seen[frame["kind"]] = frame
+        if "res" in seen:
+            assert 200 <= seen["res"]["status"] < 300, seen["res"]["body"]
+    assert seen["close"]["chan"] == "c1"
     hub_side.close()
+
+
+class _StopAfter:
+    """Stand-in for ``RelayClient._stopped`` that records backoff delays."""
+
+    def __init__(self, sleeps: int) -> None:
+        self.limit = sleeps
+        self.delays: list[float] = []
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def wait(self, delay: float | None = None) -> bool:
+        self.delays.append(delay)
+        if len(self.delays) >= self.limit:
+            self._set = True
+        return self._set
+
+
+def _always_refuses(target):
+    raise OSError("connection refused")
+
+
+def test_backoff_grows_then_resets_after_a_stable_connection(monkeypatch):
+    monkeypatch.setattr(relay_client.random, "uniform", lambda low, high: 1.0)
+
+    client = RelayClient("http://127.0.0.1:9", "laptop", "test-token", 1)
+    monkeypatch.setattr(client, "_connect", _always_refuses)
+    recorder = _StopAfter(5)
+    client._stopped = recorder
+    client.run_forever()
+    assert recorder.delays == [1.0, 2.0, 4.0, 8.0, 16.0]
+
+    # A connection that counts as stable puts the next failure back at 1s.
+    monkeypatch.setattr(relay_client, "STABLE_CONNECTION_S", 0.0)
+    stable = RelayClient("http://127.0.0.1:9", "laptop", "test-token", 1)
+    monkeypatch.setattr(stable, "_connect", _always_refuses)
+    stable_recorder = _StopAfter(4)
+    stable._stopped = stable_recorder
+    stable.run_forever()
+    assert stable_recorder.delays == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_stop_during_a_dial_tears_down_the_late_connection(monkeypatch):
+    """stop() cannot see a connection that does not exist yet."""
+    monkeypatch.setattr(relay_client, "STOP_JOIN_TIMEOUT_S", 0.2)
+    hub_side, spoke_side = socket.socketpair()
+    client = RelayClient("http://127.0.0.1:9", "laptop", "test-token", 1)
+    dialing = threading.Event()
+    release = threading.Event()
+
+    def slow_connect(target):
+        dialing.set()
+        release.wait(10)
+        return spoke_side
+
+    monkeypatch.setattr(client, "_connect", slow_connect)
+    thread = client.start()
+    assert dialing.wait(5)
+    client.stop()
+    release.set()  # the dial completes *after* stop()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    # Served indefinitely would leave this socket open and silent.
+    hub_side.settimeout(5)
+    assert hub_side.recv(16) == b""
+    hub_side.close()
+
+
+def test_unsupported_relay_scheme_disables_the_client_instead_of_dialling():
+    """Guessing a scheme is how a Bearer token ends up on the wire in clear."""
+    dialed = []
+    for url in ("hub:8787", "127.0.0.1:8787", "ftp://hub.example", "https://"):
+        client = RelayClient(url, "laptop", "test-token", 1)
+        client._connect = lambda target: dialed.append(target)
+        client.run_forever()  # returns rather than looping forever
+    assert dialed == []
+
+
+def test_websocket_schemes_map_to_their_http_equivalents():
+    secure = relay_client._Target("wss://hub.example")
+    assert (secure.tls, secure.port) == (True, 443)
+    plain = relay_client._Target("ws://hub.example:8787")
+    assert (plain.tls, plain.port) == (False, 8787)
+    assert (
+        relay_client._Target("https://hub.example/base").path == "/base/harness/relay"
+    )

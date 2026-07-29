@@ -2485,21 +2485,25 @@ def run_harnessd(
     register_daemon_host(state)
     register_daemon_host_remote(state)
     start_remote_heartbeat(state)
-    relay_client: RelayClient | None = None
-    if relay:
-        if state.central_url and state.api_token:
-            relay_client = RelayClient(
-                state.central_url, state.host_id, state.api_token, listen_port
-            )
-            relay_client.start()
-        else:
-            # Serving locally is still useful; the hub just cannot reach us.
-            log.error("--relay ignored: it needs both --central-url and an API token")
     server = create_harness_server(
         listen_host=listen_host,
         listen_port=listen_port,
         state=state,
     )
+    # After create_harness_server, and on its *bound* port: announcing a live
+    # relay before the socket is bound gives the hub a window in which every
+    # proxied call 502s, and listen_port is 0 whenever the port is ephemeral.
+    # Binding is enough - connections queue in the backlog until serve_forever.
+    relay_client: RelayClient | None = None
+    if relay:
+        if state.central_url and state.api_token:
+            relay_client = RelayClient(
+                state.central_url, state.host_id, state.api_token, server.server_port
+            )
+            relay_client.start()
+        else:
+            # Serving locally is still useful; the hub just cannot reach us.
+            log.error("--relay ignored: it needs both --central-url and an API token")
     try:
         server.serve_forever()
     finally:

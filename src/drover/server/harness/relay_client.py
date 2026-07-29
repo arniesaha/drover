@@ -73,10 +73,49 @@ MAX_BACKOFF_S = 300.0
 # A connection that lasted this long counts as healthy: the next failure
 # starts backing off from zero again.
 STABLE_CONNECTION_S = 60.0
+# How long stop() waits for the client thread. Bounded because a dial already
+# in flight cannot be interrupted; the thread is a daemon, so a wedged dial
+# delays nothing at process exit.
+STOP_JOIN_TIMEOUT_S = 5.0
+
+# ws/wss are accepted as aliases so a websocket-looking URL does the right
+# thing rather than silently downgrading to plaintext port 80.
+_SCHEME_ALIASES = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class _WriteTimeout(RuntimeError):
     """The connection's write path did not free up in time (internal)."""
+
+
+class RelayConfigError(ValueError):
+    """The relay target is unusable no matter how many times we redial."""
+
+
+class _Target:
+    """A validated dial target parsed out of ``central_url``."""
+
+    def __init__(self, central_url: str) -> None:
+        parsed = urlparse(central_url)
+        raw_scheme = (parsed.scheme or "").lower()
+        scheme = _SCHEME_ALIASES.get(raw_scheme)
+        if scheme is None:
+            # Guessing here is how a Bearer token ends up on the wire in the
+            # clear: an unknown scheme used to mean "no TLS, port 80".
+            raise RelayConfigError(
+                f"unsupported relay URL scheme {raw_scheme or '(none)'!r} in "
+                f"{central_url!r}; expected one of "
+                f"{', '.join(sorted(_SCHEME_ALIASES))}"
+            )
+        host = parsed.hostname
+        if not host:
+            raise RelayConfigError(f"relay URL has no host: {central_url!r}")
+        self.scheme = scheme
+        self.host = host
+        self.port = parsed.port or _DEFAULT_PORTS[scheme]
+        self.netloc = parsed.netloc or f"{host}:{self.port}"
+        self.path = f"{(parsed.path or '').rstrip('/')}{RELAY_PATH}"
+        self.tls = scheme == "https"
 
 
 class _Channel:
@@ -205,17 +244,36 @@ class RelayClient:
         return thread
 
     def stop(self) -> None:
+        """Stop reconnecting and drop the live connection, if any.
+
+        A dial already in flight cannot be interrupted, so ``stop`` may return
+        while ``_connect`` is still blocked in ``create_connection``. That is
+        why ``serve_connection`` re-checks ``_stopped``: a connection that
+        completes *after* this call must be torn down, not served.
+        """
         self._stopped.set()
         connection = self._conn
         if connection is not None:
             self._teardown(connection, "relay client stopping")
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=STOP_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                log.debug("relay client thread still winding down after stop()")
 
     def run_forever(self) -> None:
+        try:
+            target = _Target(self.central_url)
+        except RelayConfigError as exc:
+            # Redialling cannot fix a typo. Mirrors run_harnessd's handling of
+            # --relay without a token: log loudly, keep serving locally.
+            log.error("relay disabled: %s", exc)
+            return
         attempt = 0
         while not self._stopped.is_set():
             started = time.monotonic()
             try:
-                sock = self._connect()
+                sock = self._connect(target)
             except Exception as exc:  # noqa: BLE001 - any dial failure retries
                 self._log_failure(f"relay connect to {self.central_url} failed", exc)
             else:
@@ -238,28 +296,24 @@ class RelayClient:
         self._logged_failure = True
         log.warning("%s: %s", message, exc)
 
-    def _connect(self) -> socket.socket:
-        parsed = urlparse(self.central_url)
-        scheme = (parsed.scheme or "https").lower()
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or (443 if scheme == "https" else 80)
-        netloc = parsed.netloc or f"{host}:{port}"
-        raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
+    def _connect(self, target: _Target) -> socket.socket:
+        raw = socket.create_connection(
+            (target.host, target.port), timeout=CONNECT_TIMEOUT_S
+        )
         sock = raw
-        if scheme == "https":
+        if target.tls:
             try:
                 sock = ssl.create_default_context().wrap_socket(
-                    raw, server_hostname=host
+                    raw, server_hostname=target.host
                 )
             except Exception:
                 raw.close()
                 raise
         try:
-            base_path = (parsed.path or "").rstrip("/")
             client_handshake(
                 sock,
-                host=netloc,
-                path=f"{base_path}{RELAY_PATH}",
+                host=target.netloc,
+                path=target.path,
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             client_send_json(sock, hello_frame(self.host_id))
@@ -281,6 +335,12 @@ class RelayClient:
             sock.settimeout(READ_TIMEOUT_S)
         connection = _Conn(sock)
         self._conn = connection
+        if self._stopped.is_set():
+            # stop() ran while this connection was still being dialled, so it
+            # never saw it in _conn. Serving it now would outlive the daemon.
+            self._teardown(connection, "relay client stopped during connect")
+            self._conn = None
+            return
         try:
             self._read_loop(connection)
         except (
@@ -347,7 +407,10 @@ class RelayClient:
         try:
             connection.send(payload)
         except _WriteTimeout as exc:
-            # Wedged mid-frame: this stream can never resync, so drop it.
+            # Lock-acquisition timeout: our frame never started, so the stream
+            # is still in sync. We drop the connection anyway - 10s of not
+            # getting the lock means another writer is stuck in sendall, which
+            # means the peer stopped draining, which means it is gone.
             self._teardown(connection, str(exc))
         except (OSError, WebSocketClosed) as exc:
             self._teardown(connection, f"relay send failed: {exc}")
@@ -479,6 +542,10 @@ class RelayClient:
         try:
             connection.send(close_frame(channel.chan), timeout_s=CLOSE_WRITE_TIMEOUT_S)
         except (OSError, WebSocketClosed, _WriteTimeout) as exc:
+            # Deliberately does NOT tear the connection down, unlike _send.
+            # This budget is 1s, not 10s: losing a race for the lock that
+            # briefly is normal on a busy write path and says nothing about
+            # the peer. A genuinely dead socket is the reader's to notice.
             log.debug("relay close frame for %s failed: %s", channel.chan, exc)
 
     # -- teardown ------------------------------------------------------
