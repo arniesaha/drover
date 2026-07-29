@@ -62,6 +62,7 @@ def run_harnessd_from_options(
     tailscale_url: str | None,
     central_url: str | None,
     host_token: str | None,
+    relay: bool = False,
 ) -> None:
     cfg = resolve_config(config_path)
     bootstrap_harnessd_schema(cfg)
@@ -78,6 +79,7 @@ def run_harnessd_from_options(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
+        relay=relay,
     )
 
 
@@ -106,6 +108,12 @@ def run_harnessd_from_options(
         "then ~/.drover/api_token)"
     ),
 )
+@click.option(
+    "--relay",
+    is_flag=True,
+    default=False,
+    help="Dial out to --central-url instead of relying on inbound reachability",
+)
 def main(
     config_path: str | None,
     verbose: bool,
@@ -117,6 +125,7 @@ def main(
     tailscale_url: str | None,
     central_url: str | None,
     host_token: str | None,
+    relay: bool,
 ) -> None:
     """Run the Meta Harness host daemon without loading full drover-server."""
     logging.basicConfig(
@@ -134,6 +143,7 @@ def main(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
+        relay=relay,
     )
 
 

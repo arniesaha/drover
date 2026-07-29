@@ -238,6 +238,7 @@ def test_skinny_harnessd_entrypoint_documents_core_options():
     assert "--tailscale-url" in result.output
     assert "--central-url" in result.output
     assert "--host-token" in result.output
+    assert "--relay" in result.output
 
 
 def test_daemon_can_register_host_with_central_server(tmp_path):
@@ -271,6 +272,7 @@ def test_daemon_can_register_host_with_central_server(tmp_path):
             "authorization": "Bearer secret",
             "body": {
                 "capabilities": state.capabilities(),
+                "connection_kind": "direct",
                 "display_name": "NAS",
                 "host_id": "nas",
                 "kind": "linux",
@@ -280,6 +282,34 @@ def test_daemon_can_register_host_with_central_server(tmp_path):
             },
         }
     ]
+
+
+def test_relay_daemon_registers_itself_as_relay_connected(tmp_path):
+    central = ThreadingHTTPServer(("127.0.0.1", 0), _CentralRegistrationHandler)
+    _CentralRegistrationHandler.payloads = []
+    thread = threading.Thread(target=central.serve_forever, daemon=True)
+    thread.start()
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    state = HarnessDaemonState(
+        host_id="laptop",
+        display_name="Laptop",
+        kind="mac",
+        registry=HarnessRegistry(duckdb_path),
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        central_url=f"http://127.0.0.1:{central.server_address[1]}",
+        host_token="secret",
+        relay=True,
+    )
+
+    try:
+        assert register_daemon_host_remote(state) is True
+    finally:
+        central.shutdown()
+        central.server_close()
+
+    assert _CentralRegistrationHandler.payloads[0]["body"]["connection_kind"] == "relay"
 
 
 def test_wire_event_pusher_pushes_structured_events_to_central(tmp_path):

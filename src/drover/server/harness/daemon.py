@@ -36,6 +36,7 @@ from drover.server.harness.auth import (
 )
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.structured import claude as _structured_claude
 from drover.server.harness.structured import codex as _structured_codex
 from drover.server.harness.structured import gemini as _structured_gemini
@@ -1106,6 +1107,9 @@ class HarnessDaemonState:
     central_url: str | None = None
     host_token: str | None = None
     api_token: str = ""
+    # True when this daemon dials the hub instead of waiting to be dialled;
+    # visible here so the registration payload can advertise which it is.
+    relay: bool = False
     terminated_session_ids: set[str] = field(default_factory=set)
     worktrees_dir: Path = field(
         default_factory=lambda: Path.home() / ".drover" / "worktrees"
@@ -2371,6 +2375,7 @@ def register_daemon_host_remote(state: HarnessDaemonState) -> bool:
         "local_url": state.local_url,
         "tailscale_url": state.tailscale_url,
         "status": "online",
+        "connection_kind": "relay" if state.relay else "direct",
         "capabilities": state.capabilities(),
     }
     return _post_central_json(state, "/harness/hosts", payload)
@@ -2455,6 +2460,7 @@ def run_harnessd(
     tailscale_url: str | None = None,
     central_url: str | None = None,
     host_token: str | None = None,
+    relay: bool = False,
 ) -> None:
     state = HarnessDaemonState(
         host_id=host_id,
@@ -2467,6 +2473,7 @@ def run_harnessd(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
+        relay=relay,
     )
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token
@@ -2478,6 +2485,16 @@ def run_harnessd(
     register_daemon_host(state)
     register_daemon_host_remote(state)
     start_remote_heartbeat(state)
+    relay_client: RelayClient | None = None
+    if relay:
+        if state.central_url and state.api_token:
+            relay_client = RelayClient(
+                state.central_url, state.host_id, state.api_token, listen_port
+            )
+            relay_client.start()
+        else:
+            # Serving locally is still useful; the hub just cannot reach us.
+            log.error("--relay ignored: it needs both --central-url and an API token")
     server = create_harness_server(
         listen_host=listen_host,
         listen_port=listen_port,
@@ -2488,6 +2505,8 @@ def run_harnessd(
     finally:
         state.pty.close_all()
         state.auth.close_all()
+        if relay_client is not None:
+            relay_client.stop()
         if pusher is not None:
             pusher.stop()
         server.server_close()
