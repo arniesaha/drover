@@ -79,9 +79,7 @@ def test_register_host_persists_connection_kind(tmp_path):
 
 def test_register_host_defaults_connection_kind_direct(tmp_path):
     registry, _ = _registry(tmp_path)
-    host = registry.register_host(
-        host_id="mini", display_name="Mac Mini", kind="mac"
-    )
+    host = registry.register_host(host_id="mini", display_name="Mac Mini", kind="mac")
     assert host.connection_kind == "direct"
 
 
@@ -303,3 +301,87 @@ def test_concurrent_writes_across_registry_instances_are_serialized(tmp_path):
         # duplicate-seq rows still land (no unique constraint) -- the point
         # here is purely that no connect ever raised.
         assert len(events) == 50
+
+
+def _session_for_events(tmp_path):
+    registry, duckdb_path = _registry(tmp_path)
+    registry.register_host(host_id="laptop", display_name="Laptop", kind="mac")
+    registry.create_session(
+        session_id="s1",
+        host_id="laptop",
+        harness="shell",
+        command="/bin/sh",
+        status="running",
+    )
+    return registry, duckdb_path
+
+
+def _record(event_id, **overrides):
+    record = {
+        "event_id": event_id,
+        "session_id": "s1",
+        "event_type": "terminal.output",
+        "payload": {"data": event_id},
+        "normalized_type": None,
+        "normalized_source": None,
+        "content_preview": None,
+        "created_at": None,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_append_events_if_new_writes_a_batch_in_one_window(tmp_path):
+    """The terminal mirror's write path: many events, one connection."""
+    registry, _ = _session_for_events(tmp_path)
+    records = [_record(f"evt-{index}") for index in range(20)]
+
+    connects = {"count": 0}
+    real_connect = HarnessRegistry._connect
+
+    def counting_connect(self):
+        connects["count"] += 1
+        return real_connect(self)
+
+    HarnessRegistry._connect = counting_connect
+    try:
+        written = registry.append_events_if_new(records)
+    finally:
+        HarnessRegistry._connect = real_connect
+
+    assert written == 20
+    assert connects["count"] == 1, "batched write still opened one connection each"
+    assert len(registry.list_events("s1")) == 20
+
+
+def test_append_events_if_new_skips_ids_already_stored(tmp_path):
+    """Idempotency by event_id is what makes replaying a stream safe."""
+    registry, _ = _session_for_events(tmp_path)
+    assert registry.append_events_if_new([_record("evt-a"), _record("evt-b")]) == 2
+    # Same batch again, plus one genuinely new event.
+    written = registry.append_events_if_new(
+        [_record("evt-a"), _record("evt-b"), _record("evt-c")]
+    )
+    assert written == 1
+    assert {event.event_id for event in registry.list_events("s1")} == {
+        "evt-a",
+        "evt-b",
+        "evt-c",
+    }
+
+
+def test_append_events_if_new_dedupes_within_one_batch(tmp_path):
+    """A burst can carry the same event twice; the insert must not."""
+    registry, _ = _session_for_events(tmp_path)
+    written = registry.append_events_if_new(
+        [_record("evt-dup"), _record("evt-dup"), _record("evt-other")]
+    )
+    assert written == 2
+    assert len(registry.list_events("s1")) == 2
+
+
+def test_append_events_if_new_ignores_records_without_an_id(tmp_path):
+    registry, _ = _session_for_events(tmp_path)
+    assert registry.append_events_if_new([]) == 0
+    assert registry.append_events_if_new([_record(""), _record("  ")]) == 0
+    assert registry.list_events("s1") == []

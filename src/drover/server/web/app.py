@@ -6,9 +6,11 @@ is the thin HTTP shim around it.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timezone
 import json
 import logging
+import queue
 import socket
 import threading
 import time
@@ -48,6 +50,131 @@ if TYPE_CHECKING:
 log = logging.getLogger("drover.metrics")
 
 _PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login"}
+
+# Mirror records buffered for one relay terminal attach before the oldest are
+# dropped. Generous, because the worker below amortizes a whole backlog into a
+# single DuckDB window: filling this means the database has been unavailable
+# for a long time, not that a burst arrived.
+MIRROR_QUEUE_MAX = 2048
+# Cap on one batched write, so a huge backlog is drained in several bounded
+# windows rather than one that holds the connect lock for seconds.
+MIRROR_BATCH_MAX = 128
+
+
+def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
+    """Extract the mirrorable event out of a terminal message, or ``None``.
+
+    Pure and cheap on purpose: the relay drain thread runs this inline and
+    hands the result to a worker, so nothing that touches the database may
+    happen here.
+    """
+    from drover.server.metrics import _optional_str, _parse_event_timestamp
+
+    if not isinstance(message, dict) or message.get("type") != "event":
+        return None
+    event = message.get("event")
+    if not isinstance(event, dict):
+        return None
+    event_id = str(event.get("event_id") or "").strip()
+    event_type = str(event.get("event_type") or "").strip()
+    if not event_id or not event_type:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "event_id": event_id,
+        "session_id": session_id,
+        "event_type": event_type,
+        "payload": payload,
+        "normalized_type": _optional_str(event.get("normalized_type")),
+        "normalized_source": _optional_str(event.get("normalized_source")),
+        "content_preview": _optional_str(event.get("content_preview")),
+        "created_at": _parse_event_timestamp(event.get("created_at")),
+    }
+
+
+class _EventMirror:
+    """Batching, off-thread writer for one relay terminal attach's events.
+
+    Why this exists: the relay drain thread used to mirror inline, and every
+    mirror opened DuckDB connections under a process-wide per-path lock that
+    is contended with fleet renders and every host's event ingestion. At PTY
+    output rates the drain thread could not keep up, the channel's bounded
+    inbound queue overflowed, and it dropped the oldest messages -- silently
+    losing *terminal output the user was watching* in order to finish a
+    database write nobody was waiting on.
+
+    So the two are decoupled: the drain thread only parses and enqueues, and
+    this worker does the writing, batching whatever has piled up into one
+    connection window. If anything still has to be dropped it is now mirror
+    records rather than the terminal stream, and loudly.
+    """
+
+    def __init__(self, registry: HarnessRegistry) -> None:
+        self._registry = registry
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
+            maxsize=MIRROR_QUEUE_MAX
+        )
+        self._dropped = 0
+        self._thread = threading.Thread(
+            target=self._run, name="relay-event-mirror", daemon=True
+        )
+        self._thread.start()
+
+    def offer(self, record: dict[str, Any]) -> None:
+        """Never blocks: the caller is holding up a live terminal stream."""
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 1000 == 0:
+                log.warning(
+                    "harness event mirror dropped %d event(s): writer behind",
+                    self._dropped,
+                )
+
+    def close(self) -> None:
+        """Signal the worker to finish its backlog and stop.
+
+        Not joined: the attach is over and the caller is a request handler.
+        The worker is a daemon thread draining a bounded queue, so it ends on
+        its own, and the sentinel means it does so promptly rather than after
+        another poll interval.
+        """
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(None)
+
+    def _run(self) -> None:
+        while True:
+            batch, stopping = self._next_batch()
+            if batch:
+                try:
+                    self._registry.append_events_if_new(batch)
+                except Exception as exc:  # noqa: BLE001 - never kill the worker
+                    log.debug(
+                        "failed to mirror %d harness event(s): %s", len(batch), exc
+                    )
+            if stopping:
+                return
+
+    def _next_batch(self) -> tuple[list[dict[str, Any]], bool]:
+        """Block for one record, then sweep up everything already queued."""
+        first = self._queue.get()
+        if first is None:
+            return [], True
+        batch = [first]
+        stopping = False
+        while len(batch) < MIRROR_BATCH_MAX:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                stopping = True
+                break
+            batch.append(item)
+        return batch, stopping
 
 
 def _derive_awaiting(
@@ -567,6 +694,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
 
+        mirror: _EventMirror | None = None
         try:
             browser = self._upgrade_browser_websocket()
             if browser is None:
@@ -574,6 +702,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 
             stop = threading.Event()
             browser.settimeout(0.25)
+            # Off-thread and batched: mirroring inline here is what let a slow
+            # DuckDB write turn into dropped terminal output (see _EventMirror).
+            mirror = _EventMirror(self._harness_registry())
 
             def browser_to_channel() -> None:
                 try:
@@ -600,7 +731,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                                     pass
                                 return
                             continue
-                        self._mirror_harness_event_message(session_id, message)
+                        record = _harness_event_record(session_id, message)
+                        if record is not None:
+                            mirror.offer(record)
                         send_json(browser, message)
                 except Exception:
                     stop.set()
@@ -611,6 +744,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             stop.set()
         finally:
             channel.close()
+            if mirror is not None:
+                mirror.close()
 
     def _upgrade_browser_websocket(self) -> socket.socket | None:
         """Send the browser-side 101 upgrade and hijack the connection.
@@ -776,45 +911,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def _mirror_harness_event_message(self, session_id: str, message: object) -> None:
         """Persist a parsed harness terminal event message into the hub log.
 
-        Shared by both terminal-proxy flavors: the direct flow decodes a raw
+        Used by the direct terminal-proxy flavor, which decodes a raw
         websocket frame first (`_mirror_harness_event_frame`, above) and
-        delegates here; the relay flow already has a parsed dict (from
-        `RelayChannel.recv()`) and calls this directly. This is the sole
-        delivery path for PTY terminal events into the hub's own DuckDB
-        event log -- the daemon's local registry write never reaches the
-        hub on its own.
-        """
-        from drover.server.metrics import _optional_str, _parse_event_timestamp
+        delegates here. This is the sole delivery path for PTY terminal
+        events into the hub's own DuckDB event log -- the daemon's local
+        registry write never reaches the hub on its own.
 
-        if not isinstance(message, dict) or message.get("type") != "event":
+        Deliberately synchronous here, unlike the relay flavor: there is no
+        bounded queue between the upstream socket and the browser on this
+        path, so a slow write applies TCP backpressure and the session merely
+        runs slow. Nothing is discarded. Moving it off-thread would trade that
+        for a drop path this flavor does not currently have.
+        """
+        record = _harness_event_record(session_id, message)
+        if record is None:
             return
-        event = message.get("event")
-        if not isinstance(event, dict):
-            return
-        event_id = str(event.get("event_id") or "").strip()
-        event_type = str(event.get("event_type") or "").strip()
-        if not event_id or not event_type:
-            return
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            payload = {}
-        created_at = _parse_event_timestamp(event.get("created_at"))
         try:
-            registry = self._harness_registry()
-            if registry.get_event(event_id) is not None:
-                return
-            registry.append_event(
-                session_id=session_id,
-                event_type=event_type,
-                payload=payload,
-                normalized_type=_optional_str(event.get("normalized_type")),
-                normalized_source=_optional_str(event.get("normalized_source")),
-                content_preview=_optional_str(event.get("content_preview")),
-                event_id=event_id,
-                created_at=created_at,
-            )
+            self._harness_registry().append_events_if_new([record])
         except Exception as exc:  # noqa: BLE001
-            log.debug("failed to mirror harness event %s: %s", event_id, exc)
+            log.debug("failed to mirror harness event %s: %s", record["event_id"], exc)
 
     def _ingest_harness_events(self) -> None:
         """POST /harness/events: bulk ingest from a remote host's EventPusher.

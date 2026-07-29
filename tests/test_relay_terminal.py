@@ -194,7 +194,96 @@ def test_terminal_attach_bridges_over_relay(metrics_server_with_relay_host):
     finally:
         app.close()
 
-    mirrored = HarnessRegistry(env.duckdb_path).get_event("evt-relay-1")
+    # The mirror is deliberately off the drain thread now, so it lands shortly
+    # after the frame reaches the app rather than before it. Bounded poll.
+    registry = HarnessRegistry(env.duckdb_path)
+    deadline = time.monotonic() + 10
+    mirrored = None
+    while time.monotonic() < deadline:
+        mirrored = registry.get_event("evt-relay-1")
+        if mirrored is not None:
+            break
+        time.sleep(0.05)
     assert mirrored is not None
     assert mirrored.event_type == "terminal.output"
     assert mirrored.payload == {"data": "$ "}
+
+
+def test_terminal_output_survives_a_wedged_event_mirror(
+    metrics_server_with_relay_host, monkeypatch
+):
+    """The composition bug: a slow mirror must not eat terminal output.
+
+    Before the mirror moved off the drain thread, every message paid a DuckDB
+    connection under a process-wide lock. Under PTY burst rates the drain
+    thread fell behind, the channel's bounded queue overflowed, and it dropped
+    the *oldest* messages -- silently losing output the user was watching in
+    order to finish a write nobody was waiting on.
+
+    Here the writer is wedged outright, which is that failure taken to its
+    limit: every frame must still reach the app.
+    """
+    env = metrics_server_with_relay_host
+    spoke = env.spoke_sock
+    blocked = threading.Event()
+
+    def _wedged(self, records):
+        blocked.wait(30)
+        return 0
+
+    monkeypatch.setattr(
+        "drover.server.harness.registry.HarnessRegistry.append_events_if_new", _wedged
+    )
+
+    burst = 50
+    errors: list[BaseException] = []
+
+    def spoke_loop() -> None:
+        try:
+            reconcile = _spoke_recv(spoke)
+            client_send_json(spoke, res_frame(reconcile["id"], 200, "{}"))
+            frame = _spoke_recv(spoke)
+            chan = frame["chan"]
+            client_send_json(spoke, opened_frame(chan))
+            for index in range(burst):
+                # Every message is an event, so every one hits the mirror.
+                client_send_json(
+                    spoke,
+                    data_frame(
+                        chan,
+                        {
+                            "type": "event",
+                            "event": {
+                                "event_id": f"evt-burst-{index}",
+                                "event_type": "terminal.output",
+                                "payload": {"n": index},
+                            },
+                        },
+                    ),
+                )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=spoke_loop, daemon=True)
+    thread.start()
+
+    app = socket.create_connection((env.host, env.port), timeout=5)
+    try:
+        client_handshake(
+            app,
+            host=f"{env.host}:{env.port}",
+            path="/harness/sessions/s1/terminal",
+            headers={"Authorization": f"Bearer {env.token}"},
+        )
+        app.settimeout(15)
+        seen = []
+        while len(seen) < burst:
+            message = client_recv_json(app)
+            if message is not None:
+                seen.append(message["event"]["payload"]["n"])
+        assert seen == list(range(burst)), "terminal output was dropped or reordered"
+        assert not errors, f"spoke_loop raised: {errors}"
+    finally:
+        blocked.set()
+        app.close()
+        thread.join(timeout=5)

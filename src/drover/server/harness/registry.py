@@ -328,6 +328,77 @@ class HarnessRegistry:
             raise RuntimeError(f"failed to append harness event {event_id!r}")
         return event
 
+    def append_events_if_new(self, records: list[dict[str, Any]]) -> int:
+        """Insert many events in ONE connection window, skipping known ids.
+
+        ``append_event`` is convenient but expensive: it opens a connection to
+        insert and another to read the row back, and callers that dedupe first
+        open a third. Every one of those windows holds this database's
+        process-wide connect lock, contended with fleet renders and event
+        ingestion from every host.
+
+        The terminal mirror is the caller that cannot afford it -- it runs per
+        PTY message at burst rates -- so it hands whole batches here and pays
+        one window for all of them. Returns the number of rows inserted;
+        ``event_id`` collisions (with the table or within the batch) are
+        skipped, which is what makes replaying a message stream idempotent.
+        """
+        unique: dict[str, dict[str, Any]] = {}
+        for record in records:
+            event_id = str(record.get("event_id") or "").strip()
+            if event_id and event_id not in unique:
+                unique[event_id] = record
+        if not unique:
+            return 0
+        with self._connect() as con:
+            placeholders = ", ".join("?" for _ in unique)
+            existing = {
+                row[0]
+                for row in con.execute(
+                    "SELECT event_id FROM harness_events "
+                    f"WHERE event_id IN ({placeholders})",
+                    list(unique),
+                ).fetchall()
+            }
+            params = []
+            for event_id, record in unique.items():
+                if event_id in existing:
+                    continue
+                normalized = normalize_harness_event(
+                    event_type=record["event_type"],
+                    payload=record.get("payload"),
+                    harness=record.get("harness"),
+                    normalized_type=record.get("normalized_type"),
+                    normalized_source=record.get("normalized_source"),
+                    content_preview=record.get("content_preview"),
+                )
+                params.append(
+                    [
+                        event_id,
+                        record["session_id"],
+                        record["event_type"],
+                        normalized["normalized_type"],
+                        normalized["normalized_source"],
+                        normalized["content_preview"],
+                        _json_dumps(record.get("payload")),
+                        record.get("created_at") or _now(),
+                        None,
+                    ]
+                )
+            if not params:
+                return 0
+            con.executemany(
+                """
+                INSERT INTO harness_events (
+                  event_id, session_id, event_type, normalized_type,
+                  normalized_source, content_preview, payload_json, created_at, seq
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+        return len(params)
+
     def max_event_seq(self, session_id: str) -> int:
         with self._connect() as con:
             row = con.execute(
