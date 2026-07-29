@@ -16,7 +16,10 @@ dependencies = [
     "watchdog>=4.0",
     "opentelemetry-proto>=1.30",
     "grpcio>=1.60",
-    "mcp>=1.0",
+    # Upper bound is load-bearing: mcp 2.0 removed mcp.server.fastmcp, which
+    # drover.server.mcp.server imports. Floor is 1.2, the release that first
+    # shipped FastMCP in the official SDK (verified against 1.2.0 and 1.29.0).
+    "mcp>=1.2,<2",
     "pytz",
     "anthropic>=0.40",
     "requests",
