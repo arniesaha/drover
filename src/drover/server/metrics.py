@@ -25,6 +25,7 @@ from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
 
 if TYPE_CHECKING:
+    from drover.server.harness.models import HarnessHost
     from drover.server.relay_manager import RelayManager
 
 log = logging.getLogger("drover.metrics")
@@ -722,7 +723,16 @@ class MetricsCollector:
             launch_payload["handoff_mode"] = "nexus_handoff"
         return self.proxy_create_harness_session(target_host_id, launch_payload)
 
-    def harness_terminal_endpoint(self, session_id: str) -> str | None:
+    def harness_terminal_route(
+        self, session_id: str
+    ) -> tuple["HarnessHost", str] | None:
+        """Resolve a terminal attach to its host + host-relative path.
+
+        Runs the same reconcile/status/host checks
+        ``harness_terminal_endpoint`` has always run; split out so callers
+        that need the host object itself (to check relay liveness) don't
+        have to re-derive it from a joined URL.
+        """
         if not self._reconcile_harness_session_from_host(session_id):
             return None
         session = self._harness_session(session_id)
@@ -733,10 +743,17 @@ class MetricsCollector:
         host = self._harness_host(session.host_id)
         if host is None:
             return None
+        return host, f"/sessions/{session_id}/terminal"
+
+    def harness_terminal_endpoint(self, session_id: str) -> str | None:
+        route = self.harness_terminal_route(session_id)
+        if route is None:
+            return None
+        host, path = route
         endpoint = _harness_endpoint(host)
         if not endpoint:
             return None
-        return f"{endpoint}/sessions/{session_id}/terminal"
+        return f"{endpoint}{path}"
 
     def _reconcile_harness_session_from_host(self, session_id: str) -> bool:
         session = self._harness_session(session_id)

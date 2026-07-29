@@ -28,6 +28,7 @@ from drover.server.harness.websocket import (
     recv_frame,
     recv_json,
     send_frame,
+    send_json,
 )
 from drover.server.web.auth import (
     DISABLED,
@@ -39,7 +40,9 @@ from drover.server.web.auth import (
 from drover.server.web.ui import load_page
 
 if TYPE_CHECKING:
+    from drover.server.harness.models import HarnessHost
     from drover.server.metrics import MetricsCollector
+    from drover.server.relay_manager import RelayManager
 
 log = logging.getLogger("drover.metrics")
 
@@ -432,16 +435,39 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 '{"error": "terminal attach requires websocket upgrade"}\n',
             )
             return
-        websocket_key = self.headers.get("Sec-WebSocket-Key")
-        if not websocket_key:
+        if not self.headers.get("Sec-WebSocket-Key"):
             self._send(
                 400,
                 "application/json",
                 '{"error": "missing Sec-WebSocket-Key"}\n',
             )
             return
-        upstream_url = self.collector.harness_terminal_endpoint(session_id)
-        if not upstream_url:
+
+        route = self.collector.harness_terminal_route(session_id)
+        if route is None:
+            self._send(
+                404,
+                "application/json",
+                '{"error": "unknown terminal session or host endpoint"}\n',
+            )
+            return
+        host, path = route
+
+        relay_manager = self.collector.relay_manager
+        if relay_manager is not None and relay_manager.is_live(host.host_id):
+            self._proxy_terminal_over_relay(
+                session_id, host.host_id, path, relay_manager
+            )
+            return
+        self._proxy_terminal_direct(session_id, host, path)
+
+    def _proxy_terminal_direct(
+        self, session_id: str, host: "HarnessHost", path: str
+    ) -> None:
+        from drover.server.metrics import _harness_endpoint
+
+        endpoint = _harness_endpoint(host)
+        if not endpoint:
             self._send(
                 404,
                 "application/json",
@@ -449,20 +475,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
 
-        parsed = urlparse(upstream_url)
-        host = parsed.hostname or ""
+        parsed = urlparse(f"{endpoint}{path}")
+        upstream_host = parsed.hostname or ""
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        path = parsed.path or "/"
+        upstream_path = parsed.path or "/"
         upstream: socket.socket | None = None
         try:
-            upstream = socket.create_connection((host, port), timeout=10)
+            upstream = socket.create_connection((upstream_host, port), timeout=10)
             upstream_headers = (
                 {"Authorization": f"Bearer {self.collector.api_token}"}
                 if self.collector.api_token
                 else None
             )
             client_handshake(
-                upstream, host=f"{host}:{port}", path=path, headers=upstream_headers
+                upstream,
+                host=f"{upstream_host}:{port}",
+                path=upstream_path,
+                headers=upstream_headers,
             )
         except Exception as exc:  # noqa: BLE001
             if upstream is not None:
@@ -475,19 +504,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # BaseHTTPRequestHandler defaults to HTTP/1.0; strict WebSocket
-        # clients (URLSessionWebSocketTask) reject an "HTTP/1.0 101" status
-        # line. Scoped to the upgrade response only — the socket is hijacked
-        # after this, so HTTP/1.1 keep-alive semantics never apply.
-        self.protocol_version = "HTTP/1.1"
-        self.send_response(101)
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
-        self.send_header("Sec-WebSocket-Accept", accept_key(websocket_key))
-        self.end_headers()
-        self.close_connection = True
+        browser = self._upgrade_browser_websocket()
+        if browser is None:
+            upstream.close()
+            return
 
-        browser = self.connection
         stop = threading.Event()
         browser.settimeout(0.25)
         upstream.settimeout(0.25)
@@ -524,6 +545,95 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         upstream_to_browser()
         stop.set()
         upstream.close()
+
+    def _proxy_terminal_over_relay(
+        self,
+        session_id: str,
+        host_id: str,
+        path: str,
+        relay_manager: "RelayManager",
+    ) -> None:
+        from drover.server.relay_manager import RelayUnavailable
+
+        try:
+            channel = relay_manager.open_channel(host_id, path)
+        except RelayUnavailable as exc:
+            self._send(
+                502,
+                "application/json",
+                json.dumps({"error": f"harness websocket upstream failed: {exc}"})
+                + "\n",
+            )
+            return
+
+        browser = self._upgrade_browser_websocket()
+        if browser is None:
+            channel.close()
+            return
+
+        stop = threading.Event()
+        browser.settimeout(0.25)
+
+        def browser_to_channel() -> None:
+            try:
+                while not stop.is_set():
+                    try:
+                        message = recv_json(browser)
+                    except socket.timeout:
+                        continue
+                    if message is not None:
+                        channel.send(message)
+            except Exception:
+                stop.set()
+
+        def channel_to_browser() -> None:
+            try:
+                while not stop.is_set():
+                    message = channel.recv(timeout_s=0.25)
+                    if message is None:
+                        if channel.closed:
+                            stop.set()
+                            return
+                        continue
+                    send_json(browser, message)
+            except Exception:
+                stop.set()
+
+        thread = threading.Thread(target=browser_to_channel, daemon=True)
+        thread.start()
+        channel_to_browser()
+        stop.set()
+        channel.close()
+
+    def _upgrade_browser_websocket(self) -> socket.socket | None:
+        """Send the browser-side 101 upgrade and hijack the connection.
+
+        Shared by the direct and relay terminal-proxy flavors. Must only be
+        called once the upstream (direct socket or relay channel) is already
+        established -- a browser must never see a successful upgrade for a
+        session the hub could not actually reach; the caller sends a normal
+        HTTP error response instead in that case.
+        """
+        websocket_key = self.headers.get("Sec-WebSocket-Key")
+        if not websocket_key:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "missing Sec-WebSocket-Key"}\n',
+            )
+            return None
+        # BaseHTTPRequestHandler defaults to HTTP/1.0; strict WebSocket
+        # clients (URLSessionWebSocketTask) reject an "HTTP/1.0 101" status
+        # line. Scoped to the upgrade response only — the socket is hijacked
+        # after this, so HTTP/1.1 keep-alive semantics never apply.
+        self.protocol_version = "HTTP/1.1"
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept_key(websocket_key))
+        self.end_headers()
+        self.close_connection = True
+        return self.connection
 
     def _accept_relay_websocket(self) -> None:
         """Upgrade a spoke's connection and hand it to RelayManager.
