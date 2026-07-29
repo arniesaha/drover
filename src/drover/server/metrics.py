@@ -480,13 +480,9 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             return _json_response(404, {"error": f"unknown harness host: {host_id}"})
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return _json_response(
-                502, {"error": f"harness host has no registered endpoint: {host_id}"}
-            )
-        status, body = self._proxy_harness_request(
-            f"{endpoint}/sessions",
+        status, body = self._harness_request(
+            host,
+            "/sessions",
             method="POST",
             payload=payload,
         )
@@ -505,16 +501,9 @@ class MetricsCollector:
             return _json_response(
                 404, {"error": f"unknown harness host: {session.host_id}"}
             )
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return _json_response(
-                502,
-                {
-                    "error": f"harness host has no registered endpoint: {session.host_id}"
-                },
-            )
-        status, body = self._proxy_harness_request(
-            f"{endpoint}/sessions/{session_id}/terminate",
+        status, body = self._harness_request(
+            host,
+            f"/sessions/{session_id}/terminate",
             method="POST",
             payload={},
         )
@@ -555,16 +544,9 @@ class MetricsCollector:
             return _json_response(
                 404, {"error": f"unknown harness host: {session.host_id}"}
             )
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return _json_response(
-                502,
-                {
-                    "error": f"harness host has no registered endpoint: {session.host_id}"
-                },
-            )
-        return self._proxy_harness_request(
-            f"{endpoint}/sessions/{session_id}/{action}",
+        return self._harness_request(
+            host,
+            f"/sessions/{session_id}/{action}",
             method="POST",
             payload=payload,
         )
@@ -577,11 +559,6 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             return _json_response(404, {"error": f"unknown harness host: {host_id}"})
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return _json_response(
-                502, {"error": f"harness host has no registered endpoint: {host_id}"}
-            )
         params = {
             key: value
             for key, value in {
@@ -594,8 +571,9 @@ class MetricsCollector:
         path = "/native-sessions"
         if params:
             path = f"{path}?{urlencode(params)}"
-        return self._proxy_harness_request(
-            f"{endpoint}{path}",
+        return self._harness_request(
+            host,
+            path,
             method="GET",
             payload={},
         )
@@ -611,11 +589,6 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             return _json_response(404, {"error": f"unknown harness host: {host_id}"})
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return _json_response(
-                502, {"error": f"harness host has no registered endpoint: {host_id}"}
-            )
 
         if action in {"status", "start"}:
             path = f"/auth/{quote(harness, safe='')}/{action}"
@@ -625,8 +598,9 @@ class MetricsCollector:
         else:
             return _json_response(400, {"error": "invalid auth action"})
 
-        status, body = self._proxy_harness_request(
-            f"{endpoint}{path}",
+        status, body = self._harness_request(
+            host,
+            path,
             method="GET" if action in {"status", "flow"} else "POST",
             payload={},
         )
@@ -651,14 +625,6 @@ class MetricsCollector:
             return _json_response(
                 404, {"error": f"unknown harness host: {session.host_id}"}
             )
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return _json_response(
-                502,
-                {
-                    "error": f"harness host has no registered endpoint: {session.host_id}"
-                },
-            )
         params = {
             key: value
             for key, value in {
@@ -670,11 +636,14 @@ class MetricsCollector:
         path = f"/sessions/{session_id}/native-transcript"
         if params:
             path = f"{path}?{urlencode(params)}"
-        status, body = self._proxy_harness_request(
-            f"{endpoint}{path}",
+        # No custom timeout here: a sub-several-second timeout must never
+        # reach RelayManager.request (it would tear down the shared
+        # connection on write-budget expiry), so this rides the default.
+        status, body = self._harness_request(
+            host,
+            path,
             method="GET",
             payload={},
-            timeout_s=2.0,
         )
         if status == 404 and session.host_id in {"mac-mini", "localhost"}:
             transcript = native_transcript_for_session(
@@ -778,14 +747,14 @@ class MetricsCollector:
         host = self._harness_host(session.host_id)
         if host is None:
             return True
-        endpoint = _harness_endpoint(host)
-        if not endpoint:
-            return True
-        status, body = self._proxy_harness_request(
-            f"{endpoint}/sessions/{session_id}",
+        # No custom timeout here: a sub-several-second timeout must never
+        # reach RelayManager.request (it would tear down the shared
+        # connection on write-budget expiry), so this rides the default.
+        status, body = self._harness_request(
+            host,
+            f"/sessions/{session_id}",
             method="GET",
             payload={},
-            timeout_s=1.0,
         )
         if 200 <= status < 300:
             return True
@@ -795,7 +764,7 @@ class MetricsCollector:
         log.warning(
             "failed to reconcile harness session %s from %s: %s %s",
             session_id,
-            endpoint,
+            host.host_id,
             status,
             body.strip()[:300],
         )
@@ -1021,6 +990,41 @@ class MetricsCollector:
             )
         lines.extend(["", "Start by briefly confirming what you are continuing."])
         return "\n".join(lines).strip() + "\n"
+
+    def _harness_request(
+        self,
+        host: Any,
+        path: str,
+        *,
+        method: str,
+        payload: Mapping[str, Any] | None = None,
+        timeout_s: float = 15,
+    ) -> tuple[int, str]:
+        """Single routing choke point for every hub->harnessd API call.
+
+        Prefers a live relay connection for ``host``; falls back to a direct
+        URL dial when no relay is live; reports 502 when neither is
+        available. ``path`` is host-relative (may include a query string)
+        and is forwarded verbatim to both the relay and the direct-dial
+        path -- callers must not pre-join it to an endpoint.
+        """
+        if self.relay_manager is not None and self.relay_manager.is_live(
+            host.host_id
+        ):
+            return self.relay_manager.request(
+                host.host_id, method, path, dict(payload or {}), timeout_s=timeout_s
+            )
+        endpoint = _harness_endpoint(host)
+        if endpoint:
+            return self._proxy_harness_request(
+                f"{endpoint}{path}",
+                method=method,
+                payload=payload,
+                timeout_s=timeout_s,
+            )
+        return _json_response(
+            502, {"error": f"harness host has no reachable endpoint: {host.host_id}"}
+        )
 
     def _proxy_harness_request(
         self,

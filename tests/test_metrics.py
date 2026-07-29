@@ -988,6 +988,87 @@ def test_terminate_tombstones_session_on_unreachable_host(tmp_path):
     assert session.ended_at is not None
 
 
+@pytest.fixture
+def collector_with_hosts(tmp_path) -> MetricsCollector:
+    """Three harness hosts covering ``_harness_request``'s routing paths.
+
+    - "laptop": relay-connected, no URLs at all -- only reachable via a
+      live ``RelayManager``.
+    - "mini": a direct URL pointing at a dead port on 127.0.0.1 -- proves
+      the direct-dial fallback actually ran (connection refused -> 502).
+    - "island": no URLs and no relay -- proves the "no reachable endpoint"
+      502 short-circuit.
+    """
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(
+        host_id="laptop",
+        display_name="Laptop",
+        kind="macos",
+        connection_kind="relay",
+    )
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+    registry.register_host(
+        host_id="mini",
+        display_name="Mini",
+        kind="macos",
+        local_url=f"http://127.0.0.1:{dead_port}",
+    )
+    registry.register_host(
+        host_id="island",
+        display_name="Island",
+        kind="linux",
+    )
+    return MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+
+class _FakeRelay:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def is_live(self, host_id: str) -> bool:
+        return host_id == "laptop"
+
+    def request(self, host_id, method, path, body, timeout_s=15):
+        self.calls.append((host_id, method, path, body))
+        return 200, '{"ok": true}\n'
+
+
+def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
+    collector = collector_with_hosts
+    fake = _FakeRelay()
+    collector.relay_manager = fake
+    host = collector._harness_host("laptop")
+    status, body = collector._harness_request(host, "/sessions", method="GET")
+    assert status == 200
+    assert fake.calls == [("laptop", "GET", "/sessions", {})]
+
+
+def test_harness_request_falls_back_to_direct_url(collector_with_hosts) -> None:
+    collector = collector_with_hosts
+    collector.relay_manager = _FakeRelay()  # not live for "mini"
+    host = collector._harness_host("mini")
+    status, _ = collector._harness_request(host, "/sessions", method="GET", timeout_s=0.2)
+    assert status == 502  # tried the direct URL and it refused -- proves the direct path ran
+
+
+def test_harness_request_no_endpoint_no_relay_is_502(collector_with_hosts) -> None:
+    collector = collector_with_hosts
+    host = collector._harness_host("island")
+    status, body = collector._harness_request(host, "/sessions", method="GET")
+    assert status == 502
+    assert "no reachable endpoint" in body
+
+
 def test_proxy_forwards_bearer_to_harnessd(tmp_path):
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
