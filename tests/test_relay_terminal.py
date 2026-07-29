@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -207,6 +208,70 @@ def test_terminal_attach_bridges_over_relay(metrics_server_with_relay_host):
     assert mirrored is not None
     assert mirrored.event_type == "terminal.output"
     assert mirrored.payload == {"data": "$ "}
+
+
+def test_terminal_attach_never_dials_a_relay_host_by_url(
+    metrics_server_with_relay_host,
+):
+    """Same rule as _harness_request, on the interactive path.
+
+    A relay host whose row carries a URL must not be dialled when its socket
+    is down: 127.0.0.1:7081 is the default listen address everywhere here, so
+    the hub would attach the user's terminal to its own harnessd.
+    """
+    env = metrics_server_with_relay_host
+    # A decoy standing in for "the hub's own harnessd on 127.0.0.1:7081".
+    # Asserting on the app's status code would not discriminate -- a failed
+    # upstream dial also yields 502 -- so the invariant under test is that
+    # nothing ever arrives here.
+    hits: list[str] = []
+
+    class _Decoy(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            hits.append(self.path)
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    decoy = ThreadingHTTPServer(("127.0.0.1", 0), _Decoy)
+    decoy_thread = threading.Thread(target=decoy.serve_forever, daemon=True)
+    decoy_thread.start()
+
+    HarnessRegistry(env.duckdb_path).register_host(
+        host_id="laptop",
+        display_name="Laptop",
+        kind="mac",
+        connection_kind="relay",
+        local_url=f"http://127.0.0.1:{decoy.server_address[1]}",
+    )
+    env.spoke_sock.close()  # relay socket goes away; the stray URL remains
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not env.collector.relay_manager.is_live("laptop"):
+            break
+        time.sleep(0.05)
+    assert not env.collector.relay_manager.is_live("laptop")
+
+    app = socket.create_connection((env.host, env.port), timeout=5)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client_handshake(
+                app,
+                host=f"{env.host}:{env.port}",
+                path="/harness/sessions/s1/terminal",
+                headers={"Authorization": f"Bearer {env.token}"},
+            )
+        assert "502" in str(caught.value)
+    finally:
+        app.close()
+        decoy.shutdown()
+        decoy.server_close()
+        decoy_thread.join(timeout=5)
+
+    assert hits == [], f"hub dialled a relay host's URL for a terminal: {hits}"
 
 
 def test_terminal_output_survives_a_wedged_event_mirror(

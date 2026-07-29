@@ -587,6 +587,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 session_id, host.host_id, path, relay_manager
             )
             return
+        if getattr(host, "connection_kind", "direct") == "relay":
+            # Same rule as _harness_request: never dial a relay host by URL.
+            # Its socket is the only way in, and the default listen address
+            # everywhere in this repo is 127.0.0.1:7081 -- so a stray URL on a
+            # relay row would attach the user's terminal to the HUB's own
+            # harnessd. Unreachable is the safe failure.
+            self._send(
+                502,
+                "application/json",
+                json.dumps({"error": f"relay host is not connected: {host.host_id}"})
+                + "\n",
+            )
+            return
         self._proxy_terminal_direct(session_id, host, path)
 
     def _proxy_terminal_direct(

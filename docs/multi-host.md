@@ -114,6 +114,14 @@ of dialing the laptop directly.
 are aliased to `http`/`https`); any other scheme is a hard config error at
 startup. The funnel URL is always `https://…`.
 
+> **Never pass `--local-url` or `--tailscale-url` on a relay host.** A relay
+> host has no meaningful inbound URL — its outbound socket is the only way in.
+> Every host shape in this repo listens on `127.0.0.1:7081`, so a URL on a
+> relay host's registry row would resolve against the *hub's own loopback*.
+> The hub refuses to dial a `connection_kind = "relay"` host by URL for
+> exactly this reason (it returns `502 relay host is not connected` instead),
+> but don't set one in the first place.
+
 ## Tailscale Funnel setup (hub side)
 
 The hub's metrics/API port (`7080`) is what needs to be reachable from the

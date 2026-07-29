@@ -1033,14 +1033,29 @@ class MetricsCollector:
         """Single routing choke point for every hub->harnessd API call.
 
         Prefers a live relay connection for ``host``; falls back to a direct
-        URL dial when no relay is live; reports 502 when neither is
-        available. ``path`` is host-relative (may include a query string)
-        and is forwarded verbatim to both the relay and the direct-dial
-        path -- callers must not pre-join it to an endpoint.
+        URL dial when no relay is live *and the host is not a relay host*;
+        reports 502 when neither is available. ``path`` is host-relative (may
+        include a query string) and is forwarded verbatim to both the relay
+        and the direct-dial path -- callers must not pre-join it to an
+        endpoint.
         """
         if self.relay_manager is not None and self.relay_manager.is_live(host.host_id):
             return self.relay_manager.request(
                 host.host_id, method, path, dict(payload or {}), timeout_s=timeout_s
+            )
+        if getattr(host, "connection_kind", "direct") == "relay":
+            # A relay host is behind NAT by definition: it has no meaningful
+            # inbound URL, and its socket is the only way in. Falling through
+            # to a dial would be actively dangerous rather than merely
+            # useless, because the default listen address for every host
+            # shape in this repo is 127.0.0.1:7081 -- so a stale or
+            # mistakenly-set local_url on a relay row resolves against the
+            # HUB's own loopback and silently runs the work laptop's commands
+            # against the hub's harnessd instead. These are agent sessions
+            # with filesystem access; being unreachable is the safe failure.
+            return _json_response(
+                502,
+                {"error": f"relay host is not connected: {host.host_id}"},
             )
         endpoint = _harness_endpoint(host)
         if endpoint:

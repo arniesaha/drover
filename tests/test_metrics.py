@@ -7,6 +7,7 @@ from pathlib import Path
 import base64
 import os
 import socket
+import threading
 from time import monotonic
 import urllib.error
 import urllib.request
@@ -1071,6 +1072,57 @@ def test_harness_request_no_endpoint_no_relay_is_502(collector_with_hosts) -> No
     status, body = collector._harness_request(host, "/sessions", method="GET")
     assert status == 502
     assert "no reachable endpoint" in body
+
+
+def test_harness_request_never_dials_a_relay_host_by_url(collector_with_hosts) -> None:
+    """A relay host with a stray URL must 502, not dial it.
+
+    The danger is not a wasted request. Every host shape in this repo listens
+    on 127.0.0.1:7081 by default, so a local_url that ends up on a relay row --
+    a stale manual test, someone copying the direct docs, a future enroll
+    change -- resolves against the *hub's own loopback*. The hub would then
+    run the work laptop's session commands against its own harnessd, silently
+    and with no error, on sessions that have filesystem access.
+
+    So this stands up a real listener and proves nothing ever reaches it.
+    """
+    collector = collector_with_hosts
+    hits: list[str] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            hits.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    decoy = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=decoy.serve_forever, daemon=True)
+    thread.start()
+    try:
+        HarnessRegistry(collector.duckdb_path).register_host(
+            host_id="laptop",
+            display_name="Laptop",
+            kind="macos",
+            connection_kind="relay",
+            local_url=f"http://127.0.0.1:{decoy.server_address[1]}",
+        )
+        collector.relay_manager = None  # no live socket for "laptop"
+        host = collector._harness_host("laptop")
+        assert host.local_url  # the stray URL really is on the row
+        status, body = collector._harness_request(host, "/sessions", method="GET")
+    finally:
+        decoy.shutdown()
+        decoy.server_close()
+        thread.join(timeout=5)
+
+    assert status == 502
+    assert "not connected" in body
+    assert hits == [], f"hub dialled a relay host's URL: {hits}"
 
 
 def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> None:
