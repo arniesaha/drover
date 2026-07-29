@@ -17,9 +17,9 @@ struct ChatView: View {
     /// is never yanked back down) and shows the scroll-to-bottom button.
     @State private var isPinnedToBottom = true
 
-    init(client: NexusClient, sessionID: String) {
+    init(client: NexusClient, sessionID: String, harness: String? = nil) {
         self.client = client
-        _model = State(initialValue: ChatModel(client: client, sessionID: sessionID))
+        _model = State(initialValue: ChatModel(client: client, sessionID: sessionID, harness: harness))
     }
 
     var body: some View {
@@ -55,7 +55,7 @@ struct ChatView: View {
                 Task { await model.sendTurn() }
             }
         }
-        .navigationTitle("Chat")
+        .navigationTitle(model.harnessPresentation.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .confirmationDialog("Terminate this session?", isPresented: $showTerminateConfirm,
@@ -75,9 +75,9 @@ struct ChatView: View {
         // whichever the server actually created.
         .navigationDestination(item: $handoffSession) { handoff in
             if handoff.isStructured {
-                ChatView(client: client, sessionID: handoff.id)
+                ChatView(client: client, sessionID: handoff.id, harness: handoff.harness)
             } else {
-                TerminalScreen(client: client, sessionID: handoff.id)
+                TerminalScreen(client: client, sessionID: handoff.id, harness: handoff.harness)
             }
         }
     }
@@ -192,6 +192,14 @@ struct ChatView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            Label(model.harnessPresentation.name,
+                  systemImage: model.harnessPresentation.symbolName)
+                .labelStyle(.titleAndIcon)
+                .font(.headline)
+                .accessibilityIdentifier("chat-harness-title")
+        }
+
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
                 Button {
@@ -216,10 +224,11 @@ struct ChatView: View {
                 if !crossHarnessTargets.isEmpty {
                     Menu {
                         ForEach(crossHarnessTargets, id: \.self) { harness in
+                            let presentation = HarnessPresentation(harness)
                             Button {
                                 Task { await handOff(to: harness) }
                             } label: {
-                                Label(harness, systemImage: "arrow.triangle.branch")
+                                Label(presentation.name, systemImage: presentation.symbolName)
                             }
                         }
                     } label: {
@@ -245,8 +254,10 @@ struct ChatView: View {
 
     private func handOff(to targetHarness: String?) async {
         if let continued = await model.handOff(targetHarness: targetHarness) {
+            let harness = targetHarness ?? model.harnessPresentation.harness
             handoffSession = HandoffSession(id: continued.sessionID,
-                                            isStructured: continued.isStructured)
+                                            isStructured: continued.isStructured,
+                                            harness: harness)
         }
     }
 }
@@ -256,4 +267,5 @@ struct ChatView: View {
 private struct HandoffSession: Identifiable, Hashable {
     let id: String
     let isStructured: Bool
+    let harness: String
 }

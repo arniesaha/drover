@@ -91,6 +91,25 @@ def test_parse_assistant_text_block():
     assert messages[0].text == "hello nexus"
 
 
+def test_parse_assistant_text_block_preserves_usage_metadata():
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello nexus"}],
+                "usage": {"input_tokens": 12, "output_tokens": 3},
+                "model": "claude-test",
+            },
+            "session_id": "session-1",
+        }
+    )
+    message = _driver([]).parse_line(line)[0]
+    assert message.payload["usage"] == {"input_tokens": 12, "output_tokens": 3}
+    assert message.payload["model"] == "claude-test"
+    assert message.payload["native_session_id"] == "session-1"
+
+
 def test_parse_thinking_block_maps_to_assistant_output():
     line = json.dumps(
         {

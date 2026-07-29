@@ -37,9 +37,12 @@ struct MessageBubble: View {
             // displayText is markdown parsed once at decode —
             // `Text(.init(...))` would re-parse on every render pass,
             // which is measurable during long streams.
-            Text(message.displayText)
-                .padding(10)
-                .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+            VStack(alignment: .leading, spacing: 8) {
+                Text(message.displayText)
+                usageFooter(alignment: .leading)
+            }
+            .padding(10)
+            .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
             Spacer(minLength: 32)
         }
     }
@@ -57,9 +60,12 @@ struct MessageBubble: View {
     private var statusCaption: some View {
         HStack {
             Spacer()
-            Text(message.text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(spacing: 4) {
+                Text(message.text)
+                usageFooter(alignment: .center)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
             Spacer()
         }
     }
@@ -101,6 +107,20 @@ struct MessageBubble: View {
 
     private var toolDetail: String? {
         message.payload["input"]?.displayString ?? message.payload["result"]?.displayString
+    }
+
+    @ViewBuilder
+    private func usageFooter(alignment: HorizontalAlignment) -> some View {
+        if let summary = TokenUsageSummary(message: message) {
+            VStack(alignment: alignment, spacing: 2) {
+                Label(summary.compactText, systemImage: "number")
+                if let contextText = summary.contextText {
+                    Label(contextText, systemImage: "rectangle.expand.vertical")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
     }
 }
 

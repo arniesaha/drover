@@ -61,6 +61,95 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(s.attention == expected)
 }
 
+@Test(arguments: [
+    ("claude-code", "Claude", "brain"),
+    ("codex", "Codex", "chevron.left.forwardslash.chevron.right"),
+    ("gemini", "Gemini", "sparkles"),
+    ("shell", "Shell", "terminal"),
+    ("custom-harness", "custom-harness", "terminal"),
+])
+func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbolName: String) {
+    let presentation = HarnessPresentation(harness)
+    #expect(presentation.name == name)
+    #expect(presentation.symbolName == symbolName)
+}
+
+@Test func codexUsageSummaryFormatsTurnCompletedUsage() {
+    let message = HarnessMessage.fixture(
+        seq: 1,
+        type: .status,
+        payload: [
+            "usage": .object([
+                "input_tokens": .number(18_240),
+                "cached_input_tokens": .number(4_992),
+                "output_tokens": .number(67),
+                "reasoning_output_tokens": .number(59),
+            ])
+        ]
+    )
+    let summary = TokenUsageSummary(message: message)
+    #expect(summary?.compactText == "in 18.2K | out 67 | cache 5K | reason 59")
+    #expect(summary?.contextText == nil)
+}
+
+@Test func claudeUsageSummaryFormatsContextWindow() {
+    let message = HarnessMessage.fixture(
+        seq: 1,
+        type: .status,
+        payload: [
+            "result": .object([
+                "usage": .object([
+                    "input_tokens": .number(5_985),
+                    "cache_read_input_tokens": .number(49_153),
+                    "output_tokens": .number(64),
+                ]),
+                "modelUsage": .object([
+                    "claude-fable-5[1m]": .object([
+                        "inputTokens": .number(5_985),
+                        "outputTokens": .number(64),
+                        "cacheReadInputTokens": .number(49_153),
+                        "contextWindow": .number(1_000_000),
+                    ])
+                ])
+            ])
+        ]
+    )
+    let summary = TokenUsageSummary(message: message)
+    #expect(summary?.compactText == "in 6K | out 64 | cache 49.2K")
+    #expect(summary?.contextText == "ctx 55.1K / 1M (6%)")
+}
+
+@Test func geminiUsageSummaryAggregatesStatsTokens() {
+    let message = HarnessMessage.fixture(
+        seq: 1,
+        type: .assistantOutput,
+        payload: [
+            "stats": .object([
+                "models": .object([
+                    "gemini-3.1-flash-lite": .object([
+                        "tokens": .object([
+                            "input": .number(837),
+                            "candidates": .number(35),
+                            "cached": .number(0),
+                            "thoughts": .number(436),
+                        ])
+                    ]),
+                    "gemini-3.5-flash": .object([
+                        "tokens": .object([
+                            "input": .number(10_215),
+                            "candidates": .number(2),
+                            "cached": .number(0),
+                            "thoughts": .number(128),
+                        ])
+                    ]),
+                ])
+            ])
+        ]
+    )
+    let summary = TokenUsageSummary(message: message)
+    #expect(summary?.compactText == "in 11.1K | out 37 | reason 564")
+}
+
 /// The server sends cwd suggestions as objects ({path, source, host_id}) —
 /// regression guard for the silent [] that decoding them as [String]
 /// produced (the launch sheet's suggestion menu was always empty).

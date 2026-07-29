@@ -9,8 +9,9 @@ struct SessionRow: View {
     let session: SessionSummary
 
     var body: some View {
+        let presentation = HarnessPresentation(session.harness)
         HStack(spacing: 12) {
-            Image(systemName: harnessSymbolName)
+            Image(systemName: presentation.symbolName)
                 .foregroundStyle(attentionTint)
                 .frame(width: 22)
 
@@ -20,6 +21,12 @@ struct SessionRow: View {
                     .lineLimit(1)
 
                 HStack(spacing: 6) {
+                    Text(presentation.name)
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.tint.opacity(0.14), in: Capsule())
+
                     Text(session.hostID)
                         .font(.caption2)
                         .padding(.horizontal, 6)
@@ -37,15 +44,6 @@ struct SessionRow: View {
             Spacer()
         }
         .padding(.vertical, 2)
-    }
-
-    private var harnessSymbolName: String {
-        switch session.harness {
-        case "claude-code": "brain"
-        case "codex": "chevron.left.forwardslash.chevron.right"
-        case "gemini": "sparkles"
-        default: "terminal"
-        }
     }
 
     private var attentionTint: Color {

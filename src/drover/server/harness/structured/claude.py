@@ -136,7 +136,9 @@ class ClaudeDriver(ProcessDriver):
         self, obj: dict[str, Any], *, role: str
     ) -> list[StructuredMessage]:
         messages: list[StructuredMessage] = []
-        content = (obj.get("message") or {}).get("content") or []
+        message = obj.get("message") or {}
+        base_payload = _metadata_payload(obj, message)
+        content = message.get("content") or []
         for block in content:
             block_type = block.get("type")
             if block_type == "text":
@@ -145,6 +147,7 @@ class ClaudeDriver(ProcessDriver):
                         type="assistant_output",
                         role="assistant",
                         text=block.get("text") or "",
+                        payload=base_payload,
                     )
                 )
             elif block_type == "thinking":
@@ -153,7 +156,7 @@ class ClaudeDriver(ProcessDriver):
                         type="assistant_output",
                         role="assistant",
                         text=block.get("thinking") or "",
-                        payload={"thinking": True},
+                        payload={**base_payload, "thinking": True},
                     )
                 )
             elif block_type == "tool_use":
@@ -163,6 +166,7 @@ class ClaudeDriver(ProcessDriver):
                         role="assistant",
                         text=f"{block.get('name')}",
                         payload={
+                            **base_payload,
                             "tool": block.get("name"),
                             "tool_use_id": block.get("id"),
                             "input": block.get("input"),
@@ -175,7 +179,10 @@ class ClaudeDriver(ProcessDriver):
                         type="tool_result",
                         role="tool",
                         text=_result_text(block),
-                        payload={"tool_use_id": block.get("tool_use_id")},
+                        payload={
+                            **base_payload,
+                            "tool_use_id": block.get("tool_use_id"),
+                        },
                     )
                 )
         # Empty content array (or a content array containing only block
@@ -188,7 +195,7 @@ class ClaudeDriver(ProcessDriver):
                 type="status",
                 role=role,
                 text="empty content",
-                payload={"empty_content": True, "event": obj},
+                payload={**base_payload, "empty_content": True, "event": obj},
             )
         ]
 
@@ -229,3 +236,18 @@ def _result_text(block: dict[str, Any]) -> str:
             str(item.get("text", "")) for item in content if isinstance(item, dict)
         )
     return ""
+
+
+def _metadata_payload(
+    event: dict[str, Any], message: dict[str, Any]
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if message.get("usage") is not None:
+        payload["usage"] = message.get("usage")
+    if message.get("model") is not None:
+        payload["model"] = message.get("model")
+    if event.get("session_id") is not None:
+        payload["native_session_id"] = event.get("session_id")
+    if event.get("uuid") is not None:
+        payload["native_event_id"] = event.get("uuid")
+    return payload

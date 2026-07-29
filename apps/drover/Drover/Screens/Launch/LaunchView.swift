@@ -13,10 +13,11 @@ struct LaunchView: View {
     private let client: NexusClient
 
     /// Called once `launch()` succeeds, with the new session's id and
-    /// whether it's structured (so the caller knows Chat vs. terminal).
-    let onLaunched: (String, Bool) -> Void
+    /// whether it's structured (so the caller knows Chat vs. terminal), plus
+    /// the selected harness for the destination title/icon.
+    let onLaunched: (String, Bool, String) -> Void
 
-    init(client: NexusClient, snapshot: HarnessSnapshot?, onLaunched: @escaping (String, Bool) -> Void) {
+    init(client: NexusClient, snapshot: HarnessSnapshot?, onLaunched: @escaping (String, Bool, String) -> Void) {
         _model = State(initialValue: LaunchModel(client: client, snapshot: snapshot))
         self.client = client
         self.onLaunched = onLaunched
@@ -115,7 +116,7 @@ struct LaunchView: View {
         isLaunching = true
         defer { isLaunching = false }
         guard let sessionID = await model.launch() else { return }
-        onLaunched(sessionID, model.isStructured)
+        onLaunched(sessionID, model.isStructured, model.harness)
         dismiss()
     }
 }

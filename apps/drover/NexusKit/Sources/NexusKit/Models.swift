@@ -171,6 +171,11 @@ public enum JSONValue: Sendable, Equatable, Decodable {
         return nil
     }
 
+    public var numberValue: Double? {
+        if case .number(let value) = self { return value }
+        return nil
+    }
+
     public var objectValue: [String: JSONValue]? {
         if case .object(let value) = self { return value }
         return nil

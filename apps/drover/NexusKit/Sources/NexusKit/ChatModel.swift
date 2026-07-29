@@ -24,6 +24,7 @@ public final class ChatModel {
     public private(set) var isAnswering = false
     public private(set) var pendingApproval: HarnessMessage?
     public private(set) var hint: String?
+    public private(set) var harnessPresentation: HarnessPresentation
     public var composerText = ""
     /// Text the user sent while the harness was mid-turn (codex/gemini
     /// reject overlapping turns with 409 "turn already in flight"). Held
@@ -43,9 +44,16 @@ public final class ChatModel {
     public convenience init(
         client: NexusClient,
         sessionID: String,
+        harness: String? = nil,
         streamFactory: ((NexusClient, String) -> MessageStream)? = nil
     ) {
-        self.init(client: client, sessionID: sessionID, initialMessages: [], streamFactory: streamFactory)
+        self.init(
+            client: client,
+            sessionID: sessionID,
+            harness: harness,
+            initialMessages: [],
+            streamFactory: streamFactory
+        )
     }
 
     /// Test-only designated init: seeds `messages` directly. Not `public` —
@@ -54,12 +62,14 @@ public final class ChatModel {
     init(
         client: NexusClient,
         sessionID: String,
+        harness: String? = nil,
         initialMessages: [HarnessMessage],
         streamFactory: ((NexusClient, String) -> MessageStream)? = nil
     ) {
         self.client = client
         self.sessionID = sessionID
         self.messages = initialMessages
+        self.harnessPresentation = HarnessPresentation(harness ?? "")
         let factory = streamFactory ?? { c, s in MessageStream(client: c, sessionID: s) }
         self.stream = factory(client, sessionID)
         recomputePendingApproval()
@@ -250,9 +260,10 @@ public final class ChatModel {
     /// list as-is — the picker just doesn't gain per-harness options.
     public func loadHandoffTargets() async {
         guard let snapshot = try? await client.snapshot(),
-              let session = snapshot.sessions.first(where: { $0.id == sessionID }),
-              let host = snapshot.hosts.first(where: { $0.id == session.hostID })
+              let session = snapshot.sessions.first(where: { $0.id == sessionID })
         else { return }
+        harnessPresentation = HarnessPresentation(session.harness)
+        guard let host = snapshot.hosts.first(where: { $0.id == session.hostID }) else { return }
         handoffHarnesses = host.harnesses
     }
 

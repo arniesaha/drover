@@ -79,16 +79,20 @@ struct SessionsView: View {
         }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
-                LaunchView(client: client, snapshot: store.snapshot) { sessionID, isStructured in
-                    launchedSession = LaunchedSession(id: sessionID, isStructured: isStructured)
+                LaunchView(client: client, snapshot: store.snapshot) { sessionID, isStructured, harness in
+                    launchedSession = LaunchedSession(
+                        id: sessionID,
+                        isStructured: isStructured,
+                        harness: harness
+                    )
                 }
             }
         }
         .navigationDestination(item: $launchedSession) { launched in
             if launched.isStructured {
-                ChatView(client: client, sessionID: launched.id)
+                ChatView(client: client, sessionID: launched.id, harness: launched.harness)
             } else {
-                TerminalScreen(client: client, sessionID: launched.id)
+                TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
             }
         }
     }
@@ -107,9 +111,9 @@ struct SessionsView: View {
     private func row(for session: SessionSummary) -> some View {
         NavigationLink {
             if session.isStructured {
-                ChatView(client: client, sessionID: session.id)
+                ChatView(client: client, sessionID: session.id, harness: session.harness)
             } else {
-                TerminalScreen(client: client, sessionID: session.id)
+                TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
             }
         } label: {
             SessionRow(session: session)
@@ -125,10 +129,11 @@ struct SessionsView: View {
             // snapshot). "shell" is excluded — the handoff seed gets typed
             // into the PTY, and a bare shell would execute it as commands.
             ForEach(crossHarnessTargets(for: session), id: \.self) { harness in
+                let presentation = HarnessPresentation(harness)
                 Button {
                     Task { await continueSession(session, targetHarness: harness) }
                 } label: {
-                    Label("Continue with \(harness)", systemImage: "arrow.triangle.swap")
+                    Label("Continue with \(presentation.name)", systemImage: presentation.symbolName)
                 }
             }
         }
@@ -152,8 +157,10 @@ struct SessionsView: View {
         guard let continued = await store.continueSession(session.id, targetHarness: targetHarness) else {
             return
         }
+        let harness = targetHarness ?? session.harness
         launchedSession = LaunchedSession(id: continued.sessionID,
-                                          isStructured: continued.isStructured)
+                                          isStructured: continued.isStructured,
+                                          harness: harness)
     }
 }
 
@@ -163,4 +170,5 @@ struct SessionsView: View {
 private struct LaunchedSession: Identifiable, Hashable {
     let id: String
     let isStructured: Bool
+    let harness: String
 }

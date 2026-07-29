@@ -84,6 +84,21 @@ struct ChatModelTests {
     #expect(sentTarget == "codex")
 }
 
+@Test @MainActor func initUsesProvidedHarnessForPresentation() async throws {
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex")
+    #expect(model.harnessPresentation.name == "Codex")
+    #expect(model.harnessPresentation.symbolName == "chevron.left.forwardslash.chevron.right")
+}
+
+@Test @MainActor func loadHandoffTargetsUpdatesHarnessPresentation() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let model = ChatModel(client: client(), sessionID: "harness-1", harness: "codex")
+    #expect(model.harnessPresentation.name == "Codex")
+    await model.loadHandoffTargets()
+    #expect(model.harnessPresentation.name == "Gemini")
+    #expect(model.harnessPresentation.symbolName == "sparkles")
+}
+
 @Test @MainActor func loadHandoffTargetsListsHostHarnesses() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let model = ChatModel(client: client(), sessionID: "harness-1")

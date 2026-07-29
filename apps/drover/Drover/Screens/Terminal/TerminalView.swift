@@ -21,6 +21,7 @@ import NexusKit
 struct TerminalScreen: View {
     let client: NexusClient
     let sessionID: String
+    let harness: String?
 
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
@@ -42,7 +43,14 @@ struct TerminalScreen: View {
     @State private var showTerminateConfirm = false
     @State private var terminateHint: String?
 
+    init(client: NexusClient, sessionID: String, harness: String? = nil) {
+        self.client = client
+        self.sessionID = sessionID
+        self.harness = harness
+    }
+
     var body: some View {
+        let presentation = HarnessPresentation(harness ?? "shell")
         VStack(spacing: 0) {
             if hasConnectedOnce && isReconnecting && !sessionEnded {
                 reconnectingPill
@@ -64,9 +72,9 @@ struct TerminalScreen: View {
                 }
             )
         }
-        .navigationTitle("Terminal")
+        .navigationTitle(presentation.name)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbarContent }
+        .toolbar { toolbarContent(presentation: presentation) }
         .confirmationDialog("Terminate this session?", isPresented: $showTerminateConfirm,
                             titleVisibility: .visible) {
             Button("Terminate", role: .destructive) {
@@ -94,7 +102,14 @@ struct TerminalScreen: View {
     /// (SIGTERM→SIGKILL to the process group) over REST. Parity with the
     /// web client's Ctrl-C/Kill buttons.
     @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
+    private func toolbarContent(presentation: HarnessPresentation) -> some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            Label(presentation.name, systemImage: presentation.symbolName)
+                .labelStyle(.titleAndIcon)
+                .font(.headline)
+                .accessibilityIdentifier("terminal-harness-title")
+        }
+
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
                 Button {
