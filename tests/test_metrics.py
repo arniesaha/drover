@@ -1073,6 +1073,24 @@ def test_harness_request_no_endpoint_no_relay_is_502(collector_with_hosts) -> No
     assert "no reachable endpoint" in body
 
 
+def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> None:
+    # Top-level key confirmed by reading render_harness_json / harness_snapshot:
+    # it emits {"hosts": [...], "sessions": [...], "cwd_suggestions": [...]}.
+    collector = collector_with_hosts  # "laptop" registered connection_kind="relay", status "online"
+    collector.relay_manager = _FakeRelay()  # is_live: only "laptop"
+
+    payload = json.loads(collector.render_harness_json(include_sessions=False))
+    hosts = {h["host_id"]: h for h in payload["hosts"]}
+    assert hosts["laptop"]["connection_kind"] == "relay"
+    assert hosts["laptop"]["status"] == "online"
+
+    collector.relay_manager = None  # no live sockets at all
+    payload = json.loads(collector.render_harness_json(include_sessions=False))
+    hosts = {h["host_id"]: h for h in payload["hosts"]}
+    assert hosts["laptop"]["status"] == "offline"  # stored "online" must not leak
+    assert hosts["mini"]["status"] == "online"  # direct host keeps stored status
+
+
 def test_proxy_forwards_bearer_to_harnessd(tmp_path):
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)

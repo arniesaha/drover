@@ -348,8 +348,18 @@ def _native_resume_label(native_resume: Any) -> str | None:
     return _optional_str(native_resume.get("mode"))
 
 
-def _harness_host_dict(host: Any) -> dict[str, Any]:
+def _harness_host_dict(
+    host: Any, relay_manager: "RelayManager | None" = None
+) -> dict[str, Any]:
     item = dict(host.__dict__)
+    if item.get("connection_kind") == "relay":
+        # A relay host has no daemon-reported heartbeat to trust -- the hub's
+        # own live socket is ground truth, so it always wins over whatever
+        # status happens to be stored in the row (never leak a stale
+        # "online" once the socket has dropped, and vice versa).
+        is_live = relay_manager.is_live(host.host_id) if relay_manager else False
+        item["status"] = "online" if is_live else "offline"
+        return item
     last_seen_at = getattr(host, "last_seen_at", None)
     if last_seen_at is None:
         return item
@@ -836,7 +846,9 @@ class MetricsCollector:
                 hosts = registry.list_hosts() if include_hosts else []
                 sessions = registry.list_sessions() if include_sessions else []
                 return {
-                    "hosts": [_harness_host_dict(host) for host in hosts],
+                    "hosts": [
+                        _harness_host_dict(host, self.relay_manager) for host in hosts
+                    ],
                     "sessions": [session.__dict__ for session in sessions],
                     "cwd_suggestions": _harness_cwd_suggestions(
                         sessions, self.favorite_cwds
