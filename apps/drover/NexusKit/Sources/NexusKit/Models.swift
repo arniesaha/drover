@@ -284,7 +284,8 @@ public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashabl
         }
         if let caps = try? container.nestedContainer(keyedBy: CapabilitiesKeys.self, forKey: .capabilities) {
             displayName = (try? caps.decode(String.self, forKey: .displayName)) ?? ""
-            let entries = (try? caps.decode([HarnessEntry].self, forKey: .harnesses)) ?? []
+            let entriesWrapped = (try? caps.decode([LenientElement<HarnessEntry>].self, forKey: .harnesses)) ?? []
+            let entries = lenientDecode(HarnessEntry.self, from: entriesWrapped)
             harnesses = entries.filter(\.enabled).map(\.name)
         } else {
             displayName = ""

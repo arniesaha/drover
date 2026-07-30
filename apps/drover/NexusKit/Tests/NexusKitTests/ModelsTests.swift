@@ -310,3 +310,19 @@ func hostPresenceDerivation(status: String, expected: HostPresence) {
     let host = HostSummary.fixture(status: status)
     #expect(host.presence == expected)
 }
+
+/// Regression: a single malformed harness entry must not discard every
+/// other entry for the host — decoding is per-element lenient (mirrors
+/// `LenientElement`'s contract, already relied on elsewhere in this file),
+/// not whole-array lenient.
+@Test func hostSummaryHarnessesSkipOnlyMalformedEntries() throws {
+    let json = Data("""
+    {"host_id": "mac-mini", "status": "online",
+     "capabilities": {"display_name": "Mac Mini",
+                      "harnesses": [{"name": "claude-code", "enabled": true},
+                                    {"name": "broken-entry"},
+                                    {"name": "shell", "enabled": true}]}}
+    """.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.harnesses == ["claude-code", "shell"])
+}
