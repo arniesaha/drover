@@ -1,12 +1,13 @@
 import SwiftUI
 import NexusKit
 
-/// Three buckets over the live snapshot: sessions needing the user, sessions
-/// working, and finished sessions (collapsed). Polling starts as soon as the
-/// view appears and follows `scenePhase` thereafter; pull-to-refresh does a
-/// single one-off `refresh()`. Structured sessions navigate to the real
-/// `ChatView` (Task 7); PTY sessions navigate to `TerminalScreen` (Task 9),
-/// a live SwiftTerm view over the harness's terminal WebSocket.
+/// Fleet-first view over the live snapshot: one section per host (ordered
+/// online→stale→offline, waiting sessions first within each), plus finished
+/// sessions (collapsed). Polling starts as soon as the view appears and
+/// follows `scenePhase` thereafter; pull-to-refresh does a single one-off
+/// `refresh()`. Structured sessions navigate to the real `ChatView`
+/// (Task 7); PTY sessions navigate to `TerminalScreen` (Task 9), a live
+/// SwiftTerm view over the harness's terminal WebSocket.
 struct SessionsView: View {
     @State private var store: SessionStore
     private let client: NexusClient
@@ -30,12 +31,23 @@ struct SessionsView: View {
                 }
             }
 
-            Section("Needs you") {
-                bucket(store.needsYou, empty: "Nothing needs you right now.")
-            }
-
-            Section("Working") {
-                bucket(store.working, empty: "No sessions in progress.")
+            ForEach(store.hostGroups) { group in
+                Section {
+                    Group {
+                        if group.sessions.isEmpty {
+                            Text("No active sessions")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(group.sessions) { session in
+                                row(for: session)
+                            }
+                        }
+                    }
+                    .opacity(group.host.presence == .online ? 1 : 0.55)
+                } header: {
+                    HostSectionHeader(host: group.host)
+                }
             }
 
             if !store.finished.isEmpty {
@@ -93,17 +105,6 @@ struct SessionsView: View {
                 ChatView(client: client, sessionID: launched.id, harness: launched.harness)
             } else {
                 TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func bucket(_ sessions: [SessionSummary], empty: String) -> some View {
-        if sessions.isEmpty {
-            Text(empty).foregroundStyle(.secondary)
-        } else {
-            ForEach(sessions) { session in
-                row(for: session)
             }
         }
     }
