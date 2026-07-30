@@ -18,12 +18,41 @@ enum WireDate {
         return formatter
     }()
 
+    /// The hub serializes datetimes with Python's `str(datetime)`:
+    /// "2026-07-30 10:12:03.123456+00:00" — space separator, fraction and
+    /// offset both optional. Naive timestamps are UTC (same assumption as
+    /// the web UI's normalizer in static/harness.html).
+    /// DateFormatter parsing has been thread-safe since iOS 7; held the same
+    /// way as the ISO formatters above.
+    private static let serverFormatters: [DateFormatter] = [
+        "yyyy-MM-dd HH:mm:ss.SSSSSSxxxxx",
+        "yyyy-MM-dd HH:mm:ss.SSSSSS",
+        "yyyy-MM-dd HH:mm:ssxxxxx",
+        "yyyy-MM-dd HH:mm:ss",
+    ].map { pattern in
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = pattern
+        return formatter
+    }
+
+    private static func parseServerFormat(_ value: String) -> Date? {
+        for formatter in serverFormatters {
+            if let date = formatter.date(from: value) { return date }
+        }
+        return nil
+    }
+
     static func parse(_ string: String?) -> Date? {
         guard let string else { return nil }
         if let date = withFractionalSeconds.date(from: string) {
             return date
         }
-        return withoutFractionalSeconds.date(from: string)
+        if let date = withoutFractionalSeconds.date(from: string) {
+            return date
+        }
+        return parseServerFormat(string)
     }
 }
 

@@ -251,3 +251,24 @@ func harnessAuthFlowDropsNonAbsoluteLoginURL(rawURL: String) throws {
     let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
     #expect(flow.loginURL == nil)
 }
+
+@Test(arguments: [
+    ("2026-07-30 10:12:03.123456+00:00", true),
+    ("2026-07-30 10:12:03.123456", true),
+    ("2026-07-30 10:12:03+00:00", true),
+    ("2026-07-30 10:12:03", true),
+    ("2026-07-30T10:12:03Z", true),          // existing ISO path must keep working
+    ("2026-07-30T10:12:03.123Z", true),      // existing fractional ISO path
+    ("not a date", false),
+    ("", false),
+])
+func wireDateParsesServerAndISOFormats(raw: String, parses: Bool) {
+    #expect((WireDate.parse(raw) != nil) == parses)
+}
+
+@Test func wireDateTreatsNaiveTimestampAsUTC() {
+    let naive = WireDate.parse("2026-07-30 10:12:03")
+    let aware = WireDate.parse("2026-07-30 10:12:03+00:00")
+    #expect(naive != nil)
+    #expect(naive == aware)
+}
