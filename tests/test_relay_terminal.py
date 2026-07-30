@@ -423,3 +423,41 @@ def test_terminal_output_survives_a_wedged_event_mirror(
         blocked.set()
         app.close()
         thread.join(timeout=5)
+
+
+def test_event_mirror_close_does_not_leak_a_parked_worker_thread():
+    """N3: close()'s sentinel put is best-effort and can be dropped.
+
+    If the queue is exactly full when close() runs, `put_nowait(None)` is
+    silently suppressed. Before the `_closed` flag, the worker would then
+    drain its backlog and block forever in a plain `queue.get()`, leaking a
+    thread (and the registry it closes over) for the life of the process --
+    precisely under the overload the class exists to survive.
+    """
+    started = threading.Event()
+    wedge = threading.Event()
+
+    class _WedgedRegistry:
+        def append_events_if_new(self, records):
+            started.set()
+            wedge.wait(10)
+            return len(records)
+
+    mirror = app_module._EventMirror(_WedgedRegistry())
+    try:
+        # Get the worker parked inside append_events_if_new so everything
+        # offered after this piles up behind it instead of draining live.
+        mirror.offer({"event_id": "e-first"})
+        assert started.wait(5), "worker never started its first batch"
+
+        # Fill the queue to capacity so close()'s put_nowait(None) is
+        # guaranteed to hit queue.Full and be dropped.
+        for index in range(app_module.MIRROR_QUEUE_MAX):
+            mirror.offer({"event_id": f"e-{index}"})
+
+        mirror.close()
+    finally:
+        wedge.set()
+
+    mirror._thread.join(timeout=5)
+    assert not mirror._thread.is_alive(), "worker thread parked forever after close()"

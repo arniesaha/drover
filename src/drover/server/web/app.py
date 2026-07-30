@@ -122,6 +122,7 @@ class _EventMirror:
             maxsize=MIRROR_QUEUE_MAX
         )
         self._dropped = 0
+        self._closed = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="relay-event-mirror", daemon=True
         )
@@ -144,9 +145,16 @@ class _EventMirror:
 
         Not joined: the attach is over and the caller is a request handler.
         The worker is a daemon thread draining a bounded queue, so it ends on
-        its own, and the sentinel means it does so promptly rather than after
-        another poll interval.
+        its own -- but the sentinel `put_nowait` is best-effort: if the queue
+        is exactly full (the overload state this class exists for), it is
+        dropped under `suppress(queue.Full)`. Relying on the sentinel alone
+        would then park the worker forever in a blocking `get()` once it
+        drains the backlog, leaking a thread and the registry it closes over
+        for the life of the process. `_closed` is the guarantee: `_run`'s
+        wait is bounded, and once the queue is empty and `_closed` is set it
+        stops on its own even with no sentinel in sight.
         """
+        self._closed.set()
         with contextlib.suppress(queue.Full):
             self._queue.put_nowait(None)
 
@@ -165,7 +173,7 @@ class _EventMirror:
 
     def _next_batch(self) -> tuple[list[dict[str, Any]], bool]:
         """Block for one record, then sweep up everything already queued."""
-        first = self._queue.get()
+        first = self._next_record()
         if first is None:
             return [], True
         batch = [first]
@@ -180,6 +188,22 @@ class _EventMirror:
                 break
             batch.append(item)
         return batch, stopping
+
+    def _next_record(self) -> dict[str, Any] | None:
+        """Block for the next record, waking periodically to check `_closed`.
+
+        A plain `self._queue.get()` would hang forever if `close()`'s
+        sentinel was dropped for arriving on a full queue. Polling with a
+        timeout costs nothing on the common path -- every real record wakes
+        this immediately -- and bounds the worst case to one poll interval
+        past the backlog draining.
+        """
+        while True:
+            try:
+                return self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._closed.is_set() and self._queue.empty():
+                    return None
 
 
 class _BrowserSocket:
