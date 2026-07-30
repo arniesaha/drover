@@ -24,6 +24,18 @@ struct SessionsView: View {
 
     var body: some View {
         List {
+            // Action errors (e.g. a failed continueSession) land here — they
+            // don't touch `isReachable`, so they're distinct from the
+            // unreachable banner below: connected, but the last action
+            // failed. Refresh failures flip `isReachable` and route to the
+            // banner instead, keeping these two surfaces mutually exclusive.
+            if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
+                Section {
+                    Label(lastError, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
+            }
+
             ForEach(store.hostGroups) { group in
                 Section {
                     Group {
@@ -171,8 +183,10 @@ struct SessionsView: View {
     /// shell), then navigates into whichever the server created. Works on
     /// finished sessions too — the real "resume a dead session" path.
     /// `targetHarness` picks the new session's harness (nil keeps the
-    /// source's). Failures surface through the store's `lastError` banner at
-    /// the top of the list.
+    /// source's). Failures surface through the store's `lastError`, rendered
+    /// as an inline red-label section at the top of the list (while
+    /// connected — the unreachable banner takes over if the hub itself goes
+    /// offline).
     private func continueSession(_ session: SessionSummary, targetHarness: String? = nil) async {
         guard let continued = await store.continueSession(session.id, targetHarness: targetHarness) else {
             return
