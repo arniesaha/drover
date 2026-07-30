@@ -23,10 +23,14 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # line.
 MAX_HANDSHAKE_HEAD_BYTES = 65536
 
-# Largest frame we will read. Generous by two orders of magnitude for what
-# actually crosses these sockets: JSON control frames, and PTY chunks the
-# daemon caps at 8192 bytes.
-MAX_FRAME_BYTES = 1 << 20
+# Largest frame we will read. Bounds three traffic classes that cross these
+# sockets: JSON control frames, PTY chunks the daemon caps at 8192 bytes, and
+# `res` frames carrying a proxied HTTP response body -- the largest of which
+# is native-transcript, clipped per-record by the daemon but still able to
+# reach ~1.2 MB across 100 records plus JSON overhead. 8 MiB keeps that
+# comfortably inside the cap while still bounding the attack the cap exists
+# for (a peer announcing a multi-gigabyte length to force an allocation).
+MAX_FRAME_BYTES = 8 << 20
 
 OPCODE_CONTINUATION = 0x0
 OPCODE_TEXT = 0x1

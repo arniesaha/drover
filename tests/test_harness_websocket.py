@@ -583,3 +583,45 @@ def test_recv_frame_still_accepts_a_large_but_legal_frame():
         thread.join(timeout=5)
         client.close()
         server.close()
+
+
+def test_recv_frame_round_trips_a_two_megabyte_frame():
+    """`res` frames proxy whole HTTP bodies -- native-transcript can approach
+    ~1.2 MB (see N2 in the relay re-review). The cap must clear that with
+    comfortable margin, not just PTY-sized chunks.
+    """
+    from drover.server.harness.websocket import MAX_FRAME_BYTES, send_frame
+
+    server, client = socket.socketpair()
+    payload = b"y" * (2 * 1024 * 1024)
+    assert len(payload) <= MAX_FRAME_BYTES
+    thread = threading.Thread(
+        target=lambda: send_frame(server, 0x1, payload), daemon=True
+    )
+    thread.start()
+    try:
+        client.settimeout(10)
+        assert recv_frame(client).payload == payload
+    finally:
+        thread.join(timeout=10)
+        client.close()
+        server.close()
+
+
+def test_recv_frame_refuses_a_frame_over_the_eight_mebibyte_cap():
+    """The cap itself must land at 8 MiB, not silently drift back down."""
+    from drover.server.harness.websocket import MAX_FRAME_BYTES
+
+    assert MAX_FRAME_BYTES == 8 * 1024 * 1024
+
+    server, client = socket.socketpair()
+    try:
+        length = MAX_FRAME_BYTES + 1
+        server.sendall(bytes([0x81, 127]) + length.to_bytes(8, "big"))
+        client.settimeout(5)
+        with pytest.raises(WebSocketClosed) as caught:
+            recv_frame(client)
+        assert "exceeds" in str(caught.value)
+    finally:
+        client.close()
+        server.close()
