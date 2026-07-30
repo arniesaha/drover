@@ -1,12 +1,13 @@
 import SwiftUI
 import NexusKit
 
-/// Three buckets over the live snapshot: sessions needing the user, sessions
-/// working, and finished sessions (collapsed). Polling starts as soon as the
-/// view appears and follows `scenePhase` thereafter; pull-to-refresh does a
-/// single one-off `refresh()`. Structured sessions navigate to the real
-/// `ChatView` (Task 7); PTY sessions navigate to `TerminalScreen` (Task 9),
-/// a live SwiftTerm view over the harness's terminal WebSocket.
+/// Fleet-first view over the live snapshot: one section per host (ordered
+/// online→stale→offline, waiting sessions first within each), plus finished
+/// sessions (collapsed). Polling starts as soon as the view appears and
+/// follows `scenePhase` thereafter; pull-to-refresh does a single one-off
+/// `refresh()`. Structured sessions navigate to the real `ChatView`
+/// (Task 7); PTY sessions navigate to `TerminalScreen` (Task 9), a live
+/// SwiftTerm view over the harness's terminal WebSocket.
 struct SessionsView: View {
     @State private var store: SessionStore
     private let client: NexusClient
@@ -23,19 +24,35 @@ struct SessionsView: View {
 
     var body: some View {
         List {
-            if let lastError = store.lastError {
+            // Action errors (e.g. a failed continueSession) land here — they
+            // don't touch `isReachable`, so they're distinct from the
+            // unreachable banner below: connected, but the last action
+            // failed. Refresh failures flip `isReachable` and route to the
+            // banner instead, keeping these two surfaces mutually exclusive.
+            if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
                 Section {
                     Label(lastError, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.red)
                 }
             }
 
-            Section("Needs you") {
-                bucket(store.needsYou, empty: "Nothing needs you right now.")
-            }
-
-            Section("Working") {
-                bucket(store.working, empty: "No sessions in progress.")
+            ForEach(store.hostGroups) { group in
+                Section {
+                    Group {
+                        if group.sessions.isEmpty {
+                            Text("No active sessions")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(group.sessions) { session in
+                                row(for: session)
+                            }
+                        }
+                    }
+                    .opacity(group.host.presence == .online ? 1 : 0.55)
+                } header: {
+                    HostSectionHeader(host: group.host)
+                }
             }
 
             if !store.finished.isEmpty {
@@ -47,6 +64,32 @@ struct SessionsView: View {
             }
         }
         .navigationTitle("Sessions")
+        .opacity(store.hasLoadedOnce && !store.isReachable ? 0.5 : 1)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if store.hasLoadedOnce && !store.isReachable {
+                UnreachableBanner(message: store.lastError ?? "Server unreachable") {
+                    Task { await store.refresh() }
+                }
+            }
+        }
+        .overlay {
+            if !store.hasLoadedOnce {
+                if let error = store.lastError {
+                    ContentUnavailableView {
+                        Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+                    } description: {
+                        Text(error)
+                    } actions: {
+                        Button("Retry") {
+                            Task { await store.refresh() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    ProgressView("Connecting…")
+                }
+            }
+        }
         .refreshable { await store.refresh() }
         .task { store.startPolling() }
         .onChange(of: scenePhase) { _, phase in
@@ -97,17 +140,6 @@ struct SessionsView: View {
         }
     }
 
-    @ViewBuilder
-    private func bucket(_ sessions: [SessionSummary], empty: String) -> some View {
-        if sessions.isEmpty {
-            Text(empty).foregroundStyle(.secondary)
-        } else {
-            ForEach(sessions) { session in
-                row(for: session)
-            }
-        }
-    }
-
     private func row(for session: SessionSummary) -> some View {
         NavigationLink {
             if session.isStructured {
@@ -151,8 +183,10 @@ struct SessionsView: View {
     /// shell), then navigates into whichever the server created. Works on
     /// finished sessions too — the real "resume a dead session" path.
     /// `targetHarness` picks the new session's harness (nil keeps the
-    /// source's). Failures surface through the store's `lastError` banner at
-    /// the top of the list.
+    /// source's). Failures surface through the store's `lastError`, rendered
+    /// as an inline red-label section at the top of the list (while
+    /// connected — the unreachable banner takes over if the hub itself goes
+    /// offline).
     private func continueSession(_ session: SessionSummary, targetHarness: String? = nil) async {
         guard let continued = await store.continueSession(session.id, targetHarness: targetHarness) else {
             return

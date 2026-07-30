@@ -18,12 +18,41 @@ enum WireDate {
         return formatter
     }()
 
+    /// The hub serializes datetimes with Python's `str(datetime)`:
+    /// "2026-07-30 10:12:03.123456+00:00" — space separator, fraction and
+    /// offset both optional. Naive timestamps are UTC (same assumption as
+    /// the web UI's normalizer in static/harness.html).
+    /// DateFormatter parsing has been thread-safe since iOS 7; the plain
+    /// static needs no `nonisolated(unsafe)`, unlike the ISO formatters above.
+    private static let serverFormatters: [DateFormatter] = [
+        "yyyy-MM-dd HH:mm:ss.SSSSSSxxxxx",
+        "yyyy-MM-dd HH:mm:ss.SSSSSS",
+        "yyyy-MM-dd HH:mm:ssxxxxx",
+        "yyyy-MM-dd HH:mm:ss",
+    ].map { pattern in
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = pattern
+        return formatter
+    }
+
+    private static func parseServerFormat(_ value: String) -> Date? {
+        for formatter in serverFormatters {
+            if let date = formatter.date(from: value) { return date }
+        }
+        return nil
+    }
+
     static func parse(_ string: String?) -> Date? {
         guard let string else { return nil }
         if let date = withFractionalSeconds.date(from: string) {
             return date
         }
-        return withoutFractionalSeconds.date(from: string)
+        if let date = withoutFractionalSeconds.date(from: string) {
+            return date
+        }
+        return parseServerFormat(string)
     }
 }
 
@@ -201,15 +230,35 @@ public enum JSONValue: Sendable, Equatable, Decodable {
 
 // MARK: - HostSummary
 
-public struct HostSummary: Sendable, Identifiable, Decodable {
+public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashable {
     public var id: String        // host_id
     public var displayName: String
-    public var status: String    // "online"/"offline"
+    public var status: String    // "online"/"stale"/"offline"
+    public var connectionKind: String
+    public var lastSeenAt: Date?
     public var harnesses: [String]  // enabled preset names from capabilities
+
+    public init(
+        id: String,
+        displayName: String,
+        status: String,
+        connectionKind: String = "direct",
+        lastSeenAt: Date? = nil,
+        harnesses: [String] = []
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.status = status
+        self.connectionKind = connectionKind
+        self.lastSeenAt = lastSeenAt
+        self.harnesses = harnesses
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id = "host_id"
         case status
+        case connectionKind = "connection_kind"
+        case lastSeenAt = "last_seen_at"
         case capabilities
     }
 
@@ -227,10 +276,15 @@ public struct HostSummary: Sendable, Identifiable, Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         status = (try? container.decode(String.self, forKey: .status)) ?? ""
-
-        if let capabilities = try? container.nestedContainer(keyedBy: CapabilitiesKeys.self, forKey: .capabilities) {
-            displayName = (try? capabilities.decode(String.self, forKey: .displayName)) ?? ""
-            let entriesWrapped = (try? capabilities.decode([LenientElement<HarnessEntry>].self, forKey: .harnesses)) ?? []
+        connectionKind = (try? container.decode(String.self, forKey: .connectionKind)) ?? "direct"
+        if let raw = try? container.decode(String.self, forKey: .lastSeenAt) {
+            lastSeenAt = WireDate.parse(raw)
+        } else {
+            lastSeenAt = nil
+        }
+        if let caps = try? container.nestedContainer(keyedBy: CapabilitiesKeys.self, forKey: .capabilities) {
+            displayName = (try? caps.decode(String.self, forKey: .displayName)) ?? ""
+            let entriesWrapped = (try? caps.decode([LenientElement<HarnessEntry>].self, forKey: .harnesses)) ?? []
             let entries = lenientDecode(HarnessEntry.self, from: entriesWrapped)
             harnesses = entries.filter(\.enabled).map(\.name)
         } else {
@@ -238,6 +292,27 @@ public struct HostSummary: Sendable, Identifiable, Decodable {
             harnesses = []
         }
     }
+}
+
+/// Three-way host presence. Relay hosts are socket-truth online/offline
+/// (never stale); direct hosts are heartbeat-based online/stale (never
+/// offline). Unknown/empty statuses render as offline.
+public enum HostPresence: String, Sendable {
+    case online, stale, offline
+}
+
+extension HostSummary {
+    public var presence: HostPresence {
+        switch status {
+        case "online": return .online
+        case "stale": return .stale
+        default: return .offline
+        }
+    }
+
+    public var isRelay: Bool { connectionKind == "relay" }
+
+    public var title: String { displayName.isEmpty ? id : displayName }
 }
 
 // MARK: - SessionSummary

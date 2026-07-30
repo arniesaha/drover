@@ -182,6 +182,7 @@ public actor NexusClient {
         }
         var urlRequest = URLRequest(url: url.absoluteURL)
         urlRequest.httpMethod = method
+        urlRequest.timeoutInterval = 15
         urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         if let body {
             urlRequest.httpBody = body

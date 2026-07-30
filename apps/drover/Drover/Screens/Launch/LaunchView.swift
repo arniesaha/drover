@@ -30,7 +30,7 @@ struct LaunchView: View {
             Section("Host") {
                 Picker("Host", selection: $model.hostID) {
                     ForEach(model.availableHosts) { host in
-                        Text(host.displayName.isEmpty ? host.id : host.displayName)
+                        Text(host.title)
                             .tag(host.id)
                     }
                 }

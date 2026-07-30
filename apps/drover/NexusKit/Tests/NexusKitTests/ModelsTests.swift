@@ -251,3 +251,78 @@ func harnessAuthFlowDropsNonAbsoluteLoginURL(rawURL: String) throws {
     let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
     #expect(flow.loginURL == nil)
 }
+
+@Test(arguments: [
+    ("2026-07-30 10:12:03.123456+00:00", true),
+    ("2026-07-30 10:12:03.123456", true),
+    ("2026-07-30 10:12:03+00:00", true),
+    ("2026-07-30 10:12:03", true),
+    ("2026-07-30T10:12:03Z", true),          // existing ISO path must keep working
+    ("2026-07-30T10:12:03.123Z", true),      // existing fractional ISO path
+    ("not a date", false),
+    ("", false),
+])
+func wireDateParsesServerAndISOFormats(raw: String, parses: Bool) {
+    #expect((WireDate.parse(raw) != nil) == parses)
+}
+
+@Test func wireDateTreatsNaiveTimestampAsUTC() {
+    let naive = WireDate.parse("2026-07-30 10:12:03")
+    let aware = WireDate.parse("2026-07-30 10:12:03+00:00")
+    #expect(naive != nil)
+    #expect(naive == aware)
+}
+
+@Test func hostSummaryDecodesFleetFields() throws {
+    let json = Data("""
+    {"host_id": "work-laptop", "status": "offline", "connection_kind": "relay",
+     "last_seen_at": "2026-07-30 10:12:03.123456+00:00", "kind": "laptop",
+     "capabilities": {"display_name": "Work Laptop",
+                      "harnesses": [{"name": "claude-code", "enabled": true},
+                                    {"name": "shell", "enabled": false}]}}
+    """.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.id == "work-laptop")
+    #expect(host.displayName == "Work Laptop")
+    #expect(host.connectionKind == "relay")
+    #expect(host.isRelay)
+    #expect(host.lastSeenAt != nil)
+    #expect(host.harnesses == ["claude-code"])
+}
+
+@Test func hostSummaryDefaultsWhenFleetFieldsAbsent() throws {
+    let json = Data(#"{"host_id": "mac-mini", "status": "online"}"#.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.connectionKind == "direct")
+    #expect(host.isRelay == false)
+    #expect(host.lastSeenAt == nil)
+    #expect(host.title == "mac-mini")   // displayName empty → falls back to id
+}
+
+@Test(arguments: [
+    ("online", HostPresence.online),
+    ("stale", HostPresence.stale),
+    ("offline", HostPresence.offline),
+    ("", HostPresence.offline),
+    ("mystery", HostPresence.offline),
+])
+func hostPresenceDerivation(status: String, expected: HostPresence) {
+    let host = HostSummary.fixture(status: status)
+    #expect(host.presence == expected)
+}
+
+/// Regression: a single malformed harness entry must not discard every
+/// other entry for the host — decoding is per-element lenient (mirrors
+/// `LenientElement`'s contract, already relied on elsewhere in this file),
+/// not whole-array lenient.
+@Test func hostSummaryHarnessesSkipOnlyMalformedEntries() throws {
+    let json = Data("""
+    {"host_id": "mac-mini", "status": "online",
+     "capabilities": {"display_name": "Mac Mini",
+                      "harnesses": [{"name": "claude-code", "enabled": true},
+                                    {"name": "broken-entry"},
+                                    {"name": "shell", "enabled": true}]}}
+    """.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.harnesses == ["claude-code", "shell"])
+}
