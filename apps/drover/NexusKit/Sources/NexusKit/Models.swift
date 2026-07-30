@@ -230,15 +230,35 @@ public enum JSONValue: Sendable, Equatable, Decodable {
 
 // MARK: - HostSummary
 
-public struct HostSummary: Sendable, Identifiable, Decodable {
+public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashable {
     public var id: String        // host_id
     public var displayName: String
-    public var status: String    // "online"/"offline"
+    public var status: String    // "online"/"stale"/"offline"
+    public var connectionKind: String
+    public var lastSeenAt: Date?
     public var harnesses: [String]  // enabled preset names from capabilities
+
+    public init(
+        id: String,
+        displayName: String,
+        status: String,
+        connectionKind: String = "direct",
+        lastSeenAt: Date? = nil,
+        harnesses: [String] = []
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.status = status
+        self.connectionKind = connectionKind
+        self.lastSeenAt = lastSeenAt
+        self.harnesses = harnesses
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id = "host_id"
         case status
+        case connectionKind = "connection_kind"
+        case lastSeenAt = "last_seen_at"
         case capabilities
     }
 
@@ -256,17 +276,42 @@ public struct HostSummary: Sendable, Identifiable, Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         status = (try? container.decode(String.self, forKey: .status)) ?? ""
-
-        if let capabilities = try? container.nestedContainer(keyedBy: CapabilitiesKeys.self, forKey: .capabilities) {
-            displayName = (try? capabilities.decode(String.self, forKey: .displayName)) ?? ""
-            let entriesWrapped = (try? capabilities.decode([LenientElement<HarnessEntry>].self, forKey: .harnesses)) ?? []
-            let entries = lenientDecode(HarnessEntry.self, from: entriesWrapped)
+        connectionKind = (try? container.decode(String.self, forKey: .connectionKind)) ?? "direct"
+        if let raw = try? container.decode(String.self, forKey: .lastSeenAt) {
+            lastSeenAt = WireDate.parse(raw)
+        } else {
+            lastSeenAt = nil
+        }
+        if let caps = try? container.nestedContainer(keyedBy: CapabilitiesKeys.self, forKey: .capabilities) {
+            displayName = (try? caps.decode(String.self, forKey: .displayName)) ?? ""
+            let entries = (try? caps.decode([HarnessEntry].self, forKey: .harnesses)) ?? []
             harnesses = entries.filter(\.enabled).map(\.name)
         } else {
             displayName = ""
             harnesses = []
         }
     }
+}
+
+/// Three-way host presence. Relay hosts are socket-truth online/offline
+/// (never stale); direct hosts are heartbeat-based online/stale (never
+/// offline). Unknown/empty statuses render as offline.
+public enum HostPresence: String, Sendable {
+    case online, stale, offline
+}
+
+extension HostSummary {
+    public var presence: HostPresence {
+        switch status {
+        case "online": return .online
+        case "stale": return .stale
+        default: return .offline
+        }
+    }
+
+    public var isRelay: Bool { connectionKind == "relay" }
+
+    public var title: String { displayName.isEmpty ? id : displayName }
 }
 
 // MARK: - SessionSummary

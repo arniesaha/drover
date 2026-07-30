@@ -272,3 +272,41 @@ func wireDateParsesServerAndISOFormats(raw: String, parses: Bool) {
     #expect(naive != nil)
     #expect(naive == aware)
 }
+
+@Test func hostSummaryDecodesFleetFields() throws {
+    let json = Data("""
+    {"host_id": "work-laptop", "status": "offline", "connection_kind": "relay",
+     "last_seen_at": "2026-07-30 10:12:03.123456+00:00", "kind": "laptop",
+     "capabilities": {"display_name": "Work Laptop",
+                      "harnesses": [{"name": "claude-code", "enabled": true},
+                                    {"name": "shell", "enabled": false}]}}
+    """.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.id == "work-laptop")
+    #expect(host.displayName == "Work Laptop")
+    #expect(host.connectionKind == "relay")
+    #expect(host.isRelay)
+    #expect(host.lastSeenAt != nil)
+    #expect(host.harnesses == ["claude-code"])
+}
+
+@Test func hostSummaryDefaultsWhenFleetFieldsAbsent() throws {
+    let json = Data(#"{"host_id": "mac-mini", "status": "online"}"#.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.connectionKind == "direct")
+    #expect(host.isRelay == false)
+    #expect(host.lastSeenAt == nil)
+    #expect(host.title == "mac-mini")   // displayName empty → falls back to id
+}
+
+@Test(arguments: [
+    ("online", HostPresence.online),
+    ("stale", HostPresence.stale),
+    ("offline", HostPresence.offline),
+    ("", HostPresence.offline),
+    ("mystery", HostPresence.offline),
+])
+func hostPresenceDerivation(status: String, expected: HostPresence) {
+    let host = HostSummary.fixture(status: status)
+    #expect(host.presence == expected)
+}
