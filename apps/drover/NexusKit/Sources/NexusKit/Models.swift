@@ -22,8 +22,8 @@ enum WireDate {
     /// "2026-07-30 10:12:03.123456+00:00" — space separator, fraction and
     /// offset both optional. Naive timestamps are UTC (same assumption as
     /// the web UI's normalizer in static/harness.html).
-    /// DateFormatter parsing has been thread-safe since iOS 7; held the same
-    /// way as the ISO formatters above.
+    /// DateFormatter parsing has been thread-safe since iOS 7; the plain
+    /// static needs no `nonisolated(unsafe)`, unlike the ISO formatters above.
     private static let serverFormatters: [DateFormatter] = [
         "yyyy-MM-dd HH:mm:ss.SSSSSSxxxxx",
         "yyyy-MM-dd HH:mm:ss.SSSSSS",

@@ -143,7 +143,6 @@ struct TerminalScreen: View {
             terminateHint = "Could not terminate — try again."
         }
     }
-
 }
 
 /// Lets the SwiftUI screen reach the representable's coordinator (for the

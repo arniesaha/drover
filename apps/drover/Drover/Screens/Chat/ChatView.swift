@@ -178,7 +178,6 @@ struct ChatView: View {
         }
     }
 
-
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .principal) {

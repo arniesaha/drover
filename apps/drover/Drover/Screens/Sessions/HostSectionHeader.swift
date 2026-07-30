@@ -40,7 +40,9 @@ struct HostSectionHeader: View {
     }
 
     private var lastSeenText: String {
-        guard let lastSeenAt = host.lastSeenAt else { return "offline" }
+        guard let lastSeenAt = host.lastSeenAt else {
+            return host.presence == .stale ? "last seen unknown" : "offline"
+        }
         let relative = lastSeenAt.formatted(.relative(presentation: .named))
         return "last seen \(relative)"
     }

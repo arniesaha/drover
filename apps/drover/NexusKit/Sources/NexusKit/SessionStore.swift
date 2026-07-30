@@ -153,12 +153,11 @@ public final class SessionStore {
     // MARK: - Handoff
 
     /// Server-side handoff from the session list: returns the new session
-    /// (id plus whether it's structured, for navigation), or nil on failure
-    /// with the explanation routed through `lastError` (the same banner
-    /// refresh failures use). 409/400 carry a server-authored message
-    /// surfaced verbatim; anything else gets a generic hint. `targetHarness`
-    /// retargets the new session's harness; nil keeps the source session's
-    /// own.
+    /// (id plus whether it's structured, for navigation), or nil on failure.
+    /// Refresh failures flip `isReachable` and surface in the unreachable
+    /// banner; action failures keep `isReachable == true` and surface in the
+    /// sessions list's inline error section. `targetHarness` retargets the
+    /// new session's harness; nil keeps the source session's own.
     public func continueSession(_ sessionID: String, targetHarness: String? = nil) async -> ContinuedSession? {
         guard let client else { return nil }
         do {
