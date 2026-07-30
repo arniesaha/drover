@@ -2,7 +2,7 @@ import NexusKit
 import SwiftUI
 
 /// Fleet section header: presence dot, host name, relay badge, last-seen.
-/// Green = live, amber = stale (missed heartbeats, may recover),
+/// Green = live, orange = stale (missed heartbeats, may recover),
 /// gray = offline (relay socket down, or host unknown to the hub).
 struct HostSectionHeader: View {
     let host: HostSummary
@@ -25,9 +25,9 @@ struct HostSectionHeader: View {
                 Text(lastSeenText)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .textCase(nil)
             }
         }
+        .textCase(nil)
         .accessibilityIdentifier("host-header-\(host.id)")
     }
 
