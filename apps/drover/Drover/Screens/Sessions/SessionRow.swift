@@ -27,11 +27,7 @@ struct SessionRow: View {
                         .padding(.vertical, 2)
                         .background(.tint.opacity(0.14), in: Capsule())
 
-                    Text(session.hostID)
-                        .font(.caption2)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.secondary.opacity(0.15), in: Capsule())
+                    StatusChip(attention: session.attention)
 
                     if let lastActivity = session.lastActivity {
                         Text(lastActivity, format: .relative(presentation: .named))
