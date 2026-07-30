@@ -51,7 +51,7 @@ xcodebuild -project Drover.xcodeproj -scheme Drover \
   test
 ```
 
-Expect `** TEST SUCCEEDED **`. As of this writing that's 74 tests in 1 suite.
+Expect `** TEST SUCCEEDED **`. As of this writing that's 154 tests in 13 suites.
 
 UI tests (`DroverUITests`) use a separate scheme, since they exercise a
 different test target:
