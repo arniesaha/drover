@@ -53,7 +53,7 @@ struct TerminalScreen: View {
         let presentation = HarnessPresentation(harness ?? "shell")
         VStack(spacing: 0) {
             if hasConnectedOnce && isReconnecting && !sessionEnded {
-                reconnectingPill
+                ReconnectingPill(accessibilityID: "terminal-reconnecting")
             }
             if let terminateHint {
                 Text(terminateHint)
@@ -144,18 +144,6 @@ struct TerminalScreen: View {
         }
     }
 
-    private var reconnectingPill: some View {
-        HStack(spacing: 6) {
-            ProgressView().scaleEffect(0.7)
-            Text("Reconnecting…")
-        }
-        .font(.caption)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(.secondary.opacity(0.15), in: Capsule())
-        .padding(.vertical, 6)
-        .accessibilityIdentifier("terminal-reconnecting")
-    }
 }
 
 /// Lets the SwiftUI screen reach the representable's coordinator (for the

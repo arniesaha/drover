@@ -30,7 +30,7 @@ struct ChatView: View {
             // "Reconnecting…" pill; during the initial connect it would just
             // flash misleading chrome.
             if model.hasConnectedOnce && !model.isConnected {
-                reconnectingPill
+                ReconnectingPill(accessibilityID: "chat-reconnecting")
             }
 
             transcript
@@ -178,17 +178,6 @@ struct ChatView: View {
         }
     }
 
-    private var reconnectingPill: some View {
-        HStack(spacing: 6) {
-            ProgressView().scaleEffect(0.7)
-            Text("Reconnecting…")
-        }
-        .font(.caption)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(.secondary.opacity(0.15), in: Capsule())
-        .padding(.top, 6)
-    }
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
