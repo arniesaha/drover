@@ -24,13 +24,6 @@ struct SessionsView: View {
 
     var body: some View {
         List {
-            if let lastError = store.lastError {
-                Section {
-                    Label(lastError, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.red)
-                }
-            }
-
             ForEach(store.hostGroups) { group in
                 Section {
                     Group {
@@ -59,6 +52,32 @@ struct SessionsView: View {
             }
         }
         .navigationTitle("Sessions")
+        .opacity(store.hasLoadedOnce && !store.isReachable ? 0.5 : 1)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if store.hasLoadedOnce && !store.isReachable {
+                UnreachableBanner(message: store.lastError ?? "Server unreachable") {
+                    Task { await store.refresh() }
+                }
+            }
+        }
+        .overlay {
+            if !store.hasLoadedOnce {
+                if let error = store.lastError {
+                    ContentUnavailableView {
+                        Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+                    } description: {
+                        Text(error)
+                    } actions: {
+                        Button("Retry") {
+                            Task { await store.refresh() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    ProgressView("Connecting…")
+                }
+            }
+        }
         .refreshable { await store.refresh() }
         .task { store.startPolling() }
         .onChange(of: scenePhase) { _, phase in
