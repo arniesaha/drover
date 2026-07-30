@@ -199,6 +199,19 @@ fleet) are **not implemented yet** — tracked as a follow-up issue, not a gap
 to work around today. Don't hand out the shared token to anything you don't
 fully trust.
 
+With one shared token, any holder of it can also **claim any `host_id`** on
+the relay endpoint, not just read data: a relay spoke attaches by declaring
+its own `host_id` in its hello, attach is newest-wins, and nothing ties a
+`host_id` to a specific token or client. A second spoke that attaches with
+an existing host's `host_id` silently displaces the real one — the fleet
+keeps showing that host as online, but every request routed to it now
+executes on the impersonator instead. This is a silent takeover, not a loud
+one: there is no conflict error, no alert, just a different machine quietly
+answering in that host's name. Per-host tokens are the tracked follow-up
+that closes this. Treat it as a live property of today's setup, and decide
+deliberately — before enrolling a machine you don't fully control, such as a
+corporate laptop — rather than discovering it later.
+
 ## Troubleshooting
 
 **Relay host shows offline in the app:**
