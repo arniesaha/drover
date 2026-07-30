@@ -73,7 +73,7 @@ let messagesJSON = Data("""
 """.utf8)
 
 extension SessionSummary {
-    static func fixture(id: String = "fixture-session", hostID: String = "fixture-host", status: String, awaiting: String?) -> SessionSummary {
+    static func fixture(id: String = "fixture-session", status: String, awaiting: String?, hostID: String = "fixture-host") -> SessionSummary {
         SessionSummary(
             id: id,
             hostID: hostID,

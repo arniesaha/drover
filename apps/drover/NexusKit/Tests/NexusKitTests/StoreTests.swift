@@ -82,6 +82,33 @@ struct StoreTests {
     #expect(store.lastError == "Couldn't start handoff — is the host online?")
 }
 
+@Test @MainActor func hasLoadedOnceFlipsOnFirstSuccessfulRefresh() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    #expect(store.hasLoadedOnce == false)
+    await store.refresh()
+    #expect(store.hasLoadedOnce)
+}
+
+@Test @MainActor func hasLoadedOnceSurvivesLaterFailure() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    MockURLProtocol.handler = { _ in (500, Data()) }
+    await store.refresh()
+    #expect(store.hasLoadedOnce)
+    #expect(store.isReachable == false)
+    #expect(store.snapshot != nil)   // last-known state kept, list never blanks
+}
+
+@Test @MainActor func fleetSnapshotProducesHostGroups() async throws {
+    MockURLProtocol.handler = { _ in (200, fleetSnapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    #expect(store.hostGroups.map(\.id) == ["mac-mini", "nas", "ghost-host", "work-laptop"])
+    #expect(store.hostGroups[0].sessions.map(\.id) == ["mac-input", "mac-running"])
+}
+
 }
 
 }  // extension MockNetworkTests

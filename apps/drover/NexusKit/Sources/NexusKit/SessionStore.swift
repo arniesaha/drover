@@ -1,6 +1,20 @@
 import Foundation
 import Observation
 
+/// One host's slice of the fleet: the host row plus its *active* sessions
+/// (needs-approval / needs-input / working), waiting-first.
+public struct HostGroup: Sendable, Equatable, Identifiable {
+    public let host: HostSummary
+    public let sessions: [SessionSummary]
+
+    public var id: String { host.id }
+
+    public init(host: HostSummary, sessions: [SessionSummary]) {
+        self.host = host
+        self.sessions = sessions
+    }
+}
+
 /// Observable façade over a `NexusClient` snapshot: buckets sessions by what
 /// the user needs to do about them, polls on an interval, and never loses
 /// the last-known-good snapshot just because a refresh failed.
@@ -12,6 +26,11 @@ public final class SessionStore {
     public private(set) var snapshot: HarnessSnapshot?
     public private(set) var lastError: String?
     public private(set) var isReachable: Bool = false
+
+    /// True once any refresh has succeeded. Lets the UI distinguish
+    /// "never loaded" (spinner / retriable error) from "loaded but empty".
+    /// Never reset: after first success the list renders last-known state.
+    public private(set) var hasLoadedOnce = false
 
     // `nonisolated(unsafe)` solely so `deinit` (nonisolated in Swift 6) can
     // cancel it; every other access is from `@MainActor` methods, and deinit
@@ -51,6 +70,69 @@ public final class SessionStore {
             .sorted(by: Self.byLastActivityDescending)
     }
 
+    /// Sessions grouped by host, fleet-first: online hosts before stale
+    /// before offline, waiting sessions at the top of their group. Hosts
+    /// with no active sessions still appear (the one-glance fleet view);
+    /// sessions whose host the hub no longer lists get a synthesized
+    /// offline group rather than vanishing.
+    public var hostGroups: [HostGroup] {
+        Self.hostGroups(hosts: snapshot?.hosts ?? [], sessions: snapshot?.sessions ?? [])
+    }
+
+    public nonisolated static func hostGroups(
+        hosts: [HostSummary],
+        sessions: [SessionSummary]
+    ) -> [HostGroup] {
+        let active = sessions.filter {
+            switch $0.attention {
+            case .needsApproval, .needsInput, .working: return true
+            case .done, .errored: return false
+            }
+        }
+        var byHost = Dictionary(grouping: active, by: \.hostID)
+        var groups = hosts.map { host in
+            HostGroup(
+                host: host,
+                sessions: (byHost.removeValue(forKey: host.id) ?? []).sorted(by: groupOrdering)
+            )
+        }
+        for (hostID, orphans) in byHost {
+            groups.append(HostGroup(
+                host: HostSummary(id: hostID, displayName: hostID, status: "offline"),
+                sessions: orphans.sorted(by: groupOrdering)
+            ))
+        }
+        return groups.sorted(by: hostOrdering)
+    }
+
+    private nonisolated static func attentionRank(_ session: SessionSummary) -> Int {
+        switch session.attention {
+        case .needsApproval: return 0
+        case .needsInput: return 1
+        default: return 2
+        }
+    }
+
+    private nonisolated static func groupOrdering(_ a: SessionSummary, _ b: SessionSummary) -> Bool {
+        let (ra, rb) = (attentionRank(a), attentionRank(b))
+        if ra != rb { return ra < rb }
+        return byLastActivityDescending(a, b)
+    }
+
+    private nonisolated static func presenceRank(_ host: HostSummary) -> Int {
+        switch host.presence {
+        case .online: return 0
+        case .stale: return 1
+        case .offline: return 2
+        }
+    }
+
+    private nonisolated static func hostOrdering(_ a: HostGroup, _ b: HostGroup) -> Bool {
+        let (ra, rb) = (presenceRank(a.host), presenceRank(b.host))
+        if ra != rb { return ra < rb }
+        return a.host.title.localizedCaseInsensitiveCompare(b.host.title) == .orderedAscending
+    }
+
     // MARK: - Refresh
 
     public func refresh() async {
@@ -60,6 +142,7 @@ public final class SessionStore {
             snapshot = fresh
             lastError = nil
             isReachable = true
+            hasLoadedOnce = true
         } catch {
             isReachable = false
             lastError = Self.errorMessage(for: error)
@@ -139,7 +222,7 @@ public final class SessionStore {
         return byLastActivityDescending(lhs, rhs)
     }
 
-    private static func byLastActivityDescending(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+    private nonisolated static func byLastActivityDescending(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
         switch (lhs.lastActivity, rhs.lastActivity) {
         case let (l?, r?): return l > r
         case (nil, nil): return false
