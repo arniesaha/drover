@@ -21,8 +21,9 @@ M4's actual scope is the remaining gaps:
 1. Copy — `TerminalBridge.clipboardCopy` is a no-op; selection copies nothing.
 2. Paste — no affordance at all.
 3. Pinch-zoom — no font scaling.
-4. Sticky Ctrl — verify SwiftTerm's accessory Ctrl toggle behavior; work item
-   only if it doesn't latch usably.
+4. Sticky Ctrl — resolved during planning: SwiftTerm's accessory Ctrl toggle
+   already latches for exactly one next keypress then auto-clears
+   (`controlModifier` reset after send), matching Termius. No work needed.
 
 **Chat**
 5. Fenced code blocks render as flattened plain text

@@ -16,9 +16,12 @@ struct MessageBubble: View {
         case .userInput:
             userBubble
         case .toolAction, .toolResult:
-            ToolCard(symbolName: "wrench.fill", title: toolName, detail: toolDetail)
+            ToolCard(symbolName: "wrench.fill", title: toolName, detail: toolDetail,
+                     editDiff: EditDiff(message: message))
         case .approvalPrompt:
-            ToolCard(symbolName: "hand.raised.fill", title: "Approval requested: \(toolName)", detail: toolDetail)
+            ToolCard(symbolName: "hand.raised.fill",
+                     title: "Approval requested: \(toolName)", detail: toolDetail,
+                     editDiff: EditDiff(message: message))
         case .approvalResponse:
             approvalResponseCaption
         case .status:
@@ -34,11 +37,19 @@ struct MessageBubble: View {
     // ones into a `TranscriptItem.thinkingRun` rendered by `ThinkingBlock`.
     private var assistantBubble: some View {
         HStack {
-            // displayText is markdown parsed once at decode —
-            // `Text(.init(...))` would re-parse on every render pass,
-            // which is measurable during long streams.
+            // displayBlocks is segmented once at decode (see HarnessMessage) —
+            // this loop only lays out prebuilt values.
             VStack(alignment: .leading, spacing: 8) {
-                Text(message.displayText)
+                ForEach(Array(message.displayBlocks.enumerated()), id: \.offset) { _, block in
+                    switch block {
+                    case .text(let attributed):
+                        Text(attributed)
+                    case .code(let language, let code):
+                        CodeBlockView(language: language, code: code)
+                    case .diff(let lines):
+                        DiffBlockView(lines: lines)
+                    }
+                }
                 usageFooter(alignment: .leading)
             }
             .padding(10)
@@ -124,20 +135,35 @@ struct MessageBubble: View {
     }
 }
 
-/// Compact card shared by tool calls and approval prompts: an SF Symbol,
-/// a title, and an optional detail behind a disclosure so long tool input
-/// doesn't dominate the transcript.
+/// Compact card shared by tool calls and approval prompts: an SF Symbol, a
+/// title, and detail behind a disclosure so long tool input doesn't dominate
+/// the transcript. claude-code Edit/MultiEdit payloads show a real diff
+/// (`EditDiff` extraction succeeded); everything else keeps the raw detail.
 private struct ToolCard: View {
     let symbolName: String
     let title: String
     let detail: String?
+    var editDiff: EditDiff? = nil
 
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
                 Label(title, systemImage: symbolName)
                     .font(.callout)
-                if let detail, !detail.isEmpty {
+                if let editDiff {
+                    DisclosureGroup("Details") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let filePath = editDiff.filePath {
+                                Text(filePath)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            DiffBlockView(lines: editDiff.diffLines)
+                                .accessibilityIdentifier("tool-diff")
+                        }
+                    }
+                    .font(.caption)
+                } else if let detail, !detail.isEmpty {
                     DisclosureGroup("Details") {
                         Text(detail)
                             .font(.system(.caption, design: .monospaced))

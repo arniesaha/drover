@@ -155,8 +155,11 @@ func client() -> NexusClient {
 // MARK: - HarnessMessage/ChatModel test factories (Task 7+)
 
 extension HarnessMessage {
-    static func fixture(seq: Int, type: MessageType, payload: [String: JSONValue] = [:]) -> HarnessMessage {
-        HarnessMessage(seq: seq, type: type, payload: payload)
+    static func fixture(
+        seq: Int, type: MessageType, text: String = "",
+        payload: [String: JSONValue] = [:]
+    ) -> HarnessMessage {
+        HarnessMessage(seq: seq, type: type, text: text, payload: payload)
     }
 }
 

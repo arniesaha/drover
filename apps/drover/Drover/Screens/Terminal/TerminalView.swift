@@ -100,7 +100,8 @@ struct TerminalScreen: View {
     /// Escape hatches for a wedged CLI (e.g. a self-update that hung the
     /// process): one-tap Ctrl-C over the WebSocket, and a real terminate
     /// (SIGTERM→SIGKILL to the process group) over REST. Parity with the
-    /// web client's Ctrl-C/Kill buttons.
+    /// web client's Ctrl-C/Kill buttons. Also hosts the Paste menu item for
+    /// pushing clipboard text into the session.
     @ToolbarContentBuilder
     private func toolbarContent(presentation: HarnessPresentation) -> some ToolbarContent {
         ToolbarItem(placement: .principal) {
@@ -112,6 +113,11 @@ struct TerminalScreen: View {
 
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
+                Button {
+                    bridgeHolder.bridge?.sendPaste()
+                } label: {
+                    Label("Paste", systemImage: "doc.on.clipboard")
+                }
                 Button {
                     bridgeHolder.bridge?.sendInterrupt()
                 } label: {
@@ -185,7 +191,10 @@ private struct TerminalRepresentable: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> SwiftTerm.TerminalView {
-        let view = SwiftTerm.TerminalView(frame: .zero, font: nil)
+        let view = SwiftTerm.TerminalView(
+            frame: .zero,
+            font: UIFont.monospacedSystemFont(ofSize: TerminalBridge.storedFontSize,
+                                              weight: .regular))
         view.terminalDelegate = context.coordinator
         // Dark background/foreground to roughly match the web client, using
         // only the two colors SwiftTerm exposes as plain UIColor properties
@@ -197,6 +206,10 @@ private struct TerminalRepresentable: UIViewRepresentable {
         context.coordinator.onConnectionChanged = onConnectionChanged
         holder.bridge = context.coordinator
         context.coordinator.attach(view)
+        let pinch = UIPinchGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(TerminalBridge.handlePinch(_:)))
+        view.addGestureRecognizer(pinch)
         DispatchQueue.main.async { view.becomeFirstResponder() }
         return view
     }

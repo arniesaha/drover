@@ -1,6 +1,7 @@
 import Foundation
 import SwiftTerm
 import NexusKit
+import UIKit
 
 /// Bridges SwiftTerm's `TerminalView` to the harness's terminal WebSocket:
 /// pumps `TerminalStream`'s events (output/exit/connection state) into the
@@ -90,6 +91,15 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
         stream.send(TerminalWire.interruptFrame())
     }
 
+    /// Types the iOS clipboard into the PTY as one `input` frame — raw text,
+    /// newlines included (Termius behavior; no bracketed paste). Empty or
+    /// non-text clipboard is a no-op.
+    @MainActor
+    func sendPaste() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+        stream.send(TerminalWire.inputFrame(text))
+    }
+
     @MainActor
     private func apply(_ event: TerminalStreamEvent) {
         switch event {
@@ -104,13 +114,14 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
 
     // MARK: - TerminalViewDelegate
 
-    // Only `send` and `sizeChanged` do anything: those are the two outgoing
-    // wire frames this protocol exists to produce. The rest of the protocol
-    // (title/cwd updates, scroll position, link taps, clipboard, bell,
-    // iTerm content, damage-region reporting) has nothing to do with the
-    // harness's terminal wire protocol, so they're deliberate no-ops rather
-    // than left unimplemented (the protocol has no default for most of
-    // them on iOS).
+    // `send`, `sizeChanged`, and `clipboardCopy` are the only ones that do
+    // anything: the first two produce this protocol's outgoing wire frames,
+    // and clipboardCopy bridges the user's selection to UIPasteboard. The
+    // rest of the protocol (title/cwd updates, scroll position, link taps,
+    // bell, iTerm content, damage-region reporting) has nothing to do with
+    // the harness's terminal wire protocol, so they're deliberate no-ops
+    // rather than left unimplemented (the protocol has no default for most
+    // of them on iOS).
 
     // Synchronous by design: TerminalStream.send/sendResize are nonisolated,
     // so per-keystroke calls stay in order (an unstructured Task per
@@ -128,6 +139,58 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {}
     func scrolled(source: SwiftTerm.TerminalView, position: Double) {}
     func requestOpenLink(source: SwiftTerm.TerminalView, link: String, params: [String: String]) {}
-    func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {}
+    // SwiftTerm calls this with the UTF-8 bytes of the current selection when
+    // the user picks Copy. Delegate callbacks carry no actor isolation
+    // (see the class comment), so hop before touching UIPasteboard.
+    func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {
+        guard let text = String(data: content, encoding: .utf8), !text.isEmpty else { return }
+        Task { @MainActor in
+            UIPasteboard.general.string = text
+        }
+    }
     func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
+
+    // MARK: - Font size (pinch-zoom)
+
+    /// Persisted terminal font size. Clamped on read so a corrupted default
+    /// can't produce an unusable terminal; 0 (key absent) → default.
+    private static let fontSizeKey = "terminalFontSize"
+    static let fontSizeRange: ClosedRange<CGFloat> = 9...24
+    static let defaultFontSize: CGFloat = 13
+
+    static var storedFontSize: CGFloat {
+        let raw = CGFloat(UserDefaults.standard.double(forKey: fontSizeKey))
+        guard raw > 0 else { return defaultFontSize }
+        return min(max(raw, fontSizeRange.lowerBound), fontSizeRange.upperBound)
+    }
+
+    /// Base size captured at gesture start so scale applies to where the
+    /// pinch began, not to a moving target.
+    private var pinchBaseFontSize: CGFloat = TerminalBridge.defaultFontSize
+
+    // Gesture recognizers always fire on the main thread; this class isn't
+    // MainActor (see class comment), so assume rather than hop.
+    @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        MainActor.assumeIsolated {
+            guard let view = terminalView else { return }
+            switch gesture.state {
+            case .began:
+                pinchBaseFontSize = view.font.pointSize
+            case .changed:
+                let target = min(max(pinchBaseFontSize * gesture.scale,
+                                     Self.fontSizeRange.lowerBound),
+                                 Self.fontSizeRange.upperBound)
+                // Font assignment rebuilds SwiftTerm's font set and relays
+                // out the grid — skip sub-half-point changes to keep the
+                // gesture smooth.
+                if abs(target - view.font.pointSize) >= 0.5 {
+                    view.font = UIFont.monospacedSystemFont(ofSize: target, weight: .regular)
+                }
+            case .ended, .cancelled:
+                UserDefaults.standard.set(Double(view.font.pointSize), forKey: Self.fontSizeKey)
+            default:
+                break
+            }
+        }
+    }
 }

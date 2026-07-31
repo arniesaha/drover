@@ -51,7 +51,7 @@ xcodebuild -project Drover.xcodeproj -scheme Drover \
   test
 ```
 
-Expect `** TEST SUCCEEDED **`. As of this writing that's 154 tests in 13 suites.
+Expect `** TEST SUCCEEDED **`. As of this writing that's 176 tests total — 154 Swift-Testing tests in 13 suites plus 22 XCTest cases (DisplayBlocksTests 12 + EditDiffTests 10) under DroverTests.xctest.
 
 UI tests (`DroverUITests`) use a separate scheme, since they exercise a
 different test target:
