@@ -100,7 +100,8 @@ struct TerminalScreen: View {
     /// Escape hatches for a wedged CLI (e.g. a self-update that hung the
     /// process): one-tap Ctrl-C over the WebSocket, and a real terminate
     /// (SIGTERM→SIGKILL to the process group) over REST. Parity with the
-    /// web client's Ctrl-C/Kill buttons.
+    /// web client's Ctrl-C/Kill buttons. Also hosts the Paste menu item for
+    /// pushing clipboard text into the session.
     @ToolbarContentBuilder
     private func toolbarContent(presentation: HarnessPresentation) -> some ToolbarContent {
         ToolbarItem(placement: .principal) {

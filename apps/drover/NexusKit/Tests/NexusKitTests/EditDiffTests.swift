@@ -59,6 +59,15 @@ final class EditDiffTests: XCTestCase {
             tool: "MultiEdit", input: ["edits": .array([])])))
     }
 
+    func testMultiEditWithOneMalformedEditReturnsNil() {
+        XCTAssertNil(EditDiff(message: editMessage(tool: "MultiEdit", input: [
+            "edits": .array([
+                .object(["old_string": .string("a"), "new_string": .string("b")]),
+                .object(["old_string": .string("c")]),
+            ]),
+        ])))
+    }
+
     func testDiffLinesInterleaveHunksWithSeparators() throws {
         let diff = try XCTUnwrap(EditDiff(message: editMessage(tool: "MultiEdit", input: [
             "edits": .array([

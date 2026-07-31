@@ -31,7 +31,7 @@ public struct EditDiff: Sendable, Equatable {
         case "MultiEdit":
             guard case .array(let edits)? = input["edits"] else { return nil }
             let parsed = edits.compactMap { $0.objectValue.flatMap(Self.hunk(from:)) }
-            guard !parsed.isEmpty else { return nil }
+            guard !parsed.isEmpty, parsed.count == edits.count else { return nil }
             hunks = parsed
         default:
             return nil
