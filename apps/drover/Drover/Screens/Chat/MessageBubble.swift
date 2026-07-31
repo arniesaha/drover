@@ -34,11 +34,19 @@ struct MessageBubble: View {
     // ones into a `TranscriptItem.thinkingRun` rendered by `ThinkingBlock`.
     private var assistantBubble: some View {
         HStack {
-            // displayText is markdown parsed once at decode —
-            // `Text(.init(...))` would re-parse on every render pass,
-            // which is measurable during long streams.
+            // displayBlocks is segmented once at decode (see HarnessMessage) —
+            // this loop only lays out prebuilt values.
             VStack(alignment: .leading, spacing: 8) {
-                Text(message.displayText)
+                ForEach(Array(message.displayBlocks.enumerated()), id: \.offset) { _, block in
+                    switch block {
+                    case .text(let attributed):
+                        Text(attributed)
+                    case .code(let language, let code):
+                        CodeBlockView(language: language, code: code)
+                    case .diff(let lines):
+                        DiffBlockView(lines: lines)
+                    }
+                }
                 usageFooter(alignment: .leading)
             }
             .padding(10)
