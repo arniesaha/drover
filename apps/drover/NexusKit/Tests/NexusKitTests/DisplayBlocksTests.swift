@@ -85,4 +85,25 @@ final class DisplayBlocksTests: XCTestCase {
         XCTAssertEqual(DiffLine(line: "plain").kind, .context)
         XCTAssertEqual(DiffLine(line: "").kind, .context)
     }
+
+    // MARK: - HarnessMessage integration
+
+    func testDecodedMessageCarriesDisplayBlocks() throws {
+        let json = """
+        {"event_id": "e1", "seq": 1, "type": "assistant_output", "role": "assistant",
+         "text": "hi\\n```swift\\nlet x = 1\\n```"}
+        """
+        let message = try JSONDecoder().decode(HarnessMessage.self, from: Data(json.utf8))
+        XCTAssertEqual(message.displayBlocks.count, 2)
+        guard case .code(let language, let code) = message.displayBlocks[1] else {
+            return XCTFail("expected .code, got \(message.displayBlocks[1])")
+        }
+        XCTAssertEqual(language, "swift")
+        XCTAssertEqual(code, "let x = 1")
+    }
+
+    func testFixtureCarriesDisplayBlocks() {
+        let message = HarnessMessage.fixture(seq: 1, type: .assistantOutput, text: "plain")
+        XCTAssertEqual(message.displayBlocks.count, 1)
+    }
 }

@@ -495,12 +495,13 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
     /// parses markdown on every pass, which saturates the main thread during
     /// long streams (a contributor to the LazyVStack blanking).
     public var displayText: AttributedString
+    /// `text` split at ``` fences into renderable segments, computed exactly
+    /// once here for the same reason as `displayText`: segmentation in a view
+    /// body would re-run on every render pass during streams.
+    public var displayBlocks: [DisplayBlock]
 
     private static func parseDisplayText(_ text: String) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: text, options: options))
-            ?? AttributedString(text)
+        DisplayBlock.parseInlineMarkdown(text)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -527,6 +528,7 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         timestamp = WireDate.parse(rawTimestamp)
         payload = (try? container.decode([String: JSONValue].self, forKey: .payload)) ?? [:]
         displayText = Self.parseDisplayText(text)
+        displayBlocks = DisplayBlock.segment(text)
     }
 
     /// Test-only direct construction, bypassing JSON decoding entirely. Not
@@ -552,6 +554,7 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         self.timestamp = timestamp
         self.payload = payload
         self.displayText = Self.parseDisplayText(text)
+        self.displayBlocks = DisplayBlock.segment(text)
     }
 }
 
