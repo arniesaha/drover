@@ -149,4 +149,48 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
         }
     }
     func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
+
+    // MARK: - Font size (pinch-zoom)
+
+    /// Persisted terminal font size. Clamped on read so a corrupted default
+    /// can't produce an unusable terminal; 0 (key absent) → default.
+    private static let fontSizeKey = "terminalFontSize"
+    static let fontSizeRange: ClosedRange<CGFloat> = 9...24
+    static let defaultFontSize: CGFloat = 13
+
+    static var storedFontSize: CGFloat {
+        let raw = CGFloat(UserDefaults.standard.double(forKey: fontSizeKey))
+        guard raw > 0 else { return defaultFontSize }
+        return min(max(raw, fontSizeRange.lowerBound), fontSizeRange.upperBound)
+    }
+
+    /// Base size captured at gesture start so scale applies to where the
+    /// pinch began, not to a moving target.
+    private var pinchBaseFontSize: CGFloat = TerminalBridge.defaultFontSize
+
+    // Gesture recognizers always fire on the main thread; this class isn't
+    // MainActor (see class comment), so assume rather than hop.
+    @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        MainActor.assumeIsolated {
+            guard let view = terminalView else { return }
+            switch gesture.state {
+            case .began:
+                pinchBaseFontSize = view.font.pointSize
+            case .changed:
+                let target = min(max(pinchBaseFontSize * gesture.scale,
+                                     Self.fontSizeRange.lowerBound),
+                                 Self.fontSizeRange.upperBound)
+                // Font assignment rebuilds SwiftTerm's font set and relays
+                // out the grid — skip sub-half-point changes to keep the
+                // gesture smooth.
+                if abs(target - view.font.pointSize) >= 0.5 {
+                    view.font = UIFont.monospacedSystemFont(ofSize: target, weight: .regular)
+                }
+            case .ended, .cancelled:
+                UserDefaults.standard.set(Double(view.font.pointSize), forKey: Self.fontSizeKey)
+            default:
+                break
+            }
+        }
+    }
 }
