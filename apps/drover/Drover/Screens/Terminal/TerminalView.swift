@@ -113,6 +113,11 @@ struct TerminalScreen: View {
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
                 Button {
+                    bridgeHolder.bridge?.sendPaste()
+                } label: {
+                    Label("Paste", systemImage: "doc.on.clipboard")
+                }
+                Button {
                     bridgeHolder.bridge?.sendInterrupt()
                 } label: {
                     Label("Interrupt (Ctrl-C)", systemImage: "stop.circle")

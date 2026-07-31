@@ -1,6 +1,7 @@
 import Foundation
 import SwiftTerm
 import NexusKit
+import UIKit
 
 /// Bridges SwiftTerm's `TerminalView` to the harness's terminal WebSocket:
 /// pumps `TerminalStream`'s events (output/exit/connection state) into the
@@ -90,6 +91,15 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
         stream.send(TerminalWire.interruptFrame())
     }
 
+    /// Types the iOS clipboard into the PTY as one `input` frame — raw text,
+    /// newlines included (Termius behavior; no bracketed paste). Empty or
+    /// non-text clipboard is a no-op.
+    @MainActor
+    func sendPaste() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+        stream.send(TerminalWire.inputFrame(text))
+    }
+
     @MainActor
     private func apply(_ event: TerminalStreamEvent) {
         switch event {
@@ -104,13 +114,14 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
 
     // MARK: - TerminalViewDelegate
 
-    // Only `send` and `sizeChanged` do anything: those are the two outgoing
-    // wire frames this protocol exists to produce. The rest of the protocol
-    // (title/cwd updates, scroll position, link taps, clipboard, bell,
-    // iTerm content, damage-region reporting) has nothing to do with the
-    // harness's terminal wire protocol, so they're deliberate no-ops rather
-    // than left unimplemented (the protocol has no default for most of
-    // them on iOS).
+    // `send`, `sizeChanged`, and `clipboardCopy` are the only ones that do
+    // anything: the first two produce this protocol's outgoing wire frames,
+    // and clipboardCopy bridges the user's selection to UIPasteboard. The
+    // rest of the protocol (title/cwd updates, scroll position, link taps,
+    // bell, iTerm content, damage-region reporting) has nothing to do with
+    // the harness's terminal wire protocol, so they're deliberate no-ops
+    // rather than left unimplemented (the protocol has no default for most
+    // of them on iOS).
 
     // Synchronous by design: TerminalStream.send/sendResize are nonisolated,
     // so per-keystroke calls stay in order (an unstructured Task per
@@ -128,6 +139,14 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {}
     func scrolled(source: SwiftTerm.TerminalView, position: Double) {}
     func requestOpenLink(source: SwiftTerm.TerminalView, link: String, params: [String: String]) {}
-    func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {}
+    // SwiftTerm calls this with the UTF-8 bytes of the current selection when
+    // the user picks Copy. Delegate callbacks carry no actor isolation
+    // (see the class comment), so hop before touching UIPasteboard.
+    func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {
+        guard let text = String(data: content, encoding: .utf8), !text.isEmpty else { return }
+        Task { @MainActor in
+            UIPasteboard.general.string = text
+        }
+    }
     func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
 }
