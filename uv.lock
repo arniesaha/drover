@@ -406,7 +406,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.0" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "isort", marker = "extra == 'dev'" },
-    { name = "mcp", specifier = ">=1.0" },
+    { name = "mcp", specifier = ">=1.2,<2" },
     { name = "opentelemetry-proto", specifier = ">=1.30" },
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "pydantic", specifier = ">=2.0" },

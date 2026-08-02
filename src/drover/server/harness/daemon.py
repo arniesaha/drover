@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import queue
 import re
 import shlex
 import socket
@@ -34,6 +35,8 @@ from drover.server.harness.auth import (
     executable_path_prefix,
     resolve_executable,
 )
+from drover.server.harness.events import normalize_harness_event
+from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
@@ -1578,7 +1581,10 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # emit() path. If start() raises, the except handler below still
         # overwrites the status with "errored".
         self._safe_update_session_status(session_id, "running")
-        started_payload: dict[str, Any] = {"command": command or [], "mode": "structured"}
+        started_payload: dict[str, Any] = {
+            "command": command or [],
+            "mode": "structured",
+        }
         if session_worktree is not None:
             started_payload["worktree"] = {
                 "path": session_worktree.path,
@@ -2008,6 +2014,17 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             session_id=session_id,
             event_type="terminal.attached",
         )
+        # Resolved once: the hot loop must not pay a registry read (a
+        # connect-lock window) per keystroke just to re-learn a harness
+        # name that never changes for the session's lifetime. Same
+        # swallow stance as _safe_append_event: a failing registry only
+        # costs normalization hints, never the terminal.
+        try:
+            session = self.server.state.registry.get_session(session_id)
+        except Exception:
+            session = None
+        session_harness = session.harness if session else None
+        mirror = _TerminalMirror(self.server.state.registry)
         try:
             send_json(sock, {"type": "attached", "session_id": session_id})
             # Replay buffered scrollback so a reattach isn't a blank screen
@@ -2043,14 +2060,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     if session_id in self.server.state.pending_initial_input:
                         seed_watch = (seed_watch + text)[-4096:]
                     content = _redact_terminal_text(text)
-                    self._safe_append_transcript_chunk(
-                        session_id=session_id,
-                        content_redacted=content,
-                        byte_count=len(output),
-                    )
-                    event = self._safe_append_event(
+                    # Echo first — wire delivery never waits on registry
+                    # bookkeeping (the whole point of _TerminalMirror).
+                    send_json(sock, {"type": "output", "data": text})
+                    event = _build_mirror_event(
+                        mirror,
                         session_id=session_id,
                         event_type="terminal.output",
+                        harness=session_harness,
                         payload={
                             "byte_count": len(output),
                             "text": content,
@@ -2058,9 +2075,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                         normalized_source="inferred_terminal",
                         content_preview=content,
                     )
-                    send_json(sock, {"type": "output", "data": text})
-                    if event is not None:
-                        send_json(sock, {"type": "event", "event": _event_json(event)})
+                    send_json(sock, {"type": "event", "event": _event_json(event)})
+                    mirror.record_chunk(
+                        session_id=session_id,
+                        content_redacted=content,
+                        byte_count=len(output),
+                    )
 
                 # Type any queued handoff seed once the CLI's output settles
                 # (answering a startup gate first if one is on screen).
@@ -2076,7 +2096,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 except socket.timeout:
                     message = None
                 if message is not None:
-                    if not self._handle_terminal_message(session_id, message, sock):
+                    if not self._handle_terminal_message(
+                        session_id, message, sock, mirror, session_harness
+                    ):
                         return
 
                 if monotonic() - last_exit_check >= 0.2:
@@ -2097,6 +2119,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         finally:
             sock.settimeout(previous_timeout)
+            # Flush queued mirror writes before the detach marker so the
+            # recorded stream is complete when the detach event lands.
+            mirror.stop()
             self._safe_append_event(
                 session_id=session_id,
                 event_type="terminal.detached",
@@ -2107,14 +2132,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         session_id: str,
         message: dict[str, Any],
         sock: socket.socket,
+        mirror: _TerminalMirror,
+        harness: str | None,
     ) -> bool:
         message_type = message.get("type")
         if message_type == "input":
             data = str(message.get("data") or "")
             self.server.state.pty.write(session_id, data)
-            event = self._safe_append_event(
+            event = _build_mirror_event(
+                mirror,
                 session_id=session_id,
                 event_type="terminal.input",
+                harness=harness,
                 payload={
                     "byte_count": len(data.encode("utf-8")),
                     "text": _redact_terminal_text(data),
@@ -2122,28 +2151,30 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 normalized_source="inferred_terminal",
                 content_preview=_redact_terminal_text(data),
             )
-            if event is not None:
-                send_json(sock, {"type": "event", "event": _event_json(event)})
+            send_json(sock, {"type": "event", "event": _event_json(event)})
             return True
         if message_type == "interrupt":
             self.server.state.pty.write(session_id, b"\x03")
-            event = self._safe_append_event(
+            event = _build_mirror_event(
+                mirror,
                 session_id=session_id,
                 event_type="terminal.interrupt",
+                harness=harness,
                 normalized_type="status",
                 normalized_source="nexus_control",
                 content_preview="Ctrl-C sent",
             )
-            if event is not None:
-                send_json(sock, {"type": "event", "event": _event_json(event)})
+            send_json(sock, {"type": "event", "event": _event_json(event)})
             return True
         if message_type == "resize":
             rows = int(message.get("rows") or 24)
             cols = int(message.get("cols") or 80)
             self.server.state.pty.resize(session_id, rows=rows, cols=cols)
-            self._safe_append_event(
+            _build_mirror_event(
+                mirror,
                 session_id=session_id,
                 event_type="terminal.resized",
+                harness=harness,
                 payload={"rows": rows, "cols": cols},
             )
             return True
@@ -2151,6 +2182,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             send_json(sock, {"type": "pong"})
             return True
         if message_type in {"close", "detach"}:
+            # Flush before acking: a client that has observed the close
+            # frame may immediately read the registry and must find the
+            # stream durably recorded. (stop() is idempotent; the loop's
+            # finally calls it again on every exit path.)
+            mirror.stop()
             send_close(sock)
             return False
         send_json(
@@ -2553,6 +2589,132 @@ def _event_json(event: Any) -> dict[str, Any]:
     if hasattr(created_at, "isoformat"):
         item["created_at"] = created_at.isoformat()
     return item
+
+
+class _TerminalMirror:
+    """Off-loop writer for the terminal loop's audit bookkeeping.
+
+    Recording used to happen inline in the echo path: every keystroke paid
+    an input-event append, then its echo paid a transcript append plus an
+    output-event append — each a fresh DuckDB connect window under the
+    registry's process-wide lock (~300-500ms per key on a busy host,
+    measured; see ``append_events_if_new``'s docstring for the lock
+    economics). The loop now sends wire frames immediately and queues
+    records here; one worker thread per attachment drains the queue and
+    pays a single connect window per batch. Recording stays durable and
+    idempotent (caller-generated event_ids), just not on the echo's clock.
+    """
+
+    def __init__(self, registry: HarnessRegistry) -> None:
+        self._registry = registry
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._closing = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="terminal-mirror", daemon=True
+        )
+        self._thread.start()
+
+    def record_event(self, record: dict[str, Any]) -> None:
+        self._queue.put(("event", record))
+
+    def record_chunk(
+        self, *, session_id: str, content_redacted: str, byte_count: int
+    ) -> None:
+        self._queue.put(
+            (
+                "chunk",
+                {
+                    "session_id": session_id,
+                    "content_redacted": content_redacted,
+                    "byte_count": byte_count,
+                },
+            )
+        )
+
+    def stop(self, timeout_s: float = 5.0) -> None:
+        """Flush queued records and stop the worker (bounded wait)."""
+        self._closing.set()
+        self._queue.put(None)  # wake the worker if it's blocked on get()
+        self._thread.join(timeout=timeout_s)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            batch = [] if item is None else [item]
+            while True:
+                try:
+                    extra = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if extra is not None:
+                    batch.append(extra)
+            self._flush(batch)
+            if self._closing.is_set() and self._queue.empty():
+                return
+
+    def _flush(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
+        # Same swallow-and-continue stance as _safe_append_event: a locked
+        # or failing registry must never take the terminal down with it.
+        try:
+            for kind, record in batch:
+                if kind == "chunk":
+                    self._registry.append_transcript_chunk(**record)
+            events = [record for kind, record in batch if kind == "event"]
+            if events:
+                self._registry.append_events_if_new(events)
+        except Exception:
+            pass
+
+
+def _build_mirror_event(
+    mirror: _TerminalMirror,
+    *,
+    session_id: str,
+    event_type: str,
+    harness: str | None,
+    payload: dict[str, Any] | None = None,
+    normalized_type: str | None = None,
+    normalized_source: str | None = None,
+    content_preview: str | None = None,
+) -> HarnessEvent:
+    """Build a terminal event locally and queue its durable write.
+
+    The returned event feeds the wire mirror frame without a DB read-back;
+    ``append_events_if_new`` re-runs the same ``normalize_harness_event``
+    on the queued record, so the stored row matches the wire frame.
+    """
+    normalized = normalize_harness_event(
+        event_type=event_type,
+        payload=payload,
+        harness=harness,
+        normalized_type=normalized_type,
+        normalized_source=normalized_source,
+        content_preview=content_preview,
+    )
+    event = HarnessEvent(
+        event_id=f"harness-event-{uuid4()}",
+        session_id=session_id,
+        event_type=event_type,
+        normalized_type=normalized["normalized_type"],
+        normalized_source=normalized["normalized_source"],
+        content_preview=normalized["content_preview"],
+        payload=payload or {},
+        created_at=datetime.now(timezone.utc),
+    )
+    mirror.record_event(
+        {
+            "event_id": event.event_id,
+            "session_id": session_id,
+            "event_type": event_type,
+            "payload": payload,
+            "harness": harness,
+            "normalized_type": normalized_type,
+            "normalized_source": normalized_source,
+            "content_preview": content_preview,
+            "created_at": event.created_at,
+        }
+    )
+    return event
 
 
 def _redact_terminal_text(text: str) -> str:

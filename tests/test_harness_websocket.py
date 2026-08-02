@@ -6,6 +6,7 @@ import json
 import socket
 import threading
 from time import monotonic
+from time import sleep as time_sleep
 import urllib.request
 
 import pytest
@@ -184,6 +185,87 @@ def test_terminal_websocket_sends_input_and_captures_transcript(tmp_path):
         assert "terminal.resized" in events
         assert "terminal.interrupt" in events
         assert "terminal.detached" in events
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+class _SlowWritesRegistry:
+    """Delegates to a real registry but holds every write for ``slow_s`` —
+    a stand-in for the process-wide DuckDB connect lock under contention
+    (fleet renders, event ingest from every host). Terminal echo latency
+    must not scale with this delay; only durable recording may."""
+
+    def __init__(self, inner, slow_s: float = 0.2):
+        self._inner = inner
+        self._slow_s = slow_s
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if name in {"append_event", "append_transcript_chunk", "append_events_if_new"}:
+
+            def slowed(*args, **kwargs):
+                time_sleep(self._slow_s)
+                return attr(*args, **kwargs)
+
+            return slowed
+        return attr
+
+
+def test_terminal_echo_is_not_serialized_behind_registry_writes(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _, created = _json_request(
+            f"{base_url}/sessions",
+            payload={"harness": "shell", "cwd": str(tmp_path)},
+        )
+        session_id = created["session_id"]
+        sock = _connect_ws(base_url, f"/sessions/{session_id}/terminal")
+        try:
+            attached = _recv_json(sock)
+            assert attached["type"] == "attached"
+            _wait_for_output(sock, "$")
+
+            # From here on, every registry write stalls 200ms. A burst of five
+            # keystrokes must still echo promptly: with per-keystroke writes
+            # in the echo path (input event + transcript chunk + output
+            # event) the fifth echo takes ~3s; decoupled, it takes ~PTY time.
+            real_registry = state.registry
+            state.registry = _SlowWritesRegistry(real_registry)
+
+            start = monotonic()
+            for ch in "abcde":
+                client_send_json(sock, {"type": "input", "data": ch})
+            _wait_for_output(sock, "abcde")
+            elapsed = monotonic() - start
+            assert elapsed < 1.5, (
+                f"echo of 5-key burst took {elapsed:.2f}s — echo delivery is "
+                "serialized behind registry writes"
+            )
+
+            # Durability is still required, just not on the echo's clock:
+            # the mirrored events and transcript must land eventually.
+            deadline = monotonic() + 10
+            while monotonic() < deadline:
+                # Breathe between polls: each list_* call takes the same
+                # process-wide connect lock the mirror's writer needs.
+                time_sleep(0.2)
+                types = [e.event_type for e in real_registry.list_events(session_id)]
+                chunks = real_registry.list_transcript_chunks(session_id)
+                transcript = "".join(c.content_redacted for c in chunks)
+                if (
+                    types.count("terminal.input") >= 5
+                    and "terminal.output" in types
+                    and "abcde" in transcript
+                ):
+                    break
+            else:
+                raise AssertionError(
+                    "mirrored input/output events or transcript never recorded"
+                )
+        finally:
+            sock.close()
     finally:
         state.pty.close_all()
         server.shutdown()
