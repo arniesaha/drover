@@ -280,7 +280,12 @@ class CodexDriver:
                     type="tool_action",
                     role="assistant",
                     text=str(item.get("command") or ""),
-                    payload=item,
+                    payload={
+                        "tool": "shell",
+                        "tool_use_id": item.get("id"),
+                        "input": {"command": item.get("command")},
+                        **item,
+                    },
                 )
             ]
         return []  # e.g. agent_message item.started, if it ever occurs
@@ -296,6 +301,18 @@ class CodexDriver:
                     text=item.get("text") or "",
                 )
             ]
+        if item_type == "reasoning":
+            # Defensive: codex 0.144.4 never emits this in exec --json (even
+            # with show_raw_agent_reasoning=true, verified live 2026-08-04),
+            # but the protocol documents it and newer builds may.
+            return [
+                StructuredMessage(
+                    type="assistant_output",
+                    role="assistant",
+                    text=item.get("text") or "",
+                    payload={"thinking": True},
+                )
+            ]
         if item_type == "command_execution":
             output = item.get("aggregated_output") or ""
             return [
@@ -304,6 +321,8 @@ class CodexDriver:
                     role="tool",
                     text=output,
                     payload={
+                        "tool": "shell",
+                        "tool_use_id": item.get("id"),
                         "exit_code": item.get("exit_code"),
                         "status": item.get("status"),
                         **item,

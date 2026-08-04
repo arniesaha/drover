@@ -185,6 +185,47 @@ def test_parse_non_json_line_degrades_to_raw():
     assert message.payload["stream"] == "stdout"
 
 
+def _messages_for_line(line: str) -> list:
+    driver = CodexDriver(["codex"], cwd=None, emit=lambda m: None)
+    return driver.parse_line(json.dumps(line) if isinstance(line, dict) else line)
+
+
+def test_command_item_started_payload_has_tool_keys():
+    [msg] = _messages_for_line(
+        {"type": "item.started",
+         "item": {"id": "item_1", "type": "command_execution",
+                  "command": "pytest -x", "status": "in_progress"}}
+    )
+    assert msg.type == "tool_action"
+    assert msg.payload["tool"] == "shell"
+    assert msg.payload["tool_use_id"] == "item_1"
+    assert msg.payload["input"] == {"command": "pytest -x"}
+
+
+def test_command_item_completed_payload_has_tool_keys():
+    [msg] = _messages_for_line(
+        {"type": "item.completed",
+         "item": {"id": "item_1", "type": "command_execution",
+                  "command": "pytest -x", "aggregated_output": "3 passed\n",
+                  "exit_code": 0, "status": "completed"}}
+    )
+    assert msg.type == "tool_result"
+    assert msg.payload["tool"] == "shell"
+    assert msg.payload["tool_use_id"] == "item_1"
+    assert msg.payload["exit_code"] == 0
+    assert msg.text == "3 passed\n"
+
+
+def test_reasoning_item_maps_to_thinking():
+    [msg] = _messages_for_line(
+        {"type": "item.completed",
+         "item": {"id": "item_0", "type": "reasoning", "text": "let me look"}}
+    )
+    assert msg.type == "assistant_output"
+    assert msg.payload["thinking"] is True
+    assert msg.text == "let me look"
+
+
 # -- answer_permission: no approval channel ----------------------------------
 
 
