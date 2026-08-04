@@ -7,8 +7,6 @@ from datetime import datetime, timezone
 import http.client
 import json
 import logging
-import shutil
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -188,6 +186,21 @@ def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> N
                 allows_local,
                 backend="local",
             ),
+        ]
+    )
+
+
+def _append_harness_metrics(lines: list[str]) -> None:
+    # Non-zero means registry writes failed permanently and transcript
+    # content was lost. Gaps are marked in-band with transcript.gap events.
+    from drover.server.harness.daemon import dropped_event_count
+
+    lines.extend(
+        [
+            "# HELP drover_harness_dropped_events_total "
+            "Harness events permanently lost after write retries.",
+            "# TYPE drover_harness_dropped_events_total counter",
+            f"drover_harness_dropped_events_total {dropped_event_count()}",
         ]
     )
 
@@ -443,10 +456,15 @@ class MetricsCollector:
     favorite_cwds: tuple[str, ...] = ()
     # Set by start_metrics_server; owns live hub<->harnessd relay connections.
     relay_manager: "RelayManager | None" = None
+    # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel
+    # live, but N polling clients should still share one render.
+    harness_ttl_seconds: float = 2.0
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
     _cached_until: float = field(default=0.0, init=False)
+    _harness_cached_json: str | None = field(default=None, init=False)
+    _harness_cached_until: float = field(default=0.0, init=False)
 
     def render_prometheus(self) -> str:
         self._refresh_if_needed()
@@ -462,11 +480,22 @@ class MetricsCollector:
         include_hosts: bool = True,
         include_sessions: bool = True,
     ) -> str:
+        # Only the default full render is cached; partial renders are rare
+        # and caching them would need a per-variant key for no real gain.
+        full = include_hosts and include_sessions
+        now = time.monotonic()
+        if full and self._harness_cached_json is not None:
+            if now < self._harness_cached_until:
+                return self._harness_cached_json
         snapshot = self.harness_snapshot(
             include_hosts=include_hosts,
             include_sessions=include_sessions,
         )
-        return json.dumps(snapshot, sort_keys=True, default=str) + "\n"
+        rendered = json.dumps(snapshot, sort_keys=True, default=str) + "\n"
+        if full:
+            self._harness_cached_json = rendered
+            self._harness_cached_until = now + self.harness_ttl_seconds
+        return rendered
 
     def render_harness_session_json(self, session_id: str) -> tuple[int, str]:
         snapshot = self.harness_session_snapshot(session_id)
@@ -852,21 +881,25 @@ class MetricsCollector:
                 "error": f"DuckDB file does not exist: {source}",
             }
         try:
-            with tempfile.TemporaryDirectory(prefix="drover-harness-") as tmp:
-                snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
-                registry = HarnessRegistry(snapshot)
-                hosts = registry.list_hosts() if include_hosts else []
-                sessions = registry.list_sessions() if include_sessions else []
-                return {
-                    "hosts": [
-                        _harness_host_dict(host, self.relay_manager) for host in hosts
-                    ],
-                    "sessions": [session.__dict__ for session in sessions],
-                    "cwd_suggestions": _harness_cwd_suggestions(
-                        sessions, self.favorite_cwds
-                    ),
-                }
+            # Query the live database rather than copying it: the file is
+            # ~483MB and this runs on every fleet poll (measured 0.78s per
+            # copy against a 5s poll = a 16% disk duty cycle per client, and
+            # it grows with the store). Two indexed reads under the
+            # registry's connect lock cost microseconds. Live reads beside
+            # live writers are the supported path -- see
+            # open_duckdb_connection's docstring.
+            registry = HarnessRegistry(source)
+            hosts = registry.list_hosts() if include_hosts else []
+            sessions = registry.list_sessions() if include_sessions else []
+            return {
+                "hosts": [
+                    _harness_host_dict(host, self.relay_manager) for host in hosts
+                ],
+                "sessions": [session.__dict__ for session in sessions],
+                "cwd_suggestions": _harness_cwd_suggestions(
+                    sessions, self.favorite_cwds
+                ),
+            }
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render harness snapshot: %s", exc)
             return {"hosts": [], "sessions": [], "error": str(exc)}
@@ -877,32 +910,28 @@ class MetricsCollector:
             return {"error": f"DuckDB file does not exist: {source}"}
         try:
             self._reconcile_harness_session_from_host(session_id)
-            with tempfile.TemporaryDirectory(prefix="drover-harness-session-") as tmp:
-                snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
-                registry = HarnessRegistry(snapshot)
-                session = registry.get_session(session_id)
-                if session is None:
-                    return {"error": f"unknown harness session: {session_id}"}
-                host = registry.get_host(session.host_id)
-                chunks = registry.list_transcript_chunks(session_id)
-                events = registry.list_events(session_id)
-                native_transcript: dict[str, Any] | None = None
-                status, body = self.proxy_harness_native_transcript(session_id)
-                if 200 <= status < 300:
-                    try:
-                        parsed = json.loads(body)
-                    except json.JSONDecodeError:
-                        parsed = {}
-                    if isinstance(parsed, dict):
-                        native_transcript = parsed
-                return {
-                    "session": session.__dict__,
-                    "host": host.__dict__ if host else None,
-                    "events": [event.__dict__ for event in events],
-                    "transcript_chunks": [chunk.__dict__ for chunk in chunks],
-                    "native_transcript": native_transcript,
-                }
+            # Live read, same reasoning as harness_snapshot above.
+            registry = HarnessRegistry(source)
+            session = registry.get_session(session_id)
+            if session is None:
+                return {"error": f"unknown harness session: {session_id}"}
+            host = registry.get_host(session.host_id)
+            events = registry.list_events(session_id)
+            native_transcript: dict[str, Any] | None = None
+            status, body = self.proxy_harness_native_transcript(session_id)
+            if 200 <= status < 300:
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    native_transcript = parsed
+            return {
+                "session": session.__dict__,
+                "host": host.__dict__ if host else None,
+                "events": [event.__dict__ for event in events],
+                "native_transcript": native_transcript,
+            }
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render harness session %s: %s", session_id, exc)
             return {"error": str(exc)}
@@ -1005,10 +1034,8 @@ class MetricsCollector:
             )
 
     def _build_handoff_prompt(self, source: Any, *, target_harness: str) -> str:
-        # Reads through transcript_text, not list_transcript_chunks: only PTY
-        # sessions write chunks, so chunk-only reads handed every structured
-        # session a "transcript not available" prompt -- the handoff carried
-        # no conversation at all.
+        # transcript_text replays harness_events, which is where every
+        # session's conversation lives -- structured and PTY alike.
         try:
             registry = HarnessRegistry(self.duckdb_path)
             transcript = registry.transcript_text(source.session_id)
@@ -1144,6 +1171,7 @@ class MetricsCollector:
             _append_summarizer_metrics(lines, self.summarizer_report)
             _append_redis_metrics(lines, self.job_streams)
             _append_adoption_metrics(lines, snapshot)
+            _append_harness_metrics(lines)
             observatory = self._observatory_snapshot(snapshot)
             redis_streams = _redis_stream_snapshots(self.job_streams)
             self._cached_text = "\n".join(lines) + "\n"
@@ -1171,14 +1199,13 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
             )
-        with tempfile.TemporaryDirectory(prefix="drover-metrics-") as tmp:
-            snapshot = Path(tmp) / source.name
-            shutil.copy2(source, snapshot)
-            return quality_snapshot(
-                duckdb_path=snapshot,
-                incoming_dir=self.incoming_dir,
-                deep=False,
-            )
+        # Live read, same reasoning as harness_snapshot: copying the whole
+        # database to answer a read is unaffordable once it is large.
+        return quality_snapshot(
+            duckdb_path=source,
+            incoming_dir=self.incoming_dir,
+            deep=False,
+        )
 
     def _observatory_snapshot(self, quality: dict) -> dict:
         audit = quality.get("runtime_audit", {})
@@ -1186,15 +1213,12 @@ class MetricsCollector:
         if not source.exists():
             return {}
         try:
-            with tempfile.TemporaryDirectory(prefix="drover-observatory-") as tmp:
-                snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
-                return pipeline_observatory_snapshot(
-                    duckdb_path=snapshot,
-                    runtime_audit=audit,
-                    max_artifacts=10,
-                    max_projects=10,
-                )
+            return pipeline_observatory_snapshot(
+                duckdb_path=source,
+                runtime_audit=audit,
+                max_artifacts=10,
+                max_projects=10,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render observatory drilldown: %s", exc)
             return {"error": str(exc)}

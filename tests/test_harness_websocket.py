@@ -33,9 +33,6 @@ class _FailingRegistry:
     def append_event(self, **kwargs):
         raise RuntimeError("locked")
 
-    def append_transcript_chunk(self, **kwargs):
-        raise RuntimeError("locked")
-
     def update_session_status(self, *args, **kwargs):
         raise RuntimeError("locked")
 
@@ -168,9 +165,15 @@ def test_terminal_websocket_sends_input_and_captures_transcript(tmp_path):
         finally:
             sock.close()
 
-        chunks = state.registry.list_transcript_chunks(session_id)
-        assert [chunk.sequence for chunk in chunks] == list(range(1, len(chunks) + 1))
-        assert any("WS_OK" in chunk.content_redacted for chunk in chunks)
+        outputs = [
+            event
+            for event in state.registry.list_events(session_id)
+            if event.event_type == "terminal.output"
+        ]
+        assert outputs, "terminal output must be recorded as events"
+        assert any(
+            "WS_OK" in (event.payload or {}).get("text", "") for event in outputs
+        )
 
         _wait_for_event(state, session_id, "terminal.detached")
         events = [event.event_type for event in state.registry.list_events(session_id)]
@@ -203,7 +206,7 @@ class _SlowWritesRegistry:
 
     def __getattr__(self, name):
         attr = getattr(self._inner, name)
-        if name in {"append_event", "append_transcript_chunk", "append_events_if_new"}:
+        if name in {"append_event", "append_events_if_new"}:
 
             def slowed(*args, **kwargs):
                 time_sleep(self._slow_s)
@@ -251,9 +254,13 @@ def test_terminal_echo_is_not_serialized_behind_registry_writes(tmp_path):
                 # Breathe between polls: each list_* call takes the same
                 # process-wide connect lock the mirror's writer needs.
                 time_sleep(0.2)
-                types = [e.event_type for e in real_registry.list_events(session_id)]
-                chunks = real_registry.list_transcript_chunks(session_id)
-                transcript = "".join(c.content_redacted for c in chunks)
+                events = real_registry.list_events(session_id)
+                types = [e.event_type for e in events]
+                transcript = "".join(
+                    (e.payload or {}).get("text", "")
+                    for e in events
+                    if e.event_type == "terminal.output"
+                )
                 if (
                     types.count("terminal.input") >= 5
                     and "terminal.output" in types
@@ -707,3 +714,53 @@ def test_recv_frame_refuses_a_frame_over_the_eight_mebibyte_cap():
     finally:
         client.close()
         server.close()
+
+
+def test_mirror_retries_then_counts_dropped_events():
+    """A write failure must be retried, and a permanent one must be counted.
+
+    The old bare `except Exception: pass` lost events silently and forever.
+    """
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    attempts = {"n": 0}
+
+    class AlwaysFailingRegistry:
+        def append_events_if_new(self, records):
+            attempts["n"] += 1
+            raise RuntimeError("TransactionException: write-write conflict")
+
+        def append_event(self, **kwargs):
+            return None
+
+    mirror = daemon_mod._TerminalMirror(AlwaysFailingRegistry())
+    mirror.record_event({"event_id": "e1", "session_id": "s1"})
+    mirror.stop()
+
+    assert attempts["n"] == 3, "should retry twice after the first failure"
+    assert daemon_mod.dropped_event_count() == 1
+
+
+def test_mirror_retry_succeeds_without_counting_a_drop():
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    attempts = {"n": 0}
+
+    class FlakyRegistry:
+        def append_events_if_new(self, records):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("TransactionException")
+            return len(records)
+
+        def append_event(self, **kwargs):
+            raise AssertionError("no gap marker expected on eventual success")
+
+    mirror = daemon_mod._TerminalMirror(FlakyRegistry())
+    mirror.record_event({"event_id": "e1", "session_id": "s1"})
+    mirror.stop()
+
+    assert attempts["n"] == 2
+    assert daemon_mod.dropped_event_count() == 0

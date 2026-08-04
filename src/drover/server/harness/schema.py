@@ -8,7 +8,6 @@ HARNESS_TABLES = (
     "harness_hosts",
     "harness_sessions",
     "harness_events",
-    "harness_transcript_chunks",
 )
 
 _HARNESS_HOSTS_DDL = """
@@ -63,18 +62,6 @@ CREATE TABLE IF NOT EXISTS harness_events (
 );
 """
 
-_HARNESS_TRANSCRIPT_CHUNKS_DDL = """
-CREATE TABLE IF NOT EXISTS harness_transcript_chunks (
-  chunk_id         VARCHAR PRIMARY KEY,
-  session_id       VARCHAR NOT NULL,
-  sequence         INTEGER NOT NULL,
-  content_redacted VARCHAR NOT NULL,
-  byte_count       INTEGER NOT NULL,
-  created_at       TIMESTAMP NOT NULL DEFAULT now(),
-  UNIQUE (session_id, sequence)
-);
-"""
-
 
 def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     """Create Meta Harness control-plane tables. Idempotent."""
@@ -110,7 +97,10 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "seq": "INTEGER",
         },
     )
-    con.execute(_HARNESS_TRANSCRIPT_CHUNKS_DDL)
+    # Dropped, not migrated: every row duplicated a terminal.output event
+    # byte-for-byte (verified 1:1 on live data), so there is nothing here
+    # that harness_events does not already hold.
+    con.execute("DROP TABLE IF EXISTS harness_transcript_chunks")
 
 
 def _ensure_harness_columns(

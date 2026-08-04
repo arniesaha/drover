@@ -78,6 +78,31 @@ _WORKTREE_HARNESSES = frozenset({"codex", "gemini"})
 log = logging.getLogger("drover.harnessd")
 
 
+# Registry writes are best-effort by design -- an exception on a driver's
+# pump thread would kill it and freeze the session. But "best effort" must
+# not mean "silently lost forever": every permanently failed write bumps
+# this counter, which the metrics endpoint exports.
+_dropped_events_total = 0
+_dropped_events_lock = threading.Lock()
+
+
+def record_dropped_events(count: int = 1) -> None:
+    global _dropped_events_total
+    with _dropped_events_lock:
+        _dropped_events_total += count
+
+
+def dropped_event_count() -> int:
+    with _dropped_events_lock:
+        return _dropped_events_total
+
+
+def reset_dropped_event_count() -> None:
+    global _dropped_events_total
+    with _dropped_events_lock:
+        _dropped_events_total = 0
+
+
 @dataclass(frozen=True)
 class HarnessPreset:
     name: str
@@ -2094,11 +2119,6 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                         content_preview=content,
                     )
                     send_json(sock, {"type": "event", "event": _event_json(event)})
-                    mirror.record_chunk(
-                        session_id=session_id,
-                        content_redacted=content,
-                        byte_count=len(output),
-                    )
 
                 # Type any queued handoff seed once the CLI's output settles
                 # (answering a startup gate first if one is on screen).
@@ -2261,22 +2281,6 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return event
         except Exception:
             return None
-
-    def _safe_append_transcript_chunk(
-        self,
-        *,
-        session_id: str,
-        content_redacted: str,
-        byte_count: int,
-    ) -> None:
-        try:
-            self.server.state.registry.append_transcript_chunk(
-                session_id=session_id,
-                content_redacted=content_redacted,
-                byte_count=byte_count,
-            )
-        except Exception:
-            return
 
     def _safe_update_session_status(
         self,
@@ -2635,20 +2639,6 @@ class _TerminalMirror:
     def record_event(self, record: dict[str, Any]) -> None:
         self._queue.put(("event", record))
 
-    def record_chunk(
-        self, *, session_id: str, content_redacted: str, byte_count: int
-    ) -> None:
-        self._queue.put(
-            (
-                "chunk",
-                {
-                    "session_id": session_id,
-                    "content_redacted": content_redacted,
-                    "byte_count": byte_count,
-                },
-            )
-        )
-
     def stop(self, timeout_s: float = 5.0) -> None:
         """Flush queued records and stop the worker (bounded wait)."""
         self._closing.set()
@@ -2671,15 +2661,32 @@ class _TerminalMirror:
                 return
 
     def _flush(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
-        # Same swallow-and-continue stance as _safe_append_event: a locked
-        # or failing registry must never take the terminal down with it.
-        try:
-            for kind, record in batch:
-                if kind == "chunk":
-                    self._registry.append_transcript_chunk(**record)
-            events = [record for kind, record in batch if kind == "event"]
-            if events:
+        events = [record for kind, record in batch if kind == "event"]
+        if not events:
+            return
+        # Same never-raise stance as _safe_append_event: a locked or failing
+        # registry must never take the terminal down with it. But a bare
+        # swallow lost the events forever and invisibly, so retry first --
+        # DuckDB write-write conflicts under concurrent writers are
+        # transient -- and count whatever still cannot be written.
+        for attempt in range(3):
+            try:
                 self._registry.append_events_if_new(events)
+                return
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+        record_dropped_events(len(events))
+        # Leave a marker so the transcript shows a hole instead of quietly
+        # reading as complete. Best-effort by definition: if the registry is
+        # down hard, this fails too and only the counter records the loss.
+        try:
+            self._registry.append_event(
+                session_id=events[0].get("session_id", ""),
+                event_type="transcript.gap",
+                payload={"dropped": len(events)},
+                normalized_type="status",
+            )
         except Exception:
             pass
 

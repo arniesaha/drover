@@ -32,7 +32,6 @@ def test_bootstrap_creates_harness_tables(tmp_path):
         "harness_hosts",
         "harness_sessions",
         "harness_events",
-        "harness_transcript_chunks",
     }.issubset(tables)
 
 
@@ -118,7 +117,7 @@ def test_create_and_update_session_lifecycle(tmp_path):
     assert registry.list_sessions(status="running") == []
 
 
-def test_append_events_and_transcript_chunks_in_order(tmp_path):
+def test_append_events_in_order(tmp_path):
     registry, _ = _registry(tmp_path)
     registry.register_host(
         host_id="gpu-pc",
@@ -138,31 +137,25 @@ def test_append_events_and_transcript_chunks_in_order(tmp_path):
         event_type="session.started",
         payload={"pid": 1234},
     )
-    registry.append_transcript_chunk(
-        session_id="harness-session-2",
-        sequence=2,
-        content_redacted="second",
-    )
-    registry.append_transcript_chunk(
-        session_id="harness-session-2",
-        sequence=1,
-        content_redacted="first",
-        byte_count=5,
-    )
-    auto = registry.append_transcript_chunk(
-        session_id="harness-session-2",
-        content_redacted="third",
-    )
+    for seq, text in enumerate(["first", "second", "third"], start=1):
+        registry.append_event(
+            session_id="harness-session-2",
+            event_type="terminal.output",
+            payload={"text": text},
+            seq=seq,
+        )
 
     assert registry.list_events("harness-session-2")[0].payload == {"pid": 1234}
     assert event.event_type == "session.started"
     assert event.normalized_type == "status"
     assert event.normalized_source == "structured"
     assert event.content_preview == "session started"
-    chunks = registry.list_transcript_chunks("harness-session-2")
-    assert [chunk.content_redacted for chunk in chunks] == ["first", "second", "third"]
-    assert auto.sequence == 3
-    assert auto.byte_count == len("third".encode("utf-8"))
+    outputs = [
+        e.payload["text"]
+        for e in registry.list_events("harness-session-2")
+        if e.event_type == "terminal.output"
+    ]
+    assert outputs == ["first", "second", "third"]
 
 
 def test_structured_session_fields_roundtrip(tmp_path):
@@ -408,21 +401,6 @@ def test_create_session_permission_mode_defaults_to_none(tmp_path):
     assert fetched.permission_mode is None
 
 
-def test_transcript_text_prefers_recorded_pty_chunks(tmp_path):
-    registry, _ = _registry(tmp_path)
-    session = registry.create_session(host_id="h1", harness="shell", command="sh")
-    registry.append_transcript_chunk(
-        session_id=session.session_id, content_redacted="pty line", byte_count=8
-    )
-    registry.append_event(
-        session_id=session.session_id,
-        event_type="assistant_output",
-        payload={"text": "event line"},
-    )
-
-    assert registry.transcript_text(session.session_id) == "pty line"
-
-
 def test_transcript_text_rebuilds_structured_session_from_events(tmp_path):
     """Structured sessions never write transcript chunks.
 
@@ -449,7 +427,6 @@ def test_transcript_text_rebuilds_structured_session_from_events(tmp_path):
             seq=seq,
         )
 
-    assert registry.list_transcript_chunks(session.session_id) == []
     transcript = registry.transcript_text(session.session_id)
     assert transcript.splitlines() == [
         "[user] add retries",
@@ -467,3 +444,27 @@ def test_transcript_text_is_empty_when_session_has_no_content(tmp_path):
     )
 
     assert registry.transcript_text(session.session_id) == ""
+
+
+def test_bootstrap_drops_legacy_transcript_chunk_table(tmp_path):
+    """The chunk table duplicated terminal.output events; bootstrap removes it."""
+    from drover.server.harness.schema import bootstrap_harness_tables
+
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS harness_transcript_chunks ("
+            "chunk_id VARCHAR PRIMARY KEY, session_id VARCHAR)"
+        )
+
+    with duckdb.connect(str(duckdb_path)) as con:
+        bootstrap_harness_tables(con)
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables"
+            ).fetchall()
+        }
+
+    assert "harness_transcript_chunks" not in tables
+    assert {"harness_hosts", "harness_sessions", "harness_events"}.issubset(tables)

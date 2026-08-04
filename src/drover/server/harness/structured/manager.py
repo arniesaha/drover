@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -119,32 +120,48 @@ class StructuredSessionManager:
                 event_payload = message.to_payload()
                 event_payload["seq"] = seq
                 event_payload["session_id"] = session_id
-                try:
-                    registry.append_event(
-                        session_id=session_id,
-                        event_type=message.type,
-                        payload=event_payload,
-                        seq=seq,
-                        harness=harness,
-                        normalized_source="structured",
-                    )
-                    registry.update_session_activity(session_id, awaiting=awaiting)
-                except Exception as exc:  # noqa: BLE001
-                    # A registry failure must never propagate: emit() runs
-                    # on the driver's stdout-pump thread, and an escaped
-                    # exception silently kills that thread, freezing the
-                    # session (seen live with DuckDB's concurrent-connect
-                    # BinderException before HarnessRegistry._connect()
-                    # was serialized). Counts only -- no event text, it
-                    # may contain sensitive content. on_message still runs
-                    # below, so the central copy can still succeed.
-                    print(
-                        "drover structured manager: registry write failed "
-                        f"for session {session_id} seq {seq} "
-                        f"({type(exc).__name__}); event not recorded "
-                        "locally",
-                        file=sys.stderr,
-                    )
+                # Imported here, not at module scope: daemon imports this
+                # module, so a top-level import would be circular.
+                from drover.server.harness.daemon import record_dropped_events
+
+                recorded = False
+                for attempt in range(3):
+                    try:
+                        registry.append_event(
+                            session_id=session_id,
+                            event_type=message.type,
+                            payload=event_payload,
+                            seq=seq,
+                            harness=harness,
+                            normalized_source="structured",
+                        )
+                        registry.update_session_activity(session_id, awaiting=awaiting)
+                        recorded = True
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        # A registry failure must never propagate: emit()
+                        # runs on the driver's stdout-pump thread, and an
+                        # escaped exception silently kills that thread,
+                        # freezing the session (seen live with DuckDB's
+                        # concurrent-connect BinderException before
+                        # HarnessRegistry._connect() was serialized).
+                        # Write-write conflicts are transient, so retry
+                        # before giving up.
+                        if attempt < 2:
+                            time.sleep(0.05 * (attempt + 1))
+                            continue
+                        # Counts only -- no event text, it may contain
+                        # sensitive content. on_message still runs below,
+                        # so the central copy can still succeed.
+                        print(
+                            "drover structured manager: registry write failed "
+                            f"for session {session_id} seq {seq} "
+                            f"({type(exc).__name__}); event not recorded "
+                            "locally",
+                            file=sys.stderr,
+                        )
+                if not recorded:
+                    record_dropped_events(1)
             on_message(session_id, event_payload)
             # Only a genuine process-level exit finalizes the session.
             # ProcessDriver.on_exit() leaves turn_id=None on its "process

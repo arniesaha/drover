@@ -55,9 +55,6 @@ class _FailingRegistry:
     def append_event(self, **kwargs):
         raise RuntimeError("locked")
 
-    def append_transcript_chunk(self, **kwargs):
-        raise RuntimeError("locked")
-
 
 def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
     calls = []
@@ -453,7 +450,10 @@ def test_harnessd_auth_start_poll_and_cancel(tmp_path):
             f"{base_url}/auth/codex/start",
             data=b"{}",
             method="POST",
-            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             assert response.status == 200
@@ -476,7 +476,10 @@ def test_harnessd_auth_start_poll_and_cancel(tmp_path):
             f"{base_url}/auth/codex/flows/{flow_id}/cancel",
             data=b"{}",
             method="POST",
-            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
         )
         with urllib.request.urlopen(cancel_req, timeout=5) as response:
             cancelled = json.loads(response.read().decode("utf-8"))
@@ -612,7 +615,10 @@ def test_harnessd_auth_start_unsupported_returns_400(tmp_path):
             f"{base_url}/auth/gemini/start",
             data=b"{}",
             method="POST",
-            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
         )
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(req, timeout=5)
@@ -634,7 +640,10 @@ def test_harnessd_auth_start_launch_failure_returns_structured_500(tmp_path):
             f"{base_url}/auth/codex/start",
             data=b"{}",
             method="POST",
-            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
         )
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(req, timeout=5)
@@ -1839,9 +1848,7 @@ def _init_git_repo(root) -> None:
         ("config", "user.email", "test@example.com"),
         ("config", "user.name", "Test"),
     ):
-        subprocess.run(
-            ["git", "-C", str(root), *args], check=True, capture_output=True
-        )
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
     (root / "file.txt").write_text("hello\n")
     subprocess.run(
         ["git", "-C", str(root), "add", "file.txt"],

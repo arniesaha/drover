@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import base64
 import os
+import duckdb
+import shutil
 import socket
 import threading
 from time import monotonic
@@ -580,10 +582,6 @@ def test_metrics_collector_harness_session_json(tmp_path):
         harness="shell",
         command="/bin/sh",
         status="running",
-    )
-    registry.append_transcript_chunk(
-        session_id=session.session_id,
-        content_redacted="hello from transcript\n",
     )
     registry.append_event(
         session_id=session.session_id,
@@ -1388,9 +1386,10 @@ def test_metrics_http_server_continues_session_with_nexus_handoff(tmp_path):
         repo_name="nexus",
         branch="main",
     )
-    registry.append_transcript_chunk(
+    registry.append_event(
         session_id=source.session_id,
-        content_redacted="We just implemented central host heartbeats.\n",
+        event_type="terminal.output",
+        payload={"text": "We just implemented central host heartbeats.\n"},
     )
     collector = MetricsCollector(
         duckdb_path=duckdb_path,
@@ -2433,3 +2432,143 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
         "decision": "allow",
     }
     assert "/sessions/harness-running/interrupt" in forwarded
+
+
+def test_session_snapshot_has_no_transcript_chunks_key(tmp_path):
+    """Scrollback comes from terminal.output events; the chunk table is gone."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.create_session(
+        host_id="h1", harness="shell", command="sh", mode="pty"
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="terminal.output",
+        payload={"text": "hello"},
+    )
+
+    snapshot = collector.harness_session_snapshot(session.session_id)
+
+    assert "transcript_chunks" not in snapshot
+    assert any(e["event_type"] == "terminal.output" for e in snapshot["events"])
+
+
+def test_prometheus_exports_dropped_harness_events(tmp_path):
+    """A non-zero counter means transcript content was permanently lost."""
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    daemon_mod.record_dropped_events(4)
+
+    collector = _make_collector(tmp_path)
+    text = collector.render_prometheus()
+
+    assert "drover_harness_dropped_events_total 4" in text
+
+
+def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
+    """The hub DB is ~483MB; copying it per poll was a 16% disk duty cycle."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+
+    copies: list = []
+    real_copy = shutil.copy2
+
+    def spy(*args, **kwargs):
+        copies.append(args)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", spy)
+
+    snapshot = collector.harness_snapshot()
+
+    assert copies == [], "harness_snapshot must query the live DB, not copy it"
+    assert len(snapshot["sessions"]) == 1
+
+
+def test_render_harness_json_caches_within_ttl(tmp_path, monkeypatch):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+
+    calls = {"n": 0}
+    real = collector.harness_snapshot
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(collector, "harness_snapshot", counting)
+
+    first = collector.render_harness_json()
+    second = collector.render_harness_json()
+
+    assert calls["n"] == 1, "second call inside the TTL must be served from cache"
+    assert first == second
+
+
+def test_render_harness_json_refreshes_after_ttl(tmp_path, monkeypatch):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+    collector.harness_ttl_seconds = 0.0
+
+    calls = {"n": 0}
+    real = collector.harness_snapshot
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(collector, "harness_snapshot", counting)
+    collector.render_harness_json()
+    collector.render_harness_json()
+
+    assert calls["n"] == 2
+
+
+def test_quality_and_observatory_snapshots_do_not_copy_the_database(
+    tmp_path, monkeypatch
+):
+    """Same defect as harness_snapshot, lower request frequency."""
+    collector = _make_collector(tmp_path)
+
+    copies: list = []
+    real_copy = shutil.copy2
+
+    def spy(*args, **kwargs):
+        copies.append(args)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", spy)
+
+    quality = collector._quality_snapshot()
+    collector._observatory_snapshot(quality)
+
+    assert copies == []
+
+
+def test_harness_snapshot_works_while_this_process_holds_the_db(tmp_path):
+    """The hub serves snapshots from the same process that owns the database.
+
+    DuckDB's single-writer lock is cross-process: a second *process* opening
+    the file fails, but the owning process can open it again. harness_snapshot
+    reads the live file (no copy), so it depends on that. If snapshot rendering
+    ever moves to a subprocess or a separate worker, this breaks and the fleet
+    silently renders empty -- the error path returns hosts=[] sessions=[].
+    """
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+
+    # Mimic drover-server: hold a long-lived connection for the whole render.
+    held = duckdb.connect(str(collector.duckdb_path))
+    try:
+        held.execute("SELECT 1").fetchall()
+        snapshot = collector.harness_snapshot()
+    finally:
+        held.close()
+
+    assert "error" not in snapshot, snapshot.get("error")
+    assert len(snapshot["sessions"]) == 1
