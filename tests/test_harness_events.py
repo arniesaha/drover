@@ -36,3 +36,34 @@ def test_terminal_input_preview_keeps_command_newline() -> None:
 
     assert event["normalized_type"] == "command"
     assert event["content_preview"] == "echo OK"
+
+
+def test_structured_event_types_keep_their_semantic_kind() -> None:
+    """Structured drivers emit bare names, not dotted ones.
+
+    The prefix rules only ever matched "tool."/"session."/"approval.", so every
+    structured event used to collapse to "status" -- the whole chat transcript
+    landed in one undifferentiated bucket.
+    """
+    for event_type in (
+        "assistant_output",
+        "user_input",
+        "tool_action",
+        "tool_result",
+        "approval_prompt",
+        "approval_response",
+        "error",
+    ):
+        event = normalize_harness_event(
+            event_type=event_type,
+            payload={"text": "x"},
+            normalized_source="structured",
+        )
+        assert event["normalized_type"] == event_type, event_type
+        assert event["normalized_source"] == "structured"
+
+
+def test_unknown_event_type_still_falls_back_to_status() -> None:
+    event = normalize_harness_event(event_type="raw", payload={})
+
+    assert event["normalized_type"] == "status"

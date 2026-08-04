@@ -517,3 +517,52 @@ class HarnessRegistry:
                     [session_id],
                 )
             ]
+
+    # Structured (non-PTY) sessions never write harness_transcript_chunks --
+    # only the PTY terminal mirror does. Their conversation lives entirely in
+    # harness_events, so anything that wants "the transcript" for a structured
+    # session (handoff prompts above all) has to reconstruct it from there.
+    _TRANSCRIPT_EVENT_ROLES = {
+        "user_input": "user",
+        "assistant_output": "assistant",
+        "tool_action": "tool",
+        "tool_result": "tool-result",
+    }
+
+    def transcript_text(self, session_id: str, *, limit: int = 200) -> str:
+        """Best-effort readable transcript for a session, either storage shape.
+
+        Prefers recorded PTY chunks; falls back to replaying the structured
+        event stream. Returns "" when neither source has usable content.
+        """
+        chunks = self.list_transcript_chunks(session_id)
+        recorded = "\n".join(
+            chunk.content_redacted for chunk in chunks if chunk.content_redacted
+        ).strip()
+        if recorded:
+            return recorded
+
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                """
+                SELECT event_type, payload_json
+                FROM harness_events
+                WHERE session_id = ? AND event_type IN
+                      ('user_input', 'assistant_output', 'tool_action', 'tool_result')
+                ORDER BY COALESCE(seq, 0), created_at, event_id
+                """,
+                [session_id],
+            )
+        lines: list[str] = []
+        for row in rows[-limit:]:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                continue
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                continue
+            label = self._TRANSCRIPT_EVENT_ROLES.get(str(row.get("event_type")), "note")
+            lines.append(f"[{label}] {text}")
+        return "\n".join(lines).strip()

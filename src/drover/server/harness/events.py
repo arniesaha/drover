@@ -9,7 +9,9 @@ NORMALIZED_EVENT_TYPES = {
     "assistant_output",
     "user_input",
     "tool_action",
+    "tool_result",
     "approval_prompt",
+    "approval_response",
     "file_change",
     "command",
     "error",
@@ -83,6 +85,14 @@ def _clean_type(value: str | None) -> str | None:
 
 
 def _infer_type(event_type: str, payload: dict[str, Any], harness: str | None) -> str:
+    # Structured drivers emit the semantic name directly as the event type
+    # ("assistant_output", "tool_action", "tool_result", "user_input",
+    # "error"). None of the prefix rules below match those bare underscore
+    # names -- they only match dotted terminal./session./tool. types -- so
+    # without this pass-through every structured event fell through to the
+    # "status" default, collapsing the whole transcript into one bucket.
+    if event_type in NORMALIZED_EVENT_TYPES:
+        return event_type
     if event_type in {"terminal.input", "terminal.initial_input"}:
         data = str(payload.get("text") or "")
         if harness == "shell" and _looks_like_command(data):

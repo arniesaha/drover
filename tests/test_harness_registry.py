@@ -403,3 +403,64 @@ def test_create_session_permission_mode_defaults_to_none(tmp_path):
     session = registry.create_session(host_id="h1", harness="shell", command="sh")
     fetched = registry.get_session(session.session_id)
     assert fetched.permission_mode is None
+
+
+def test_transcript_text_prefers_recorded_pty_chunks(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(host_id="h1", harness="shell", command="sh")
+    registry.append_transcript_chunk(
+        session_id=session.session_id, content_redacted="pty line", byte_count=8
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="assistant_output",
+        payload={"text": "event line"},
+    )
+
+    assert registry.transcript_text(session.session_id) == "pty line"
+
+
+def test_transcript_text_rebuilds_structured_session_from_events(tmp_path):
+    """Structured sessions never write transcript chunks.
+
+    Reading chunks alone handed every structured handoff an empty transcript,
+    so the continuation started with no conversation context at all.
+    """
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(
+        host_id="h1", harness="claude-code", command="claude", mode="structured"
+    )
+    for seq, (event_type, text) in enumerate(
+        [
+            ("user_input", "add retries"),
+            ("assistant_output", "on it"),
+            ("tool_action", "Edit(main.py)"),
+            ("tool_result", "1 file changed"),
+        ],
+        start=1,
+    ):
+        registry.append_event(
+            session_id=session.session_id,
+            event_type=event_type,
+            payload={"text": text},
+            seq=seq,
+        )
+
+    assert registry.list_transcript_chunks(session.session_id) == []
+    transcript = registry.transcript_text(session.session_id)
+    assert transcript.splitlines() == [
+        "[user] add retries",
+        "[assistant] on it",
+        "[tool] Edit(main.py)",
+        "[tool-result] 1 file changed",
+    ]
+
+
+def test_transcript_text_is_empty_when_session_has_no_content(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(host_id="h1", harness="shell", command="sh")
+    registry.append_event(
+        session_id=session.session_id, event_type="session.started", payload={}
+    )
+
+    assert registry.transcript_text(session.session_id) == ""

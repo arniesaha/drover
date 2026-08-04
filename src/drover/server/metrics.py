@@ -1005,15 +1005,15 @@ class MetricsCollector:
             )
 
     def _build_handoff_prompt(self, source: Any, *, target_harness: str) -> str:
-        chunks = []
+        # Reads through transcript_text, not list_transcript_chunks: only PTY
+        # sessions write chunks, so chunk-only reads handed every structured
+        # session a "transcript not available" prompt -- the handoff carried
+        # no conversation at all.
         try:
             registry = HarnessRegistry(self.duckdb_path)
-            chunks = registry.list_transcript_chunks(source.session_id)[-8:]
+            transcript = registry.transcript_text(source.session_id)
         except Exception:
-            chunks = []
-        transcript = "\n".join(
-            chunk.content_redacted for chunk in chunks if chunk.content_redacted
-        ).strip()
+            transcript = ""
         if len(transcript) > 4000:
             transcript = transcript[-4000:]
         lines = [

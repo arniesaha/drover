@@ -20,7 +20,9 @@ supersede):
    ``exec_approval_request``-shaped event. Sandbox escalation flags (e.g.
    ``-s workspace-write``, ``-s danger-full-access``) are how a caller
    gets write access instead. This driver passes
-   ``--sandbox danger-full-access``: the default resolved sandbox
+   ``--sandbox danger-full-access`` on the first turn and the equivalent
+   ``-c sandbox_mode=danger-full-access`` on resume turns (the ``resume``
+   subcommand does not accept ``--sandbox``): the default resolved sandbox
    (workspace-write for trusted projects) keeps ``.git`` read-only and
    network off, which silently breaks every commit/push a session
    attempts, and with ``approval_policy: never`` there is no prompt to
@@ -152,14 +154,18 @@ class CodexDriver:
                 "danger-full-access",
                 text,
             ]
+        # ``codex exec resume`` does NOT accept ``--sandbox`` (that flag lives
+        # only on the parent ``codex exec``); passing it aborts the follow-up
+        # turn at arg-parse with "unexpected argument '--sandbox' found". The
+        # config override is the supported equivalent on the resume path.
         return self.command + [
             "exec",
             "resume",
             self._thread_id,
             "--json",
             "--skip-git-repo-check",
-            "--sandbox",
-            "danger-full-access",
+            "-c",
+            "sandbox_mode=danger-full-access",
             text,
         ]
 

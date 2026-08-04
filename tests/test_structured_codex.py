@@ -281,8 +281,12 @@ def test_second_turn_argv_has_resume_and_captured_thread_id(tmp_path, monkeypatc
     assert "resume" in argv2
     assert "thread-abc" in argv2
     assert argv2[-1] == "second"
-    sandbox_flag = argv2.index("--sandbox")
-    assert argv2[sandbox_flag + 1] == "danger-full-access"
+    # ``codex exec resume`` rejects ``--sandbox``; full access is requested via
+    # the ``-c`` config override instead. Asserting the *absence* of the flag
+    # keeps the regression (every follow-up turn dying at arg-parse) locked out.
+    assert "--sandbox" not in argv2
+    config_flag = argv2.index("-c")
+    assert argv2[config_flag + 1] == "sandbox_mode=danger-full-access"
     driver.close()
 
 
