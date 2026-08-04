@@ -417,3 +417,16 @@ The auth blocker in §3 is resolved. Live findings:
 - CLI version drift note: Task 0 probed 0.38.2; this re-probe is 0.46.0.
 - `--resume` semantics still unverified live (v1 driver remains context-free
   per turn; re-probe when multi-turn gemini support is scheduled).
+
+## Addendum 2026-08-04 — stream-json probes (gemini 0.46.0, codex-cli 0.144.4)
+
+- Gemini `-o stream-json` verified live (this Mac, GEMINI auth working). NDJSON on
+  stdout: `init` (session_id, model), `message` (role user echo; role assistant with
+  `"delta": true` streamed chunks), `tool_use` (tool_name, tool_id, parameters),
+  `tool_result` (tool_id, status — NO output text), `result` (status, stats)
+  terminator. Captured as `gemini_stream.ndjson`. Error envelope on stderr +
+  nonzero exit is unchanged from `-o json`.
+- Codex 0.144.4 emits NO reasoning items in `exec --json`, even with
+  `-c show_raw_agent_reasoning=true` (usage reports reasoning_output_tokens > 0 but
+  no item ever appears). Driver maps `item.type == "reasoning"` defensively; do not
+  expect it live on this build.

@@ -1,0 +1,7 @@
+{"type":"init","timestamp":"2026-08-04T11:43:19.742Z","session_id":"a05c8061-8f5b-40f6-aba5-25c971c50136","model":"auto"}
+{"type":"message","timestamp":"2026-08-04T11:43:19.742Z","role":"user","content":"Say exactly: probe-ok, then list files in the current directory"}
+{"type":"tool_use","timestamp":"2026-08-04T11:43:36.125Z","tool_name":"list_directory","tool_id":"list_directory__859y31fx","parameters":{"dir_path":"."}}
+{"type":"tool_result","timestamp":"2026-08-04T11:43:36.249Z","tool_id":"list_directory__859y31fx","status":"success"}
+{"type":"message","timestamp":"2026-08-04T11:43:45.086Z","role":"assistant","content":"probe-ok\n\nHere are the files in the current directory (`/private/tmp","delta":true}
+{"type":"message","timestamp":"2026-08-04T11:43:45.087Z","role":"assistant","content":"`):\n\n* **Directories:** ...","delta":true}
+{"type":"result","timestamp":"2026-08-04T11:43:45.100Z","status":"success","stats":{"total_tokens":46783,"input_tokens":44974,"output_tokens":561,"cached":8160,"input":36814,"duration_ms":25358,"tool_calls":1,"models":{}}}
