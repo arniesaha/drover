@@ -777,7 +777,12 @@
       renderContinueControls();
       renderHandoffSummary();
       renderEvents();
-      (data.transcript_chunks || []).forEach((chunk) => append(chunk.content_redacted || ""));
+      // Scrollback comes from terminal.output events, not a separate chunk
+      // table: the two carried byte-identical text, and the chunk table is
+      // gone. `payload` is a decoded object here, same as displayEvent reads.
+      (data.events || [])
+        .filter((event) => event.event_type === "terminal.output")
+        .forEach((event) => append(event?.payload?.text || ""));
     }
 
     async function continueSession() {
