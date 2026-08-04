@@ -75,3 +75,54 @@ private func output(_ id: String, seq: Int) -> HarnessMessage {
         #expect(!odd.isThinking)
     }
 }
+
+@Suite struct StepPairingTests {
+    private func action(_ seq: Int, id toolID: String) -> HarnessMessage {
+        HarnessMessage(seq: seq, type: .toolAction, role: "assistant",
+                       text: "Bash", payload: ["tool": .string("Bash"),
+                                               "tool_use_id": .string(toolID)])
+    }
+    private func result(_ seq: Int, id toolID: String) -> HarnessMessage {
+        HarnessMessage(seq: seq, type: .toolResult, role: "tool",
+                       text: "ok", payload: ["tool_use_id": .string(toolID)])
+    }
+
+    @Test func pairsActionWithItsResult() {
+        let a = action(1, id: "t1"), r = result(2, id: "t1")
+        let items = TranscriptItem.group([a, r])
+        #expect(items == [.step(action: a, result: r)])
+    }
+
+    @Test func stepRowIDIsStableWhenResultAttaches() {
+        let a = action(1, id: "t1"), r = result(2, id: "t1")
+        #expect(TranscriptItem.group([a]).last?.id == a.id)
+        #expect(TranscriptItem.group([a, r]).last?.id == a.id)
+    }
+
+    @Test func pairsAcrossInterveningMessages() {
+        let a = action(1, id: "t1")
+        let thinking = HarnessMessage(seq: 2, type: .assistantOutput,
+                                      text: "hm", payload: ["thinking": .bool(true)])
+        let r = result(3, id: "t1")
+        let items = TranscriptItem.group([a, thinking, r])
+        #expect(items.count == 2)
+        #expect(items[0] == .step(action: a, result: r))
+    }
+
+    @Test func unmatchedResultStaysAMessage() {
+        let r = result(1, id: "orphan")
+        #expect(TranscriptItem.group([r]) == [.message(r)])
+    }
+
+    @Test func actionWithoutToolUseIDStaysAMessage() {
+        let bare = HarnessMessage(seq: 1, type: .toolAction, text: "Bash")
+        #expect(TranscriptItem.group([bare]) == [.message(bare)])
+    }
+
+    @Test func latestRowIDTargetsStepRowWhenResultIsNewest() {
+        let a = action(1, id: "t1")
+        let out = HarnessMessage(seq: 2, type: .assistantOutput, text: "mid")
+        let r = result(3, id: "t1")
+        #expect(TranscriptItem.latestRowID(of: [a, out, r]) == a.id)
+    }
+}

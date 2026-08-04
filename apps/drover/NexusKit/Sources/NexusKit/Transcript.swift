@@ -11,23 +11,58 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
     case message(HarnessMessage)
     /// Always non-empty; ordered as received.
     case thinkingRun([HarnessMessage])
+    /// A tool call paired (by payload `tool_use_id`) with its result. The
+    /// result attaches in place when it streams in; the row keeps the
+    /// action's identity so SwiftUI updates rather than rebuilds it.
+    case step(action: HarnessMessage, result: HarnessMessage?)
 
     /// A run is identified by its *first* message, so an in-progress run
     /// keeps a stable SwiftUI identity as later chunks join it — the row is
-    /// updated in place rather than torn down and rebuilt mid-stream.
+    /// updated in place rather than torn down and rebuilt mid-stream. A step
+    /// row is identified by its action, so the row stays stable when the
+    /// result attaches (see `case step`).
     public var id: String {
         switch self {
         case .message(let message): message.id
         case .thinkingRun(let run): run[0].id
+        case .step(let action, _): action.id
         }
     }
 
     /// Folds the raw message list into render items. O(n); called from the
-    /// view layer on each transcript change.
+    /// view layer on each transcript change. Tool actions and results pair
+    /// by payload `tool_use_id` into `.step` rows; actions without an id and
+    /// results with no pending match fall through to `.message` — this is
+    /// what keeps old recorded sessions (no `tool_use_id`) rendering.
     public static func group(_ messages: [HarnessMessage]) -> [TranscriptItem] {
+        fold(messages).items
+    }
+
+    /// ID of the row the newest message renders in. This is what auto-scroll
+    /// must target; scrolling to `messages.last!.id` would miss when that id
+    /// is folded into a run or a step.
+    ///
+    /// Deliberately *not* `group(messages).last?.id`: a `.step` row updates
+    /// in place at its original index when its result arrives (so the row
+    /// keeps the action's SwiftUI identity — see `pairsAcrossInterveningMessages`
+    /// in TranscriptTests), so a result can be the newest message while its
+    /// row sits earlier than messages that streamed in between the action
+    /// and the result. `fold` tracks the id each message actually rendered
+    /// into as it walks, so this stays correct in that case too.
+    public static func latestRowID(of messages: [HarnessMessage]) -> String? {
+        fold(messages).lastRenderedID
+    }
+
+    /// Shared walk behind `group` and `latestRowID` so both stay consistent
+    /// with a single pass. O(n) per call; it already ran O(n) and callers
+    /// are coalesced to ~8Hz, so this is fine.
+    private static func fold(_ messages: [HarnessMessage]) -> (items: [TranscriptItem], lastRenderedID: String?) {
         var items: [TranscriptItem] = []
         items.reserveCapacity(messages.count)
         var run: [HarnessMessage] = []
+        /// tool_use_id -> index in `items` of the awaiting `.step` row.
+        var pendingSteps: [String: Int] = [:]
+        var lastRenderedID: String?
 
         func flushRun() {
             guard !run.isEmpty else { return }
@@ -38,28 +73,31 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         for message in messages {
             if message.isThinking {
                 run.append(message)
-            } else {
-                flushRun()
-                items.append(.message(message))
+                lastRenderedID = run[0].id
+                continue
             }
+            if message.type == .toolAction,
+               let toolUseID = message.payload["tool_use_id"]?.stringValue {
+                flushRun()
+                pendingSteps[toolUseID] = items.count
+                items.append(.step(action: message, result: nil))
+                lastRenderedID = message.id
+                continue
+            }
+            if message.type == .toolResult,
+               let toolUseID = message.payload["tool_use_id"]?.stringValue,
+               let index = pendingSteps.removeValue(forKey: toolUseID),
+               case .step(let action, nil) = items[index] {
+                items[index] = .step(action: action, result: message)
+                lastRenderedID = action.id
+                continue
+            }
+            flushRun()
+            items.append(.message(message))
+            lastRenderedID = message.id
         }
         flushRun()
-        return items
-    }
-
-    /// ID of the row the newest message renders in — the message's own id,
-    /// unless it's part of a trailing thinking run, in which case the run's
-    /// first id (see `id`). This is what auto-scroll must target; scrolling
-    /// to `messages.last!.id` would miss when that id is folded into a run.
-    public static func latestRowID(of messages: [HarnessMessage]) -> String? {
-        guard let last = messages.last else { return nil }
-        guard last.isThinking else { return last.id }
-        var runStart = last
-        for message in messages.reversed().dropFirst() {
-            guard message.isThinking else { break }
-            runStart = message
-        }
-        return runStart.id
+        return (items, lastRenderedID)
     }
 }
 
