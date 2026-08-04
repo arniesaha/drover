@@ -372,3 +372,58 @@ def test_finalize_still_fires_when_registry_write_fails(monkeypatch, tmp_path, c
     assert finalized == [("sess-1", 0)]
     captured = capsys.readouterr()
     assert "registry write failed" in captured.err
+
+
+def test_emit_retries_then_counts_a_permanent_drop(monkeypatch, tmp_path):
+    """emit() must never raise -- but it must not lose the event silently.
+
+    The old handler made one attempt and swallowed the failure, so a
+    transient DuckDB write-write conflict discarded the event forever.
+    """
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    mgr, driver, registry, on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    attempts = {"n": 0}
+
+    def boom(**kwargs):
+        attempts["n"] += 1
+        raise RuntimeError("TransactionException: write-write conflict")
+
+    monkeypatch.setattr(registry, "append_event", boom)
+
+    driver.emit(StructuredMessage(type="assistant_output", role="assistant", text="hi"))
+
+    assert attempts["n"] == 3, "one attempt plus two retries"
+    assert daemon_mod.dropped_event_count() == 1
+    # The central copy must still go out -- that is the whole point of not
+    # letting the local write failure propagate.
+    assert on_messages, "on_message must still run after a failed local write"
+
+
+def test_emit_retry_succeeds_without_counting_a_drop(monkeypatch, tmp_path):
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    original = registry.append_event
+    attempts = {"n": 0}
+
+    def flaky(**kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("TransactionException")
+        return original(**kwargs)
+
+    monkeypatch.setattr(registry, "append_event", flaky)
+
+    driver.emit(StructuredMessage(type="assistant_output", role="assistant", text="hi"))
+
+    assert attempts["n"] == 2
+    assert daemon_mod.dropped_event_count() == 0
