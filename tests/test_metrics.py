@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import base64
 import os
+import duckdb
 import shutil
 import socket
 import threading
@@ -2546,3 +2547,28 @@ def test_quality_and_observatory_snapshots_do_not_copy_the_database(
     collector._observatory_snapshot(quality)
 
     assert copies == []
+
+
+def test_harness_snapshot_works_while_this_process_holds_the_db(tmp_path):
+    """The hub serves snapshots from the same process that owns the database.
+
+    DuckDB's single-writer lock is cross-process: a second *process* opening
+    the file fails, but the owning process can open it again. harness_snapshot
+    reads the live file (no copy), so it depends on that. If snapshot rendering
+    ever moves to a subprocess or a separate worker, this breaks and the fleet
+    silently renders empty -- the error path returns hosts=[] sessions=[].
+    """
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+
+    # Mimic drover-server: hold a long-lived connection for the whole render.
+    held = duckdb.connect(str(collector.duckdb_path))
+    try:
+        held.execute("SELECT 1").fetchall()
+        snapshot = collector.harness_snapshot()
+    finally:
+        held.close()
+
+    assert "error" not in snapshot, snapshot.get("error")
+    assert len(snapshot["sessions"]) == 1
