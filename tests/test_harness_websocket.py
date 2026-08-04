@@ -714,3 +714,53 @@ def test_recv_frame_refuses_a_frame_over_the_eight_mebibyte_cap():
     finally:
         client.close()
         server.close()
+
+
+def test_mirror_retries_then_counts_dropped_events():
+    """A write failure must be retried, and a permanent one must be counted.
+
+    The old bare `except Exception: pass` lost events silently and forever.
+    """
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    attempts = {"n": 0}
+
+    class AlwaysFailingRegistry:
+        def append_events_if_new(self, records):
+            attempts["n"] += 1
+            raise RuntimeError("TransactionException: write-write conflict")
+
+        def append_event(self, **kwargs):
+            return None
+
+    mirror = daemon_mod._TerminalMirror(AlwaysFailingRegistry())
+    mirror.record_event({"event_id": "e1", "session_id": "s1"})
+    mirror.stop()
+
+    assert attempts["n"] == 3, "should retry twice after the first failure"
+    assert daemon_mod.dropped_event_count() == 1
+
+
+def test_mirror_retry_succeeds_without_counting_a_drop():
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    attempts = {"n": 0}
+
+    class FlakyRegistry:
+        def append_events_if_new(self, records):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("TransactionException")
+            return len(records)
+
+        def append_event(self, **kwargs):
+            raise AssertionError("no gap marker expected on eventual success")
+
+    mirror = daemon_mod._TerminalMirror(FlakyRegistry())
+    mirror.record_event({"event_id": "e1", "session_id": "s1"})
+    mirror.stop()
+
+    assert attempts["n"] == 2
+    assert daemon_mod.dropped_event_count() == 0
