@@ -16,6 +16,10 @@ struct ChatView: View {
     /// Auto-scroll only runs while pinned; scrolling up unpins (so reading
     /// is never yanked back down) and shows the scroll-to-bottom button.
     @State private var isPinnedToBottom = true
+    /// Current scroll phase — only user-driven phases may unpin (content
+    /// growth pushing the bottom away must not; that was the stuck-button
+    /// race: a tall new row unpinned before the coalesced scroll fired).
+    @State private var scrollPhase: ScrollPhase = .idle
 
     init(client: NexusClient, sessionID: String, harness: String? = nil) {
         self.client = client
@@ -104,7 +108,17 @@ struct ChatView: View {
                     >= geometry.contentSize.height + geometry.contentInsets.bottom - 80
             } action: { _, isNearBottom in
                 guard isNearBottom != isPinnedToBottom else { return }
+                // Re-pin whenever the bottom is reached, by any means; unpin
+                // only mid-gesture (tracking/interacting/decelerating), so
+                // content growth can't silently disable auto-scroll.
+                let isUserDriven = scrollPhase == .tracking
+                    || scrollPhase == .interacting
+                    || scrollPhase == .decelerating
+                guard isNearBottom || isUserDriven else { return }
                 withAnimation(.snappy(duration: 0.2)) { isPinnedToBottom = isNearBottom }
+            }
+            .onScrollPhaseChange { _, newPhase in
+                scrollPhase = newPhase
             }
             .overlay(alignment: .bottomTrailing) {
                 if !isPinnedToBottom {
@@ -124,6 +138,7 @@ struct ChatView: View {
                 guard newestID != nil, isPinnedToBottom else { return }
                 scheduleScroll(with: proxy)
             }
+            .defaultScrollAnchor(.bottom)
             .onDisappear { pendingScroll?.cancel() }
         }
     }
@@ -146,9 +161,14 @@ struct ChatView: View {
     private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
         Button {
             guard let rowID = TranscriptItem.latestRowID(of: model.messages) else { return }
-            // A single user-initiated scroll may animate — the storm problem
-            // above only applies to per-message auto-scrolls.
-            withAnimation(.snappy) { proxy.scrollTo(rowID, anchor: .bottom) }
+            withAnimation(.snappy) {
+                isPinnedToBottom = true
+                proxy.scrollTo(rowID, anchor: .bottom)
+            }
+            // Late-measuring lazy rows (tall diffs) can land the animated
+            // scroll short; one unanimated follow-up after layout settles
+            // closes the gap so pinning actually holds.
+            scheduleScroll(with: proxy)
         } label: {
             Image(systemName: "arrow.down")
                 .font(.system(size: 15, weight: .semibold))
@@ -169,14 +189,20 @@ struct ChatView: View {
         guard pendingScroll == nil else { return }
         pendingScroll = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
-            pendingScroll = nil
-            // Re-check pinning at fire time — the user may have started
-            // scrolling up during the coalescing window. The scroll target
-            // is the newest *row* (a trailing thinking run's row id is its
-            // first message, not the newest message).
             guard !Task.isCancelled, isPinnedToBottom,
-                  let rowID = TranscriptItem.latestRowID(of: model.messages) else { return }
+                  let rowID = TranscriptItem.latestRowID(of: model.messages) else {
+                pendingScroll = nil
+                return
+            }
             proxy.scrollTo(rowID, anchor: .bottom)
+            // Settle pass: rows that finish measuring after the first scroll
+            // (LazyVStack + tall code/diff blocks) grow the content under us;
+            // one more unanimated scroll pins the real bottom.
+            try? await Task.sleep(for: .milliseconds(200))
+            pendingScroll = nil
+            guard !Task.isCancelled, isPinnedToBottom,
+                  let settledRowID = TranscriptItem.latestRowID(of: model.messages) else { return }
+            proxy.scrollTo(settledRowID, anchor: .bottom)
         }
     }
 
