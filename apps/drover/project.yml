@@ -54,7 +54,9 @@ targets:
   DroverTests:
     type: bundle.unit-test
     platform: iOS
-    sources: [NexusKit/Tests/NexusKitTests]
+    sources:
+      - NexusKit/Tests/NexusKitTests
+      - DroverTests
     dependencies:
       - target: Drover
     settings:

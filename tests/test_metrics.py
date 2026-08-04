@@ -2327,6 +2327,26 @@ def test_sync_created_harness_session_preserves_mode(tmp_path):
     assert session.mode == "structured"
 
 
+def test_sync_created_harness_session_preserves_permission_mode(tmp_path):
+    collector = _make_collector(tmp_path)
+    collector._sync_created_harness_session(
+        "mac-mini",
+        {"harness": "claude-code", "permission_mode": "auto", "cwd": "/tmp/nexus"},
+        json.dumps(
+            {
+                "session_id": "harness-sync-permission",
+                "mode": "structured",
+                "harness": "claude-code",
+                "status": "running",
+            }
+        ),
+    )
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.get_session("harness-sync-permission")
+    assert session is not None
+    assert session.permission_mode == "auto"
+
+
 def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)

@@ -198,6 +198,7 @@ class GeminiDriver:
         stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
         stderr_thread.start()
         delta_buffer: list[str] = []
+        saw_result = False
 
         def flush_deltas() -> None:
             if not delta_buffer:
@@ -221,6 +222,11 @@ class GeminiDriver:
                     continue
                 for message in self.parse_stream_line(line, delta_buffer, turn_id):
                     flush_deltas()
+                    if (
+                        message.type == "status"
+                        and message.payload.get("turn_complete") is True
+                    ):
+                        saw_result = True
                     self.emit(message)
             flush_deltas()
             returncode = process.wait()
@@ -229,6 +235,20 @@ class GeminiDriver:
             with self._turn_lock:
                 self._turn_process = None
                 self._turn_active = False
+        if returncode == 0 and not saw_result:
+            self.emit(
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="turn complete",
+                    payload={
+                        "turn_complete": True,
+                        "awaiting": "input",
+                        "missing_result": True,
+                    },
+                    turn_id=turn_id,
+                )
+            )
         if returncode != 0:
             self.emit(
                 self.parse_error(returncode, "\n".join(stderr_lines), turn_id=turn_id)

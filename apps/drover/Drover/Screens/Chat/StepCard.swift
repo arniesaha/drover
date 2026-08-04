@@ -71,9 +71,34 @@ struct StepCard: View {
     }
 
     private var title: String {
+        StepCardPresentation.title(for: action)
+    }
+
+    @ViewBuilder
+    private var statusChip: some View {
+        if let result {
+            let status = StepCardPresentation.status(for: result)
+            Label(
+                status.label,
+                systemImage: status.failed ? "xmark.circle" : "checkmark.circle"
+            )
+                .font(.caption)
+                .foregroundStyle(status.failed ? .red : .secondary)
+        } else {
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text("running…")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct StepCardPresentation {
+    static func title(for action: HarnessMessage) -> String {
         let tool = action.payload["tool"]?.stringValue ?? action.text
-        if tool == "shell",
-           let command = action.payload["input"]?.objectValue?["command"]?.stringValue,
+        if let command = action.payload["input"]?.objectValue?["command"]?.stringValue,
            let firstLine = command.split(separator: "\n").first {
             return String(firstLine.prefix(72))
         }
@@ -83,24 +108,13 @@ struct StepCard: View {
         return tool
     }
 
-    @ViewBuilder
-    private var statusChip: some View {
-        if let result {
-            let exitCode = result.payload["exit_code"]?.numberValue.map { Int($0) }
-            let failed = (exitCode ?? 0) != 0
-                || result.payload["status"]?.stringValue == "failed"
-                || result.payload["is_error"]?.boolValue == true
-            let label = failed ? (exitCode.map { "exit \($0)" } ?? "failed") : "done"
-            Label(label, systemImage: failed ? "xmark.circle" : "checkmark.circle")
-                .font(.caption)
-                .foregroundStyle(failed ? .red : .secondary)
-        } else {
-            HStack(spacing: 4) {
-                ProgressView().controlSize(.mini)
-                Text("running…")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
+    static func status(for result: HarnessMessage) -> (failed: Bool, label: String) {
+        let exitCode = result.payload["exit_code"]?.numberValue.map { Int($0) }
+        let resultStatus = result.payload["status"]?.stringValue
+        let failed = (exitCode ?? 0) != 0
+            || ["failed", "error"].contains(resultStatus)
+            || result.payload["is_error"]?.boolValue == true
+        let label = failed ? (exitCode.map { "exit \($0)" } ?? "failed") : "done"
+        return (failed, label)
     }
 }

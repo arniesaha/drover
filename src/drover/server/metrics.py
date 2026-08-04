@@ -969,6 +969,10 @@ class MetricsCollector:
                         request_payload.get("source_session_id")
                     ),
                     handoff_mode=_optional_str(request_payload.get("handoff_mode")),
+                    permission_mode=_optional_str(
+                        payload.get("permission_mode")
+                        or request_payload.get("permission_mode")
+                    ),
                 )
             else:
                 registry.update_session_status(session_id, status)

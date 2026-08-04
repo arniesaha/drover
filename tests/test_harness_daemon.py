@@ -2006,3 +2006,52 @@ def test_structured_session_stores_default_permission_mode(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_structured_session_stores_explicit_auto_permission_mode(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+                "permission_mode": "auto",
+            },
+        )
+        assert status == 201
+        session = state.registry.get_session(body["session_id"])
+        assert session.permission_mode == "auto"
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_structured_session_rejects_unknown_permission_mode(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        try:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "claude-code",
+                    "mode": "structured",
+                    "command": FAKE_STRUCTURED_CLI,
+                    "cwd": str(tmp_path),
+                    "permission_mode": "yolo",
+                },
+            )
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            assert "unknown permission_mode" in exc.read().decode()
+        else:
+            raise AssertionError("unknown permission_mode should be rejected")
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()

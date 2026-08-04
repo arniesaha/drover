@@ -86,6 +86,12 @@ for line in open(os.environ["GEMINI_STREAM_FIXTURE"]):
         print(line.rstrip(), flush=True)
 """
 
+FAKE_GEMINI_NO_RESULT = """
+import json
+print(json.dumps({"type": "init", "session_id": "gemini-native-1"}), flush=True)
+print(json.dumps({"type": "message", "role": "assistant", "content": "partial"}), flush=True)
+"""
+
 
 def _driver(sink: list) -> GeminiDriver:
     return GeminiDriver([sys.executable, "-c", FAKE_GEMINI], None, sink.append)
@@ -244,6 +250,16 @@ def test_stream_json_turn_maps_events(tmp_path, monkeypatch):
     final = messages[4]
     assert final.payload["turn_complete"] is True
     assert final.payload["awaiting"] == "input"
+
+
+def test_zero_exit_without_result_still_marks_turn_complete(tmp_path):
+    messages = _run_fake_turn(tmp_path, FAKE_GEMINI_NO_RESULT)
+    assert [m.type for m in messages] == ["status", "assistant_output", "status"]
+    assert messages[1].text == "partial"
+    final = messages[-1]
+    assert final.payload["turn_complete"] is True
+    assert final.payload["awaiting"] == "input"
+    assert final.payload["missing_result"] is True
 
 
 # -- answer_permission: no interactive approvals (yolo mode) ------------------
