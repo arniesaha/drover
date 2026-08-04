@@ -168,9 +168,15 @@ def test_terminal_websocket_sends_input_and_captures_transcript(tmp_path):
         finally:
             sock.close()
 
-        chunks = state.registry.list_transcript_chunks(session_id)
-        assert [chunk.sequence for chunk in chunks] == list(range(1, len(chunks) + 1))
-        assert any("WS_OK" in chunk.content_redacted for chunk in chunks)
+        outputs = [
+            event
+            for event in state.registry.list_events(session_id)
+            if event.event_type == "terminal.output"
+        ]
+        assert outputs, "terminal output must be recorded as events"
+        assert any(
+            "WS_OK" in (event.payload or {}).get("text", "") for event in outputs
+        )
 
         _wait_for_event(state, session_id, "terminal.detached")
         events = [event.event_type for event in state.registry.list_events(session_id)]
@@ -203,7 +209,7 @@ class _SlowWritesRegistry:
 
     def __getattr__(self, name):
         attr = getattr(self._inner, name)
-        if name in {"append_event", "append_transcript_chunk", "append_events_if_new"}:
+        if name in {"append_event", "append_events_if_new"}:
 
             def slowed(*args, **kwargs):
                 time_sleep(self._slow_s)
@@ -251,9 +257,13 @@ def test_terminal_echo_is_not_serialized_behind_registry_writes(tmp_path):
                 # Breathe between polls: each list_* call takes the same
                 # process-wide connect lock the mirror's writer needs.
                 time_sleep(0.2)
-                types = [e.event_type for e in real_registry.list_events(session_id)]
-                chunks = real_registry.list_transcript_chunks(session_id)
-                transcript = "".join(c.content_redacted for c in chunks)
+                events = real_registry.list_events(session_id)
+                types = [e.event_type for e in events]
+                transcript = "".join(
+                    (e.payload or {}).get("text", "")
+                    for e in events
+                    if e.event_type == "terminal.output"
+                )
                 if (
                     types.count("terminal.input") >= 5
                     and "terminal.output" in types

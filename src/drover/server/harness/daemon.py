@@ -2094,11 +2094,6 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                         content_preview=content,
                     )
                     send_json(sock, {"type": "event", "event": _event_json(event)})
-                    mirror.record_chunk(
-                        session_id=session_id,
-                        content_redacted=content,
-                        byte_count=len(output),
-                    )
 
                 # Type any queued handoff seed once the CLI's output settles
                 # (answering a startup gate first if one is on screen).
@@ -2261,22 +2256,6 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return event
         except Exception:
             return None
-
-    def _safe_append_transcript_chunk(
-        self,
-        *,
-        session_id: str,
-        content_redacted: str,
-        byte_count: int,
-    ) -> None:
-        try:
-            self.server.state.registry.append_transcript_chunk(
-                session_id=session_id,
-                content_redacted=content_redacted,
-                byte_count=byte_count,
-            )
-        except Exception:
-            return
 
     def _safe_update_session_status(
         self,
@@ -2635,20 +2614,6 @@ class _TerminalMirror:
     def record_event(self, record: dict[str, Any]) -> None:
         self._queue.put(("event", record))
 
-    def record_chunk(
-        self, *, session_id: str, content_redacted: str, byte_count: int
-    ) -> None:
-        self._queue.put(
-            (
-                "chunk",
-                {
-                    "session_id": session_id,
-                    "content_redacted": content_redacted,
-                    "byte_count": byte_count,
-                },
-            )
-        )
-
     def stop(self, timeout_s: float = 5.0) -> None:
         """Flush queued records and stop the worker (bounded wait)."""
         self._closing.set()
@@ -2673,13 +2638,12 @@ class _TerminalMirror:
     def _flush(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         # Same swallow-and-continue stance as _safe_append_event: a locked
         # or failing registry must never take the terminal down with it.
+        # (Task 6 replaces the bare swallow with retry + a dropped counter.)
+        events = [record for kind, record in batch if kind == "event"]
+        if not events:
+            return
         try:
-            for kind, record in batch:
-                if kind == "chunk":
-                    self._registry.append_transcript_chunk(**record)
-            events = [record for kind, record in batch if kind == "event"]
-            if events:
-                self._registry.append_events_if_new(events)
+            self._registry.append_events_if_new(events)
         except Exception:
             pass
 
