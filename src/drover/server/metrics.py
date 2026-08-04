@@ -458,10 +458,15 @@ class MetricsCollector:
     favorite_cwds: tuple[str, ...] = ()
     # Set by start_metrics_server; owns live hub<->harnessd relay connections.
     relay_manager: "RelayManager | None" = None
+    # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel
+    # live, but N polling clients should still share one render.
+    harness_ttl_seconds: float = 2.0
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
     _cached_until: float = field(default=0.0, init=False)
+    _harness_cached_json: str | None = field(default=None, init=False)
+    _harness_cached_until: float = field(default=0.0, init=False)
 
     def render_prometheus(self) -> str:
         self._refresh_if_needed()
@@ -477,11 +482,22 @@ class MetricsCollector:
         include_hosts: bool = True,
         include_sessions: bool = True,
     ) -> str:
+        # Only the default full render is cached; partial renders are rare
+        # and caching them would need a per-variant key for no real gain.
+        full = include_hosts and include_sessions
+        now = time.monotonic()
+        if full and self._harness_cached_json is not None:
+            if now < self._harness_cached_until:
+                return self._harness_cached_json
         snapshot = self.harness_snapshot(
             include_hosts=include_hosts,
             include_sessions=include_sessions,
         )
-        return json.dumps(snapshot, sort_keys=True, default=str) + "\n"
+        rendered = json.dumps(snapshot, sort_keys=True, default=str) + "\n"
+        if full:
+            self._harness_cached_json = rendered
+            self._harness_cached_until = now + self.harness_ttl_seconds
+        return rendered
 
     def render_harness_session_json(self, session_id: str) -> tuple[int, str]:
         snapshot = self.harness_session_snapshot(session_id)

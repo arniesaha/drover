@@ -2484,3 +2484,44 @@ def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
 
     assert copies == [], "harness_snapshot must query the live DB, not copy it"
     assert len(snapshot["sessions"]) == 1
+
+
+def test_render_harness_json_caches_within_ttl(tmp_path, monkeypatch):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+
+    calls = {"n": 0}
+    real = collector.harness_snapshot
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(collector, "harness_snapshot", counting)
+
+    first = collector.render_harness_json()
+    second = collector.render_harness_json()
+
+    assert calls["n"] == 1, "second call inside the TTL must be served from cache"
+    assert first == second
+
+
+def test_render_harness_json_refreshes_after_ttl(tmp_path, monkeypatch):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+    collector.harness_ttl_seconds = 0.0
+
+    calls = {"n": 0}
+    real = collector.harness_snapshot
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(collector, "harness_snapshot", counting)
+    collector.render_harness_json()
+    collector.render_harness_json()
+
+    assert calls["n"] == 2
