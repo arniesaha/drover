@@ -17,7 +17,6 @@ from drover.server.harness.models import (
     HarnessEvent,
     HarnessHost,
     HarnessSession,
-    HarnessTranscriptChunk,
 )
 from drover.server.harness.events import normalize_harness_event
 
@@ -445,103 +444,23 @@ class HarnessRegistry:
                 )
             ]
 
-    def append_transcript_chunk(
-        self,
-        *,
-        session_id: str,
-        content_redacted: str,
-        sequence: int | None = None,
-        byte_count: int | None = None,
-        chunk_id: str | None = None,
-        created_at: datetime | None = None,
-    ) -> HarnessTranscriptChunk:
-        chunk_id = chunk_id or f"harness-chunk-{uuid4()}"
-        created_at = created_at or _now()
-        byte_count = (
-            byte_count
-            if byte_count is not None
-            else len(content_redacted.encode("utf-8"))
-        )
-        with self._connect() as con:
-            if sequence is None:
-                sequence = con.execute(
-                    """
-                    SELECT COALESCE(MAX(sequence), 0) + 1
-                    FROM harness_transcript_chunks
-                    WHERE session_id = ?
-                    """,
-                    [session_id],
-                ).fetchone()[0]
-            con.execute(
-                """
-                INSERT INTO harness_transcript_chunks (
-                  chunk_id, session_id, sequence, content_redacted, byte_count,
-                  created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    chunk_id,
-                    session_id,
-                    sequence,
-                    content_redacted,
-                    byte_count,
-                    created_at,
-                ],
-            )
-        chunk = self.get_transcript_chunk(chunk_id)
-        if chunk is None:
-            raise RuntimeError(f"failed to append transcript chunk {chunk_id!r}")
-        return chunk
-
-    def get_transcript_chunk(self, chunk_id: str) -> HarnessTranscriptChunk | None:
-        with self._connect() as con:
-            rows = _rows(
-                con,
-                "SELECT * FROM harness_transcript_chunks WHERE chunk_id = ?",
-                [chunk_id],
-            )
-        return HarnessTranscriptChunk.from_row(rows[0]) if rows else None
-
-    def list_transcript_chunks(self, session_id: str) -> list[HarnessTranscriptChunk]:
-        with self._connect() as con:
-            return [
-                HarnessTranscriptChunk.from_row(row)
-                for row in _rows(
-                    con,
-                    """
-                    SELECT * FROM harness_transcript_chunks
-                    WHERE session_id = ?
-                    ORDER BY sequence, created_at, chunk_id
-                    """,
-                    [session_id],
-                )
-            ]
-
-    # Structured (non-PTY) sessions never write harness_transcript_chunks --
-    # only the PTY terminal mirror does. Their conversation lives entirely in
-    # harness_events, so anything that wants "the transcript" for a structured
-    # session (handoff prompts above all) has to reconstruct it from there.
+    # Session conversation lives entirely in harness_events, for both PTY and
+    # structured sessions. PTY output arrives as terminal.output events; the
+    # separate transcript-chunk table it used to be duplicated into is gone
+    # (the two held byte-identical text).
     _TRANSCRIPT_EVENT_ROLES = {
         "user_input": "user",
         "assistant_output": "assistant",
         "tool_action": "tool",
         "tool_result": "tool-result",
+        "terminal.output": "terminal",
     }
 
     def transcript_text(self, session_id: str, *, limit: int = 200) -> str:
-        """Best-effort readable transcript for a session, either storage shape.
+        """Best-effort readable transcript for a session.
 
-        Prefers recorded PTY chunks; falls back to replaying the structured
-        event stream. Returns "" when neither source has usable content.
+        Returns "" when the session has no content-bearing events.
         """
-        chunks = self.list_transcript_chunks(session_id)
-        recorded = "\n".join(
-            chunk.content_redacted for chunk in chunks if chunk.content_redacted
-        ).strip()
-        if recorded:
-            return recorded
-
         with self._connect() as con:
             rows = _rows(
                 con,
@@ -549,7 +468,8 @@ class HarnessRegistry:
                 SELECT event_type, payload_json
                 FROM harness_events
                 WHERE session_id = ? AND event_type IN
-                      ('user_input', 'assistant_output', 'tool_action', 'tool_result')
+                      ('user_input', 'assistant_output', 'tool_action',
+                       'tool_result', 'terminal.output')
                 ORDER BY COALESCE(seq, 0), created_at, event_id
                 """,
                 [session_id],

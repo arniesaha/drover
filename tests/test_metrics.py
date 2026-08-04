@@ -581,10 +581,6 @@ def test_metrics_collector_harness_session_json(tmp_path):
         command="/bin/sh",
         status="running",
     )
-    registry.append_transcript_chunk(
-        session_id=session.session_id,
-        content_redacted="hello from transcript\n",
-    )
     registry.append_event(
         session_id=session.session_id,
         event_type="terminal.output",
@@ -1388,9 +1384,10 @@ def test_metrics_http_server_continues_session_with_nexus_handoff(tmp_path):
         repo_name="nexus",
         branch="main",
     )
-    registry.append_transcript_chunk(
+    registry.append_event(
         session_id=source.session_id,
-        content_redacted="We just implemented central host heartbeats.\n",
+        event_type="terminal.output",
+        payload={"text": "We just implemented central host heartbeats.\n"},
     )
     collector = MetricsCollector(
         duckdb_path=duckdb_path,

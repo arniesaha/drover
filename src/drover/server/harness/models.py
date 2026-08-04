@@ -126,24 +126,3 @@ class HarnessEvent:
             created_at=row.get("created_at"),
             seq=row.get("seq"),
         )
-
-
-@dataclass(frozen=True)
-class HarnessTranscriptChunk:
-    chunk_id: str
-    session_id: str
-    sequence: int
-    content_redacted: str
-    byte_count: int
-    created_at: datetime | None = None
-
-    @classmethod
-    def from_row(cls, row: dict[str, Any]) -> "HarnessTranscriptChunk":
-        return cls(
-            chunk_id=row["chunk_id"],
-            session_id=row["session_id"],
-            sequence=row["sequence"],
-            content_redacted=row["content_redacted"],
-            byte_count=row["byte_count"],
-            created_at=row.get("created_at"),
-        )

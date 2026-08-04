@@ -33,9 +33,6 @@ class _FailingRegistry:
     def append_event(self, **kwargs):
         raise RuntimeError("locked")
 
-    def append_transcript_chunk(self, **kwargs):
-        raise RuntimeError("locked")
-
     def update_session_status(self, *args, **kwargs):
         raise RuntimeError("locked")
 
