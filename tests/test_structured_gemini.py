@@ -24,15 +24,19 @@ from drover.server.harness.structured.gemini import GeminiDriver, default_comman
 FIXTURES_DIR = Path("tests/fixtures/structured")
 GEMINI_ERROR_ENVELOPE = FIXTURES_DIR / "gemini_basic.json"
 
+# Emits stream-json NDJSON: one "message"/assistant event, then a "result"
+# event (the turn-complete signal the new parser looks for).
 FAKE_GEMINI = (
     "import json,sys; args=sys.argv[1:]; "
     'idx=args.index("-p"); prompt=args[idx+1]; '
-    'print(json.dumps({"response": "echo: " + prompt, "stats": {}}))'
+    'print(json.dumps({"type": "message", "role": "assistant", '
+    '"content": "echo: " + prompt})); '
+    'print(json.dumps({"type": "result", "status": "success", "stats": {}}))'
 )
 
 # Logs its own argv (JSON, one line) to $GEMINI_ARGV_LOG before emitting the
-# same success shape as FAKE_GEMINI, so argv-shape tests (the --approval-mode
-# yolo flag in particular) don't need a separate script.
+# same NDJSON shape as FAKE_GEMINI, so argv-shape tests (the --approval-mode
+# yolo / -o stream-json flags in particular) don't need a separate script.
 FAKE_GEMINI_LOGGING = """
 import json, os, sys
 args = sys.argv[1:]
@@ -42,7 +46,8 @@ if log:
         print(json.dumps(args), file=fh)
 idx = args.index("-p")
 prompt = args[idx + 1]
-print(json.dumps({"response": "echo: " + prompt, "stats": {}}))
+print(json.dumps({"type": "message", "role": "assistant", "content": "echo: " + prompt}))
+print(json.dumps({"type": "result", "status": "success", "stats": {}}))
 """
 
 # Sleeps before finishing so a second send_turn / close() can be attempted
@@ -59,10 +64,27 @@ if pid_file:
     with open(pid_file, "w") as fh:
         print(os.getpid(), file=fh)
 time.sleep(1.0)
-print(json.dumps({"response": "late", "stats": {}}))
+print(json.dumps({"type": "message", "role": "assistant", "content": "late"}))
+print(json.dumps({"type": "result", "status": "success", "stats": {}}))
 """
 
 FAIL_GEMINI_SILENT = "import sys; sys.exit(2)"
+
+# Fake CLI that emits the golden NDJSON fixture (tests/fixtures/structured/
+# gemini_stream.ndjson, captured live 2026-08-04) verbatim to stdout, so the
+# mapping test exercises the real captured line shapes rather than
+# hand-rolled ones. Also logs argv, mirroring FAKE_GEMINI_LOGGING.
+FAKE_GEMINI_STREAM = """
+import json, os, sys
+argv = sys.argv[1:]
+log = os.environ.get("GEMINI_ARGV_LOG")
+if log:
+    with open(log, "a") as fh:
+        print(json.dumps(argv), file=fh)
+for line in open(os.environ["GEMINI_STREAM_FIXTURE"]):
+    if line.strip():
+        print(line.rstrip(), flush=True)
+"""
 
 
 def _driver(sink: list) -> GeminiDriver:
@@ -76,6 +98,30 @@ def _wait_for(got: list, predicate, timeout: float = 10.0) -> None:
             return
         time.sleep(0.05)
     raise AssertionError([m.type for m in got])
+
+
+def _run_fake_turn(tmp_path: Path, source: str) -> list:
+    """Spawn a fake gemini CLI from `source`, run one turn, return messages.
+
+    Mirrors the driver-construction + send_turn + wait-for-terminal-message
+    pattern every other test in this file hand-rolls, so the new mapping
+    tests don't need their own bespoke plumbing.
+    """
+    del tmp_path  # kept for parity with the brief's helper signature
+    got: list = []
+    driver = GeminiDriver([sys.executable, "-c", source], None, got.append)
+    driver.start()
+    got.clear()  # drop the start()-emitted "ready" status; only turn output
+    driver.send_turn("hello", turn_id="t1")
+    _wait_for(
+        got,
+        lambda g: any(
+            (m.type == "status" and m.payload.get("turn_complete")) or m.type == "error"
+            for m in g
+        ),
+    )
+    driver.close()
+    return got
 
 
 # -- default_command ---------------------------------------------------------
@@ -150,7 +196,7 @@ def test_argv_includes_approval_mode_yolo(tmp_path, monkeypatch):
     argv = json.loads(log.read_text().splitlines()[0])
     assert "-p" in argv
     assert argv[argv.index("-p") + 1] == "hello"
-    assert "-o" in argv and argv[argv.index("-o") + 1] == "json"
+    assert "-o" in argv and argv[argv.index("-o") + 1] == "stream-json"
     assert "--approval-mode" in argv
     assert argv[argv.index("--approval-mode") + 1] == "yolo"
     assert "--skip-trust" in argv
@@ -158,21 +204,46 @@ def test_argv_includes_approval_mode_yolo(tmp_path, monkeypatch):
     driver.close()
 
 
-# -- golden fixture: live-captured success envelope (gemini 0.46.0) -----------
+def test_argv_uses_stream_json(tmp_path):
+    del tmp_path
+    driver = GeminiDriver(["gemini"], cwd=None, emit=lambda m: None)
+    argv = driver._argv_for("hello")
+    assert "-o" in argv and argv[argv.index("-o") + 1] == "stream-json"
+    assert "--approval-mode" in argv and "yolo" in argv
+    assert "--skip-trust" in argv
 
 
-def test_success_envelope_fixture_parses_to_assistant_output():
-    fixture = Path("tests/fixtures/structured/gemini_success.json")
-    if not fixture.exists():
-        pytest.skip("gemini success fixture not captured")
-    driver = _driver([])
-    got = driver.build_messages(0, fixture.read_text(), "", turn_id="t1")
-    output = next(m for m in got if m.type == "assistant_output")
-    assert output.text == "hello nexus"
-    assert output.turn_id == "t1"
-    status = next(m for m in got if m.type == "status")
-    assert status.payload["turn_complete"] is True
-    assert status.payload["awaiting"] == "input"
+# -- golden fixture: live-captured NDJSON stream (gemini 0.46.0, Task 1) ------
+
+
+def test_stream_json_turn_maps_events(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "GEMINI_STREAM_FIXTURE", str(FIXTURES_DIR / "gemini_stream.ndjson")
+    )
+    messages = _run_fake_turn(tmp_path, FAKE_GEMINI_STREAM)
+    types = [m.type for m in messages]
+    # init status, tool_action, tool_result, ONE coalesced assistant_output,
+    # then turn-complete status. The user-echo message line is skipped
+    # (manager already records user_input for every sent turn).
+    assert types == [
+        "status",
+        "tool_action",
+        "tool_result",
+        "assistant_output",
+        "status",
+    ]
+    action = messages[1]
+    assert action.payload["tool"] == "list_directory"
+    assert action.payload["tool_use_id"] == "list_directory__859y31fx"
+    assert action.payload["input"] == {"dir_path": "."}
+    result = messages[2]
+    assert result.payload["tool_use_id"] == "list_directory__859y31fx"
+    output = messages[3]
+    assert output.text.startswith("probe-ok")
+    assert "current directory" in output.text  # both delta chunks joined
+    final = messages[4]
+    assert final.payload["turn_complete"] is True
+    assert final.payload["awaiting"] == "input"
 
 
 # -- answer_permission: no interactive approvals (yolo mode) ------------------

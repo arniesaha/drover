@@ -33,8 +33,10 @@ same probe: headless runs in a not-yet-trusted directory exit 55 unless
 Two more findings that diverge from the original brief:
 
 1. **No persistent bidirectional process.** Like Codex, every turn is a
-   fresh ``gemini -p <text> -o json --approval-mode yolo`` subprocess that
-   emits one JSON blob (or one JSON error envelope on stderr) and exits.
+   fresh ``gemini -p <text> -o stream-json --approval-mode yolo`` subprocess
+   per turn streaming NDJSON (verified live 2026-08-04, gemini 0.46.0,
+   captured as ``gemini_stream.ndjson``) -- or one JSON error envelope on
+   stderr and a nonzero exit, unchanged from the earlier ``-o json`` probe.
    ``GeminiDriver`` does not subclass ``ProcessDriver``.
 2. **No resume support in v1.** FINDINGS.md sec 3 documents Gemini's
    ``-r/--resume <"latest"|index>`` flag as *index-based*, not id-based --
@@ -79,7 +81,7 @@ def _tail(text: str, n: int) -> str:
 
 
 class GeminiDriver:
-    """Owns one `gemini -p ... -o json` subprocess per turn; no resume."""
+    """Owns one `gemini -p ... -o stream-json` subprocess per turn; no resume."""
 
     def __init__(self, command: list[str], cwd: str | None, emit: EmitFn) -> None:
         self.command = command
@@ -160,6 +162,7 @@ class GeminiDriver:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
             )
             worker = threading.Thread(
                 target=self._run_turn, args=(process, turn_id), daemon=True
@@ -178,71 +181,167 @@ class GeminiDriver:
             "-p",
             text,
             "-o",
-            "json",
+            "stream-json",
             "--approval-mode",
             "yolo",
             "--skip-trust",
         ]
 
     def _run_turn(self, process: subprocess.Popen[str], turn_id: str) -> None:
-        # Gemini's `-o json` emits exactly one JSON blob per invocation, not
-        # a streaming NDJSON sequence -- communicate() (full buffering) is
-        # the right tool here, unlike Codex/Claude's line-oriented pumps.
+        stderr_lines: list[str] = []
+
+        def pump_stderr() -> None:
+            assert process.stderr is not None
+            for line in process.stderr:
+                stderr_lines.append(line.rstrip("\n"))
+
+        stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
+        stderr_thread.start()
+        delta_buffer: list[str] = []
+
+        def flush_deltas() -> None:
+            if not delta_buffer:
+                return
+            text = "".join(delta_buffer)
+            delta_buffer.clear()
+            self.emit(
+                StructuredMessage(
+                    type="assistant_output",
+                    role="assistant",
+                    text=text,
+                    turn_id=turn_id,
+                )
+            )
+
         try:
-            stdout, stderr = process.communicate()
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                for message in self.parse_stream_line(line, delta_buffer, turn_id):
+                    flush_deltas()
+                    self.emit(message)
+            flush_deltas()
+            returncode = process.wait()
+            stderr_thread.join(timeout=2)
         finally:
             with self._turn_lock:
                 self._turn_process = None
                 self._turn_active = False
-        returncode = process.returncode
-        for message in self.build_messages(returncode, stdout, stderr, turn_id):
-            self.emit(message)
-
-    # -- parsing ---------------------------------------------------------------
-
-    def build_messages(
-        self, returncode: int, stdout: str, stderr: str, turn_id: str
-    ) -> list[StructuredMessage]:
         if returncode != 0:
-            return [
-                self.parse_error(returncode, stderr, turn_id=turn_id),
+            self.emit(
+                self.parse_error(returncode, "\n".join(stderr_lines), turn_id=turn_id)
+            )
+            self.emit(
                 StructuredMessage(
                     type="status",
                     role="system",
                     text="turn exited",
                     payload={"exited": returncode},
                     turn_id=turn_id,
-                ),
-            ]
-        turn_complete = StructuredMessage(
-            type="status",
-            role="system",
-            text="turn complete",
-            payload={"turn_complete": True, "awaiting": "input"},
-            turn_id=turn_id,
-        )
+                )
+            )
+
+    # -- parsing ---------------------------------------------------------------
+
+    def parse_stream_line(
+        self, line: str, delta_buffer: list[str], turn_id: str
+    ) -> list[StructuredMessage]:
         try:
-            obj: dict[str, Any] = json.loads(stdout)
+            obj: dict[str, Any] = json.loads(line)
         except json.JSONDecodeError:
             return [
                 StructuredMessage(
                     type="raw",
                     role="system",
-                    text=stdout,
+                    text=line,
                     payload={"stream": "stdout"},
                     turn_id=turn_id,
-                ),
-                turn_complete,
+                )
+            ]
+        kind = obj.get("type")
+        if kind == "message":
+            if obj.get("role") == "assistant":
+                delta_buffer.append(str(obj.get("content") or ""))
+                return []
+            # role=user is the CLI echoing the prompt back; the manager
+            # already records a user_input event for every sent turn, so
+            # emitting this would duplicate it in the transcript.
+            return []
+        if kind == "init":
+            return [
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="init",
+                    payload={"native_session_id": obj.get("session_id"), **obj},
+                    turn_id=turn_id,
+                )
+            ]
+        if kind == "tool_use":
+            return [
+                StructuredMessage(
+                    type="tool_action",
+                    role="assistant",
+                    text=str(obj.get("tool_name") or ""),
+                    payload={
+                        "tool": obj.get("tool_name"),
+                        "tool_use_id": obj.get("tool_id"),
+                        "input": obj.get("parameters"),
+                    },
+                    turn_id=turn_id,
+                )
+            ]
+        if kind == "tool_result":
+            return [
+                StructuredMessage(
+                    type="tool_result",
+                    role="tool",
+                    text=str(obj.get("output") or obj.get("status") or ""),
+                    payload={
+                        "tool_use_id": obj.get("tool_id"),
+                        "status": obj.get("status"),
+                        **obj,
+                    },
+                    turn_id=turn_id,
+                )
+            ]
+        if kind == "thought":
+            # Defensive: never observed live (2026-08-04 probe, flash model);
+            # gemini docs suggest thought summaries may stream in some modes.
+            return [
+                StructuredMessage(
+                    type="assistant_output",
+                    role="assistant",
+                    text=str(obj.get("content") or obj.get("text") or ""),
+                    payload={"thinking": True},
+                    turn_id=turn_id,
+                )
+            ]
+        if kind == "result":
+            return [
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="turn complete",
+                    payload={
+                        "turn_complete": True,
+                        "awaiting": "input",
+                        "stats": obj.get("stats"),
+                        "status": obj.get("status"),
+                    },
+                    turn_id=turn_id,
+                )
             ]
         return [
             StructuredMessage(
-                type="assistant_output",
-                role="assistant",
-                text=obj.get("response") or "",
-                payload={k: v for k, v in obj.items() if k != "response"},
+                type="status",
+                role="system",
+                text=str(kind),
+                payload=obj,
                 turn_id=turn_id,
-            ),
-            turn_complete,
+            )
         ]
 
     def parse_error(
