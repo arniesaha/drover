@@ -7,8 +7,6 @@ from datetime import datetime, timezone
 import http.client
 import json
 import logging
-import shutil
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1201,14 +1199,13 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
             )
-        with tempfile.TemporaryDirectory(prefix="drover-metrics-") as tmp:
-            snapshot = Path(tmp) / source.name
-            shutil.copy2(source, snapshot)
-            return quality_snapshot(
-                duckdb_path=snapshot,
-                incoming_dir=self.incoming_dir,
-                deep=False,
-            )
+        # Live read, same reasoning as harness_snapshot: copying the whole
+        # database to answer a read is unaffordable once it is large.
+        return quality_snapshot(
+            duckdb_path=source,
+            incoming_dir=self.incoming_dir,
+            deep=False,
+        )
 
     def _observatory_snapshot(self, quality: dict) -> dict:
         audit = quality.get("runtime_audit", {})
@@ -1216,15 +1213,12 @@ class MetricsCollector:
         if not source.exists():
             return {}
         try:
-            with tempfile.TemporaryDirectory(prefix="drover-observatory-") as tmp:
-                snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
-                return pipeline_observatory_snapshot(
-                    duckdb_path=snapshot,
-                    runtime_audit=audit,
-                    max_artifacts=10,
-                    max_projects=10,
-                )
+            return pipeline_observatory_snapshot(
+                duckdb_path=source,
+                runtime_audit=audit,
+                max_artifacts=10,
+                max_projects=10,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render observatory drilldown: %s", exc)
             return {"error": str(exc)}

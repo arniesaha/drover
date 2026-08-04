@@ -2525,3 +2525,24 @@ def test_render_harness_json_refreshes_after_ttl(tmp_path, monkeypatch):
     collector.render_harness_json()
 
     assert calls["n"] == 2
+
+
+def test_quality_and_observatory_snapshots_do_not_copy_the_database(
+    tmp_path, monkeypatch
+):
+    """Same defect as harness_snapshot, lower request frequency."""
+    collector = _make_collector(tmp_path)
+
+    copies: list = []
+    real_copy = shutil.copy2
+
+    def spy(*args, **kwargs):
+        copies.append(args)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", spy)
+
+    quality = collector._quality_snapshot()
+    collector._observatory_snapshot(quality)
+
+    assert copies == []
