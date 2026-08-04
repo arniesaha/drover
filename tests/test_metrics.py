@@ -2433,3 +2433,22 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
         "decision": "allow",
     }
     assert "/sessions/harness-running/interrupt" in forwarded
+
+
+def test_session_snapshot_has_no_transcript_chunks_key(tmp_path):
+    """Scrollback comes from terminal.output events; the chunk table is gone."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.create_session(
+        host_id="h1", harness="shell", command="sh", mode="pty"
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="terminal.output",
+        payload={"text": "hello"},
+    )
+
+    snapshot = collector.harness_session_snapshot(session.session_id)
+
+    assert "transcript_chunks" not in snapshot
+    assert any(e["event_type"] == "terminal.output" for e in snapshot["events"])

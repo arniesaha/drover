@@ -885,7 +885,6 @@ class MetricsCollector:
                 if session is None:
                     return {"error": f"unknown harness session: {session_id}"}
                 host = registry.get_host(session.host_id)
-                chunks = registry.list_transcript_chunks(session_id)
                 events = registry.list_events(session_id)
                 native_transcript: dict[str, Any] | None = None
                 status, body = self.proxy_harness_native_transcript(session_id)
@@ -900,7 +899,6 @@ class MetricsCollector:
                     "session": session.__dict__,
                     "host": host.__dict__ if host else None,
                     "events": [event.__dict__ for event in events],
-                    "transcript_chunks": [chunk.__dict__ for chunk in chunks],
                     "native_transcript": native_transcript,
                 }
         except Exception as exc:  # noqa: BLE001
