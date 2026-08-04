@@ -1534,6 +1534,23 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        permission_mode = str(body.get("permission_mode") or "auto")
+        if permission_mode == "ask":
+            self._write_json(
+                {
+                    "error": "permission_mode 'ask' is not supported yet "
+                    "(approval surfacing is a follow-up); use 'auto'"
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if permission_mode != "auto":
+            self._write_json(
+                {"error": f"unknown permission_mode: {permission_mode}"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
         command = body.get("command")
         default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
         label_source = command or (default_command_fn() if default_command_fn else None)
@@ -1564,6 +1581,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 source_session_id=_optional_text(body.get("source_session_id")),
                 handoff_mode=_optional_text(body.get("handoff_mode")),
                 mode="structured",
+                permission_mode=permission_mode,
             )
             session_id = session.session_id
             registry_created = True

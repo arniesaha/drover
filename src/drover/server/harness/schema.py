@@ -96,6 +96,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "mode": "VARCHAR",
             "awaiting": "VARCHAR",
             "last_activity": "TIMESTAMP",
+            "permission_mode": "VARCHAR",
         },
     )
     con.execute(_HARNESS_EVENTS_DDL)

@@ -31,6 +31,13 @@ def default_command(binary: str | None = None) -> list[str]:
         "--output-format",
         "stream-json",
         "--verbose",
+        # M5: structured sessions run headless — without an answered
+        # control_request channel, any gated tool call fails outright
+        # ("requested permissions ... but you haven't granted it"), so the
+        # only workable posture until approval surfacing (Part B) lands is
+        # full bypass, matching codex danger-full-access / gemini yolo.
+        "--permission-mode",
+        "bypassPermissions",
     ]
 
 

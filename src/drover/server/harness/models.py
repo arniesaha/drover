@@ -69,6 +69,7 @@ class HarnessSession:
     source_session_id: str | None = None
     handoff_mode: str | None = None
     mode: str | None = None
+    permission_mode: str | None = None
     awaiting: str | None = None
     last_activity: datetime | None = None
 
@@ -94,6 +95,7 @@ class HarnessSession:
             source_session_id=row.get("source_session_id"),
             handoff_mode=row.get("handoff_mode"),
             mode=row.get("mode"),
+            permission_mode=row.get("permission_mode"),
             awaiting=row.get("awaiting"),
             last_activity=row.get("last_activity"),
         )

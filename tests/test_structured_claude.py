@@ -32,6 +32,13 @@ def test_default_command_shape():
     assert "--output-format" in command and "stream-json" in command
 
 
+def test_default_command_bypasses_permissions():
+    command = default_command(binary="/bin/claude")
+    assert command[-2:] == ["--permission-mode", "bypassPermissions"]
+    # bypass flag must come after the stream-json plumbing flags
+    assert "--output-format" in command
+
+
 def test_default_command_falls_back_to_which(monkeypatch, tmp_path):
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

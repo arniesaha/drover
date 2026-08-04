@@ -161,6 +161,7 @@ class HarnessRegistry:
         source_session_id: str | None = None,
         handoff_mode: str | None = None,
         mode: str = "pty",
+        permission_mode: str | None = None,
     ) -> HarnessSession:
         now = _now()
         session_id = session_id or f"harness-{uuid4()}"
@@ -170,9 +171,10 @@ class HarnessRegistry:
                 INSERT INTO harness_sessions (
                   session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
                   command, status, started_at, updated_at, native_session_id,
-                  native_resume_label, source_session_id, handoff_mode, mode
+                  native_resume_label, source_session_id, handoff_mode, mode,
+                  permission_mode
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     session_id,
@@ -191,6 +193,7 @@ class HarnessRegistry:
                     source_session_id,
                     handoff_mode,
                     mode,
+                    permission_mode,
                 ],
             )
         session = self.get_session(session_id)

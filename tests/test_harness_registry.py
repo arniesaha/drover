@@ -385,3 +385,21 @@ def test_append_events_if_new_ignores_records_without_an_id(tmp_path):
     assert registry.append_events_if_new([]) == 0
     assert registry.append_events_if_new([_record(""), _record("  ")]) == 0
     assert registry.list_events("s1") == []
+
+
+def test_create_session_persists_permission_mode(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(
+        host_id="h1", harness="claude-code", command="claude",
+        mode="structured", permission_mode="auto",
+    )
+    fetched = registry.get_session(session.session_id)
+    assert fetched is not None
+    assert fetched.permission_mode == "auto"
+
+
+def test_create_session_permission_mode_defaults_to_none(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(host_id="h1", harness="shell", command="sh")
+    fetched = registry.get_session(session.session_id)
+    assert fetched.permission_mode is None
