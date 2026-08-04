@@ -190,6 +190,28 @@ def test_tool_result_payload_carries_tool_name():
     assert result.payload["tool"] == "Bash"
 
 
+def test_tool_result_payload_carries_is_error():
+    driver = _driver([])
+    action_line = json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+             "input": {"command": "false"}}
+        ]},
+    })
+    result_line = json.dumps({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "error",
+             "is_error": True}
+        ]},
+    })
+    driver.parse_line(action_line)
+    [result] = driver.parse_line(result_line)
+    assert result.type == "tool_result"
+    assert result.payload["is_error"] is True
+
+
 def test_parse_result_marks_turn_complete():
     line = json.dumps({"type": "result", "subtype": "success", "total_cost_usd": 0.01})
     message = _driver([]).parse_line(line)[0]

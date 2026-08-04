@@ -201,6 +201,7 @@ class ClaudeDriver(ProcessDriver):
                             "tool": self._tool_names.get(
                                 str(block.get("tool_use_id"))
                             ),
+                            "is_error": block.get("is_error"),
                         },
                     )
                 )

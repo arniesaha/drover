@@ -89,8 +89,9 @@ struct StepCard: View {
             let exitCode = result.payload["exit_code"]?.numberValue.map { Int($0) }
             let failed = (exitCode ?? 0) != 0
                 || result.payload["status"]?.stringValue == "failed"
-            Label(exitCode.map { failed ? "exit \($0)" : "done" } ?? "done",
-                  systemImage: failed ? "xmark.circle" : "checkmark.circle")
+                || result.payload["is_error"]?.boolValue == true
+            let label = failed ? (exitCode.map { "exit \($0)" } ?? "failed") : "done"
+            Label(label, systemImage: failed ? "xmark.circle" : "checkmark.circle")
                 .font(.caption)
                 .foregroundStyle(failed ? .red : .secondary)
         } else {
