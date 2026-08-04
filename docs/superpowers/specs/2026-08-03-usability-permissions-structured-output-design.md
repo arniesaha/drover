@@ -80,12 +80,13 @@ Shared target vocabulary (already defined, `structured/driver.py:22-34`):
   `tool_result` with `{tool, tool_use_id, result: aggregated_output, exit_code,
   status}`. Sandbox-denied commands are normal failed `tool_result`s (per
   `tests/fixtures/structured/FINDINGS.md` — codex exec has no approval channel).
-- **Gemini** (`gemini.py`): switch `-o json` → `-o stream-json`. **First step is a
-  live probe** to capture the per-line shape (never exercised; the old auth
-  blocker is resolved). Map thought/tool/text events into the shared vocabulary.
-  Fallback if stream-json is unusable in the installed build: keep `-o json` but
-  segment the response server-side into thinking/output messages — degraded but
-  no more single blob.
+- **Gemini** (`gemini.py`): switch `-o json` → `-o stream-json`. Verified live
+  2026-08-04 (gemini 0.46.0): NDJSON with `init` / `message` (assistant text as
+  `delta: true` chunks) / `tool_use` / `tool_result` / `result` events, captured
+  as `tests/fixtures/structured/gemini_stream.ndjson`. Map tool events into the
+  shared vocabulary; coalesce contiguous assistant deltas into one
+  `assistant_output` per run (each delta as its own message would recreate the
+  wall as dozens of rows).
 - **Claude** (`claude.py`): populate `payload.tool` on `tool_result` by joining
   `tool_use_id` against the originating `tool_use` block, so the iOS card can
   title the result instead of dumping raw output.
@@ -142,9 +143,11 @@ New captured NDJSON fixtures for Codex reasoning and Gemini stream-json land in
   join); session-creation tests for `permission_mode` (default, explicit auto,
   ask-rejected, bad value); spawn-argv assertions for `bypassPermissions`.
 - **iOS:** NexusKit tests for action/result pairing (paired, unpaired, out of
-  order, historical replay); MockNetworkTests stay serialized per existing rule.
-  UITest: scroll-down button re-pins and disappears after tap with a tall diff
-  in the transcript.
+  order, historical replay) and scroll-target row identity; MockNetworkTests
+  stay serialized per existing rule. Scroll re-pin behavior is verified in the
+  live smoke checklist rather than a UITest — the existing smoke UITests attach
+  to an externally-launched live-fleet app and can't drive a streaming
+  transcript deterministically.
 - **Live:** deploy to mac + work laptop; verify the Linear-MCP scenario runs
   un-prompted on the work laptop; Gemini + Codex sessions show thinking blocks
   and step cards on the phone; combined with the pending M3/M4 phone smoke.
