@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import base64
 import os
+import shutil
 import socket
 import threading
 from time import monotonic
@@ -2462,3 +2463,24 @@ def test_prometheus_exports_dropped_harness_events(tmp_path):
     text = collector.render_prometheus()
 
     assert "drover_harness_dropped_events_total 4" in text
+
+
+def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
+    """The hub DB is ~483MB; copying it per poll was a 16% disk duty cycle."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(host_id="h1", harness="shell", command="sh")
+
+    copies: list = []
+    real_copy = shutil.copy2
+
+    def spy(*args, **kwargs):
+        copies.append(args)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", spy)
+
+    snapshot = collector.harness_snapshot()
+
+    assert copies == [], "harness_snapshot must query the live DB, not copy it"
+    assert len(snapshot["sessions"]) == 1

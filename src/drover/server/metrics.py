@@ -867,21 +867,25 @@ class MetricsCollector:
                 "error": f"DuckDB file does not exist: {source}",
             }
         try:
-            with tempfile.TemporaryDirectory(prefix="drover-harness-") as tmp:
-                snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
-                registry = HarnessRegistry(snapshot)
-                hosts = registry.list_hosts() if include_hosts else []
-                sessions = registry.list_sessions() if include_sessions else []
-                return {
-                    "hosts": [
-                        _harness_host_dict(host, self.relay_manager) for host in hosts
-                    ],
-                    "sessions": [session.__dict__ for session in sessions],
-                    "cwd_suggestions": _harness_cwd_suggestions(
-                        sessions, self.favorite_cwds
-                    ),
-                }
+            # Query the live database rather than copying it: the file is
+            # ~483MB and this runs on every fleet poll (measured 0.78s per
+            # copy against a 5s poll = a 16% disk duty cycle per client, and
+            # it grows with the store). Two indexed reads under the
+            # registry's connect lock cost microseconds. Live reads beside
+            # live writers are the supported path -- see
+            # open_duckdb_connection's docstring.
+            registry = HarnessRegistry(source)
+            hosts = registry.list_hosts() if include_hosts else []
+            sessions = registry.list_sessions() if include_sessions else []
+            return {
+                "hosts": [
+                    _harness_host_dict(host, self.relay_manager) for host in hosts
+                ],
+                "sessions": [session.__dict__ for session in sessions],
+                "cwd_suggestions": _harness_cwd_suggestions(
+                    sessions, self.favorite_cwds
+                ),
+            }
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render harness snapshot: %s", exc)
             return {"hosts": [], "sessions": [], "error": str(exc)}
@@ -892,30 +896,28 @@ class MetricsCollector:
             return {"error": f"DuckDB file does not exist: {source}"}
         try:
             self._reconcile_harness_session_from_host(session_id)
-            with tempfile.TemporaryDirectory(prefix="drover-harness-session-") as tmp:
-                snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
-                registry = HarnessRegistry(snapshot)
-                session = registry.get_session(session_id)
-                if session is None:
-                    return {"error": f"unknown harness session: {session_id}"}
-                host = registry.get_host(session.host_id)
-                events = registry.list_events(session_id)
-                native_transcript: dict[str, Any] | None = None
-                status, body = self.proxy_harness_native_transcript(session_id)
-                if 200 <= status < 300:
-                    try:
-                        parsed = json.loads(body)
-                    except json.JSONDecodeError:
-                        parsed = {}
-                    if isinstance(parsed, dict):
-                        native_transcript = parsed
-                return {
-                    "session": session.__dict__,
-                    "host": host.__dict__ if host else None,
-                    "events": [event.__dict__ for event in events],
-                    "native_transcript": native_transcript,
-                }
+            # Live read, same reasoning as harness_snapshot above.
+            registry = HarnessRegistry(source)
+            session = registry.get_session(session_id)
+            if session is None:
+                return {"error": f"unknown harness session: {session_id}"}
+            host = registry.get_host(session.host_id)
+            events = registry.list_events(session_id)
+            native_transcript: dict[str, Any] | None = None
+            status, body = self.proxy_harness_native_transcript(session_id)
+            if 200 <= status < 300:
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    native_transcript = parsed
+            return {
+                "session": session.__dict__,
+                "host": host.__dict__ if host else None,
+                "events": [event.__dict__ for event in events],
+                "native_transcript": native_transcript,
+            }
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render harness session %s: %s", session_id, exc)
             return {"error": str(exc)}
