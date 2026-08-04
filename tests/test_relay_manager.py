@@ -365,6 +365,8 @@ def test_a_ponging_spoke_stays_live_past_the_silence_timeout(monkeypatch) -> Non
         while not stop.is_set():
             try:
                 client_recv_json(spoke)
+            except socket.timeout:
+                continue
             except (OSError, WebSocketClosed):
                 return
 
