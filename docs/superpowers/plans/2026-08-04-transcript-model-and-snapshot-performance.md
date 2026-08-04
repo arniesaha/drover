@@ -89,7 +89,8 @@ Add to `tests/test_metrics.py`:
 ```python
 def test_session_snapshot_has_no_transcript_chunks_key(tmp_path):
     """Scrollback comes from terminal.output events; the chunk table is gone."""
-    collector, registry = _metrics_collector_with_registry(tmp_path)
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
     session = registry.create_session(
         host_id="h1", harness="shell", command="sh", mode="pty"
     )
@@ -105,7 +106,7 @@ def test_session_snapshot_has_no_transcript_chunks_key(tmp_path):
     assert any(e["event_type"] == "terminal.output" for e in snapshot["events"])
 ```
 
-If `_metrics_collector_with_registry` does not exist in this file, build the collector the way the nearest existing `harness_session_snapshot` test does — search for `harness_session_snapshot` in `tests/test_metrics.py` and copy its setup.
+`_make_collector` is defined at `tests/test_metrics.py:266` and returns a `MetricsCollector`; build the registry from `collector.duckdb_path`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -673,16 +674,19 @@ def test_emit_retries_then_counts_a_permanent_drop(monkeypatch, tmp_path):
         HarnessRegistry, "update_session_activity", lambda self, *a, **k: None
     )
 
-    manager, session_id, driver = _build_manager(monkeypatch, tmp_path)
+    mgr, driver, _registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
     driver.emit(StructuredMessage(type="assistant_output", role="assistant", text="hi"))
 
     assert attempts["n"] == 3, "one attempt plus two retries"
     assert daemon_mod.dropped_event_count() == 1
 ```
 
-`_build_manager`'s exact return shape is whatever the existing tests unpack —
-match it. If it returns something other than a 3-tuple, adapt this line and
-reach the driver's `emit` the way the neighbouring tests do.
+`_build_manager` (at `tests/test_structured_manager.py:67`) returns the 5-tuple
+`(mgr, driver, registry, on_messages, finalized)`. Patch `HarnessRegistry`'s
+methods on the class, not the instance — the manager closes over the registry
+built inside the helper.
 
 - [ ] **Step 2b: Run test to verify it fails**
 
@@ -782,7 +786,7 @@ def test_prometheus_exports_dropped_harness_events(tmp_path):
     daemon_mod.reset_dropped_event_count()
     daemon_mod.record_dropped_events(4)
 
-    collector, _ = _metrics_collector_with_registry(tmp_path)
+    collector = _make_collector(tmp_path)
     text = collector.render_prometheus()
 
     assert "drover_harness_dropped_events_total" in text
@@ -851,7 +855,8 @@ git commit -m "feat(metrics): export drover_harness_dropped_events_total"
 ```python
 def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
     """The hub DB is ~483MB; copying it per poll was a 16% disk duty cycle."""
-    collector, registry = _metrics_collector_with_registry(tmp_path)
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
     registry.create_session(host_id="h1", harness="shell", command="sh")
 
     copies: list = []
@@ -866,7 +871,7 @@ def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
     assert len(snapshot["sessions"]) == 1
 ```
 
-Reuse this file's existing collector helper; if it is named differently, use the actual name.
+`_make_collector(tmp_path)` is the existing helper at `tests/test_metrics.py:266`; `HarnessRegistry` is already imported in that file.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -937,7 +942,8 @@ Note `MetricsCollector.ttl_seconds` already exists and is 60.0 — that is the P
 
 ```python
 def test_render_harness_json_caches_within_ttl(tmp_path, monkeypatch):
-    collector, registry = _metrics_collector_with_registry(tmp_path)
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
     registry.create_session(host_id="h1", harness="shell", command="sh")
 
     calls = {"n": 0}
@@ -1004,7 +1010,8 @@ In the `MetricsCollector` dataclass, beside the existing cache fields:
 
 ```python
 def test_render_harness_json_refreshes_after_ttl(tmp_path, monkeypatch):
-    collector, registry = _metrics_collector_with_registry(tmp_path)
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
     registry.create_session(host_id="h1", harness="shell", command="sh")
     collector.harness_ttl_seconds = 0.0
 
@@ -1055,7 +1062,7 @@ Lower frequency than the fleet poll, but the identical defect.
 def test_quality_and_observatory_snapshots_do_not_copy_the_database(
     tmp_path, monkeypatch
 ):
-    collector, _ = _metrics_collector_with_registry(tmp_path)
+    collector = _make_collector(tmp_path)
 
     copies: list = []
     real_copy = shutil.copy2
