@@ -169,6 +169,27 @@ def test_parse_tool_use_and_result():
     assert outcome.type == "tool_result"
 
 
+def test_tool_result_payload_carries_tool_name():
+    driver = _driver([])
+    action_line = json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+             "input": {"command": "ls"}}
+        ]},
+    })
+    result_line = json.dumps({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+        ]},
+    })
+    driver.parse_line(action_line)
+    [result] = driver.parse_line(result_line)
+    assert result.type == "tool_result"
+    assert result.payload["tool"] == "Bash"
+
+
 def test_parse_result_marks_turn_complete():
     line = json.dumps({"type": "result", "subtype": "success", "total_cost_usd": 0.01})
     message = _driver([]).parse_line(line)[0]

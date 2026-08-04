@@ -81,6 +81,13 @@ def _version_key(version: str) -> tuple[tuple[int, int, str], ...]:
 
 
 class ClaudeDriver(ProcessDriver):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # tool_use_id -> tool name, so a later tool_result can carry the
+        # originating tool's name for display (iOS card titles). Unbounded
+        # but tiny: one short string pair per tool call in the session.
+        self._tool_names: dict[str, str] = {}
+
     def parse_line(self, line: str) -> list[StructuredMessage]:
         obj = json.loads(line)
         kind = obj.get("type")
@@ -167,6 +174,8 @@ class ClaudeDriver(ProcessDriver):
                     )
                 )
             elif block_type == "tool_use":
+                if block.get("id") and block.get("name"):
+                    self._tool_names[str(block["id"])] = str(block["name"])
                 messages.append(
                     StructuredMessage(
                         type="tool_action",
@@ -189,6 +198,9 @@ class ClaudeDriver(ProcessDriver):
                         payload={
                             **base_payload,
                             "tool_use_id": block.get("tool_use_id"),
+                            "tool": self._tool_names.get(
+                                str(block.get("tool_use_id"))
+                            ),
                         },
                     )
                 )
