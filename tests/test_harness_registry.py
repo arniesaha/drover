@@ -444,3 +444,27 @@ def test_transcript_text_is_empty_when_session_has_no_content(tmp_path):
     )
 
     assert registry.transcript_text(session.session_id) == ""
+
+
+def test_bootstrap_drops_legacy_transcript_chunk_table(tmp_path):
+    """The chunk table duplicated terminal.output events; bootstrap removes it."""
+    from drover.server.harness.schema import bootstrap_harness_tables
+
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS harness_transcript_chunks ("
+            "chunk_id VARCHAR PRIMARY KEY, session_id VARCHAR)"
+        )
+
+    with duckdb.connect(str(duckdb_path)) as con:
+        bootstrap_harness_tables(con)
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables"
+            ).fetchall()
+        }
+
+    assert "harness_transcript_chunks" not in tables
+    assert {"harness_hosts", "harness_sessions", "harness_events"}.issubset(tables)
