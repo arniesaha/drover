@@ -113,11 +113,19 @@ struct MessageBubble: View {
     }
 
     private var toolName: String {
-        message.payload["tool"]?.stringValue ?? message.text
+        if let tool = message.payload["tool"]?.stringValue { return tool }
+        // Old recorded sessions: tool results carried no tool key, and text
+        // is the entire output — never use it as a title.
+        return message.type == .toolResult ? "Tool result" : message.text
     }
 
     private var toolDetail: String? {
-        message.payload["input"]?.displayString ?? message.payload["result"]?.displayString
+        if message.type == .toolResult {
+            return message.text.isEmpty
+                ? message.payload["result"]?.displayString : message.text
+        }
+        return message.payload["input"]?.displayString
+            ?? message.payload["result"]?.displayString
     }
 
     @ViewBuilder

@@ -138,6 +138,8 @@ struct ChatView: View {
                 run: run,
                 isStreaming: isNewest && (model.messages.last?.isThinking ?? false)
             )
+        case .step(let action, let result):
+            StepCard(action: action, result: result)
         }
     }
 
