@@ -24,8 +24,54 @@ struct StoreTests {
     MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
     await store.refresh()
     #expect(store.snapshot != nil)          // cached snapshot survives
-    #expect(store.lastError?.contains("token") == true)
+    #expect(store.lastError?.localizedCaseInsensitiveContains("token") == true)
     #expect(!store.isReachable)
+}
+
+@Test @MainActor func refreshErrorIsHumanReadableNotEnumReflection() async throws {
+    // Regression: the banner used to render `"\(error)"`, so users saw the
+    // literal Swift enum case — `transport("cancelled")` — as the message.
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    defer { MockURLProtocol.transportError = nil }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    let message = try #require(store.lastError)
+    #expect(!message.contains("transport("))
+    #expect(!message.contains("NexusError"))
+    #expect(message == "Can't reach the hub")
+    #expect(!store.isReachable)
+}
+
+@Test @MainActor func cancelledRefreshIsNotTreatedAsUnreachable() async throws {
+    // A superseded poll or a dismissed screen cancels its own request. That
+    // used to flash an unreachable banner over a perfectly healthy fleet.
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    #expect(store.isReachable)
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    await store.refresh()
+    #expect(store.isReachable)
+    #expect(store.lastError == nil)
+    #expect(store.snapshot != nil)
+}
+
+@Test func nexusErrorDescriptionsAreHumanReadable() {
+    #expect(NexusError.unauthorized.localizedDescription == "Token rejected — check Settings")
+    #expect(NexusError.conflict("turn in flight").localizedDescription == "turn in flight")
+    #expect(NexusError.transport("cancelled").localizedDescription == "Request cancelled")
+    #expect(NexusError.transport("offline").localizedDescription == "Can't reach the hub")
+    #expect(NexusError.decoding("bad json").localizedDescription
+            == "Unexpected response from the hub")
+    #expect(NexusError.httpStatus(500, "").localizedDescription == "Server error (500)")
+}
+
+@Test func cancellationDetectionOnlyMatchesTransportCancels() {
+    #expect(NexusError.transport(NexusError.cancellationDetail).isCancellation)
+    #expect(!NexusError.transport("offline").isCancellation)
+    #expect(!NexusError.conflict(NexusError.cancellationDetail).isCancellation)
 }
 
 @Test func needsYouDiffForNotifications() {

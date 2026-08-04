@@ -144,6 +144,16 @@ public final class SessionStore {
             isReachable = true
             hasLoadedOnce = true
         } catch {
+            // A cancelled request means *we* tore it down (a superseded poll,
+            // a dismissed screen) — the hub never said anything. Treating it
+            // as a failure flashed an unreachable banner over a perfectly
+            // healthy fleet.
+            if let nexusError = error as? NexusError, nexusError.isCancellation {
+                return
+            }
+            if (error as? URLError)?.code == .cancelled {
+                return
+            }
             isReachable = false
             lastError = Self.errorMessage(for: error)
             // Deliberately keep the cached `snapshot` as-is.
@@ -231,9 +241,12 @@ public final class SessionStore {
     }
 
     private static func errorMessage(for error: Error) -> String {
-        if let nexusError = error as? NexusError, nexusError == .unauthorized {
-            return "token rejected — check Settings"
+        // NexusError is LocalizedError, so localizedDescription is the human
+        // string. The old "\(error)" fallback printed raw enum reflection —
+        // that is where the literal `transport("cancelled")` banner came from.
+        if let nexusError = error as? NexusError {
+            return nexusError.localizedDescription
         }
-        return "\(error)"
+        return (error as NSError).localizedDescription
     }
 }

@@ -10,6 +10,38 @@ public enum NexusError: Error, Equatable {
     case transport(String)               // URLError etc.
     case httpStatus(Int, String)         // Other HTTP statuses
     case decoding(String)
+
+    /// Canonical detail string for a client-side cancellation, set by
+    /// `NexusClient` when it sees `URLError.cancelled`.
+    public static let cancellationDetail = "cancelled"
+
+    /// True for a request the app itself tore down — a superseded poll, a
+    /// dismissed screen. Not a failure worth telling anyone about.
+    public var isCancellation: Bool {
+        guard case .transport(let detail) = self else { return false }
+        return detail == Self.cancellationDetail
+    }
+}
+
+// Without this, `"\(error)"` renders Swift's default reflection of the enum
+// — users were shown literal `transport("cancelled")` in the sessions banner.
+extension NexusError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .unauthorized:
+            return "Token rejected — check Settings"
+        case .conflict(let message), .badRequest(let message):
+            return message
+        case .unavailable(let message):
+            return message.isEmpty ? "That session is no longer available" : message
+        case .transport:
+            return isCancellation ? "Request cancelled" : "Can't reach the hub"
+        case .httpStatus(let code, let message):
+            return message.isEmpty ? "Server error (\(code))" : message
+        case .decoding:
+            return "Unexpected response from the hub"
+        }
+    }
 }
 
 // MARK: - NexusClient
@@ -194,6 +226,14 @@ public actor NexusClient {
         do {
             (data, response) = try await session.data(for: urlRequest)
         } catch {
+            // Normalize here rather than downstream: URLError's
+            // localizedDescription for a cancel is the useless
+            // "The operation couldn't be completed. (NSURLErrorDomain error
+            // -999.)" on some platforms and a bare "cancelled" on others, so
+            // no substring test on it is reliable. The code always is.
+            if (error as? URLError)?.code == .cancelled {
+                throw NexusError.transport(NexusError.cancellationDetail)
+            }
             throw NexusError.transport(error.localizedDescription)
         }
 

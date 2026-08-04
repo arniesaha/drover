@@ -6,10 +6,20 @@ import Foundation
 final class MockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
 
+    /// Fail the request at the transport layer instead of answering it, so
+    /// tests can exercise the `NexusError.transport` path (offline hub,
+    /// cancelled poll) that no (status, body) pair can represent. Takes
+    /// precedence over `handler`; clear it when the test is done.
+    nonisolated(unsafe) static var transportError: URLError?
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        if let transportError = Self.transportError {
+            client?.urlProtocol(self, didFailWithError: transportError)
+            return
+        }
         guard let handler = Self.handler else { return }
         let (status, body) = handler(request)
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
