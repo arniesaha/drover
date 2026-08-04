@@ -2449,3 +2449,16 @@ def test_session_snapshot_has_no_transcript_chunks_key(tmp_path):
 
     assert "transcript_chunks" not in snapshot
     assert any(e["event_type"] == "terminal.output" for e in snapshot["events"])
+
+
+def test_prometheus_exports_dropped_harness_events(tmp_path):
+    """A non-zero counter means transcript content was permanently lost."""
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    daemon_mod.record_dropped_events(4)
+
+    collector = _make_collector(tmp_path)
+    text = collector.render_prometheus()
+
+    assert "drover_harness_dropped_events_total 4" in text
