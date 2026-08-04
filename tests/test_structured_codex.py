@@ -192,9 +192,15 @@ def _messages_for_line(line: str) -> list:
 
 def test_command_item_started_payload_has_tool_keys():
     [msg] = _messages_for_line(
-        {"type": "item.started",
-         "item": {"id": "item_1", "type": "command_execution",
-                  "command": "pytest -x", "status": "in_progress"}}
+        {
+            "type": "item.started",
+            "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": "pytest -x",
+                "status": "in_progress",
+            },
+        }
     )
     assert msg.type == "tool_action"
     assert msg.payload["tool"] == "shell"
@@ -204,10 +210,17 @@ def test_command_item_started_payload_has_tool_keys():
 
 def test_command_item_completed_payload_has_tool_keys():
     [msg] = _messages_for_line(
-        {"type": "item.completed",
-         "item": {"id": "item_1", "type": "command_execution",
-                  "command": "pytest -x", "aggregated_output": "3 passed\n",
-                  "exit_code": 0, "status": "completed"}}
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": "pytest -x",
+                "aggregated_output": "3 passed\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        }
     )
     assert msg.type == "tool_result"
     assert msg.payload["tool"] == "shell"
@@ -218,8 +231,10 @@ def test_command_item_completed_payload_has_tool_keys():
 
 def test_reasoning_item_maps_to_thinking():
     [msg] = _messages_for_line(
-        {"type": "item.completed",
-         "item": {"id": "item_0", "type": "reasoning", "text": "let me look"}}
+        {
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "reasoning", "text": "let me look"},
+        }
     )
     assert msg.type == "assistant_output"
     assert msg.payload["thinking"] is True
