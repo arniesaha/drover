@@ -350,6 +350,26 @@ def _parse_event_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def _wire_datetime(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        parsed = _parse_event_timestamp(value)
+        return parsed.isoformat() if parsed else str(value)
+    # DuckDB TIMESTAMP columns round-trip aware datetimes as naive local wall
+    # time. Give clients an explicit offset so they do not reinterpret local
+    # Pacific times as UTC and render fresh sessions as seven hours old.
+    aware = value.astimezone() if value.tzinfo is None else value
+    return aware.isoformat()
+
+
+def _wire_datetimes(item: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    for key in keys:
+        if key in item:
+            item[key] = _wire_datetime(item.get(key))
+    return item
+
+
 def _command_label(command: Any) -> str:
     if isinstance(command, str):
         return command
@@ -387,17 +407,26 @@ def _harness_host_dict(
         # "online" once the socket has dropped, and vice versa).
         is_live = relay_manager.is_live(host.host_id) if relay_manager else False
         item["status"] = "online" if is_live else "offline"
-        return item
+        return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
     last_seen_at = getattr(host, "last_seen_at", None)
-    if last_seen_at is None:
-        return item
-    if last_seen_at.tzinfo is None:
-        age_s = (datetime.now() - last_seen_at).total_seconds()
-    else:
-        age_s = (datetime.now(timezone.utc) - last_seen_at).total_seconds()
-    if age_s > _HARNESS_STALE_AFTER_SECONDS and item.get("status") == "online":
-        item["status"] = "stale"
-        item["stale_after_seconds"] = _HARNESS_STALE_AFTER_SECONDS
+    if last_seen_at is not None:
+        if last_seen_at.tzinfo is None:
+            age_s = (datetime.now() - last_seen_at).total_seconds()
+        else:
+            age_s = (datetime.now(timezone.utc) - last_seen_at).total_seconds()
+        if age_s > _HARNESS_STALE_AFTER_SECONDS and item.get("status") == "online":
+            item["status"] = "stale"
+            item["stale_after_seconds"] = _HARNESS_STALE_AFTER_SECONDS
+    return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
+
+
+def _harness_session_dict(session: Any, preview: str | None = None) -> dict[str, Any]:
+    item = dict(session.__dict__)
+    _wire_datetimes(
+        item,
+        ("started_at", "updated_at", "ended_at", "last_activity"),
+    )
+    item["preview"] = _optional_str(preview)
     return item
 
 
@@ -894,11 +923,20 @@ class MetricsCollector:
             registry = HarnessRegistry(source)
             hosts = registry.list_hosts() if include_hosts else []
             sessions = registry.list_sessions() if include_sessions else []
+            previews = registry.latest_session_previews(
+                [session.session_id for session in sessions]
+            )
             return {
                 "hosts": [
                     _harness_host_dict(host, self.relay_manager) for host in hosts
                 ],
-                "sessions": [session.__dict__ for session in sessions],
+                "sessions": [
+                    _harness_session_dict(
+                        session,
+                        previews.get(session.session_id),
+                    )
+                    for session in sessions
+                ],
                 "cwd_suggestions": _harness_cwd_suggestions(
                     sessions, self.favorite_cwds
                 ),

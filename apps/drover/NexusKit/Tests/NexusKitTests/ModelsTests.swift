@@ -33,6 +33,28 @@ import Testing
     #expect(snap.sessions[0].isStructured == true)
 }
 
+@Test func sessionMetadataDecodesFromHarnessSnapshot() throws {
+    let json = Data("""
+    {"hosts": [], "sessions": [
+      {"session_id": "s1", "host_id": "h1", "harness": "codex",
+       "mode": "structured", "status": "running", "awaiting": "input",
+       "cwd": "/Volumes/M2 1/drover",
+       "preview": "Refactor session screen cards",
+       "started_at": "2026-08-05T10:40:37-07:00",
+       "updated_at": "2026-08-05T10:41:00-07:00",
+       "last_activity": "2026-08-05T10:55:34-07:00",
+       "ended_at": null}],
+     "cwd_suggestions": []}
+    """.utf8)
+    let snap = try HarnessSnapshot.decode(from: json)
+    let session = snap.sessions[0]
+    #expect(session.preview == "Refactor session screen cards")
+    #expect(session.startedAt == ISO8601DateFormatter().date(from: "2026-08-05T17:40:37Z"))
+    #expect(session.updatedAt == ISO8601DateFormatter().date(from: "2026-08-05T17:41:00Z"))
+    #expect(session.lastActivity == ISO8601DateFormatter().date(from: "2026-08-05T17:55:34Z"))
+    #expect(session.endedAt == nil)
+}
+
 @Test(arguments: [
     ("structured", "shell", true),
     ("structured", "claude-code", true),

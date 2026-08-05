@@ -163,6 +163,7 @@ class HarnessRegistry:
         permission_mode: str | None = None,
     ) -> HarnessSession:
         now = _now()
+        started_at = started_at or now
         session_id = session_id or f"harness-{uuid4()}"
         with self._connect() as con:
             con.execute(
@@ -443,6 +444,33 @@ class HarnessRegistry:
                     [session_id],
                 )
             ]
+
+    def latest_session_previews(self, session_ids: list[str]) -> dict[str, str]:
+        session_ids = [session_id for session_id in session_ids if session_id]
+        if not session_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in session_ids)
+        with self._connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT session_id, content_preview
+                FROM (
+                  SELECT session_id,
+                         content_preview,
+                         row_number() OVER (
+                           PARTITION BY session_id
+                           ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
+                         ) AS rn
+                  FROM harness_events
+                  WHERE session_id IN ({placeholders})
+                    AND event_type IN ('user_input', 'assistant_output', 'terminal.input')
+                    AND NULLIF(trim(COALESCE(content_preview, '')), '') IS NOT NULL
+                )
+                WHERE rn = 1
+                """,
+                session_ids,
+            ).fetchall()
+        return {str(session_id): str(preview) for session_id, preview in rows}
 
     # Session conversation lives entirely in harness_events, for both PTY and
     # structured sessions. PTY output arrives as terminal.output events; the
