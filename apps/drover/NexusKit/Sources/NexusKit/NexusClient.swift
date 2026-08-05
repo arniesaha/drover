@@ -109,10 +109,20 @@ public actor NexusClient {
         return decoded.sessionID
     }
 
-    public func sendTurn(sessionID: String, text: String) async throws -> String {
-        let body = try JSONSerialization.data(withJSONObject: ["text": text])
+    public func sendTurn(sessionID: String, text: String,
+                         images: [TurnAttachment] = []) async throws -> String {
+        var payload: [String: Any] = ["text": text]
+        if !images.isEmpty {
+            payload["images"] = images.map {
+                ["media_type": $0.mediaType, "data_base64": $0.data.base64EncodedString()]
+            }
+        }
+        let body = try JSONSerialization.data(withJSONObject: payload)
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/turns"
-        let data = try await request(path: path, method: "POST", body: body)
+        // Image bodies are orders of magnitude larger than any other request
+        // this client makes — give them a cellular-realistic budget.
+        let data = try await request(path: path, method: "POST", body: body,
+                                     timeout: images.isEmpty ? nil : 60)
         let decoded = try decode(TurnResponse.self, from: data)
         return decoded.turnID
     }
@@ -208,13 +218,14 @@ public actor NexusClient {
 
     /// Builds the request, sends it, and maps non-2xx responses to
     /// `NexusError`. Returns the raw response body on success.
-    private func request(path: String, method: String, body: Data?) async throws -> Data {
+    private func request(path: String, method: String, body: Data?,
+                         timeout: TimeInterval? = nil) async throws -> Data {
         guard let url = URL(string: path, relativeTo: config.baseURL) else {
             throw NexusError.transport("invalid URL for path \(path)")
         }
         var urlRequest = URLRequest(url: url.absoluteURL)
         urlRequest.httpMethod = method
-        urlRequest.timeoutInterval = 15
+        urlRequest.timeoutInterval = timeout ?? 15
         urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         if let body {
             urlRequest.httpBody = body

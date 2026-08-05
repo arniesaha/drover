@@ -35,6 +35,37 @@ struct ClientTests {
     }
 }
 
+@Test func sendTurnWithoutImagesOmitsImagesKey() async throws {
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        #expect(request.url?.path == "/harness/sessions/s1/turns")
+        #expect(body["text"] as? String == "hi")
+        #expect(body["images"] == nil)
+        return (202, Data(#"{"turn_id": "turn-1"}"#.utf8))
+    }
+    let turnID = try await client().sendTurn(sessionID: "s1", text: "hi")
+    #expect(turnID == "turn-1")
+}
+
+@Test func sendTurnEncodesImagesAsBase64() async throws {
+    let bytes = Data([0xFF, 0xD8, 0xFF])
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        let images = body["images"] as! [[String: Any]]
+        #expect(images.count == 1)
+        #expect(images[0]["media_type"] as? String == "image/jpeg")
+        #expect(images[0]["data_base64"] as? String == bytes.base64EncodedString())
+        #expect(body["text"] as? String == "look")
+        return (202, Data(#"{"turn_id": "turn-2"}"#.utf8))
+    }
+    let turnID = try await client().sendTurn(
+        sessionID: "s1", text: "look",
+        images: [TurnAttachment(mediaType: "image/jpeg", data: bytes)])
+    #expect(turnID == "turn-2")
+}
+
 @Test func createSessionPostsBodyAndReturnsID() async throws {
     MockURLProtocol.handler = { request in
         let body = try! JSONSerialization.jsonObject(
