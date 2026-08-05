@@ -156,6 +156,65 @@ struct ChatModelTests {
     #expect(model.hint == nil)
 }
 
+@Test @MainActor func sendTurnPassesAttachmentsAndClearsThem() async throws {
+    let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01, 0x02]))
+    nonisolated(unsafe) var sentImages: [[String: Any]] = []
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentImages = body["images"] as? [[String: Any]] ?? []
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "hi"
+    model.pendingAttachments = [attachment]
+    await model.sendTurn()
+    #expect(sentImages.count == 1)
+    #expect(sentImages[0]["data_base64"] as? String == attachment.data.base64EncodedString())
+    #expect(model.pendingAttachments.isEmpty)
+}
+
+@Test @MainActor func imageOnlyTurnSends() async throws {
+    nonisolated(unsafe) var sentTexts: [String] = []
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentTexts.append(body["text"] as? String ?? "missing")
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.pendingAttachments = [TurnAttachment(mediaType: "image/jpeg", data: Data([0x03]))]
+    await model.sendTurn()
+    #expect(sentTexts == [""])
+    #expect(model.pendingAttachments.isEmpty)
+}
+
+@Test @MainActor func attachmentsSurviveConflictQueueing() async throws {
+    let attachment = TurnAttachment(mediaType: "image/png", data: Data([0x0A, 0x0B]))
+    nonisolated(unsafe) var turnPosts: [[String: Any]] = []
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        turnPosts.append(body)
+        if turnPosts.count == 1 {
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        }
+        return (202, Data(#"{"turn_id": "t2"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "see attached"
+    model.pendingAttachments = [attachment]
+    await model.sendTurn()
+
+    #expect(model.pendingAttachments.isEmpty)   // moved to the queue, not lost
+    #expect(model.queuedTurn == "see attached")
+
+    model.ingest(.message(.fixture(seq: 9, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await waitUntil { turnPosts.count == 2 }
+    let retriedImages = turnPosts[1]["images"] as? [[String: Any]] ?? []
+    #expect(retriedImages.count == 1)
+    #expect(retriedImages[0]["data_base64"] as? String == attachment.data.base64EncodedString())
+}
+
 @Test @MainActor func otherConflictsStillSurfaceAsHintNotQueue() async throws {
     MockURLProtocol.handler = { _ in
         (409, Data(#"{"error": "approval pending; answer it first"}"#.utf8))
