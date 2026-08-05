@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NexusKit
 
 /// Renders one `HarnessMessage` per the chat rendering map: markdown bubbles
@@ -48,24 +49,62 @@ struct MessageBubble: View {
                         CodeBlockView(language: language, code: code)
                     case .diff(let lines):
                         DiffBlockView(lines: lines)
+                    case .heading(let level, let content):
+                        Text(content)
+                            .font(headingFont(level))
+                            .padding(.top, 2)
                     }
                 }
                 usageFooter(alignment: .leading)
             }
             .padding(10)
             .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+            .contextMenu { copyButton }
             Spacer(minLength: 32)
+        }
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case 1, 2: return .title3.bold()
+        case 3: return .headline
+        default: return .subheadline.bold()
+        }
+    }
+
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = message.text
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
         }
     }
 
     private var userBubble: some View {
         HStack {
             Spacer(minLength: 32)
-            Text(message.displayText)
-                .padding(10)
-                .foregroundStyle(.white)
-                .background(.tint, in: RoundedRectangle(cornerRadius: 12))
+            VStack(alignment: .trailing, spacing: 4) {
+                if !message.text.isEmpty || attachmentCount == 0 {
+                    Text(message.displayText)
+                }
+                if attachmentCount > 0 {
+                    Label(attachmentCount == 1 ? "1 image" : "\(attachmentCount) images",
+                          systemImage: "paperclip")
+                        .font(.caption2)
+                }
+            }
+            .padding(10)
+            .foregroundStyle(.white)
+            .background(.tint, in: RoundedRectangle(cornerRadius: 12))
+            .contextMenu { copyButton }
         }
+    }
+
+    /// Count of images the server recorded on this turn (`user_input`
+    /// payload `attachments`, added by the harness manager).
+    private var attachmentCount: Int {
+        if case .array(let items)? = message.payload["attachments"] { return items.count }
+        return 0
     }
 
     private var statusCaption: some View {

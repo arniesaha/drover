@@ -26,12 +26,16 @@ public final class ChatModel {
     public private(set) var hint: String?
     public private(set) var harnessPresentation: HarnessPresentation
     public var composerText = ""
+    /// Images picked in the composer, waiting to ride the next turn.
+    public var pendingAttachments: [TurnAttachment] = []
     /// Text the user sent while the harness was mid-turn (codex/gemini
     /// reject overlapping turns with 409 "turn already in flight"). Held
     /// here and auto-dispatched when the turn-complete status arrives.
     /// Claude never 409s on overlap (mid-turn input is steering), so this
     /// only ever fills for harnesses that actually reject.
     public private(set) var queuedTurn: String?
+    /// Attachments that were on a turn deferred by the same 409.
+    private var queuedAttachments: [TurnAttachment] = []
 
     // `nonisolated(unsafe)` solely so `deinit` (nonisolated in Swift 6) can
     // cancel it; every other access is from `@MainActor` methods, and deinit
@@ -173,20 +177,26 @@ public final class ChatModel {
 
     public func sendTurn() async {
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let images = pendingAttachments
+        guard !text.isEmpty || !images.isEmpty else { return }
         do {
-            _ = try await client.sendTurn(sessionID: sessionID, text: text)
+            _ = try await client.sendTurn(sessionID: sessionID, text: text, images: images)
             composerText = ""
+            pendingAttachments = []
             hint = nil
         } catch NexusError.conflict(let message) where message == "turn already in flight" {
             // The harness rejects overlapping turns — queue instead of
             // erroring, and dispatch when the turn-complete status arrives.
-            queuedTurn = queuedTurn.map { "\($0)\n\(text)" } ?? text
+            if !text.isEmpty {
+                queuedTurn = queuedTurn.map { "\($0)\n\(text)" } ?? text
+            }
+            queuedAttachments.append(contentsOf: images)
             composerText = ""
+            pendingAttachments = []
             hint = "Queued — sends when the current response finishes."
         } catch {
-            // Preserve composerText on failure (other 409s or transport) so
-            // the user can retry without retyping.
+            // Preserve composerText/attachments on failure (other 409s or
+            // transport) so the user can retry without retyping.
             applyHint(for: error, action: "send")
         }
     }
@@ -197,24 +207,31 @@ public final class ChatModel {
     private func dispatchQueuedTurnIfComplete(_ message: HarnessMessage) {
         guard message.type == .status,
               message.payload["turn_complete"]?.boolValue == true,
-              let queued = queuedTurn
+              queuedTurn != nil || !queuedAttachments.isEmpty
         else { return }
+        let text = queuedTurn ?? ""
+        let images = queuedAttachments
         queuedTurn = nil
-        Task { await sendQueued(queued) }
+        queuedAttachments = []
+        Task { await sendQueued(text, images: images) }
     }
 
-    private func sendQueued(_ text: String) async {
+    private func sendQueued(_ text: String, images: [TurnAttachment]) async {
         do {
-            _ = try await client.sendTurn(sessionID: sessionID, text: text)
+            _ = try await client.sendTurn(sessionID: sessionID, text: text, images: images)
             hint = nil
         } catch NexusError.conflict(let message) where message == "turn already in flight" {
             // Raced a new turn (e.g. an approval resumed it) — keep waiting
             // for the next turn-complete.
-            queuedTurn = queuedTurn.map { "\(text)\n\($0)" } ?? text
+            if !text.isEmpty {
+                queuedTurn = queuedTurn.map { "\(text)\n\($0)" } ?? text
+            }
+            queuedAttachments = images + queuedAttachments
         } catch {
-            // Anything else: hand the text back to the composer for a
-            // manual retry rather than dropping it silently.
+            // Anything else: hand the text and images back to the composer
+            // for a manual retry rather than dropping them silently.
             composerText = composerText.isEmpty ? text : "\(text)\n\(composerText)"
+            pendingAttachments = images + pendingAttachments
             applyHint(for: error, action: "send")
         }
     }

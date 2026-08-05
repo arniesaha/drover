@@ -106,4 +106,61 @@ final class DisplayBlocksTests: XCTestCase {
         let message = HarnessMessage.fixture(seq: 1, type: .assistantOutput, text: "plain")
         XCTAssertEqual(message.displayBlocks.count, 1)
     }
+
+    // MARK: - Headings
+
+    func testHeadingLineBecomesHeadingBlock() {
+        let blocks = DisplayBlock.segment("### Results\nbody")
+        XCTAssertEqual(blocks.count, 2)
+        guard case .heading(let level, let content) = blocks[0] else {
+            return XCTFail("expected .heading, got \(blocks[0])")
+        }
+        XCTAssertEqual(level, 3)
+        XCTAssertEqual(String(content.characters), "Results")
+    }
+
+    func testHeadingLevelsOneThroughSix() {
+        for level in 1...6 {
+            let hashes = String(repeating: "#", count: level)
+            let blocks = DisplayBlock.segment("\(hashes) T")
+            guard case .heading(let parsed, _) = blocks[0] else {
+                return XCTFail("level \(level): expected .heading, got \(blocks[0])")
+            }
+            XCTAssertEqual(parsed, level)
+        }
+    }
+
+    func testSevenHashesStaysProse() {
+        let blocks = DisplayBlock.segment("####### not a heading")
+        guard case .text = blocks[0] else { return XCTFail("expected .text, got \(blocks[0])") }
+    }
+
+    func testHashWithoutSpaceStaysProse() {
+        let blocks = DisplayBlock.segment("#hashtag")
+        guard case .text = blocks[0] else { return XCTFail("expected .text, got \(blocks[0])") }
+    }
+
+    func testHashInsideFenceStaysCode() {
+        let blocks = DisplayBlock.segment("```\n# comment\n```")
+        guard case .code(_, let code) = blocks[0] else {
+            return XCTFail("expected .code, got \(blocks[0])")
+        }
+        XCTAssertEqual(code, "# comment")
+    }
+
+    func testInlineMarkdownInsideHeadingParsed() {
+        let blocks = DisplayBlock.segment("## **bold** title")
+        guard case .heading(_, let content) = blocks[0] else {
+            return XCTFail("expected .heading, got \(blocks[0])")
+        }
+        XCTAssertEqual(String(content.characters), "bold title")
+    }
+
+    func testHeadingBetweenProseSplitsBlocks() {
+        let blocks = DisplayBlock.segment("intro\n## Section\noutro")
+        XCTAssertEqual(blocks.count, 3)
+        guard case .text = blocks[0], case .heading = blocks[1], case .text = blocks[2] else {
+            return XCTFail("expected text/heading/text, got \(blocks)")
+        }
+    }
 }

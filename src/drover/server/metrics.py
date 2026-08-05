@@ -604,6 +604,9 @@ class MetricsCollector:
             f"/sessions/{session_id}/{action}",
             method="POST",
             payload=payload,
+            # Turn bodies can carry base64 images — orders of magnitude
+            # larger than any other proxied payload.
+            timeout_s=60.0 if action == "turns" else 15.0,
         )
 
     def proxy_harness_native_sessions(

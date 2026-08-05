@@ -58,6 +58,10 @@ struct StepCard: View {
                                 CodeBlockView(language: language, code: code)
                             case .diff(let lines):
                                 DiffBlockView(lines: lines)
+                            case .heading(_, let content):
+                                // Tool results are compact captions; a heading
+                                // inside one keeps caption size, just bolder.
+                                Text(content).font(.caption.bold())
                             }
                         }
                     }

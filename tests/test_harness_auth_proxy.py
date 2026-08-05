@@ -136,7 +136,10 @@ def test_central_proxies_auth_start(tmp_path):
         req = urllib.request.Request(
             f"{base}/harness/hosts/mac-mini/auth/codex/start",
             data=b"{}",
-            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -177,7 +180,10 @@ def test_central_proxies_auth_flow_cancel(tmp_path):
         req = urllib.request.Request(
             f"{base}/harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel",
             data=b"{}",
-            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -277,10 +283,7 @@ def test_proxy_harness_auth_builds_quoted_upstream_paths(tmp_path):
         flow_id="flow/1",
     )
     assert calls[-1][0] == "GET"
-    assert (
-        calls[-1][1]
-        == "http://127.0.0.1:30400/auth/provider%2Ftest/flows/flow%2F1"
-    )
+    assert calls[-1][1] == "http://127.0.0.1:30400/auth/provider%2Ftest/flows/flow%2F1"
 
     collector.proxy_harness_auth(
         "mac-mini",

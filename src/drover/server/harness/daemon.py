@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hmac
@@ -84,6 +86,49 @@ log = logging.getLogger("drover.harnessd")
 # this counter, which the metrics endpoint exports.
 _dropped_events_total = 0
 _dropped_events_lock = threading.Lock()
+
+
+_ATTACHMENT_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+
+
+def save_turn_attachments(
+    attachments_dir: Path, session_id: str, images: list
+) -> list[dict[str, str]]:
+    """Decode and persist per-turn images under
+    ``<attachments_dir>/<session_id>/``; raises ValueError on any bad entry.
+    Entries are validated before anything is written for them, so a rejected
+    request leaves no file behind for the entry that failed."""
+    saved: list[dict[str, str]] = []
+    target = attachments_dir / session_id
+    for index, image in enumerate(images):
+        if not isinstance(image, dict):
+            raise ValueError(f"images[{index}] must be an object")
+        media_type = str(image.get("media_type") or "")
+        extension = _ATTACHMENT_EXTENSIONS.get(media_type)
+        if extension is None:
+            raise ValueError(f"unsupported media_type: {media_type!r}")
+        encoded = str(image.get("data_base64") or "")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except binascii.Error as exc:
+            raise ValueError(f"invalid base64 in images[{index}]") from exc
+        if not data:
+            raise ValueError(f"images[{index}] is empty")
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"images[{index}] exceeds {MAX_ATTACHMENT_BYTES} bytes decoded"
+            )
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"{uuid4().hex[:12]}-{index + 1}.{extension}"
+        path.write_bytes(data)
+        saved.append({"path": str(path), "media_type": media_type, "data_b64": encoded})
+    return saved
 
 
 def record_dropped_events(count: int = 1) -> None:
@@ -1142,6 +1187,11 @@ class HarnessDaemonState:
     worktrees_dir: Path = field(
         default_factory=lambda: Path.home() / ".drover" / "worktrees"
     )
+    # Per-turn image attachments land here (never inside the session cwd or
+    # its worktree, so user repos stay clean).
+    attachments_dir: Path = field(
+        default_factory=lambda: Path.home() / ".drover" / "attachments"
+    )
     # Live sessions running in a per-session worktree, for cleanup at
     # finalize/terminate time. Lost on daemon restart, in which case the
     # worktree simply stays on disk (git worktree list still shows it).
@@ -1697,13 +1747,26 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         body = self._read_json() or {}
         text = str(body.get("text") or "").strip()
-        if not text:
+        images = body.get("images") or []
+        if not text and not images:
             self._write_json(
-                {"error": "text is required"}, status=HTTPStatus.BAD_REQUEST
+                {"error": "text or images required"}, status=HTTPStatus.BAD_REQUEST
             )
             return
         try:
-            turn_id = self.server.state.structured.send_turn(session_id, text)
+            saved = save_turn_attachments(
+                self.server.state.attachments_dir, session_id, images
+            )
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        for item in saved:
+            line = f"[Attached image: {item['path']}]"
+            text = f"{text}\n\n{line}" if text else line
+        try:
+            turn_id = self.server.state.structured.send_turn(
+                session_id, text, images=saved or None
+            )
         except KeyError:
             # Session was closed by a concurrent /terminate between the has()
             # check above and this call -- treat it as "no longer there".

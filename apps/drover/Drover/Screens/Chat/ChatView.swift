@@ -55,7 +55,8 @@ struct ChatView: View {
                     .padding(.horizontal)
             }
 
-            Composer(text: $model.composerText) {
+            Composer(text: $model.composerText,
+                     attachments: $model.pendingAttachments) {
                 Task { await model.sendTurn() }
             }
         }

@@ -73,7 +73,10 @@ def test_redact_auth_text_removes_non_query_secret_values(text, secret):
         ("password: colon-password", "colon-password"),
         ("Cookie: session=header-cookie", "header-cookie"),
         ("Bearer standalone-secret", "standalone-secret"),
-        ("token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature", "eyJhbGciOiJIUzI1NiJ9"),
+        (
+            "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "eyJhbGciOiJIUzI1NiJ9",
+        ),
         ('{"OPENAI_API_KEY":"openai-secret"}', "openai-secret"),
         ("ANTHROPIC_API_KEY: anthropic-secret", "anthropic-secret"),
         ("CLAUDE_CODE_OAUTH_TOKEN = oauth-secret", "oauth-secret"),
@@ -153,7 +156,7 @@ def test_claude_status_parses_logged_in_json(tmp_path):
     cli = tmp_path / "claude"
     cli.write_text(
         "#!/bin/sh\n"
-        "printf '%s\\n' '{\"loggedIn\":true,\"email\":\"a@example.test\",\"subscriptionType\":\"max\"}'\n"
+        'printf \'%s\\n\' \'{"loggedIn":true,"email":"a@example.test","subscriptionType":"max"}\'\n'
     )
     cli.chmod(0o755)
     adapter = CommandAuthAdapter(
@@ -189,11 +192,7 @@ def test_claude_status_handles_malformed_or_non_object_json(tmp_path, output):
 
 def test_claude_status_reports_nonzero_exit_as_unauthenticated(tmp_path):
     cli = tmp_path / "claude"
-    cli.write_text(
-        "#!/bin/sh\n"
-        "printf '%s\\n' '{\"loggedIn\":true}'\n"
-        "exit 1\n"
-    )
+    cli.write_text("#!/bin/sh\n" "printf '%s\\n' '{\"loggedIn\":true}'\n" "exit 1\n")
     cli.chmod(0o755)
     adapter = CommandAuthAdapter(
         harness="claude-code",
@@ -233,11 +232,7 @@ def test_codex_status_parses_logged_in_text(tmp_path):
 
 def test_command_adapter_redacts_status_output_and_replaces_invalid_bytes(tmp_path):
     cli = tmp_path / "codex"
-    cli.write_text(
-        "#!/bin/sh\n"
-        "printf 'token: super-secret '\n"
-        "printf '\\377'\n"
-    )
+    cli.write_text("#!/bin/sh\n" "printf 'token: super-secret '\n" "printf '\\377'\n")
     cli.chmod(0o755)
     adapter = CommandAuthAdapter(
         harness="codex",
@@ -467,9 +462,7 @@ def test_manager_kills_flow_that_ignores_termination(tmp_path):
         "print('ready', flush=True)\n"
         "time.sleep(5)\n"
     )
-    adapter = StaticAuthAdapter(
-        "codex", start_command=[sys.executable, str(script)]
-    )
+    adapter = StaticAuthAdapter("codex", start_command=[sys.executable, str(script)])
     manager = AuthFlowManager({"codex": adapter})
 
     flow = manager.start("codex")
@@ -500,9 +493,7 @@ def test_manager_kills_descendant_process_group_on_cancel(tmp_path):
         "print('Open https://example.test/device and enter KILL-0001', flush=True)\n"
         "time.sleep(10)\n"
     )
-    adapter = StaticAuthAdapter(
-        "codex", start_command=[sys.executable, str(script)]
-    )
+    adapter = StaticAuthAdapter("codex", start_command=[sys.executable, str(script)])
     manager = AuthFlowManager({"codex": adapter})
 
     flow = manager.start("codex")
@@ -615,9 +606,7 @@ def test_manager_expires_descendant_output(tmp_path):
         "    time.sleep(0.01)\n"
         "time.sleep(10)\n"
     )
-    adapter = StaticAuthAdapter(
-        "codex", start_command=[sys.executable, str(script)]
-    )
+    adapter = StaticAuthAdapter("codex", start_command=[sys.executable, str(script)])
     manager = AuthFlowManager({"codex": adapter}, timeout_s=0.2, retention_s=60)
 
     flow = manager.start("codex")

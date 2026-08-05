@@ -120,7 +120,8 @@ class CodexDriver:
 
     # -- turns -----------------------------------------------------------------
 
-    def send_turn(self, text: str, turn_id: str) -> None:
+    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
+        del images  # [Attached image: <path>] lines in the text are the channel here
         with self._turn_lock:
             if self._turn_active:
                 raise RuntimeError("turn already in flight")

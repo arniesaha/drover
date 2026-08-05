@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
@@ -1708,6 +1709,172 @@ def test_structured_turn_appends_user_input_and_seq_is_monotonic(tmp_path):
 
         seqs = [event.seq for event in events if event.seq is not None]
         assert seqs == list(range(1, len(seqs) + 1))
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+ONE_FAKE_PNG = b"\x89PNG\r\n\x1a\nfakebody"
+ONE_FAKE_PNG_B64 = base64.b64encode(ONE_FAKE_PNG).decode()
+
+
+def _structured_session_awaiting_input(tmp_path, base_url, state):
+    """Create a FAKE_STRUCTURED_CLI session and walk it to awaiting=input."""
+    status, body = _json_request(
+        f"{base_url}/sessions",
+        payload={
+            "harness": "claude-code",
+            "mode": "structured",
+            "prompt": "first turn",
+            "command": FAKE_STRUCTURED_CLI,
+            "cwd": str(tmp_path),
+        },
+    )
+    assert status == 201
+    sid = body["session_id"]
+    _wait_until(lambda: _fetch_session(base_url, sid)["awaiting"] == "approval")
+    _json_request(
+        f"{base_url}/sessions/{sid}/permission",
+        payload={"request_id": "req-1", "decision": "allow"},
+    )
+    _wait_until(lambda: _fetch_session(base_url, sid)["awaiting"] == "input")
+    return sid
+
+
+def test_turn_with_image_saves_file_and_appends_path(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.attachments_dir = tmp_path / "attachments"
+    try:
+        sid = _structured_session_awaiting_input(tmp_path, base_url, state)
+        status, body = _json_request(
+            f"{base_url}/sessions/{sid}/turns",
+            payload={
+                "text": "look at this",
+                "images": [
+                    {"media_type": "image/png", "data_base64": ONE_FAKE_PNG_B64}
+                ],
+            },
+        )
+        assert status == 202
+        saved = list((tmp_path / "attachments" / sid).glob("*.png"))
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == ONE_FAKE_PNG
+
+        def _has_augmented_user_input() -> bool:
+            return any(
+                event.event_type == "user_input"
+                and "look at this" in event.payload.get("text", "")
+                and f"[Attached image: {saved[0]}]" in event.payload.get("text", "")
+                for event in state.registry.list_events(sid)
+            )
+
+        _wait_until(_has_augmented_user_input)
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_image_only_turn_is_accepted(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.attachments_dir = tmp_path / "attachments"
+    try:
+        sid = _structured_session_awaiting_input(tmp_path, base_url, state)
+        status, _ = _json_request(
+            f"{base_url}/sessions/{sid}/turns",
+            payload={
+                "images": [{"media_type": "image/png", "data_base64": ONE_FAKE_PNG_B64}]
+            },
+        )
+        assert status == 202
+        saved = list((tmp_path / "attachments" / sid).glob("*.png"))
+        assert len(saved) == 1
+
+        def _has_attachment_only_user_input() -> bool:
+            return any(
+                event.event_type == "user_input"
+                and event.payload.get("text", "") == f"[Attached image: {saved[0]}]"
+                for event in state.registry.list_events(sid)
+            )
+
+        _wait_until(_has_attachment_only_user_input)
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_turn_with_bad_base64_is_rejected(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.attachments_dir = tmp_path / "attachments"
+    try:
+        sid = _structured_session_awaiting_input(tmp_path, base_url, state)
+        try:
+            _json_request(
+                f"{base_url}/sessions/{sid}/turns",
+                payload={
+                    "text": "x",
+                    "images": [{"media_type": "image/png", "data_base64": "!!!"}],
+                },
+            )
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert "invalid base64" in payload["error"]
+        else:
+            raise AssertionError("bad base64 should be rejected")
+        assert not (tmp_path / "attachments" / sid).exists()
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_turn_with_unsupported_media_type_is_rejected(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.attachments_dir = tmp_path / "attachments"
+    try:
+        sid = _structured_session_awaiting_input(tmp_path, base_url, state)
+        try:
+            _json_request(
+                f"{base_url}/sessions/{sid}/turns",
+                payload={
+                    "text": "x",
+                    "images": [
+                        {"media_type": "application/pdf", "data_base64": "QUJD"}
+                    ],
+                },
+            )
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert "unsupported media_type" in payload["error"]
+        else:
+            raise AssertionError("unsupported media type should be rejected")
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_empty_turn_still_rejected(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        sid = _structured_session_awaiting_input(tmp_path, base_url, state)
+        try:
+            _json_request(f"{base_url}/sessions/{sid}/turns", payload={"text": ""})
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert "text or images required" in payload["error"]
+        else:
+            raise AssertionError("empty turn should be rejected")
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()

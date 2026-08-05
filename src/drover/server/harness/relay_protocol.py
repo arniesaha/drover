@@ -26,7 +26,13 @@ def hello_frame(host_id: str) -> dict[str, Any]:
 def req_frame(
     request_id: str, method: str, path: str, body: dict[str, Any] | None
 ) -> dict[str, Any]:
-    return {"kind": "req", "id": request_id, "method": method, "path": path, "body": body}
+    return {
+        "kind": "req",
+        "id": request_id,
+        "method": method,
+        "path": path,
+        "body": body,
+    }
 
 
 def res_frame(request_id: str, status: int, body: str) -> dict[str, Any]:
