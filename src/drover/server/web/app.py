@@ -448,6 +448,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             session_id = unquote(
                 path.removeprefix("/harness/sessions/").removesuffix("/stream")
             ).strip("/")
+            params = parse_qs(parsed.query)
+            raw_after = (params.get("after_seq") or ["0"])[0]
+            try:
+                after_seq = int(raw_after)
+            except ValueError:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "after_seq must be an integer"}\n',
+                )
+                return
             if (self.headers.get("Upgrade") or "").lower() != "websocket":
                 self._send(
                     400,
@@ -455,7 +466,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     '{"error": "websocket upgrade required"}\n',
                 )
                 return
-            self._stream_session_messages(session_id)
+            self._stream_session_messages(session_id, after_seq=after_seq)
             return
         if path.startswith("/harness/sessions/") and path.endswith("/messages"):
             session_id = unquote(
@@ -958,7 +969,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)
 
-    def _stream_session_messages(self, session_id: str) -> None:
+    def _stream_session_messages(self, session_id: str, *, after_seq: int = 0) -> None:
         """WS handler: push new structured events for a session as they land.
 
         Handshakes at 101, then polls the registry roughly once a second,
@@ -987,7 +998,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         sock = self.connection
         sock.settimeout(0.2)
         registry = self._harness_registry()
-        last_seq = 0
+        last_seq = after_seq
         try:
             while True:
                 for event in registry.list_events_after(session_id, last_seq):
