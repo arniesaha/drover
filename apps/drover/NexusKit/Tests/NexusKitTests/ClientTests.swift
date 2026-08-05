@@ -83,6 +83,32 @@ struct ClientTests {
     #expect(id == "harness-xyz")
 }
 
+@Test func createSessionPostsImagesModelAndThinking() async throws {
+    let bytes = Data([0x01, 0x02, 0x03])
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        let images = body["images"] as! [[String: Any]]
+        #expect(images.count == 1)
+        #expect(images[0]["media_type"] as? String == "image/jpeg")
+        #expect(images[0]["data_base64"] as? String == bytes.base64EncodedString())
+        #expect(body["model"] as? String == "gpt-5.6-sol")
+        #expect(body["thinking_effort"] as? String == "high")
+        return (201, Data(#"{"session_id": "harness-xyz", "mode": "structured"}"#.utf8))
+    }
+    let id = try await client().createSession(
+        hostID: "mac-mini",
+        harness: "codex",
+        mode: "structured",
+        prompt: "look",
+        cwd: nil,
+        images: [TurnAttachment(mediaType: "image/jpeg", data: bytes)],
+        model: "gpt-5.6-sol",
+        thinkingEffort: "high"
+    )
+    #expect(id == "harness-xyz")
+}
+
 @Test func permissionBadRequestMaps() async {
     MockURLProtocol.handler = { _ in
         (400, Data(#"{"error": "codex exec has no approval channel; use sandbox flags"}"#.utf8))
@@ -135,6 +161,24 @@ struct ClientTests {
         return (202, Data(#"{"turn_id": "turn-42"}"#.utf8))
     }
     let turnID = try await client().sendTurn(sessionID: "s1", text: "go")
+    #expect(turnID == "turn-42")
+}
+
+@Test func sendTurnPostsModelAndThinkingWhenProvided() async throws {
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        #expect(body["text"] as? String == "go")
+        #expect(body["model"] as? String == "gpt-5.6-sol")
+        #expect(body["thinking_effort"] as? String == "max")
+        return (202, Data(#"{"turn_id": "turn-42"}"#.utf8))
+    }
+    let turnID = try await client().sendTurn(
+        sessionID: "s1",
+        text: "go",
+        model: "gpt-5.6-sol",
+        thinkingEffort: "max"
+    )
     #expect(turnID == "turn-42")
 }
 

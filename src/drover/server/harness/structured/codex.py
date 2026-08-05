@@ -120,7 +120,14 @@ class CodexDriver:
 
     # -- turns -----------------------------------------------------------------
 
-    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
+    def send_turn(
+        self,
+        text: str,
+        turn_id: str,
+        images: list | None = None,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
         del images  # [Attached image: <path>] lines in the text are the channel here
         with self._turn_lock:
             if self._turn_active:
@@ -129,7 +136,7 @@ class CodexDriver:
                 raise RuntimeError("driver is closed")
             self._stderr_tail.clear()
             process = subprocess.Popen(
-                self._argv_for(text),
+                self._argv_for(text, model=model, thinking_effort=thinking_effort),
                 cwd=self.cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -145,9 +152,20 @@ class CodexDriver:
             self._turn_thread = worker
             worker.start()
 
-    def _argv_for(self, text: str) -> list[str]:
+    def _argv_for(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> list[str]:
+        command = list(self.command)
+        if model:
+            command.extend(["--model", model])
+        if thinking_effort:
+            command.extend(["-c", f'model_reasoning_effort="{thinking_effort}"'])
         if self._thread_id is None:
-            return self.command + [
+            return command + [
                 "exec",
                 "--json",
                 "--skip-git-repo-check",
@@ -159,7 +177,7 @@ class CodexDriver:
         # only on the parent ``codex exec``); passing it aborts the follow-up
         # turn at arg-parse with "unexpected argument '--sandbox' found". The
         # config override is the supported equivalent on the resume path.
-        return self.command + [
+        return command + [
             "exec",
             "resume",
             self._thread_id,

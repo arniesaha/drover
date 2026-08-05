@@ -57,6 +57,9 @@ struct ChatView: View {
 
             Composer(text: $model.composerText,
                      attachments: $model.pendingAttachments,
+                     selectedModel: $model.selectedModel,
+                     thinkingEffort: $model.thinkingEffort,
+                     harness: model.harnessPresentation.harness,
                      isSending: model.isSending) {
                 Task { await model.sendTurn() }
             }

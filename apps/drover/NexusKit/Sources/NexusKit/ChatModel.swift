@@ -35,6 +35,8 @@ public final class ChatModel {
     public var composerText = ""
     /// Images picked in the composer, waiting to ride the next turn.
     public var pendingAttachments: [TurnAttachment] = []
+    public var selectedModel = ""
+    public var thinkingEffort = ""
     /// Text the user sent while the harness was mid-turn (codex/gemini
     /// reject overlapping turns with 409 "turn already in flight"). Held
     /// here and auto-dispatched when the turn-complete status arrives.
@@ -189,8 +191,18 @@ public final class ChatModel {
         guard !text.isEmpty || !images.isEmpty else { return }
         isSending = true
         defer { isSending = false }
+        let model = HarnessRunPreferences.optional(selectedModel)
+        let thinking = HarnessRunPreferences.supportsThinkingEffort(harnessPresentation.harness)
+            ? HarnessRunPreferences.optional(thinkingEffort)
+            : nil
         do {
-            _ = try await client.sendTurn(sessionID: sessionID, text: text, images: images)
+            _ = try await client.sendTurn(
+                sessionID: sessionID,
+                text: text,
+                images: images,
+                model: model,
+                thinkingEffort: thinking
+            )
             composerText = ""
             pendingAttachments = []
             hint = nil
@@ -227,8 +239,18 @@ public final class ChatModel {
     }
 
     private func sendQueued(_ text: String, images: [TurnAttachment]) async {
+        let model = HarnessRunPreferences.optional(selectedModel)
+        let thinking = HarnessRunPreferences.supportsThinkingEffort(harnessPresentation.harness)
+            ? HarnessRunPreferences.optional(thinkingEffort)
+            : nil
         do {
-            _ = try await client.sendTurn(sessionID: sessionID, text: text, images: images)
+            _ = try await client.sendTurn(
+                sessionID: sessionID,
+                text: text,
+                images: images,
+                model: model,
+                thinkingEffort: thinking
+            )
             hint = nil
         } catch NexusError.conflict(let message) where message == "turn already in flight" {
             // Raced a new turn (e.g. an approval resumed it) — keep waiting
