@@ -190,9 +190,7 @@ def test_latest_session_previews_skips_traceback_payload_fallback(tmp_path):
 
     previews = registry.latest_session_previews(["harness-session-traceback"])
 
-    assert previews == {
-        "harness-session-traceback": "Summarize readable session cards"
-    }
+    assert previews == {"harness-session-traceback": "Summarize readable session cards"}
 
 
 def test_append_events_in_order(tmp_path):
