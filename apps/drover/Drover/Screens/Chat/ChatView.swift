@@ -213,11 +213,19 @@ struct ChatView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .principal) {
-            Label(model.harnessPresentation.name,
-                  systemImage: model.harnessPresentation.symbolName)
-                .labelStyle(.titleAndIcon)
-                .font(.headline)
-                .accessibilityIdentifier("chat-harness-title")
+            VStack(spacing: 0) {
+                Label(model.harnessPresentation.name,
+                      systemImage: model.harnessPresentation.symbolName)
+                    .labelStyle(.titleAndIcon)
+                    .font(.headline)
+                    .accessibilityIdentifier("chat-harness-title")
+                if let gauge = model.contextGauge {
+                    Text(gauge.text)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("chat-context-gauge")
+                }
+            }
         }
 
         ToolbarItem(placement: .topBarTrailing) {

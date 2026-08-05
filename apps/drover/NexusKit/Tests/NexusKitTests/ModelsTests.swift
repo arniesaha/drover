@@ -92,7 +92,7 @@ func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbol
     #expect(summary?.contextText == nil)
 }
 
-@Test func claudeUsageSummaryFormatsContextWindow() {
+@Test func claudeUsageSummaryReportsTotalsButNotContext() {
     let message = HarnessMessage.fixture(
         seq: 1,
         type: .status,
@@ -116,7 +116,10 @@ func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbol
     )
     let summary = TokenUsageSummary(message: message)
     #expect(summary?.compactText == "in 6K | out 64 | cache 49.2K")
-    #expect(summary?.contextText == "ctx 55.1K / 1M (6%)")
+    // Context now comes from ContextGauge over the whole message list --
+    // a single result payload cannot describe live context (see
+    // ContextGaugeTests.ignoresResultUsageWhichIsAlsoCumulative).
+    #expect(summary?.contextText == nil)
 }
 
 @Test func geminiUsageSummaryAggregatesStatsTokens() {
