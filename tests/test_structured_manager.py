@@ -48,7 +48,15 @@ class _StubDriver:
     def is_alive(self) -> bool:
         return not self.closed
 
-    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
+    def send_turn(
+        self,
+        text: str,
+        turn_id: str,
+        images: list | None = None,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
+        del model, thinking_effort
         if self.send_turn_error is not None:
             raise self.send_turn_error
         self.sent_turns.append((text, turn_id))

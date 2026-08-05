@@ -217,8 +217,16 @@ class ClaudeDriver(ProcessDriver):
             )
         ]
 
-    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
-        del turn_id  # not part of Claude's wire shape; caller-side bookkeeping only
+    def send_turn(
+        self,
+        text: str,
+        turn_id: str,
+        images: list | None = None,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
+        # The Claude stream is persistent; model/effort are startup flags.
+        del turn_id, model, thinking_effort
         content: list[dict] = [{"type": "text", "text": text}]
         # Attachments also appear as [Attached image: <path>] lines in the
         # text (that's the only channel codex/gemini have); the base64 block

@@ -182,7 +182,14 @@ class StructuredSessionManager:
             self._entries[session_id] = entry
         entry.driver.start()
 
-    def send_turn(self, session_id: str, text: str, images: list | None = None) -> str:
+    def send_turn(
+        self,
+        session_id: str,
+        text: str,
+        images: list | None = None,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> str:
         entry = self._require_entry(session_id)
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
@@ -191,7 +198,13 @@ class StructuredSessionManager:
         # already in flight" / "driver is closed") when a turn can't be
         # accepted, and we must not record a user_input event for a turn
         # that was never actually sent.
-        entry.driver.send_turn(text, turn_id, images=images)
+        entry.driver.send_turn(
+            text,
+            turn_id,
+            images=images,
+            model=model,
+            thinking_effort=thinking_effort,
+        )
         payload: dict = {}
         if images:
             # Metadata only — the base64 payload never enters the event

@@ -227,6 +227,24 @@ struct ChatModelTests {
     #expect(model.pendingAttachments.isEmpty)
 }
 
+@Test @MainActor func sendTurnPassesModelAndThinkingPreferences() async throws {
+    nonisolated(unsafe) var sentModel: String?
+    nonisolated(unsafe) var sentThinking: String?
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentModel = body["model"] as? String
+        sentThinking = body["thinking_effort"] as? String
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex")
+    model.composerText = "hi"
+    model.selectedModel = "gpt-5.6-sol"
+    model.thinkingEffort = "xhigh"
+    await model.sendTurn()
+    #expect(sentModel == "gpt-5.6-sol")
+    #expect(sentThinking == "xhigh")
+}
+
 @Test @MainActor func imageOnlyTurnSends() async throws {
     nonisolated(unsafe) var sentTexts: [String] = []
     MockURLProtocol.handler = { request in

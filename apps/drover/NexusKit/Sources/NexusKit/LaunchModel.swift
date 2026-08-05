@@ -29,6 +29,9 @@ public final class LaunchModel {
     public var harness: String
     public var cwd: String = ""
     public var prompt: String = ""
+    public var promptAttachments: [TurnAttachment] = []
+    public var selectedModel: String = ""
+    public var thinkingEffort: String = ""
     public private(set) var launchError: String?
 
     public init(client: NexusClient, snapshot: HarnessSnapshot?) {
@@ -69,6 +72,10 @@ public final class LaunchModel {
         Self.structuredCapableHarnesses.contains(harness)
     }
 
+    public var supportsThinkingEffort: Bool {
+        HarnessRunPreferences.supportsThinkingEffort(harness)
+    }
+
     /// Posts `createSession` for the current selection. On success returns
     /// the new session id; on failure sets `launchError` (server-authored
     /// text when available) and returns nil.
@@ -76,13 +83,21 @@ public final class LaunchModel {
         let mode = isStructured ? "structured" : "pty"
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectivePrompt = (isStructured && !trimmedPrompt.isEmpty) ? trimmedPrompt : nil
+        let effectiveImages = isStructured ? promptAttachments : []
         let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveCwd = trimmedCwd.isEmpty ? nil : trimmedCwd
+        let effectiveModel = isStructured ? HarnessRunPreferences.optional(selectedModel) : nil
+        let effectiveThinking = (isStructured && supportsThinkingEffort)
+            ? HarnessRunPreferences.optional(thinkingEffort)
+            : nil
 
         do {
             let sessionID = try await client.createSession(
                 hostID: hostID, harness: harness, mode: mode,
-                prompt: effectivePrompt, cwd: effectiveCwd)
+                prompt: effectivePrompt, cwd: effectiveCwd,
+                images: effectiveImages,
+                model: effectiveModel,
+                thinkingEffort: effectiveThinking)
             launchError = nil
             return sessionID
         } catch {

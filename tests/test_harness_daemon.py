@@ -1720,6 +1720,74 @@ ONE_FAKE_PNG = b"\x89PNG\r\n\x1a\nfakebody"
 ONE_FAKE_PNG_B64 = base64.b64encode(ONE_FAKE_PNG).decode()
 
 
+def test_initial_prompt_with_image_saves_file_and_records_attachment(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.attachments_dir = tmp_path / "attachments"
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "prompt": "first turn",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+                "images": [
+                    {"media_type": "image/png", "data_base64": ONE_FAKE_PNG_B64}
+                ],
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+        saved = list((tmp_path / "attachments" / sid).glob("*.png"))
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == ONE_FAKE_PNG
+
+        def _has_initial_attachment() -> bool:
+            return any(
+                event.event_type == "user_input"
+                and "first turn" in event.payload.get("text", "")
+                and f"[Attached image: {saved[0]}]" in event.payload.get("text", "")
+                and event.payload.get("payload", {}).get("attachments")
+                == [{"path": str(saved[0]), "media_type": "image/png"}]
+                for event in state.registry.list_events(sid)
+            )
+
+        _wait_until(_has_initial_attachment)
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_structured_command_preferences_map_to_cli_flags():
+    assert harness_daemon.apply_structured_preferences(
+        ["claude", "-p"],
+        harness="claude-code",
+        model="sonnet",
+        thinking_effort="xhigh",
+    ) == ["claude", "-p", "--model", "sonnet", "--effort", "xhigh"]
+    assert harness_daemon.apply_structured_preferences(
+        ["codex"],
+        harness="codex",
+        model="gpt-5.6-sol",
+        thinking_effort="high",
+    ) == [
+        "codex",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+    ]
+    assert harness_daemon.apply_structured_preferences(
+        ["gemini"],
+        harness="gemini",
+        model="gemini-2.5-pro",
+        thinking_effort="high",
+    ) == ["gemini", "--model", "gemini-2.5-pro"]
+
+
 def _structured_session_awaiting_input(tmp_path, base_url, state):
     """Create a FAKE_STRUCTURED_CLI session and walk it to awaiting=input."""
     status, body = _json_request(

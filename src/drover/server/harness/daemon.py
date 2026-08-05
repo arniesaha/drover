@@ -131,6 +131,13 @@ def save_turn_attachments(
     return saved
 
 
+def append_attachment_lines(text: str, saved: list[dict[str, str]]) -> str:
+    for item in saved:
+        line = f"[Attached image: {item['path']}]"
+        text = f"{text}\n\n{line}" if text else line
+    return text
+
+
 def record_dropped_events(count: int = 1) -> None:
     global _dropped_events_total
     with _dropped_events_lock:
@@ -268,6 +275,25 @@ def build_launch_command(
         command[2] = command[2] + " " + " ".join(shlex.quote(arg) for arg in args)
         return command
     return [*command, *args]
+
+
+def apply_structured_preferences(
+    command: list[str],
+    *,
+    harness: str,
+    model: str | None,
+    thinking_effort: str | None,
+) -> list[str]:
+    """Add harness-native model/thinking flags to a structured CLI command."""
+    preferred = list(command)
+    if model and harness in {"claude-code", "codex", "gemini"}:
+        preferred.extend(["--model", model])
+    if thinking_effort:
+        if harness == "claude-code":
+            preferred.extend(["--effort", thinking_effort])
+        elif harness == "codex":
+            preferred.extend(["-c", f'model_reasoning_effort="{thinking_effort}"'])
+    return preferred
 
 
 def _native_resume_args(harness: str, native_resume: Any) -> list[str]:
@@ -1626,9 +1652,20 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        model = _optional_text(body.get("model"))
+        thinking_effort = _optional_text(body.get("thinking_effort"))
         command = body.get("command")
         default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
-        label_source = command or (default_command_fn() if default_command_fn else None)
+        if command is None and default_command_fn:
+            command = default_command_fn()
+        if command is not None:
+            command = apply_structured_preferences(
+                list(command),
+                harness=harness,
+                model=model,
+                thinking_effort=thinking_effort,
+            )
+        label_source = command
         session_id = f"harness-{uuid4()}"
 
         session_cwd = str(cwd) if cwd is not None else None
@@ -1713,9 +1750,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
 
         prompt = body.get("prompt")
-        if isinstance(prompt, str) and prompt.strip():
+        prompt_text = prompt.strip() if isinstance(prompt, str) else ""
+        images = body.get("images") or []
+        if prompt_text or images:
             try:
-                self.server.state.structured.send_turn(session_id, prompt)
+                saved = save_turn_attachments(
+                    self.server.state.attachments_dir, session_id, images
+                )
+                text = append_attachment_lines(prompt_text, saved)
+                self.server.state.structured.send_turn(
+                    session_id,
+                    text,
+                    images=saved or None,
+                )
+            except ValueError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
             except Exception as exc:
                 # Best-effort initial turn; caller can retry via /turns.
                 # Log it so a failed first turn isn't completely traceless
@@ -1760,12 +1810,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
-        for item in saved:
-            line = f"[Attached image: {item['path']}]"
-            text = f"{text}\n\n{line}" if text else line
+        text = append_attachment_lines(text, saved)
         try:
             turn_id = self.server.state.structured.send_turn(
-                session_id, text, images=saved or None
+                session_id,
+                text,
+                images=saved or None,
+                model=_optional_text(body.get("model")),
+                thinking_effort=_optional_text(body.get("thinking_effort")),
             )
         except KeyError:
             # Session was closed by a concurrent /terminate between the has()
