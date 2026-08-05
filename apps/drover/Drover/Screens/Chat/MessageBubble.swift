@@ -83,12 +83,28 @@ struct MessageBubble: View {
     private var userBubble: some View {
         HStack {
             Spacer(minLength: 32)
-            Text(message.displayText)
-                .padding(10)
-                .foregroundStyle(.white)
-                .background(.tint, in: RoundedRectangle(cornerRadius: 12))
-                .contextMenu { copyButton }
+            VStack(alignment: .trailing, spacing: 4) {
+                if !message.text.isEmpty || attachmentCount == 0 {
+                    Text(message.displayText)
+                }
+                if attachmentCount > 0 {
+                    Label(attachmentCount == 1 ? "1 image" : "\(attachmentCount) images",
+                          systemImage: "paperclip")
+                        .font(.caption2)
+                }
+            }
+            .padding(10)
+            .foregroundStyle(.white)
+            .background(.tint, in: RoundedRectangle(cornerRadius: 12))
+            .contextMenu { copyButton }
         }
+    }
+
+    /// Count of images the server recorded on this turn (`user_input`
+    /// payload `attachments`, added by the harness manager).
+    private var attachmentCount: Int {
+        if case .array(let items)? = message.payload["attachments"] { return items.count }
+        return 0
     }
 
     private var statusCaption: some View {
