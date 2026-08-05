@@ -293,6 +293,34 @@ WantedBy=default.target
 (The real file has `ExecStart` on one line; it is wrapped here for reading.
 If you recreate it from this block, keep the backslashes or unwrap it.)
 
+### The PATH drop-in (required)
+
+`~/.config/systemd/user/drover-nas-harnessd.service.d/path.conf`:
+
+```ini
+[Service]
+Environment=PATH=/home/Arnab/.local/bin:/home/Arnab/.nvm/versions/node/v24.13.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+Without this the daemon inherits systemd's bare default PATH
+(`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), which has
+none of the agent CLIs on it — `codex`/`gemini` come from nvm and `claude`
+from `~/.local/bin`. **The failure is invisible until the first turn**: the
+unit reports `active (running)`, `/healthz` returns `ok: true`, the host
+heartbeats `online`, and `POST /harness/hosts/nas/sessions` returns `201`.
+Only the turn fails, as a 502 at the hub (`Remote end closed connection
+without response`) with the real cause in the journal:
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: 'codex'
+```
+
+Added 2026-08-04, after the chat-UX deploy. It was missing since the unit was
+first hand-written, so **no** structured session on the NAS had ever launched
+a driver — every Phase 3 check before this one passed without exercising one.
+Pin the nvm version in the path; systemd `Environment=` does not glob. When
+node is upgraded, this file has to be updated with it.
+
 Rebuilding the deploy directory from scratch, if it is ever lost:
 
 ```bash
