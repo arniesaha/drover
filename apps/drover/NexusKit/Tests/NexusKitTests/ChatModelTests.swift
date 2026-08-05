@@ -8,6 +8,14 @@ private func chatWireMessage(seq: Int, text: String) -> String {
 
 private struct TimeoutError: Error {}
 
+/// Thread-safe counter: `MockURLProtocol.handler` runs off the main actor.
+private final class RequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func bump() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
 @MainActor
 private func waitUntil(
     timeout: Duration = .seconds(5), _ condition: () -> Bool
@@ -47,6 +55,52 @@ struct ChatModelTests {
     await model.sendTurn()
     #expect(model.hint == "session is terminating")
     #expect(model.composerText == "next thing")   // preserved for retry
+}
+
+@Test @MainActor func concurrentSendsIssueExactlyOneRequest() async throws {
+    // Regression: nine taps during a cellular stall produced nine accepted
+    // turns (seq 876, 878-885, all "Yes") because sendTurn had no guard.
+    let counter = RequestCounter()
+    MockURLProtocol.handler = { _ in
+        counter.bump()
+        Thread.sleep(forTimeInterval: 0.3)   // hold the request in flight
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes"
+
+    async let first: Void = model.sendTurn()
+    async let second: Void = model.sendTurn()
+    async let third: Void = model.sendTurn()
+    _ = await (first, second, third)
+
+    #expect(counter.value == 1)
+    #expect(model.composerText == "")
+    #expect(model.isSending == false)
+}
+
+@Test @MainActor func guardClearsSoTheNextSendStillWorks() async throws {
+    let counter = RequestCounter()
+    MockURLProtocol.handler = { _ in
+        counter.bump()
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "first"
+    await model.sendTurn()
+    model.composerText = "second"
+    await model.sendTurn()
+    #expect(counter.value == 2)
+}
+
+@Test @MainActor func failedSendReArmsAndKeepsTheText() async throws {
+    MockURLProtocol.transportError = URLError(.notConnectedToInternet)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes"
+    await model.sendTurn()
+    #expect(model.composerText == "Yes")   // retry without retyping
+    #expect(model.isSending == false)      // not wedged
 }
 
 @Test @MainActor func handOffReturnsNewSessionID() async throws {

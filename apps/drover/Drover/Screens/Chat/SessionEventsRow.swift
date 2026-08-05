@@ -1,24 +1,13 @@
 import SwiftUI
 import NexusKit
 
-/// One collapsed row per thinking run (consecutive thinking messages,
-/// grouped by `TranscriptItem.group`): a quiet brain-icon caption that
-/// expands to the run's text behind a leading accent bar. Deliberately
-/// recessive next to real output bubbles — thinking is context, not content.
-struct ThinkingBlock: View {
+/// One collapsed row per status run (consecutive status messages, grouped by
+/// `TranscriptItem.group`). Deliberately recessive and styled to match
+/// `ThinkingBlock` so every fold in the transcript reads as one family.
+/// Purely presentational — the labels come from `SessionEventSummary`.
+struct SessionEventsRow: View {
     let run: [HarnessMessage]
-    /// Running total from the harness's `thinking_tokens` events, folded in
-    /// by `TranscriptItem.group`. Nil for harnesses that never report it.
-    let estimatedTokens: Int?
-    /// The newest run keeps streaming into this row; label it accordingly.
-    let isStreaming: Bool
     @State private var isExpanded = false
-
-    private var label: String {
-        if isStreaming { return "Thinking…" }
-        guard let estimatedTokens, estimatedTokens > 0 else { return "Thought for a bit" }
-        return "Thought for \(TokenCount.format(estimatedTokens)) tokens"
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -26,10 +15,8 @@ struct ThinkingBlock: View {
                 withAnimation(.snappy(duration: 0.2)) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: "brain")
-                        .symbolEffect(.pulse, isActive: isStreaming)
-                    Text(label)
-                        .italic()
+                    Image(systemName: "gearshape")
+                    Text(SessionEventSummary.title(for: run))
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
@@ -39,7 +26,8 @@ struct ThinkingBlock: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(isExpanded ? "Collapse thinking" : "Expand thinking")
+            .accessibilityIdentifier("session-events-row")
+            .accessibilityLabel(isExpanded ? "Collapse session events" : "Expand session events")
 
             if isExpanded {
                 HStack(alignment: .top, spacing: 10) {
@@ -48,9 +36,8 @@ struct ThinkingBlock: View {
                         .frame(width: 2)
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(run) { message in
-                            Text(message.text)
-                                .font(.callout)
-                                .italic()
+                            Text(SessionEventSummary.detail(for: message))
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
