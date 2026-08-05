@@ -54,7 +54,8 @@ struct ChatView: View {
                     .foregroundStyle(.orange)
                     .padding(.horizontal)
             }
-
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             Composer(text: $model.composerText,
                      attachments: $model.pendingAttachments,
                      selectedModel: $model.selectedModel,

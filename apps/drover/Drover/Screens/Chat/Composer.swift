@@ -2,19 +2,15 @@ import SwiftUI
 import PhotosUI
 import NexusKit
 
-/// The entry row pinned to the bottom of `ChatView`: a paperclip photo
-/// picker, a growing text field, and a send button — plus a removable
-/// thumbnail strip when images are attached. No chat logic — `onSend` is
-/// wired by the caller to `ChatModel.sendTurn()`, and picked images land in
-/// the bound `attachments` (already downscaled to JPEG).
+/// Bottom chat input for structured sessions. The prompt surface owns the
+/// glass dock treatment; this wrapper keeps PhotosPicker loading and send
+/// wiring local to chat.
 struct Composer: View {
     @Binding var text: String
     @Binding var attachments: [TurnAttachment]
     @Binding var selectedModel: String
     @Binding var thinkingEffort: String
     let harness: String
-    /// A turn POST is in flight. Disables send and swaps the arrow for a
-    /// spinner, so a stalled request reads as pending rather than ignored.
     let isSending: Bool
     let onSend: () -> Void
 
@@ -25,85 +21,37 @@ struct Composer: View {
     private static let maxCombinedBytes = 6 * 1024 * 1024
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if !attachments.isEmpty {
-                attachmentStrip
+        GlassPromptSurface(
+            text: $text,
+            attachments: $attachments,
+            selectedModel: $selectedModel,
+            thinkingEffort: $thinkingEffort,
+            harness: harness,
+            placeholder: "Add feedback...",
+            isSending: isSending,
+            canSend: !isEmpty,
+            attachmentAccessibilityIdentifier: "composer-attachment"
+        ) {
+            PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
+                         matching: .images) {
+                Image(systemName: "plus")
+                    .font(.system(size: 24, weight: .regular))
+                    .foregroundStyle(.primary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
             }
-            HarnessPreferenceControls(
-                harness: harness,
-                selectedModel: $selectedModel,
-                thinkingEffort: $thinkingEffort
-            )
-            HStack(alignment: .bottom, spacing: 8) {
-                PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
-                             matching: .images) {
-                    Image(systemName: "paperclip")
-                        .font(.title3)
-                }
-                .accessibilityLabel("Attach image")
-                .accessibilityIdentifier("composer-attach")
-
-                TextField("Message", text: $text, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(1...5)
-
-                Button(action: onSend) {
-                    if isSending {
-                        ProgressView()
-                            .frame(width: 30, height: 30)
-                    } else {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title)
-                    }
-                }
-                .disabled(isEmpty || isSending)
-                .accessibilityLabel(isSending ? "Sending" : "Send")
-                .accessibilityIdentifier("composer-send")
-            }
+            .accessibilityLabel("Attach image")
+            .accessibilityIdentifier("composer-attach")
+        } onSend: {
+            onSend()
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
             pickerItems = []
             Task { await load(items) }
-        }
-    }
-
-    private var attachmentStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(Array(attachments.enumerated()), id: \.offset) { index, attachment in
-                    thumbnail(for: attachment)
-                        .overlay(alignment: .topTrailing) {
-                            Button {
-                                attachments.remove(at: index)
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.white, .black.opacity(0.6))
-                            }
-                            .accessibilityLabel("Remove attachment")
-                        }
-                        .accessibilityIdentifier("composer-attachment")
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func thumbnail(for attachment: TurnAttachment) -> some View {
-        if let image = UIImage(data: attachment.data) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 44, height: 44)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        } else {
-            Image(systemName: "photo")
-                .frame(width: 44, height: 44)
-                .background(.secondary.opacity(0.2),
-                            in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
