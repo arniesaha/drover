@@ -29,7 +29,10 @@ from drover.server.harness.daemon import (
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import (
+    OPCODE_PING,
+    OPCODE_PONG,
     client_handshake,
+    client_send_frame,
     client_send_json,
     recv_frame,
 )
@@ -2213,6 +2216,36 @@ def test_session_stream_ws_delivers_new_events(tmp_path):
         # server must still be healthy after an abrupt client disconnect
         with _authed_get(f"http://127.0.0.1:{port}/harness/hosts") as response:
             assert response.status == 200
+    finally:
+        server.shutdown()
+
+
+def test_session_stream_ws_answers_ping_and_stays_live(tmp_path):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            client_handshake(
+                sock,
+                host=f"127.0.0.1:{port}",
+                path="/harness/sessions/harness-s2/stream",
+                headers=_AUTH_HEADERS,
+            )
+            sock.settimeout(2)
+            client_send_frame(sock, OPCODE_PING, b"hb")
+            pong = recv_frame(sock)
+            assert pong.opcode == OPCODE_PONG
+            assert pong.payload == b"hb"
+
+            _ingest_events(port, [_event(1, "after-ping")])
+            message = json.loads(recv_frame(sock).payload.decode("utf-8"))
+            assert message["text"] == "after-ping"
+        finally:
+            sock.close()
     finally:
         server.shutdown()
 
