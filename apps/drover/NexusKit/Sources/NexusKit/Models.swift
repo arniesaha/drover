@@ -330,6 +330,10 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     public var awaiting: String?
     public var cwd: String?
     public var lastActivity: Date?
+    public var preview: String?
+    public var startedAt: Date?
+    public var updatedAt: Date?
+    public var endedAt: Date?
 
     public init(
         id: String,
@@ -339,7 +343,11 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         status: String,
         awaiting: String?,
         cwd: String?,
-        lastActivity: Date?
+        lastActivity: Date?,
+        preview: String? = nil,
+        startedAt: Date? = nil,
+        updatedAt: Date? = nil,
+        endedAt: Date? = nil
     ) {
         self.id = id
         self.hostID = hostID
@@ -349,6 +357,10 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         self.awaiting = awaiting
         self.cwd = cwd
         self.lastActivity = lastActivity
+        self.preview = preview
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.endedAt = endedAt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -360,6 +372,10 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         case awaiting
         case cwd
         case lastActivity = "last_activity"
+        case preview
+        case startedAt = "started_at"
+        case updatedAt = "updated_at"
+        case endedAt = "ended_at"
     }
 
     public init(from decoder: Decoder) throws {
@@ -373,6 +389,13 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         cwd = try? container.decode(String.self, forKey: .cwd)
         let rawDate = try? container.decode(String.self, forKey: .lastActivity)
         lastActivity = WireDate.parse(rawDate)
+        preview = try? container.decode(String.self, forKey: .preview)
+        let rawStartedAt = try? container.decode(String.self, forKey: .startedAt)
+        startedAt = WireDate.parse(rawStartedAt)
+        let rawUpdatedAt = try? container.decode(String.self, forKey: .updatedAt)
+        updatedAt = WireDate.parse(rawUpdatedAt)
+        let rawEndedAt = try? container.decode(String.self, forKey: .endedAt)
+        endedAt = WireDate.parse(rawEndedAt)
     }
 
     public var attention: AttentionState {

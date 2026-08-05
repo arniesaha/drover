@@ -180,6 +180,12 @@ def test_default_mode_is_pty(tmp_path):
     assert session.last_activity is None
 
 
+def test_create_session_defaults_started_at(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(host_id="h1", harness="codex", command="codex")
+    assert session.started_at is not None
+
+
 def test_event_seq_ordering(tmp_path):
     registry, _ = _registry(tmp_path)
     session = registry.create_session(host_id="h1", harness="claude-code", command="c")

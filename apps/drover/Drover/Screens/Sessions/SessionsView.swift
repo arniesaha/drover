@@ -15,6 +15,7 @@ struct SessionsView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
+    @State private var showFinished = false
 
     init(client: NexusClient, notifier: Notifying = LocalNotifier()) {
         self.client = client
@@ -23,44 +24,89 @@ struct SessionsView: View {
     }
 
     var body: some View {
-        List {
-            // Action errors (e.g. a failed continueSession) land here — they
-            // don't touch `isReachable`, so they're distinct from the
-            // unreachable banner below: connected, but the last action
-            // failed. Refresh failures flip `isReachable` and route to the
-            // banner instead, keeping these two surfaces mutually exclusive.
-            if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
-                Section {
-                    Label(lastError, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.red)
-                }
-            }
+        ZStack(alignment: .bottomLeading) {
+            Color(.systemGroupedBackground)
+                .ignoresSafeArea()
 
-            ForEach(store.hostGroups) { group in
-                Section {
-                    Group {
-                        if group.sessions.isEmpty {
-                            Text("No active sessions")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(group.sessions) { session in
-                                row(for: session)
-                            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    // Action errors (e.g. a failed continueSession) land here — they
+                    // don't touch `isReachable`, so they're distinct from the
+                    // unreachable banner below: connected, but the last action
+                    // failed. Refresh failures flip `isReachable` and route to the
+                    // banner instead, keeping these two surfaces mutually exclusive.
+                    if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
+                        Label(lastError, systemImage: "exclamationmark.triangle")
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    }
+
+                    if activeSessions.isEmpty, store.hasLoadedOnce {
+                        ContentUnavailableView("No active sessions",
+                                               systemImage: "rectangle.stack.badge.plus",
+                                               description: Text("Launch a session when you're ready."))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 48)
+                    } else {
+                        ForEach(activeSessions) { session in
+                            row(for: session)
                         }
                     }
-                    .opacity(group.host.presence == .online ? 1 : 0.55)
-                } header: {
-                    HostSectionHeader(host: group.host)
-                }
-            }
 
-            if !store.finished.isEmpty {
-                DisclosureGroup("Finished (\(store.finished.count))") {
-                    ForEach(store.finished) { session in
-                        row(for: session)
+                    if !store.finished.isEmpty {
+                        DisclosureGroup(isExpanded: $showFinished) {
+                            VStack(spacing: 10) {
+                                ForEach(store.finished) { session in
+                                    row(for: session)
+                                }
+                            }
+                            .padding(.top, 10)
+                        } label: {
+                            HStack {
+                                Text("Finished")
+                                    .font(.headline)
+                                Text("\(store.finished.count)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(.secondary.opacity(0.12), in: Capsule())
+                            }
+                        }
+                        .padding(16)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .tint(.primary)
                     }
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                .padding(.bottom, 98)
+            }
+            .refreshable { await store.refresh() }
+
+            if store.hasLoadedOnce {
+                Button {
+                    showLaunch = true
+                } label: {
+                    Label("New session", systemImage: "plus")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 13)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay {
+                            Capsule()
+                                .strokeBorder(.white.opacity(0.24), lineWidth: 1)
+                        }
+                        .shadow(color: .black.opacity(0.18), radius: 16, y: 8)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("launch-button")
+                .padding(.leading, 20)
+                .padding(.bottom, 18)
             }
         }
         .navigationTitle("Sessions")
@@ -90,7 +136,6 @@ struct SessionsView: View {
                 }
             }
         }
-        .refreshable { await store.refresh() }
         .task { store.startPolling() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -110,16 +155,6 @@ struct SessionsView: View {
             let watcher = AttentionWatcher(notifier: notifier)
             Task { await watcher.evaluate(snapshot) }
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showLaunch = true
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .accessibilityIdentifier("launch-button")
-            }
-        }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
                 LaunchView(client: client, snapshot: store.snapshot) { sessionID, isStructured, harness in
@@ -130,6 +165,9 @@ struct SessionsView: View {
                     )
                 }
             }
+            .presentationDetents([.large])
+            .presentationCornerRadius(30)
+            .presentationBackground(.regularMaterial)
         }
         .navigationDestination(item: $launchedSession) { launched in
             if launched.isStructured {
@@ -140,6 +178,10 @@ struct SessionsView: View {
         }
     }
 
+    private var activeSessions: [SessionSummary] {
+        store.needsYou + store.working
+    }
+
     private func row(for session: SessionSummary) -> some View {
         NavigationLink {
             if session.isStructured {
@@ -148,8 +190,9 @@ struct SessionsView: View {
                 TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
             }
         } label: {
-            SessionRow(session: session)
+            SessionRow(session: session, hostTitle: hostTitle(for: session))
         }
+        .buttonStyle(.plain)
         .accessibilityIdentifier(session.id)
         .contextMenu {
             Button {
@@ -169,6 +212,10 @@ struct SessionsView: View {
                 }
             }
         }
+    }
+
+    private func hostTitle(for session: SessionSummary) -> String {
+        store.snapshot?.hosts.first { $0.id == session.hostID }?.title ?? session.hostID
     }
 
     private func crossHarnessTargets(for session: SessionSummary) -> [String] {
