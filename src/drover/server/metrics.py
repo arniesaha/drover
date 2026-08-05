@@ -353,14 +353,17 @@ def _parse_event_timestamp(value: Any) -> datetime | None:
 def _wire_datetime(value: Any) -> str | None:
     if value is None:
         return None
+
+    def with_local_timezone(candidate: datetime) -> datetime:
+        return candidate.astimezone() if candidate.tzinfo is None else candidate
+
     if not isinstance(value, datetime):
         parsed = _parse_event_timestamp(value)
-        return parsed.isoformat() if parsed else str(value)
+        return with_local_timezone(parsed).isoformat() if parsed else str(value)
     # DuckDB TIMESTAMP columns round-trip aware datetimes as naive local wall
     # time. Give clients an explicit offset so they do not reinterpret local
     # Pacific times as UTC and render fresh sessions as seven hours old.
-    aware = value.astimezone() if value.tzinfo is None else value
-    return aware.isoformat()
+    return with_local_timezone(value).isoformat()
 
 
 def _wire_datetimes(item: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -628,7 +631,7 @@ class MetricsCollector:
             return _json_response(
                 404, {"error": f"unknown harness host: {session.host_id}"}
             )
-        return self._harness_request(
+        status, body = self._harness_request(
             host,
             f"/sessions/{session_id}/{action}",
             method="POST",
@@ -637,6 +640,9 @@ class MetricsCollector:
             # larger than any other proxied payload.
             timeout_s=60.0 if action == "turns" else 15.0,
         )
+        if action == "turns" and 200 <= status < 300:
+            self._sync_harness_session_preferences(session_id, payload)
+        return status, body
 
     def proxy_harness_native_sessions(
         self,
@@ -1043,12 +1049,39 @@ class MetricsCollector:
                         payload.get("permission_mode")
                         or request_payload.get("permission_mode")
                     ),
+                    model=_optional_str(
+                        payload.get("model") or request_payload.get("model")
+                    ),
+                    thinking_effort=_optional_str(
+                        payload.get("thinking_effort")
+                        or request_payload.get("thinking_effort")
+                    ),
                 )
             else:
                 registry.update_session_status(session_id, status)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "failed to sync created harness session %s: %s", session_id, exc
+            )
+
+    def _sync_harness_session_preferences(
+        self, session_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        model = _optional_str(payload.get("model"))
+        thinking_effort = _optional_str(payload.get("thinking_effort"))
+        if model is None and thinking_effort is None:
+            return
+        try:
+            HarnessRegistry(self.duckdb_path).update_session_preferences(
+                session_id,
+                model=model,
+                thinking_effort=thinking_effort,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "failed to sync harness session preferences %s: %s",
+                session_id,
+                exc,
             )
 
     def _sync_terminated_harness_session(

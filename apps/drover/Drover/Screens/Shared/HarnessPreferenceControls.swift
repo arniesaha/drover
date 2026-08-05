@@ -14,7 +14,7 @@ struct HarnessPreferenceControls: View {
                     Button(model) { selectedModel = model }
                 }
             } label: {
-                PreferenceChip(title: modelLabel, systemImage: "cpu")
+                PreferenceChip(title: modelLabel, systemImage: "cpu", kind: "Model")
             }
             .buttonStyle(.plain)
 
@@ -25,15 +25,16 @@ struct HarnessPreferenceControls: View {
                         Button(effort.capitalized) { thinkingEffort = effort }
                     }
                 } label: {
-                    PreferenceChip(title: thinkingLabel, systemImage: "brain")
+                    PreferenceChip(title: thinkingLabel, systemImage: "brain", kind: "Thinking effort")
                 }
                 .buttonStyle(.plain)
             }
         }
+        .layoutPriority(1)
     }
 
     private var modelLabel: String {
-        selectedModel.isEmpty ? "Model" : selectedModel
+        selectedModel.isEmpty ? "Default" : selectedModel
     }
 
     private var thinkingLabel: String {
@@ -44,17 +45,23 @@ struct HarnessPreferenceControls: View {
 private struct PreferenceChip: View {
     let title: String
     let systemImage: String
+    let kind: String
 
     var body: some View {
-        Label(title, systemImage: systemImage)
-            .font(.callout.weight(.medium))
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .labelStyle(.titleAndIcon)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .frame(maxWidth: 140)
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(Capsule().strokeBorder(.secondary.opacity(0.18)))
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .imageScale(.medium)
+            Text(title)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+                .allowsTightening(true)
+        }
+        .font(.callout.weight(.medium))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.secondary.opacity(0.18)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(kind): \(title)")
     }
 }

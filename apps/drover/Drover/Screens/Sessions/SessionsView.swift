@@ -179,7 +179,7 @@ struct SessionsView: View {
     }
 
     private var activeSessions: [SessionSummary] {
-        store.needsYou + store.working
+        store.activeSessions
     }
 
     private func row(for session: SessionSummary) -> some View {

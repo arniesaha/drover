@@ -314,6 +314,15 @@ public final class ChatModel {
               let session = snapshot.sessions.first(where: { $0.id == sessionID })
         else { return }
         harnessPresentation = HarnessPresentation(session.harness)
+        if selectedModel.isEmpty, let model = session.model, !model.isEmpty {
+            selectedModel = model
+        }
+        if thinkingEffort.isEmpty,
+           let effort = session.thinkingEffort,
+           !effort.isEmpty,
+           HarnessRunPreferences.supportsThinkingEffort(session.harness) {
+            thinkingEffort = effort
+        }
         guard let host = snapshot.hosts.first(where: { $0.id == session.hostID }) else { return }
         handoffHarnesses = host.harnesses
     }

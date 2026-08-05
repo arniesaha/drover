@@ -172,6 +172,8 @@ class HarnessRegistry:
         handoff_mode: str | None = None,
         mode: str = "pty",
         permission_mode: str | None = None,
+        model: str | None = None,
+        thinking_effort: str | None = None,
     ) -> HarnessSession:
         now = _now()
         started_at = started_at or now
@@ -183,9 +185,9 @@ class HarnessRegistry:
                   session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
                   command, status, started_at, updated_at, native_session_id,
                   native_resume_label, source_session_id, handoff_mode, mode,
-                  permission_mode
+                  permission_mode, model, thinking_effort
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     session_id,
@@ -205,6 +207,8 @@ class HarnessRegistry:
                     handoff_mode,
                     mode,
                     permission_mode,
+                    model,
+                    thinking_effort,
                 ],
             )
         session = self.get_session(session_id)
@@ -290,6 +294,30 @@ class HarnessRegistry:
                 "UPDATE harness_sessions SET awaiting = ?, last_activity = ? "
                 "WHERE session_id = ?",
                 [awaiting, stamp, session_id],
+            )
+
+    def update_session_preferences(
+        self,
+        session_id: str,
+        *,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
+        if model is None and thinking_effort is None:
+            return
+        assignments = ["updated_at = ?"]
+        params: list[Any] = [_now()]
+        if model is not None:
+            assignments.append("model = ?")
+            params.append(model)
+        if thinking_effort is not None:
+            assignments.append("thinking_effort = ?")
+            params.append(thinking_effort)
+        params.append(session_id)
+        with self._connect() as con:
+            con.execute(
+                f"UPDATE harness_sessions SET {', '.join(assignments)} WHERE session_id = ?",
+                params,
             )
 
     def append_event(
@@ -473,7 +501,14 @@ class HarnessRegistry:
                          payload_json,
                          row_number() OVER (
                            PARTITION BY session_id
-                           ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
+                           ORDER BY CASE event_type
+                                      WHEN 'user_input' THEN 0
+                                      WHEN 'terminal.input' THEN 1
+                                      ELSE 2
+                                    END,
+                                    COALESCE(seq, 0) DESC,
+                                    created_at DESC,
+                                    event_id DESC
                          ) AS rn
                   FROM harness_events
                   WHERE session_id IN ({placeholders})

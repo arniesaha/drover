@@ -1694,6 +1694,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 handoff_mode=_optional_text(body.get("handoff_mode")),
                 mode="structured",
                 permission_mode=permission_mode,
+                model=model,
+                thinking_effort=thinking_effort,
             )
             session_id = session.session_id
             registry_created = True
@@ -1715,6 +1717,10 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             "command": command or [],
             "mode": "structured",
         }
+        if model is not None:
+            started_payload["model"] = model
+        if thinking_effort is not None:
+            started_payload["thinking_effort"] = thinking_effort
         if session_worktree is not None:
             started_payload["worktree"] = {
                 "path": session_worktree.path,
@@ -1762,6 +1768,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     session_id,
                     text,
                     images=saved or None,
+                    model=model,
+                    thinking_effort=thinking_effort,
                 )
             except ValueError as exc:
                 self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -1783,6 +1791,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 "harness": harness,
                 "status": "running",
                 "mode": "structured",
+                "model": model,
+                "thinking_effort": thinking_effort,
                 "registry_synced": registry_created,
             },
             status=HTTPStatus.CREATED,
@@ -1811,13 +1821,20 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         text = append_attachment_lines(text, saved)
+        model = _optional_text(body.get("model"))
+        thinking_effort = _optional_text(body.get("thinking_effort"))
         try:
             turn_id = self.server.state.structured.send_turn(
                 session_id,
                 text,
                 images=saved or None,
-                model=_optional_text(body.get("model")),
-                thinking_effort=_optional_text(body.get("thinking_effort")),
+                model=model,
+                thinking_effort=thinking_effort,
+            )
+            self.server.state.registry.update_session_preferences(
+                session_id,
+                model=model,
+                thinking_effort=thinking_effort,
             )
         except KeyError:
             # Session was closed by a concurrent /terminate between the has()
@@ -1930,10 +1947,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 if registry_session.last_activity
                 else None
             )
+            data["model"] = registry_session.model
+            data["thinking_effort"] = registry_session.thinking_effort
         else:
             data.setdefault("mode", "pty")
             data.setdefault("awaiting", None)
             data.setdefault("last_activity", None)
+            data.setdefault("model", None)
+            data.setdefault("thinking_effort", None)
         return data
 
     def _structured_session_json(self, session_id: str) -> dict[str, Any] | None:
@@ -1948,6 +1969,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             "status": registry_session.status,
             "mode": registry_session.mode or "structured",
             "awaiting": registry_session.awaiting,
+            "model": registry_session.model,
+            "thinking_effort": registry_session.thinking_effort,
             "last_activity": (
                 registry_session.last_activity.isoformat()
                 if registry_session.last_activity

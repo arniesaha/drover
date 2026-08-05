@@ -83,6 +83,25 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     #expect(s.attention == expected)
 }
 
+@Test func activityDateFallsBackToUpdatedThenStartedAt() {
+    let updated = Date(timeIntervalSince1970: 200)
+    let started = Date(timeIntervalSince1970: 100)
+    let session = SessionSummary(
+        id: "s",
+        hostID: "h",
+        harness: "codex",
+        mode: "structured",
+        status: "running",
+        awaiting: nil,
+        cwd: nil,
+        lastActivity: nil,
+        startedAt: started,
+        updatedAt: updated
+    )
+
+    #expect(session.activityDate == updated)
+}
+
 @Test(arguments: [
     ("claude-code", "Claude", "brain"),
     ("codex", "Codex", "chevron.left.forwardslash.chevron.right"),

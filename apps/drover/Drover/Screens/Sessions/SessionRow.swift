@@ -31,8 +31,8 @@ struct SessionRow: View {
 
                     Spacer(minLength: 4)
 
-                    if let lastActivity = session.lastActivity {
-                        Text(lastActivity, format: .relative(presentation: .numeric))
+                    if let activityDate = session.activityDate {
+                        Text(activityDate, format: .relative(presentation: .numeric))
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)

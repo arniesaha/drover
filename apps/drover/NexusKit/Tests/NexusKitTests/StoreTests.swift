@@ -17,6 +17,45 @@ struct StoreTests {
     #expect(store.isReachable)
 }
 
+@Test @MainActor func activeSessionsAreSortedByMostRecentActivityAcrossStates() async throws {
+    let newestRunning = SessionSummary(
+        id: "new-running",
+        hostID: "mac-mini",
+        harness: "codex",
+        mode: "structured",
+        status: "running",
+        awaiting: nil,
+        cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 300)
+    )
+    let olderInput = SessionSummary(
+        id: "older-input",
+        hostID: "mac-mini",
+        harness: "claude-code",
+        mode: "structured",
+        status: "running",
+        awaiting: "input",
+        cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 200)
+    )
+    let oldestApproval = SessionSummary(
+        id: "oldest-approval",
+        hostID: "mac-mini",
+        harness: "claude-code",
+        mode: "structured",
+        status: "running",
+        awaiting: "approval",
+        cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 100)
+    )
+
+    #expect(SessionStore.activeSessions(from: [
+        olderInput,
+        newestRunning,
+        oldestApproval,
+    ]).map(\.id) == ["new-running", "older-input", "oldest-approval"])
+}
+
 @Test @MainActor func refreshFailureKeepsSnapshotSetsError() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())

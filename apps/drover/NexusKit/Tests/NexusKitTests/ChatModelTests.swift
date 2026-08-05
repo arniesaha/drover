@@ -161,6 +161,26 @@ struct ChatModelTests {
     #expect(model.handoffHarnesses == ["shell", "claude-code", "gemini"])
 }
 
+@Test @MainActor func loadHandoffTargetsSeedsRunPreferencesFromSession() async throws {
+    let snapshot = Data("""
+    {"hosts": [{"host_id": "mac-mini", "status": "online",
+      "capabilities": {"display_name": "Mac Mini", "harnesses": [
+        {"name": "claude-code", "enabled": true}]}}],
+     "sessions": [
+      {"session_id": "harness-preferred", "host_id": "mac-mini", "harness": "claude-code",
+       "mode": "structured", "status": "running", "awaiting": null,
+       "model": "claude-fable-5[1m]", "thinking_effort": "xhigh"}],
+     "cwd_suggestions": []}
+    """.utf8)
+    MockURLProtocol.handler = { _ in (200, snapshot) }
+    let model = ChatModel(client: client(), sessionID: "harness-preferred")
+
+    await model.loadHandoffTargets()
+
+    #expect(model.selectedModel == "claude-fable-5[1m]")
+    #expect(model.thinkingEffort == "xhigh")
+}
+
 @Test @MainActor func loadHandoffTargetsUnknownSessionLeavesListEmpty() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let model = ChatModel(client: client(), sessionID: "not-in-snapshot")

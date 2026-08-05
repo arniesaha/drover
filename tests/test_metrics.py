@@ -465,6 +465,13 @@ def test_harness_snapshot_serializes_session_dates_with_timezone(tmp_path):
     )
 
 
+def test_wire_datetime_adds_offset_to_naive_server_strings():
+    rendered = metrics._wire_datetime("2026-08-05 14:01:49.805981")
+
+    assert rendered is not None
+    assert datetime.fromisoformat(rendered).tzinfo is not None
+
+
 def test_harness_snapshot_includes_latest_user_or_assistant_preview(tmp_path):
     collector = _make_collector(tmp_path)
     registry = HarnessRegistry(collector.duckdb_path)
@@ -2471,6 +2478,32 @@ def test_sync_created_harness_session_preserves_permission_mode(tmp_path):
     assert session.permission_mode == "auto"
 
 
+def test_sync_created_harness_session_preserves_run_preferences(tmp_path):
+    collector = _make_collector(tmp_path)
+    collector._sync_created_harness_session(
+        "mac-mini",
+        {
+            "harness": "claude-code",
+            "mode": "structured",
+            "model": "claude-fable-5[1m]",
+            "thinking_effort": "xhigh",
+        },
+        json.dumps(
+            {
+                "session_id": "harness-sync-preferences",
+                "mode": "structured",
+                "harness": "claude-code",
+                "status": "running",
+            }
+        ),
+    )
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.get_session("harness-sync-preferences")
+    assert session is not None
+    assert session.model == "claude-fable-5[1m]"
+    assert session.thinking_effort == "xhigh"
+
+
 def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
@@ -2513,7 +2546,13 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
         # turns: forwards body, returns turn_id
         turn = Request(
             f"http://127.0.0.1:{port}/harness/sessions/harness-running/turns",
-            data=json.dumps({"text": "second turn"}).encode("utf-8"),
+            data=json.dumps(
+                {
+                    "text": "second turn",
+                    "model": "gemini-2.5-pro",
+                    "thinking_effort": "high",
+                }
+            ).encode("utf-8"),
             method="POST",
             headers={"Content-Type": "application/json", **_AUTH_HEADERS},
         )
@@ -2546,11 +2585,17 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
     forwarded = {r["path"]: r for r in _FakeHarnessHandler.requests}
     assert "/sessions/harness-running/turns" in forwarded
     assert forwarded["/sessions/harness-running/turns"]["body"] == {
-        "text": "second turn"
+        "text": "second turn",
+        "model": "gemini-2.5-pro",
+        "thinking_effort": "high",
     }
     assert forwarded["/sessions/harness-running/turns"]["authorization"] == (
         "Bearer host-secret"
     )
+    session = HarnessRegistry(duckdb_path).get_session("harness-running")
+    assert session is not None
+    assert session.model == "gemini-2.5-pro"
+    assert session.thinking_effort == "high"
     assert "/sessions/harness-running/permission" in forwarded
     assert forwarded["/sessions/harness-running/permission"]["body"] == {
         "request_id": "r1",

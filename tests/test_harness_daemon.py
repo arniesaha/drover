@@ -1659,6 +1659,41 @@ def test_structured_session_full_lifecycle(tmp_path):
         server.server_close()
 
 
+def test_structured_session_inventory_includes_run_preferences(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "prompt": "list files",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+                "model": "claude-fable-5[1m]",
+                "thinking_effort": "xhigh",
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+
+        _, session = _json_request(f"{base_url}/sessions/{sid}")
+        assert session["model"] == "claude-fable-5[1m]"
+        assert session["thinking_effort"] == "xhigh"
+
+        _, inventory = _json_request(f"{base_url}/sessions")
+        structured_item = next(
+            item for item in inventory["sessions"] if item["session_id"] == sid
+        )
+        assert structured_item["model"] == "claude-fable-5[1m]"
+        assert structured_item["thinking_effort"] == "xhigh"
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_structured_turn_appends_user_input_and_seq_is_monotonic(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     try:

@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS harness_sessions (
   native_session_id  VARCHAR,
   native_resume_label VARCHAR,
   source_session_id  VARCHAR,
-  handoff_mode       VARCHAR
+  handoff_mode       VARCHAR,
+  model              VARCHAR,
+  thinking_effort    VARCHAR
 );
 """
 
@@ -84,6 +86,8 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "awaiting": "VARCHAR",
             "last_activity": "TIMESTAMP",
             "permission_mode": "VARCHAR",
+            "model": "VARCHAR",
+            "thinking_effort": "VARCHAR",
         },
     )
     con.execute(_HARNESS_EVENTS_DDL)

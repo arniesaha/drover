@@ -58,16 +58,31 @@ public final class SessionStore {
         return sessions.sorted(by: Self.needsYouOrdering)
     }
 
+    public var activeSessions: [SessionSummary] {
+        Self.activeSessions(from: snapshot?.sessions ?? [])
+    }
+
+    public nonisolated static func activeSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
+        sessions
+            .filter {
+                switch $0.attention {
+                case .needsApproval, .needsInput, .working: return true
+                case .done, .errored: return false
+                }
+            }
+            .sorted(by: Self.activeOrdering)
+    }
+
     public var working: [SessionSummary] {
         (snapshot?.sessions ?? [])
             .filter { $0.attention == .working }
-            .sorted(by: Self.byLastActivityDescending)
+            .sorted(by: Self.byActivityDescending)
     }
 
     public var finished: [SessionSummary] {
         (snapshot?.sessions ?? [])
             .filter { $0.attention == .done || $0.attention == .errored }
-            .sorted(by: Self.byLastActivityDescending)
+            .sorted(by: Self.byActivityDescending)
     }
 
     /// Sessions grouped by host, fleet-first: online hosts before stale
@@ -116,7 +131,7 @@ public final class SessionStore {
     private nonisolated static func groupOrdering(_ a: SessionSummary, _ b: SessionSummary) -> Bool {
         let (ra, rb) = (attentionRank(a), attentionRank(b))
         if ra != rb { return ra < rb }
-        return byLastActivityDescending(a, b)
+        return byActivityDescending(a, b)
     }
 
     private nonisolated static func presenceRank(_ host: HostSummary) -> Int {
@@ -228,15 +243,28 @@ public final class SessionStore {
         if lhs.attention != rhs.attention {
             return lhs.attention == .needsApproval
         }
-        return byLastActivityDescending(lhs, rhs)
+        return byActivityDescending(lhs, rhs)
     }
 
-    private nonisolated static func byLastActivityDescending(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
-        switch (lhs.lastActivity, rhs.lastActivity) {
-        case let (l?, r?): return l > r
-        case (nil, nil): return false
-        case (nil, _): return false
-        case (_, nil): return true
+    private nonisolated static func activeOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+        if let ordered = activityDateOrdering(lhs, rhs) {
+            return ordered
+        }
+        let (ra, rb) = (attentionRank(lhs), attentionRank(rhs))
+        if ra != rb { return ra < rb }
+        return lhs.id < rhs.id
+    }
+
+    private nonisolated static func byActivityDescending(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+        activityDateOrdering(lhs, rhs) ?? (lhs.id < rhs.id)
+    }
+
+    private nonisolated static func activityDateOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool? {
+        switch (lhs.activityDate, rhs.activityDate) {
+        case let (l?, r?) where l != r: return l > r
+        case (_?, nil): return true
+        case (nil, _?): return false
+        default: return nil
         }
     }
 

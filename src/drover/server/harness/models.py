@@ -70,6 +70,8 @@ class HarnessSession:
     handoff_mode: str | None = None
     mode: str | None = None
     permission_mode: str | None = None
+    model: str | None = None
+    thinking_effort: str | None = None
     awaiting: str | None = None
     last_activity: datetime | None = None
 
@@ -96,6 +98,8 @@ class HarnessSession:
             handoff_mode=row.get("handoff_mode"),
             mode=row.get("mode"),
             permission_mode=row.get("permission_mode"),
+            model=row.get("model"),
+            thinking_effort=row.get("thinking_effort"),
             awaiting=row.get("awaiting"),
             last_activity=row.get("last_activity"),
         )

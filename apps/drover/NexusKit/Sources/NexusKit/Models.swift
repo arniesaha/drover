@@ -334,6 +334,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     public var startedAt: Date?
     public var updatedAt: Date?
     public var endedAt: Date?
+    public var model: String?
+    public var thinkingEffort: String?
 
     public init(
         id: String,
@@ -347,7 +349,9 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         preview: String? = nil,
         startedAt: Date? = nil,
         updatedAt: Date? = nil,
-        endedAt: Date? = nil
+        endedAt: Date? = nil,
+        model: String? = nil,
+        thinkingEffort: String? = nil
     ) {
         self.id = id
         self.hostID = hostID
@@ -361,6 +365,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.endedAt = endedAt
+        self.model = model
+        self.thinkingEffort = thinkingEffort
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -376,6 +382,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         case startedAt = "started_at"
         case updatedAt = "updated_at"
         case endedAt = "ended_at"
+        case model
+        case thinkingEffort = "thinking_effort"
     }
 
     public init(from decoder: Decoder) throws {
@@ -396,6 +404,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         updatedAt = WireDate.parse(rawUpdatedAt)
         let rawEndedAt = try? container.decode(String.self, forKey: .endedAt)
         endedAt = WireDate.parse(rawEndedAt)
+        model = try? container.decode(String.self, forKey: .model)
+        thinkingEffort = try? container.decode(String.self, forKey: .thinkingEffort)
     }
 
     public var attention: AttentionState {
@@ -413,6 +423,10 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
                 return .working
             }
         }
+    }
+
+    public var activityDate: Date? {
+        lastActivity ?? updatedAt ?? startedAt
     }
 
     /// Legacy sessions predating the `mode` field send neither the key nor a

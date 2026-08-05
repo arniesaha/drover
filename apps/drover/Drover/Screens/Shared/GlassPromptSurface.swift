@@ -111,8 +111,6 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 .strokeBorder(borderStyle, lineWidth: 1)
         }
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.4 : 0.16), radius: 20, y: 10)
-        .contentShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
-        .onTapGesture { isTextFocused = true }
     }
 
     private var surfaceTint: some ShapeStyle {

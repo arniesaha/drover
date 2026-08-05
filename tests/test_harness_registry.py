@@ -193,6 +193,36 @@ def test_latest_session_previews_skips_traceback_payload_fallback(tmp_path):
     assert previews == {"harness-session-traceback": "Summarize readable session cards"}
 
 
+def test_latest_session_previews_prefer_task_prompt_over_newer_assistant_text(
+    tmp_path,
+):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-task-title",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        session_id="harness-session-task-title",
+        event_type="user_input",
+        content_preview="Fix the session screen sorting and titles",
+        seq=1,
+    )
+    registry.append_event(
+        session_id="harness-session-task-title",
+        event_type="assistant_output",
+        content_preview="I am checking the registry query now.",
+        seq=2,
+    )
+
+    previews = registry.latest_session_previews(["harness-session-task-title"])
+
+    assert previews == {
+        "harness-session-task-title": "Fix the session screen sorting and titles"
+    }
+
+
 def test_append_events_in_order(tmp_path):
     registry, _ = _registry(tmp_path)
     registry.register_host(
