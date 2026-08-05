@@ -117,6 +117,82 @@ def test_create_and_update_session_lifecycle(tmp_path):
     assert registry.list_sessions(status="running") == []
 
 
+def test_latest_session_previews_falls_back_to_payload_text(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-preview",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        session_id="harness-session-preview",
+        event_type="user_input",
+        payload={"text": "Rework session cards for iPhone 17 Pro"},
+        content_preview="",
+    )
+
+    previews = registry.latest_session_previews(["harness-session-preview"])
+
+    assert previews == {
+        "harness-session-preview": "Rework session cards for iPhone 17 Pro"
+    }
+
+
+def test_latest_session_previews_redacts_payload_fallback(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-secret",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        session_id="harness-session-secret",
+        event_type="user_input",
+        payload={
+            "text": "curl -H 'Authorization: Bearer sk-secret' "
+            "https://example.test?api_key=sk-query"
+        },
+        content_preview="",
+    )
+
+    preview = registry.latest_session_previews(["harness-session-secret"])[
+        "harness-session-secret"
+    ]
+
+    assert "sk-secret" not in preview
+    assert "sk-query" not in preview
+    assert "<redacted>" in preview
+
+
+def test_latest_session_previews_skips_traceback_payload_fallback(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-traceback",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        session_id="harness-session-traceback",
+        event_type="user_input",
+        content_preview="Summarize readable session cards",
+        seq=1,
+    )
+    registry.append_event(
+        session_id="harness-session-traceback",
+        event_type="assistant_output",
+        payload={"text": "Traceback (most recent call last):\napi_key=sk-secret"},
+        content_preview="",
+        seq=2,
+    )
+
+    previews = registry.latest_session_previews(["harness-session-traceback"])
+
+    assert previews == {"harness-session-traceback": "Summarize readable session cards"}
+
+
 def test_append_events_in_order(tmp_path):
     registry, _ = _registry(tmp_path)
     registry.register_host(
