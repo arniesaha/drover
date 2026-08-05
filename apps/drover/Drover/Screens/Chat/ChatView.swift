@@ -155,6 +155,8 @@ struct ChatView: View {
                 estimatedTokens: estimatedTokens,
                 isStreaming: isNewest && (model.messages.last?.isThinking ?? false)
             )
+        case .statusRun(let run):
+            SessionEventsRow(run: run)
         case .step(let action, let result):
             StepCard(action: action, result: result)
         }
