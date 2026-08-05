@@ -41,6 +41,7 @@ public enum DisplayBlock: Sendable, Equatable {
     case text(AttributedString)
     case code(language: String?, code: String)
     case diff([DiffLine])
+    case heading(level: Int, content: AttributedString)
 
     /// Splits message text at ``` fences. Rules (all covered by tests):
     /// - A line whose trimmed form starts with ``` opens a fence; the rest of
@@ -50,6 +51,8 @@ public enum DisplayBlock: Sendable, Equatable {
     /// - An unterminated fence swallows the rest of the text as its body —
     ///   deterministic handling for mid-stream cutoffs.
     /// - `diff`-tagged fences become `.diff` with per-line classification.
+    /// - An ATX heading line (`#{1..6} title`) outside a fence becomes a
+    ///   `.heading` with the title inline-parsed.
     /// - Prose runs that are blank after trimming produce no block.
     public static func segment(_ text: String) -> [DisplayBlock] {
         var blocks: [DisplayBlock] = []
@@ -92,12 +95,28 @@ public enum DisplayBlock: Sendable, Equatable {
                 flushCode()
             } else if inFence {
                 codeLines.append(line)
+            } else if let heading = headingBlock(from: trimmed) {
+                flushProse()
+                blocks.append(heading)
             } else {
                 proseLines.append(line)
             }
         }
         if inFence { flushCode() } else { flushProse() }
         return blocks
+    }
+
+    /// A prose line of the form `#{1..6} title` becomes a heading block; the
+    /// title still gets the inline markdown parse. No space after the hashes,
+    /// or 7+ hashes, means it's ordinary prose (matches CommonMark ATX rules).
+    private static func headingBlock(from trimmed: String) -> DisplayBlock? {
+        let hashes = trimmed.prefix(while: { $0 == "#" })
+        guard (1...6).contains(hashes.count) else { return nil }
+        let rest = trimmed.dropFirst(hashes.count)
+        guard rest.first == " " else { return nil }
+        let title = rest.trimmingCharacters(in: .whitespaces)
+        guard !title.isEmpty else { return nil }
+        return .heading(level: hashes.count, content: parseInlineMarkdown(title))
     }
 
     /// The same inline-only markdown parse `displayText` has always used —
