@@ -33,11 +33,11 @@ struct HarnessPreferenceControls: View {
     }
 
     private var modelLabel: String {
-        selectedModel.isEmpty ? "Default model" : selectedModel
+        selectedModel.isEmpty ? "Model" : selectedModel
     }
 
     private var thinkingLabel: String {
-        thinkingEffort.isEmpty ? "Default thinking" : thinkingEffort.capitalized
+        thinkingEffort.isEmpty ? "Auto" : thinkingEffort.capitalized
     }
 }
 
@@ -47,11 +47,14 @@ private struct PreferenceChip: View {
 
     var body: some View {
         Label(title, systemImage: systemImage)
-            .font(.caption.weight(.medium))
+            .font(.callout.weight(.medium))
             .lineLimit(1)
+            .truncationMode(.middle)
+            .labelStyle(.titleAndIcon)
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
-            .background(.thinMaterial, in: Capsule())
+            .frame(maxWidth: 140)
+            .background(.ultraThinMaterial, in: Capsule())
             .overlay(Capsule().strokeBorder(.secondary.opacity(0.18)))
     }
 }
