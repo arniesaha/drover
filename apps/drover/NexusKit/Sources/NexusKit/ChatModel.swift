@@ -24,6 +24,10 @@ public final class ChatModel {
     public private(set) var isAnswering = false
     public private(set) var pendingApproval: HarnessMessage?
     public private(set) var hint: String?
+    /// True while a turn POST is in flight. The composer disables on this,
+    /// so a slow network cannot be mistaken for a dead send button --
+    /// which is what produced nine duplicate turns from one message.
+    public private(set) var isSending = false
     public private(set) var harnessPresentation: HarnessPresentation
     /// Live context pressure for the header gauge; nil when the harness
     /// reports no per-call usage.
@@ -179,9 +183,12 @@ public final class ChatModel {
     // MARK: - Actions
 
     public func sendTurn() async {
+        guard !isSending else { return }
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = pendingAttachments
         guard !text.isEmpty || !images.isEmpty else { return }
+        isSending = true
+        defer { isSending = false }
         do {
             _ = try await client.sendTurn(sessionID: sessionID, text: text, images: images)
             composerText = ""

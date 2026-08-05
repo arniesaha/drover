@@ -56,7 +56,8 @@ struct ChatView: View {
             }
 
             Composer(text: $model.composerText,
-                     attachments: $model.pendingAttachments) {
+                     attachments: $model.pendingAttachments,
+                     isSending: model.isSending) {
                 Task { await model.sendTurn() }
             }
         }
