@@ -56,7 +56,8 @@ struct ChatView: View {
             }
 
             Composer(text: $model.composerText,
-                     attachments: $model.pendingAttachments) {
+                     attachments: $model.pendingAttachments,
+                     isSending: model.isSending) {
                 Task { await model.sendTurn() }
             }
         }
@@ -149,11 +150,14 @@ struct ChatView: View {
         switch item {
         case .message(let message):
             MessageBubble(message: message)
-        case .thinkingRun(let run):
+        case .thinkingRun(let run, let estimatedTokens):
             ThinkingBlock(
                 run: run,
+                estimatedTokens: estimatedTokens,
                 isStreaming: isNewest && (model.messages.last?.isThinking ?? false)
             )
+        case .statusRun(let run):
+            SessionEventsRow(run: run)
         case .step(let action, let result):
             StepCard(action: action, result: result)
         }
@@ -210,11 +214,19 @@ struct ChatView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .principal) {
-            Label(model.harnessPresentation.name,
-                  systemImage: model.harnessPresentation.symbolName)
-                .labelStyle(.titleAndIcon)
-                .font(.headline)
-                .accessibilityIdentifier("chat-harness-title")
+            VStack(spacing: 0) {
+                Label(model.harnessPresentation.name,
+                      systemImage: model.harnessPresentation.symbolName)
+                    .labelStyle(.titleAndIcon)
+                    .font(.headline)
+                    .accessibilityIdentifier("chat-harness-title")
+                if let gauge = model.contextGauge {
+                    Text(gauge.text)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("chat-context-gauge")
+                }
+            }
         }
 
         ToolbarItem(placement: .topBarTrailing) {

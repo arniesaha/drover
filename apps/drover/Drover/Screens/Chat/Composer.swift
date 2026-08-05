@@ -10,6 +10,9 @@ import NexusKit
 struct Composer: View {
     @Binding var text: String
     @Binding var attachments: [TurnAttachment]
+    /// A turn POST is in flight. Disables send and swaps the arrow for a
+    /// spinner, so a stalled request reads as pending rather than ignored.
+    let isSending: Bool
     let onSend: () -> Void
 
     @State private var pickerItems: [PhotosPickerItem] = []
@@ -37,11 +40,16 @@ struct Composer: View {
                     .lineLimit(1...5)
 
                 Button(action: onSend) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title)
+                    if isSending {
+                        ProgressView()
+                            .frame(width: 30, height: 30)
+                    } else {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title)
+                    }
                 }
-                .disabled(isEmpty)
-                .accessibilityLabel("Send")
+                .disabled(isEmpty || isSending)
+                .accessibilityLabel(isSending ? "Sending" : "Send")
                 .accessibilityIdentifier("composer-send")
             }
         }
