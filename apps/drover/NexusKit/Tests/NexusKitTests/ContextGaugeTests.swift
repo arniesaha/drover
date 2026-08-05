@@ -92,4 +92,19 @@ import Testing
         )
         #expect(ContextGauge(messages: [resultWithUsage]) == nil)
     }
+
+    @Test func ignoresCodexTurnCompletedCumulativeUsage() {
+        let codexTurnCompleted = HarnessMessage.fixture(
+            seq: 608,
+            type: .status,
+            text: "turn complete",
+            payload: ["usage": .object([
+                "input_tokens": .number(18_062_364),
+                "cached_input_tokens": .number(17_266_432),
+                "output_tokens": .number(65_598),
+                "reasoning_output_tokens": .number(19_252),
+            ])]
+        )
+        #expect(ContextGauge(messages: [codexTurnCompleted], harness: "codex") == nil)
+    }
 }

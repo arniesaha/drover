@@ -20,8 +20,8 @@ public struct ContextGauge: Sendable, Equatable {
         return "ctx \(TokenCount.format(usedTokens)) / \(TokenCount.format(window)) · \(percent)%"
     }
 
-    public init?(messages: [HarnessMessage]) {
-        guard let used = Self.latestPromptTokens(messages) else { return nil }
+    public init?(messages: [HarnessMessage], harness: String? = nil) {
+        guard let used = Self.latestPromptTokens(messages, harness: harness) else { return nil }
         usedTokens = used
         window = Self.latestWindow(messages)
     }
@@ -29,10 +29,16 @@ public struct ContextGauge: Sendable, Equatable {
     /// Newest-first: one assistant message's `usage` is one API call.
     /// A `result` payload is explicitly skipped -- its `usage` sibling is a
     /// per-request total, not a per-call one.
-    private static func latestPromptTokens(_ messages: [HarnessMessage]) -> Int? {
+    private static func latestPromptTokens(_ messages: [HarnessMessage], harness: String?) -> Int? {
+        let normalizedHarness = harness?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let window = Self.latestWindow(messages)
         for message in messages.reversed() {
-            guard message.payload["result"] == nil,
+            guard message.type == .assistantOutput,
+                  message.payload["result"] == nil,
                   let usage = message.payload["usage"]?.objectValue else { continue }
+            if normalizedHarness == "codex" && window == nil {
+                return nil
+            }
             let input = usage["input_tokens"]?.numberValue ?? 0
             let cacheRead = usage["cache_read_input_tokens"]?.numberValue ?? 0
             let cacheCreation = usage["cache_creation_input_tokens"]?.numberValue ?? 0

@@ -433,6 +433,69 @@ def test_metrics_collector_harness_json(tmp_path):
     assert '"source": "recent session"' in body
 
 
+def test_harness_snapshot_serializes_session_dates_with_timezone(tmp_path):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.create_session(
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/Volumes/M2 1/drover",
+        started_at=datetime(2026, 8, 5, 10, 40, 37, tzinfo=timezone.utc),
+    )
+    registry.update_session_activity(
+        session.session_id,
+        awaiting="input",
+        last_activity=datetime(2026, 8, 5, 10, 55, 34, tzinfo=timezone.utc),
+    )
+
+    payload = json.loads(collector.render_harness_json())
+
+    rendered = payload["sessions"][0]
+    started_at = datetime.fromisoformat(rendered["started_at"])
+    last_activity = datetime.fromisoformat(rendered["last_activity"])
+    assert started_at.tzinfo is not None
+    assert last_activity.tzinfo is not None
+    assert started_at.astimezone(timezone.utc) == datetime(
+        2026, 8, 5, 10, 40, 37, tzinfo=timezone.utc
+    )
+    assert last_activity.astimezone(timezone.utc) == datetime(
+        2026, 8, 5, 10, 55, 34, tzinfo=timezone.utc
+    )
+
+
+def test_harness_snapshot_includes_latest_user_or_assistant_preview(tmp_path):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.create_session(
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/Volumes/M2 1/drover",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="status",
+        content_preview="turn started",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="user_input",
+        content_preview="Refactor session screen cards",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="tool_action",
+        content_preview="git status --short",
+    )
+
+    payload = json.loads(collector.render_harness_json())
+
+    assert payload["sessions"][0]["preview"] == "Refactor session screen cards"
+
+
 def test_metrics_collector_marks_stale_harness_hosts(tmp_path):
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)

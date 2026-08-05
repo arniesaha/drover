@@ -31,7 +31,9 @@ public final class ChatModel {
     public private(set) var harnessPresentation: HarnessPresentation
     /// Live context pressure for the header gauge; nil when the harness
     /// reports no per-call usage.
-    public var contextGauge: ContextGauge? { ContextGauge(messages: messages) }
+    public var contextGauge: ContextGauge? {
+        ContextGauge(messages: messages, harness: harnessPresentation.harness)
+    }
     public var composerText = ""
     /// Images picked in the composer, waiting to ride the next turn.
     public var pendingAttachments: [TurnAttachment] = []
