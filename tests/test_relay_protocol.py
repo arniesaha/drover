@@ -43,9 +43,7 @@ def test_hello_frame() -> None:
     assert hello_frame("work-laptop") == {"kind": "hello", "host_id": "work-laptop"}
 
 
-@pytest.mark.parametrize(
-    "bad", [None, [], "req", {}, {"kind": "unknown"}, {"kind": 7}]
-)
+@pytest.mark.parametrize("bad", [None, [], "req", {}, {"kind": "unknown"}, {"kind": 7}])
 def test_parse_frame_rejects_garbage(bad: object) -> None:
     with pytest.raises(RelayProtocolError):
         parse_frame(bad)

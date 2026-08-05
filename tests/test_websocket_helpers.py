@@ -1,4 +1,5 @@
 """Round-trip tests for client-role (masked) websocket helpers."""
+
 import socket
 
 import pytest

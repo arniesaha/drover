@@ -46,9 +46,7 @@ def _git(cwd: str, *args: str) -> str | None:
         log.debug("git %s failed in %s: %s", args, cwd, exc)
         return None
     if result.returncode != 0:
-        log.debug(
-            "git %s failed in %s: %s", args, cwd, result.stderr.strip()
-        )
+        log.debug("git %s failed in %s: %s", args, cwd, result.stderr.strip())
         return None
     return result.stdout.strip()
 

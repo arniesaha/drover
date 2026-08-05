@@ -37,6 +37,7 @@ class _StubDriver:
         self.started = False
         self.closed = False
         self.sent_turns: list[tuple[str, str]] = []
+        self.sent_images: list = []
         self.answered: list[tuple[str, str, str | None]] = []
         self.send_turn_error: Exception | None = None
         self.answer_permission_error: Exception | None = None
@@ -47,10 +48,11 @@ class _StubDriver:
     def is_alive(self) -> bool:
         return not self.closed
 
-    def send_turn(self, text: str, turn_id: str) -> None:
+    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
         if self.send_turn_error is not None:
             raise self.send_turn_error
         self.sent_turns.append((text, turn_id))
+        self.sent_images.append(images)
 
     def answer_permission(self, request_id, decision, note=None) -> None:
         if self.answer_permission_error is not None:
@@ -164,6 +166,29 @@ def test_send_turn_dispatches_before_recording_and_skips_event_on_failure(
     ]
     assert len(user_input_events) == 1
     assert user_input_events[0].payload["text"] == "hello"
+
+
+def test_send_turn_forwards_images_and_records_attachments(monkeypatch, tmp_path):
+    mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    images = [{"path": "/tmp/a.png", "media_type": "image/png", "data_b64": "QUJD"}]
+    turn_id = mgr.send_turn("sess-1", "see attached", images=images)
+
+    assert driver.sent_turns == [("see attached", turn_id)]
+    assert driver.sent_images == [images]
+
+    user_input_events = [
+        event
+        for event in registry.list_events("sess-1")
+        if event.event_type == "user_input"
+    ]
+    assert len(user_input_events) == 1
+    # Attachment metadata is recorded, but never the base64 payload — events
+    # are pushed to the hub and replayed into transcripts.
+    assert user_input_events[0].payload["payload"]["attachments"] == [
+        {"path": "/tmp/a.png", "media_type": "image/png"}
+    ]
 
 
 def test_answer_permission_dispatches_before_recording_and_skips_event_on_failure(

@@ -171,19 +171,31 @@ def test_parse_tool_use_and_result():
 
 def test_tool_result_payload_carries_tool_name():
     driver = _driver([])
-    action_line = json.dumps({
-        "type": "assistant",
-        "message": {"content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash",
-             "input": {"command": "ls"}}
-        ]},
-    })
-    result_line = json.dumps({
-        "type": "user",
-        "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
-        ]},
-    })
+    action_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    }
+                ]
+            },
+        }
+    )
+    result_line = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]
+            },
+        }
+    )
     driver.parse_line(action_line)
     [result] = driver.parse_line(result_line)
     assert result.type == "tool_result"
@@ -192,20 +204,36 @@ def test_tool_result_payload_carries_tool_name():
 
 def test_tool_result_payload_carries_is_error():
     driver = _driver([])
-    action_line = json.dumps({
-        "type": "assistant",
-        "message": {"content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash",
-             "input": {"command": "false"}}
-        ]},
-    })
-    result_line = json.dumps({
-        "type": "user",
-        "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "error",
-             "is_error": True}
-        ]},
-    })
+    action_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "false"},
+                    }
+                ]
+            },
+        }
+    )
+    result_line = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "error",
+                        "is_error": True,
+                    }
+                ]
+            },
+        }
+    )
     driver.parse_line(action_line)
     [result] = driver.parse_line(result_line)
     assert result.type == "tool_result"
@@ -281,6 +309,31 @@ def test_send_turn_and_answer_permission_wire_shapes(monkeypatch):
     driver.answer_permission("req-1", "allow")
     assert sent[1]["type"] == "control_response"
     assert sent[1]["response"]["request_id"] == "req-1"
+
+
+def test_send_turn_with_images_appends_image_blocks(monkeypatch):
+    sent: list[dict] = []
+    driver = _driver([])
+    monkeypatch.setattr(driver, "send_line", sent.append)
+    driver.send_turn(
+        "look",
+        turn_id="t1",
+        images=[{"path": "/tmp/a.png", "media_type": "image/png", "data_b64": "QUJD"}],
+    )
+    content = sent[0]["message"]["content"]
+    assert content[0] == {"type": "text", "text": "look"}
+    assert content[1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"},
+    }
+
+
+def test_send_turn_without_images_unchanged(monkeypatch):
+    sent: list[dict] = []
+    driver = _driver([])
+    monkeypatch.setattr(driver, "send_line", sent.append)
+    driver.send_turn("look", turn_id="t1")
+    assert sent[0]["message"]["content"] == [{"type": "text", "text": "look"}]
 
 
 def test_answer_permission_deny_behavior(monkeypatch):

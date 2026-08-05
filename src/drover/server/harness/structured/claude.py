@@ -198,9 +198,7 @@ class ClaudeDriver(ProcessDriver):
                         payload={
                             **base_payload,
                             "tool_use_id": block.get("tool_use_id"),
-                            "tool": self._tool_names.get(
-                                str(block.get("tool_use_id"))
-                            ),
+                            "tool": self._tool_names.get(str(block.get("tool_use_id"))),
                             "is_error": block.get("is_error"),
                         },
                     )
@@ -219,15 +217,27 @@ class ClaudeDriver(ProcessDriver):
             )
         ]
 
-    def send_turn(self, text: str, turn_id: str) -> None:
+    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
         del turn_id  # not part of Claude's wire shape; caller-side bookkeeping only
+        content: list[dict] = [{"type": "text", "text": text}]
+        # Attachments also appear as [Attached image: <path>] lines in the
+        # text (that's the only channel codex/gemini have); the base64 block
+        # here lets Claude see the image without a Read tool call.
+        for image in images or []:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image["media_type"],
+                        "data": image["data_b64"],
+                    },
+                }
+            )
         self.send_line(
             {
                 "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}],
-                },
+                "message": {"role": "user", "content": content},
             }
         )
 
@@ -258,9 +268,7 @@ def _result_text(block: dict[str, Any]) -> str:
     return ""
 
 
-def _metadata_payload(
-    event: dict[str, Any], message: dict[str, Any]
-) -> dict[str, Any]:
+def _metadata_payload(event: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if message.get("usage") is not None:
         payload["usage"] = message.get("usage")

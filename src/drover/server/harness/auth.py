@@ -14,7 +14,6 @@ import time
 from typing import Any, Protocol, Sequence
 from uuid import uuid4
 
-
 _SECRET_QUERY_KEYS = {
     "authorization",
     "bearer",
@@ -221,7 +220,9 @@ class CommandAuthAdapter:
                 check=False,
             )
         except OSError:
-            return HarnessAuthStatus(self.harness, "unavailable", detail="CLI not runnable")
+            return HarnessAuthStatus(
+                self.harness, "unavailable", detail="CLI not runnable"
+            )
         except subprocess.TimeoutExpired:
             return HarnessAuthStatus(self.harness, "unknown", detail="status timed out")
 
@@ -244,7 +245,9 @@ def _parse_claude_status(output: str, returncode: int) -> HarnessAuthStatus:
     except json.JSONDecodeError:
         return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
     if returncode != 0:
-        return HarnessAuthStatus("claude-code", "unauthenticated", detail=output or None)
+        return HarnessAuthStatus(
+            "claude-code", "unauthenticated", detail=output or None
+        )
     if not isinstance(data, dict):
         return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
     if data.get("loggedIn") is True:
@@ -255,7 +258,9 @@ def _parse_claude_status(output: str, returncode: int) -> HarnessAuthStatus:
             detail=data.get("subscriptionType") or data.get("authMethod"),
         )
     if data.get("loggedIn") is False:
-        return HarnessAuthStatus("claude-code", "unauthenticated", detail=output or None)
+        return HarnessAuthStatus(
+            "claude-code", "unauthenticated", detail=output or None
+        )
     return HarnessAuthStatus("claude-code", "unknown", detail=output or None)
 
 
@@ -381,7 +386,9 @@ def _resolve_login_command(binary: str, *, shell: str | None) -> list[str] | Non
         return None
     shell_command = "exec " + shlex.quote(executable)
     if path_prefix := executable_path_prefix(executable):
-        shell_command = f"export PATH={shlex.quote(path_prefix)}{os.pathsep}$PATH; {shell_command}"
+        shell_command = (
+            f"export PATH={shlex.quote(path_prefix)}{os.pathsep}$PATH; {shell_command}"
+        )
     return [login_shell, "-lc", shell_command]
 
 
@@ -497,7 +504,9 @@ class AuthFlowManager:
                     start_new_session=True,
                 )
             except OSError as exc:
-                raise AuthFlowLaunchError("authentication command could not start") from exc
+                raise AuthFlowLaunchError(
+                    "authentication command could not start"
+                ) from exc
             flow = _AuthFlow(
                 flow_id=str(uuid4()),
                 harness=harness,
@@ -569,8 +578,7 @@ class AuthFlowManager:
             with flow.lock:
                 completed_at = flow.completed_at
                 should_discard = (
-                    completed_at is not None
-                    and now - completed_at >= self._retention_s
+                    completed_at is not None and now - completed_at >= self._retention_s
                 )
             if should_discard:
                 del self._flows_by_id[flow_id]
@@ -703,7 +711,9 @@ class AuthFlowManager:
                 flow.last_error = redact_auth_text(diagnostic)
             else:
                 flow.state = "failed"
-                flow.last_error = f"authentication process exited with code {return_code}"
+                flow.last_error = (
+                    f"authentication process exited with code {return_code}"
+                )
             self._schedule_discard_locked(flow)
 
     def _expire_flow(self, flow: _AuthFlow) -> None:

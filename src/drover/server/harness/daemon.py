@@ -1764,7 +1764,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             line = f"[Attached image: {item['path']}]"
             text = f"{text}\n\n{line}" if text else line
         try:
-            turn_id = self.server.state.structured.send_turn(session_id, text)
+            turn_id = self.server.state.structured.send_turn(
+                session_id, text, images=saved or None
+            )
         except KeyError:
             # Session was closed by a concurrent /terminate between the has()
             # check above and this call -- treat it as "no longer there".
