@@ -12,6 +12,17 @@ The original draft was written blind (the NAS was unreachable, see
 now verified from the host itself and recorded below — no discovery phase
 needed.
 
+**Revised again 2026-08-04**, from an audit run on the NAS itself. The SSH
+failure was misdiagnosed as a host that could not fork; it is a UGREEN
+`ForceCommand` gate (Phase 0). Phase 0, the Phase 3 database check, the memory
+watch item, and the appendix were all corrected against measurements.
+
+**Deployed state as of this revision:** `/home/Arnab/dev/drover-harness-prod`
+is a clean clone at `1ac0e2e`, identical to `origin/main`. The running daemon
+is `72d848b`; the only difference is this file, so no restart is pending. The
+codex `exec resume` fix and transcript replay are both live, and `nas`
+heartbeats `online` in the fleet.
+
 The NAS is Debian 12 bookworm, user `Arnab`, harnessd on port 7081,
 `host_id: nas`. The hub is the Mac at `192.168.1.149:7080`.
 
@@ -39,29 +50,36 @@ Copy of it lives at the bottom of this file so it can be recreated.
 
 ---
 
-## Phase 0 — can the NAS start new processes?
+## Phase 0 — can you actually run commands on the NAS?
 
-Skip if `ssh Arnab@arnabsnas.local id` returns promptly, or if you are already
-running on the NAS.
+Skip if you are already running on the NAS (e.g. via the Drover harness).
 
-If SSH authenticates and then hangs, the machine usually cannot fork. Get in
-via the console (DSM web terminal or physical) and check the four usual
-causes:
+**Use `ssh -tt`, not `ssh host 'cmd'`.** The NAS runs a stock UGREEN
+`ForceCommand` gate (`/etc/ssh/sshd_config` → `/etc/ssh/force_command.sh`)
+that dispatches on `$SSH_ORIGINAL_COMMAND`:
+
+| how you invoke it | `$SSH_ORIGINAL_COMMAND` | result |
+|---|---|---|
+| `ssh Arnab@arnabsnas.local 'id'` | non-empty | **swallowed** — exit 0, no output |
+| `ssh -tt Arnab@arnabsnas.local` | empty → `exec "$SHELL" -` | **works** |
+| `sftp` | subsystem | broken by the same gate |
+
+So every step below should be piped into an interactive shell:
 
 ```bash
-df -h                      # full disk, especially / and /home
-free -m                    # memory and swap exhausted
-ps -eo pid | wc -l         # PID count vs `ulimit -u` and kernel.pid_max
-dmesg -T | tail -50        # OOM killer, I/O errors, hung-task warnings
-mount | grep -E 'nfs|cifs' # a wedged network mount hangs anything touching it
+printf 'cd /home/Arnab/dev/drover-harness-prod && git pull && exit\n' \
+  | ssh -tt Arnab@arnabsnas.local
 ```
 
-Hung-task or I/O errors against the volume holding `/home/Arnab` is the
-common answer. A reboot is the usual fix; if the console itself cannot spawn
-a shell, it is a power cycle.
+**A zero exit from `ssh` proves nothing here** — the gate returns 0 having run
+nothing. Always confirm the command's expected *output*. (And note
+`ssh ... | head; echo $?` reports `head`'s status, not ssh's.)
 
-**Do not continue until `ssh Arnab@arnabsnas.local id` returns.** Everything
-below spawns processes.
+If `ssh -tt` also fails, only then suspect the host. The Phase 0 checks are
+`df -h`, `free -m`, `ps -eo pid | wc -l` vs `ulimit -u`, `dmesg -T | tail -50`,
+and `mount | grep -E 'nfs|cifs'`. Do **not** reach for a reboot before those
+five have actually shown a problem — see the appendix for a day lost to
+exactly that inference.
 
 ## Phase 1 — back up
 
@@ -115,9 +133,20 @@ Expect `{"active_sessions": 0, "host_id": "nas", "ok": true}`.
 start. Wait for `drover-harnessd nas listening on 0.0.0.0:7081` in
 `journalctl --user -u drover-nas-harnessd -n 20`.
 
-Then verify against the **real** database — read the path from the config
-rather than hardcoding it, so a typo cannot silently create an empty DuckDB
-file and report a green result:
+Then verify against the **real** database. Run this **while the daemon is
+stopped** — at the end of Phase 2, before the `systemctl --user start` above.
+DuckDB's file lock is exclusive per process and `read_only=True` does **not**
+exempt you; against a running daemon this fails with:
+
+```
+IOException: Could not set lock on file "/home/Arnab/.drover/drover.duckdb":
+Conflicting lock is held in /usr/bin/python3.11 (PID …) by user Arnab
+```
+
+That error means "the daemon is up", not "the database is broken" — do not
+stop the service to chase it, and do not point the check at a different path
+to make it pass. Read the path from the config rather than hardcoding it, so a
+typo cannot silently create an empty DuckDB file and report a green result:
 
 ```bash
 cd /home/Arnab/dev/drover-harness-prod
@@ -221,10 +250,16 @@ Two things to watch on this release:
 - `drover_harness_dropped_events_total` after a day of real use. Non-zero
   means the retry budget is too small for real contention — the retry path has
   only ever been exercised against simulated failures.
-- **Resident memory.** The pre-deploy process sat at 10.7 MB RSS after 12 days;
-  the new one settles around 117 MB. Some of that is transcript replay now
-  reading from `harness_events`, but a 10x jump has not been explained. If it
-  keeps climbing across days, that is a leak, not a baseline.
+- **Resident memory.** The pre-deploy process sat at 10.7 MB RSS after 12 days.
+  Measured 5h into the new release: **67 MB RSS**, below the ~117 MB this
+  originally predicted and flat. No leak evident so far; keep an eye on it
+  across days rather than hours.
+
+  Measure with `ps -o rss= -p <pid>`, **not** `systemctl status`. The
+  `Memory: 578.0M` that systemd reports is the whole cgroup, which includes
+  every agent CLI the daemon has spawned (a Node-based `claude` child alone
+  accounts for most of it). Reading the cgroup number as the daemon's RSS
+  turns a healthy 67 MB into a phantom 8x leak.
 
 ---
 
@@ -293,6 +328,44 @@ The obvious guess — a bad `.bashrc` or shell startup — was **wrong**:
 out. Meanwhile harnessd — already running, files already open — kept serving
 `/healthz` in 16ms.
 
-Existing processes fine, new processes impossible: that is a host that cannot
-fork. Check PIDs, memory, disk, and wedged mounts (Phase 0), not the network
-and not SSH config.
+From there the session concluded "existing processes fine, new processes
+impossible — the host cannot fork," and recommended console access and a
+reboot. **That conclusion was wrong**, and it cost a day.
+
+### What it actually was (verified 2026-08-04 from the host)
+
+The host was healthy the entire time: 20 days uptime, load 0.6, `/` 82% with
+20G free, 5.9G RAM available, **442 PIDs against a 62485 limit**, no nfs/cifs
+mounts, `sshd` up continuously since 2026-07-15, and forking fine.
+
+The blocker is the UGREEN `ForceCommand` gate described in Phase 0. It
+intercepts the exec channel *and* the sftp subsystem — which is exactly why
+the table above looks like a fork failure. Every row it lists is a channel the
+gate sits in front of, so "sftp fails too" eliminates the login shell without
+implicating the kernel at all. The `ssh -tt` row was the tell: that path takes
+the gate's empty-`SSH_ORIGINAL_COMMAND` branch and **works**.
+
+Later the same day the symptom mutated from hanging to returning **exit 0
+instantly with no output**, which read as "the command ran and printed
+nothing." It had not run. Confirm output, never exit status.
+
+### The lesson
+
+"Existing processes work, new ones don't" has at least two causes, and the
+benign one is far more common: something is intercepting the channel. Prove
+fork is broken by *measuring* PIDs, memory, and disk before concluding it —
+all five Phase 0 numbers were one command away and every one of them was fine.
+A reboot here would have destroyed 20 days of uptime and fixed nothing.
+
+Corroborating evidence, if you need to re-derive this: the server host key
+`SHA256:KXeOGlZWNyQi7X/X851WdcCOcovLLdvkmAWLGqeWpRA` matches the NAS's
+`/etc/ssh/ssh_host_ed25519_key.pub` (so it really is the NAS answering), and
+`journalctl -t sshd` logs `exec request accepted on channel 0` immediately
+before each empty exit 0.
+
+One loose end worth knowing about: `/etc/pam.d/sshd` ends with a `required`
+`pam_exec` running `/etc/pam.scripts/login.sh`, whose only job is a blocking
+`dbus-send --print-reply` to `com.ugreen.log_server` — a name that is **not
+registered on the bus**. It fails fast as `Arnab`, so it is not today's
+blocker, but it has no timeout and is the best candidate for the earlier
+hang-phase behaviour.
