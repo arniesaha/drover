@@ -2250,6 +2250,35 @@ def test_session_stream_ws_answers_ping_and_stays_live(tmp_path):
         server.shutdown()
 
 
+def test_session_stream_ws_respects_after_seq(tmp_path):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        _ingest_events(port, [_event(1, "old"), _event(2, "new")])
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            client_handshake(
+                sock,
+                host=f"127.0.0.1:{port}",
+                path="/harness/sessions/harness-s2/stream?after_seq=1",
+                headers=_AUTH_HEADERS,
+            )
+            sock.settimeout(5)
+            message = json.loads(recv_frame(sock).payload.decode("utf-8"))
+            assert message["text"] == "new"
+
+            _ingest_events(port, [_event(3, "later")])
+            message = json.loads(recv_frame(sock).payload.decode("utf-8"))
+            assert message["text"] == "later"
+        finally:
+            sock.close()
+    finally:
+        server.shutdown()
+
+
 def test_session_stream_ws_requires_auth(tmp_path):
     collector = _make_collector(tmp_path)
     server = start_metrics_server(

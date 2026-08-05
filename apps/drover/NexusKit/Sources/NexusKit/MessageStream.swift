@@ -161,7 +161,7 @@ public actor MessageStream {
                 deliver(message, continuation: continuation)
             }
 
-            let request = client.streamRequest(sessionID: sessionID)
+            let request = client.streamRequest(sessionID: sessionID, afterSeq: lastSeq)
             let frames = connector.connect(request)
 
             do {

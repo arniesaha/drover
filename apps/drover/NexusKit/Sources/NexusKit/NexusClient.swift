@@ -189,8 +189,8 @@ public actor NexusClient {
         }
     }
 
-    public nonisolated func streamRequest(sessionID: String) -> URLRequest {
-        wsRequest(sessionID: sessionID, suffix: "stream")
+    public nonisolated func streamRequest(sessionID: String, afterSeq: Int? = nil) -> URLRequest {
+        wsRequest(sessionID: sessionID, suffix: "stream", query: afterSeq.map { "after_seq=\($0)" })
     }
 
     public nonisolated func terminalRequest(sessionID: String) -> URLRequest {
@@ -199,12 +199,13 @@ public actor NexusClient {
 
     // MARK: Private helpers
 
-    private nonisolated func wsRequest(sessionID: String, suffix: String) -> URLRequest {
+    private nonisolated func wsRequest(sessionID: String, suffix: String,
+                                       query: String? = nil) -> URLRequest {
         var components = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false)
         let isSecure = components?.scheme == "https"
         components?.scheme = isSecure ? "wss" : "ws"
         components?.path = "/harness/sessions/\(encodePathComponent(sessionID))/\(suffix)"
-        components?.query = nil
+        components?.percentEncodedQuery = query
         let url = components?.url ?? config.baseURL
         var urlRequest = URLRequest(url: url)
         urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

@@ -6,8 +6,10 @@ import Testing
 final class FakeConnector: WebSocketConnecting, @unchecked Sendable {
     enum Scenario { case frames([String], thenError: Bool) }
     var scenarios: [Scenario]
+    var requests: [URLRequest] = []
     init(_ scenarios: [Scenario]) { self.scenarios = scenarios }
     func connect(_ request: URLRequest) -> AsyncThrowingStream<String, Error> {
+        requests.append(request)
         let scenario = scenarios.isEmpty ? .frames([], thenError: false) : scenarios.removeFirst()
         return AsyncThrowingStream { continuation in
             guard case let .frames(frames, thenError) = scenario else { return }
@@ -89,6 +91,26 @@ struct StreamTests {
     #expect(sawDisconnect)
     #expect(sawReconnectUp)   // reconnecting indicator must clear again
     #expect(restCalls.last!.contains("after_seq=1"))
+}
+
+@Test func websocketStartsAfterRestCatchupSeq() async throws {
+    MockURLProtocol.handler = { _ in
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
+         "max_seq": 2}
+        """.utf8))
+    }
+    let connector = FakeConnector([.frames([wireMessage(seq: 3, text: "live")], thenError: false)])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: connector,
+        reconnectBaseDelay: .milliseconds(10))
+    var texts: [String] = []
+    for await event in await stream.events() {
+        if case let .message(m) = event { texts.append(m.text) }
+        if texts.count == 3 { break }
+    }
+    #expect(connector.requests.first?.url?.query == "after_seq=2")
 }
 
 @Test func catchUpFailureBacksOffAndRetries() async throws {

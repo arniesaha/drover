@@ -100,6 +100,12 @@ struct ClientTests {
     #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
 }
 
+@Test func streamRequestIncludesAfterSeqWhenProvided() {
+    let request = client().streamRequest(sessionID: "harness-1", afterSeq: 42)
+    #expect(request.url?.absoluteString == "ws://test.local:7080/harness/sessions/harness-1/stream?after_seq=42")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+}
+
 @Test func terminalRequestShape() {
     let request = client().terminalRequest(sessionID: "harness-1")
     #expect(request.url?.absoluteString == "ws://test.local:7080/harness/sessions/harness-1/terminal")
