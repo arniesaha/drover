@@ -7,7 +7,7 @@ payload this needs already reaches the phone.
 
 ## Problem
 
-Two defects, found together while reviewing a live chat transcript.
+Three defects, found while reviewing live chat transcripts.
 
 ### 1. Half the transcript is status noise
 
@@ -84,6 +84,51 @@ seq 741: in=2  cacheRead=156,973  cacheCreation=1,173   -> 158,148   <- correct
 It also drops correctly on compaction (1,065,318 → 158,148), which is the
 behaviour a gauge must have and a cumulative counter never can.
 
+### 3. Repeated send taps during a network stall produce duplicate turns
+
+Reported from a cellular session: replying to a question, the send appeared
+to do nothing for a long time, then every queued tap landed at once when the
+network recovered. Confirmed in the same session's data — **nine** separate
+`user_input` turns, seq 876 and 878–885, each the text `Yes`, all accepted:
+
+```
+seq= 876  text='Yes'
+seq= 878  text='Yes'      <- 878..885 contiguous, all landed together
+...
+seq= 885  text='Yes'
+```
+
+These are nine independent turns, not one queued-and-concatenated entry. The
+409 queue path (`ChatModel.swift:187`) never engaged, because Claude does not
+409 on overlapping turns — mid-turn input is steering — so every one of the
+nine POSTs was accepted on its own.
+
+Four things compound:
+
+1. `sendTurn()` has **no re-entrancy guard** (`ChatModel.swift:178`).
+2. `composerText` is cleared only *after* `client.sendTurn` returns
+   (`ChatModel.swift:183-184`), so the text survives for the whole request.
+3. The send button's only disable condition is `isEmpty`
+   (`Composer.swift:43`) — precisely the condition a pending send preserves.
+4. Each tap spawns an independent `Task { await model.sendTurn() }`
+   (`ChatView.swift:60`).
+
+Text-only turns pass `timeout: nil` (`NexusClient.swift:125`), taking
+URLSession's default, so the window for repeat taps is tens of seconds with
+no visible indication that anything is in flight.
+
+The correct pattern already exists 60 lines below the bug — `approve()`
+guards itself and is the model to copy:
+
+```swift
+public func approve(_ decision: String) async {
+    guard !isAnswering else { return }
+    isAnswering = true
+    defer { isAnswering = false }
+```
+
+`sendTurn()`, far more frequently tapped, has no equivalent.
+
 ## Design
 
 ### Unit 1 — `Transcript.fold` (NexusKit, pure, unit-tested)
@@ -148,6 +193,36 @@ Degradation:
 - Over 100% is shown, not clamped. 1.06M/1M was real and meant "about to
   compact" — the most useful thing the gauge can say.
 
+### Unit 4 — single-flight sends
+
+Mirror the `approve()` pattern in `sendTurn()`:
+
+```swift
+guard !isSending else { return }
+isSending = true
+defer { isSending = false }
+```
+
+`isSending` is published so `Composer` can act on it:
+
+- Send button disabled while a send is in flight — `isEmpty || isSending`.
+- The arrow swaps for a progress indicator, so a stalled send reads as
+  *pending* rather than *ignored*. This matters more than the guard itself:
+  without it a 60-second stall looks identical to a dead button, which is
+  what produced nine taps in the first place.
+
+Deliberately **not** changing: the failure path still preserves
+`composerText` and attachments (`ChatModel.swift:198`) so a genuinely failed
+send can be retried without retyping. Optimistically clearing before the
+request and restoring on error would also close the window, but it trades a
+duplicate-send bug for a lost-text bug on every transport failure. The guard
+closes it without that risk.
+
+Open question for the plan, not a blocker: text-only turns take URLSession's
+default timeout. A shorter, explicit budget would make stalls fail fast
+rather than hang, but it risks aborting slow-but-live sends on bad cellular.
+Decide with measurements, not a guess.
+
 ## Testing
 
 - **Regression fixture for the bug itself:** the captured payload where the
@@ -158,6 +233,11 @@ Degradation:
   `latestRowID` correct for a transcript ending in a status run.
 - Gauge returns nil for the gemini `stats` shape and when no window is known.
 - Single-event run renders its name, not a count.
+- **Single-flight:** with a client whose `sendTurn` blocks until released,
+  N concurrent `sendTurn()` calls issue exactly **one** request; the guard
+  clears afterwards so the next send still works; and a *failed* send leaves
+  `composerText` intact and re-armed. This is the regression test for the
+  nine-`Yes` incident and must fail against today's code.
 
 ## Out of scope
 
