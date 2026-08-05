@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NexusKit
 
 /// Renders one `HarnessMessage` per the chat rendering map: markdown bubbles
@@ -48,13 +49,34 @@ struct MessageBubble: View {
                         CodeBlockView(language: language, code: code)
                     case .diff(let lines):
                         DiffBlockView(lines: lines)
+                    case .heading(let level, let content):
+                        Text(content)
+                            .font(headingFont(level))
+                            .padding(.top, 2)
                     }
                 }
                 usageFooter(alignment: .leading)
             }
             .padding(10)
             .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+            .contextMenu { copyButton }
             Spacer(minLength: 32)
+        }
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case 1, 2: return .title3.bold()
+        case 3: return .headline
+        default: return .subheadline.bold()
+        }
+    }
+
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = message.text
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
         }
     }
 
@@ -65,6 +87,7 @@ struct MessageBubble: View {
                 .padding(10)
                 .foregroundStyle(.white)
                 .background(.tint, in: RoundedRectangle(cornerRadius: 12))
+                .contextMenu { copyButton }
         }
     }
 
