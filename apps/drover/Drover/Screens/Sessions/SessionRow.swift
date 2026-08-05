@@ -1,61 +1,63 @@
 import SwiftUI
 import NexusKit
 
-/// One row in `SessionsView`: harness icon, cwd (last path component), host
-/// badge, and a relative timestamp. All formatting/derivation here is purely
-/// presentational — the underlying bucket/status logic lives on
-/// `SessionSummary`/`SessionStore`.
+/// One row in `SessionsView`: session snippet, compact metadata, and a
+/// relative timestamp. Bucket/status logic lives on `SessionSummary` and
+/// `SessionStore`; card copy derivation lives in NexusKit.
 struct SessionRow: View {
     let session: SessionSummary
     let hostTitle: String
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        let presentation = HarnessPresentation(session.harness)
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: presentation.symbolName)
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(attentionTint)
-                    .frame(width: 34, height: 34)
-                    .background(attentionTint.opacity(0.13), in: Circle())
+        let card = SessionCardPresentation(session: session, hostTitle: hostTitle)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: card.harness.symbolName)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(attentionTint)
+                .frame(width: 30, height: 30)
+                .background(attentionTint.opacity(0.13), in: Circle())
+                .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(title)
-                        .font(.headline.weight(.semibold))
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(card.title)
+                        .font(.callout.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                         .multilineTextAlignment(.leading)
+                        .layoutPriority(1)
 
-                    if let subtitle {
-                        Text(subtitle)
-                            .font(.subheadline)
+                    Spacer(minLength: 4)
+
+                    if let lastActivity = session.lastActivity {
+                        Text(lastActivity, format: .relative(presentation: .numeric))
+                            .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                            .minimumScaleFactor(0.82)
+                            .frame(minWidth: 58, alignment: .trailing)
+                            .padding(.top, 1)
                     }
                 }
 
-                Spacer(minLength: 8)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Circle()
+                        .fill(attentionTint)
+                        .frame(width: 6, height: 6)
 
-                if let lastActivity = session.lastActivity {
-                    Text(lastActivity, format: .relative(presentation: .numeric))
-                        .font(.caption.weight(.semibold))
+                    Text(card.metadataText)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(card.metadataText)
             }
-
-            HStack(spacing: 8) {
-                metadataLabel(presentation.name, systemImage: presentation.symbolName)
-                StatusChip(attention: session.attention)
-                metadataLabel(hostTitle, systemImage: "desktopcomputer")
-                if let cwdLabel {
-                    metadataLabel(cwdLabel, systemImage: "folder")
-                }
-            }
-            .lineLimit(1)
         }
-        .padding(16)
+        .padding(15)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .background(surfaceTint, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
@@ -76,44 +78,6 @@ struct SessionRow: View {
         }
     }
 
-    /// Row title: the cwd's last path component when we have one, else a
-    /// human harness label instead of the raw `harness-<uuid>` session id
-    /// (which is unreadable and identical-looking across shell sessions).
-    private var cwdLastComponent: String {
-        if let cwd = session.cwd, !cwd.isEmpty {
-            return URL(fileURLWithPath: cwd).lastPathComponent
-        }
-        switch session.harness {
-        case "shell": return "Shell session"
-        case "": return "Session"
-        default: return "\(session.harness) session"
-        }
-    }
-
-    private var title: String {
-        if let preview = session.preview?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !preview.isEmpty {
-            return preview
-        }
-        return cwdLastComponent
-    }
-
-    private var subtitle: String? {
-        var parts: [String] = []
-        if title != cwdLastComponent, !cwdLastComponent.isEmpty {
-            parts.append(cwdLastComponent)
-        }
-        if let startedAt = session.startedAt {
-            parts.append("started \(startedAt.formatted(.relative(presentation: .named)))")
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private var cwdLabel: String? {
-        guard let cwd = session.cwd, !cwd.isEmpty else { return nil }
-        return URL(fileURLWithPath: cwd).lastPathComponent
-    }
-
     private var surfaceTint: some ShapeStyle {
         if colorScheme == .dark {
             return AnyShapeStyle(.black.opacity(0.34))
@@ -126,14 +90,5 @@ struct SessionRow: View {
             return AnyShapeStyle(.white.opacity(0.11))
         }
         return AnyShapeStyle(.black.opacity(0.07))
-    }
-
-    private func metadataLabel(_ text: String, systemImage: String) -> some View {
-        Label(text, systemImage: systemImage)
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(.secondary.opacity(0.10), in: Capsule())
     }
 }

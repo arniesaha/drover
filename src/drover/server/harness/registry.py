@@ -18,6 +18,7 @@ from drover.server.harness.models import (
     HarnessHost,
     HarnessSession,
 )
+from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
 
 # DuckDB's Python client is not safe against two threads in one process
@@ -30,6 +31,7 @@ from drover.server.harness.events import normalize_harness_event
 # drover.server.db so worker/diagnostic connects (which only serialize the
 # connect call) contend on the same lock as registry windows.
 _db_lock = duckdb_connect_lock
+_SESSION_PREVIEW_CANDIDATE_LIMIT = 5
 
 
 def _now() -> datetime:
@@ -38,6 +40,15 @@ def _now() -> datetime:
 
 def _json_dumps(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
+
+
+def _looks_like_traceback(value: str) -> bool:
+    lowered = value.lower()
+    return (
+        "traceback (most recent call last)" in lowered
+        or lowered.startswith("stack trace")
+        or "\n  file " in lowered
+    )
 
 
 def _rows(
@@ -451,12 +462,15 @@ class HarnessRegistry:
             return {}
         placeholders = ", ".join("?" for _ in session_ids)
         with self._connect() as con:
-            rows = con.execute(
+            rows = _rows(
+                con,
                 f"""
-                SELECT session_id, content_preview
+                SELECT session_id, event_type, content_preview, payload_json
                 FROM (
                   SELECT session_id,
+                         event_type,
                          content_preview,
+                         payload_json,
                          row_number() OVER (
                            PARTITION BY session_id
                            ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
@@ -464,13 +478,52 @@ class HarnessRegistry:
                   FROM harness_events
                   WHERE session_id IN ({placeholders})
                     AND event_type IN ('user_input', 'assistant_output', 'terminal.input')
-                    AND NULLIF(trim(COALESCE(content_preview, '')), '') IS NOT NULL
                 )
-                WHERE rn = 1
+                WHERE rn <= ?
+                ORDER BY session_id, rn
                 """,
-                session_ids,
-            ).fetchall()
-        return {str(session_id): str(preview) for session_id, preview in rows}
+                [*session_ids, _SESSION_PREVIEW_CANDIDATE_LIMIT],
+            )
+        previews: dict[str, str] = {}
+        for row in rows:
+            session_id = str(row.get("session_id") or "")
+            if not session_id or session_id in previews:
+                continue
+            preview = self._session_event_preview(row)
+            if preview:
+                previews[session_id] = preview
+        return previews
+
+    @staticmethod
+    def _session_event_preview(row: dict[str, Any]) -> str:
+        stored_preview = str(row.get("content_preview") or "").strip()
+        if stored_preview:
+            return HarnessRegistry._safe_session_preview(stored_preview)
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("text", "content", "summary", "message", "error", "command"):
+            value = payload.get(key)
+            if value:
+                normalized = normalize_harness_event(
+                    event_type=str(row.get("event_type") or ""),
+                    payload=payload,
+                    content_preview=str(value),
+                )
+                return HarnessRegistry._safe_session_preview(
+                    normalized["content_preview"]
+                )
+        return ""
+
+    @staticmethod
+    def _safe_session_preview(value: str) -> str:
+        preview = redact_auth_text(value).strip()
+        if _looks_like_traceback(preview):
+            return ""
+        return preview
 
     # Session conversation lives entirely in harness_events, for both PTY and
     # structured sessions. PTY output arrives as terminal.output events; the
