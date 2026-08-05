@@ -1,6 +1,10 @@
 # General context containers
 
-Nexus remains a local-first, personal, open-source harness context store and handoff layer. Repository attribution is still valuable for code work, but it is no longer the only shape of resumable context. A **context container** is a confidence-aware record that describes what a local agent session was about and how another agent can resume it.
+Drover remains a local-first, personal, open-source harness context store and
+handoff layer. Repository attribution is still valuable for code work, but it is
+no longer the only shape of resumable context. A **context container** is a
+confidence-aware record that describes what a local agent session was about and
+how another agent can resume it.
 
 ## Container types
 
@@ -28,16 +32,18 @@ This distinction means `/home/Arnab` or another broad local workspace can become
 
 This slice adds pure MCP tool functions and registrations:
 
-- `nexus_recent_contexts(container_type?, source_harness?, limit?)`
-- `nexus_context_brief(context_id? | label?)`
-- `nexus_open_loops(container_type?, limit?)`
-- `nexus_resume_context(context_id? | label?, max_summaries?)`
+- `drover_recent_contexts(container_type?, source_harness?, limit?)`
+- `drover_context_brief(context_id? | label?)`
+- `drover_open_loops(container_type?, limit?)`
+- `drover_resume_context(context_id? | label?, max_summaries?)`
 
-Existing repo-first tools (`nexus_handoff`, `nexus_project_brief`, `nexus_recent_sessions`, `nexus_project_activity`, `nexus_recall`, etc.) remain unchanged and should continue to be the preferred surface for code-repo handoffs.
+Existing repo-first tools (`drover_handoff`, `drover_project_brief`,
+`drover_recent_sessions`, `drover_project_activity`, `drover_recall`, etc.)
+remain the preferred surface for code-repo handoffs.
 
 ## Redaction policy
 
-Context containers must store resumable summaries and metadata, not raw private transcripts. The default `redaction_policy` is `session-summary-redacted`, meaning container text is derived from existing summarized material with unnecessary personal detail removed; credentials, tokens, API keys, passwords, and connection strings are never preserved and are replaced with literal `[REDACTED]`. If a container is metadata-only (for example, explicit `general_activity` created from cwd/source signals), use `metadata-only`. Future automated extractors should preserve source links (`session_ids`, `task_ids`) and avoid copying raw message content unless it is already covered by Nexus summarization redaction.
+Context containers must store resumable summaries and metadata, not raw private transcripts. The default `redaction_policy` is `session-summary-redacted`, meaning container text is derived from existing summarized material with unnecessary personal detail removed; credentials, tokens, API keys, passwords, and connection strings are never preserved and are replaced with literal `[REDACTED]`. If a container is metadata-only (for example, explicit `general_activity` created from cwd/source signals), use `metadata-only`. Future automated extractors should preserve source links (`session_ids`, `task_ids`) and avoid copying raw message content unless it is already covered by Drover summarization redaction.
 
 ## Migration path from agent-shared semantics
 

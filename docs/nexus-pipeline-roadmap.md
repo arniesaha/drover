@@ -1,11 +1,14 @@
-# Nexus Pipeline Roadmap
+# Drover Pipeline Roadmap
 
 Status: active roadmap  
 Date: 2026-06-20
 
+Note: this file keeps its original `nexus-pipeline-roadmap.md` path until the
+public-release documentation sweep decides whether to rename historical links.
+
 ## Goal
 
-Nexus is moving from a reliable local context store into a visible, adopted,
+Drover is moving from a reliable local context store into a visible, adopted,
 self-improving agent context pipeline.
 
 The near-term goal is not to add more background magic. The goal is to make the
@@ -50,8 +53,8 @@ flowchart LR
   end
 
   subgraph Use[Agent use]
-    MCP[Nexus MCP tools]
-    Skills[Nexus skills]
+    MCP[Drover MCP tools]
+    Skills[Drover skills]
     UI[Pipeline Observatory]
     Registry[skill registry + recommendations]
   end
@@ -87,7 +90,7 @@ Delivered:
 - Redis job stream adapter.
 - Stream-coordinated summarizer, brief, session embedding, and span embedding
   workers.
-- Completion contract for Paperclip-delegated Nexus work.
+- Completion contract for Paperclip-delegated Drover work.
 
 Still open:
 
@@ -130,26 +133,26 @@ main, Max/Mac Mini, Paperclip agents, and Codex/Claude-style CLI sessions.
 
 Tracking issue: [#192](https://github.com/arniesaha/nexus/issues/192)
 
-Nexus should grow a phone-friendly Meta Harness surface for Arnab's personal
+Drover should grow a phone-friendly Meta Harness surface for Arnab's personal
 agent fleet:
 
 - host registry for NAS, Mac Mini, and GPU PC
-- per-host `nexus-harnessd` daemon for PTY/tmux-backed local CLI sessions
-- WebSocket terminal attach/input/resize/detach from the Nexus UI
+- per-host `drover-harnessd` daemon for PTY/tmux-backed local CLI sessions
+- WebSocket terminal attach/input/resize/detach from the Drover UI
 - launch presets for shell, Claude Code, Codex, Gemini, and OpenClaw
-- transcript chunks and lifecycle events persisted into Nexus
+- transcript chunks and lifecycle events persisted into Drover
 - session summaries and handoff bundles for continuing work in another harness
 
 The design is scoped in [`meta-harness-mvp.md`](meta-harness-mvp.md), with an
 agentic implementation plan in
 [`superpowers/plans/2026-06-21-meta-harness-mvp.md`](superpowers/plans/2026-06-21-meta-harness-mvp.md).
 
-This keeps the boundary crisp: Nexus is the control/context plane; per-host
+This keeps the boundary crisp: Drover is the control/context plane; per-host
 daemons are the terminal data plane.
 
 ### 5. Redis Interview Learning Track
 
-Nexus is now a practical Redis case study:
+Drover is now a practical Redis case study:
 
 - Streams are the work queues.
 - Consumer groups represent worker ownership.
@@ -169,7 +172,7 @@ while WebSockets carry hot terminal bytes and DuckDB stores durable context.
 
 Tracking issue: [#178](https://github.com/arniesaha/nexus/issues/178)
 
-Once agents reliably emit and consume Nexus context, Nexus can observe which
+Once agents reliably emit and consume Drover context, Drover can observe which
 skills, MCP tools, and context bundles are useful. The first loop is passive:
 
 - inventory agent capabilities
@@ -191,6 +194,15 @@ Before publishing:
 - provide a demo dataset
 - keep private dogfood runbooks out of the public tree
 - preserve the local-first architecture and install path
+
+Context-standard adoption for the public-release boundary is tracked
+separately in
+[`context-standards-roadmap.md`](context-standards-roadmap.md). That roadmap
+covers OKF, Agent Behavior, Graphify, MCP, OpenTelemetry GenAI, W3C PROV, and
+A2A, and separates first-public-release scope from post-release research.
+
+The public release blocker checklist is tracked in
+[`public-release-checklist.md`](public-release-checklist.md).
 
 ### 8. Vortex / Trace Lake Spike
 

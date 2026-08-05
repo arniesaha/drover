@@ -1,15 +1,19 @@
-# Installing a Nexus shipper on a new host
+# Installing a Drover shipper on a new host
 
-For a single-user setup, `nexus-server` owns the local `~/.nexus/` store
+For a single-user setup, `drover-server` owns the local `~/.drover/` store
 on one workstation. Any additional personal host can run a **shipper** —
 a small periodic job that bundles new agent session files into JSONL and
-rsyncs them to the workstation's `~/.nexus/incoming/<host_id>/` directory.
-The `nexus-server` watcher picks them up and merges them into the local
+rsyncs them to the workstation's `~/.drover/incoming/<host_id>/` directory.
+The `drover-server` watcher picks them up and merges them into the local
 DuckDB + Parquet store.
+
+Pre-public status: this guide reflects the intended Drover names. The installer
+scripts and unit templates still need the tracked #14 rename before this guide
+is published as a copy-paste setup path.
 
 In the current dogfood deployment, the receiving workstation is the Mac
 mini (`Arnabs-Mac-mini.local`), so the examples below use
-`arnabmac@Arnabs-Mac-mini.local:~/.nexus/incoming/<host_id>/`.
+`arnabmac@Arnabs-Mac-mini.local:~/.drover/incoming/<host_id>/`.
 
 This guide is for adding a new shipping host. There are two flavors
 depending on the OS:
@@ -31,7 +35,7 @@ host's SSH key must be in mac-mini's `authorized_keys`:
 ```bash
 # On the new host (NAS or work MacBook)
 ssh-copy-id arnabmac@Arnabs-Mac-mini.local
-ssh -o BatchMode=yes arnabmac@Arnabs-Mac-mini.local "echo OK; mkdir -p ~/.nexus/incoming"
+ssh -o BatchMode=yes arnabmac@Arnabs-Mac-mini.local "echo OK; mkdir -p ~/.drover/incoming"
 ```
 
 The second command should print `OK` without a password prompt. If it
@@ -50,8 +54,8 @@ for the NAS (`host_id=nas-claude`, sources: `claude_code` +
 
 ```bash
 # On the NAS, as the Arnab user
-git clone git@github.com:arniesaha/nexus.git ~/jenny/nexus  # or git pull if it exists
-cd ~/jenny/nexus
+git clone git@github.com:arniesaha/drover.git ~/jenny/drover  # or git pull if it exists
+cd ~/jenny/drover
 bash scripts/install_shipper_linux.sh
 ```
 
@@ -59,7 +63,7 @@ The script:
 
 1. Installs `uv` if missing (via the official curl-installer).
 2. Runs `uv sync` to materialize the venv.
-3. Writes `~/.nexus/collect.toml` with `host_id=nas-claude`,
+3. Writes `~/.drover/collect.toml` with `host_id=nas-claude`,
    `remote_host=Arnabs-Mac-mini.local`, sources:
    - `claude_code` → `~/.claude/projects/`
    - `openclaw` → `~/.openclaw/agents/main/sessions/`
@@ -67,7 +71,7 @@ The script:
    [`scripts/systemd/`](../scripts/systemd/) into `~/.config/systemd/user/`.
 5. Enables `loginctl enable-linger $USER` so the timer runs without
    an active login.
-6. `systemctl --user enable --now nexus-collect.timer`.
+6. `systemctl --user enable --now drover-collect.timer`.
 7. Triggers an immediate first run and shows the log tail.
 
 Knobs (override via env if defaults don't match):
@@ -82,9 +86,9 @@ bash scripts/install_shipper_linux.sh
 After it completes:
 
 ```bash
-systemctl --user list-timers nexus-collect.timer
-journalctl --user -u nexus-collect -n 30 --no-pager
-ssh arnabmac@Arnabs-Mac-mini.local 'ls -la ~/.nexus/incoming/nas-claude/.processed/ | head'
+systemctl --user list-timers drover-collect.timer
+journalctl --user -u drover-collect -n 30 --no-pager
+ssh arnabmac@Arnabs-Mac-mini.local 'ls -la ~/.drover/incoming/nas-claude/.processed/ | head'
 ```
 
 ---
@@ -96,8 +100,8 @@ sources: `claude_code` (the standard `~/.claude/projects/`).
 
 ```bash
 # On the work MacBook
-git clone git@github.com:arniesaha/nexus.git ~/jenny/nexus
-cd ~/jenny/nexus
+git clone git@github.com:arniesaha/drover.git ~/jenny/drover
+cd ~/jenny/drover
 bash scripts/install_shipper_macos.sh
 ```
 
@@ -105,12 +109,12 @@ The script:
 
 1. Installs `uv` if missing.
 2. `uv sync`.
-3. Writes `~/.nexus/collect.toml` with `host_id=work-macbook-claude`,
+3. Writes `~/.drover/collect.toml` with `host_id=work-macbook-claude`,
    `remote_host=Arnabs-Mac-mini.local`.
-4. Renders `~/Library/LaunchAgents/com.arnab.nexus-collect.plist`
+4. Renders `~/Library/LaunchAgents/com.drover.collect.plist`
    (every 5 minutes via `StartInterval`).
 5. `launchctl unload && launchctl load -w` to (re)install.
-6. Triggers an immediate first run and tails `/tmp/nexus-collect.log`.
+6. Triggers an immediate first run and tails `/tmp/drover-collect.log`.
 
 Knobs:
 
@@ -132,13 +136,13 @@ the mac-mini side:
 
 ```bash
 # On the mac-mini — see incoming + processed manifests
-ls -lat ~/.nexus/incoming/*/        # what's queued
-ls -lat ~/.nexus/incoming/*/.processed/  # what's been ingested
+ls -lat ~/.drover/incoming/*/        # what's queued
+ls -lat ~/.drover/incoming/*/.processed/  # what's been ingested
 
 # Live row count by host
 uv run python -c "
 import duckdb
-con = duckdb.connect('/Users/arnabmac/.nexus/nexus.duckdb', read_only=True)
+con = duckdb.connect('/Users/arnabmac/.drover/drover.duckdb', read_only=True)
 for r in con.execute('''
   SELECT agent_id, count(DISTINCT session_id) AS sessions, count(*) AS events,
          max(TRY_CAST(timestamp AS TIMESTAMP)) AS last_seen
@@ -161,10 +165,10 @@ shipper), plus any newly-installed hosts (`nas-claude`,
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `rsync: connection unexpectedly closed` | SSH key not in mac-mini's `authorized_keys` | Run `ssh-copy-id arnabmac@Arnabs-Mac-mini.local` from the new host |
-| `nexus-collect run` succeeds but the receiving host sees nothing | `host` field in collect.toml is wrong, or remote `~/.nexus/incoming/` doesn't exist | `ssh arnabmac@Arnabs-Mac-mini.local "mkdir -p ~/.nexus/incoming"` |
-| New host's events appear under the wrong `agent_id` | `host_id` in collect.toml mis-set | Edit `~/.nexus/collect.toml` and restart the timer (`systemctl --user restart nexus-collect.timer` / `launchctl kickstart`) |
-| Validation errors in the watcher logs about `token_usage` | Pre-2026-05-09 release of nexus on the receiving server | `git pull && systemctl restart` (or relaunch) the **mac-mini** server — the strict-int schema was relaxed in commit `ba7f287` |
-| Shipper runs but the mac-mini watcher isn't running | `nexus-server run` not active on the mac-mini | On mac-mini: `nohup uv run nexus-server run > /tmp/nexus-server.log 2>&1 &` (long-term: install a launchd plist) |
+| `drover-collect run` succeeds but the receiving host sees nothing | `host` field in collect.toml is wrong, or remote `~/.drover/incoming/` doesn't exist | `ssh arnabmac@Arnabs-Mac-mini.local "mkdir -p ~/.drover/incoming"` |
+| New host's events appear under the wrong `agent_id` | `host_id` in collect.toml mis-set | Edit `~/.drover/collect.toml` and restart the timer (`systemctl --user restart drover-collect.timer` / `launchctl kickstart`) |
+| Validation errors in the watcher logs about `token_usage` | Pre-2026-05-09 release of drover on the receiving server | `git pull && systemctl restart` (or relaunch) the **mac-mini** server — the strict-int schema was relaxed in commit `ba7f287` |
+| Shipper runs but the mac-mini watcher isn't running | `drover-server run` not active on the mac-mini | On mac-mini: `nohup uv run drover-server run > /tmp/drover-server.log 2>&1 &` (long-term: install a launchd plist) |
 
 ---
 
@@ -172,9 +176,9 @@ shipper), plus any newly-installed hosts (`nas-claude`,
 
 | Host | OS | Scheduler | Sources |
 |---|---|---|---|
-| `Arnabs-Mac-mini.local` (receiving host itself) | macOS | launchd `com.arnab.nexus-collect` | claude_code, claude_macmini, hermes |
-| `arnabsnas` | Debian | systemd `nexus-collect.timer` | claude_code, openclaw |
-| Work MacBook | macOS | launchd `com.arnab.nexus-collect` | claude_code |
+| `Arnabs-Mac-mini.local` (receiving host itself) | macOS | launchd `com.drover.collect` | claude_code, claude_macmini, hermes |
+| `arnabsnas` | Debian | systemd `drover-collect.timer` | claude_code, openclaw |
+| Work MacBook | macOS | launchd `com.drover.collect` | claude_code |
 
 To add a fourth host, copy whichever install script matches the OS,
 adjust `HOST_ID` + the source list, and run.

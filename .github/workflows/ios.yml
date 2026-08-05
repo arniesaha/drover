@@ -1,0 +1,83 @@
+name: iOS CI
+
+on:
+  push:
+    branches: [ "main", "production" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test iOS app
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: apps/drover
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Show Xcode version
+      run: xcodebuild -version
+
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Generate Xcode project
+      run: xcodegen generate
+
+    - name: Select iPhone simulator
+      run: |
+        simulator_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
+        if [ -z "$simulator_id" ]; then
+          echo "No available iPhone simulator found." >&2
+          xcrun simctl list devices available >&2
+          exit 1
+        fi
+        echo "SIMULATOR_DESTINATION=id=$simulator_id" >> "$GITHUB_ENV"
+        echo "Selected simulator id=$simulator_id"
+
+    - name: Resolve Swift packages
+      run: |
+        xcodebuild -project Drover.xcodeproj \
+          -scheme Drover \
+          -resolvePackageDependencies
+
+    - name: Run unit tests
+      run: |
+        set -o pipefail
+        xcodebuild -project Drover.xcodeproj \
+          -scheme Drover \
+          -destination "$SIMULATOR_DESTINATION" \
+          -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
+          test
+
+    - name: Build UI test bundle
+      run: |
+        set -o pipefail
+        xcodebuild -project Drover.xcodeproj \
+          -scheme DroverUITests \
+          -destination "$SIMULATOR_DESTINATION" \
+          -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
+          build-for-testing
+
+    - name: Upload unit test result bundle
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: DroverTests.xcresult
+        path: ${{ runner.temp }}/DroverTests.xcresult
+        if-no-files-found: ignore
+
+    - name: Upload UI build result bundle
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: DroverUITests.xcresult
+        path: ${{ runner.temp }}/DroverUITests.xcresult
+        if-no-files-found: ignore
