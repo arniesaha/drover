@@ -1005,6 +1005,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     continue
                 if frame.opcode == OPCODE_CLOSE:
                     break
+                if frame.opcode == OPCODE_PING:
+                    send_frame(sock, OPCODE_PONG, frame.payload)
+                    continue
+                if frame.opcode == OPCODE_PONG:
+                    continue
         except (OSError, WebSocketClosed):
             pass
 
