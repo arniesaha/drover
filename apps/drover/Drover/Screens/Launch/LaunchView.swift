@@ -76,24 +76,29 @@ struct LaunchView: View {
 
             if model.isStructured {
                 Section("Starting prompt") {
-                    HarnessPreferenceControls(
-                        harness: model.harness,
+                    GlassPromptSurface(
+                        text: $model.prompt,
+                        attachments: $model.promptAttachments,
                         selectedModel: $model.selectedModel,
-                        thinkingEffort: $model.thinkingEffort
-                    )
-
-                    if !model.promptAttachments.isEmpty {
-                        attachmentStrip
+                        thinkingEffort: $model.thinkingEffort,
+                        harness: model.harness,
+                        placeholder: "Add instructions...",
+                        showsSendButton: false,
+                        attachmentAccessibilityIdentifier: "launch-attachment"
+                    ) {
+                        PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
+                                     matching: .images) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 24, weight: .regular))
+                                .foregroundStyle(.primary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Circle())
+                        }
+                        .accessibilityLabel("Attach image")
+                        .accessibilityIdentifier("launch-attach")
                     }
-
-                    TextEditor(text: $model.prompt)
-                        .frame(minHeight: 100)
-
-                    PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
-                                 matching: .images) {
-                        Label("Attach image", systemImage: "paperclip")
-                    }
-                    .accessibilityIdentifier("launch-attach")
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    .listRowBackground(Color.clear)
                 }
             }
 
@@ -133,45 +138,6 @@ struct LaunchView: View {
             guard !items.isEmpty else { return }
             pickerItems = []
             Task { await load(items) }
-        }
-    }
-
-    private var attachmentStrip: some View {
-        @Bindable var model = model
-
-        return ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(Array(model.promptAttachments.enumerated()), id: \.offset) { index, attachment in
-                    thumbnail(for: attachment)
-                        .overlay(alignment: .topTrailing) {
-                            Button {
-                                model.promptAttachments.remove(at: index)
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.white, .black.opacity(0.6))
-                            }
-                            .accessibilityLabel("Remove attachment")
-                        }
-                        .accessibilityIdentifier("launch-attachment")
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func thumbnail(for attachment: TurnAttachment) -> some View {
-        if let image = UIImage(data: attachment.data) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 44, height: 44)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        } else {
-            Image(systemName: "photo")
-                .frame(width: 44, height: 44)
-                .background(.secondary.opacity(0.2),
-                            in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
