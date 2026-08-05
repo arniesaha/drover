@@ -13,6 +13,10 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
     /// running total reported by the harness's `thinking_tokens` events,
     /// which are consumed into the run rather than rendered as rows.
     case thinkingRun([HarnessMessage], estimatedTokens: Int?)
+    /// Consecutive `.status` messages. They are 48% of a real transcript and
+    /// individually meaningless, so they collapse into one row that expands
+    /// on demand. Always non-empty.
+    case statusRun([HarnessMessage])
     /// A tool call paired (by payload `tool_use_id`) with its result. The
     /// result attaches in place when it streams in; the row keeps the
     /// action's identity so SwiftUI updates rather than rebuilds it.
@@ -27,6 +31,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         switch self {
         case .message(let message): message.id
         case .thinkingRun(let run, _): run[0].id
+        case .statusRun(let run): run[0].id
         case .step(let action, _): action.id
         }
     }
@@ -67,11 +72,19 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         var pendingSteps: [String: Int] = [:]
         var lastRenderedID: String?
 
+        var statusRun: [HarnessMessage] = []
+
         func flushRun() {
             guard !run.isEmpty else { return }
             items.append(.thinkingRun(run, estimatedTokens: runTokens))
             run = []
             runTokens = nil
+        }
+
+        func flushStatus() {
+            guard !statusRun.isEmpty else { return }
+            items.append(.statusRun(statusRun))
+            statusRun = []
         }
 
         /// Raise the count on the most recently emitted run — for tokens that
@@ -100,6 +113,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
                 continue
             }
             if message.isThinking {
+                flushStatus()
                 run.append(message)
                 lastRenderedID = run[0].id
                 continue
@@ -107,6 +121,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             if message.type == .toolAction,
                let toolUseID = message.payload["tool_use_id"]?.stringValue {
                 flushRun()
+                flushStatus()
                 pendingSteps[toolUseID] = items.count
                 items.append(.step(action: message, result: nil))
                 lastRenderedID = message.id
@@ -120,11 +135,19 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
                 lastRenderedID = action.id
                 continue
             }
+            if message.type == .status {
+                flushRun()
+                statusRun.append(message)
+                lastRenderedID = statusRun[0].id
+                continue
+            }
             flushRun()
+            flushStatus()
             items.append(.message(message))
             lastRenderedID = message.id
         }
         flushRun()
+        flushStatus()
         return (items, lastRenderedID)
     }
 }

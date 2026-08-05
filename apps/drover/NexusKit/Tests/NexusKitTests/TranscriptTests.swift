@@ -120,8 +120,57 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         // be folded into a run.
         let odd = HarnessMessage(id: "s", seq: 1, type: .status,
                                  payload: ["thinking": .bool(true)])
-        #expect(TranscriptItem.group([odd]) == [.message(odd)])
+        #expect(TranscriptItem.group([odd]) == [.statusRun([odd])])
         #expect(!odd.isThinking)
+    }
+}
+
+@Suite struct StatusFoldingTests {
+    private func status(_ id: String, seq: Int, _ text: String) -> HarnessMessage {
+        HarnessMessage(id: id, seq: seq, type: .status, text: text,
+                       payload: ["subtype": .string(text)])
+    }
+
+    @Test func consecutiveStatusMessagesCollapseIntoOneRun() {
+        let s1 = status("s1", seq: 1, "hook_started")
+        let s2 = status("s2", seq: 2, "hook_response")
+        let s3 = status("s3", seq: 3, "init")
+        #expect(TranscriptItem.group([s1, s2, s3]) == [.statusRun([s1, s2, s3])])
+    }
+
+    @Test func aNonStatusMessageBreaksTheRun() {
+        let s1 = status("s1", seq: 1, "hook_started")
+        let answer = output("a", seq: 2)
+        let s2 = status("s2", seq: 3, "init")
+        #expect(TranscriptItem.group([s1, answer, s2])
+                == [.statusRun([s1]), .message(answer), .statusRun([s2])])
+    }
+
+    @Test func statusRunIdentityIsItsFirstMessage() {
+        let s1 = status("s1", seq: 1, "hook_started")
+        let s2 = status("s2", seq: 2, "init")
+        #expect(TranscriptItem.group([s1]).first?.id == "s1")
+        #expect(TranscriptItem.group([s1, s2]).first?.id == "s1")
+    }
+
+    @Test func latestRowIDTargetsTheRunStartForAStatusTail() {
+        let answer = output("a", seq: 1)
+        let s1 = status("s1", seq: 2, "hook_started")
+        let s2 = status("s2", seq: 3, "init")
+        #expect(TranscriptItem.latestRowID(of: [answer, s1, s2]) == "s1")
+    }
+
+    @Test func aStatusMessageEndsAThinkingRun() {
+        let t1 = thinking("t1", seq: 1)
+        let s1 = status("s1", seq: 2, "init")
+        #expect(TranscriptItem.group([t1, s1])
+                == [.thinkingRun([t1], estimatedTokens: nil), .statusRun([s1])])
+    }
+
+    @Test func thinkingTokensAreNeverPartOfAStatusRun() {
+        let tok = thinkingTokens("k1", seq: 1, estimated: 50)
+        let s1 = status("s1", seq: 2, "init")
+        #expect(TranscriptItem.group([tok, s1]) == [.statusRun([s1])])
     }
 }
 
