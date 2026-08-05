@@ -56,6 +56,11 @@ uv run pytest      # run the test suite
   audience, and the capability pillars.
 - [docs/architecture.md](docs/architecture.md) — system architecture: the
   context store, ingest pipeline, and harness control plane.
+- [docs/public-release-checklist.md](docs/public-release-checklist.md) —
+  public-release blockers, open-issue triage, CI/branch gates, and docs sweep.
+- [docs/context-standards-roadmap.md](docs/context-standards-roadmap.md) —
+  how OKF, Agent Behavior, Graphify, CodeGraph, MCP, OTel GenAI, PROV, and A2A
+  fit Drover's roadmap.
 
 ## License
 

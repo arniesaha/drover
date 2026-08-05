@@ -21,11 +21,11 @@ A span embedding represents selected text already present on a `spans` row. It i
 - `prompt_preview`
 - `response_preview`
 
-Before embedding or persistence, Nexus builds a labeled text block from non-empty fields, redacts common emails/tokens/secrets, and truncates the final text to `SPAN_EMBED_MAX_CHARS` (currently 4096 characters). `source_fields` records the included columns.
+Before embedding or persistence, Drover builds a labeled text block from non-empty fields, redacts common emails/tokens/secrets, and truncates the final text to `SPAN_EMBED_MAX_CHARS` (currently 4096 characters). `source_fields` records the included columns.
 
 ## Retrieval and audit
 
-`nexus_recall` returns a `source_type` for every hit:
+`drover_recall` returns a `source_type` for every hit:
 
 - `session_summary`: row came from `session_embeddings` joined to `session_summaries`.
 - `span`: row came from `span_embeddings`; `span_id` and `source_text` are populated.
@@ -39,13 +39,13 @@ New OTLP ingest enqueues `span_embed_jobs` automatically for newly inserted span
 Dry-run first:
 
 ```bash
-nexus-server --config /Users/arnabmac/.nexus/config.toml embeddings enqueue-spans --limit 1000 --since-days 7
+drover-server --config /Users/arnabmac/.drover/config.toml embeddings enqueue-spans --limit 1000 --since-days 7
 ```
 
 Apply once the candidate count looks right:
 
 ```bash
-nexus-server --config /Users/arnabmac/.nexus/config.toml embeddings enqueue-spans --limit 1000 --since-days 7 --apply
+drover-server --config /Users/arnabmac/.drover/config.toml embeddings enqueue-spans --limit 1000 --since-days 7 --apply
 ```
 
 The command is idempotent: it skips spans that already have a `span_embeddings` row and spans that already have a `span_embed_jobs` row. When date partitions are present, it reads them through `spans_for_date(...)` rather than scanning the whole span parquet tree. After applying, use `runtime-audit` to confirm `span_embed_jobs` or `span_embeddings` is nonzero, then let the normal embedding worker drain the queue.

@@ -1,10 +1,10 @@
-# Nexus Paperclip completion contract
+# Drover Paperclip completion contract
 
-Paperclip can coordinate Nexus reliability work, but Nexus only accepts work as
+Paperclip can coordinate Drover reliability work, but Drover only accepts work as
 complete when the board state, GitHub state, repository state, and runtime
 evidence agree. A Paperclip comment that says "done" is not enough.
 
-This contract applies to every Nexus issue delegated through Paperclip,
+This contract applies to every Drover issue delegated through Paperclip,
 especially work linked to GitHub issues.
 
 ## Required completion evidence
@@ -18,7 +18,7 @@ handoff contains all applicable fields:
 | GitHub issue | Linked GitHub issue URL/number and final state, when one exists. |
 | Durable artifact | Branch, commit, PR, merged PR, documentation path, or explicit no-PR rationale. |
 | Verification | Test command/output, CI URL, live validation command/output, or explicit not-tested rationale. |
-| Runtime/data quality | `nexus-server quality --json` snapshot when the change can affect ingestion, workers, embeddings, summaries, ledgers, attribution, or handoff quality. |
+| Runtime/data quality | `drover-server quality --json` snapshot when the change can affect ingestion, workers, embeddings, summaries, ledgers, attribution, or handoff quality. |
 | Deployment | Deployed commit and service health when the change affects the Mac Mini runtime. |
 | Backup | Backup path before any live DuckDB/PVC/state mutation. |
 
@@ -38,7 +38,7 @@ handoff contains all applicable fields:
 
 ## Runtime-facing issue checklist
 
-For runtime-facing Nexus changes, the final handoff should include:
+For runtime-facing Drover changes, the final handoff should include:
 
 ```text
 Paperclip: AGE-<id> <status>
@@ -46,7 +46,7 @@ GitHub: #<id> <open|closed>
 Artifact: PR #<id> / commit <sha> / docs path / no-PR rationale
 Validation: test command + result, CI status, or not-tested rationale
 Deploy: host + commit + service health
-Quality: status + score + key warnings from nexus-server quality --json
+Quality: status + score + key warnings from drover-server quality --json
 Backups: paths for any live DB/PVC mutations
 Remaining work: issue ids or explicit "none"
 ```
@@ -73,7 +73,7 @@ Minimal evidence shape:
       "paperclip_status": "done",
       "github_issue": 158,
       "github_state": "closed",
-      "artifacts": ["https://github.com/arniesaha/nexus/pull/169"],
+      "artifacts": ["https://github.com/arniesaha/drover/pull/169"],
       "validation": ["uv run pytest"],
       "quality_required": true,
       "quality_snapshot": {
@@ -82,9 +82,9 @@ Minimal evidence shape:
         "generated_at": "2026-06-20T15:56:48Z"
       },
       "deployed_commit": "5a32839",
-      "service_health": "com.nexus.server running",
+      "service_health": "com.drover.server running",
       "backups": [
-        "/Users/arnabmac/.nexus/backups/nexus.duckdb-pre-change.bak"
+        "/Users/arnabmac/.drover/backups/drover.duckdb-pre-change.bak"
       ],
       "remaining_work": ["#151"]
     }

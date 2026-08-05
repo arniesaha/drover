@@ -66,6 +66,15 @@ UI tests here are self-contained (no live server) unless you've added a
 temporary smoke test of your own — see "Debug env override" below for how
 those are typically driven.
 
+## CI
+
+GitHub Actions runs the iOS workflow in `.github/workflows/ios.yml` on pull
+requests to `main`, pushes to `main`, pushes to `production`, and manual
+dispatch. The workflow installs XcodeGen, generates `Drover.xcodeproj`, runs
+the `Drover` scheme tests on an iOS simulator, and builds the `DroverUITests`
+bundle for testing. Release/TestFlight signing is not configured; the CI path
+is a simulator build/test gate that uses Xcode's local signing for testability.
+
 ## Run in the simulator
 
 ```bash

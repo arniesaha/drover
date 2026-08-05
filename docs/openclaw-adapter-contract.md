@@ -1,6 +1,6 @@
 # OpenClaw adapter contract
 
-Tracking: Nexus [#106](https://github.com/arniesaha/nexus/issues/106), [#107](https://github.com/arniesaha/nexus/issues/107), [#108](https://github.com/arniesaha/nexus/issues/108), [#134](https://github.com/arniesaha/nexus/issues/134); AgentWeave [#187](https://github.com/arniesaha/agentweave/issues/187), [#216](https://github.com/arniesaha/agentweave/issues/216), [#217](https://github.com/arniesaha/agentweave/issues/217).
+Historical tracking: Nexus [#106](https://github.com/arniesaha/nexus/issues/106), [#107](https://github.com/arniesaha/nexus/issues/107), [#108](https://github.com/arniesaha/nexus/issues/108), [#134](https://github.com/arniesaha/nexus/issues/134); AgentWeave [#187](https://github.com/arniesaha/agentweave/issues/187), [#216](https://github.com/arniesaha/agentweave/issues/216), [#217](https://github.com/arniesaha/agentweave/issues/217).
 
 Implementation handoff docs:
 
@@ -11,17 +11,17 @@ Implementation handoff docs:
 ## Purpose
 
 OpenClaw is the runtime and harness: it owns hooks, plugins, sessions,
-subagents, channels, command lifecycle, and message flow. Nexus should not
-scrape private OpenClaw internals or assume a single on-disk layout. Nexus
+subagents, channels, command lifecycle, and message flow. Drover should not
+scrape private OpenClaw internals or assume a single on-disk layout. Drover
 should consume a stable adapter contract that can be produced by any of these
 paths:
 
 1. native OpenClaw JSONL/session exports,
-2. an OpenClaw hook or plugin that emits normalized Nexus events,
+2. an OpenClaw hook or plugin that emits normalized Drover events,
 3. AgentWeave spans from the OpenClaw bridge, or
 4. a combination of native events and provenance spans.
 
-Nexus is the local context server and session archive. It stores, links,
+Drover is the local context server and session archive. It stores, links,
 summarizes, embeds, and recalls the facts OpenClaw and AgentWeave emit; it does
 not become an OpenClaw runtime, plugin host, or tracing dashboard.
 
@@ -39,7 +39,7 @@ not become an OpenClaw runtime, plugin host, or tracing dashboard.
 
 ## Event envelope
 
-Every OpenClaw-derived event accepted by Nexus should normalize to the regular
+Every OpenClaw-derived event accepted by Drover should normalize to the regular
 `AgentEvent` shape plus OpenClaw-specific fields in `raw_data`.
 
 Required top-level fields:
@@ -56,7 +56,7 @@ Recommended top-level or first-class ingest columns, where available:
 
 - `repo_owner`, `repo_name`, `branch`: derived at collect time from `cwd` or
   provided `repository` metadata.
-- `task_id`: explicit user/task id if present; otherwise Nexus may derive one
+- `task_id`: explicit user/task id if present; otherwise Drover may derive one
   from repository attribution.
 
 OpenClaw-specific `raw_data` fields:
@@ -104,7 +104,7 @@ should depend only on this contract.
 
 `session_id` and `raw_data.session_uuid` should be the canonical OpenClaw
 session UUID that native OpenClaw session exports use. This is the durable
-archive key in Nexus.
+archive key in Drover.
 
 If the native event does not expose the UUID yet, the adapter should:
 
@@ -130,7 +130,7 @@ when known:
 - `raw_data.child_session_uuid` for lifecycle events that announce a child
 - `raw_data.child_session_key` for lifecycle events that only know the route key
 
-Nexus session-link reconciliation should prefer UUID-to-UUID links, then fall
+Drover session-link reconciliation should prefer UUID-to-UUID links, then fall
 back to session-key mapping for partial data. Missing links should not block
 native event ingest.
 
@@ -164,7 +164,7 @@ Suggested mappings:
 ## Attribution fields
 
 OpenClaw events should carry attribution at the point where paths are still
-resolvable, usually on the host running `nexus-collect` or in the OpenClaw
+resolvable, usually on the host running `drover-collect` or in the OpenClaw
 plugin/hook itself.
 
 Preferred fields:
@@ -174,7 +174,7 @@ Preferred fields:
 - `raw_data.repository`: remote URL or `owner/repo` string.
 - `raw_data.project`: stable project key, preferably `owner/repo`.
 - `raw_data.topic` or `raw_data.task_label`: human task label if supplied.
-- `_repo_owner`, `_repo_name`, `gitBranch`: Nexus collect-time enrichment keys.
+- `_repo_owner`, `_repo_name`, `gitBranch`: Drover collect-time enrichment keys.
 
 If both `cwd` and `repository` are present, repository metadata wins for
 project identity, while `cwd` remains useful for files-touched and replay.
@@ -192,7 +192,7 @@ headers, or full user identifiers unless the deployment explicitly opts in.
 
 ## Redaction and sensitivity
 
-OpenClaw adapters should mark payload sensitivity rather than forcing Nexus to
+OpenClaw adapters should mark payload sensitivity rather than forcing Drover to
 guess later.
 
 Recommended flags:
@@ -204,7 +204,7 @@ Recommended flags:
 - `raw_data.sensitivity`: optional tags such as `secret`, `credential`,
   `customer_data`, `private_path`, or `unknown`.
 
-Nexus should store raw payloads only when the source marks them safe. Prompt,
+Drover should store raw payloads only when the source marks them safe. Prompt,
 response, tool input, and tool output previews should be truncated before they
 reach embedding or summary jobs.
 
@@ -217,10 +217,10 @@ When an OpenClaw event has matching AgentWeave provenance, include:
 - `raw_data.provenance.parent_span_id`
 - `raw_data.provenance.source = agentweave`
 
-When only AgentWeave spans are available, Nexus should still ingest the spans as
+When only AgentWeave spans are available, Drover should still ingest the spans as
 provenance facts and later link them to native OpenClaw events by
 `session_uuid`, `session_key`, timestamp window, and agent id. When only native
-events are available, Nexus should still provide replay and handoff without
+events are available, Drover should still provide replay and handoff without
 trace/cost details.
 
 ## Join strategy
@@ -260,7 +260,7 @@ details.
   including `onDiagnosticEvent`, `onModelDiagnosticEvent`, `message.queued`,
   `message.processed`, `session.state`, and `model.usage`.
 - AgentWeave #217 tracks preserving live Mux routing while adding context attrs
-  such as `prov.cwd` and `prov.repository`; Nexus should ingest Mux routing
+  such as `prov.cwd` and `prov.repository`; Drover should ingest Mux routing
   facts as evidence, not become the router.
 - Older OpenClaw runtimes may lack canonical UUIDs or cwd/repository attrs. The
   adapter should mark those fields missing and continue ingesting safely.
