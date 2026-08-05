@@ -14,6 +14,12 @@ private func output(_ id: String, seq: Int) -> HarnessMessage {
     HarnessMessage(id: id, seq: seq, type: .assistantOutput, text: "answer")
 }
 
+private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMessage {
+    HarnessMessage(id: id, seq: seq, type: .status, text: "thinking_tokens",
+                   payload: ["subtype": .string("thinking_tokens"),
+                             "estimated_tokens": .number(Double(estimated))])
+}
+
 @Suite struct TranscriptGroupingTests {
     @Test func passesNonThinkingMessagesThroughUnchanged() {
         let messages = [
@@ -29,7 +35,7 @@ private func output(_ id: String, seq: Int) -> HarnessMessage {
         let t2 = thinking("t2", seq: 2)
         let answer = output("a", seq: 3)
         let items = TranscriptItem.group([t1, t2, answer])
-        #expect(items == [.thinkingRun([t1, t2]), .message(answer)])
+        #expect(items == [.thinkingRun([t1, t2], estimatedTokens: nil), .message(answer)])
     }
 
     @Test func runIdentityIsStableAsChunksArrive() {
@@ -45,14 +51,15 @@ private func output(_ id: String, seq: Int) -> HarnessMessage {
         let tool = HarnessMessage(id: "tool", seq: 2, type: .toolAction)
         let t2 = thinking("t2", seq: 3)
         let items = TranscriptItem.group([t1, tool, t2])
-        #expect(items == [.thinkingRun([t1]), .message(tool), .thinkingRun([t2])])
+        #expect(items == [.thinkingRun([t1], estimatedTokens: nil), .message(tool),
+                          .thinkingRun([t2], estimatedTokens: nil)])
         #expect(items[0].id != items[2].id)
     }
 
     @Test func trailingRunIsFlushed() {
         let t1 = thinking("t1", seq: 2)
         let items = TranscriptItem.group([output("a", seq: 1), t1])
-        #expect(items.last == .thinkingRun([t1]))
+        #expect(items.last == .thinkingRun([t1], estimatedTokens: nil))
     }
 
     @Test func latestRowIDIsLastMessageForNormalTail() {
@@ -64,6 +71,48 @@ private func output(_ id: String, seq: Int) -> HarnessMessage {
         let messages = [output("a", seq: 1), thinking("t1", seq: 2), thinking("t2", seq: 3)]
         #expect(TranscriptItem.latestRowID(of: messages) == "t1")
         #expect(TranscriptItem.latestRowID(of: []) == nil)
+    }
+
+    @Test func thinkingTokensNeverRenderAsTheirOwnRow() {
+        let t1 = thinking("t1", seq: 1)
+        let tok = thinkingTokens("k1", seq: 2, estimated: 150)
+        let items = TranscriptItem.group([t1, tok])
+        #expect(items == [.thinkingRun([t1], estimatedTokens: 150)])
+    }
+
+    @Test func thinkingTokensDoNotBreakARun() {
+        let t1 = thinking("t1", seq: 1)
+        let tok = thinkingTokens("k1", seq: 2, estimated: 50)
+        let t2 = thinking("t2", seq: 3)
+        let items = TranscriptItem.group([t1, tok, t2])
+        #expect(items == [.thinkingRun([t1, t2], estimatedTokens: 50)])
+    }
+
+    @Test func thinkingTokensKeepTheMaxAcrossTheRun() {
+        // estimated_tokens is a running total; out-of-order deltas must not
+        // lower the number already reached.
+        let t1 = thinking("t1", seq: 1)
+        let items = TranscriptItem.group([
+            t1,
+            thinkingTokens("k1", seq: 2, estimated: 50),
+            thinkingTokens("k2", seq: 3, estimated: 1_200),
+            thinkingTokens("k3", seq: 4, estimated: 900),
+        ])
+        #expect(items == [.thinkingRun([t1], estimatedTokens: 1_200)])
+    }
+
+    @Test func thinkingTokensAfterARunClosesAttachToThatRun() {
+        let t1 = thinking("t1", seq: 1)
+        let answer = output("a", seq: 2)
+        let tok = thinkingTokens("k1", seq: 3, estimated: 700)
+        let items = TranscriptItem.group([t1, answer, tok])
+        #expect(items == [.thinkingRun([t1], estimatedTokens: 700), .message(answer)])
+    }
+
+    @Test func thinkingTokensWithNoRunAtAllAreDropped() {
+        let tok = thinkingTokens("k1", seq: 1, estimated: 500)
+        #expect(TranscriptItem.group([tok]).isEmpty)
+        #expect(TranscriptItem.latestRowID(of: [tok]) == nil)
     }
 
     @Test func thinkingFlagOnlyCountsForAssistantOutput() {

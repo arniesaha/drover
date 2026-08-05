@@ -9,8 +9,10 @@ import Foundation
 /// identical disclosure rows.
 public enum TranscriptItem: Identifiable, Equatable, Sendable {
     case message(HarnessMessage)
-    /// Always non-empty; ordered as received.
-    case thinkingRun([HarnessMessage])
+    /// Always non-empty; ordered as received. `estimatedTokens` is the
+    /// running total reported by the harness's `thinking_tokens` events,
+    /// which are consumed into the run rather than rendered as rows.
+    case thinkingRun([HarnessMessage], estimatedTokens: Int?)
     /// A tool call paired (by payload `tool_use_id`) with its result. The
     /// result attaches in place when it streams in; the row keeps the
     /// action's identity so SwiftUI updates rather than rebuilds it.
@@ -24,7 +26,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
     public var id: String {
         switch self {
         case .message(let message): message.id
-        case .thinkingRun(let run): run[0].id
+        case .thinkingRun(let run, _): run[0].id
         case .step(let action, _): action.id
         }
     }
@@ -60,17 +62,43 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         var items: [TranscriptItem] = []
         items.reserveCapacity(messages.count)
         var run: [HarnessMessage] = []
+        var runTokens: Int?
         /// tool_use_id -> index in `items` of the awaiting `.step` row.
         var pendingSteps: [String: Int] = [:]
         var lastRenderedID: String?
 
         func flushRun() {
             guard !run.isEmpty else { return }
-            items.append(.thinkingRun(run))
+            items.append(.thinkingRun(run, estimatedTokens: runTokens))
             run = []
+            runTokens = nil
+        }
+
+        /// Raise the count on the most recently emitted run — for tokens that
+        /// arrive after their run has already been flushed.
+        func attachTokensToLastRun(_ value: Int) {
+            for index in items.indices.reversed() {
+                if case .thinkingRun(let messages, let existing) = items[index] {
+                    items[index] = .thinkingRun(messages,
+                                                estimatedTokens: max(existing ?? 0, value))
+                    return
+                }
+            }
         }
 
         for message in messages {
+            // First branch on purpose: these are consumed into a run, and
+            // must never flush a buffer or break the run they describe.
+            if message.isThinkingTokens {
+                guard let value = message.estimatedThinkingTokens else { continue }
+                if run.isEmpty {
+                    attachTokensToLastRun(value)
+                } else {
+                    runTokens = max(runTokens ?? 0, value)
+                    lastRenderedID = run[0].id
+                }
+                continue
+            }
             if message.isThinking {
                 run.append(message)
                 lastRenderedID = run[0].id
@@ -106,5 +134,16 @@ extension HarnessMessage {
     /// harness driver.
     public var isThinking: Bool {
         type == .assistantOutput && payload["thinking"]?.boolValue == true
+    }
+
+    /// Telemetry about the adjacent thinking run, not an event in its own
+    /// right: 286 of these landed in one real 741-message session.
+    public var isThinkingTokens: Bool {
+        type == .status && payload["subtype"]?.stringValue == "thinking_tokens"
+    }
+
+    /// Running total, not a delta — callers keep the max across a run.
+    public var estimatedThinkingTokens: Int? {
+        payload["estimated_tokens"]?.numberValue.map { Int($0.rounded()) }
     }
 }

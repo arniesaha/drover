@@ -11,16 +11,16 @@ public struct TokenUsageSummary: Sendable, Equatable {
     public var compactText: String {
         var parts: [String] = []
         if let inputTokens, inputTokens > 0 {
-            parts.append("in \(Self.format(inputTokens))")
+            parts.append("in \(TokenCount.format(inputTokens))")
         }
         if let outputTokens, outputTokens > 0 {
-            parts.append("out \(Self.format(outputTokens))")
+            parts.append("out \(TokenCount.format(outputTokens))")
         }
         if let cachedInputTokens, cachedInputTokens > 0 {
-            parts.append("cache \(Self.format(cachedInputTokens))")
+            parts.append("cache \(TokenCount.format(cachedInputTokens))")
         }
         if let reasoningOutputTokens, reasoningOutputTokens > 0 {
-            parts.append("reason \(Self.format(reasoningOutputTokens))")
+            parts.append("reason \(TokenCount.format(reasoningOutputTokens))")
         }
         return parts.joined(separator: " | ")
     }
@@ -30,7 +30,7 @@ public struct TokenUsageSummary: Sendable, Equatable {
             return nil
         }
         let percent = Int((Double(contextTokens) / Double(contextWindow) * 100).rounded())
-        return "ctx \(Self.format(contextTokens)) / \(Self.format(contextWindow)) (\(percent)%)"
+        return "ctx \(TokenCount.format(contextTokens)) / \(TokenCount.format(contextWindow)) (\(percent)%)"
     }
 
     public init?(message: HarnessMessage) {
@@ -142,24 +142,6 @@ public struct TokenUsageSummary: Sendable, Equatable {
         return total > 0 ? total : nil
     }
 
-    private static func format(_ value: Int) -> String {
-        let absolute = abs(value)
-        if absolute >= 1_000_000 {
-            return compact(Double(value) / 1_000_000, suffix: "M")
-        }
-        if absolute >= 1_000 {
-            return compact(Double(value) / 1_000, suffix: "K")
-        }
-        return "\(value)"
-    }
-
-    private static func compact(_ value: Double, suffix: String) -> String {
-        let rounded = (value * 10).rounded() / 10
-        if rounded.truncatingRemainder(dividingBy: 1) == 0 {
-            return "\(Int(rounded))\(suffix)"
-        }
-        return String(format: "%.1f%@", rounded, suffix)
-    }
 }
 
 private extension JSONValue {

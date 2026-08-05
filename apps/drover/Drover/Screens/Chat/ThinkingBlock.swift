@@ -7,9 +7,18 @@ import NexusKit
 /// recessive next to real output bubbles — thinking is context, not content.
 struct ThinkingBlock: View {
     let run: [HarnessMessage]
+    /// Running total from the harness's `thinking_tokens` events, folded in
+    /// by `TranscriptItem.group`. Nil for harnesses that never report it.
+    let estimatedTokens: Int?
     /// The newest run keeps streaming into this row; label it accordingly.
     let isStreaming: Bool
     @State private var isExpanded = false
+
+    private var label: String {
+        if isStreaming { return "Thinking…" }
+        guard let estimatedTokens, estimatedTokens > 0 else { return "Thought for a bit" }
+        return "Thought for \(TokenCount.format(estimatedTokens)) tokens"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -19,7 +28,7 @@ struct ThinkingBlock: View {
                 HStack(spacing: 6) {
                     Image(systemName: "brain")
                         .symbolEffect(.pulse, isActive: isStreaming)
-                    Text(isStreaming ? "Thinking…" : "Thought for a bit")
+                    Text(label)
                         .italic()
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))

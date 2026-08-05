@@ -149,9 +149,10 @@ struct ChatView: View {
         switch item {
         case .message(let message):
             MessageBubble(message: message)
-        case .thinkingRun(let run):
+        case .thinkingRun(let run, let estimatedTokens):
             ThinkingBlock(
                 run: run,
+                estimatedTokens: estimatedTokens,
                 isStreaming: isNewest && (model.messages.last?.isThinking ?? false)
             )
         case .step(let action, let result):
