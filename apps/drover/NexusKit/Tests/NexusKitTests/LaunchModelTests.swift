@@ -102,6 +102,31 @@ struct LaunchModelTests {
     #expect(model.launchError == nil)
 }
 
+@Test @MainActor func launchPostsAttachmentsModelAndThinking() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
+    let model = LaunchModel(client: client(), snapshot: snapshot)
+    let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x0A, 0x0B]))
+    model.harness = "codex"
+    model.prompt = "inspect this"
+    model.promptAttachments = [attachment]
+    model.selectedModel = "gpt-5.6-sol"
+    model.thinkingEffort = "high"
+
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        let images = body["images"] as! [[String: Any]]
+        #expect(body["harness"] as? String == "codex")
+        #expect(body["model"] as? String == "gpt-5.6-sol")
+        #expect(body["thinking_effort"] as? String == "high")
+        #expect(images[0]["data_base64"] as? String == attachment.data.base64EncodedString())
+        return (201, Data(#"{"session_id": "harness-pref"}"#.utf8))
+    }
+
+    let sessionID = await model.launch()
+    #expect(sessionID == "harness-pref")
+}
+
 @Test @MainActor func launchPostsPtyModeWithNoPromptForShell() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot)

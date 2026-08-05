@@ -10,6 +10,9 @@ import NexusKit
 struct Composer: View {
     @Binding var text: String
     @Binding var attachments: [TurnAttachment]
+    @Binding var selectedModel: String
+    @Binding var thinkingEffort: String
+    let harness: String
     /// A turn POST is in flight. Disables send and swaps the arrow for a
     /// spinner, so a stalled request reads as pending rather than ignored.
     let isSending: Bool
@@ -26,6 +29,11 @@ struct Composer: View {
             if !attachments.isEmpty {
                 attachmentStrip
             }
+            HarnessPreferenceControls(
+                harness: harness,
+                selectedModel: $selectedModel,
+                thinkingEffort: $thinkingEffort
+            )
             HStack(alignment: .bottom, spacing: 8) {
                 PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
                              matching: .images) {

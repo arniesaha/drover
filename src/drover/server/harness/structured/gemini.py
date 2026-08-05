@@ -149,15 +149,23 @@ class GeminiDriver:
 
     # -- turns -----------------------------------------------------------------
 
-    def send_turn(self, text: str, turn_id: str, images: list | None = None) -> None:
+    def send_turn(
+        self,
+        text: str,
+        turn_id: str,
+        images: list | None = None,
+        model: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
         del images  # [Attached image: <path>] lines in the text are the channel here
+        del thinking_effort  # Gemini CLI has no matching headless flag.
         with self._turn_lock:
             if self._turn_active:
                 raise RuntimeError("turn already in flight")
             if self._closed:
                 raise RuntimeError("driver is closed")
             process = subprocess.Popen(
-                self._argv_for(text),
+                self._argv_for(text, model=model),
                 cwd=self.cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -173,12 +181,15 @@ class GeminiDriver:
             self._turn_thread = worker
             worker.start()
 
-    def _argv_for(self, text: str) -> list[str]:
+    def _argv_for(self, text: str, *, model: str | None = None) -> list[str]:
         # No resume flag: see the module docstring, point 2 -- every turn is
         # context-free in v1. --skip-trust is required since gemini 0.46:
         # headless runs in a not-yet-trusted cwd otherwise exit 55 with a
         # trusted-folders error (verified live 2026-07-06).
-        return list(self.command) + [
+        command = list(self.command)
+        if model:
+            command.extend(["--model", model])
+        return command + [
             "-p",
             text,
             "-o",

@@ -98,25 +98,40 @@ public actor NexusClient {
     }
 
     public func createSession(hostID: String, harness: String, mode: String,
-                              prompt: String?, cwd: String?) async throws -> String {
+                              prompt: String?, cwd: String?,
+                              images: [TurnAttachment] = [],
+                              model: String? = nil,
+                              thinkingEffort: String? = nil) async throws -> String {
         var payload: [String: Any] = ["harness": harness, "mode": mode]
         if let prompt { payload["prompt"] = prompt }
         if let cwd { payload["cwd"] = cwd }
+        if !images.isEmpty {
+            payload["images"] = images.map {
+                ["media_type": $0.mediaType, "data_base64": $0.data.base64EncodedString()]
+            }
+        }
+        if let model { payload["model"] = model }
+        if let thinkingEffort { payload["thinking_effort"] = thinkingEffort }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let path = "/harness/hosts/\(encodePathComponent(hostID))/sessions"
-        let data = try await request(path: path, method: "POST", body: body)
+        let data = try await request(path: path, method: "POST", body: body,
+                                     timeout: images.isEmpty ? nil : 60)
         let decoded = try decode(CreateSessionResponse.self, from: data)
         return decoded.sessionID
     }
 
     public func sendTurn(sessionID: String, text: String,
-                         images: [TurnAttachment] = []) async throws -> String {
+                         images: [TurnAttachment] = [],
+                         model: String? = nil,
+                         thinkingEffort: String? = nil) async throws -> String {
         var payload: [String: Any] = ["text": text]
         if !images.isEmpty {
             payload["images"] = images.map {
                 ["media_type": $0.mediaType, "data_base64": $0.data.base64EncodedString()]
             }
         }
+        if let model { payload["model"] = model }
+        if let thinkingEffort { payload["thinking_effort"] = thinkingEffort }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/turns"
         // Image bodies are orders of magnitude larger than any other request
