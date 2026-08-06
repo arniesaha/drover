@@ -211,11 +211,16 @@ def _seed_redis_job_streams(
     try:
         for key, stream in streams.items():
             table, column, field = table_map[key]
+            selected = f"{column}, source_version" if key == "summarize" else column
             rows = con.execute(
-                f"SELECT {column} FROM {table} WHERE status='pending' ORDER BY enqueued_at ASC"
+                f"SELECT {selected} FROM {table} "
+                "WHERE status='pending' ORDER BY enqueued_at ASC"
             ).fetchall()
-            for (value,) in rows:
-                stream.add({field: str(value)})
+            for row in rows:
+                payload = {field: str(row[0])}
+                if key == "summarize" and row[1] is not None:
+                    payload["source_version"] = str(row[1])
+                stream.add(payload)
             counts[key] = len(rows)
     finally:
         con.close()

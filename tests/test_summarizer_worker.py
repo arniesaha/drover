@@ -155,7 +155,7 @@ def test_worker_drains_one_pending_job(tmp_path: Path) -> None:
         con.close()
 
 
-def test_worker_marks_errored_when_no_api_key(tmp_path: Path) -> None:
+def test_worker_parks_failure_until_retry_time_when_no_api_key(tmp_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _write_events(parquet_dir, "sess-W2")
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -169,7 +169,7 @@ def test_worker_marks_errored_when_no_api_key(tmp_path: Path) -> None:
         status = con.execute(
             "SELECT status, last_error FROM summarize_jobs WHERE session_id='sess-W2'"
         ).fetchone()
-        assert status[0] == "errored"
+        assert status[0] == "retry_wait"
         assert status[1] and "api_key" in status[1].lower()
 
         # No session_summaries row written
@@ -179,7 +179,7 @@ def test_worker_marks_errored_when_no_api_key(tmp_path: Path) -> None:
         con.close()
 
 
-def test_worker_handles_llm_failure_gracefully(tmp_path: Path) -> None:
+def test_worker_handles_llm_failure_with_retry_wait(tmp_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _write_events(parquet_dir, "sess-W3")
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -198,7 +198,7 @@ def test_worker_handles_llm_failure_gracefully(tmp_path: Path) -> None:
         status = con.execute(
             "SELECT status, last_error FROM summarize_jobs WHERE session_id='sess-W3'"
         ).fetchone()
-        assert status[0] == "errored"
+        assert status[0] == "retry_wait"
         assert "simulated network blip" in status[1]
     finally:
         con.close()
@@ -404,3 +404,137 @@ def test_worker_acks_redelivery_when_summary_already_done(tmp_path: Path) -> Non
     assert worker.drain_once() == 1
     assert stream.pending() == []
     assert stream.length() == 0
+
+
+def test_fifth_failure_dead_letters_serving_and_pipeline_job(tmp_path: Path) -> None:
+    _parquet_dir, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, source_version) "
+            "VALUES ('s1', 'running', 4, 'v1')"
+        )
+    finally:
+        con.close()
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path,
+        _clock=lambda: datetime(2026, 8, 6, tzinfo=timezone.utc),
+        _jitter=lambda _low, _high: 0,
+    )
+
+    worker._finish_failure("s1", "v1", RuntimeError("backend failed"))
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT status,attempts FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == ("dead_lettered", 5)
+        assert con.execute(
+            "SELECT status FROM pipeline_jobs "
+            "WHERE job_kind='summarize_session' AND subject_key='s1'"
+        ).fetchone() == ("dead_lettered",)
+    finally:
+        con.close()
+
+
+def test_duckdb_worker_honors_retry_wait_until_due(tmp_path: Path) -> None:
+    _parquet_dir, duckdb_path = _seed(tmp_path)
+    due = datetime(2026, 8, 6, 12, 5)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, source_version, next_run_at) "
+            "VALUES ('s1', 'retry_wait', 1, 'v1', ?)",
+            [due],
+        )
+    finally:
+        con.close()
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path,
+        _clock=lambda: datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert worker._claim_duckdb_job() is None
+
+    worker._clock = lambda: datetime(2026, 8, 6, 12, 6, tzinfo=timezone.utc)
+    claim = worker._claim_duckdb_job()
+    assert claim is not None
+    assert claim[0] == "s1"
+
+
+def test_stream_worker_acks_stale_source_generation_without_backend_call(
+    tmp_path: Path,
+) -> None:
+    _parquet_dir, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('s1', 'pending', 'v2')"
+        )
+    finally:
+        con.close()
+    stream = JobStream("summarize_jobs")
+    stream.add({"session_id": "s1", "source_version": "v1"})
+    backend = _StubBackend()
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path, backend=backend, job_stream=stream
+    )
+
+    assert worker.drain_once() == 1
+    assert backend.calls == 0
+    assert stream.pending() == []
+
+
+def test_stream_worker_acks_dead_lettered_generation_without_backend_call(
+    tmp_path: Path,
+) -> None:
+    _parquet_dir, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, source_version, dead_lettered_at) "
+            "VALUES ('s1', 'dead_lettered', 5, 'v1', now())"
+        )
+    finally:
+        con.close()
+    stream = JobStream("summarize_jobs")
+    stream.add({"session_id": "s1", "source_version": "v1"})
+    backend = _StubBackend()
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path, backend=backend, job_stream=stream
+    )
+
+    assert worker.drain_once() == 1
+    assert backend.calls == 0
+    assert stream.pending() == []
+
+
+def test_stream_worker_leaves_retry_wait_unacked_until_due(tmp_path: Path) -> None:
+    _parquet_dir, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, source_version, next_run_at) "
+            "VALUES ('s1', 'retry_wait', 1, 'v1', ?)",
+            [datetime(2026, 8, 6, 12, 5)],
+        )
+    finally:
+        con.close()
+    stream = JobStream("summarize_jobs", visibility_timeout_ms=0)
+    stream.add({"session_id": "s1", "source_version": "v1"})
+    backend = _StubBackend()
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path,
+        backend=backend,
+        job_stream=stream,
+        _clock=lambda: datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert worker.drain_once() == 0
+    assert backend.calls == 0
+    assert len(stream.pending()) == 1

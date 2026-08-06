@@ -261,6 +261,39 @@ def retry(
         con.close()
 
 
+def fail_and_dead_letter(
+    duckdb_path: Path,
+    job_id: Optional[str],
+    *,
+    error_message: str,
+    error_category: Optional[str] = None,
+) -> None:
+    """Close a leased attempt terminally and park its job in the dead letter."""
+    if job_id is None:
+        return
+    try:
+        con = open_duckdb_connection(duckdb_path)
+    except Exception:  # noqa: BLE001
+        log.debug("ledger shadow connect failed for %s", duckdb_path, exc_info=True)
+        return
+    try:
+        ledger = Ledger(con)
+        ledger.fail_job(
+            job_id,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        ledger.dead_letter_job(job_id)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "ledger shadow fail_and_dead_letter failed for job %s",
+            job_id,
+            exc_info=True,
+        )
+    finally:
+        con.close()
+
+
 # --------------------------------------------------------------------------- #
 # Crash recovery & operator replay (AGE-45 cutover)                            #
 # --------------------------------------------------------------------------- #

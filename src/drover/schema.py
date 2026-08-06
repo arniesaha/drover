@@ -97,14 +97,25 @@ CREATE TABLE IF NOT EXISTS session_summaries (
 
 _SUMMARIZE_JOBS_DDL = """
 CREATE TABLE IF NOT EXISTS summarize_jobs (
-  session_id  VARCHAR PRIMARY KEY,
-  status      VARCHAR,           -- 'pending' | 'running' | 'done' | 'errored'
-  attempts    INTEGER DEFAULT 0,
-  last_error  VARCHAR,
-  enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP
+  session_id       VARCHAR PRIMARY KEY,
+  status           VARCHAR,
+  attempts         INTEGER DEFAULT 0,
+  last_error       VARCHAR,
+  enqueued_at      TIMESTAMP DEFAULT now(),
+  updated_at       TIMESTAMP,
+  source_version   VARCHAR,
+  max_attempts     INTEGER DEFAULT 5,
+  next_run_at      TIMESTAMP,
+  dead_lettered_at TIMESTAMP
 );
 """
+
+_SUMMARIZE_JOBS_COLUMNS = {
+    "source_version": "VARCHAR",
+    "max_attempts": "INTEGER DEFAULT 5",
+    "next_run_at": "TIMESTAMP",
+    "dead_lettered_at": "TIMESTAMP",
+}
 
 # Project-level rollup keyed by `<repo_owner>/<repo_name>`. One row per
 # project; regenerated from session_summaries when activity warrants.
@@ -1372,6 +1383,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_TASKS_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
+        _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
         con.execute(_PROJECT_BRIEFS_DDL)
         con.execute(_BRIEF_JOBS_DDL)
         con.execute(_SESSION_EMBEDDINGS_DDL)
