@@ -188,7 +188,7 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
     @Test func pairsActionWithItsResult() {
         let a = action(1, id: "t1"), r = result(2, id: "t1")
         let items = TranscriptItem.group([a, r])
-        #expect(items == [.step(action: a, result: r)])
+        #expect(items == [.stepRun([ToolStep(action: a, result: r)])])
     }
 
     @Test func stepRowIDIsStableWhenResultAttaches() {
@@ -204,7 +204,7 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         let r = result(3, id: "t1")
         let items = TranscriptItem.group([a, thinking, r])
         #expect(items.count == 2)
-        #expect(items[0] == .step(action: a, result: r))
+        #expect(items[0] == .stepRun([ToolStep(action: a, result: r)]))
     }
 
     @Test func unmatchedResultStaysAMessage() {

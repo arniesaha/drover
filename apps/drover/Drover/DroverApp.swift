@@ -82,6 +82,7 @@ private struct RootView: View {
                 }
             }
         }
+        .droverTint()
         // Covers both a returning user (client already configured at launch,
         // `generation` still 0) and a fresh onboarding success (`generation`
         // bumps): request once a client exists, either way. Re-requesting is

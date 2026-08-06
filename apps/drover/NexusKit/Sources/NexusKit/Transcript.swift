@@ -17,10 +17,12 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
     /// individually meaningless, so they collapse into one row that expands
     /// on demand. Always non-empty.
     case statusRun([HarnessMessage])
-    /// A tool call paired (by payload `tool_use_id`) with its result. The
-    /// result attaches in place when it streams in; the row keeps the
-    /// action's identity so SwiftUI updates rather than rebuilds it.
-    case step(action: HarnessMessage, result: HarnessMessage?)
+    /// Consecutive tool calls, each paired (by payload `tool_use_id`) with
+    /// its result. Six `git` calls in a row are one line of transcript, not
+    /// six — the run collapses to `6 steps · 42s · all clean` and expands on
+    /// demand. Results attach in place as they stream in, so the run keeps
+    /// its identity rather than being rebuilt. Always non-empty.
+    case stepRun([ToolStep])
 
     /// A run is identified by its *first* message, so an in-progress run
     /// keeps a stable SwiftUI identity as later chunks join it — the row is
@@ -32,7 +34,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         case .message(let message): message.id
         case .thinkingRun(let run, _): run[0].id
         case .statusRun(let run): run[0].id
-        case .step(let action, _): action.id
+        case .stepRun(let steps): steps[0].id
         }
     }
 
@@ -68,8 +70,13 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         items.reserveCapacity(messages.count)
         var run: [HarnessMessage] = []
         var runTokens: Int?
-        /// tool_use_id -> index in `items` of the awaiting `.step` row.
-        var pendingSteps: [String: Int] = [:]
+        /// tool_use_id -> where its step sits: which `.stepRun` item, and
+        /// which step within it. Two levels because a result can arrive long
+        /// after its run stopped accepting new actions.
+        var pendingSteps: [String: (item: Int, step: Int)] = [:]
+        /// Index of the `.stepRun` still accepting actions, or nil once any
+        /// non-step message has broken the run.
+        var openStepRun: Int?
         var lastRenderedID: String?
 
         var statusRun: [HarnessMessage] = []
@@ -114,6 +121,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             }
             if message.isThinking {
                 flushStatus()
+                openStepRun = nil
                 run.append(message)
                 lastRenderedID = run[0].id
                 continue
@@ -122,27 +130,39 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
                let toolUseID = message.payload["tool_use_id"]?.stringValue {
                 flushRun()
                 flushStatus()
-                pendingSteps[toolUseID] = items.count
-                items.append(.step(action: message, result: nil))
-                lastRenderedID = message.id
+                if let index = openStepRun, case .stepRun(var steps) = items[index] {
+                    steps.append(ToolStep(action: message))
+                    items[index] = .stepRun(steps)
+                    pendingSteps[toolUseID] = (index, steps.count - 1)
+                    lastRenderedID = steps[0].id
+                } else {
+                    items.append(.stepRun([ToolStep(action: message)]))
+                    openStepRun = items.count - 1
+                    pendingSteps[toolUseID] = (items.count - 1, 0)
+                    lastRenderedID = message.id
+                }
                 continue
             }
             if message.type == .toolResult,
                let toolUseID = message.payload["tool_use_id"]?.stringValue,
-               let index = pendingSteps.removeValue(forKey: toolUseID),
-               case .step(let action, nil) = items[index] {
-                items[index] = .step(action: action, result: message)
-                lastRenderedID = action.id
+               let slot = pendingSteps.removeValue(forKey: toolUseID),
+               case .stepRun(var steps) = items[slot.item],
+               steps.indices.contains(slot.step) {
+                steps[slot.step].result = message
+                items[slot.item] = .stepRun(steps)
+                lastRenderedID = steps[0].id
                 continue
             }
             if message.type == .status {
                 flushRun()
+                openStepRun = nil
                 statusRun.append(message)
                 lastRenderedID = statusRun[0].id
                 continue
             }
             flushRun()
             flushStatus()
+            openStepRun = nil
             items.append(.message(message))
             lastRenderedID = message.id
         }

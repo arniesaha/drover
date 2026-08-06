@@ -34,6 +34,12 @@ public final class ChatModel {
     public var contextGauge: ContextGauge? {
         ContextGauge(messages: messages, harness: harnessPresentation.harness)
     }
+    /// Branches and pull requests this session produced. Derived rather than
+    /// stored — the hub reports neither, so the transcript is the only place
+    /// they exist. Same O(n)-per-render cost as the transcript fold beside it.
+    public var artifacts: [SessionArtifact] {
+        SessionArtifactExtractor.artifacts(in: messages)
+    }
     public var composerText = ""
     /// Images picked in the composer, waiting to ride the next turn.
     public var pendingAttachments: [TurnAttachment] = []

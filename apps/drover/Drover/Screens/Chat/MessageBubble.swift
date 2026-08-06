@@ -40,35 +40,40 @@ struct MessageBubble: View {
         HStack {
             // displayBlocks is segmented once at decode (see HarnessMessage) —
             // this loop only lays out prebuilt values.
-            VStack(alignment: .leading, spacing: 8) {
+            // A single text column at one rhythm, with headings as the only
+            // size jump — that is what keeps a heading, a table, a code block
+            // and a list reading as one document.
+            VStack(alignment: .leading, spacing: 13) {
                 ForEach(Array(message.displayBlocks.enumerated()), id: \.offset) { _, block in
                     switch block {
                     case .text(let attributed):
-                        Text(attributed)
+                        Text(attributed).droverText(.body)
                     case .code(let language, let code):
                         CodeBlockView(language: language, code: code)
                     case .diff(let lines):
                         DiffBlockView(lines: lines)
                     case .heading(let level, let content):
-                        Text(content)
-                            .font(headingFont(level))
-                            .padding(.top, 2)
+                        Text(content).droverText(level <= 1 ? .h1 : (level == 2 ? .h2 : .h3))
+                    case .table(let table):
+                        TableBlockView(table: table)
+                    case .list(let list):
+                        ListBlockView(list: list)
+                    case .quote(let content):
+                        QuoteBlockView(content: content)
+                    case .rule:
+                        FadingRule()
                     }
                 }
                 usageFooter(alignment: .leading)
             }
-            .padding(10)
-            .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+            .padding(12)
+            .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.line, lineWidth: 1)
+            }
             .contextMenu { copyButton }
             Spacer(minLength: 32)
-        }
-    }
-
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1, 2: return .title3.bold()
-        case 3: return .headline
-        default: return .subheadline.bold()
         }
     }
 
