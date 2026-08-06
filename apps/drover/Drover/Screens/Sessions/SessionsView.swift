@@ -1,13 +1,18 @@
 import SwiftUI
 import NexusKit
 
-/// Fleet-first view over the live snapshot: one section per host (ordered
-/// online→stale→offline, waiting sessions first within each), plus finished
-/// sessions (collapsed). Polling starts as soon as the view appears and
-/// follows `scenePhase` thereafter; pull-to-refresh does a single one-off
-/// `refresh()`. Structured sessions navigate to the real `ChatView`
-/// (Task 7); PTY sessions navigate to `TerminalScreen` (Task 9), a live
-/// SwiftTerm view over the harness's terminal WebSocket.
+/// The fleet inbox: a count that says how much wants you, a host strip that
+/// says where the herd is, then one list of live sessions ordered by activity.
+///
+/// Conversation and terminal sessions share that list — `SessionRow` gives
+/// each species its own form, and the card's verb ("Answer", "Attach") carries
+/// what tapping it does. Structured sessions navigate to `ChatView`, PTY
+/// sessions to `TerminalScreen`, exactly as before.
+///
+/// Degraded states live in `FleetHeader` rather than in chrome of their own:
+/// an unreachable hub turns the fleet line into the error and drops every host
+/// dot to its offline form, which is why there is no longer a banner inset or
+/// a whole-screen dim here.
 struct SessionsView: View {
     @State private var store: SessionStore
     private let client: NexusClient
@@ -25,31 +30,32 @@ struct SessionsView: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            Color(.systemGroupedBackground)
-                .ignoresSafeArea()
-
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    // Action errors (e.g. a failed continueSession) land here — they
-                    // don't touch `isReachable`, so they're distinct from the
-                    // unreachable banner below: connected, but the last action
-                    // failed. Refresh failures flip `isReachable` and route to the
-                    // banner instead, keeping these two surfaces mutually exclusive.
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if store.hasLoadedOnce {
+                        FleetHeader(
+                            summary: summary,
+                            hostGroups: store.hostGroups,
+                            onRetry: { Task { await store.refresh() } }
+                        )
+                        .padding(.bottom, 4)
+                    }
+
+                    // Action errors (e.g. a failed continueSession) land here.
+                    // They are distinct from an unreachable hub: connected, but
+                    // the last thing you asked for didn't happen. Refresh
+                    // failures flip `isReachable` and are reported by the fleet
+                    // line instead, so the two can never both be showing.
                     if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
-                        Label(lastError, systemImage: "exclamationmark.triangle")
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                            .padding(14)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        actionFailedRow(lastError)
                     }
 
                     if activeSessions.isEmpty, store.hasLoadedOnce {
-                        ContentUnavailableView("No active sessions",
+                        ContentUnavailableView("Nothing running",
                                                systemImage: "rectangle.stack.badge.plus",
-                                               description: Text("Launch a session when you're ready."))
+                                               description: Text("Send one out when you're ready."))
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 48)
+                            .padding(.vertical, 40)
                     } else {
                         ForEach(activeSessions) { session in
                             row(for: session)
@@ -57,67 +63,22 @@ struct SessionsView: View {
                     }
 
                     if !store.finished.isEmpty {
-                        DisclosureGroup(isExpanded: $showFinished) {
-                            VStack(spacing: 10) {
-                                ForEach(store.finished) { session in
-                                    row(for: session)
-                                }
-                            }
-                            .padding(.top, 10)
-                        } label: {
-                            HStack {
-                                Text("Finished")
-                                    .font(.headline)
-                                Text("\(store.finished.count)")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 3)
-                                    .background(.secondary.opacity(0.12), in: Capsule())
-                            }
-                        }
-                        .padding(16)
-                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                        .tint(.primary)
+                        finishedSection
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
                 .padding(.bottom, 98)
             }
             .refreshable { await store.refresh() }
 
             if store.hasLoadedOnce {
-                Button {
-                    showLaunch = true
-                } label: {
-                    Label("New session", systemImage: "plus")
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 13)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .overlay {
-                            Capsule()
-                                .strokeBorder(.white.opacity(0.24), lineWidth: 1)
-                        }
-                        .shadow(color: .black.opacity(0.18), radius: 16, y: 8)
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("launch-button")
-                .padding(.leading, 20)
-                .padding(.bottom, 18)
+                launchButton
             }
         }
-        .navigationTitle("Sessions")
-        .opacity(store.hasLoadedOnce && !store.isReachable ? 0.5 : 1)
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if store.hasLoadedOnce && !store.isReachable {
-                UnreachableBanner(message: store.lastError ?? "Server unreachable") {
-                    Task { await store.refresh() }
-                }
-            }
-        }
+        .background(DroverColor.bg)
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
         .overlay {
             if !store.hasLoadedOnce {
                 if let error = store.lastError {
@@ -129,7 +90,7 @@ struct SessionsView: View {
                         Button("Retry") {
                             Task { await store.refresh() }
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.bordered)
                     }
                 } else {
                     ProgressView("Connecting…")
@@ -166,8 +127,7 @@ struct SessionsView: View {
                 }
             }
             .presentationDetents([.large])
-            .presentationCornerRadius(30)
-            .presentationBackground(.regularMaterial)
+            .presentationCornerRadius(24)
         }
         .navigationDestination(item: $launchedSession) { launched in
             if launched.isStructured {
@@ -178,9 +138,79 @@ struct SessionsView: View {
         }
     }
 
+    private var summary: FleetSummaryPresentation {
+        FleetSummaryPresentation(
+            snapshot: store.snapshot,
+            isReachable: store.isReachable,
+            error: store.lastError
+        )
+    }
+
     private var activeSessions: [SessionSummary] {
         store.activeSessions
     }
+
+    // MARK: - Pieces
+
+    private func actionFailedRow(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle")
+                .font(.system(size: 12, weight: .medium))
+            Text(message)
+                .lineLimit(2)
+        }
+        .droverText(.subtitle)
+        .foregroundStyle(DroverColor.accentHi)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(DroverColor.accentTint, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityIdentifier("action-failed")
+    }
+
+    private var finishedSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            FadingRule()
+                .padding(.vertical, 6)
+
+            DisclosureGroup(isExpanded: $showFinished) {
+                VStack(spacing: 10) {
+                    ForEach(store.finished) { session in
+                        row(for: session)
+                    }
+                }
+                .padding(.top, 10)
+            } label: {
+                HStack(spacing: 8) {
+                    Text("Finished").droverText(.h3)
+                    Text("\(store.finished.count)").droverText(.marker)
+                }
+            }
+            .tint(DroverColor.muted.color(for: colorScheme))
+        }
+    }
+
+    private var launchButton: some View {
+        Button {
+            showLaunch = true
+        } label: {
+            Label("Send one out", systemImage: "plus")
+                .font(.system(.subheadline, design: .default, weight: .medium))
+                .foregroundStyle(DroverColor.accentHi)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 11)
+                // Outlined on the ground tone, never a filled pill — the
+                // system guide reserves fills for nothing at this scale.
+                .background(DroverColor.bg, in: Capsule())
+                .overlay { Capsule().strokeBorder(DroverColor.accent, lineWidth: 1) }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("launch-button")
+        .padding(.leading, 18)
+        .padding(.bottom, 18)
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
 
     private func row(for session: SessionSummary) -> some View {
         NavigationLink {
@@ -231,9 +261,8 @@ struct SessionsView: View {
     /// finished sessions too — the real "resume a dead session" path.
     /// `targetHarness` picks the new session's harness (nil keeps the
     /// source's). Failures surface through the store's `lastError`, rendered
-    /// as an inline red-label section at the top of the list (while
-    /// connected — the unreachable banner takes over if the hub itself goes
-    /// offline).
+    /// as the inline action-failed row above the list (while connected — the
+    /// fleet line takes over if the hub itself goes offline).
     private func continueSession(_ session: SessionSummary, targetHarness: String? = nil) async {
         guard let continued = await store.continueSession(session.id, targetHarness: targetHarness) else {
             return
