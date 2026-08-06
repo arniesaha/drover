@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// A run of consecutive tool calls as one fold: `6 steps · 42s · all clean`
 /// collapsed, a mono list of commands expanded.

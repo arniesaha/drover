@@ -1,6 +1,6 @@
 import Foundation
 import SwiftTerm
-import NexusKit
+import DroverKit
 import UIKit
 
 /// Bridges SwiftTerm's `TerminalView` to the harness's terminal WebSocket:
@@ -10,7 +10,7 @@ import UIKit
 /// `TerminalView.swift`).
 ///
 /// All socket lifecycle — including reconnecting with backoff after a drop —
-/// lives in `TerminalStream` (NexusKit, unit-tested). The daemon keeps the
+/// lives in `TerminalStream` (DroverKit, unit-tested). The daemon keeps the
 /// PTY alive when a client vanishes, so a network blip or iOS suspending the
 /// socket in the background is survivable: the stream reattaches and the
 /// re-sent resize makes full-screen TUIs repaint. Only the daemon's `exit`
@@ -22,7 +22,7 @@ import UIKit
 /// pump runs on a plain background `Task` by construction, so every touch of
 /// the (weak, main-actor-isolated) `TerminalView` is explicitly hopped via
 /// `@MainActor` — see `apply(_:)`. This class is `@unchecked Sendable` the
-/// same way the test-only fakes in NexusKitTests are: a class handed across
+/// same way the test-only fakes in DroverKitTests are: a class handed across
 /// an isolation boundary with manually-verified safe access patterns rather
 /// than actor isolation.
 final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable {

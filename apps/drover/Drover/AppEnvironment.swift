@@ -1,18 +1,18 @@
 import Foundation
 import Observation
-import NexusKit
+import DroverKit
 
-/// App-wide configuration state: holds the current `NexusClient`/`ServerConfig`
+/// App-wide configuration state: holds the current `DroverClient`/`ServerConfig`
 /// (if any) and the one entry point (`configure`) that validates a candidate
 /// server + token against the live server before persisting anything.
 ///
 /// The actual "which source wins" logic (DEBUG env override vs. persisted
-/// defaults + Keychain) lives in `NexusKit.ClientFactory` so it's unit
+/// defaults + Keychain) lives in `DroverKit.ClientFactory` so it's unit
 /// testable independent of SwiftUI.
 @MainActor
 @Observable
 final class AppEnvironment {
-    private(set) var client: NexusClient?
+    private(set) var client: DroverClient?
     private(set) var config: ServerConfig?
 
     /// Bumped on every successful `configure()` so views that hold a
@@ -54,7 +54,7 @@ final class AppEnvironment {
             return .failure("Enter the API token.")
         }
 
-        // Server-checking logic lives in NexusKit so it's unit-testable;
+        // Server-checking logic lives in DroverKit so it's unit-testable;
         // this stays a thin caller.
         if let failure = await ClientFactory.validate(config: newConfig, token: trimmedToken) {
             return .failure(failure)
@@ -68,7 +68,7 @@ final class AppEnvironment {
         }
 
         config = newConfig
-        client = NexusClient(config: newConfig, token: trimmedToken)
+        client = DroverClient(config: newConfig, token: trimmedToken)
         generation += 1
         return .success
     }

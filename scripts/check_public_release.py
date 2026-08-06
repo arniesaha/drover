@@ -71,7 +71,7 @@ RULE_ALLOWLIST = {
 }
 
 RULE_PREFIX_ALLOWLIST = {
-    "credential-value": ("tests/", "apps/drover/NexusKit/Tests/"),
+    "credential-value": ("tests/", "apps/drover/DroverKit/Tests/"),
 }
 
 

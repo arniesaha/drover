@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// The "blocked on you" slot, pinned above the composer.
 ///

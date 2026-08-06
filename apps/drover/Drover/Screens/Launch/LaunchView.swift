@@ -1,6 +1,6 @@
 import SwiftUI
 import PhotosUI
-import NexusKit
+import DroverKit
 
 /// The "new session" sheet: host/harness pickers, a cwd field with a
 /// suggestions menu, and (for structured harnesses only) a starting prompt.
@@ -12,7 +12,7 @@ struct LaunchView: View {
     @State private var isLaunching = false
     @State private var showAuth = false
     @State private var pickerItems: [PhotosPickerItem] = []
-    private let client: NexusClient
+    private let client: DroverClient
     private static let maxCombinedBytes = 6 * 1024 * 1024
 
     /// Called once `launch()` succeeds, with the new session's id and
@@ -20,7 +20,7 @@ struct LaunchView: View {
     /// the selected harness for the destination title/icon.
     let onLaunched: (String, Bool, String) -> Void
 
-    init(client: NexusClient, snapshot: HarnessSnapshot?, onLaunched: @escaping (String, Bool, String) -> Void) {
+    init(client: DroverClient, snapshot: HarnessSnapshot?, onLaunched: @escaping (String, Bool, String) -> Void) {
         _model = State(initialValue: LaunchModel(client: client, snapshot: snapshot))
         self.client = client
         self.onLaunched = onLaunched

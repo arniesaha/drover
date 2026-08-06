@@ -1,6 +1,6 @@
 import SwiftUI
 import PhotosUI
-import NexusKit
+import DroverKit
 
 /// Bottom chat input for structured sessions. The prompt surface owns the
 /// glass dock treatment; this wrapper keeps PhotosPicker loading and send

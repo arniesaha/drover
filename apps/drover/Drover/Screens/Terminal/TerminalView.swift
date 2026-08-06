@@ -1,6 +1,6 @@
 import SwiftUI
 import SwiftTerm
-import NexusKit
+import DroverKit
 
 /// PTY escape hatch: renders a live shell session over the harness's
 /// terminal WebSocket using SwiftTerm. All wire handling and socket
@@ -19,7 +19,7 @@ import NexusKit
 /// is a two-tap sequence (toggle Ctrl, tap C) rather than a single button,
 /// which matches how other iOS terminal clients (Termius, Blink) expose it.
 struct TerminalScreen: View {
-    let client: NexusClient
+    let client: DroverClient
     let sessionID: String
     let harness: String?
 
@@ -43,7 +43,7 @@ struct TerminalScreen: View {
     @State private var showTerminateConfirm = false
     @State private var terminateHint: String?
 
-    init(client: NexusClient, sessionID: String, harness: String? = nil) {
+    init(client: DroverClient, sessionID: String, harness: String? = nil) {
         self.client = client
         self.sessionID = sessionID
         self.harness = harness
@@ -180,7 +180,7 @@ private struct SessionEndedOverlay: View {
 }
 
 private struct TerminalRepresentable: UIViewRepresentable {
-    let client: NexusClient
+    let client: DroverClient
     let sessionID: String
     let holder: BridgeHolder
     let onSessionEnded: () -> Void

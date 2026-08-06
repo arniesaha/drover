@@ -1,12 +1,12 @@
 import BackgroundTasks
-import NexusKit
+import DroverKit
 
 /// Owns the `com.arnab.drover.refresh` BGAppRefreshTask lifecycle: register
 /// the handler once at app init (BGTaskScheduler requires this before the app
 /// finishes launching), then schedule/reschedule a request each time the task
 /// runs and each time the app backgrounds.
 ///
-/// The handler rebuilds its own `NexusClient` via `ClientFactory.make(...)`
+/// The handler rebuilds its own `DroverClient` via `ClientFactory.make(...)`
 /// rather than capturing one from the app, because a BGTask can run after the
 /// OS has relaunched the process from scratch — there is no live
 /// `AppEnvironment` to borrow a client from.

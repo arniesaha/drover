@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// A thinking run as a fold: `Thought for 12s · 1.2K tokens` collapsed, the
 /// reasoning behind an accent bar expanded. Recessive on purpose — thinking is

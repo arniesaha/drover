@@ -1,6 +1,6 @@
 import SwiftUI
 import UserNotifications
-import NexusKit
+import DroverKit
 
 /// Without a `UNUserNotificationCenterDelegate`, iOS silently drops any
 /// local notification that fires while the app is foregrounded — which is

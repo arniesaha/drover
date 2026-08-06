@@ -1,12 +1,12 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 struct HarnessAuthSheet: View {
     @State private var model: AuthFlowModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
 
-    init(client: NexusClient, hostID: String, harness: String) {
+    init(client: DroverClient, hostID: String, harness: String) {
         _model = State(initialValue: AuthFlowModel(client: client, hostID: hostID, harness: harness))
     }
 

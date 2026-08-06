@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// One card in the fleet inbox. Two species share this view because they
 /// share a shape — kicker, one loud line, one quiet line, one verb — and
