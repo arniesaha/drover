@@ -1,6 +1,6 @@
 import SwiftUI
 import UIKit
-import NexusKit
+import DroverKit
 
 /// Renders one `HarnessMessage` per the chat rendering map: markdown bubbles
 /// for assistant/user turns, a compact card for tool calls, a centered

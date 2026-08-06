@@ -60,5 +60,5 @@ For non-Mac hosts, set `mcp_url` to point at the Mac Mini over
 Tailscale or LAN:
 
 ```toml
-mcp_url = "http://mac-mini.tailnet.ts.net:7077/mcp"
+mcp_url = "http://100.x.y.z:7077/mcp"
 ```

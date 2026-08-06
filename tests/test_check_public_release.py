@@ -1,0 +1,82 @@
+import importlib.util
+from pathlib import Path
+import sys
+
+SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "check_public_release.py"
+SPEC = importlib.util.spec_from_file_location("check_public_release", SCRIPT_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+check_paths = MODULE.check_paths
+
+
+def write_file(root: Path, relative: str, content: str) -> Path:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return path
+
+
+def test_check_paths_finds_private_environment_and_stale_names(tmp_path: Path) -> None:
+    paths = [
+        write_file(tmp_path, "docs/setup.md", "cd /Users/alice/projects/drover\n"),
+        write_file(tmp_path, "docs/network.md", "server: http://192.168.1.70:7080\n"),
+        write_file(tmp_path, "docs/tailnet.md", "host.private-name.ts.net\n"),
+        write_file(tmp_path, "docs/sdk.md", "Import NexusKit in your application.\n"),
+    ]
+
+    findings = check_paths(paths)
+
+    assert {finding.rule for finding in findings} == {
+        "personal-home-path",
+        "private-ip-address",
+        "private-tailnet-hostname",
+        "legacy-public-name",
+    }
+
+
+def test_check_paths_redacts_credential_values(tmp_path: Path) -> None:
+    path = write_file(tmp_path, "config.env", 'token = "secret-value"\n')
+
+    findings = check_paths([path])
+
+    assert len(findings) == 1
+    assert findings[0].rule == "credential-value"
+    assert "secret-value" not in findings[0].excerpt
+    assert "[REDACTED]" in findings[0].excerpt
+
+
+def test_check_paths_does_not_treat_type_annotations_as_credentials(
+    tmp_path: Path,
+) -> None:
+    path = write_file(
+        tmp_path,
+        "Client.swift",
+        "func configure(token: String) async {}\n",
+    )
+
+    assert check_paths([path]) == []
+
+
+def test_check_paths_allows_test_only_credential_fixtures(tmp_path: Path) -> None:
+    path = write_file(tmp_path, "tests/test_client.py", 'token = "fake-token"\n')
+
+    assert check_paths([path]) == []
+
+
+def test_check_paths_skips_binary_files(tmp_path: Path) -> None:
+    path = tmp_path / "fixture.bin"
+    path.write_bytes(b"token=secret-value\x00binary")
+
+    assert check_paths([path]) == []
+
+
+def test_check_paths_allows_documented_legacy_compatibility(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "docs/compatibility.md",
+        "NexusKit is retained only as a historical compatibility name.\n",
+    )
+
+    assert check_paths([path]) == []

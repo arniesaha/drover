@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// The fleet inbox: a count that says how much wants you, a host strip that
 /// says where the herd is, then one list of live sessions ordered by activity.
@@ -15,14 +15,14 @@ import NexusKit
 /// a whole-screen dim here.
 struct SessionsView: View {
     @State private var store: SessionStore
-    private let client: NexusClient
+    private let client: DroverClient
     private let notifier: Notifying
     @Environment(\.scenePhase) private var scenePhase
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
 
-    init(client: NexusClient, notifier: Notifying = LocalNotifier()) {
+    init(client: DroverClient, notifier: Notifying = LocalNotifier()) {
         self.client = client
         self.notifier = notifier
         _store = State(initialValue: SessionStore(client: client))

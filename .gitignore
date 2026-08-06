@@ -41,14 +41,17 @@ parquet/
 .swiftpm/
 
 # Local Swift/Xcode build caches
-apps/drover/.derivedData/
+apps/drover/.derivedData*/
 apps/drover/.xcode-home/
-apps/drover/NexusKit/.build/
-apps/drover/NexusKit/.clang-cache/
-apps/drover/NexusKit/.swift-cache/
+apps/drover/DroverKit/.build/
+apps/drover/DroverKit/.clang-cache/
+apps/drover/DroverKit/.swift-cache/
 
 # Local git worktrees
 .worktrees/
+
+# Private planning belongs in the private roadmap repository.
+docs/internal/
 
 # Terraform
 .terraform/

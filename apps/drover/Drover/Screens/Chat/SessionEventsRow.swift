@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// A status run as a fold: `3 status updates · last: indexed 1,204 files`.
 /// Status messages are ~48% of a real transcript and individually meaningless,

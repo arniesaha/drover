@@ -1,5 +1,5 @@
 import SwiftUI
-import NexusKit
+import DroverKit
 
 /// The structured-session chat screen: a scrolling transcript (auto-scrolls
 /// to the newest message), a "reconnecting…" pill while the stream is down,
@@ -7,7 +7,7 @@ import NexusKit
 /// composer. Interrupt/terminate live in the toolbar. All state and network
 /// calls are delegated to `ChatModel` — this view only renders it.
 struct ChatView: View {
-    private let client: NexusClient
+    private let client: DroverClient
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
     @State private var handoffSession: HandoffSession?
@@ -21,7 +21,7 @@ struct ChatView: View {
     /// race: a tall new row unpinned before the coalesced scroll fired).
     @State private var scrollPhase: ScrollPhase = .idle
 
-    init(client: NexusClient, sessionID: String, harness: String? = nil) {
+    init(client: DroverClient, sessionID: String, harness: String? = nil) {
         self.client = client
         _model = State(initialValue: ChatModel(client: client, sessionID: sessionID, harness: harness))
     }

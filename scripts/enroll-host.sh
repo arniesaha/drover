@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Enroll this machine as a Drover relay harness host.
-# Usage: ./scripts/enroll-host.sh --host-id work-laptop --central-url https://mini.tailnet.ts.net --relay
+# Usage: ./scripts/enroll-host.sh --host-id work-laptop --central-url http://drover-host.local:7080 --relay
 set -euo pipefail
 
 HOST_ID="" CENTRAL_URL="" RELAY=0
@@ -51,13 +51,13 @@ MSG
 
 TOKEN_FILE="$HOME/.drover/api_token"
 [[ -s "$TOKEN_FILE" ]] || { echo "put the fleet API token in $TOKEN_FILE first" >&2; exit 2; }
-TOKEN="$(cat "$TOKEN_FILE")"
+AUTH_VALUE="$(cat "$TOKEN_FILE")"
 
 # Validate the token before installing anything (spec: fail loudly, never a silent retry loop).
 # The `|| STATUS="000"` matters under `set -e`: if curl can't connect at all (bad host,
 # DNS failure, timeout, TLS error) it exits non-zero and prints no http_code, which would
 # otherwise kill the script right here with zero output instead of hitting the loud check below.
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$CENTRAL_URL/harness/hosts") || STATUS="000"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $AUTH_VALUE" "$CENTRAL_URL/harness/hosts") || STATUS="000"
 [[ "$STATUS" == "200" ]] || { echo "token/URL check failed against $CENTRAL_URL (HTTP $STATUS)" >&2; exit 1; }
 
 # A 200 *with* the token proves the token is right; it does not prove anything is

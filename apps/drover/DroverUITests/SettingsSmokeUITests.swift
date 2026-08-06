@@ -21,7 +21,7 @@ final class SettingsSmokeUITests: XCTestCase {
         XCTAssertTrue(urlField.waitForExistence(timeout: 10), "onboarding URL field should show")
         urlField.tap()
         let serverURL = ProcessInfo.processInfo.environment["DROVER_SMOKE_URL"]
-            ?? "http://192.168.1.149:7080"
+            ?? "http://127.0.0.1:7080"
         urlField.typeText(serverURL)
 
         let tokenField = app.secureTextFields["API token"]

@@ -1,67 +1,139 @@
 # Drover
 
 <p align="center">
-  <img src="docs/assets/drover-hero.png" alt="Drover — a drover's dog watching over a small herd of terminals" width="480">
+  <img src="docs/assets/drover-hero.png" alt="Drover watching over a fleet of coding-agent terminals" width="480">
 </p>
 
-> Drive your whole agent fleet — from your pocket.
+> Drive your coding-agent fleet from your pocket.
 
-**Drover** is a local-first cockpit for driving a personal fleet of CLI
-coding agents (Claude Code, Codex, Gemini) across your own machines, from
-anywhere. Agent sessions and traces land in a local DuckDB context store; a
-harness control plane lets you watch, chat with, and hand off running
-sessions from a native iOS app or a phone-friendly web UI. There is no cloud
-component — everything runs on hardware you own.
+## What Drover Is
 
-## Components
+Drover is a local-first cockpit and context store for a personal fleet of CLI
+coding agents. It connects Claude Code, Codex, Gemini, OpenClaw, and compatible
+harnesses running on machines you control. A native iOS client lets you inspect
+sessions, answer prompts, send turns, hand work off, and attach to a terminal.
 
-The server side lives in `src/drover/` and installs as console scripts (see
-`pyproject.toml`):
+Drover is self-hosted software for one trusted operator. The supported v0.1
+network boundary is localhost, a private LAN, or a private Tailscale network.
+It does not require a Drover cloud service.
 
-- **`drover-server`** — central control plane: event ingest into the DuckDB
-  context store, plus the `/harness` REST + WebSocket API (session list,
-  chat, terminal proxy) and the web UI that clients talk to.
-- **`drover-harnessd`** — per-host data plane: owns the PTY/tmux processes
-  that run the actual CLI agents and registers them with the central server.
-- **`drover-collect`** — per-host shipper: parses agent CLI logs and ships
-  events to the server.
-- **`drover-hook`** — lifecycle hook CLI invoked by agent harness hooks
-  (e.g. Claude Code SessionStart/SessionEnd).
-- **iOS app** — native client in [`apps/drover/`](apps/drover/README.md):
-  browse sessions across hosts, chat with them, attach a real terminal.
+## Screenshots
 
-## Repository layout
+<p align="center">
+  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view showing active sessions across two hosts" width="360">
+  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="360">
+</p>
 
-```
-src/drover/     Python package: server, harness daemon, collector, hooks
-apps/drover/    Native iOS client (SwiftUI, XcodeGen project)
-docs/           Architecture and design docs
-deploy/         Kubernetes manifests and Grafana dashboards
-scripts/        Install scripts, launchd/systemd units, operational tooling
-tests/          Python test suite (pytest)
-```
+The fleet view groups live work by host and brings approvals and questions to
+the top. The launch sheet selects a host and harness, checks authentication,
+and carries model and reasoning preferences into the new session.
 
-## Getting started
+## How It Works
 
-Requires Python 3.11+.
+![Drover command and context planes](docs/drover-architecture.png)
+
+- The **command plane** connects the iOS app to `drover-server` and per-host
+  `drover-harnessd` daemons for session control, structured chat, approvals,
+  handoff, and terminal streaming.
+- The **context plane** collects durable agent events and spans into local
+  Parquet and DuckDB storage, then derives summaries, project briefs, and
+  embeddings for recall.
+- The **MCP surface** exposes that context to coding agents as `drover_*` tools.
+
+See [Architecture](docs/architecture.md) for the component boundaries and
+[Context Store](docs/context-store.md) for the data model.
+
+## Quickstart
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync            # or: pip install -e .
-uv run pytest      # run the test suite
+git clone https://github.com/arniesaha/drover.git
+cd drover
+uv sync --extra dev
+uv run drover-server init
 ```
+
+Set `metrics_http_port = 7080` in `~/.drover/config.toml`, then start the
+central process:
+
+```bash
+uv run drover-server run
+```
+
+In another terminal, start a local harness host:
+
+```bash
+uv run drover-harnessd \
+  --host-id local \
+  --kind macos \
+  --central-url http://127.0.0.1:7080 \
+  --local-url http://127.0.0.1:7081
+```
+
+The first server start creates `~/.drover/api_token` with mode `0600`. Use
+that token when configuring the iOS app or calling the harness API.
+
+Continue with [Getting Started](docs/getting-started.md) for verification,
+private Tailscale setup, and optional context ingestion.
+
+## Context Store
+
+Raw agent events and OpenTelemetry spans are durable facts. Drover stores them
+as partitioned Parquet, exposes normalized DuckDB views, and keeps mutable
+derived context such as summaries, briefs, embeddings, and job provenance in
+DuckDB. Derived records always retain links back to source sessions or spans.
+
+The model and its compatibility boundary are documented in
+[Context Store](docs/context-store.md). Historical telemetry may retain
+`nexus.*` attributes; new public APIs, commands, and MCP tools use Drover.
+
+## Supported Networking And Security
+
+- Supported: localhost, a trusted private LAN, and a private Tailscale network.
+- Not supported for v0.1: Tailscale Funnel or any public-internet exposure.
+- Authentication: one shared bearer token for a single trusted operator.
+- Not provided: multi-user isolation, RBAC, SSO, per-host credentials, or a
+  hosted control plane.
+
+Read [Security](docs/security.md) before exposing a listener beyond localhost,
+and [Multi-Host](docs/multi-host.md) before adding another machine.
+
+## Build The iOS App
+
+The iOS app ships from source. It requires Xcode 16+, iOS 18+, and XcodeGen.
+
+```bash
+brew install xcodegen
+cd apps/drover
+xcodegen generate
+open Drover.xcodeproj
+```
+
+Select your Apple development team and run the `Drover` scheme on a simulator
+or connected iPhone. See the [iOS build guide](apps/drover/README.md) for tests,
+device signing, and server configuration.
 
 ## Documentation
 
-- [docs/north-star.md](docs/north-star.md) — philosophy, positioning,
-  audience, and the capability pillars.
-- [docs/architecture.md](docs/architecture.md) — system architecture: the
-  context store, ingest pipeline, and harness control plane.
-- [docs/public-release-checklist.md](docs/public-release-checklist.md) —
-  public-release blockers, open-issue triage, CI/branch gates, and docs sweep.
-- [docs/context-standards-roadmap.md](docs/context-standards-roadmap.md) —
-  how OKF, Agent Behavior, Graphify, CodeGraph, MCP, OTel GenAI, PROV, and A2A
-  fit Drover's roadmap.
+- [Getting Started](docs/getting-started.md)
+- [Architecture](docs/architecture.md)
+- [Context Store](docs/context-store.md)
+- [Integrations](docs/integrations.md)
+- [Multi-Host](docs/multi-host.md)
+- [Security](docs/security.md)
+- [Roadmap](docs/roadmap.md)
+
+## Status And Limitations
+
+Drover v0.1 is source-distributed software for technical users operating a
+trusted personal fleet. The Python server and native iOS client are functional,
+but packaging, host-bound relay credentials, timely background push
+notifications, and broader context interchange standards remain future work.
+
+See [open issues](https://github.com/arniesaha/drover/issues) for current bugs
+and [Roadmap](docs/roadmap.md) for the supported direction.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

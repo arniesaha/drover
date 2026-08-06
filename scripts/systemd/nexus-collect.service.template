@@ -1,9 +1,0 @@
-[Unit]
-Description=Nexus collect — one-shot ship of local sources
-
-[Service]
-Type=oneshot
-WorkingDirectory=@@REPO_DIR@@
-ExecStart=@@HOME@@/.local/bin/uv run --quiet nexus-collect run
-StandardOutput=append:/tmp/nexus-collect.log
-StandardError=append:/tmp/nexus-collect.log

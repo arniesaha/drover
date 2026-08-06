@@ -5,8 +5,8 @@ options:
     iOS: "18.0"
   createIntermediateGroups: true
 packages:
-  NexusKit:
-    path: NexusKit
+  DroverKit:
+    path: DroverKit
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
     exactVersion: "1.13.0"
@@ -16,7 +16,7 @@ targets:
     platform: iOS
     sources: [Drover]
     dependencies:
-      - package: NexusKit
+      - package: DroverKit
       - package: SwiftTerm
     settings:
       base:
@@ -55,7 +55,7 @@ targets:
     type: bundle.unit-test
     platform: iOS
     sources:
-      - NexusKit/Tests/NexusKitTests
+      - DroverKit/Tests/DroverKitTests
       - DroverTests
     dependencies:
       - target: Drover

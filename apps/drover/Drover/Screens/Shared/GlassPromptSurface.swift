@@ -1,6 +1,6 @@
 import SwiftUI
 import UIKit
-import NexusKit
+import DroverKit
 
 struct GlassPromptSurface<AttachmentButton: View>: View {
     @Binding var text: String
