@@ -99,6 +99,14 @@ private struct StepLine: View {
                     DiffBlockView(lines: lines)
                 case .heading(_, let content):
                     Text(content).droverText(.h2)
+                case .table(let table):
+                    TableBlockView(table: table)
+                case .list(let list):
+                    ListBlockView(list: list)
+                case .quote(let quoted):
+                    QuoteBlockView(content: quoted)
+                case .rule:
+                    FadingRule()
                 }
             }
         }
