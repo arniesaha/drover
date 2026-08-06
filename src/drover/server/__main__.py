@@ -111,7 +111,7 @@ api_token = ""
 
 [agent]
 agent_id     = "{default_agent_id}"
-principal_id = "arnab"
+principal_id = "unknown"
 
 [summarizer]
 # backend_policy:
@@ -122,8 +122,8 @@ backend_policy  = "hybrid"
 api_model        = "claude-haiku-4-5-20251001"
 local_model      = "qwen3.5:35b-a3b"
 local_ollama_url = ""   # e.g. "http://127.0.0.1:11435" — no wake relay
-gpu_relay_url    = ""   # e.g. "http://192.168.1.70:9753" — NAS WoL relay
-gpu_ollama_url   = ""   # e.g. "http://10.10.10.2:11434" — Ollama on the GPU rig
+gpu_relay_url    = ""   # e.g. "http://gpu-host.local:9753" — optional WoL relay
+gpu_ollama_url   = ""   # e.g. "http://gpu-host.local:11434" — optional Ollama host
 wake_timeout_s   = 120  # GPU relay only
 batch_size       = 8    # drain N jobs per batch
 

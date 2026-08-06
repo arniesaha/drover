@@ -19,8 +19,14 @@ It does not require a Drover cloud service.
 
 ## Screenshots
 
-Release-candidate iOS screenshots will be captured from the final redesign and
-added before the `v0.1.0` tag.
+<p align="center">
+  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view showing active sessions across two hosts" width="360">
+  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="360">
+</p>
+
+The fleet view groups live work by host and brings approvals and questions to
+the top. The launch sheet selects a host and harness, checks authentication,
+and carries model and reasoning preferences into the new session.
 
 ## How It Works
 

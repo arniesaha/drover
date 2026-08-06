@@ -116,7 +116,12 @@ def test_cli_init_writes_default_config(tmp_path):
     res = runner.invoke(main, ["--config", str(target), "init"])
     assert res.exit_code == 0, res.output
     assert target.exists()
-    assert "[paths]" in target.read_text()
+    text = target.read_text()
+    assert "[paths]" in text
+    assert 'principal_id = "unknown"' in text
+    assert 'principal_id = "arnab"' not in text
+    assert "192.168." not in text
+    assert "10.10." not in text
 
 
 def test_cli_init_does_not_overwrite_existing(tmp_path):
