@@ -1,4 +1,4 @@
-# renamed from nexus-*; live cluster still runs the nexus-* objects until cutover (§5b)
+# Example Prometheus scrape configuration for a private Drover deployment.
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,7 +13,7 @@ spec:
       protocol: TCP
       targetPort: 7080
 ---
-# renamed from nexus-*; live cluster still runs the nexus-* objects until cutover (§5b)
+# Replace the documentation address with the server's private LAN address.
 apiVersion: v1
 kind: Endpoints
 metadata:
@@ -23,13 +23,13 @@ metadata:
     app: drover-metrics
 subsets:
   - addresses:
-      - ip: 192.168.1.149
+      - ip: 192.0.2.10
     ports:
       - name: http
         port: 7080
         protocol: TCP
 ---
-# renamed from nexus-*; live cluster still runs the nexus-* objects until cutover (§5b)
+# Requires the Prometheus Operator custom resources.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

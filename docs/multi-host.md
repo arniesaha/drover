@@ -1,242 +1,91 @@
-# Drover — Multi-Host Fleet
+# Multi-Host Drover
 
-How to add a machine — on the LAN/tailnet or on the open internet — to a
-Drover fleet as a harness host, and how the hub reaches each shape of host.
+Start with the one-machine path in [Getting Started](getting-started.md). A
+multi-host fleet adds trusted machines over a private LAN or private Tailscale
+network; it does not change Drover's single-operator trust model.
 
-## Fleet topology
+## Topology
 
-```
-                    ┌─────────────────────────┐
-                    │   Hub — Mac Mini         │
-                    │   drover-server          │
-                    │   :7080 metrics/API      │
-                    │   :7077 MCP  :4317 OTLP  │
-                    └────────────┬─────────────┘
-                                 │
-        ┌────────────────────────┼────────────────────────┐
-        │ LAN / tailnet                                    │ internet
-        │ (inbound reachable)                              │ (via Tailscale Funnel)
-        ▼                                                   ▼
-┌───────────────────┐   ┌───────────────────┐   ┌───────────────────────┐
-│ Mac direct         │   │ NAS direct         │   │ Laptop (relay)         │
-│ drover-harnessd     │   │ drover-harnessd     │   │ drover-harnessd --relay │
-│ :7081, hub dials in │   │ :7081, hub dials in │   │ dials OUT to the hub's │
-│ launchd             │   │ systemd            │   │ public funnel URL      │
-└───────────────────┘   └───────────────────┘   └───────────────────────┘
+```text
+                       private LAN or tailnet
+
+ iOS app  ───────────────► drover-server :7080
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+          drover-harnessd :7081       outbound relay connection
+             direct host                   relay host
 ```
 
-The hub always registers a host the same way (`GET /harness/hosts`, chat,
-terminal attach all look identical from the app). What differs is *how the
-hub's requests reach the harness daemon*:
+The central server presents one fleet API. Each `drover-harnessd` owns local
+agent processes, structured sessions, and terminal I/O on its machine.
 
-- **Direct hosts** (Mac, NAS) are reachable inbound — the hub connects
-  straight to `host:7081` over LAN or tailnet.
-- **Relay hosts** (anywhere: a laptop off the tailnet, a machine behind NAT
-  you don't control) are not inbound-reachable, so the harness daemon dials
-  *out* to the hub instead (`--relay`) and the hub proxies requests back down
-  that outbound connection.
+## Direct Hosts
 
-## The three host shapes
-
-`scripts/enroll-host.sh` enrolls **relay hosts only** (`--relay`). Direct hosts
-use the pre-existing launchd/systemd units — see below for why.
-
-Before running it on a fresh clone:
+Use a direct host when the central server can reach its private address. Bind
+the daemon to the private interface and advertise the same reachable URL:
 
 ```bash
-cd <repo> && uv sync     # creates .venv/bin/drover-harnessd, which the plist runs
+uv run drover-harnessd \
+  --host-id build-mac \
+  --display-name "Build Mac" \
+  --kind macos \
+  --listen 0.0.0.0:7081 \
+  --local-url http://<private-host-address>:7081 \
+  --central-url http://<private-central-address>:7080
 ```
 
-The script refuses rather than installing anything if that binary is missing,
-if the token is wrong, or if the hub turns out not to be gating requests at
-all. Only once all three pass does it render
-`scripts/launchd/com.drover.harnessd-relay.plist.template` into
-`~/Library/LaunchAgents/com.drover.harnessd.plist` and load it.
+Restrict port `7081` to the trusted LAN or tailnet with host firewall rules.
+Do not advertise a public URL.
 
-### 1. Mac direct (hub-local or LAN-adjacent Mac)
+## Relay Hosts
 
-Reachable by the hub over LAN/tailnet. **Not enrollable with
-`enroll-host.sh`** — the plist it renders listens on `127.0.0.1:7081` and
-advertises no `--local-url`, so the hub would have no URL to dial and every
-request would return `harness host has no reachable endpoint`. The script
-refuses without `--relay` for exactly this reason.
-
-Use the existing launchd unit shape instead (see
-`scripts/launchd/README-nexus-server.md` for the hub-side
-`launchctl load`/`unload`/log-tail pattern), passing `--listen` on a
-LAN-reachable address and a matching `--local-url`. Teaching the script the
-direct shape is tracked work, not something to improvise at enroll time.
-
-### 2. NAS direct (systemd host)
-
-`enroll-host.sh` is launchd-only (macOS) — **no `drover-harnessd` systemd
-unit exists in this repo yet.** One needs to be written and tested when the
-NAS actually moves to running harnessd; until then this is guidance for
-writing that unit, not a ready-to-copy file.
-
-Follow the shape of the existing `scripts/systemd/*.template` units (e.g.
-`nexus-server.service.template`, `nexus-tempo-relay.service.template`),
-which invoke console scripts via `uv run` rather than an absolute venv
-path:
-
-```
-ExecStart=@@HOME@@/.local/bin/uv run --quiet drover-harnessd --host-id nas --central-url @@CENTRAL_URL@@ --listen 127.0.0.1:7081
-WorkingDirectory=@@REPO_DIR@@
-```
-
-with `WantedBy=default.target`, matching the other `*.template` units'
-`[Install]` section. (`<repo>/.venv/bin/drover-harnessd` — the same
-absolute-venv-binary shape `enroll-host.sh`/the launchd template use on
-macOS — also works once `uv sync` has populated `.venv`, since it's the
-same console script either way; `uv run` is just what every other unit in
-`scripts/systemd/` already does, so match that for consistency rather than
-introducing a second invocation style on the NAS.)
-
-Validate the token the same way the enroll script does, before enabling the
-unit:
+Use relay mode when inbound access to the host is undesirable or unavailable.
+The daemon opens an outbound WebSocket to the central server, which proxies
+fleet requests over that connection:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}' \
+uv run drover-harnessd \
+  --host-id laptop \
+  --display-name "Laptop" \
+  --kind macos \
+  --central-url http://<private-central-address>:7080 \
+  --relay
+```
+
+The central address must still be private to your LAN or tailnet. Do not use
+Tailscale Funnel. A relay host should not set `--local-url` or
+`--tailscale-url`; its outbound connection is the route.
+
+## Authentication
+
+The central server and every host currently share one bearer token. The daemon
+resolves it from `--host-token`, `DROVER_API_TOKEN`, or
+`~/.drover/api_token`. Prefer the environment or token file so it does not
+appear in shell history.
+
+Because v0.1 does not bind a credential to a specific `host-id`, every host
+belongs to the same trust domain. Do not enroll a machine you do not fully
+control. See [Security](security.md).
+
+## Validation
+
+From the central machine:
+
+```bash
+curl -fsS \
   -H "Authorization: Bearer $(cat ~/.drover/api_token)" \
-  <hub-url>/harness/hosts
-# must print 200 before you `systemctl enable --now` anything
+  http://127.0.0.1:7080/harness/hosts
 ```
 
-### 3. Laptop (relay)
+Confirm each host reports the expected connection type and a current
+heartbeat. Then connect through the iOS app, open a session on each host, send
+a turn, and verify terminal attach only on machines where you intend to allow
+it.
 
-Not inbound-reachable — dials out through `--relay` to the hub's public
-Tailscale Funnel URL:
+## Service Installation
 
-```bash
-cd <repo> && uv sync   # the plist runs .venv/bin/drover-harnessd by absolute path
-./scripts/enroll-host.sh --host-id work-laptop --central-url https://mini.tailnet.ts.net --relay
-```
-
-The daemon still listens on `127.0.0.1:7081` locally (for `drover-collect`
-and local tooling) but registers itself over an *outbound* WebSocket to
-`--central-url`; the hub proxies fleet requests down that connection instead
-of dialing the laptop directly.
-
-`--central-url` accepts `http://`, `https://`, `ws://`, or `wss://` (`ws`/`wss`
-are aliased to `http`/`https`); any other scheme is a hard config error at
-startup. The funnel URL is always `https://…`.
-
-> **Never pass `--local-url` or `--tailscale-url` on a relay host.** A relay
-> host has no meaningful inbound URL — its outbound socket is the only way in.
-> Every host shape in this repo listens on `127.0.0.1:7081`, so a URL on a
-> relay host's registry row would resolve against the *hub's own loopback*.
-> The hub refuses to dial a `connection_kind = "relay"` host by URL for
-> exactly this reason (it returns `502 relay host is not connected` instead),
-> but don't set one in the first place.
-
-## Tailscale Funnel setup (hub side)
-
-The hub's metrics/API port (`7080`) is what needs to be reachable from the
-public internet for relay hosts to dial in and for the iOS app to work off
-the tailnet (e.g. on cellular).
-
-**Do these in order. Step 1 is not optional.**
-
-1. **Prove auth is actually on, before anything is public.** The funnel makes
-   `/harness/*` — including `/harness/relay` and terminal attach — reachable
-   from the whole internet, and the bearer token is the only gate. If the
-   hub's config has auth disabled, every one of those endpoints is world
-   writable the instant the funnel comes up.
-
-   ```bash
-   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7080/harness/hosts
-   # must print 401 (or 403). A 200 means auth is OFF -- fix that first.
-   ```
-
-   `enroll-host.sh` runs this same check and refuses to enroll a host against
-   an ungated hub, but the funnel can go up without it, so check here too.
-
-2. **Turn the hub's :7080 into a public HTTPS URL.**
-
-   ```bash
-   tailscale funnel --bg 7080
-   ```
-
-3. **Read back the assigned URL and confirm it is live.**
-
-   ```bash
-   tailscale funnel status
-   ```
-
-4. **Re-run the bare check against the public URL**, since that is the surface
-   that actually matters:
-
-   ```bash
-   curl -s -o /dev/null -w '%{http_code}\n' https://<machine>.<tailnet>.ts.net/harness/hosts
-   # must print 401 (or 403)
-   ```
-
-To take it back down:
-
-```bash
-tailscale funnel --https=443 off
-```
-
-`tailscale funnel status` prints the public `https://<machine>.<tailnet>.ts.net`
-URL once the funnel is up — that's the value to pass as `--central-url` to
-relay hosts. `tailscale funnel --bg` keeps the funnel running across
-reboots/logouts; re-run `tailscale funnel status` any time to confirm it's
-still active.
-
-## Security
-
-The funnel URL is **public** — anyone with the URL can reach `/harness/*`.
-The bearer token (`~/.drover/api_token` / `DROVER_API_TOKEN`) is the *only*
-gate on that surface; there is currently one shared token for the whole
-fleet. Rotate it via the existing manual rotation flow (write a new value
-into `~/.drover/api_token` on every host, verify `401` bare / `200` with the
-new bearer token, update any stored copies — see the Mac + NAS token
-rotation entry in `docs/porting-and-cutover.md` for the exact steps that
-were run last time).
-
-Per-host tokens (so a single leaked host credential doesn't expose the whole
-fleet) are **not implemented yet** — tracked as a follow-up issue, not a gap
-to work around today. Don't hand out the shared token to anything you don't
-fully trust.
-
-With one shared token, any holder of it can also **claim any `host_id`** on
-the relay endpoint, not just read data: a relay spoke attaches by declaring
-its own `host_id` in its hello, attach is newest-wins, and nothing ties a
-`host_id` to a specific token or client. A second spoke that attaches with
-an existing host's `host_id` silently displaces the real one — the fleet
-keeps showing that host as online, but every request routed to it now
-executes on the impersonator instead. This is a silent takeover, not a loud
-one: there is no conflict error, no alert, just a different machine quietly
-answering in that host's name. Per-host tokens are the tracked follow-up
-that closes this. Treat it as a live property of today's setup, and decide
-deliberately — before enrolling a machine you don't fully control, such as a
-corporate laptop — rather than discovering it later.
-
-## Troubleshooting
-
-**Relay host shows offline in the app:**
-
-1. Check the laptop's own logs first — the daemon logs locally even when it
-   can't reach the hub:
-   ```bash
-   tail -f ~/Library/Logs/drover/harnessd.err.log
-   tail -f ~/Library/Logs/drover/harnessd.out.log
-   ```
-2. Check the funnel is actually up on the hub:
-   ```bash
-   tailscale funnel status
-   ```
-   If it's not listed as running, relay hosts have nothing to dial into —
-   restart it with `tailscale funnel --bg 7080`.
-3. Check the token. A relay host that started with a stale/rotated token
-   will fail to register; re-run `enroll-host.sh` (it re-validates the token
-   before touching launchd) or update `~/.drover/api_token` and reload:
-   ```bash
-   launchctl unload ~/Library/LaunchAgents/com.drover.harnessd.plist
-   launchctl load ~/Library/LaunchAgents/com.drover.harnessd.plist
-   ```
-
-**Direct host (Mac/NAS) shows offline:** same log/token checks as above,
-plus confirm the hub can actually reach `host:7081` on the LAN/tailnet
-(direct hosts don't need the funnel at all — that's only for relay hosts and
-the iOS app's off-tailnet path).
+The repository includes launchd and systemd templates under `scripts/`. Treat
+them as starting points: review paths, bind addresses, environment variables,
+and token-file permissions before loading a service. Source-build service
+packaging remains in progress for v0.1.
