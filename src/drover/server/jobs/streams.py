@@ -235,6 +235,19 @@ class JobStream:
         if pe is not None:
             pe.last_error = error
 
+    def defer(self, entry_id: str, *, until_ms: int) -> bool:
+        """Keep a pending entry invisible until ``until_ms`` without a delivery.
+
+        Redis visibility is measured from ``last_delivered_ms``. Positioning
+        that clock one visibility window before the durable due time makes the
+        entry reclaimable at the due time while preserving its delivery count.
+        """
+        pe = self._pel.get(entry_id)
+        if pe is None:
+            return False
+        pe.last_delivered_ms = int(until_ms) - self.visibility_timeout_ms
+        return True
+
     # -- janitor: XAUTOCLAIM + dead-letter policy ------------------------
 
     def reclaim(self, consumer: str, count: int = 10) -> List[Delivery]:

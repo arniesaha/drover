@@ -1204,6 +1204,7 @@ def run(
                 host=mcp_host,
                 port=cfg.mcp_http_port,
                 backend_config=mcp_backend_cfg,
+                summarize_job_stream=job_streams.get("summarize"),
             )
 
             def _run_mcp() -> None:

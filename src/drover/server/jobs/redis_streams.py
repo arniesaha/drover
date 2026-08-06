@@ -124,6 +124,23 @@ class RedisJobStream:
     def fail(self, entry_id: str, error: str) -> None:
         self._client.hset(self.error_hash, entry_id, _redact_error(error))
 
+    def defer(self, entry_id: str, *, until_ms: int) -> bool:
+        """Move a pending entry's idle clock to its durable retry due time."""
+        pending = self._pending_entry(entry_id)
+        if pending is None:
+            return False
+        last_delivered_ms = max(0, int(until_ms) - self.config.visibility_timeout_ms)
+        rows = self._client.xclaim(
+            self.name,
+            self.group,
+            pending.consumer,
+            0,
+            [entry_id],
+            time=last_delivered_ms,
+            retrycount=pending.delivery_count,
+        )
+        return bool(rows)
+
     # -- janitor: XAUTOCLAIM + DLQ -------------------------------------
 
     def reclaim(self, consumer: str, count: int = 10) -> List[Delivery]:

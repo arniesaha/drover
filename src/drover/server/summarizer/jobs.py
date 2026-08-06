@@ -50,6 +50,18 @@ def enqueue_summary_generation(
     con: duckdb.DuckDBPyConnection, session_id: str, source_version: str
 ) -> bool:
     """Open a runnable generation only when the immutable source changed."""
+    legacy = con.execute(
+        """UPDATE summarize_jobs
+              SET source_version = ?, updated_at = now()
+            WHERE session_id = ? AND source_version IS NULL
+            RETURNING session_id""",
+        [source_version, session_id],
+    ).fetchone()
+    if legacy is not None:
+        # A null legacy version carries no evidence that its source changed.
+        # Backfill its identity without resetting or republishing the generation.
+        return False
+
     row = con.execute(
         """INSERT INTO summarize_jobs
              (session_id, status, attempts, source_version, max_attempts,

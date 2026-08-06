@@ -56,6 +56,24 @@ def test_new_source_version_opens_fresh_generation(tmp_path: Path) -> None:
         con.close()
 
 
+def test_legacy_null_source_version_is_backfilled_without_reset(tmp_path: Path) -> None:
+    con, _ = _bootstrapped(tmp_path)
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, source_version) "
+            "VALUES ('s1', 'dead_lettered', 5, NULL)"
+        )
+
+        assert enqueue_summary_generation(con, "s1", "v1") is False
+        assert con.execute(
+            "SELECT source_version, status, attempts FROM summarize_jobs "
+            "WHERE session_id='s1'"
+        ).fetchone() == ("v1", "dead_lettered", 5)
+    finally:
+        con.close()
+
+
 def test_failure_waits_with_capped_exponential_backoff(tmp_path: Path) -> None:
     con, _ = _bootstrapped(tmp_path)
     now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)

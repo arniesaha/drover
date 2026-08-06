@@ -21,6 +21,10 @@ from drover.event_identity import canonical_agent_events_cte
 from drover.server.db import open_duckdb_connection
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import quality_snapshot
+from drover.server.summarizer.jobs import (
+    enqueue_summary_generation,
+    source_version_for_session,
+)
 from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.mcp.tools")
@@ -369,11 +373,13 @@ def drover_session_close(
     *,
     duckdb_path: Path,
     session_id: str,
+    summarize_job_stream: object | None = None,
 ) -> dict:
-    """Enqueue a summarize_jobs row for ``session_id``.
+    """Enqueue the current source generation for ``session_id``.
 
-    Idempotent: if a row already exists in any non-terminal state, no-op.
-    Returns ``{"session_id": ..., "status": "queued"|"already_queued"|"already_done"}``.
+    Only a changed source generation resets the serving row and publishes a
+    stream delivery. Legacy null versions are backfilled without resetting the
+    row's existing retry budget.
     """
     con = open_duckdb_connection(duckdb_path)
     try:
@@ -381,25 +387,25 @@ def drover_session_close(
             "SELECT status FROM summarize_jobs WHERE session_id=?",
             [session_id],
         ).fetchone()
-        if existing:
-            status = existing[0]
-            if status == "done":
-                return {"session_id": session_id, "status": "already_done"}
-            if status in ("pending", "running"):
-                return {"session_id": session_id, "status": "already_queued"}
-            # status == 'errored' — re-queue
-            con.execute(
-                "UPDATE summarize_jobs SET status='pending', last_error=NULL, updated_at=now() WHERE session_id=?",
-                [session_id],
+        source_version = source_version_for_session(con, session_id)
+        created = enqueue_summary_generation(con, session_id, source_version)
+        if created and summarize_job_stream is not None:
+            summarize_job_stream.add(
+                {"session_id": session_id, "source_version": source_version}
             )
-            return {"session_id": session_id, "status": "requeued"}
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts) VALUES (?, 'pending', 0)",
-            [session_id],
-        )
     finally:
         con.close()
-    return {"session_id": session_id, "status": "queued"}
+    if existing is None:
+        status = "queued"
+    elif created:
+        status = "requeued"
+    elif existing[0] == "done":
+        status = "already_done"
+    elif existing[0] == "dead_lettered":
+        status = "dead_lettered"
+    else:
+        status = "already_queued"
+    return {"session_id": session_id, "status": status}
 
 
 # --- drover_project_brief -----------------------------------------------------
