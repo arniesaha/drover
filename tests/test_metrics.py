@@ -472,6 +472,14 @@ def test_wire_datetime_adds_offset_to_naive_server_strings():
     assert datetime.fromisoformat(rendered).tzinfo is not None
 
 
+def test_wire_datetime_normalizes_aware_values_to_utc():
+    pacific = timezone(timedelta(hours=-7))
+
+    rendered = metrics._wire_datetime(datetime(2026, 8, 5, 14, 1, 49, tzinfo=pacific))
+
+    assert rendered == "2026-08-05T21:01:49+00:00"
+
+
 def test_harness_snapshot_includes_latest_user_or_assistant_preview(tmp_path):
     collector = _make_collector(tmp_path)
     registry = HarnessRegistry(collector.duckdb_path)

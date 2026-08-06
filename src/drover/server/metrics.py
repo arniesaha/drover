@@ -354,16 +354,18 @@ def _wire_datetime(value: Any) -> str | None:
     if value is None:
         return None
 
-    def with_local_timezone(candidate: datetime) -> datetime:
-        return candidate.astimezone() if candidate.tzinfo is None else candidate
-
     if not isinstance(value, datetime):
         parsed = _parse_event_timestamp(value)
-        return with_local_timezone(parsed).isoformat() if parsed else str(value)
+        if parsed is None:
+            return str(value)
+        value = parsed
     # DuckDB TIMESTAMP columns round-trip aware datetimes as naive local wall
-    # time. Give clients an explicit offset so they do not reinterpret local
-    # Pacific times as UTC and render fresh sessions as seven hours old.
-    return with_local_timezone(value).isoformat()
+    # time. Attach the process timezone before normalizing to UTC so clients do
+    # not reinterpret local Pacific times as UTC and render fresh sessions as
+    # seven hours old.
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value.astimezone(timezone.utc).isoformat()
 
 
 def _wire_datetimes(item: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
