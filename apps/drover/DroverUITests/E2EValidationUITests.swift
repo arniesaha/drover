@@ -16,14 +16,21 @@ final class E2EValidationUITests: XCTestCase {
         // clear it: XCUITest fires it on the next interaction that finds the
         // app blocked, dismisses the alert, and retries the interaction.
         addUIInterruptionMonitor(withDescription: "System dialogs") { alert in
-            for label in ["Allow", "Not Now", "Don’t Save", "OK"] {
-                let button = alert.buttons[label]
-                if button.exists {
-                    button.tap()
-                    return true
+            // The handler is delivered on the main thread but typed as a
+            // nonisolated @Sendable closure, and XCUIElement is main-actor
+            // isolated — so under Swift 6 checking this needs an explicit
+            // assumption rather than a hop, since the monitor has to answer
+            // synchronously with whether it handled the alert.
+            MainActor.assumeIsolated {
+                for label in ["Allow", "Not Now", "Don’t Save", "OK"] {
+                    let button = alert.buttons[label]
+                    if button.exists {
+                        button.tap()
+                        return true
+                    }
                 }
+                return false
             }
-            return false
         }
     }
 
