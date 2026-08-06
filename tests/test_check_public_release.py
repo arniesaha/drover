@@ -1,6 +1,15 @@
+import importlib.util
 from pathlib import Path
+import sys
 
-from scripts.check_public_release import check_paths
+
+SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "check_public_release.py"
+SPEC = importlib.util.spec_from_file_location("check_public_release", SCRIPT_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+check_paths = MODULE.check_paths
 
 
 def write_file(root: Path, relative: str, content: str) -> Path:
