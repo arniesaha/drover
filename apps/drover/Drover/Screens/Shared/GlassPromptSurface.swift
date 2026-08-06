@@ -18,7 +18,6 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     let attachmentButton: AttachmentButton
     let onSend: () -> Void
 
-    @Environment(\.colorScheme) private var colorScheme
     @FocusState private var isTextFocused: Bool
 
     init(
@@ -104,27 +103,15 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         .padding(.horizontal, 18)
         .padding(.top, attachments.isEmpty ? 16 : 14)
         .padding(.bottom, 14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
-        .background(surfaceTint, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+        // Nocturne separates surfaces by ramp step and a hairline, not by
+        // material and drop shadow: the composer is `sheet` lifted off `bg`,
+        // outlined in `line`. Dropping the shadow also drops this view's last
+        // reason to know which theme it is in.
+        .background(DroverColor.sheet, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 30, style: .continuous)
-                .strokeBorder(borderStyle, lineWidth: 1)
+                .strokeBorder(DroverColor.line, lineWidth: 1)
         }
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.4 : 0.16), radius: 20, y: 10)
-    }
-
-    private var surfaceTint: some ShapeStyle {
-        if colorScheme == .dark {
-            return AnyShapeStyle(.black.opacity(0.72))
-        }
-        return AnyShapeStyle(.white.opacity(0.68))
-    }
-
-    private var borderStyle: some ShapeStyle {
-        if colorScheme == .dark {
-            return AnyShapeStyle(.white.opacity(0.12))
-        }
-        return AnyShapeStyle(.black.opacity(0.08))
     }
 
     private var sendFill: some ShapeStyle {
