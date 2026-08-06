@@ -39,6 +39,10 @@ struct ChatView: View {
 
             transcript
 
+            if !model.artifacts.isEmpty {
+                ArtifactRows(artifacts: model.artifacts)
+            }
+
             if let approval = model.pendingApproval {
                 DecisionBlock(
                     approval: approval,
