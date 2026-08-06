@@ -65,8 +65,9 @@ def enqueue_summary_generation(
     row = con.execute(
         """INSERT INTO summarize_jobs
              (session_id, status, attempts, source_version, max_attempts,
-              last_error, next_run_at, dead_lettered_at, updated_at)
-             VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now())
+              last_error, next_run_at, dead_lettered_at, updated_at,
+              stream_publish_needed)
+             VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now(), TRUE)
              ON CONFLICT (session_id) DO UPDATE SET
                source_version = excluded.source_version,
                status = 'pending',
@@ -75,12 +76,41 @@ def enqueue_summary_generation(
                last_error = NULL,
                next_run_at = NULL,
                dead_lettered_at = NULL,
-               updated_at = now()
+               updated_at = now(),
+               stream_publish_needed = TRUE
              WHERE summarize_jobs.source_version IS DISTINCT FROM excluded.source_version
              RETURNING session_id""",
         [session_id, source_version, SUMMARY_MAX_ATTEMPTS],
     ).fetchone()
     return row is not None
+
+
+def publish_summary_generation(
+    con: duckdb.DuckDBPyConnection,
+    session_id: str,
+    source_version: str,
+    stream: object | None,
+) -> bool:
+    """Publish a durable pending generation with at-least-once semantics."""
+    if stream is None:
+        return False
+    pending = con.execute(
+        """SELECT 1 FROM summarize_jobs
+             WHERE session_id=?
+               AND source_version IS NOT DISTINCT FROM ?
+               AND COALESCE(stream_publish_needed, FALSE)""",
+        [session_id, source_version],
+    ).fetchone()
+    if pending is None:
+        return False
+    stream.add({"session_id": session_id, "source_version": source_version})
+    con.execute(
+        """UPDATE summarize_jobs SET stream_publish_needed=FALSE
+             WHERE session_id=?
+               AND source_version IS NOT DISTINCT FROM ?""",
+        [session_id, source_version],
+    )
+    return True
 
 
 def finish_summary_failure(
@@ -91,46 +121,58 @@ def finish_summary_failure(
     *,
     now: datetime,
     jitter: Callable[[float, float], float],
-) -> Literal["retry_wait", "dead_lettered"]:
+) -> Literal["retry_wait", "dead_lettered", "stale"]:
     """Spend one failure from the matching source generation's retry budget."""
-    row = con.execute(
-        """SELECT attempts, COALESCE(max_attempts, ?)
-             FROM summarize_jobs
-            WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?""",
-        [SUMMARY_MAX_ATTEMPTS, session_id, source_version],
-    ).fetchone()
-    if row is None:
-        # Claim paths reject stale deliveries before backend execution. Retain a
-        # no-op guard here so a late failure can never mutate a newer generation.
-        return "retry_wait"
+    try:
+        con.execute("BEGIN TRANSACTION")
+        row = con.execute(
+            """SELECT attempts, COALESCE(max_attempts, ?)
+                 FROM summarize_jobs
+                WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?""",
+            [SUMMARY_MAX_ATTEMPTS, session_id, source_version],
+        ).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            return "stale"
 
-    attempts = int(row[0] or 0) + 1
-    max_attempts = int(row[1] or SUMMARY_MAX_ATTEMPTS)
-    terminal = attempts >= max_attempts
-    status = "dead_lettered" if terminal else "retry_wait"
-    base_seconds = min(60 * (2 ** max(0, attempts - 1)), 3600)
-    next_run_at = (
-        None
-        if terminal
-        else _duckdb_timestamp(now)
-        + timedelta(seconds=base_seconds + jitter(0, base_seconds * 0.2))
-    )
-    stored_now = _duckdb_timestamp(now)
-    dead_lettered_at = stored_now if terminal else None
-    con.execute(
-        """UPDATE summarize_jobs
-              SET status = ?, attempts = ?, last_error = ?, next_run_at = ?,
-                  dead_lettered_at = ?, updated_at = ?
-            WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?""",
-        [
-            status,
-            attempts,
-            error,
-            next_run_at,
-            dead_lettered_at,
-            stored_now,
-            session_id,
-            source_version,
-        ],
-    )
-    return status
+        attempts = int(row[0] or 0) + 1
+        max_attempts = int(row[1] or SUMMARY_MAX_ATTEMPTS)
+        terminal = attempts >= max_attempts
+        status = "dead_lettered" if terminal else "retry_wait"
+        base_seconds = min(60 * (2 ** max(0, attempts - 1)), 3600)
+        next_run_at = (
+            None
+            if terminal
+            else _duckdb_timestamp(now)
+            + timedelta(seconds=base_seconds + jitter(0, base_seconds * 0.2))
+        )
+        stored_now = _duckdb_timestamp(now)
+        dead_lettered_at = stored_now if terminal else None
+        updated = con.execute(
+            """UPDATE summarize_jobs
+                  SET status = ?, attempts = ?, last_error = ?, next_run_at = ?,
+                      dead_lettered_at = ?, updated_at = ?
+                WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?
+                RETURNING session_id""",
+            [
+                status,
+                attempts,
+                error,
+                next_run_at,
+                dead_lettered_at,
+                stored_now,
+                session_id,
+                source_version,
+            ],
+        ).fetchone()
+        if updated is None:
+            con.execute("ROLLBACK")
+            return "stale"
+        con.execute("COMMIT")
+        return status
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except duckdb.Error:
+            pass
+        raise

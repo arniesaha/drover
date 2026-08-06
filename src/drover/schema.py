@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS summarize_jobs (
   source_version   VARCHAR,
   max_attempts     INTEGER DEFAULT 5,
   next_run_at      TIMESTAMP,
-  dead_lettered_at TIMESTAMP
+  dead_lettered_at TIMESTAMP,
+  stream_publish_needed BOOLEAN DEFAULT FALSE
 );
 """
 
@@ -115,6 +116,7 @@ _SUMMARIZE_JOBS_COLUMNS = {
     "max_attempts": "INTEGER DEFAULT 5",
     "next_run_at": "TIMESTAMP",
     "dead_lettered_at": "TIMESTAMP",
+    "stream_publish_needed": "BOOLEAN DEFAULT FALSE",
 }
 
 # Project-level rollup keyed by `<repo_owner>/<repo_name>`. One row per

@@ -133,3 +133,54 @@ def test_close_publishes_only_changed_source_generation(
         {"session_id": "s1", "source_version": "v1"},
         {"session_id": "s1", "source_version": "v2"},
     ]
+
+
+def test_close_retries_publish_after_stream_failure_without_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _seed(tmp_path)
+    monkeypatch.setattr(
+        "drover.server.mcp.tools.source_version_for_session", lambda con, sid: "v1"
+    )
+
+    class FlakyStream:
+        calls = 0
+        published: list[dict] = []
+
+        def add(self, fields: dict) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("redis unavailable")
+            self.published.append(fields)
+            return "1-0"
+
+    stream = FlakyStream()
+    with pytest.raises(RuntimeError, match="redis unavailable"):
+        drover_session_close(
+            duckdb_path=db, session_id="s1", summarize_job_stream=stream
+        )
+
+    con = duckdb.connect(str(db))
+    try:
+        assert con.execute(
+            "SELECT source_version, status, attempts, stream_publish_needed "
+            "FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == ("v1", "pending", 0, True)
+    finally:
+        con.close()
+
+    assert (
+        drover_session_close(
+            duckdb_path=db, session_id="s1", summarize_job_stream=stream
+        )["status"]
+        == "already_queued"
+    )
+    assert stream.published == [{"session_id": "s1", "source_version": "v1"}]
+    con = duckdb.connect(str(db))
+    try:
+        assert con.execute(
+            "SELECT attempts, stream_publish_needed FROM summarize_jobs "
+            "WHERE session_id='s1'"
+        ).fetchone() == (0, False)
+    finally:
+        con.close()

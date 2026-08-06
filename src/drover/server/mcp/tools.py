@@ -23,6 +23,7 @@ from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import quality_snapshot
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
+    publish_summary_generation,
     source_version_for_session,
 )
 from drover.task_id import compute_task_id
@@ -389,10 +390,9 @@ def drover_session_close(
         ).fetchone()
         source_version = source_version_for_session(con, session_id)
         created = enqueue_summary_generation(con, session_id, source_version)
-        if created and summarize_job_stream is not None:
-            summarize_job_stream.add(
-                {"session_id": session_id, "source_version": source_version}
-            )
+        publish_summary_generation(
+            con, session_id, source_version, summarize_job_stream
+        )
     finally:
         con.close()
     if existing is None:

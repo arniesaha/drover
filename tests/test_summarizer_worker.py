@@ -719,3 +719,108 @@ def test_stale_inflight_failure_acks_and_closes_ledger_attempt(tmp_path: Path) -
     finally:
         con.close()
     assert stream.pending() == []
+
+
+def test_generation_change_at_post_persist_seam_blocks_all_success_effects(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _write_events(parquet_dir, "s1")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('s1', 'pending', 'v1')"
+        )
+    finally:
+        con.close()
+
+    def supersede_before_success_effects() -> None:
+        con = duckdb.connect(str(duckdb_path))
+        try:
+            enqueue_summary_generation(con, "s1", "v2")
+        finally:
+            con.close()
+
+    stream = JobStream("summarize_jobs")
+    stream.add({"session_id": "s1", "source_version": "v1"})
+    brief_stream = JobStream("brief_jobs")
+    embed_stream = JobStream("embed_jobs")
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path,
+        backend=_StubBackend(),
+        job_stream=stream,
+        brief_job_stream=brief_stream,
+        embed_job_stream=embed_stream,
+        _before_success_effects=supersede_before_success_effects,
+    )
+
+    assert worker.drain_once() == 1
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT source_version, status FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == ("v2", "pending")
+        assert con.execute(
+            "SELECT count(*) FROM session_summaries WHERE session_id='s1'"
+        ).fetchone() == (0,)
+        assert con.execute(
+            "SELECT status FROM pipeline_jobs WHERE subject_key='s1'"
+        ).fetchone() == ("dead_lettered",)
+        assert con.execute("SELECT count(*) FROM brief_jobs").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM embed_jobs").fetchone() == (0,)
+    finally:
+        con.close()
+    assert brief_stream.length() == 0
+    assert embed_stream.length() == 0
+    assert stream.pending() == []
+
+
+def test_generation_change_at_failure_finish_seam_is_atomically_stale(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _write_events(parquet_dir, "s1")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('s1', 'pending', 'v1')"
+        )
+    finally:
+        con.close()
+
+    def supersede_before_failure_finish() -> None:
+        con = duckdb.connect(str(duckdb_path))
+        try:
+            enqueue_summary_generation(con, "s1", "v2")
+        finally:
+            con.close()
+
+    class FailingBackend(_StubBackend):
+        def summarize(self, prompt: str) -> dict:
+            self.calls += 1
+            raise RuntimeError("backend failed")
+
+    stream = JobStream("summarize_jobs")
+    stream.add({"session_id": "s1", "source_version": "v1"})
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path,
+        backend=FailingBackend(),
+        job_stream=stream,
+        _before_failure_finish=supersede_before_failure_finish,
+    )
+
+    assert worker.drain_once() == 1
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT source_version, status, attempts FROM summarize_jobs "
+            "WHERE session_id='s1'"
+        ).fetchone() == ("v2", "pending", 0)
+        assert con.execute(
+            "SELECT status FROM pipeline_jobs WHERE subject_key='s1'"
+        ).fetchone() == ("dead_lettered",)
+    finally:
+        con.close()
+    assert stream.pending() == []

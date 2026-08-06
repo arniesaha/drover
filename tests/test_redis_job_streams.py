@@ -123,9 +123,13 @@ class FakeRedis:
             pe = pel[entry_id]
             pe["consumer"] = consumername
             if kwargs.get("time") is not None:
-                pe["last_delivered_ms"] = int(kwargs["time"])
+                # Redis clamps future XCLAIM TIME values to server time.
+                pe["last_delivered_ms"] = min(int(kwargs["time"]), self.now_ms)
             if kwargs.get("retrycount") is not None:
                 pe["times_delivered"] = int(kwargs["retrycount"])
+            else:
+                pe["times_delivered"] += 1
+            pe["last_delivered_ms"] = self.now_ms
             out.append((entry_id, dict(entries[entry_id])))
         return out
 
@@ -155,6 +159,19 @@ class FakeRedis:
 
     def hdel(self, name, key):
         self.hashes.get(name, {}).pop(key, None)
+
+    def time(self):
+        return self.now_ms // 1000, (self.now_ms % 1000) * 1000
+
+    def zadd(self, name, mapping):
+        self.hashes.setdefault(name, {}).update(mapping)
+        return len(mapping)
+
+    def zscore(self, name, key):
+        return self.hashes.get(name, {}).get(key)
+
+    def zrem(self, name, key):
+        return 1 if self.hashes.get(name, {}).pop(key, None) is not None else 0
 
 
 def _id_key(entry_id: str) -> tuple[int, int]:
@@ -225,7 +242,7 @@ def test_redis_adapter_defers_without_spending_transport_attempts():
     client.advance(60_000)
     (reclaimed,) = stream.reclaim("worker-b")
     assert reclaimed.delivery_count == 2
-    assert client.xclaim_calls[0]["retrycount"] == 1
+    assert client.xclaim_calls[0].get("time") is None
 
 
 def test_redis_adapter_backoffs_preserve_five_backend_executions():

@@ -25,6 +25,7 @@ from drover.server.ingest import ingest_file
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
+    publish_summary_generation,
     source_version_for_session,
 )
 
@@ -164,14 +165,13 @@ class _Handler(FileSystemEventHandler):
             try:
                 for sid in session_ids:
                     source_version = source_version_for_session(con, str(sid))
-                    created = enqueue_summary_generation(con, str(sid), source_version)
-                    if created and self._summarize_job_stream is not None:
-                        self._summarize_job_stream.add(
-                            {
-                                "session_id": str(sid),
-                                "source_version": source_version,
-                            }
-                        )
+                    enqueue_summary_generation(con, str(sid), source_version)
+                    publish_summary_generation(
+                        con,
+                        str(sid),
+                        source_version,
+                        self._summarize_job_stream,
+                    )
                 log.info(
                     "enqueued %d summarize_job(s) for %s",
                     len(session_ids),

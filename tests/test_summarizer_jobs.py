@@ -140,7 +140,7 @@ def test_stale_failure_cannot_spend_new_generation_budget(tmp_path: Path) -> Non
             jitter=lambda _low, _high: 0,
         )
 
-        assert outcome == "retry_wait"
+        assert outcome == "stale"
         assert con.execute(
             "SELECT status, attempts, last_error FROM summarize_jobs "
             "WHERE session_id='s1'"
@@ -199,5 +199,6 @@ def test_bootstrap_adds_retry_columns_to_existing_table(tmp_path: Path) -> None:
         assert columns["max_attempts"] == "5"
         assert columns["next_run_at"] is None
         assert columns["dead_lettered_at"] is None
+        assert columns["stream_publish_needed"] is not None
     finally:
         con.close()
