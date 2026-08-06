@@ -65,8 +65,13 @@ struct ChatView: View {
                 Task { await model.sendTurn() }
             }
         }
+        .background(DroverColor.bg)
         .navigationTitle(model.harnessPresentation.name)
         .navigationBarTitleDisplayMode(.inline)
+        // Without an explicit bar background the transcript scrolls under a
+        // transparent bar and ghosts through the title.
+        .toolbarBackground(DroverColor.bg, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .toolbar { toolbarContent }
         .confirmationDialog("Terminate this session?", isPresented: $showTerminateConfirm,
                             titleVisibility: .visible) {

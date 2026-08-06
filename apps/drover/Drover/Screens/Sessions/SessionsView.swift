@@ -79,6 +79,8 @@ struct SessionsView: View {
         .background(DroverColor.bg)
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(DroverColor.bg, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .overlay {
             if !store.hasLoadedOnce {
                 if let error = store.lastError {
