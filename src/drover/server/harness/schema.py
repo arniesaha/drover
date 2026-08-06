@@ -74,20 +74,44 @@ class LegacySequenceMigrationReport:
     mixed_sessions: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class LegacySequenceAuditReport:
+    null_event_count: int
+    all_null_sessions: tuple[str, ...]
+    mixed_sessions: tuple[str, ...]
+
+
+def audit_legacy_harness_event_sequences(
+    con: duckdb.DuckDBPyConnection,
+) -> LegacySequenceAuditReport:
+    """Classify sessions affected by legacy null event sequences."""
+    rows = con.execute("""
+        SELECT
+            session_id,
+            count(*) FILTER (WHERE seq IS NULL) AS null_count,
+            count(*) FILTER (WHERE seq IS NOT NULL) AS sequenced_count
+        FROM harness_events
+        GROUP BY session_id
+        HAVING count(*) FILTER (WHERE seq IS NULL) > 0
+        ORDER BY session_id
+        """).fetchall()
+    all_null = tuple(
+        str(session_id) for session_id, _, sequenced in rows if not sequenced
+    )
+    mixed = tuple(str(session_id) for session_id, _, sequenced in rows if sequenced)
+    return LegacySequenceAuditReport(
+        null_event_count=sum(int(null_count) for _, null_count, _ in rows),
+        all_null_sessions=all_null,
+        mixed_sessions=mixed,
+    )
+
+
 def migrate_legacy_harness_event_sequences(
     con: duckdb.DuckDBPyConnection,
 ) -> LegacySequenceMigrationReport:
-    mixed = tuple(row[0] for row in con.execute("""
-            SELECT session_id FROM harness_events GROUP BY session_id
-            HAVING count(*) FILTER (WHERE seq IS NULL) > 0
-               AND count(*) FILTER (WHERE seq IS NOT NULL) > 0
-            ORDER BY session_id
-            """).fetchall())
-    eligible = [row[0] for row in con.execute("""
-            SELECT session_id FROM harness_events GROUP BY session_id
-            HAVING count(*) > 0 AND count(seq) = 0
-            ORDER BY session_id
-            """).fetchall()]
+    audit = audit_legacy_harness_event_sequences(con)
+    mixed = audit.mixed_sessions
+    eligible = audit.all_null_sessions
     migrated_events = 0
     con.execute("BEGIN TRANSACTION")
     try:

@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import click
 import duckdb
@@ -40,7 +40,11 @@ from drover.server.context_catalog import (
 )
 from drover.server.doctor import audit_lakehouse, format_runtime_audit, runtime_audit
 from drover.server.mcp import tools as mcp_tools
-from drover.server.metrics import MetricsCollector, start_metrics_server
+from drover.server.metrics import (
+    MetricsCollector,
+    sequence_health_report,
+    start_metrics_server,
+)
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.web.auth import load_auth
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -419,6 +423,67 @@ def _parse_listen_address(value: str) -> tuple[str, int]:
 @main.group(name="session")
 def session_cmd() -> None:
     """Inspect recorded session data."""
+
+
+@main.group(name="harness")
+def harness_cmd() -> None:
+    """Audit and migrate Meta Harness data."""
+
+
+def _sequence_command_payload(db_path: Path, *, apply: bool) -> dict[str, Any]:
+    report = sequence_health_report(db_path, apply=apply)
+    return {"database": str(db_path), **report, "applied": apply}
+
+
+def _emit_sequence_command_result(
+    ctx: click.Context, payload: Mapping[str, Any], *, as_json: bool
+) -> None:
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True))
+    else:
+        click.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
+    if payload["mixed_sessions"]:
+        ctx.exit(1)
+
+
+@harness_cmd.command(name="audit-sequences")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help="Exact DuckDB path to audit.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+@click.pass_context
+def harness_audit_sequences_cmd(
+    ctx: click.Context, db_path: Path, as_json: bool
+) -> None:
+    """Audit legacy harness event sequences without mutating the database."""
+    _emit_sequence_command_result(
+        ctx, _sequence_command_payload(db_path, apply=False), as_json=as_json
+    )
+
+
+@harness_cmd.command(name="migrate-sequences")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help="Exact DuckDB path to migrate.",
+)
+@click.option(
+    "--apply", is_flag=True, help="Apply sequence migration. Default is dry-run."
+)
+@click.pass_context
+def harness_migrate_sequences_cmd(
+    ctx: click.Context, db_path: Path, apply: bool
+) -> None:
+    """Preview or apply deterministic legacy event sequencing."""
+    _emit_sequence_command_result(
+        ctx, _sequence_command_payload(db_path, apply=apply), as_json=True
+    )
 
 
 @main.group(name="mcp")

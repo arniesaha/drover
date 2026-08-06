@@ -397,6 +397,112 @@ def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp
     assert 'drover_agent_adoption_observed_events{runtime="openclaw-main"} 12' in text
 
 
+def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(metrics, "quality_snapshot", lambda **_: _snapshot())
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(db)) as con:
+        con.executemany(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, created_at, seq) "
+            "VALUES (?, ?, 'user_input', '{}', now(), ?)",
+            [
+                ("legacy-1", "private-legacy-session", None),
+                ("mixed-1", "private-mixed-session", 1),
+                ("mixed-2", "private-mixed-session", None),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, max_attempts, next_run_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "private-retry-session",
+                    "retry_wait",
+                    2,
+                    5,
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(minutes=5),
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(minutes=2),
+                ),
+                (
+                    "private-dead-session",
+                    "dead_lettered",
+                    7,
+                    7,
+                    None,
+                    datetime.now() - timedelta(minutes=10),
+                ),
+                ("private-unbounded-label", "private-status", 1, 99, None, None),
+            ],
+        )
+    collector = MetricsCollector(
+        duckdb_path=db,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+    text = collector.render_prometheus()
+
+    assert "drover_harness_legacy_unsequenced_events 2" in text
+    assert "drover_harness_mixed_sequence_sessions 1" in text
+    assert 'drover_summarize_jobs{status="retry_wait"} 1' in text
+    assert 'drover_summarize_jobs{status="dead_lettered"} 1' in text
+    assert "drover_summarize_max_attempts 99" in text
+    oldest = next(
+        line
+        for line in text.splitlines()
+        if line.startswith("drover_summarize_oldest_retry_seconds ")
+    )
+    oldest_seconds = float(oldest.rsplit(" ", 1)[1])
+    assert 119 <= oldest_seconds <= 125
+    assert "private-retry-session" not in text
+    assert "private-dead-session" not in text
+    assert 'status="private-status"' not in text
+
+
+def test_sequence_health_report_does_not_materialize_event_metadata(
+    monkeypatch, tmp_path
+):
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(db)) as con:
+        con.execute(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, created_at, seq) "
+            "VALUES ('event-1', 'session-1', 'user_input', '{}', now(), NULL)"
+        )
+    real = duckdb.connect(str(db))
+
+    class AggregateOnlyConnection:
+        def execute(self, query, parameters=None):
+            normalized = " ".join(str(query).lower().split())
+            assert "select event_id, session_id, created_at, seq" not in normalized
+            if parameters is None:
+                return real.execute(query)
+            return real.execute(query, parameters)
+
+        def close(self):
+            real.close()
+
+    monkeypatch.setattr(
+        metrics,
+        "open_duckdb_connection",
+        lambda *args, **kwargs: AggregateOnlyConnection(),
+    )
+
+    assert metrics.sequence_health_report(db) == {
+        "null_event_count": 1,
+        "all_null_sessions": 1,
+        "mixed_sessions": 0,
+    }
+
+
 def test_metrics_collector_json_surface(monkeypatch, tmp_path):
     monkeypatch.setattr(metrics, "quality_snapshot", lambda **_: _snapshot())
     collector = MetricsCollector(

@@ -79,6 +79,128 @@ def _write_spans(parquet_dir: Path, rows: list[dict]) -> None:
         pq.write_table(pa.table(cols, schema=_SPAN_SCHEMA), out / "part.parquet")
 
 
+def _insert_legacy_sequence_events(db: Path, *, mixed: bool = False) -> None:
+    with duckdb.connect(str(db)) as con:
+        con.executemany(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, created_at, seq) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "legacy-event-2",
+                    "private-legacy-session",
+                    "assistant_output",
+                    '{"message":"must-not-leak"}',
+                    "2026-08-06 10:00:00",
+                    None,
+                ),
+                (
+                    "legacy-event-1",
+                    "private-legacy-session",
+                    "user_input",
+                    '{"token":"must-not-leak"}',
+                    "2026-08-06 10:00:00",
+                    None,
+                ),
+            ],
+        )
+        if mixed:
+            con.executemany(
+                "INSERT INTO harness_events "
+                "(event_id, session_id, event_type, payload_json, created_at, seq) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        "mixed-event-1",
+                        "private-mixed-session",
+                        "user_input",
+                        "{}",
+                        "2026-08-06 11:00:00",
+                        1,
+                    ),
+                    (
+                        "mixed-event-2",
+                        "private-mixed-session",
+                        "assistant_output",
+                        "{}",
+                        "2026-08-06 11:01:00",
+                        None,
+                    ),
+                ],
+            )
+
+
+def test_harness_migrate_sequences_dry_run_reports_without_mutating(tmp_path):
+    db = tmp_path / "override.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    _insert_legacy_sequence_events(db)
+
+    result = CliRunner().invoke(main, ["harness", "migrate-sequences", "--db", str(db)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "all_null_sessions": 1,
+        "applied": False,
+        "database": str(db),
+        "mixed_sessions": 0,
+        "null_event_count": 2,
+    }
+    with duckdb.connect(str(db), read_only=True) as con:
+        assert con.execute(
+            "SELECT count(*) FROM harness_events WHERE seq IS NULL"
+        ).fetchone() == (2,)
+
+
+def test_harness_migrate_sequences_apply_reports_exact_counts(tmp_path):
+    db = tmp_path / "override.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    _insert_legacy_sequence_events(db)
+
+    result = CliRunner().invoke(
+        main, ["harness", "migrate-sequences", "--db", str(db), "--apply"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "all_null_sessions": 1,
+        "applied": True,
+        "database": str(db),
+        "mixed_sessions": 0,
+        "null_event_count": 2,
+    }
+    with duckdb.connect(str(db), read_only=True) as con:
+        assert con.execute(
+            "SELECT event_id, seq FROM harness_events "
+            "WHERE session_id = 'private-legacy-session' ORDER BY seq"
+        ).fetchall() == [("legacy-event-1", 1), ("legacy-event-2", 2)]
+
+
+def test_harness_audit_sequences_mixed_session_is_safe_nonzero_json(tmp_path):
+    db = tmp_path / "override.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    _insert_legacy_sequence_events(db, mixed=True)
+
+    result = CliRunner().invoke(
+        main, ["harness", "audit-sequences", "--db", str(db), "--json"]
+    )
+
+    assert result.exit_code != 0
+    assert json.loads(result.output) == {
+        "all_null_sessions": 1,
+        "applied": False,
+        "database": str(db),
+        "mixed_sessions": 1,
+        "null_event_count": 3,
+    }
+    assert "private-legacy-session" not in result.output
+    assert "private-mixed-session" not in result.output
+    assert "must-not-leak" not in result.output
+    with duckdb.connect(str(db), read_only=True) as con:
+        assert con.execute(
+            "SELECT count(*) FROM harness_events WHERE seq IS NULL"
+        ).fetchone() == (3,)
+
+
 def test_summarizer_backend_available_requires_api_or_local_backend(
     monkeypatch, tmp_path
 ):
