@@ -38,6 +38,19 @@ To install on an iPhone, open the generated project in Xcode, select the
 Capabilities, and press Run. Builds signed with a free Apple developer account
 must be installed again after their provisioning profile expires.
 
+The same thing without the GUI, for when the change you are deploying came out
+of a terminal in the first place:
+
+```bash
+scripts/deploy-ios.sh              # regenerate, build, install, launch
+scripts/deploy-ios.sh --no-launch  # stop after installing
+scripts/deploy-ios.sh --device iPad
+```
+
+It regenerates the project, resolves the first paired device matching the name,
+signs with automatic provisioning, and installs over `devicectl`. Override the
+team with `DROVER_TEAM_ID`. The device must be paired and unlocked.
+
 ## Connect
 
 On first launch, enter:
