@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 from pathlib import Path
 import base64
 import os
@@ -37,6 +38,7 @@ from drover.server.harness.websocket import (
     recv_frame,
 )
 from drover.server.metrics import MetricsCollector, start_metrics_server
+from drover.server.web.app import _MetricsHandler
 from drover.server.web.auth import AuthSettings, mint_session
 from drover.server.web.ui import load_page
 
@@ -277,6 +279,60 @@ def _make_collector(tmp_path) -> MetricsCollector:
         summarizer_report={},
         ttl_seconds=60,
     )
+
+
+class _FailingWriter:
+    def __init__(self, error: Exception):
+        self.error = error
+
+    def write(self, payload: bytes) -> None:
+        raise self.error
+
+
+def _send_handler(*, writer, end_headers=lambda: None):
+    class _Handler:
+        path = "/harness/sessions/legacy/messages"
+        wfile = writer
+
+        @staticmethod
+        def send_response(status):
+            return None
+
+        @staticmethod
+        def send_header(name, value):
+            return None
+
+    handler = _Handler()
+    handler.end_headers = end_headers
+    return handler
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError(), ConnectionResetError()])
+def test_send_treats_expected_final_write_disconnect_as_access_outcome(caplog, error):
+    handler = _send_handler(writer=_FailingWriter(error))
+
+    with caplog.at_level(logging.INFO, logger="drover.metrics"):
+        _MetricsHandler._send(handler, 200, "application/json", "secret message")
+
+    assert "client disconnected while sending 14 bytes" in caplog.text
+    assert "secret message" not in caplog.text
+
+
+def test_send_does_not_swallow_other_final_write_errors():
+    handler = _send_handler(writer=_FailingWriter(OSError("disk failure")))
+
+    with pytest.raises(OSError, match="disk failure"):
+        _MetricsHandler._send(handler, 200, "application/json", "{}")
+
+
+def test_send_does_not_swallow_disconnect_before_final_write():
+    handler = _send_handler(
+        writer=_FailingWriter(AssertionError("write must not run")),
+        end_headers=lambda: (_ for _ in ()).throw(BrokenPipeError("headers")),
+    )
+
+    with pytest.raises(BrokenPipeError, match="headers"):
+        _MetricsHandler._send(handler, 200, "application/json", "{}")
 
 
 def _json_request(url: str, *, payload: dict | None = None):
@@ -2213,6 +2269,36 @@ def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
         server.shutdown()
 
 
+def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).append_event(
+        event_id="legacy-e1",
+        session_id="legacy",
+        seq=1,
+        event_type="assistant_output",
+        payload={"text": "hello"},
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        with _authed_get(
+            f"http://127.0.0.1:{port}/harness/sessions/legacy/messages"
+        ) as response:
+            body = json.loads(response.read())
+        assert body["messages"] == [
+            {
+                "text": "hello",
+                "event_id": "legacy-e1",
+                "session_id": "legacy",
+                "seq": 1,
+            }
+        ]
+    finally:
+        server.shutdown()
+
+
 def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
     collector = _make_collector(tmp_path)
     server = start_metrics_server(
@@ -2294,6 +2380,44 @@ def test_session_stream_ws_delivers_new_events(tmp_path):
         # server must still be healthy after an abrupt client disconnect
         with _authed_get(f"http://127.0.0.1:{port}/harness/hosts") as response:
             assert response.status == 200
+    finally:
+        server.shutdown()
+
+
+def test_session_stream_ws_initial_catch_up_overlays_canonical_event_metadata(
+    tmp_path,
+):
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).append_event(
+        event_id="legacy-e1",
+        session_id="legacy",
+        seq=1,
+        event_type="assistant_output",
+        payload={"text": "hello"},
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            client_handshake(
+                sock,
+                host=f"127.0.0.1:{port}",
+                path="/harness/sessions/legacy/stream",
+                headers=_AUTH_HEADERS,
+            )
+            sock.settimeout(5)
+            message = json.loads(recv_frame(sock).payload.decode("utf-8"))
+            assert message == {
+                "text": "hello",
+                "event_id": "legacy-e1",
+                "session_id": "legacy",
+                "seq": 1,
+            }
+        finally:
+            sock.close()
     finally:
         server.shutdown()
 

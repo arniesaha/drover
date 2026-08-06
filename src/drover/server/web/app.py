@@ -487,7 +487,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             events = registry.list_events_after(session_id, after_seq)
             body = json.dumps(
                 {
-                    "messages": [event.payload for event in events],
+                    "messages": [event.wire_payload() for event in events],
                     "max_seq": registry.max_event_seq(session_id),
                 }
             )
@@ -1007,7 +1007,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     send_frame(
                         sock,
                         OPCODE_TEXT,
-                        json.dumps(event.payload).encode("utf-8"),
+                        json.dumps(event.wire_payload()).encode("utf-8"),
                     )
                 try:
                     frame = recv_frame(sock)
@@ -1191,7 +1191,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self.send_header("Pragma", "no-cache")
             self.send_header("Expires", "0")
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            log.info(
+                "client disconnected while sending %s bytes for %s",
+                len(payload),
+                self.path,
+            )
 
 
 def start_metrics_server(
