@@ -400,7 +400,7 @@ Expected: only reviewed plan commits are ahead; no uncommitted files.
 
 - [ ] **Step 2: Capture dry-run audits**
 
-Run the audit command against `/Users/arnabmac/.drover/drover.duckdb`. The harness daemon database is process-locked, so record its audit during the controlled restart window rather than bypassing the lock.
+Before shutdown, resolve the exact central DuckDB path from the deployed launch-agent/config and run the audit command against that path. The harness daemon database is process-locked, so record its audit during the controlled restart window rather than bypassing the lock.
 
 - [ ] **Step 3: Stop services and create explicit backups**
 
