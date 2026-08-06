@@ -294,19 +294,36 @@ class EmbedWorker:
                    FROM embed_jobs j
                    JOIN session_summaries ss USING (session_id)
                    WHERE j.status='pending'
+                     AND (j.source_version IS NULL OR EXISTS (
+                       SELECT 1 FROM summarize_jobs s
+                        WHERE s.session_id=j.session_id
+                          AND s.source_version IS NOT DISTINCT FROM j.source_version
+                          AND s.status='done'
+                     ))
                    ORDER BY j.enqueued_at ASC
                    LIMIT ?""",
                 [max_jobs],
             )
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            claimed_rows: list[dict] = []
             for r in rows:
-                con.execute(
-                    """UPDATE embed_jobs SET status='running',
+                claimed = con.execute(
+                    """UPDATE embed_jobs j SET status='running',
                        attempts = COALESCE(attempts,0)+1, updated_at=now()
-                       WHERE session_id=?""",
+                       WHERE j.session_id=? AND j.status='pending'
+                         AND (j.source_version IS NULL OR EXISTS (
+                           SELECT 1 FROM summarize_jobs s
+                            WHERE s.session_id=j.session_id
+                              AND s.source_version IS NOT DISTINCT FROM j.source_version
+                              AND s.status='done'
+                         ))
+                       RETURNING j.session_id""",
                     [r["session_id"]],
-                )
+                ).fetchone()
+                if claimed is not None:
+                    claimed_rows.append(r)
+            rows = claimed_rows
         finally:
             con.close()
         # Shadow durable-ledger lease per claimed session job (AGE-44).
@@ -416,10 +433,61 @@ class EmbedWorker:
                     self.session_job_stream.fail(delivery.id, "missing session_id")
                     continue
                 session_id = str(session_id)
+                delivery_source_version = delivery.fields.get("source_version")
+                if delivery_source_version is not None:
+                    delivery_source_version = str(delivery_source_version)
                 job = con.execute(
-                    "SELECT status, attempts FROM embed_jobs WHERE session_id=?",
+                    """SELECT status, attempts, source_version
+                         FROM embed_jobs WHERE session_id=?""",
                     [session_id],
                 ).fetchone()
+                if delivery_source_version is not None:
+                    if job is None:
+                        self.session_job_stream.ack(delivery.id)
+                        continue
+                    claimed = con.execute(
+                        """UPDATE embed_jobs e
+                              SET status='running',
+                                  attempts=COALESCE(attempts, 0)+1,
+                                  updated_at=now()
+                            WHERE e.session_id=?
+                              AND e.status NOT IN ('done', 'superseded')
+                              AND e.source_version IS NOT DISTINCT FROM ?
+                              AND EXISTS (
+                                SELECT 1 FROM summarize_jobs s
+                                 WHERE s.session_id=e.session_id
+                                   AND s.source_version IS NOT DISTINCT FROM e.source_version
+                                   AND s.status='done'
+                              )
+                            RETURNING e.session_id""",
+                        [session_id, delivery_source_version],
+                    ).fetchone()
+                    if claimed is None:
+                        self.session_job_stream.ack(delivery.id)
+                        continue
+                    summary = con.execute(
+                        "SELECT summary_md FROM session_summaries WHERE session_id=?",
+                        [session_id],
+                    ).fetchone()
+                    if summary is None:
+                        con.execute(
+                            """UPDATE embed_jobs SET status='errored',
+                                      last_error='session summary missing', updated_at=now()
+                                 WHERE session_id=?""",
+                            [session_id],
+                        )
+                        self.session_job_stream.fail(
+                            delivery.id, "session summary missing"
+                        )
+                        continue
+                    rows.append(
+                        {
+                            "session_id": session_id,
+                            "summary_md": summary[0],
+                            "_delivery": delivery,
+                        }
+                    )
+                    continue
                 if job and job[0] == "done":
                     self.session_job_stream.ack(delivery.id)
                     continue

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Callable, Literal
 
 import duckdb
@@ -50,39 +50,66 @@ def enqueue_summary_generation(
     con: duckdb.DuckDBPyConnection, session_id: str, source_version: str
 ) -> bool:
     """Open a runnable generation only when the immutable source changed."""
-    legacy = con.execute(
-        """UPDATE summarize_jobs
-              SET source_version = ?, updated_at = now()
-            WHERE session_id = ? AND source_version IS NULL
-            RETURNING session_id""",
-        [source_version, session_id],
-    ).fetchone()
-    if legacy is not None:
-        # A null legacy version carries no evidence that its source changed.
-        # Backfill its identity without resetting or republishing the generation.
-        return False
+    try:
+        con.execute("BEGIN TRANSACTION")
+        legacy = con.execute(
+            """UPDATE summarize_jobs
+                  SET source_version = ?, updated_at = now()
+                WHERE session_id = ? AND source_version IS NULL
+                RETURNING session_id""",
+            [source_version, session_id],
+        ).fetchone()
+        if legacy is not None:
+            # A null legacy version carries no evidence that its source changed.
+            # Backfill its identity without resetting or republishing the generation.
+            con.execute("COMMIT")
+            return False
 
-    row = con.execute(
-        """INSERT INTO summarize_jobs
-             (session_id, status, attempts, source_version, max_attempts,
-              last_error, next_run_at, dead_lettered_at, updated_at,
-              stream_publish_needed)
-             VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now(), TRUE)
-             ON CONFLICT (session_id) DO UPDATE SET
-               source_version = excluded.source_version,
-               status = 'pending',
-               attempts = 0,
-               max_attempts = excluded.max_attempts,
-               last_error = NULL,
-               next_run_at = NULL,
-               dead_lettered_at = NULL,
-               updated_at = now(),
-               stream_publish_needed = TRUE
-             WHERE summarize_jobs.source_version IS DISTINCT FROM excluded.source_version
-             RETURNING session_id""",
-        [session_id, source_version, SUMMARY_MAX_ATTEMPTS],
-    ).fetchone()
-    return row is not None
+        row = con.execute(
+            """INSERT INTO summarize_jobs
+                 (session_id, status, attempts, source_version, max_attempts,
+                  last_error, next_run_at, dead_lettered_at, updated_at,
+                  stream_publish_needed)
+                 VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now(), TRUE)
+                 ON CONFLICT (session_id) DO UPDATE SET
+                   source_version = excluded.source_version,
+                   status = 'pending',
+                   attempts = 0,
+                   max_attempts = excluded.max_attempts,
+                   last_error = NULL,
+                   next_run_at = NULL,
+                   dead_lettered_at = NULL,
+                   updated_at = now(),
+                   stream_publish_needed = TRUE
+                 WHERE summarize_jobs.source_version IS DISTINCT FROM excluded.source_version
+                 RETURNING session_id""",
+            [session_id, source_version, SUMMARY_MAX_ATTEMPTS],
+        ).fetchone()
+        if row is not None:
+            con.execute(
+                """UPDATE embed_jobs SET status='superseded', updated_at=now()
+                     WHERE session_id=?
+                       AND source_version IS NOT NULL
+                       AND source_version IS DISTINCT FROM ?
+                       AND status <> 'superseded'""",
+                [session_id, source_version],
+            )
+            con.execute(
+                """UPDATE brief_jobs SET status='superseded', updated_at=now()
+                     WHERE source_session_id=?
+                       AND source_version IS NOT NULL
+                       AND source_version IS DISTINCT FROM ?
+                       AND status <> 'superseded'""",
+                [session_id, source_version],
+            )
+        con.execute("COMMIT")
+        return row is not None
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except duckdb.Error:
+            pass
+        raise
 
 
 def publish_summary_generation(
@@ -113,6 +140,26 @@ def publish_summary_generation(
     return True
 
 
+def flush_summary_publications(
+    con: duckdb.DuckDBPyConnection, stream: object | None, *, limit: int = 100
+) -> int:
+    """Retry durable summary-generation publications from the worker poll path."""
+    if stream is None:
+        return 0
+    rows = con.execute(
+        """SELECT session_id, source_version FROM summarize_jobs
+             WHERE COALESCE(stream_publish_needed, FALSE)
+             ORDER BY enqueued_at ASC
+             LIMIT ?""",
+        [max(1, int(limit))],
+    ).fetchall()
+    published = 0
+    for session_id, source_version in rows:
+        if publish_summary_generation(con, session_id, source_version, stream):
+            published += 1
+    return published
+
+
 def finish_summary_failure(
     con: duckdb.DuckDBPyConnection,
     session_id: str,
@@ -123,56 +170,42 @@ def finish_summary_failure(
     jitter: Callable[[float, float], float],
 ) -> Literal["retry_wait", "dead_lettered", "stale"]:
     """Spend one failure from the matching source generation's retry budget."""
-    try:
-        con.execute("BEGIN TRANSACTION")
-        row = con.execute(
-            """SELECT attempts, COALESCE(max_attempts, ?)
-                 FROM summarize_jobs
-                WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?""",
-            [SUMMARY_MAX_ATTEMPTS, session_id, source_version],
-        ).fetchone()
-        if row is None:
-            con.execute("ROLLBACK")
-            return "stale"
-
-        attempts = int(row[0] or 0) + 1
-        max_attempts = int(row[1] or SUMMARY_MAX_ATTEMPTS)
-        terminal = attempts >= max_attempts
-        status = "dead_lettered" if terminal else "retry_wait"
-        base_seconds = min(60 * (2 ** max(0, attempts - 1)), 3600)
-        next_run_at = (
-            None
-            if terminal
-            else _duckdb_timestamp(now)
-            + timedelta(seconds=base_seconds + jitter(0, base_seconds * 0.2))
-        )
-        stored_now = _duckdb_timestamp(now)
-        dead_lettered_at = stored_now if terminal else None
-        updated = con.execute(
-            """UPDATE summarize_jobs
-                  SET status = ?, attempts = ?, last_error = ?, next_run_at = ?,
-                      dead_lettered_at = ?, updated_at = ?
-                WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?
-                RETURNING session_id""",
-            [
-                status,
-                attempts,
-                error,
-                next_run_at,
-                dead_lettered_at,
-                stored_now,
-                session_id,
-                source_version,
-            ],
-        ).fetchone()
-        if updated is None:
-            con.execute("ROLLBACK")
-            return "stale"
-        con.execute("COMMIT")
-        return status
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except duckdb.Error:
-            pass
-        raise
+    stored_now = _duckdb_timestamp(now)
+    jitter_fraction = jitter(0, 0.2)
+    updated = con.execute(
+        """UPDATE summarize_jobs
+              SET status = CASE
+                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
+                    THEN 'dead_lettered' ELSE 'retry_wait' END,
+                  attempts = COALESCE(attempts, 0) + 1,
+                  last_error = ?,
+                  next_run_at = CASE
+                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
+                    THEN NULL
+                    ELSE ? + (
+                      LEAST(60 * POWER(2, COALESCE(attempts, 0)), 3600)
+                      * (1 + ?)
+                    ) * INTERVAL '1 second'
+                  END,
+                  dead_lettered_at = CASE
+                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
+                    THEN ? ELSE NULL END,
+                  updated_at = ?
+            WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?
+            RETURNING status, next_run_at""",
+        [
+            SUMMARY_MAX_ATTEMPTS,
+            error,
+            SUMMARY_MAX_ATTEMPTS,
+            stored_now,
+            jitter_fraction,
+            SUMMARY_MAX_ATTEMPTS,
+            stored_now,
+            stored_now,
+            session_id,
+            source_version,
+        ],
+    ).fetchone()
+    if updated is None:
+        return "stale"
+    return updated[0]

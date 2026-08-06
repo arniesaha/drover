@@ -149,6 +149,48 @@ def test_stale_failure_cannot_spend_new_generation_budget(tmp_path: Path) -> Non
         con.close()
 
 
+def test_failure_completion_is_one_conditional_statement_at_supersession(
+    tmp_path: Path,
+) -> None:
+    con, duckdb_path = _bootstrapped(tmp_path)
+    try:
+        assert enqueue_summary_generation(con, "s1", "v1") is True
+
+        class SupersedingConnection:
+            calls = 0
+
+            def execute(self, sql: str, params=None):
+                self.calls += 1
+                assert sql.lstrip().startswith(
+                    "UPDATE summarize_jobs"
+                ), "failure completion must have no snapshot read before mutation"
+                other = duckdb.connect(str(duckdb_path))
+                try:
+                    assert enqueue_summary_generation(other, "s1", "v2") is True
+                finally:
+                    other.close()
+                return con.execute(sql, params)
+
+        interleaved = SupersedingConnection()
+        outcome = finish_summary_failure(
+            interleaved,
+            "s1",
+            "v1",
+            "obsolete failure",
+            now=datetime(2026, 8, 6, tzinfo=timezone.utc),
+            jitter=lambda _low, _high: 0,
+        )
+
+        assert outcome == "stale"
+        assert interleaved.calls == 1
+        assert con.execute(
+            "SELECT source_version, status, attempts FROM summarize_jobs "
+            "WHERE session_id='s1'"
+        ).fetchone() == ("v2", "pending", 0)
+    finally:
+        con.close()
+
+
 def test_source_version_hashes_stable_facts_not_content(tmp_path: Path) -> None:
     con = duckdb.connect()
     try:
@@ -185,6 +227,12 @@ def test_bootstrap_adds_retry_columns_to_existing_table(tmp_path: Path) -> None:
         "attempts INTEGER DEFAULT 0, last_error VARCHAR, enqueued_at TIMESTAMP, "
         "updated_at TIMESTAMP)"
     )
+    con.execute("""CREATE TABLE brief_jobs (
+             project_key VARCHAR PRIMARY KEY, status VARCHAR, attempts INTEGER,
+             last_error VARCHAR, enqueued_at TIMESTAMP, updated_at TIMESTAMP)""")
+    con.execute("""CREATE TABLE embed_jobs (
+             session_id VARCHAR PRIMARY KEY, status VARCHAR, attempts INTEGER,
+             last_error VARCHAR, enqueued_at TIMESTAMP, updated_at TIMESTAMP)""")
     con.close()
 
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
@@ -200,5 +248,16 @@ def test_bootstrap_adds_retry_columns_to_existing_table(tmp_path: Path) -> None:
         assert columns["next_run_at"] is None
         assert columns["dead_lettered_at"] is None
         assert columns["stream_publish_needed"] is not None
+        brief_columns = {
+            row[1]: row[4]
+            for row in con.execute("PRAGMA table_info('brief_jobs')").fetchall()
+        }
+        embed_columns = {
+            row[1]: row[4]
+            for row in con.execute("PRAGMA table_info('embed_jobs')").fetchall()
+        }
+        assert brief_columns["source_session_id"] is None
+        assert brief_columns["source_version"] is None
+        assert embed_columns["source_version"] is None
     finally:
         con.close()

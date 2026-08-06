@@ -60,7 +60,11 @@ class FakeRedis:
         if min not in {"-", "0-0"} and max == min:
             ids = [min] if min in pel else []
         else:
-            ids = sorted(pel, key=lambda s: tuple(map(int, s.split("-"))))[:count]
+            ids = sorted(pel, key=_id_key)
+            if isinstance(min, str) and min.startswith("("):
+                cursor = _id_key(min[1:])
+                ids = [entry_id for entry_id in ids if _id_key(entry_id) > cursor]
+            ids = ids[:count]
         return [
             {
                 "message_id": entry_id,
@@ -277,6 +281,42 @@ def test_redis_adapter_backoffs_preserve_five_backend_executions():
     assert delivery.delivery_count == 5
     assert stream.dead_letters() == []
     assert stream.ack(delivery.id) is True
+
+
+def test_redis_reclaim_pages_past_deferred_prefix_without_claiming_it():
+    client = FakeRedis()
+    stream = RedisJobStream(
+        client,
+        RedisJobStreamConfig(
+            stream="summarize_jobs",
+            visibility_timeout_ms=0,
+            max_deliveries=5,
+        ),
+    )
+    deferred_ids = []
+    for index in range(1_001):
+        stream.add({"session_id": f"deferred-{index}"})
+        (delivery,) = stream.read_group("worker-a")
+        deferred_ids.append(delivery.id)
+        assert stream.defer(delivery.id, until_ms=client.now_ms + 60_000)
+    stream.add({"session_id": "due"})
+    (due_delivery,) = stream.read_group("worker-a")
+
+    (reclaimed,) = stream.reclaim("worker-b", count=1)
+
+    assert reclaimed.id == due_delivery.id
+    assert reclaimed.delivery_count == 2
+    assert client.xclaim_calls == [
+        {
+            "name": "summarize_jobs",
+            "group": "workers",
+            "consumer": "worker-b",
+            "min_idle_time": 0,
+            "message_ids": [due_delivery.id],
+        }
+    ]
+    pending_by_id = {entry.id: entry for entry in stream.pending()}
+    assert pending_by_id[deferred_ids[0]].delivery_count == 1
 
 
 def test_redis_adapter_crash_after_durable_write_before_ack_is_redelivered_once():

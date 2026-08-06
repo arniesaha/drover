@@ -139,20 +139,29 @@ class RedisJobStream:
 
     def reclaim(self, consumer: str, count: int = 10) -> List[Delivery]:
         now_ms = self._server_time_ms()
-        pending_rows = self._client.xpending_range(
-            self.name, self.group, "-", "+", 1000
-        )
         claim_ids: list[str] = []
-        for row in pending_rows:
-            pending = self._pending_from_row(row)
-            if self._pending_idle_ms(row) < self.config.visibility_timeout_ms:
-                continue
-            deferred_until = self._client.zscore(self.deferred_zset, pending.id)
-            if deferred_until is not None and float(deferred_until) > now_ms:
-                continue
-            claim_ids.append(pending.id)
-            if len(claim_ids) >= count:
+        page_start = "-"
+        page_size = 1000
+        while len(claim_ids) < count:
+            pending_rows = self._client.xpending_range(
+                self.name, self.group, page_start, "+", page_size
+            )
+            if not pending_rows:
                 break
+            for row in pending_rows:
+                pending = self._pending_from_row(row)
+                if self._pending_idle_ms(row) < self.config.visibility_timeout_ms:
+                    continue
+                deferred_until = self._client.zscore(self.deferred_zset, pending.id)
+                if deferred_until is not None and float(deferred_until) > now_ms:
+                    continue
+                claim_ids.append(pending.id)
+                if len(claim_ids) >= count:
+                    break
+            if len(pending_rows) < page_size or len(claim_ids) >= count:
+                break
+            last_pending = self._pending_from_row(pending_rows[-1])
+            page_start = f"({last_pending.id}"
         if not claim_ids:
             return []
         claimed = self._client.xclaim(

@@ -38,12 +38,11 @@ def test_seed_redis_job_streams_from_pending_duckdb_jobs(tmp_path: Path) -> None
         con.execute(
             "INSERT INTO summarize_jobs (session_id, status) VALUES ('sess-done', 'done')"
         )
-        con.execute(
-            "INSERT INTO brief_jobs (project_key, status) VALUES ('arniesaha/nexus', 'pending')"
-        )
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status) VALUES ('sess-embed', 'pending')"
-        )
+        con.execute("""INSERT INTO brief_jobs
+               (project_key, status, source_session_id, source_version)
+               VALUES ('arniesaha/nexus', 'pending', 'sess-pending', 'version-1')""")
+        con.execute("""INSERT INTO embed_jobs (session_id, status, source_version)
+               VALUES ('sess-pending', 'pending', 'version-1')""")
         con.execute(
             "INSERT INTO span_embed_jobs (span_id, status) VALUES ('span-embed', 'pending')"
         )
@@ -68,6 +67,14 @@ def test_seed_redis_job_streams_from_pending_duckdb_jobs(tmp_path: Path) -> None
     assert streams["summarize"].published == [
         {"session_id": "sess-pending", "source_version": "version-1"}
     ]
-    assert streams["brief"].published == [{"project_key": "arniesaha/nexus"}]
-    assert streams["embed_session"].published == [{"session_id": "sess-embed"}]
+    assert streams["brief"].published == [
+        {
+            "project_key": "arniesaha/nexus",
+            "source_session_id": "sess-pending",
+            "source_version": "version-1",
+        }
+    ]
+    assert streams["embed_session"].published == [
+        {"session_id": "sess-pending", "source_version": "version-1"}
+    ]
     assert streams["embed_span"].published == [{"span_id": "span-embed"}]

@@ -211,14 +211,23 @@ def _seed_redis_job_streams(
     try:
         for key, stream in streams.items():
             table, column, field = table_map[key]
-            selected = f"{column}, source_version" if key == "summarize" else column
+            if key == "brief":
+                selected = f"{column}, source_session_id, source_version"
+            elif key in ("summarize", "embed_session"):
+                selected = f"{column}, source_version"
+            else:
+                selected = column
             rows = con.execute(
                 f"SELECT {selected} FROM {table} "
                 "WHERE status='pending' ORDER BY enqueued_at ASC"
             ).fetchall()
             for row in rows:
                 payload = {field: str(row[0])}
-                if key == "summarize" and row[1] is not None:
+                if key == "brief" and row[1] is not None:
+                    payload["source_session_id"] = str(row[1])
+                if key == "brief" and row[2] is not None:
+                    payload["source_version"] = str(row[2])
+                elif key in ("summarize", "embed_session") and row[1] is not None:
                     payload["source_version"] = str(row[1])
                 stream.add(payload)
             counts[key] = len(rows)

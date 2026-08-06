@@ -50,7 +50,10 @@ from drover.server.summarizer.client import (
     call_claude_summary,
 )
 from drover.server.summarizer.derive import compute_files_touched, compute_tools_used
-from drover.server.summarizer.jobs import finish_summary_failure
+from drover.server.summarizer.jobs import (
+    finish_summary_failure,
+    flush_summary_publications,
+)
 from drover.server.summarizer.prompt import build_summary_prompt
 
 log = logging.getLogger("drover.summarizer.worker")
@@ -99,6 +102,7 @@ class SummarizerWorker:
         _jitter: Callable[[float, float], float] = random.uniform,
         _before_success_effects: Callable[[], None] = lambda: None,
         _before_failure_finish: Callable[[], None] = lambda: None,
+        _after_completion_commit: Callable[[], None] = lambda: None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.api_key = api_key
@@ -117,6 +121,7 @@ class SummarizerWorker:
         self._jitter = _jitter
         self._before_success_effects = _before_success_effects
         self._before_failure_finish = _before_failure_finish
+        self._after_completion_commit = _after_completion_commit
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -191,6 +196,7 @@ class SummarizerWorker:
             max_jobs = self.batch_size
 
         if self.job_stream is not None:
+            self._flush_stream_outbox()
             return self._drain_stream_batch(max_jobs=max_jobs)
 
         # Check for pending jobs BEFORE selecting a backend so that backend
@@ -228,6 +234,15 @@ class SummarizerWorker:
                 break
             processed += n
         return processed
+
+    def _flush_stream_outbox(self) -> None:
+        con = _open_summarizer_db(self.duckdb_path)
+        try:
+            flush_summary_publications(con, self.job_stream)
+        except Exception:  # noqa: BLE001
+            log.warning("summary publication outbox flush failed", exc_info=True)
+        finally:
+            con.close()
 
     def _drain_stream_batch(self, *, max_jobs: int) -> int:
         """Drain stream deliveries without warming the backend on idle ticks."""
@@ -327,6 +342,7 @@ class SummarizerWorker:
                 self.job_stream.ack(delivery.id)
             return 1
 
+        self._after_completion_commit()
         self._publish_downstream_jobs(
             session_id,
             source_version,
@@ -549,9 +565,10 @@ class SummarizerWorker:
     ) -> None:
         """Publish durable downstream jobs after their fenced transaction commits."""
         try:
-            if self.embed_job_stream is not None and completion.embed_outcome in (
-                "queued",
-                "requeued",
+            if (
+                self.embed_job_stream is not None
+                and completion.embed_outcome in ("queued", "requeued")
+                and self._embed_generation_is_current(session_id, source_version)
             ):
                 self.embed_job_stream.add(
                     {"session_id": session_id, "source_version": source_version}
@@ -565,10 +582,14 @@ class SummarizerWorker:
                 self.brief_job_stream is not None
                 and completion.project_key is not None
                 and completion.brief_outcome in ("queued", "requeued")
+                and self._brief_generation_is_current(
+                    completion.project_key, session_id, source_version
+                )
             ):
                 self.brief_job_stream.add(
                     {
                         "project_key": completion.project_key,
+                        "source_session_id": session_id,
                         "source_version": source_version,
                     }
                 )
@@ -576,6 +597,50 @@ class SummarizerWorker:
             log.exception(
                 "brief publish for session %s failed (continuing)", session_id
             )
+
+    def _embed_generation_is_current(
+        self, session_id: str, source_version: Optional[str]
+    ) -> bool:
+        con = _open_summarizer_db(self.duckdb_path)
+        try:
+            return (
+                con.execute(
+                    """SELECT 1 FROM embed_jobs e
+                         JOIN summarize_jobs s USING (session_id)
+                        WHERE e.session_id=? AND e.status='pending'
+                          AND e.source_version IS NOT DISTINCT FROM ?
+                          AND s.source_version IS NOT DISTINCT FROM ?
+                          AND s.status='done'""",
+                    [session_id, source_version, source_version],
+                ).fetchone()
+                is not None
+            )
+        finally:
+            con.close()
+
+    def _brief_generation_is_current(
+        self,
+        project_key: str,
+        session_id: str,
+        source_version: Optional[str],
+    ) -> bool:
+        con = _open_summarizer_db(self.duckdb_path)
+        try:
+            return (
+                con.execute(
+                    """SELECT 1 FROM brief_jobs b
+                         JOIN summarize_jobs s ON s.session_id=b.source_session_id
+                        WHERE b.project_key=? AND b.status='pending'
+                          AND b.source_session_id=?
+                          AND b.source_version IS NOT DISTINCT FROM ?
+                          AND s.source_version IS NOT DISTINCT FROM ?
+                          AND s.status='done'""",
+                    [project_key, session_id, source_version, source_version],
+                ).fetchone()
+                is not None
+            )
+        finally:
+            con.close()
 
     def _summarize_session(
         self,
@@ -711,11 +776,15 @@ class SummarizerWorker:
                     else None
                 )
                 brief_outcome = (
-                    _enqueue_brief_on_connection(con, project_key)
+                    _enqueue_brief_on_connection(
+                        con, project_key, session_id, source_version
+                    )
                     if project_key is not None
                     else None
                 )
-                embed_outcome = _enqueue_embed_on_connection(con, session_id)
+                embed_outcome = _enqueue_embed_on_connection(
+                    con, session_id, source_version
+                )
                 if ledger_job_id is not None:
                     Ledger(con).succeed_job(
                         ledger_job_id,
@@ -767,14 +836,24 @@ def _safe_task_id(con: duckdb.DuckDBPyConnection, session_id: str) -> Optional[s
 
 
 def _enqueue_embed_on_connection(
-    con: duckdb.DuckDBPyConnection, session_id: str
+    con: duckdb.DuckDBPyConnection,
+    session_id: str,
+    source_version: Optional[str],
 ) -> str:
     """Create/requeue the embed job on the caller's completion transaction."""
     existing = con.execute(
-        "SELECT status FROM embed_jobs WHERE session_id=?", [session_id]
+        "SELECT status, source_version FROM embed_jobs WHERE session_id=?", [session_id]
     ).fetchone()
     if existing:
-        status = existing[0]
+        status, existing_version = existing
+        if existing_version != source_version:
+            con.execute(
+                """UPDATE embed_jobs SET status='pending', attempts=0,
+                          last_error=NULL, updated_at=now(), source_version=?
+                     WHERE session_id=?""",
+                [source_version, session_id],
+            )
+            return "requeued"
         if status == "done":
             return "already_done"
         if status in ("pending", "running"):
@@ -787,21 +866,39 @@ def _enqueue_embed_on_connection(
         )
         return "requeued"
     con.execute(
-        "INSERT INTO embed_jobs (session_id, status, attempts) VALUES (?, 'pending', 0)",
-        [session_id],
+        """INSERT INTO embed_jobs (session_id, status, attempts, source_version)
+           VALUES (?, 'pending', 0, ?)""",
+        [session_id, source_version],
     )
     return "queued"
 
 
 def _enqueue_brief_on_connection(
-    con: duckdb.DuckDBPyConnection, project_key: str
+    con: duckdb.DuckDBPyConnection,
+    project_key: str,
+    source_session_id: str,
+    source_version: Optional[str],
 ) -> str:
     """Create/requeue the brief job on the caller's completion transaction."""
     existing = con.execute(
-        "SELECT status FROM brief_jobs WHERE project_key=?", [project_key]
+        """SELECT status, source_session_id, source_version
+             FROM brief_jobs WHERE project_key=?""",
+        [project_key],
     ).fetchone()
     if existing:
-        status = existing[0]
+        status, existing_session_id, existing_version = existing
+        if (existing_session_id, existing_version) != (
+            source_session_id,
+            source_version,
+        ):
+            con.execute(
+                """UPDATE brief_jobs SET status='pending', attempts=0,
+                          last_error=NULL, updated_at=now(),
+                          source_session_id=?, source_version=?
+                     WHERE project_key=?""",
+                [source_session_id, source_version, project_key],
+            )
+            return "requeued"
         if status in ("pending", "running"):
             return "already_queued"
         con.execute(
@@ -812,7 +909,9 @@ def _enqueue_brief_on_connection(
         )
         return "requeued"
     con.execute(
-        "INSERT INTO brief_jobs (project_key, status, attempts) VALUES (?, 'pending', 0)",
-        [project_key],
+        """INSERT INTO brief_jobs
+             (project_key, status, attempts, source_session_id, source_version)
+           VALUES (?, 'pending', 0, ?, ?)""",
+        [project_key, source_session_id, source_version],
     )
     return "queued"

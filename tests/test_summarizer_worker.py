@@ -13,7 +13,10 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.jobs import JobStream
-from drover.server.summarizer.jobs import enqueue_summary_generation
+from drover.server.summarizer.jobs import (
+    enqueue_summary_generation,
+    publish_summary_generation,
+)
 from drover.server.summarizer.worker import SummarizerWorker, _session_agent_events_ctes
 
 
@@ -824,3 +827,104 @@ def test_generation_change_at_failure_finish_seam_is_atomically_stale(
     finally:
         con.close()
     assert stream.pending() == []
+
+
+def test_generation_change_after_commit_suppresses_old_downstream_publication(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _write_events(parquet_dir, "s1")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('s1', 'pending', 'v1')"
+        )
+    finally:
+        con.close()
+
+    summarize_stream = JobStream("summarize_jobs")
+    summarize_stream.add({"session_id": "s1", "source_version": "v1"})
+
+    def supersede_after_commit() -> None:
+        con = duckdb.connect(str(duckdb_path))
+        try:
+            assert enqueue_summary_generation(con, "s1", "v2") is True
+        finally:
+            con.close()
+        summarize_stream.add({"session_id": "s1", "source_version": "v2"})
+
+    brief_stream = JobStream("brief_jobs")
+    embed_stream = JobStream("embed_jobs")
+    worker = SummarizerWorker(
+        duckdb_path=duckdb_path,
+        backend=_StubBackend(),
+        job_stream=summarize_stream,
+        brief_job_stream=brief_stream,
+        embed_job_stream=embed_stream,
+        _after_completion_commit=supersede_after_commit,
+    )
+
+    assert worker.drain_once() == 1
+    assert brief_stream.length() == 0
+    assert embed_stream.length() == 0
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT source_version, status FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == ("v2", "pending")
+        assert con.execute(
+            "SELECT source_version, status FROM embed_jobs WHERE session_id='s1'"
+        ).fetchone() == ("v1", "superseded")
+        assert con.execute(
+            "SELECT source_session_id, source_version, status FROM brief_jobs"
+        ).fetchone() == ("s1", "v1", "superseded")
+    finally:
+        con.close()
+
+    (v2_delivery,) = summarize_stream.read_group("next-worker")
+    assert v2_delivery.fields == {"session_id": "s1", "source_version": "v2"}
+
+
+def test_stream_poll_recovers_durable_publish_without_producer_reentry(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+
+    class FlakyIdleStream:
+        def __init__(self) -> None:
+            self.add_calls = 0
+            self.published: list[dict] = []
+
+        def add(self, fields: dict) -> str:
+            self.add_calls += 1
+            if self.add_calls == 1:
+                raise RuntimeError("redis unavailable")
+            self.published.append(fields)
+            return "1-0"
+
+        def read_group(self, consumer: str, count: int = 1) -> list:
+            return []
+
+        def reclaim(self, consumer: str, count: int = 1) -> list:
+            return []
+
+    stream = FlakyIdleStream()
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert enqueue_summary_generation(con, "s1", "v1") is True
+        with pytest.raises(RuntimeError, match="redis unavailable"):
+            publish_summary_generation(con, "s1", "v1", stream)
+    finally:
+        con.close()
+
+    worker = SummarizerWorker(duckdb_path=duckdb_path, job_stream=stream)
+    assert worker.drain_once() == 0
+    assert stream.published == [{"session_id": "s1", "source_version": "v1"}]
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT stream_publish_needed FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == (False,)
+    finally:
+        con.close()
