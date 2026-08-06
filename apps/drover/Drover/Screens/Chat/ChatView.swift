@@ -3,7 +3,7 @@ import NexusKit
 
 /// The structured-session chat screen: a scrolling transcript (auto-scrolls
 /// to the newest message), a "reconnecting…" pill while the stream is down,
-/// a pinned approval banner when the harness is waiting on a decision, and a
+/// a pinned decision block when the harness is blocked on you, and a
 /// composer. Interrupt/terminate live in the toolbar. All state and network
 /// calls are delegated to `ChatModel` — this view only renders it.
 struct ChatView: View {
@@ -40,7 +40,7 @@ struct ChatView: View {
             transcript
 
             if let approval = model.pendingApproval {
-                ApprovalBanner(
+                DecisionBlock(
                     approval: approval,
                     isBusy: model.isAnswering,
                     onApprove: { Task { await model.approve("allow") } },
@@ -162,8 +162,8 @@ struct ChatView: View {
             )
         case .statusRun(let run):
             SessionEventsRow(run: run)
-        case .step(let action, let result):
-            StepCard(action: action, result: result)
+        case .stepRun(let steps):
+            StepRunCard(steps: steps)
         }
     }
 
