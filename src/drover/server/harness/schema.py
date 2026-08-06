@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import duckdb
 
 HARNESS_TABLES = (
@@ -65,6 +67,56 @@ CREATE TABLE IF NOT EXISTS harness_events (
 """
 
 
+@dataclass(frozen=True)
+class LegacySequenceMigrationReport:
+    migrated_sessions: int
+    migrated_events: int
+    mixed_sessions: tuple[str, ...]
+
+
+def migrate_legacy_harness_event_sequences(
+    con: duckdb.DuckDBPyConnection,
+) -> LegacySequenceMigrationReport:
+    mixed = tuple(row[0] for row in con.execute("""
+            SELECT session_id FROM harness_events GROUP BY session_id
+            HAVING count(*) FILTER (WHERE seq IS NULL) > 0
+               AND count(*) FILTER (WHERE seq IS NOT NULL) > 0
+            ORDER BY session_id
+            """).fetchall())
+    eligible = [row[0] for row in con.execute("""
+            SELECT session_id FROM harness_events GROUP BY session_id
+            HAVING count(*) > 0 AND count(seq) = 0
+            ORDER BY session_id
+            """).fetchall()]
+    migrated_events = 0
+    con.execute("BEGIN TRANSACTION")
+    try:
+        for session_id in eligible:
+            event_count = con.execute(
+                "SELECT count(*) FROM harness_events WHERE session_id = ?",
+                [session_id],
+            ).fetchone()[0]
+            con.execute(
+                """
+                UPDATE harness_events AS target SET seq = ranked.new_seq
+                FROM (
+                    SELECT event_id, row_number() OVER (
+                        ORDER BY created_at, event_id
+                    )::INTEGER AS new_seq
+                    FROM harness_events WHERE session_id = ?
+                ) AS ranked
+                WHERE target.event_id = ranked.event_id
+                """,
+                [session_id],
+            )
+            migrated_events += int(event_count)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    return LegacySequenceMigrationReport(len(eligible), migrated_events, mixed)
+
+
 def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     """Create Meta Harness control-plane tables. Idempotent."""
     con.execute(_HARNESS_HOSTS_DDL)
@@ -101,6 +153,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "seq": "INTEGER",
         },
     )
+    migrate_legacy_harness_event_sequences(con)
     # Dropped, not migrated: every row duplicated a terminal.output event
     # byte-for-byte (verified 1:1 on live data), so there is nothing here
     # that harness_events does not already hold.
