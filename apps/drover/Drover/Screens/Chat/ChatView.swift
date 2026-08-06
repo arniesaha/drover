@@ -39,8 +39,11 @@ struct ChatView: View {
 
             transcript
 
-            if !model.artifacts.isEmpty {
-                ArtifactRows(artifacts: model.artifacts)
+            // Read once: `artifacts` is cached, but two reads still cost two
+            // dictionary lookups and obscure that this is one value.
+            let artifacts = model.artifacts
+            if !artifacts.isEmpty {
+                ArtifactRows(artifacts: artifacts)
             }
 
             if let approval = model.pendingApproval {
@@ -103,9 +106,10 @@ struct ChatView: View {
 
     private var transcript: some View {
         ScrollViewReader { proxy in
-            // Consecutive thinking messages fold into one ThinkingBlock row
-            // (TranscriptItem.group); everything else renders 1:1.
-            let items = TranscriptItem.group(model.messages)
+            // Folded once per transcript change on the model and cached
+            // there — re-folding here meant a full pass over every message
+            // on each scroll-phase change.
+            let items = model.items
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(items) { item in
@@ -178,7 +182,7 @@ struct ChatView: View {
 
     private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
         Button {
-            guard let rowID = TranscriptItem.latestRowID(of: model.messages) else { return }
+            guard let rowID = model.latestRowID else { return }
             withAnimation(.snappy) {
                 isPinnedToBottom = true
                 proxy.scrollTo(rowID, anchor: .bottom)
@@ -207,8 +211,7 @@ struct ChatView: View {
         guard pendingScroll == nil else { return }
         pendingScroll = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, isPinnedToBottom,
-                  let rowID = TranscriptItem.latestRowID(of: model.messages) else {
+            guard !Task.isCancelled, isPinnedToBottom, let rowID = model.latestRowID else {
                 pendingScroll = nil
                 return
             }
@@ -219,7 +222,7 @@ struct ChatView: View {
             try? await Task.sleep(for: .milliseconds(200))
             pendingScroll = nil
             guard !Task.isCancelled, isPinnedToBottom,
-                  let settledRowID = TranscriptItem.latestRowID(of: model.messages) else { return }
+                  let settledRowID = model.latestRowID else { return }
             proxy.scrollTo(settledRowID, anchor: .bottom)
         }
     }

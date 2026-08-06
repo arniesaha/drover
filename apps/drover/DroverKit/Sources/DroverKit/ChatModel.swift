@@ -29,16 +29,65 @@ public final class ChatModel {
     /// which is what produced nine duplicate turns from one message.
     public private(set) var isSending = false
     public private(set) var harnessPresentation: HarnessPresentation
+    /// Bumped once per `messages` mutation. Every derived value below reads
+    /// this — and only this — so SwiftUI's dependency is "the transcript
+    /// changed" rather than "something on the model changed". A scroll-phase
+    /// change or a keystroke re-runs the view body without recomputing a
+    /// single fold.
+    public private(set) var messagesVersion = 0
+
+    /// Derived transcript state, cached against `messagesVersion`.
+    ///
+    /// These used to be plain computed properties, which meant a full O(n)
+    /// pass *per read*: the view body reads `items`, `latestRowID`,
+    /// `artifacts` (twice) and `contextGauge`, so one render walked a
+    /// 3,000-message transcript five times. Sessions here really do reach
+    /// 3,316 messages, and the body re-runs on every scroll phase change.
+    ///
+    /// The caches are `@ObservationIgnored` deliberately: writing them during
+    /// a read must not register as a mutation, or every render would
+    /// invalidate the view that just rendered.
+    @ObservationIgnored private var itemsCache: (version: Int, items: [TranscriptItem])?
+    @ObservationIgnored private var rowIDCache: (version: Int, id: String?)?
+    @ObservationIgnored private var artifactsCache: (version: Int, artifacts: [SessionArtifact])?
+    @ObservationIgnored private var gaugeCache: (version: Int, gauge: ContextGauge?)?
+
+    /// The folded transcript: thinking runs, status runs and tool-step runs
+    /// collapsed into render rows.
+    public var items: [TranscriptItem] {
+        if let itemsCache, itemsCache.version == messagesVersion { return itemsCache.items }
+        let folded = TranscriptItem.group(messages)
+        itemsCache = (messagesVersion, folded)
+        return folded
+    }
+
+    /// The row the newest message actually rendered into — what auto-scroll
+    /// must target, since a message can fold into a run that sits earlier
+    /// than later arrivals.
+    public var latestRowID: String? {
+        if let rowIDCache, rowIDCache.version == messagesVersion { return rowIDCache.id }
+        let id = TranscriptItem.latestRowID(of: messages)
+        rowIDCache = (messagesVersion, id)
+        return id
+    }
+
     /// Live context pressure for the header gauge; nil when the harness
     /// reports no per-call usage.
     public var contextGauge: ContextGauge? {
-        ContextGauge(messages: messages, harness: harnessPresentation.harness)
+        if let gaugeCache, gaugeCache.version == messagesVersion { return gaugeCache.gauge }
+        let gauge = ContextGauge(messages: messages, harness: harnessPresentation.harness)
+        gaugeCache = (messagesVersion, gauge)
+        return gauge
     }
+
     /// Branches and pull requests this session produced. Derived rather than
     /// stored — the hub reports neither, so the transcript is the only place
-    /// they exist. Same O(n)-per-render cost as the transcript fold beside it.
+    /// they exist.
     public var artifacts: [SessionArtifact] {
-        SessionArtifactExtractor.artifacts(in: messages)
+        if let artifactsCache, artifactsCache.version == messagesVersion { return artifactsCache.artifacts }
+        let found = SessionArtifactExtractor.artifacts(in: messages)
+        artifactsCache = (messagesVersion, found)
+        return found
     }
     public var composerText = ""
     /// Images picked in the composer, waiting to ride the next turn.
@@ -53,6 +102,10 @@ public final class ChatModel {
     public private(set) var queuedTurn: String?
     /// Attachments that were on a turn deferred by the same 409.
     private var queuedAttachments: [TurnAttachment] = []
+
+    /// request_id -> the prompt still awaiting an answer. Tiny in practice:
+    /// a harness blocks on one approval at a time.
+    @ObservationIgnored private var openApprovals: [String: HarnessMessage] = [:]
 
     // `nonisolated(unsafe)` solely so `deinit` (nonisolated in Swift 6) can
     // cancel it; every other access is from `@MainActor` methods, and deinit
@@ -93,7 +146,7 @@ public final class ChatModel {
         self.harnessPresentation = HarnessPresentation(harness ?? "")
         let factory = streamFactory ?? { c, s in MessageStream(client: c, sessionID: s) }
         self.stream = factory(client, sessionID)
-        recomputePendingApproval()
+        rebuildApprovals()
     }
 
     deinit {
@@ -155,7 +208,8 @@ public final class ChatModel {
         switch event {
         case .message(let message):
             messages.append(message)
-            recomputePendingApproval()
+            messagesVersion &+= 1
+            noteApproval(message)
             dispatchQueuedTurnIfComplete(message)
         case .connection(let connected):
             isConnected = connected
@@ -173,21 +227,39 @@ public final class ChatModel {
     /// `pendingApproval` is the latest (highest-`seq`) `approval_prompt`
     /// whose `payload.request_id` has no later `approval_response` carrying
     /// the same `request_id`.
-    private func recomputePendingApproval() {
-        let prompts = messages.filter { $0.type == .approvalPrompt }.sorted { $0.seq > $1.seq }
-        for prompt in prompts {
-            guard let requestID = prompt.payload["request_id"]?.stringValue else { continue }
-            let answered = messages.contains { message in
-                message.type == .approvalResponse
-                    && message.seq > prompt.seq
-                    && message.payload["request_id"]?.stringValue == requestID
+    ///
+    /// Maintained incrementally. The previous version rescanned the whole
+    /// transcript on *every appended message* — filter, sort, then a nested
+    /// `contains` per prompt — so replaying a 3,316-message session cost
+    /// O(n² x prompts) before a single frame was drawn. Open prompts are
+    /// almost always zero or one, so tracking them directly makes the live
+    /// path O(1) and the catch-up path linear.
+    private func noteApproval(_ message: HarnessMessage) {
+        guard let requestID = message.payload["request_id"]?.stringValue else { return }
+        switch message.type {
+        case .approvalPrompt:
+            openApprovals[requestID] = message
+        case .approvalResponse:
+            // A response only answers a prompt that came before it; one
+            // arriving first would be for a prompt this client never saw.
+            if let prompt = openApprovals[requestID], message.seq > prompt.seq {
+                openApprovals.removeValue(forKey: requestID)
             }
-            if !answered {
-                pendingApproval = prompt
-                return
-            }
+        default:
+            return
         }
-        pendingApproval = nil
+        pendingApproval = openApprovals.values.max { $0.seq < $1.seq }
+    }
+
+    /// One linear pass for the initial backlog, then `noteApproval` keeps it
+    /// current.
+    private func rebuildApprovals() {
+        openApprovals.removeAll(keepingCapacity: true)
+        for message in messages {
+            guard message.type == .approvalPrompt || message.type == .approvalResponse else { continue }
+            noteApproval(message)
+        }
+        pendingApproval = openApprovals.values.max { $0.seq < $1.seq }
     }
 
     // MARK: - Actions
