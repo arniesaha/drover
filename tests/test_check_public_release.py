@@ -2,7 +2,6 @@ import importlib.util
 from pathlib import Path
 import sys
 
-
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "check_public_release.py"
 SPEC = importlib.util.spec_from_file_location("check_public_release", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
