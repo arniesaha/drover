@@ -128,6 +128,8 @@ struct TableBlockView: View {
 struct ListBlockView: View {
     let list: ListBlock
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(Array(list.items.enumerated()), id: \.offset) { _, item in
@@ -140,7 +142,7 @@ struct ListBlockView: View {
                     }
                     marker(for: item)
                         .frame(width: 14, alignment: .leading)
-                    Text(item.content)
+                    Text(item.content.droverLinks(on: .surface, in: colorScheme))
                         .droverText(item.depth > 0 ? .nested : .body)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -167,12 +169,14 @@ struct ListBlockView: View {
 struct QuoteBlockView: View {
     let content: AttributedString
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1)
                 .fill(DroverColor.accent)
                 .frame(width: 2)
-            Text(content)
+            Text(content.droverLinks(on: .surface, in: colorScheme))
                 .droverText(.nested)
                 .italic()
                 .fixedSize(horizontal: false, vertical: true)

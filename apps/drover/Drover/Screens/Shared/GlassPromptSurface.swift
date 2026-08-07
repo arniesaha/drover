@@ -66,6 +66,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                     guard showsSendButton, canSend, !isSending else { return }
                     onSend()
                 }
+                .toolbar { keyboardBar }
 
             HStack(spacing: 12) {
                 attachmentButton
@@ -111,6 +112,41 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         .overlay {
             RoundedRectangle(cornerRadius: 30, style: .continuous)
                 .strokeBorder(DroverColor.line, lineWidth: 1)
+        }
+    }
+
+    /// The one strip of chrome iOS guarantees sits above the keyboard,
+    /// whatever the keyboard is.
+    ///
+    /// Keyboard avoidance moves the composer by the height the keyboard
+    /// reports, and a third-party keyboard with its own accessory row (Wispr
+    /// Flow, and most dictation keyboards) reports less than it draws — the
+    /// composer lands *under* it, send and all. Rather than chase that
+    /// measurement, send gets a second home in the input accessory view, and
+    /// there is finally an explicit way to put the keyboard away.
+    @ToolbarContentBuilder
+    private var keyboardBar: some ToolbarContent {
+        ToolbarItemGroup(placement: .keyboard) {
+            Button {
+                isTextFocused = false
+            } label: {
+                Label("Hide keyboard", systemImage: "keyboard.chevron.compact.down")
+            }
+            .accessibilityIdentifier("keyboard-dismiss")
+
+            Spacer()
+
+            if showsSendButton {
+                Button {
+                    onSend()
+                } label: {
+                    Label("Send", systemImage: sendSystemImage)
+                        .labelStyle(.titleAndIcon)
+                        .fontWeight(.medium)
+                }
+                .disabled(!canSend || isSending)
+                .accessibilityIdentifier("keyboard-send")
+            }
         }
     }
 
