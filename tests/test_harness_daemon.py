@@ -1649,7 +1649,12 @@ def test_structured_session_full_lifecycle(tmp_path):
         session = state.registry.get_session(sid)
         assert session is not None
         assert session.mode == "structured"
-        event_types = [event.event_type for event in state.registry.list_events(sid)]
+        events = state.registry.list_events(sid)
+        event_types = [event.event_type for event in events]
+        assert events[0].event_type == "session.started"
+        assert events[0].seq == 1
+        assert all(event.seq is not None for event in events)
+        assert [event.seq for event in events] == list(range(1, len(events) + 1))
         assert "approval_prompt" in event_types
         assert "approval_response" in event_types
     finally:

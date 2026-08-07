@@ -1731,6 +1731,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             session_id=session_id,
             event_type="session.started",
             payload=started_payload,
+            seq=1,
         )
 
         try:
@@ -2404,6 +2405,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         normalized_type: str | None = None,
         normalized_source: str | None = None,
         content_preview: str | None = None,
+        seq: int | None = None,
     ):
         try:
             session = self.server.state.registry.get_session(session_id)
@@ -2415,6 +2417,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 normalized_type=normalized_type,
                 normalized_source=normalized_source,
                 content_preview=content_preview,
+                seq=seq,
             )
             return event
         except Exception:
