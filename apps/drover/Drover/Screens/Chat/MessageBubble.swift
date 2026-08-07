@@ -10,6 +10,10 @@ import DroverKit
 struct MessageBubble: View {
     let message: HarnessMessage
 
+    /// Read only to colour link runs, which need a concrete `Color` rather
+    /// than a `PaletteToken` — see `DroverLinkGround`.
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         switch message.type {
         case .assistantOutput:
@@ -47,13 +51,13 @@ struct MessageBubble: View {
                 ForEach(Array(message.displayBlocks.enumerated()), id: \.offset) { _, block in
                     switch block {
                     case .text(let attributed):
-                        Text(attributed).droverText(.body)
+                        Text(linked(attributed)).droverText(.body)
                     case .code(let language, let code):
                         CodeBlockView(language: language, code: code)
                     case .diff(let lines):
                         DiffBlockView(lines: lines)
                     case .heading(let level, let content):
-                        Text(content).droverText(level <= 1 ? .h1 : (level == 2 ? .h2 : .h3))
+                        Text(linked(content)).droverText(level <= 1 ? .h1 : (level == 2 ? .h2 : .h3))
                     case .table(let table):
                         TableBlockView(table: table)
                     case .list(let list):
@@ -77,6 +81,10 @@ struct MessageBubble: View {
         }
     }
 
+    private func linked(_ content: AttributedString) -> AttributedString {
+        content.droverLinks(on: .surface, in: colorScheme)
+    }
+
     private var copyButton: some View {
         Button {
             UIPasteboard.general.string = message.text
@@ -90,7 +98,10 @@ struct MessageBubble: View {
             Spacer(minLength: 32)
             VStack(alignment: .trailing, spacing: 4) {
                 if !message.text.isEmpty || attachmentCount == 0 {
-                    Text(message.displayText)
+                    // The bubble's ground is the tint, which is also the
+                    // colour SwiftUI would draw a link in — a URL you sent
+                    // was invisible until this recoloured it.
+                    Text(message.displayText.droverLinks(on: .accent, in: colorScheme))
                 }
                 if attachmentCount > 0 {
                     Label(attachmentCount == 1 ? "1 image" : "\(attachmentCount) images",

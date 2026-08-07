@@ -59,7 +59,8 @@ public enum SessionArtifactExtractor {
                 }
             }
             for url in pullRequestURLs(in: searchableText(of: message)) {
-                add(pullRequest(from: url))
+                guard let artifact = pullRequest(from: url) else { continue }
+                add(artifact)
             }
         }
         return found
@@ -101,11 +102,15 @@ public enum SessionArtifactExtractor {
 
     /// `https://github.com/arniesaha/drover/pull/142` → `arniesaha/drover #142`.
     /// Shortening is lossless here because the URL rides along for the action.
-    static func pullRequest(from url: URL) -> SessionArtifact {
+    ///
+    /// nil for any `/pull/` path that does not name a numbered pull request.
+    /// The one that matters is `/pull/new/<branch>` — the "create a pull
+    /// request" link `git push` prints for every branch it pushes. Admitting
+    /// it produced a second row per branch, captioned PULL REQUEST, showing a
+    /// middle-truncated URL, opening a form for a PR that may already exist.
+    static func pullRequest(from url: URL) -> SessionArtifact? {
         let parts = url.path.split(separator: "/").map(String.init)
-        guard parts.count >= 4, parts[2] == "pull", Int(parts[3]) != nil else {
-            return SessionArtifact(kind: .pullRequest, value: url.absoluteString, url: url)
-        }
+        guard parts.count >= 4, parts[2] == "pull", Int(parts[3]) != nil else { return nil }
         return SessionArtifact(kind: .pullRequest,
                                value: "\(parts[0])/\(parts[1]) #\(parts[3])",
                                url: url)

@@ -100,6 +100,43 @@ import Testing
         #expect(SessionArtifactExtractor.artifacts(in: messages).isEmpty)
     }
 
+    /// `git push` prints a "create a pull request" link for the branch it just
+    /// pushed. It is an invitation, not a pull request — promoting it doubled
+    /// every branch into a second, unreadable row whose value was the raw URL.
+    @Test func theCreateAPullRequestLinkIsNotAPullRequest() {
+        let messages = [
+            result(1, text: """
+            remote: Create a pull request for 'fix/hook-span' on GitHub by visiting:
+            remote:      https://github.com/arniesaha/agentweave/pull/new/fix/hook-span
+            """),
+        ]
+
+        #expect(SessionArtifactExtractor.artifacts(in: messages).isEmpty)
+    }
+
+    /// The full push-then-open sequence: one branch, one pull request. The
+    /// `pull/new` link the push emits in between adds nothing.
+    @Test func pushThenOpenYieldsExactlyTwoRows() {
+        let messages = [
+            action(1, command: "git push -u origin fix/hook-span"),
+            result(2, text: "remote: https://github.com/arniesaha/agentweave/pull/new/fix/hook-span"),
+            result(3, text: "https://github.com/arniesaha/agentweave/pull/250"),
+        ]
+
+        let artifacts = SessionArtifactExtractor.artifacts(in: messages)
+
+        #expect(artifacts.map(\.value) == ["fix/hook-span", "arniesaha/agentweave #250"])
+    }
+
+    /// Anything under `/pull/` that isn't a number isn't a pull request —
+    /// `files`, `new`, and GitHub's other sub-paths all fall in here.
+    @Test func nonNumericPullPathsAreIgnored() {
+        for path in ["pull/new/topic", "pull/files", "pull/"] {
+            let messages = [result(1, text: "https://github.com/a/b/\(path)")]
+            #expect(SessionArtifactExtractor.artifacts(in: messages).isEmpty, "\(path)")
+        }
+    }
+
     // MARK: - Collection behaviour
 
     @Test func repeatedMentionsProduceOneRow() {

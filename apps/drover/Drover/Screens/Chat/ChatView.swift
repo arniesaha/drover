@@ -119,6 +119,10 @@ struct ChatView: View {
                 }
                 .padding()
             }
+            // Scrolling back to read is the other moment you want the
+            // keyboard gone, and dragging it away is cheaper than reaching
+            // for the accessory bar's dismiss button.
+            .scrollDismissesKeyboard(.interactively)
             // Pinned means "within 80pt of the end" — close enough that the
             // user is following the stream, far enough that the last row's
             // own growth doesn't flap the state.
