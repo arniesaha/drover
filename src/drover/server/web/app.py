@@ -7,7 +7,9 @@ is the thin HTTP shim around it.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import gzip
 import json
 import logging
 import queue
@@ -64,6 +66,52 @@ MIRROR_QUEUE_MAX = 2048
 # Cap on one batched write, so a huge backlog is drained in several bounded
 # windows rather than one that holds the connect lock for seconds.
 MIRROR_BATCH_MAX = 128
+_MESSAGE_PAGE_DEFAULT = 200
+_MESSAGE_PAGE_MAX = 500
+_GZIP_MIN_BYTES = 1024
+
+
+@dataclass(frozen=True)
+class MessagePageQuery:
+    after_seq: int | None
+    before_seq: int | None
+    through_seq: int | None
+    limit: int | None
+
+
+def _parse_optional_nonnegative_int(
+    params: dict[str, list[str]], name: str
+) -> int | None:
+    values = params.get(name)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise ValueError(f"{name} must appear once")
+    try:
+        value = int(values[0])
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
+def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
+    query = MessagePageQuery(
+        after_seq=_parse_optional_nonnegative_int(params, "after_seq"),
+        before_seq=_parse_optional_nonnegative_int(params, "before_seq"),
+        through_seq=_parse_optional_nonnegative_int(params, "through_seq"),
+        limit=_parse_optional_nonnegative_int(params, "limit"),
+    )
+    if query.after_seq is not None and query.before_seq is not None:
+        raise ValueError("after_seq and before_seq are mutually exclusive")
+    if query.through_seq is not None and query.after_seq is None:
+        raise ValueError("through_seq requires after_seq")
+    if query.limit == 0 or (
+        query.limit is not None and query.limit > _MESSAGE_PAGE_MAX
+    ):
+        raise ValueError(f"limit must be between 1 and {_MESSAGE_PAGE_MAX}")
+    return query
 
 
 def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
@@ -472,26 +520,52 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             session_id = unquote(
                 path.removeprefix("/harness/sessions/").removesuffix("/messages")
             ).strip("/")
-            params = parse_qs(parsed.query)
-            raw_after = (params.get("after_seq") or ["0"])[0]
             try:
-                after_seq = int(raw_after)
-            except ValueError:
+                query = _parse_message_page_query(parse_qs(parsed.query))
+            except ValueError as exc:
                 self._send(
                     400,
                     "application/json",
-                    '{"error": "after_seq must be an integer"}\n',
+                    json.dumps({"error": str(exc)}) + "\n",
                 )
                 return
             registry = self._harness_registry()
-            events = registry.list_events_after(session_id, after_seq)
-            body = json.dumps(
-                {
+            compatibility_mode = (
+                query.limit is None
+                and query.before_seq is None
+                and query.through_seq is None
+            )
+            if compatibility_mode:
+                events = registry.list_events_after(
+                    session_id, query.after_seq if query.after_seq is not None else 0
+                )
+                payload = {
                     "messages": [event.wire_payload() for event in events],
                     "max_seq": registry.max_event_seq(session_id),
                 }
+            else:
+                page = registry.list_event_page(
+                    session_id,
+                    after_seq=query.after_seq,
+                    before_seq=query.before_seq,
+                    through_seq=query.through_seq,
+                    limit=query.limit or _MESSAGE_PAGE_DEFAULT,
+                )
+                payload = {
+                    "messages": [event.wire_payload() for event in page.events],
+                    "page_min_seq": page.page_min_seq,
+                    "page_max_seq": page.page_max_seq,
+                    "max_seq": page.max_seq,
+                    "has_older": page.has_older,
+                    "has_newer": page.has_newer,
+                }
+            self._send(
+                200,
+                "application/json",
+                json.dumps(payload) + "\n",
+                allow_gzip=True,
+                route_class="session_messages",
             )
-            self._send(200, "application/json", body + "\n")
             return
         if path.startswith("/harness/sessions/"):
             session_id = unquote(path.removeprefix("/harness/sessions/").strip("/"))
@@ -1181,10 +1255,32 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return None
         return value if isinstance(value, dict) else None
 
-    def _send(self, status: int, content_type: str, body: str) -> None:
+    def _send(
+        self,
+        status: int,
+        content_type: str,
+        body: str,
+        *,
+        allow_gzip: bool = False,
+        route_class: str | None = None,
+    ) -> None:
+        started = time.monotonic()
         payload = body.encode("utf-8")
+        uncompressed_bytes = len(payload)
+        headers = getattr(self, "headers", {})
+        accepts_gzip = "gzip" in {
+            encoding.split(";", 1)[0].strip().lower()
+            for encoding in (headers.get("Accept-Encoding") or "").split(",")
+        }
+        compressed = allow_gzip and accepts_gzip and len(payload) >= _GZIP_MIN_BYTES
+        if compressed:
+            payload = gzip.compress(payload)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        if allow_gzip:
+            self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(payload)))
         if self.path.startswith(("/ui/harness", "/harness")):
             self.send_header("Cache-Control", "no-store, max-age=0")
@@ -1197,7 +1293,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             log.info(
                 "client disconnected while sending %s bytes for %s",
                 len(payload),
-                self.path,
+                route_class or self.path,
+            )
+        if route_class:
+            log.info(
+                "http_response route_class=%s status=%d uncompressed_bytes=%d "
+                "transferred_bytes=%d elapsed_ms=%.3f",
+                route_class,
+                status,
+                uncompressed_bytes,
+                len(payload),
+                (time.monotonic() - started) * 1000,
             )
 
 
