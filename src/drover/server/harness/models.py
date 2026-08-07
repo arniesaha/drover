@@ -139,3 +139,13 @@ class HarnessEvent:
             created_at=row.get("created_at"),
             seq=row.get("seq"),
         )
+
+
+@dataclass(frozen=True)
+class HarnessEventPage:
+    events: list[HarnessEvent]
+    page_min_seq: int | None
+    page_max_seq: int | None
+    max_seq: int
+    has_older: bool
+    has_newer: bool

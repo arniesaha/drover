@@ -15,6 +15,7 @@ import duckdb
 from drover.server.db import duckdb_connect_lock
 from drover.server.harness.models import (
     HarnessEvent,
+    HarnessEventPage,
     HarnessHost,
     HarnessSession,
 )
@@ -459,6 +460,64 @@ class HarnessRegistry:
                 [session_id, after_seq],
             )
         return [HarnessEvent.from_row(row) for row in rows]
+
+    def list_event_page(
+        self,
+        session_id: str,
+        *,
+        after_seq: int | None = None,
+        before_seq: int | None = None,
+        through_seq: int | None = None,
+        limit: int | None = None,
+    ) -> HarnessEventPage:
+        page_limit = limit or 200
+        with self._connect() as con:
+            if through_seq is None:
+                row = con.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM harness_events "
+                    "WHERE session_id = ?",
+                    [session_id],
+                ).fetchone()
+                max_seq = int(row[0] or 0)
+            else:
+                max_seq = through_seq
+
+            if after_seq is not None:
+                rows = _rows(
+                    con,
+                    "SELECT * FROM harness_events WHERE session_id = ? "
+                    "AND seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?",
+                    [session_id, after_seq, max_seq, page_limit + 1],
+                )
+                has_newer = len(rows) > page_limit
+                rows = rows[:page_limit]
+                has_older = after_seq > 0
+            else:
+                upper_bound = before_seq if before_seq is not None else max_seq + 1
+                rows = _rows(
+                    con,
+                    "SELECT * FROM ("
+                    "SELECT * FROM harness_events WHERE session_id = ? "
+                    "AND seq IS NOT NULL AND seq > 0 AND seq < ? "
+                    "ORDER BY seq DESC LIMIT ?"
+                    ") page ORDER BY seq ASC",
+                    [session_id, upper_bound, page_limit + 1],
+                )
+                has_older = len(rows) > page_limit
+                if has_older:
+                    rows = rows[1:]
+                has_newer = before_seq is not None and before_seq <= max_seq
+
+        events = [HarnessEvent.from_row(row) for row in rows]
+        sequences = [event.seq for event in events if event.seq is not None]
+        return HarnessEventPage(
+            events=events,
+            page_min_seq=min(sequences) if sequences else None,
+            page_max_seq=max(sequences) if sequences else None,
+            max_seq=max_seq,
+            has_older=has_older,
+            has_newer=has_newer,
+        )
 
     def get_event(self, event_id: str) -> HarnessEvent | None:
         with self._connect() as con:

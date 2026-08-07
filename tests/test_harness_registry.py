@@ -313,6 +313,108 @@ def test_event_seq_ordering(tmp_path):
     assert [e.seq for e in registry.list_events_after(sid, 0)] == [1, 2, 3]
 
 
+def _seed_event_page(registry: HarnessRegistry, session_id: str, count: int) -> None:
+    registry.create_session(
+        session_id=session_id,
+        host_id="h1",
+        harness="claude-code",
+        command="claude",
+    )
+    for seq in range(1, count + 1):
+        registry.append_event(
+            session_id=session_id,
+            event_type="assistant_output",
+            payload={"text": f"message {seq}"},
+            seq=seq,
+        )
+
+
+def test_event_page_reads_forward_with_fixed_snapshot_bound(tmp_path):
+    registry, _ = _registry(tmp_path)
+    _seed_event_page(registry, "paged-forward", 7)
+
+    first = registry.list_event_page(
+        "paged-forward", after_seq=0, through_seq=5, limit=2
+    )
+    second = registry.list_event_page(
+        "paged-forward", after_seq=2, through_seq=5, limit=2
+    )
+    final = registry.list_event_page(
+        "paged-forward", after_seq=4, through_seq=5, limit=2
+    )
+
+    assert [event.seq for event in first.events] == [1, 2]
+    assert (first.page_min_seq, first.page_max_seq, first.max_seq) == (1, 2, 5)
+    assert first.has_older is False
+    assert first.has_newer is True
+    assert [event.seq for event in second.events] == [3, 4]
+    assert second.has_older is True
+    assert second.has_newer is True
+    assert [event.seq for event in final.events] == [5]
+    assert final.has_newer is False
+
+
+def test_event_page_reads_newest_tail_and_older_pages(tmp_path):
+    registry, _ = _registry(tmp_path)
+    _seed_event_page(registry, "paged-backward", 7)
+
+    tail = registry.list_event_page("paged-backward", limit=3)
+    older = registry.list_event_page("paged-backward", before_seq=5, limit=2)
+    beginning = registry.list_event_page("paged-backward", before_seq=1, limit=2)
+
+    assert [event.seq for event in tail.events] == [5, 6, 7]
+    assert (tail.page_min_seq, tail.page_max_seq, tail.max_seq) == (5, 7, 7)
+    assert tail.has_older is True
+    assert tail.has_newer is False
+    assert [event.seq for event in older.events] == [3, 4]
+    assert older.has_older is True
+    assert older.has_newer is True
+    assert beginning.events == []
+    assert beginning.page_min_seq is None
+    assert beginning.page_max_seq is None
+    assert beginning.max_seq == 7
+    assert beginning.has_older is False
+    assert beginning.has_newer is True
+
+
+def test_event_page_empty_session_has_empty_metadata(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="paged-empty", host_id="h1", harness="codex", command="codex"
+    )
+
+    page = registry.list_event_page("paged-empty", limit=200)
+
+    assert page.events == []
+    assert page.page_min_seq is None
+    assert page.page_max_seq is None
+    assert page.max_seq == 0
+    assert page.has_older is False
+    assert page.has_newer is False
+
+
+def test_event_page_ignores_concurrent_append_after_fixed_bound(tmp_path):
+    registry, _ = _registry(tmp_path)
+    _seed_event_page(registry, "paged-race", 7)
+    first = registry.list_event_page(
+        "paged-race", after_seq=0, through_seq=7, limit=4
+    )
+    registry.append_event(
+        session_id="paged-race",
+        event_type="assistant_output",
+        payload={"text": "message 8"},
+        seq=8,
+    )
+
+    second = registry.list_event_page(
+        "paged-race", after_seq=4, through_seq=first.max_seq, limit=4
+    )
+
+    assert [event.seq for event in second.events] == [5, 6, 7]
+    assert second.max_seq == 7
+    assert second.has_newer is False
+
+
 def test_append_event_stores_queryable_normalized_terminal_metadata(tmp_path):
     registry, duckdb_path = _registry(tmp_path)
     registry.register_host(
