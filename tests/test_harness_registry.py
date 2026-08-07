@@ -396,9 +396,7 @@ def test_event_page_empty_session_has_empty_metadata(tmp_path):
 def test_event_page_ignores_concurrent_append_after_fixed_bound(tmp_path):
     registry, _ = _registry(tmp_path)
     _seed_event_page(registry, "paged-race", 7)
-    first = registry.list_event_page(
-        "paged-race", after_seq=0, through_seq=7, limit=4
-    )
+    first = registry.list_event_page("paged-race", after_seq=0, through_seq=7, limit=4)
     registry.append_event(
         session_id="paged-race",
         event_type="assistant_output",
