@@ -12,6 +12,8 @@ struct ChatView: View {
     @State private var showTerminateConfirm = false
     @State private var handoffSession: HandoffSession?
     @State private var pendingScroll: Task<Void, Never>?
+    @State private var pendingPrependScroll: Task<Void, Never>?
+    @State private var prependScrollGeneration = 0
     /// True while the user is at (or within ~80pt of) the transcript's end.
     /// Auto-scroll only runs while pinned; scrolling up unpins (so reading
     /// is never yanked back down) and shows the scroll-to-bottom button.
@@ -112,6 +114,66 @@ struct ChatView: View {
             let items = model.items
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
+                    if model.hasOlderHistory {
+                        Button {
+                            let anchorMessageID = items.first?.anchorMessageID
+                            cancelPrependScroll()
+                            let generation = prependScrollGeneration
+                            pendingScroll?.cancel()
+                            pendingScroll = nil
+                            isPinnedToBottom = false
+                            pendingPrependScroll = Task { @MainActor in
+                                defer {
+                                    if prependScrollGeneration == generation {
+                                        pendingPrependScroll = nil
+                                    }
+                                }
+                                let didLoad = await model.loadOlderHistory()
+                                guard !Task.isCancelled,
+                                      prependScrollGeneration == generation,
+                                      didLoad, let anchorMessageID,
+                                      let anchorRowID = TranscriptItem.rowID(
+                                        containing: anchorMessageID,
+                                        in: model.messages
+                                      ) else { return }
+                                // Prepending must not move the row the user
+                                // was reading. A folded run's rendered ID can
+                                // change at the page boundary, so follow one
+                                // of its raw messages into the regrouped row.
+                                try? await Task.sleep(for: .milliseconds(50))
+                                guard !Task.isCancelled else { return }
+                                proxy.scrollTo(anchorRowID, anchor: .top)
+                                // Tall lazy rows can finish measuring after
+                                // the first pass; settle once more against the
+                                // raw anchor's current rendered row.
+                                try? await Task.sleep(for: .milliseconds(200))
+                                guard !Task.isCancelled,
+                                      prependScrollGeneration == generation,
+                                      let settledRowID = TranscriptItem.rowID(
+                                        containing: anchorMessageID,
+                                        in: model.messages
+                                      ) else { return }
+                                proxy.scrollTo(settledRowID, anchor: .top)
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if model.isLoadingOlderHistory {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                                Text(model.isLoadingOlderHistory
+                                     ? "Loading earlier messages…"
+                                     : "Load earlier messages")
+                                    .font(.caption.weight(.medium))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isLoadingOlderHistory)
+                        .accessibilityIdentifier("chat-load-earlier")
+                    }
+
                     ForEach(items) { item in
                         row(for: item, isNewest: item.id == items.last?.id)
                             .id(item.id)
@@ -142,6 +204,10 @@ struct ChatView: View {
             }
             .onScrollPhaseChange { _, newPhase in
                 scrollPhase = newPhase
+                if newPhase == .tracking || newPhase == .interacting
+                    || newPhase == .decelerating {
+                    cancelPrependScroll()
+                }
             }
             .overlay(alignment: .bottomTrailing) {
                 if !isPinnedToBottom {
@@ -162,7 +228,10 @@ struct ChatView: View {
                 scheduleScroll(with: proxy)
             }
             .defaultScrollAnchor(.bottom)
-            .onDisappear { pendingScroll?.cancel() }
+            .onDisappear {
+                pendingScroll?.cancel()
+                pendingPrependScroll?.cancel()
+            }
         }
     }
 
@@ -186,6 +255,7 @@ struct ChatView: View {
 
     private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
         Button {
+            cancelPrependScroll()
             guard let rowID = model.latestRowID else { return }
             withAnimation(.snappy) {
                 isPinnedToBottom = true
@@ -229,6 +299,12 @@ struct ChatView: View {
                   let settledRowID = model.latestRowID else { return }
             proxy.scrollTo(settledRowID, anchor: .bottom)
         }
+    }
+
+    private func cancelPrependScroll() {
+        prependScrollGeneration &+= 1
+        pendingPrependScroll?.cancel()
+        pendingPrependScroll = nil
     }
 
     @ToolbarContentBuilder

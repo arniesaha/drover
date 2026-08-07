@@ -20,6 +20,8 @@ public final class ChatModel {
     /// suppress its "reconnecting" indicator during the initial connect
     /// (when there is nothing to *re*-connect to yet).
     public private(set) var hasConnectedOnce = false
+    public private(set) var hasOlderHistory = false
+    public private(set) var isLoadingOlderHistory = false
     /// True while an `approve(_:)` network call is in flight; the UI should
     /// disable the Approve/Deny controls to prevent double-submission.
     public private(set) var isAnswering = false
@@ -194,6 +196,9 @@ public final class ChatModel {
                 // (and hit belt one) while this loop is between events.
                 guard let self else { break }
                 self.ingest(event)
+                if case .history = event {
+                    self.hasOlderHistory = await stream.olderHistoryAvailable()
+                }
             }
         }
     }
@@ -207,6 +212,27 @@ public final class ChatModel {
         // events() pump and wedge the stream.)
         pumpTask?.cancel()
         pumpTask = nil
+    }
+
+    @discardableResult
+    public func loadOlderHistory() async -> Bool {
+        guard hasOlderHistory, !isLoadingOlderHistory else { return false }
+        isLoadingOlderHistory = true
+        defer { isLoadingOlderHistory = false }
+        do {
+            guard let page = try await stream.loadOlderHistory() else { return false }
+            mergeHistory(page.messages)
+            hasOlderHistory = page.hasOlder
+            if hint == "Could not load earlier messages — try again." {
+                hint = nil
+            }
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            hint = "Could not load earlier messages — try again."
+            return false
+        }
     }
 
     /// Reducer driving both the live pump above and the unit tests — funnels

@@ -38,6 +38,40 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         }
     }
 
+    /// A raw message that remains part of this row even if prepended history
+    /// extends a folded run and changes the row's rendered identity.
+    public var anchorMessageID: String {
+        switch self {
+        case .message(let message): message.id
+        case .thinkingRun(let run, _): run[0].id
+        case .statusRun(let run): run[0].id
+        case .stepRun(let steps): steps[0].action.id
+        }
+    }
+
+    /// Resolves a stable raw-message anchor to the row that renders it after
+    /// regrouping. This matters when pagination joins two folded runs: the
+    /// original row ID disappears, but its raw message is still present.
+    public static func rowID(
+        containing messageID: String,
+        in messages: [HarnessMessage]
+    ) -> String? {
+        group(messages).first { $0.contains(messageID: messageID) }?.id
+    }
+
+    private func contains(messageID: String) -> Bool {
+        switch self {
+        case .message(let message):
+            message.id == messageID
+        case .thinkingRun(let run, _), .statusRun(let run):
+            run.contains { $0.id == messageID }
+        case .stepRun(let steps):
+            steps.contains {
+                $0.action.id == messageID || $0.result?.id == messageID
+            }
+        }
+    }
+
     /// Folds the raw message list into render items. O(n); called from the
     /// view layer on each transcript change. Tool actions and results pair
     /// by payload `tool_use_id` into `.step` rows; actions without an id and
