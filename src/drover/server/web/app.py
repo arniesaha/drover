@@ -107,6 +107,12 @@ def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
         raise ValueError("after_seq and before_seq are mutually exclusive")
     if query.through_seq is not None and query.after_seq is None:
         raise ValueError("through_seq requires after_seq")
+    if (
+        query.through_seq is not None
+        and query.after_seq is not None
+        and query.through_seq < query.after_seq
+    ):
+        raise ValueError("through_seq must not precede after_seq")
     if query.limit == 0 or (
         query.limit is not None and query.limit > _MESSAGE_PAGE_MAX
     ):

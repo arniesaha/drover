@@ -2502,6 +2502,10 @@ def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
     [
         ("after_seq=0&before_seq=2&limit=1", "mutually exclusive"),
         ("through_seq=2&limit=1", "through_seq requires after_seq"),
+        (
+            "after_seq=10&through_seq=5&limit=200",
+            "through_seq must not precede after_seq",
+        ),
         ("limit=0", "limit must be between 1 and 500"),
         ("limit=501", "limit must be between 1 and 500"),
         ("before_seq=-1&limit=1", "before_seq must be nonnegative"),
