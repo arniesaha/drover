@@ -211,6 +211,17 @@ public final class ChatModel {
             messagesVersion &+= 1
             noteApproval(message)
             dispatchQueuedTurnIfComplete(message)
+        case .history(let messages, _):
+            // Task 5 replaces this compatibility path with one atomic merge.
+            // Keeping the legacy reducer behavior here makes the new stream
+            // event source-compatible while preserving a red performance
+            // test for the batching work.
+            for message in messages {
+                self.messages.append(message)
+                messagesVersion &+= 1
+                noteApproval(message)
+                dispatchQueuedTurnIfComplete(message)
+            }
         case .connection(let connected):
             isConnected = connected
             if connected { hasConnectedOnce = true }

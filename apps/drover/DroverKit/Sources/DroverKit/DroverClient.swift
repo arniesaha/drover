@@ -3,7 +3,7 @@ import Foundation
 public enum MessagePageRequest: Sendable, Equatable {
     case newest(limit: Int)
     case older(beforeSeq: Int, limit: Int)
-    case newer(afterSeq: Int, throughSeq: Int, limit: Int)
+    case newer(afterSeq: Int, throughSeq: Int?, limit: Int)
 }
 
 // MARK: - DroverError
@@ -121,11 +121,16 @@ public actor DroverClient {
                 URLQueryItem(name: "limit", value: "\(limit)"),
             ]
         case .newer(let afterSeq, let throughSeq, let limit):
-            components?.queryItems = [
+            var queryItems = [
                 URLQueryItem(name: "after_seq", value: "\(afterSeq)"),
-                URLQueryItem(name: "through_seq", value: "\(throughSeq)"),
-                URLQueryItem(name: "limit", value: "\(limit)"),
             ]
+            if let throughSeq {
+                queryItems.append(
+                    URLQueryItem(name: "through_seq", value: "\(throughSeq)")
+                )
+            }
+            queryItems.append(URLQueryItem(name: "limit", value: "\(limit)"))
+            components?.queryItems = queryItems
         }
         guard let url = components?.url else {
             throw DroverError.transport("invalid session message page URL")
