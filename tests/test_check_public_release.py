@@ -99,7 +99,7 @@ def test_check_paths_rejects_private_roadmap_link(tmp_path: Path) -> None:
     path = write_file(
         tmp_path,
         "docs/direction.md",
-        "See https://github.com/arniesaha/rover-roadmap for private plans.\n",
+        "See https://github.com/arniesaha/drover-roadmap for private plans.\n",
     )
 
     findings = check_paths([path])

@@ -43,7 +43,7 @@ RULES = (
     Rule(
         "private-roadmap-link",
         re.compile(
-            r"https://github\.com/arniesaha/(?:nexus|rover-roadmap)\b",
+            r"https://github\.com/arniesaha/(?:nexus|drover-roadmap)\b",
             re.IGNORECASE,
         ),
     ),
