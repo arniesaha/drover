@@ -1,0 +1,4 @@
+interface:
+  display_name: "Drover"
+  short_description: "Resume and recall work with Drover context"
+  default_prompt: "Use $drover to resume recent work in this repository with grounded session context."

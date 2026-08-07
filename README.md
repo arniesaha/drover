@@ -122,7 +122,7 @@ device signing, and server configuration.
 - [Integrations](docs/integrations.md)
 - [Multi-Host](docs/multi-host.md)
 - [Security](docs/security.md)
-- [Roadmap](docs/roadmap.md)
+- [Agent Skills](skills/README.md)
 
 ## Status And Limitations
 
@@ -132,7 +132,7 @@ but packaging, host-bound relay credentials, timely background push
 notifications, and broader context interchange standards remain future work.
 
 See [open issues](https://github.com/arniesaha/drover/issues) for current bugs
-and [Roadmap](docs/roadmap.md) for the supported direction.
+and accepted user-visible work.
 
 ## License
 
