@@ -120,6 +120,40 @@ import Testing
         #expect(model.messagesVersion == start + 2)
     }
 
+    @Test func historyPageAdvancesVersionExactlyOnce() {
+        let model = ChatModel.fixture()
+        let page = (1...200).map { output($0, "message \($0)") }
+        let start = model.messagesVersion
+
+        model.ingest(.history(page, decodeIssues: []))
+
+        #expect(model.messages.count == 200)
+        #expect(model.messagesVersion == start + 1)
+        #expect(model.historyPagesMerged == 1)
+        #expect(model.lastHistoryMergeDuration != nil)
+    }
+
+    @Test func historyMergeSortsDeduplicatesAndRebuildsApprovalState() {
+        let model = ChatModel.fixture(messages: [
+            output(1, "one"), output(2, "stale two"),
+        ])
+
+        model.ingest(.history([
+            output(4, "stale four"),
+            output(2, "new two"),
+            prompt(3, request: "r1"),
+            output(4, "new four"),
+        ], decodeIssues: []))
+
+        #expect(model.messages.map(\.seq) == [1, 2, 3, 4])
+        #expect(model.messages.first(where: { $0.seq == 2 })?.text == "new two")
+        #expect(model.messages.first(where: { $0.seq == 4 })?.text == "new four")
+        #expect(model.pendingApproval?.seq == 3)
+
+        model.ingest(.history([response(5, request: "r1")], decodeIssues: []))
+        #expect(model.pendingApproval == nil)
+    }
+
     /// A non-message event must not invalidate the transcript caches — a
     /// reconnect blip should never cost a re-fold of the whole session.
     @Test func connectionEventsDoNotInvalidateTheTranscript() {

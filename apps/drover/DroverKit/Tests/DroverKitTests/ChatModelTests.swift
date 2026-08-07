@@ -230,6 +230,30 @@ struct ChatModelTests {
     #expect(model.hint == nil)
 }
 
+@Test @MainActor func historicalTurnCompletionDoesNotDispatchQueuedTurn() async throws {
+    let counter = RequestCounter()
+    MockURLProtocol.handler = { _ in
+        counter.bump()
+        return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "wait for the live completion"
+    await model.sendTurn()
+    #expect(model.queuedTurn == "wait for the live completion")
+
+    model.ingest(.history([
+        .fixture(
+            seq: 9,
+            type: .status,
+            payload: ["turn_complete": .bool(true), "awaiting": .string("input")]
+        ),
+    ], decodeIssues: []))
+    try await Task.sleep(for: .milliseconds(30))
+
+    #expect(counter.value == 1)
+    #expect(model.queuedTurn == "wait for the live completion")
+}
+
 @Test @MainActor func sendTurnPassesAttachmentsAndClearsThem() async throws {
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01, 0x02]))
     nonisolated(unsafe) var sentImages: [[String: Any]] = []
@@ -431,8 +455,14 @@ struct ChatModelTests {
 /// the second start()'s pump, and a finished pump must not leave
 /// `pumpTask` non-nil (which would wedge start()'s idempotency guard).
 @Test @MainActor func restartAfterStopStillStreamsMessages() async throws {
-    MockURLProtocol.handler = { _ in
-        (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
+    MockURLProtocol.handler = { request in
+        let afterSeq = URLComponents(
+            url: request.url!, resolvingAgainstBaseURL: false
+        )?.queryItems?.first(where: { $0.name == "after_seq" })?.value ?? "0"
+        return (200, Data("""
+        {"messages": [], "max_seq": \(afterSeq),
+         "has_older": false, "has_newer": false}
+        """.utf8))
     }
     let connector = FakeConnector([
         .frames([chatWireMessage(seq: 1, text: "before stop")], thenError: false),

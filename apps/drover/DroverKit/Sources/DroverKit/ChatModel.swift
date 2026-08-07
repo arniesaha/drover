@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 
 /// All chat logic for one structured-session conversation: ingesting the
 /// resumable `MessageStream`, tracking the newest unanswered approval
@@ -51,6 +52,13 @@ public final class ChatModel {
     @ObservationIgnored private var rowIDCache: (version: Int, id: String?)?
     @ObservationIgnored private var artifactsCache: (version: Int, artifacts: [SessionArtifact])?
     @ObservationIgnored private var gaugeCache: (version: Int, gauge: ContextGauge?)?
+    @ObservationIgnored private(set) var historyPagesMerged = 0
+    @ObservationIgnored private(set) var lastHistoryMergeDuration: Duration?
+
+    private static let historySignposter = OSSignposter(
+        subsystem: "com.arniesaha.drover",
+        category: "SessionHistory"
+    )
 
     /// The folded transcript: thinking runs, status runs and tool-step runs
     /// collapsed into render rows.
@@ -212,16 +220,7 @@ public final class ChatModel {
             noteApproval(message)
             dispatchQueuedTurnIfComplete(message)
         case .history(let messages, _):
-            // Task 5 replaces this compatibility path with one atomic merge.
-            // Keeping the legacy reducer behavior here makes the new stream
-            // event source-compatible while preserving a red performance
-            // test for the batching work.
-            for message in messages {
-                self.messages.append(message)
-                messagesVersion &+= 1
-                noteApproval(message)
-                dispatchQueuedTurnIfComplete(message)
-            }
+            mergeHistory(messages)
         case .connection(let connected):
             isConnected = connected
             if connected { hasConnectedOnce = true }
@@ -233,6 +232,50 @@ public final class ChatModel {
             isConnected = false
             hint = "Token rejected — check Settings."
         }
+    }
+
+    private func mergeHistory(_ incoming: [HarnessMessage]) {
+        guard !incoming.isEmpty else { return }
+        let clock = ContinuousClock()
+        let started = clock.now
+        let signpostID = Self.historySignposter.makeSignpostID()
+        let signpostState = Self.historySignposter.beginInterval(
+            "MergeHistoryPage", id: signpostID
+        )
+        defer {
+            Self.historySignposter.endInterval("MergeHistoryPage", signpostState)
+            lastHistoryMergeDuration = started.duration(to: clock.now)
+            historyPagesMerged &+= 1
+        }
+
+        let isStrictlyAscending = zip(incoming, incoming.dropFirst()).allSatisfy {
+            $0.seq < $1.seq
+        }
+        let canAppend: Bool
+        if let currentLast = messages.last?.seq {
+            canAppend = isStrictlyAscending && incoming[0].seq > currentLast
+        } else {
+            canAppend = isStrictlyAscending
+        }
+
+        if canAppend {
+            messages.append(contentsOf: incoming)
+        } else {
+            var bySequence: [Int: HarnessMessage] = [:]
+            bySequence.reserveCapacity(messages.count + incoming.count)
+            for message in messages {
+                bySequence[message.seq] = message
+            }
+            for message in incoming {
+                bySequence[message.seq] = message
+            }
+            messages = bySequence.values.sorted { $0.seq < $1.seq }
+        }
+
+        rebuildApprovals()
+        messagesVersion &+= 1
+        // Historical terminal statuses describe already-completed work. They
+        // must never dispatch a turn queued against the current live run.
     }
 
     /// `pendingApproval` is the latest (highest-`seq`) `approval_prompt`
@@ -267,8 +310,19 @@ public final class ChatModel {
     private func rebuildApprovals() {
         openApprovals.removeAll(keepingCapacity: true)
         for message in messages {
-            guard message.type == .approvalPrompt || message.type == .approvalResponse else { continue }
-            noteApproval(message)
+            guard let requestID = message.payload["request_id"]?.stringValue else {
+                continue
+            }
+            switch message.type {
+            case .approvalPrompt:
+                openApprovals[requestID] = message
+            case .approvalResponse:
+                if let prompt = openApprovals[requestID], message.seq > prompt.seq {
+                    openApprovals.removeValue(forKey: requestID)
+                }
+            default:
+                continue
+            }
         }
         pendingApproval = openApprovals.values.max { $0.seq < $1.seq }
     }
