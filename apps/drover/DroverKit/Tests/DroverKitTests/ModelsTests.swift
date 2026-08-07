@@ -216,6 +216,64 @@ func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbol
     #expect(batch.messages[2].type == .unknown)  // future type degrades
 }
 
+@Test func messagePageDecodesPaginationMetadata() throws {
+    let data = Data("""
+    {"messages": [
+      {"event_id": "event-4", "seq": 4, "type": "assistant_output",
+       "role": "assistant", "text": "four", "payload": {}},
+      {"event_id": "event-5", "seq": 5, "type": "assistant_output",
+       "role": "assistant", "text": "five", "payload": {}}
+    ], "page_min_seq": 4, "page_max_seq": 5, "max_seq": 9,
+       "has_older": true, "has_newer": true}
+    """.utf8)
+
+    let page = try MessagePage.decode(from: data)
+
+    #expect(page.messages.map(\.seq) == [4, 5])
+    #expect(page.pageMinSeq == 4)
+    #expect(page.pageMaxSeq == 5)
+    #expect(page.maxSeq == 9)
+    #expect(page.hasOlder)
+    #expect(page.hasNewer)
+    #expect(page.decodeIssues.isEmpty)
+}
+
+@Test func messagePageDecodesLegacyBatchDefaults() throws {
+    let page = try MessagePage.decode(from: messagesJSON)
+
+    #expect(page.messages.map(\.seq) == [1, 2, 3])
+    #expect(page.pageMinSeq == nil)
+    #expect(page.pageMaxSeq == nil)
+    #expect(page.maxSeq == 3)
+    #expect(page.hasOlder == false)
+    #expect(page.hasNewer == false)
+    #expect(page.decodeIssues.count == 1)
+    #expect(page.decodeIssues[0].index == 3)
+    #expect(page.decodeIssues[0].seq == nil)
+}
+
+@Test func messagePageReportsMalformedElementWithoutDiscardingNeighbors() throws {
+    let data = Data("""
+    {"messages": [
+      {"event_id": "event-1", "seq": 1, "type": "user_input",
+       "role": "user", "text": "one", "payload": {}},
+      {"seq": 2, "type": "assistant_output", "role": "assistant",
+       "text": "must not appear in diagnostics", "payload": {}},
+      {"event_id": "event-3", "seq": 3, "type": "assistant_output",
+       "role": "assistant", "text": "three", "payload": {}}
+    ], "page_min_seq": 1, "page_max_seq": 3, "max_seq": 3,
+       "has_older": false, "has_newer": false}
+    """.utf8)
+
+    let page = try MessagePage.decode(from: data)
+
+    #expect(page.messages.map(\.seq) == [1, 3])
+    #expect(page.decodeIssues.count == 1)
+    #expect(page.decodeIssues[0].index == 1)
+    #expect(page.decodeIssues[0].seq == 2)
+    #expect(page.decodeIssues[0].detail.contains("must not appear") == false)
+}
+
 // The chat transcript renders `displayText`, parsed from markdown exactly
 // once per message (at decode/init) — parsing per render pass (what
 // `Text(LocalizedStringKey)` does) saturates the main thread during long

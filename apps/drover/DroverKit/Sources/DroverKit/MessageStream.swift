@@ -55,6 +55,7 @@ public struct URLSessionWebSocketConnector: WebSocketConnecting {
 
 public enum StreamEvent: Sendable, Equatable {
     case message(HarnessMessage)
+    case history([HarnessMessage], decodeIssues: [MessageDecodeIssue])
     case connection(Bool)   // false while reconnecting
     /// Terminal: the token was rejected (401) by either the REST catch-up or
     /// the WebSocket handshake. Unlike a transient drop, this is never
@@ -74,6 +75,13 @@ public enum StreamEvent: Sendable, Equatable {
 /// catching up via REST from `lastSeq` first so no message is missed or
 /// re-delivered.
 public actor MessageStream {
+    private enum CatchUpError: Error {
+        case sequenceGap
+        case malformedPage
+        case snapshotChanged
+    }
+
+    private static let historyPageSize = 200
     private let client: DroverClient
     private let sessionID: String
     private let connector: WebSocketConnecting
@@ -137,9 +145,9 @@ public actor MessageStream {
             // with the same credentials can never succeed, so stop for good
             // instead of reconnecting forever behind a silent "Reconnecting…"
             // pill.
-            let batch: MessageBatch
+            let fixedMaxSeq: Int
             do {
-                batch = try await client.messages(sessionID: sessionID, afterSeq: lastSeq)
+                fixedMaxSeq = try await catchUp(continuation: continuation)
             } catch DroverError.unauthorized {
                 if !Task.isCancelled { continuation.yield(.unauthorized) }
                 break
@@ -157,18 +165,16 @@ public actor MessageStream {
             continuation.yield(.connection(true))
             backoff = reconnectBaseDelay
 
-            for message in batch.messages.sorted(by: { $0.seq < $1.seq }) {
-                deliver(message, continuation: continuation)
-            }
-
-            let request = client.streamRequest(sessionID: sessionID, afterSeq: lastSeq)
+            let request = client.streamRequest(
+                sessionID: sessionID, afterSeq: fixedMaxSeq
+            )
             let frames = connector.connect(request)
 
             do {
                 for try await frame in frames {
                     if Task.isCancelled { break }
                     guard let message = decode(frame: frame) else { continue }
-                    deliver(message, continuation: continuation)
+                    try deliver(message, continuation: continuation)
                 }
                 // Stream finished without error: server closed cleanly.
                 // Treat as a disconnect and reconnect, same as an error.
@@ -188,13 +194,77 @@ public actor MessageStream {
         continuation.finish()
     }
 
-    /// Dedup relies on the server contract that `seq` is strictly monotonic
-    /// per session: anything at or below `lastSeq` has, by definition, already
-    /// been delivered (via REST history or an earlier frame). If the server
-    /// ever regressed a session's seq counter, those messages would be
-    /// silently dropped here — by design, since re-delivering would duplicate.
-    private func deliver(_ message: HarnessMessage, continuation: AsyncStream<StreamEvent>.Continuation) {
+    private func catchUp(
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) async throws -> Int {
+        var cursor = lastSeq
+        var fixedMaxSeq: Int?
+
+        while !Task.isCancelled {
+            let page = try await client.messagePage(
+                sessionID: sessionID,
+                request: .newer(
+                    afterSeq: cursor,
+                    throughSeq: fixedMaxSeq,
+                    limit: Self.historyPageSize
+                )
+            )
+            try Task.checkCancellation()
+
+            if let fixedMaxSeq {
+                guard page.maxSeq == fixedMaxSeq else {
+                    throw CatchUpError.snapshotChanged
+                }
+            } else {
+                guard page.maxSeq >= cursor else {
+                    throw CatchUpError.snapshotChanged
+                }
+                fixedMaxSeq = page.maxSeq
+            }
+            guard page.decodeIssues.isEmpty else {
+                throw CatchUpError.malformedPage
+            }
+
+            let fresh = page.messages.filter { $0.seq > cursor }
+            var expectedSeq = cursor + 1
+            for message in fresh {
+                guard message.seq == expectedSeq else {
+                    throw CatchUpError.sequenceGap
+                }
+                expectedSeq += 1
+            }
+
+            if !fresh.isEmpty {
+                cursor = fresh.last!.seq
+                lastSeq = cursor
+                continuation.yield(.history(fresh, decodeIssues: page.decodeIssues))
+            }
+
+            guard let bound = fixedMaxSeq else {
+                throw CatchUpError.snapshotChanged
+            }
+            if cursor == bound {
+                return bound
+            }
+            guard cursor < bound, !fresh.isEmpty, page.hasNewer else {
+                throw CatchUpError.sequenceGap
+            }
+        }
+
+        throw CancellationError()
+    }
+
+    /// Duplicate replay at or below `lastSeq` is harmless. A jump above the
+    /// next contiguous sequence is not: reconnect through REST from the last
+    /// safe cursor rather than advancing past a message the client never saw.
+    private func deliver(
+        _ message: HarnessMessage,
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) throws {
         guard message.seq > lastSeq else { return }
+        guard message.seq == lastSeq + 1 else {
+            throw CatchUpError.sequenceGap
+        }
         lastSeq = message.seq
         continuation.yield(.message(message))
     }

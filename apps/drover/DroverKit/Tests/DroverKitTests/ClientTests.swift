@@ -151,6 +151,43 @@ struct ClientTests {
     #expect(batch.messages.count == 3)
 }
 
+@Test func messagePageBuildsNewestRequest() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.absoluteString.contains(
+            "/harness/sessions/session%20one/messages?"
+        ) == true)
+        #expect(request.url?.query == "limit=200")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        return (200, Data(#"{"messages": [], "max_seq": 0, "has_older": false, "has_newer": false}"#.utf8))
+    }
+
+    let page = try await client().messagePage(
+        sessionID: "session one", request: .newest(limit: 200))
+
+    #expect(page.maxSeq == 0)
+}
+
+@Test func messagePageBuildsOlderRequest() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.query == "before_seq=42&limit=100")
+        return (200, Data(#"{"messages": [], "max_seq": 42, "has_older": false, "has_newer": true}"#.utf8))
+    }
+
+    _ = try await client().messagePage(
+        sessionID: "s1", request: .older(beforeSeq: 42, limit: 100))
+}
+
+@Test func messagePageBuildsFixedBoundNewerRequest() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.query == "after_seq=7&through_seq=99&limit=500")
+        return (200, Data(#"{"messages": [], "max_seq": 99, "has_older": true, "has_newer": false}"#.utf8))
+    }
+
+    _ = try await client().messagePage(
+        sessionID: "s1",
+        request: .newer(afterSeq: 7, throughSeq: 99, limit: 500))
+}
+
 @Test func sendTurnPostsBodyAndReturnsTurnID() async throws {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/turns")

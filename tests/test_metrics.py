@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import base64
+import gzip
 import os
 import duckdb
 import shutil
@@ -2419,6 +2420,156 @@ def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
             body = json.loads(response.read())
         assert [m["text"] for m in body["messages"]] == ["a", "b"]
         assert body["max_seq"] == 2
+    finally:
+        server.shutdown()
+
+
+def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        _ingest_events(port, [_event(seq, str(seq)) for seq in range(1, 8)])
+
+        with _authed_get(
+            f"http://127.0.0.1:{port}/harness/sessions/harness-s2/messages"
+            "?after_seq=0"
+        ) as response:
+            body = json.loads(response.read())
+
+        assert [message["seq"] for message in body["messages"]] == list(range(1, 8))
+        assert body["max_seq"] == 7
+        assert "has_newer" not in body
+    finally:
+        server.shutdown()
+
+
+def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        base = f"http://127.0.0.1:{port}/harness/sessions/harness-s2/messages"
+        _ingest_events(port, [_event(seq, str(seq)) for seq in range(1, 8)])
+
+        with _authed_get(f"{base}?limit=3") as response:
+            newest = json.loads(response.read())
+        with _authed_get(f"{base}?before_seq=5&limit=2") as response:
+            older = json.loads(response.read())
+        with _authed_get(f"{base}?after_seq=0&limit=2") as response:
+            forward = json.loads(response.read())
+        _ingest_events(port, [_event(8, "8")])
+        with _authed_get(
+            f"{base}?after_seq=2&through_seq={forward['max_seq']}&limit=500"
+        ) as response:
+            bounded = json.loads(response.read())
+
+        assert [message["seq"] for message in newest["messages"]] == [5, 6, 7]
+        assert {
+            key: newest[key]
+            for key in (
+                "page_min_seq",
+                "page_max_seq",
+                "max_seq",
+                "has_older",
+                "has_newer",
+            )
+        } == {
+            "page_min_seq": 5,
+            "page_max_seq": 7,
+            "max_seq": 7,
+            "has_older": True,
+            "has_newer": False,
+        }
+        assert [message["seq"] for message in older["messages"]] == [3, 4]
+        assert older["has_older"] is True
+        assert older["has_newer"] is True
+        assert [message["seq"] for message in forward["messages"]] == [1, 2]
+        assert forward["has_newer"] is True
+        assert [message["seq"] for message in bounded["messages"]] == [3, 4, 5, 6, 7]
+        assert bounded["max_seq"] == 7
+        assert bounded["has_newer"] is False
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("query", "detail"),
+    [
+        ("after_seq=0&before_seq=2&limit=1", "mutually exclusive"),
+        ("through_seq=2&limit=1", "through_seq requires after_seq"),
+        (
+            "after_seq=10&through_seq=5&limit=200",
+            "through_seq must not precede after_seq",
+        ),
+        ("limit=0", "limit must be between 1 and 500"),
+        ("limit=501", "limit must be between 1 and 500"),
+        ("before_seq=-1&limit=1", "before_seq must be nonnegative"),
+        ("after_seq=0&after_seq=1&limit=1", "after_seq must appear once"),
+    ],
+)
+def test_messages_endpoint_rejects_invalid_page_queries(tmp_path, query, detail):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _authed_get(
+                f"http://127.0.0.1:{port}/harness/sessions/harness-s2/messages?{query}"
+            )
+        assert exc.value.code == 400
+        assert detail in exc.value.read().decode()
+    finally:
+        server.shutdown()
+
+
+def test_messages_endpoint_selectively_gzips_large_pages(tmp_path):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        base = f"http://127.0.0.1:{port}/harness/sessions/harness-s2/messages"
+        _ingest_events(port, [_event(1, "compressible transcript " * 100)])
+
+        with _authed_get(f"{base}?limit=1") as response:
+            identity = response.read()
+        with _authed_get(
+            f"{base}?limit=1", headers={"Accept-Encoding": "br, gzip"}
+        ) as response:
+            compressed = response.read()
+            assert response.headers["Content-Encoding"] == "gzip"
+            assert response.headers["Vary"] == "Accept-Encoding"
+
+        assert gzip.decompress(compressed) == identity
+        assert len(compressed) < len(identity)
+    finally:
+        server.shutdown()
+
+
+def test_messages_endpoint_keeps_small_page_uncompressed(tmp_path):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        _ingest_events(port, [_event(1, "small")])
+        with _authed_get(
+            f"http://127.0.0.1:{port}/harness/sessions/harness-s2/messages?limit=1",
+            headers={"Accept-Encoding": "gzip"},
+        ) as response:
+            body = json.loads(response.read())
+            assert response.headers.get("Content-Encoding") is None
+
+        assert body["messages"][0]["text"] == "small"
     finally:
         server.shutdown()
 

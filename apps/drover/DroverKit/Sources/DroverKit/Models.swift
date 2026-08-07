@@ -62,11 +62,25 @@ enum WireDate {
 /// Decode `[LenientElement<T>].compactMap(\.value)` to skip bad elements.
 private struct LenientElement<T: Decodable>: Decodable {
     let value: T?
+    let errorDetail: String?
+    let seq: Int?
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        value = try? container.decode(T.self)
+        do {
+            value = try container.decode(T.self)
+            errorDetail = nil
+            seq = nil
+        } catch {
+            value = nil
+            errorDetail = String(describing: error)
+            seq = (try? container.decode(SequenceProbe.self))?.seq
+        }
     }
+}
+
+private struct SequenceProbe: Decodable {
+    let seq: Int?
 }
 
 private func lenientDecode<T: Decodable>(_ type: T.Type, from array: [LenientElement<T>]) -> [T] {
@@ -626,5 +640,65 @@ public struct MessageBatch: Sendable {
             messages = lenientDecode(HarnessMessage.self, from: messagesWrapped)
             maxSeq = (try? container.decode(Int.self, forKey: .maxSeq)) ?? 0
         }
+    }
+}
+
+// MARK: - MessagePage
+
+public struct MessageDecodeIssue: Sendable, Equatable {
+    public let index: Int
+    public let seq: Int?
+    public let detail: String
+
+    public init(index: Int, seq: Int?, detail: String) {
+        self.index = index
+        self.seq = seq
+        self.detail = detail
+    }
+}
+
+public struct MessagePage: Sendable {
+    public let messages: [HarnessMessage]
+    public let pageMinSeq: Int?
+    public let pageMaxSeq: Int?
+    public let maxSeq: Int
+    public let hasOlder: Bool
+    public let hasNewer: Bool
+    public let decodeIssues: [MessageDecodeIssue]
+
+    public static func decode(from data: Data) throws -> MessagePage {
+        try JSONDecoder().decode(MessagePage.self, from: data)
+    }
+}
+
+extension MessagePage: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case messages
+        case pageMinSeq = "page_min_seq"
+        case pageMaxSeq = "page_max_seq"
+        case maxSeq = "max_seq"
+        case hasOlder = "has_older"
+        case hasNewer = "has_newer"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let wrapped = (try? container.decode(
+            [LenientElement<HarnessMessage>].self, forKey: .messages
+        )) ?? []
+        messages = lenientDecode(HarnessMessage.self, from: wrapped)
+        decodeIssues = wrapped.enumerated().compactMap { index, element in
+            guard element.value == nil else { return nil }
+            return MessageDecodeIssue(
+                index: index,
+                seq: element.seq,
+                detail: element.errorDetail ?? "message could not be decoded"
+            )
+        }
+        pageMinSeq = try? container.decode(Int.self, forKey: .pageMinSeq)
+        pageMaxSeq = try? container.decode(Int.self, forKey: .pageMaxSeq)
+        maxSeq = (try? container.decode(Int.self, forKey: .maxSeq)) ?? 0
+        hasOlder = (try? container.decode(Bool.self, forKey: .hasOlder)) ?? false
+        hasNewer = (try? container.decode(Bool.self, forKey: .hasNewer)) ?? false
     }
 }

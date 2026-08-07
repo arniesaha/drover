@@ -1,5 +1,11 @@
 import Foundation
 
+public enum MessagePageRequest: Sendable, Equatable {
+    case newest(limit: Int)
+    case older(beforeSeq: Int, limit: Int)
+    case newer(afterSeq: Int, throughSeq: Int?, limit: Int)
+}
+
 // MARK: - DroverError
 
 public enum DroverError: Error, Equatable {
@@ -95,6 +101,46 @@ public actor DroverClient {
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/messages?after_seq=\(afterSeq)"
         let data = try await request(path: path, method: "GET", body: nil)
         return try decodeMessageBatch(from: data)
+    }
+
+    public func messagePage(
+        sessionID: String,
+        request pageRequest: MessagePageRequest
+    ) async throws -> MessagePage {
+        var components = URLComponents(
+            url: config.baseURL, resolvingAgainstBaseURL: false
+        )
+        components?.percentEncodedPath =
+            "/harness/sessions/\(encodePathComponent(sessionID))/messages"
+        switch pageRequest {
+        case .newest(let limit):
+            components?.queryItems = [URLQueryItem(name: "limit", value: "\(limit)")]
+        case .older(let beforeSeq, let limit):
+            components?.queryItems = [
+                URLQueryItem(name: "before_seq", value: "\(beforeSeq)"),
+                URLQueryItem(name: "limit", value: "\(limit)"),
+            ]
+        case .newer(let afterSeq, let throughSeq, let limit):
+            var queryItems = [
+                URLQueryItem(name: "after_seq", value: "\(afterSeq)"),
+            ]
+            if let throughSeq {
+                queryItems.append(
+                    URLQueryItem(name: "through_seq", value: "\(throughSeq)")
+                )
+            }
+            queryItems.append(URLQueryItem(name: "limit", value: "\(limit)"))
+            components?.queryItems = queryItems
+        }
+        guard let url = components?.url else {
+            throw DroverError.transport("invalid session message page URL")
+        }
+        let data = try await request(url: url, method: "GET", body: nil)
+        do {
+            return try MessagePage.decode(from: data)
+        } catch {
+            throw DroverError.decoding("\(error)")
+        }
     }
 
     public func createSession(hostID: String, harness: String, mode: String,
@@ -239,7 +285,14 @@ public actor DroverClient {
         guard let url = URL(string: path, relativeTo: config.baseURL) else {
             throw DroverError.transport("invalid URL for path \(path)")
         }
-        var urlRequest = URLRequest(url: url.absoluteURL)
+        return try await request(
+            url: url.absoluteURL, method: method, body: body, timeout: timeout
+        )
+    }
+
+    private func request(url: URL, method: String, body: Data?,
+                         timeout: TimeInterval? = nil) async throws -> Data {
+        var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = method
         urlRequest.timeoutInterval = timeout ?? 15
         urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

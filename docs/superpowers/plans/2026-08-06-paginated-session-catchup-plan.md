@@ -44,7 +44,7 @@
 - Produces `HarnessEventPage(events, page_min_seq, page_max_seq, max_seq, has_older, has_newer)`.
 - Produces `list_event_page(session_id: str, *, after_seq: int | None = None, before_seq: int | None = None, through_seq: int | None = None, limit: int | None = None) -> HarnessEventPage`.
 
-- [ ] **Step 1: Write failing forward/backward page tests**
+- [x] **Step 1: Write failing forward/backward page tests**
 
 Seed sequences 1–7 and assert:
 
@@ -65,13 +65,13 @@ assert [e.seq for e in older.events] == [3, 4]
 
 Also test empty sessions, `before_seq=1`, and a concurrent sequence 8 arriving after `through_seq=7`; forward pages must stop at 7.
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run: `uv run --extra dev python -m pytest -q tests/test_harness_registry.py -k event_page`
 
 Expected: FAIL because the page API does not exist.
 
-- [ ] **Step 3: Implement page queries**
+- [x] **Step 3: Implement page queries**
 
 Use an ascending query for forward pages:
 
@@ -93,7 +93,7 @@ SELECT * FROM (
 
 Fetch `limit + 1` rows to derive `has_newer`/`has_older` without a second count query. `max_seq` is the supplied `through_seq` or the session maximum captured at the start of the call.
 
-- [ ] **Step 4: Run registry tests and commit**
+- [x] **Step 4: Run registry tests and commit**
 
 Run: `uv run --extra dev python -m pytest -q tests/test_harness_registry.py`
 
@@ -115,7 +115,7 @@ git commit -m "feat(harness): page session events by sequence"
 - Produces query parameters `after_seq`, `before_seq`, `through_seq`, `limit`.
 - Produces response keys `messages`, `page_min_seq`, `page_max_seq`, `max_seq`, `has_older`, `has_newer`.
 
-- [ ] **Step 1: Write failing HTTP contract tests**
+- [x] **Step 1: Write failing HTTP contract tests**
 
 Add tests for newest-tail, older, limited-forward, fixed-through, and invalid combinations. Preserve this old-client assertion:
 
@@ -128,13 +128,13 @@ assert body["max_seq"] == 7
 
 Add gzip coverage using `Accept-Encoding: gzip`; assert `Content-Encoding: gzip`, decompress, and compare JSON with the identity response. Assert bodies below 1 KiB remain uncompressed.
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run: `uv run --extra dev python -m pytest -q tests/test_metrics.py -k 'messages_endpoint and (page or gzip or limit or through)'`
 
 Expected: FAIL because pagination metadata and gzip are absent.
 
-- [ ] **Step 3: Implement validation and compatibility mode**
+- [x] **Step 3: Implement validation and compatibility mode**
 
 Add pure helpers:
 
@@ -183,11 +183,11 @@ def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
 
 When `limit`, `before_seq`, and `through_seq` are all absent, retain the current complete `after_seq` behavior. Otherwise enforce the page cap and serialize Task 1's metadata.
 
-- [ ] **Step 4: Add selective gzip and response metrics**
+- [x] **Step 4: Add selective gzip and response metrics**
 
 Extend `_send` with `allow_gzip: bool = False`. Compress only when allowed, body length is at least 1,024 bytes, and `Accept-Encoding` contains `gzip`. Set `Vary: Accept-Encoding`, `Content-Encoding: gzip`, and the compressed `Content-Length`. Record structured log fields for route class, status, uncompressed bytes, transferred bytes, and elapsed milliseconds without logging the session ID or content.
 
-- [ ] **Step 5: Run HTTP tests and commit**
+- [x] **Step 5: Run HTTP tests and commit**
 
 Run: `uv run --extra dev python -m pytest -q tests/test_metrics.py`
 
@@ -211,17 +211,17 @@ git commit -m "feat(api): paginate and compress session history"
 - Produces `MessagePageRequest` enum cases `.newest(limit:)`, `.older(beforeSeq:limit:)`, `.newer(afterSeq:throughSeq:limit:)`.
 - Produces `DroverClient.messagePage(sessionID:request:) async throws -> MessagePage`.
 
-- [ ] **Step 1: Write failing decode and request-shape tests**
+- [x] **Step 1: Write failing decode and request-shape tests**
 
 Assert the new response decodes, legacy `{messages,max_seq}` still decodes with false page flags, and each enum case produces the exact query string. Include a malformed element between valid sequences and assert one `MessageDecodeIssue` is returned rather than blanking the page.
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run: `swift test --filter 'ModelsTests|ClientTests'`
 
 Expected: FAIL because the page types and client method are absent.
 
-- [ ] **Step 3: Implement page types and diagnostic lenient decoding**
+- [x] **Step 3: Implement page types and diagnostic lenient decoding**
 
 Define:
 
@@ -245,11 +245,11 @@ public struct MessagePage: Sendable {
 
 Retain the raw decoding error and, when recoverable, the raw integer `seq` inside `LenientElement` so `MessagePage.decode` can surface indexed diagnostics. Do not include raw JSON or message text in the diagnostic.
 
-- [ ] **Step 4: Implement typed URL construction**
+- [x] **Step 4: Implement typed URL construction**
 
 Build `URLComponents.queryItems` rather than concatenating user-controlled strings. Keep `messages(sessionID:afterSeq:)` as a compatibility wrapper around an unlimited legacy request until Task 4 switches the stream.
 
-- [ ] **Step 5: Run DroverKit model/client tests and commit**
+- [x] **Step 5: Run DroverKit model/client tests and commit**
 
 Run: `swift test --filter 'ModelsTests|ClientTests'`
 
@@ -271,19 +271,19 @@ git commit -m "feat(ios): decode paginated session history"
 - Adds `StreamEvent.history([HarnessMessage], decodeIssues: [MessageDecodeIssue])`.
 - Produces contiguous fixed-bound catch-up with page size 200.
 
-- [ ] **Step 1: Write failing multi-page and race tests**
+- [x] **Step 1: Write failing multi-page and race tests**
 
 Mock pages `[1,2] max=5`, `[3,4] through=5`, `[5]`, then a WebSocket frame 6. Assert emitted events are three history batches followed by message 6, the WebSocket request uses `after_seq=5`, and no duplicate is delivered.
 
 Add a page with sequences `[1,3]`; assert the stream emits a connection failure and retries from zero without attaching WebSocket. Add a malformed issue at sequence 2 and assert the same gap behavior.
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run: `swift test --filter StreamTests`
 
 Expected: FAIL because history batching and page iteration do not exist.
 
-- [ ] **Step 3: Implement `catchUp()` as a private actor method**
+- [x] **Step 3: Implement `catchUp()` as a private actor method**
 
 Use this contract:
 
@@ -295,11 +295,11 @@ private func catchUp(
 
 The first request captures `maxSeq`; later requests use the same value as `throughSeq`. Validate that every message equals `lastSeq + 1` before yielding the page. Update `lastSeq` only after validating the complete page. Return the fixed maximum for WebSocket attachment.
 
-- [ ] **Step 4: Keep live delivery incremental**
+- [x] **Step 4: Keep live delivery incremental**
 
 After catch-up, call `streamRequest(sessionID:afterSeq: fixedMaxSeq)`. Continue using the existing `deliver` guard for live frames. Reconnect starts forward catch-up from the current contiguous `lastSeq` and captures a new bound.
 
-- [ ] **Step 5: Run stream tests and commit**
+- [x] **Step 5: Run stream tests and commit**
 
 Run: `swift test --filter StreamTests`
 
@@ -322,25 +322,25 @@ git commit -m "perf(ios): batch paginated session catch-up"
 - Produces `mergeHistory(_ incoming: [HarnessMessage])` with one version bump.
 - Produces internal counters `historyPagesMerged` and `lastHistoryMergeDuration` for signpost tests; production instrumentation uses `OSSignposter` when available.
 
-- [ ] **Step 1: Write failing atomic-merge tests**
+- [x] **Step 1: Write failing atomic-merge tests**
 
 Assert a 200-message history event increments `messagesVersion` once, sorts and deduplicates overlapping sequences, rebuilds pending approval correctly, and does not dispatch queued turns from historical completion statuses.
 
-- [ ] **Step 2: Add a production-shaped performance fixture**
+- [x] **Step 2: Add a production-shaped performance fixture**
 
 Generate 3,316 messages with representative status, thinking, tool, and prose payload sizes. The test measures the merge itself and asserts one version mutation; use `measure`/clock reporting rather than a brittle CI wall-clock failure. Keep the physical-device thresholds for the deployment gate.
 
-- [ ] **Step 3: Run tests and confirm failure**
+- [x] **Step 3: Run tests and confirm failure**
 
 Run: `swift test --filter 'ChatModelDerivedStateTests|SessionLoadPerformanceTests'`
 
 Expected: FAIL because `history` is not handled atomically.
 
-- [ ] **Step 4: Implement ordered deduplicating batch merge**
+- [x] **Step 4: Implement ordered deduplicating batch merge**
 
 For append-only forward pages, compare against the current last sequence and append only greater sequences. For a replacement/overlap path, merge by `seq` in a dictionary and sort once. Call `rebuildApprovals()` once, increment `messagesVersion` once, and never call `dispatchQueuedTurnIfComplete` for backlog messages.
 
-- [ ] **Step 5: Run the full DroverKit suite and commit**
+- [x] **Step 5: Run the full DroverKit suite and commit**
 
 Run: `swift test`
 
@@ -356,7 +356,7 @@ git commit -m "perf(ios): apply history pages atomically"
 **Files:**
 - No source changes unless instrumentation reveals a defect, which must get its own failing test and commit.
 
-- [ ] **Step 1: Run complete automated verification**
+- [x] **Step 1: Run complete automated verification**
 
 ```bash
 uv run --extra dev python -m pytest -q
@@ -366,9 +366,23 @@ uv run --extra dev python scripts/check_public_release.py
 
 Expected: all tests pass and public audit has zero findings.
 
-- [ ] **Step 2: Benchmark server pages**
+- [x] **Step 2: Benchmark server pages**
 
 Against copies of the 3,316-event/4 MB and 2,024-event/10 MB sessions, record identity versus gzip transferred bytes, time to first byte, total time, and page query duration for newest, older, and forward catch-up.
+
+Benchmark recorded 2026-08-06 on the Mac Mini against an ephemeral authenticated
+server and temporary DuckDB populated from the existing pre-maintenance backup.
+The selected rows exactly match production's 3,316-event/3,844,431-byte and
+2,024-event/10,367,721-byte sessions and all 5,340 rows have canonical sequences.
+
+| Session | Query median newest / older / forward | Newest identity | Newest gzip |
+| --- | --- | --- | --- |
+| 3,316 events | 5.307 / 5.374 / 7.962 ms | 156,787 bytes; 23.472 ms TTFB; 23.518 ms total | 25,349 bytes; 9.565 ms TTFB; 9.582 ms total |
+| 2,024 events | 9.703 / 9.857 / 9.337 ms | 1,125,901 bytes; 11.548 ms TTFB; 11.956 ms total | 119,324 bytes; 22.325 ms TTFB; 22.346 ms total |
+
+The unpaginated compatibility request returned all 3,316 and 2,024 messages,
+respectively. These are local transport/query measurements, not substitutes for
+the release-build physical-device cold-load gates below.
 
 - [ ] **Step 3: Deploy server before client**
 
