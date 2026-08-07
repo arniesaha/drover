@@ -56,17 +56,25 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 attachmentStrip
             }
 
-            TextField(placeholder, text: $text, axis: .vertical)
-                .font(.system(size: 22, weight: .regular, design: .default))
-                .lineLimit(1...5)
-                .textFieldStyle(.plain)
-                .focused($isTextFocused)
-                .submitLabel(.send)
-                .onSubmit {
-                    guard showsSendButton, canSend, !isSending else { return }
-                    onSend()
+            HStack(alignment: .top, spacing: 8) {
+                TextField(placeholder, text: $text, axis: .vertical)
+                    .font(.system(size: 22, weight: .regular, design: .default))
+                    .lineLimit(1...5)
+                    .textFieldStyle(.plain)
+                    .focused($isTextFocused)
+                    .submitLabel(.send)
+                    .onSubmit {
+                        guard showsSendButton, canSend, !isSending else { return }
+                        onSend()
+                    }
+
+                // Only while the keyboard is up — the rest of the time it
+                // would be a control for a state you are not in.
+                if isTextFocused {
+                    dismissKeyboardButton
                 }
-                .toolbar { keyboardBar }
+            }
+            .animation(.snappy(duration: 0.2), value: isTextFocused)
 
             HStack(spacing: 12) {
                 attachmentButton
@@ -115,39 +123,34 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         }
     }
 
-    /// The one strip of chrome iOS guarantees sits above the keyboard,
-    /// whatever the keyboard is.
+    /// Dismissal lives in the composer, at the trailing end of the text line.
     ///
-    /// Keyboard avoidance moves the composer by the height the keyboard
-    /// reports, and a third-party keyboard with its own accessory row (Wispr
-    /// Flow, and most dictation keyboards) reports less than it draws — the
-    /// composer lands *under* it, send and all. Rather than chase that
-    /// measurement, send gets a second home in the input accessory view, and
-    /// there is finally an explicit way to put the keyboard away.
-    @ToolbarContentBuilder
-    private var keyboardBar: some ToolbarContent {
-        ToolbarItemGroup(placement: .keyboard) {
-            Button {
-                isTextFocused = false
-            } label: {
-                Label("Hide keyboard", systemImage: "keyboard.chevron.compact.down")
-            }
-            .accessibilityIdentifier("keyboard-dismiss")
-
-            Spacer()
-
-            if showsSendButton {
-                Button {
-                    onSend()
-                } label: {
-                    Label("Send", systemImage: sendSystemImage)
-                        .labelStyle(.titleAndIcon)
-                        .fontWeight(.medium)
-                }
-                .disabled(!canSend || isSending)
-                .accessibilityIdentifier("keyboard-send")
-            }
+    /// It began on an input accessory bar, which cost a second strip of
+    /// chrome and put a second send arrow directly under the composer's own —
+    /// two identical buttons, no way to tell them apart. The obvious next
+    /// home was the control row beside the preference chips, and that row has
+    /// no room: a 32pt button plus its spacing takes 44 of the ~48pt of slack
+    /// there, and the chips collapse to "Def…" at 393pt and "D…"/"A…" at
+    /// 375pt. Trading the model you are about to run for a button that hides
+    /// a keyboard is the wrong trade.
+    ///
+    /// The text line, meanwhile, is empty to the right of a short prompt at
+    /// every width. Top-aligned, so it stays on the first line as the field
+    /// grows to five.
+    private var dismissKeyboardButton: some View {
+        Button {
+            isTextFocused = false
+        } label: {
+            Image(systemName: "keyboard.chevron.compact.down")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(DroverColor.muted)
+                .frame(width: 32, height: 30)
+                .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+        .accessibilityLabel("Hide keyboard")
+        .accessibilityIdentifier("keyboard-dismiss")
     }
 
     private var sendFill: some ShapeStyle {
