@@ -1652,9 +1652,9 @@ def test_structured_session_full_lifecycle(tmp_path):
         events = state.registry.list_events(sid)
         event_types = [event.event_type for event in events]
         assert events[0].event_type == "session.started"
-        assert events[0].seq == 1
+        assert events[0].seq == 0
         assert all(event.seq is not None for event in events)
-        assert [event.seq for event in events] == list(range(1, len(events) + 1))
+        assert [event.seq for event in events[1:]] == list(range(1, len(events)))
         assert "approval_prompt" in event_types
         assert "approval_response" in event_types
     finally:
@@ -1748,7 +1748,7 @@ def test_structured_turn_appends_user_input_and_seq_is_monotonic(tmp_path):
         assert user_input_events[-1].payload["text"] == "second turn"
 
         seqs = [event.seq for event in events if event.seq is not None]
-        assert seqs == list(range(1, len(seqs) + 1))
+        assert seqs == list(range(len(seqs)))
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()

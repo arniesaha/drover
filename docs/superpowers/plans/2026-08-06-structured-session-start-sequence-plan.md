@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ensure every new structured session begins with a sequenced `session.started` event and remains fully contiguous.
+**Goal:** Ensure every new structured session has a sequenced local lifecycle marker while client-visible messages remain contiguous from sequence 1.
 
-**Architecture:** Add optional sequence forwarding to the daemon's best-effort event helper, then assign sequence 1 only to the structured-session start event. The structured manager's existing `max_event_seq()` initialization will continue later messages from sequence 2 under its existing per-session lock.
+**Architecture:** Add optional sequence forwarding to the daemon's best-effort event helper, then reserve sequence 0 only for the local structured-session start marker. `list_events_after(session_id, 0)` excludes that marker, and the structured manager's existing `max_event_seq()` initialization continues client-visible messages from sequence 1 under its existing per-session lock.
 
 **Tech Stack:** Python 3.12, DuckDB-backed `HarnessRegistry`, pytest, uv
 
@@ -26,7 +26,7 @@
 
 **Interfaces:**
 - Consumes: `HarnessRegistry.append_event(..., seq: int | None = None) -> HarnessEvent` and `HarnessRegistry.max_event_seq(session_id: str) -> int`.
-- Produces: `_safe_append_event(..., seq: int | None = None)` forwarding the canonical sequence to the registry; structured `session.started` persisted with `seq=1`.
+- Produces: `_safe_append_event(..., seq: int | None = None)` forwarding the local lifecycle sequence to the registry; structured `session.started` persisted with `seq=0`.
 
 - [x] **Step 1: Write the failing regression assertion**
 
@@ -36,11 +36,18 @@ In `test_structured_session_full_lifecycle`, replace the event-type-only read wi
         events = state.registry.list_events(sid)
         event_types = [event.event_type for event in events]
         assert events[0].event_type == "session.started"
-        assert events[0].seq == 1
+        assert events[0].seq == 0
         assert all(event.seq is not None for event in events)
-        assert [event.seq for event in events] == list(range(1, len(events) + 1))
+        assert [event.seq for event in events[1:]] == list(range(1, len(events)))
         assert "approval_prompt" in event_types
         assert "approval_response" in event_types
+```
+
+Update `test_structured_turn_appends_user_input_and_seq_is_monotonic` to assert that its complete local event list is contiguous from the reserved lifecycle sequence:
+
+```python
+        seqs = [event.seq for event in events if event.seq is not None]
+        assert seqs == list(range(len(seqs)))
 ```
 
 - [x] **Step 2: Run the focused test and verify RED**
@@ -51,7 +58,7 @@ Run:
 uv run --extra dev python -m pytest -q tests/test_harness_daemon.py::test_structured_session_full_lifecycle
 ```
 
-Expected: FAIL because `events[0].seq` is `None` instead of `1`.
+Expected: FAIL because `events[0].seq` is `1` instead of the reserved local sequence `0`.
 
 - [x] **Step 3: Implement the minimal sequence forwarding**
 
@@ -83,14 +90,14 @@ Add the optional parameter to `_safe_append_event` and forward it:
             )
 ```
 
-Pass sequence 1 at the structured start call only:
+Pass sequence 0 at the structured start call only:
 
 ```python
         self._safe_append_event(
             session_id=session_id,
             event_type="session.started",
             payload=started_payload,
-            seq=1,
+            seq=0,
         )
 ```
 

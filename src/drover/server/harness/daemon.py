@@ -1731,7 +1731,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             session_id=session_id,
             event_type="session.started",
             payload=started_payload,
-            seq=1,
+            seq=0,
         )
 
         try:
