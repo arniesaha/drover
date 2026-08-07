@@ -20,7 +20,16 @@ import UIKit
 struct ArtifactRows: View {
     let artifacts: [SessionArtifact]
 
-    @State private var isExpanded = true
+    /// Collapsed until asked. The header already answers the question the
+    /// pane exists for — *did this session produce anything, and how much* —
+    /// and answering it costs one row instead of four. Opening it is a tap;
+    /// the transcript gets the rest of the screen until then.
+    @State private var isExpanded: Bool
+
+    init(artifacts: [SessionArtifact], initiallyExpanded: Bool = false) {
+        self.artifacts = artifacts
+        _isExpanded = State(initialValue: initiallyExpanded)
+    }
 
     @Environment(\.openURL) private var openURL
 

@@ -29,17 +29,35 @@ struct ArtifactRowsLayoutTests {
         }
     }
 
-    private func height(of artifacts: [SessionArtifact]) -> CGFloat {
-        let host = UIHostingController(rootView: ArtifactRows(artifacts: artifacts).droverTint())
+    private func height(of artifacts: [SessionArtifact], expanded: Bool = true) -> CGFloat {
+        let pane = ArtifactRows(artifacts: artifacts, initiallyExpanded: expanded)
+        let host = UIHostingController(rootView: pane.droverTint())
         host.view.frame = CGRect(x: 0, y: 0, width: Self.phoneWidth, height: Self.offeredHeight)
         host.view.layoutIfNeeded()
         return host.sizeThatFits(in: CGSize(width: Self.phoneWidth,
                                             height: Self.offeredHeight)).height
     }
 
+    /// The pane arrives as one header row. It competes with the transcript
+    /// for the same screen, and the header already answers the question it
+    /// exists for — how many, and were there any.
+    @Test func thePaneStartsCollapsed() {
+        for count in [1, 3, 9, 40] {
+            #expect(height(of: artifacts(count), expanded: false) <= 60,
+                    "\(count) artifacts opened to more than a header row")
+        }
+    }
+
+    /// Collapsed is a default, not a ceiling: opening it has to actually
+    /// show the rows.
+    @Test func openingThePaneShowsTheRows() {
+        #expect(height(of: artifacts(3), expanded: true)
+                > height(of: artifacts(3), expanded: false))
+    }
+
     /// The screenshot that started this: nine artifacts filled the phone and
-    /// left the transcript a strip. However many there are, the pane stays a
-    /// pane.
+    /// left the transcript a strip. Opened, however many there are, the pane
+    /// stays a pane.
     @Test func manyArtifactsStayBounded() {
         #expect(height(of: artifacts(9)) <= 230)
         #expect(height(of: artifacts(40)) <= 230)
@@ -85,7 +103,8 @@ struct ArtifactRowsLayoutTests {
     /// A scene-attached window: SwiftUI only materialises the UIKit views
     /// behind a `ScrollView` once the hierarchy is in a real window.
     private func hosted(_ artifacts: [SessionArtifact]) -> UIHostingController<some View> {
-        let host = UIHostingController(rootView: ArtifactRows(artifacts: artifacts).droverTint())
+        let pane = ArtifactRows(artifacts: artifacts, initiallyExpanded: true)
+        let host = UIHostingController(rootView: pane.droverTint())
         let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
         let window = scene.map { UIWindow(windowScene: $0) }
             ?? UIWindow(frame: CGRect(x: 0, y: 0, width: Self.phoneWidth, height: Self.offeredHeight))
