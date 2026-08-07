@@ -80,3 +80,43 @@ def test_check_paths_allows_documented_legacy_compatibility(tmp_path: Path) -> N
     )
 
     assert check_paths([path]) == []
+
+
+def test_check_paths_rejects_legacy_nexus_skill_entrypoint(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "skills/nexus/SKILL.md",
+        "---\nname: nexus\ndescription: Use when recalling prior work.\n---\n",
+    )
+
+    findings = check_paths([path])
+
+    assert len(findings) == 1
+    assert findings[0].rule == "legacy-skill-entrypoint"
+
+
+def test_check_paths_rejects_private_roadmap_link(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "docs/direction.md",
+        "See https://github.com/arniesaha/drover-roadmap for private plans.\n",
+    )
+
+    findings = check_paths([path])
+
+    assert len(findings) == 1
+    assert findings[0].rule == "private-roadmap-link"
+
+
+def test_check_paths_rejects_private_planning_paths(tmp_path: Path) -> None:
+    paths = [
+        write_file(tmp_path, "docs/roadmap.md", "# Roadmap\n"),
+        write_file(tmp_path, "docs/superpowers/specs/design.md", "# Design\n"),
+    ]
+
+    findings = check_paths(paths)
+
+    assert [finding.rule for finding in findings] == [
+        "private-planning-path",
+        "private-planning-path",
+    ]

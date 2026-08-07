@@ -40,11 +40,23 @@ RULES = (
         "private-tailnet-hostname",
         re.compile(r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net\b", re.IGNORECASE),
     ),
+    Rule(
+        "private-roadmap-link",
+        re.compile(
+            r"https://github\.com/arniesaha/(?:nexus|drover-roadmap)\b",
+            re.IGNORECASE,
+        ),
+    ),
     Rule("legacy-public-name", re.compile(r"\bNexusKit\b")),
 )
 
 ENVIRONMENT_RULES = frozenset(
-    {"personal-home-path", "private-ip-address", "private-tailnet-hostname"}
+    {
+        "personal-home-path",
+        "private-ip-address",
+        "private-tailnet-hostname",
+        "private-roadmap-link",
+    }
 )
 RELEASE_FACING_PARTS = frozenset({"docs", "deploy", "scripts", ".github"})
 RELEASE_FACING_SUFFIXES = frozenset({".env", ".md", ".plist", ".toml", ".yaml", ".yml"})
@@ -58,7 +70,9 @@ CREDENTIAL_PATTERN = re.compile(
 # Only the named rule is suppressed. Other findings in an allowlisted file still fail.
 RULE_ALLOWLIST = {
     "docs/compatibility.md": frozenset({"legacy-public-name"}),
-    "scripts/check_public_release.py": frozenset({"legacy-public-name"}),
+    "scripts/check_public_release.py": frozenset(
+        {"legacy-public-name", "private-roadmap-link"}
+    ),
     "tests/test_check_public_release.py": frozenset(
         {
             "credential-value",
@@ -66,6 +80,7 @@ RULE_ALLOWLIST = {
             "personal-home-path",
             "private-ip-address",
             "private-tailnet-hostname",
+            "private-roadmap-link",
         }
     ),
 }
@@ -108,6 +123,31 @@ def _is_release_facing(path: Path) -> bool:
 def check_paths(paths: Sequence[Path]) -> list[Finding]:
     findings: list[Finding] = []
     for path in paths:
+        normalized = f"/{path.as_posix().lstrip('/')}"
+        if normalized.endswith("/docs/roadmap.md") or "/docs/superpowers/" in normalized:
+            findings.append(
+                Finding(
+                    path=str(path),
+                    line=1,
+                    rule="private-planning-path",
+                    excerpt=path.as_posix(),
+                )
+            )
+
+        if (
+            path.name == "SKILL.md"
+            and path.parent.name == "nexus"
+            and path.parent.parent.name == "skills"
+        ):
+            findings.append(
+                Finding(
+                    path=str(path),
+                    line=1,
+                    rule="legacy-skill-entrypoint",
+                    excerpt="skills/nexus/SKILL.md",
+                )
+            )
+
         try:
             data = path.read_bytes()
         except (OSError, ValueError):

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Drover Local Lakehouse"
+  short_description: "Inspect Drover DuckDB and Parquet safely"
+  default_prompt: "Use $drover-local-lakehouse to run a bounded read-only data quality check."
