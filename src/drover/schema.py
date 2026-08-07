@@ -97,14 +97,27 @@ CREATE TABLE IF NOT EXISTS session_summaries (
 
 _SUMMARIZE_JOBS_DDL = """
 CREATE TABLE IF NOT EXISTS summarize_jobs (
-  session_id  VARCHAR PRIMARY KEY,
-  status      VARCHAR,           -- 'pending' | 'running' | 'done' | 'errored'
-  attempts    INTEGER DEFAULT 0,
-  last_error  VARCHAR,
-  enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP
+  session_id       VARCHAR PRIMARY KEY,
+  status           VARCHAR,
+  attempts         INTEGER DEFAULT 0,
+  last_error       VARCHAR,
+  enqueued_at      TIMESTAMP DEFAULT now(),
+  updated_at       TIMESTAMP,
+  source_version   VARCHAR,
+  max_attempts     INTEGER DEFAULT 5,
+  next_run_at      TIMESTAMP,
+  dead_lettered_at TIMESTAMP,
+  stream_publish_needed BOOLEAN DEFAULT FALSE
 );
 """
+
+_SUMMARIZE_JOBS_COLUMNS = {
+    "source_version": "VARCHAR",
+    "max_attempts": "INTEGER DEFAULT 5",
+    "next_run_at": "TIMESTAMP",
+    "dead_lettered_at": "TIMESTAMP",
+    "stream_publish_needed": "BOOLEAN DEFAULT FALSE",
+}
 
 # Project-level rollup keyed by `<repo_owner>/<repo_name>`. One row per
 # project; regenerated from session_summaries when activity warrants.
@@ -132,9 +145,16 @@ CREATE TABLE IF NOT EXISTS brief_jobs (
   attempts    INTEGER DEFAULT 0,
   last_error  VARCHAR,
   enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP
+  updated_at  TIMESTAMP,
+  source_session_id VARCHAR,
+  source_version VARCHAR
 );
 """
+
+_BRIEF_JOBS_COLUMNS = {
+    "source_session_id": "VARCHAR",
+    "source_version": "VARCHAR",
+}
 
 # Embeddings of session_summaries.summary_md, keyed by session_id.
 # Stored as FLOAT[] so DuckDB's array_cosine_similarity works directly.
@@ -155,9 +175,12 @@ CREATE TABLE IF NOT EXISTS embed_jobs (
   attempts    INTEGER DEFAULT 0,
   last_error  VARCHAR,
   enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP
+  updated_at  TIMESTAMP,
+  source_version VARCHAR
 );
 """
+
+_EMBED_JOBS_COLUMNS = {"source_version": "VARCHAR"}
 
 # Span-derived embeddings are intentionally separate from session-summary
 # embeddings: span_id is the source identity, and source_text/source_fields record
@@ -1372,10 +1395,13 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_TASKS_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
+        _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
         con.execute(_PROJECT_BRIEFS_DDL)
         con.execute(_BRIEF_JOBS_DDL)
+        _ensure_table_columns(con, "brief_jobs", _BRIEF_JOBS_COLUMNS)
         con.execute(_SESSION_EMBEDDINGS_DDL)
         con.execute(_EMBED_JOBS_DDL)
+        _ensure_table_columns(con, "embed_jobs", _EMBED_JOBS_COLUMNS)
         con.execute(_SPAN_EMBEDDINGS_DDL)
         _ensure_table_columns(con, "span_embeddings", _SPAN_EMBEDDINGS_COLUMNS)
         con.execute(_SPAN_EMBED_JOBS_DDL)

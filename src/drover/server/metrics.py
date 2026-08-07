@@ -18,6 +18,11 @@ from drover.server.harness.daemon import (
     native_transcript_for_session,
 )
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.schema import (
+    audit_legacy_harness_event_sequences,
+    migrate_legacy_harness_event_sequences,
+)
+from drover.server.db import open_duckdb_connection
 from drover.server.jobs import RedisJobStream
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -50,6 +55,15 @@ RELAY_MIN_TIMEOUT_S = 5.0
 # delivers the handoff text as the first turn -- strictly more reliable than
 # typing it into a cold PTY (no startup-gate race).
 _STRUCTURED_HANDOFF_HARNESSES = frozenset(_STRUCTURED_DEFAULT_COMMANDS)
+
+_SUMMARIZE_JOB_STATUSES = (
+    "pending",
+    "running",
+    "retry_wait",
+    "done",
+    "errored",
+    "dead_lettered",
+)
 
 
 def _label_value(value: object) -> str:
@@ -102,18 +116,6 @@ def _append_details_metrics(lines: list[str], snapshot: dict) -> None:
                 "drover_event_sessions_without_summary",
                 summary.get("event_sessions_without_summary"),
             ),
-            "# HELP drover_summarize_jobs Jobs in the summarization ledger by status.",
-            "# TYPE drover_summarize_jobs gauge",
-            _metric(
-                "drover_summarize_jobs",
-                summary.get("pending_summarize_jobs", 0),
-                status="pending",
-            ),
-            _metric(
-                "drover_summarize_jobs",
-                summary.get("errored_summarize_jobs", 0),
-                status="errored",
-            ),
             "# HELP drover_session_embedding_coverage_percent Percent of summaries with session embeddings.",
             "# TYPE drover_session_embedding_coverage_percent gauge",
             _metric(
@@ -137,6 +139,116 @@ def _append_details_metrics(lines: list[str], snapshot: dict) -> None:
             _metric(
                 "drover_openclaw_unmatched_spans",
                 span_linkability.get("unmatched_spans", 0),
+            ),
+        ]
+    )
+
+
+def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, int]:
+    """Return aggregate legacy-sequence health, optionally applying migration.
+
+    Dry-runs reuse the migration's read-only classification helper. This
+    preserves its exact eligibility rules without writing the source database
+    or selecting event content.
+    """
+    source = Path(db_path)
+    if not source.exists():
+        return {
+            "null_event_count": 0,
+            "all_null_sessions": 0,
+            "mixed_sessions": 0,
+        }
+
+    con = open_duckdb_connection(source, read_only=not apply, role="diagnostic")
+    try:
+        audit = audit_legacy_harness_event_sequences(con)
+        if apply:
+            report = migrate_legacy_harness_event_sequences(con)
+            all_null_sessions = report.migrated_sessions
+            mixed_sessions = len(report.mixed_sessions)
+        else:
+            all_null_sessions = len(audit.all_null_sessions)
+            mixed_sessions = len(audit.mixed_sessions)
+    finally:
+        con.close()
+    return {
+        "null_event_count": audit.null_event_count,
+        "all_null_sessions": all_null_sessions,
+        "mixed_sessions": mixed_sessions,
+    }
+
+
+def _append_operational_health_metrics(
+    lines: list[str], db_path: Path, snapshot: Mapping[str, Any]
+) -> None:
+    summary = (
+        snapshot.get("categories", {}).get("summary_coverage", {}).get("details", {})
+    )
+    statuses = {status: 0 for status in _SUMMARIZE_JOB_STATUSES}
+    statuses["pending"] = int(summary.get("pending_summarize_jobs", 0) or 0)
+    statuses["errored"] = int(summary.get("errored_summarize_jobs", 0) or 0)
+    max_attempts = 0
+    oldest_retry_seconds = 0.0
+    source = Path(db_path)
+    if source.exists():
+        con = open_duckdb_connection(source, read_only=True, role="diagnostic")
+        try:
+            rows = con.execute(
+                "SELECT status, count(*) FROM summarize_jobs "
+                "WHERE status IN (?, ?, ?, ?, ?, ?) GROUP BY status",
+                list(_SUMMARIZE_JOB_STATUSES),
+            ).fetchall()
+            statuses.update({str(status): int(count) for status, count in rows})
+            max_attempts, oldest_retry_seconds = con.execute("""
+                SELECT
+                    COALESCE(max(max_attempts), 0),
+                    COALESCE(max(epoch((now() AT TIME ZONE 'UTC')
+                        - COALESCE(updated_at, enqueued_at)))
+                        FILTER (WHERE status = 'retry_wait'), 0)
+                FROM summarize_jobs
+                """).fetchone()
+        finally:
+            con.close()
+
+    try:
+        sequences = sequence_health_report(source)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("failed to render sequence health metrics: %s", exc)
+        sequences = {
+            "null_event_count": 0,
+            "all_null_sessions": 0,
+            "mixed_sessions": 0,
+        }
+    lines.extend(
+        [
+            "# HELP drover_harness_legacy_unsequenced_events Harness events with no sequence number.",
+            "# TYPE drover_harness_legacy_unsequenced_events gauge",
+            _metric(
+                "drover_harness_legacy_unsequenced_events",
+                sequences["null_event_count"],
+            ),
+            "# HELP drover_harness_mixed_sequence_sessions Sessions mixing sequenced and unsequenced events.",
+            "# TYPE drover_harness_mixed_sequence_sessions gauge",
+            _metric(
+                "drover_harness_mixed_sequence_sessions",
+                sequences["mixed_sessions"],
+            ),
+            "# HELP drover_summarize_jobs Summarization jobs by bounded status.",
+            "# TYPE drover_summarize_jobs gauge",
+        ]
+    )
+    for status in _SUMMARIZE_JOB_STATUSES:
+        lines.append(_metric("drover_summarize_jobs", statuses[status], status=status))
+    lines.extend(
+        [
+            "# HELP drover_summarize_max_attempts Maximum configured summarize-job attempt ceiling.",
+            "# TYPE drover_summarize_max_attempts gauge",
+            _metric("drover_summarize_max_attempts", int(max_attempts or 0)),
+            "# HELP drover_summarize_oldest_retry_seconds Age of the oldest waiting summarize retry.",
+            "# TYPE drover_summarize_oldest_retry_seconds gauge",
+            _metric(
+                "drover_summarize_oldest_retry_seconds",
+                max(float(oldest_retry_seconds or 0), 0.0),
             ),
         ]
     )
@@ -1244,6 +1356,7 @@ class MetricsCollector:
             snapshot = self._quality_snapshot()
             lines = [format_prometheus(snapshot).rstrip()]
             _append_details_metrics(lines, snapshot)
+            _append_operational_health_metrics(lines, self.duckdb_path, snapshot)
             _append_summarizer_metrics(lines, self.summarizer_report)
             _append_redis_metrics(lines, self.job_streams)
             _append_adoption_metrics(lines, snapshot)

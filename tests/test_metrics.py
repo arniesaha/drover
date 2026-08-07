@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 from pathlib import Path
 import base64
 import os
@@ -37,6 +38,7 @@ from drover.server.harness.websocket import (
     recv_frame,
 )
 from drover.server.metrics import MetricsCollector, start_metrics_server
+from drover.server.web.app import _MetricsHandler
 from drover.server.web.auth import AuthSettings, mint_session
 from drover.server.web.ui import load_page
 
@@ -279,6 +281,60 @@ def _make_collector(tmp_path) -> MetricsCollector:
     )
 
 
+class _FailingWriter:
+    def __init__(self, error: Exception):
+        self.error = error
+
+    def write(self, payload: bytes) -> None:
+        raise self.error
+
+
+def _send_handler(*, writer, end_headers=lambda: None):
+    class _Handler:
+        path = "/harness/sessions/legacy/messages"
+        wfile = writer
+
+        @staticmethod
+        def send_response(status):
+            return None
+
+        @staticmethod
+        def send_header(name, value):
+            return None
+
+    handler = _Handler()
+    handler.end_headers = end_headers
+    return handler
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError(), ConnectionResetError()])
+def test_send_treats_expected_final_write_disconnect_as_access_outcome(caplog, error):
+    handler = _send_handler(writer=_FailingWriter(error))
+
+    with caplog.at_level(logging.INFO, logger="drover.metrics"):
+        _MetricsHandler._send(handler, 200, "application/json", "secret message")
+
+    assert "client disconnected while sending 14 bytes" in caplog.text
+    assert "secret message" not in caplog.text
+
+
+def test_send_does_not_swallow_other_final_write_errors():
+    handler = _send_handler(writer=_FailingWriter(OSError("disk failure")))
+
+    with pytest.raises(OSError, match="disk failure"):
+        _MetricsHandler._send(handler, 200, "application/json", "{}")
+
+
+def test_send_does_not_swallow_disconnect_before_final_write():
+    handler = _send_handler(
+        writer=_FailingWriter(AssertionError("write must not run")),
+        end_headers=lambda: (_ for _ in ()).throw(BrokenPipeError("headers")),
+    )
+
+    with pytest.raises(BrokenPipeError, match="headers"):
+        _MetricsHandler._send(handler, 200, "application/json", "{}")
+
+
 def _json_request(url: str, *, payload: dict | None = None):
     data = None
     headers = dict(_AUTH_HEADERS)
@@ -339,6 +395,112 @@ def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp
         'drover_agent_adoption_ready{runtime="openclaw-main",status="active"} 1' in text
     )
     assert 'drover_agent_adoption_observed_events{runtime="openclaw-main"} 12' in text
+
+
+def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(metrics, "quality_snapshot", lambda **_: _snapshot())
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(db)) as con:
+        con.executemany(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, created_at, seq) "
+            "VALUES (?, ?, 'user_input', '{}', now(), ?)",
+            [
+                ("legacy-1", "private-legacy-session", None),
+                ("mixed-1", "private-mixed-session", 1),
+                ("mixed-2", "private-mixed-session", None),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, max_attempts, next_run_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "private-retry-session",
+                    "retry_wait",
+                    2,
+                    5,
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(minutes=5),
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(minutes=2),
+                ),
+                (
+                    "private-dead-session",
+                    "dead_lettered",
+                    7,
+                    7,
+                    None,
+                    datetime.now() - timedelta(minutes=10),
+                ),
+                ("private-unbounded-label", "private-status", 1, 99, None, None),
+            ],
+        )
+    collector = MetricsCollector(
+        duckdb_path=db,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+    text = collector.render_prometheus()
+
+    assert "drover_harness_legacy_unsequenced_events 2" in text
+    assert "drover_harness_mixed_sequence_sessions 1" in text
+    assert 'drover_summarize_jobs{status="retry_wait"} 1' in text
+    assert 'drover_summarize_jobs{status="dead_lettered"} 1' in text
+    assert "drover_summarize_max_attempts 99" in text
+    oldest = next(
+        line
+        for line in text.splitlines()
+        if line.startswith("drover_summarize_oldest_retry_seconds ")
+    )
+    oldest_seconds = float(oldest.rsplit(" ", 1)[1])
+    assert 119 <= oldest_seconds <= 125
+    assert "private-retry-session" not in text
+    assert "private-dead-session" not in text
+    assert 'status="private-status"' not in text
+
+
+def test_sequence_health_report_does_not_materialize_event_metadata(
+    monkeypatch, tmp_path
+):
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(db)) as con:
+        con.execute(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, created_at, seq) "
+            "VALUES ('event-1', 'session-1', 'user_input', '{}', now(), NULL)"
+        )
+    real = duckdb.connect(str(db))
+
+    class AggregateOnlyConnection:
+        def execute(self, query, parameters=None):
+            normalized = " ".join(str(query).lower().split())
+            assert "select event_id, session_id, created_at, seq" not in normalized
+            if parameters is None:
+                return real.execute(query)
+            return real.execute(query, parameters)
+
+        def close(self):
+            real.close()
+
+    monkeypatch.setattr(
+        metrics,
+        "open_duckdb_connection",
+        lambda *args, **kwargs: AggregateOnlyConnection(),
+    )
+
+    assert metrics.sequence_health_report(db) == {
+        "null_event_count": 1,
+        "all_null_sessions": 1,
+        "mixed_sessions": 0,
+    }
 
 
 def test_metrics_collector_json_surface(monkeypatch, tmp_path):
@@ -2213,6 +2375,36 @@ def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
         server.shutdown()
 
 
+def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).append_event(
+        event_id="legacy-e1",
+        session_id="legacy",
+        seq=1,
+        event_type="assistant_output",
+        payload={"text": "hello"},
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        with _authed_get(
+            f"http://127.0.0.1:{port}/harness/sessions/legacy/messages"
+        ) as response:
+            body = json.loads(response.read())
+        assert body["messages"] == [
+            {
+                "text": "hello",
+                "event_id": "legacy-e1",
+                "session_id": "legacy",
+                "seq": 1,
+            }
+        ]
+    finally:
+        server.shutdown()
+
+
 def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
     collector = _make_collector(tmp_path)
     server = start_metrics_server(
@@ -2294,6 +2486,44 @@ def test_session_stream_ws_delivers_new_events(tmp_path):
         # server must still be healthy after an abrupt client disconnect
         with _authed_get(f"http://127.0.0.1:{port}/harness/hosts") as response:
             assert response.status == 200
+    finally:
+        server.shutdown()
+
+
+def test_session_stream_ws_initial_catch_up_overlays_canonical_event_metadata(
+    tmp_path,
+):
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).append_event(
+        event_id="legacy-e1",
+        session_id="legacy",
+        seq=1,
+        event_type="assistant_output",
+        payload={"text": "hello"},
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            client_handshake(
+                sock,
+                host=f"127.0.0.1:{port}",
+                path="/harness/sessions/legacy/stream",
+                headers=_AUTH_HEADERS,
+            )
+            sock.settimeout(5)
+            message = json.loads(recv_frame(sock).payload.decode("utf-8"))
+            assert message == {
+                "text": "hello",
+                "event_id": "legacy-e1",
+                "session_id": "legacy",
+                "seq": 1,
+            }
+        finally:
+            sock.close()
     finally:
         server.shutdown()
 

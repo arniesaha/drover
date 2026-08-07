@@ -8,9 +8,10 @@ Each pending job:
   2. Read session events from agent_events.
   3. Compute deterministic fields (files_touched, tools_used).
   4. Build prompt → call backend → parse JSON.
-  5. INSERT INTO session_summaries.
-  6. Mark status='done'.
-On any exception: status='errored', last_error captured, attempts++.
+  5. Fence persistence against the claimed source version.
+  6. Atomically write session_summaries and mark status='done'.
+On failure: increment the generation's failure count, then schedule retry_wait
+or dead-letter exactly the fifth failure.
 
 Backend selection prefers Anthropic whenever credentials are functional and
 falls back to the local Ollama GPU rig only when Anthropic is unavailable.
@@ -21,8 +22,10 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -33,6 +36,7 @@ from drover.event_identity import canonical_agent_events_cte
 from drover.server.jobs import Delivery
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
+from drover.server.ledger import ArtifactSpec, Ledger
 from drover.server.summarizer.backends import (
     BackendError,
     LLMBackend,
@@ -46,9 +50,20 @@ from drover.server.summarizer.client import (
     call_claude_summary,
 )
 from drover.server.summarizer.derive import compute_files_touched, compute_tools_used
+from drover.server.summarizer.jobs import (
+    finish_summary_failure,
+    flush_summary_publications,
+)
 from drover.server.summarizer.prompt import build_summary_prompt
 
 log = logging.getLogger("drover.summarizer.worker")
+
+
+@dataclass(frozen=True)
+class _SummaryCompletion:
+    project_key: Optional[str]
+    brief_outcome: Optional[str]
+    embed_outcome: str
 
 
 def _open_summarizer_db(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
@@ -83,6 +98,11 @@ class SummarizerWorker:
         brief_job_stream: Optional[object] = None,
         embed_job_stream: Optional[object] = None,
         worker_id: str = "summarizer",
+        _clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        _jitter: Callable[[float, float], float] = random.uniform,
+        _before_success_effects: Callable[[], None] = lambda: None,
+        _before_failure_finish: Callable[[], None] = lambda: None,
+        _after_completion_commit: Callable[[], None] = lambda: None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.api_key = api_key
@@ -97,6 +117,11 @@ class SummarizerWorker:
         self.brief_job_stream = brief_job_stream
         self.embed_job_stream = embed_job_stream
         self.worker_id = worker_id
+        self._clock = _clock
+        self._jitter = _jitter
+        self._before_success_effects = _before_success_effects
+        self._before_failure_finish = _before_failure_finish
+        self._after_completion_commit = _after_completion_commit
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -116,6 +141,12 @@ class SummarizerWorker:
         except BackendError as e:
             log.warning("backend selection failed: %s", e)
             return None
+
+    def _db_now(self) -> datetime:
+        now = self._clock()
+        if now.tzinfo is None:
+            return now
+        return now.astimezone(timezone.utc).replace(tzinfo=None)
 
     # --- public lifecycle ---
 
@@ -165,12 +196,19 @@ class SummarizerWorker:
             max_jobs = self.batch_size
 
         if self.job_stream is not None:
+            self._flush_stream_outbox()
             return self._drain_stream_batch(max_jobs=max_jobs)
 
         # Check for pending jobs BEFORE selecting a backend so that backend
         # fallback warnings are never emitted on idle poll ticks (fixes #55).
         con = _open_summarizer_db(self.duckdb_path)
         try:
+            con.execute(
+                """UPDATE summarize_jobs
+                      SET status='pending', next_run_at=NULL, updated_at=?
+                    WHERE status='retry_wait' AND next_run_at <= ?""",
+                [self._db_now(), self._db_now()],
+            )
             row = con.execute(
                 "SELECT 1 FROM summarize_jobs WHERE status='pending' LIMIT 1"
             ).fetchone()
@@ -197,6 +235,15 @@ class SummarizerWorker:
             processed += n
         return processed
 
+    def _flush_stream_outbox(self) -> None:
+        con = _open_summarizer_db(self.duckdb_path)
+        try:
+            flush_summary_publications(con, self.job_stream)
+        except Exception:  # noqa: BLE001
+            log.warning("summary publication outbox flush failed", exc_info=True)
+        finally:
+            con.close()
+
     def _drain_stream_batch(self, *, max_jobs: int) -> int:
         """Drain stream deliveries without warming the backend on idle ticks."""
         processed = 0
@@ -206,7 +253,7 @@ class SummarizerWorker:
             claim = self._claim_stream_job()
             if claim is None:
                 break
-            session_id, delivery = claim
+            session_id, source_version, delivery = claim
             if session_id is None:
                 processed += 1
                 continue
@@ -219,7 +266,10 @@ class SummarizerWorker:
                         log.warning("backend ensure_ready failed: %s", e)
                 backend_checked = True
             processed += self._process_claim(
-                session_id=session_id, delivery=delivery, backend=backend
+                session_id=session_id,
+                source_version=source_version,
+                delivery=delivery,
+                backend=backend,
             )
         return processed
 
@@ -229,17 +279,21 @@ class SummarizerWorker:
         )
         if claim is None:
             return 0
-        session_id, delivery = claim
+        session_id, source_version, delivery = claim
         if session_id is None:
             return 1
         return self._process_claim(
-            session_id=session_id, delivery=delivery, backend=backend
+            session_id=session_id,
+            source_version=source_version,
+            delivery=delivery,
+            backend=backend,
         )
 
     def _process_claim(
         self,
         *,
         session_id: str,
+        source_version: Optional[str],
         delivery: Optional[Delivery],
         backend: Optional[LLMBackend],
     ) -> int:
@@ -255,48 +309,79 @@ class SummarizerWorker:
         )
 
         try:
-            self._summarize_session(session_id, backend)
+            completion = self._summarize_session(
+                session_id,
+                source_version,
+                backend,
+                ledger_job_id=ledger_job_id,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("summarize %s failed: %s", session_id, exc)
-            self._mark_errored(session_id, str(exc))
+            outcome = self._finish_failure(
+                session_id,
+                source_version,
+                exc,
+                ledger_job_id=ledger_job_id,
+            )
             if delivery is not None:
-                self.job_stream.fail(delivery.id, str(exc))
-            ledger_shadow.retry(self.duckdb_path, ledger_job_id, error_message=str(exc))
+                if outcome in ("dead_lettered", "stale"):
+                    self.job_stream.ack(delivery.id)
+                else:
+                    self.job_stream.fail(delivery.id, str(exc))
+                    self._defer_stream_delivery(session_id, delivery)
             return 1
 
-        self._mark_done(session_id)
-        ledger_shadow.succeed(
-            self.duckdb_path,
-            ledger_job_id,
-            artifact_kind="session_summary",
-            subject_key=session_id,
-            storage_uri=f"session_summaries/{session_id}",
+        if completion is None:
+            ledger_shadow.fail_and_dead_letter(
+                self.duckdb_path,
+                ledger_job_id,
+                error_message="source generation superseded",
+                error_category="summarizer_stale_generation",
+            )
+            if delivery is not None:
+                self.job_stream.ack(delivery.id)
+            return 1
+
+        self._after_completion_commit()
+        self._publish_downstream_jobs(
+            session_id,
+            source_version,
+            completion,
         )
-        self._maybe_enqueue_brief(session_id)
-        self._maybe_enqueue_embed(session_id)
         if delivery is not None:
             self.job_stream.ack(delivery.id)
         return 1
 
-    def _claim_duckdb_job(self) -> Optional[tuple[str, Optional[Delivery]]]:
+    def _claim_duckdb_job(
+        self,
+    ) -> Optional[tuple[str, Optional[str], Optional[Delivery]]]:
         # Claim phase: retry on DuckDB optimistic-concurrency conflicts
         # ("Conflict on update!") that show up when multiple worker threads
         # race for the same row. Each retry re-reads to avoid stale state.
         for attempt in range(8):
             con = _open_summarizer_db(self.duckdb_path)
             try:
-                row = con.execute("""SELECT session_id, attempts FROM summarize_jobs
+                now = self._db_now()
+                con.execute(
+                    """UPDATE summarize_jobs
+                          SET status='pending', next_run_at=NULL, updated_at=?
+                        WHERE status='retry_wait' AND next_run_at <= ?""",
+                    [now, now],
+                )
+                row = con.execute(
+                    """SELECT session_id, source_version FROM summarize_jobs
                        WHERE status='pending'
-                       ORDER BY enqueued_at ASC LIMIT 1""").fetchone()
+                       ORDER BY enqueued_at ASC LIMIT 1"""
+                ).fetchone()
                 if row is None:
                     return None
-                candidate, attempts = row[0], row[1] or 0
+                candidate, source_version = row
                 # Conditional update: only claim if still pending
                 con.execute(
                     """UPDATE summarize_jobs
-                       SET status='running', attempts=?, updated_at=now()
+                       SET status='running', updated_at=?
                        WHERE session_id=? AND status='pending'""",
-                    [attempts + 1, candidate],
+                    [now, candidate],
                 )
                 # If a sibling already claimed it, fetchone returns 0 affected rows.
                 # DuckDB doesn't expose rowcount on UPDATE directly; verify via re-read.
@@ -305,7 +390,7 @@ class SummarizerWorker:
                     [candidate],
                 ).fetchone()
                 if claimed and claimed[0] == "running":
-                    return candidate, None
+                    return candidate, source_version, None
                 # Else loop and try the next pending row.
             except duckdb.TransactionException:
                 time.sleep(0.05 * (attempt + 1))
@@ -314,7 +399,9 @@ class SummarizerWorker:
                 con.close()
         return None
 
-    def _claim_stream_job(self) -> Optional[tuple[Optional[str], Optional[Delivery]]]:
+    def _claim_stream_job(
+        self,
+    ) -> Optional[tuple[Optional[str], Optional[str], Optional[Delivery]]]:
         deliveries = self.job_stream.read_group(self.worker_id, count=1)
         if not deliveries:
             deliveries = self.job_stream.reclaim(self.worker_id, count=1)
@@ -324,96 +411,245 @@ class SummarizerWorker:
         session_id = delivery.fields.get("session_id")
         if not session_id:
             self.job_stream.fail(delivery.id, "missing session_id")
-            return None, delivery
+            return None, None, delivery
         session_id = str(session_id)
+        delivery_source_version = delivery.fields.get("source_version")
+        if delivery_source_version is not None:
+            delivery_source_version = str(delivery_source_version)
 
         for attempt in range(8):
             con = _open_summarizer_db(self.duckdb_path)
             try:
                 row = con.execute(
-                    "SELECT status, attempts FROM summarize_jobs WHERE session_id=?",
+                    """SELECT status, source_version, next_run_at
+                         FROM summarize_jobs WHERE session_id=?""",
                     [session_id],
                 ).fetchone()
                 if row is None:
-                    con.execute(
-                        """INSERT INTO summarize_jobs
-                           (session_id, status, attempts, updated_at)
-                           VALUES (?, 'running', 1, now())""",
-                        [session_id],
-                    )
-                    return session_id, delivery
-                status, attempts = row[0], row[1] or 0
-                if status == "done":
+                    self.job_stream.ack(delivery.id)
+                    return None, None, None
+                status, source_version, next_run_at = row
+                if delivery_source_version != source_version:
+                    # Redis is delivery coordination, not durable truth. An old
+                    # generation must never spend the current row's budget.
+                    self.job_stream.ack(delivery.id)
+                    return None, None, None
+                if status in ("done", "dead_lettered"):
                     # Crash-after-write-before-ACK recovery: durable projection won,
                     # so the redelivery can be acknowledged without reprocessing.
                     self.job_stream.ack(delivery.id)
-                    return None, None
+                    return None, None, None
+                now = self._db_now()
+                if status == "retry_wait":
+                    if next_run_at is None or next_run_at > now:
+                        if next_run_at is not None:
+                            self._defer_delivery(delivery, next_run_at)
+                        return None
+                    con.execute(
+                        """UPDATE summarize_jobs
+                              SET status='pending', next_run_at=NULL, updated_at=?
+                            WHERE session_id=? AND status='retry_wait'
+                              AND source_version IS NOT DISTINCT FROM ?""",
+                        [now, session_id, source_version],
+                    )
+                    status = "pending"
+                if status != "pending":
+                    return None
                 con.execute(
                     """UPDATE summarize_jobs
-                       SET status='running', attempts=?, updated_at=now()
-                       WHERE session_id=?""",
-                    [attempts + 1, session_id],
+                       SET status='running', updated_at=?
+                       WHERE session_id=? AND status='pending'
+                         AND source_version IS NOT DISTINCT FROM ?""",
+                    [now, session_id, source_version],
                 )
-                return session_id, delivery
+                claimed = con.execute(
+                    "SELECT status FROM summarize_jobs WHERE session_id=?",
+                    [session_id],
+                ).fetchone()
+                if claimed and claimed[0] == "running":
+                    return session_id, source_version, delivery
             except duckdb.TransactionException:
                 time.sleep(0.05 * (attempt + 1))
                 continue
             finally:
                 con.close()
         self.job_stream.fail(delivery.id, f"failed to claim summarize job {session_id}")
-        return None, delivery
+        return None, None, delivery
 
-    def _maybe_enqueue_embed(self, session_id: str) -> None:
-        """Enqueue an embed_job for the just-summarized session. Best-effort."""
+    def _finish_failure(
+        self,
+        session_id: str,
+        source_version: Optional[str],
+        exc: BaseException,
+        *,
+        ledger_job_id: Optional[str] = None,
+    ) -> str:
+        """Bound one generation's failures and mirror the result to the ledger."""
+        self._before_failure_finish()
+        con = _open_summarizer_db(self.duckdb_path)
         try:
-            from drover.server.embeddings.worker import enqueue_embed
+            outcome = finish_summary_failure(
+                con,
+                session_id,
+                source_version,
+                str(exc),
+                now=self._clock(),
+                jitter=self._jitter,
+            )
+            if outcome == "stale":
+                ledger_shadow.fail_and_dead_letter(
+                    self.duckdb_path,
+                    ledger_job_id,
+                    error_message="source generation superseded",
+                    error_category="summarizer_stale_generation",
+                )
+                return "stale"
+            next_run_at = con.execute(
+                """SELECT next_run_at FROM summarize_jobs
+                     WHERE session_id=? AND source_version IS NOT DISTINCT FROM ?""",
+                [session_id, source_version],
+            ).fetchone()[0]
+        finally:
+            con.close()
 
-            outcome = enqueue_embed(self.duckdb_path, session_id)
-            if self.embed_job_stream is not None and outcome in ("queued", "requeued"):
-                self.embed_job_stream.add({"session_id": session_id})
-            log.debug("embed enqueue %s → %s", session_id, outcome)
+        if ledger_job_id is None:
+            ledger_job_id = ledger_shadow.begin_attempt(
+                self.duckdb_path,
+                job_kind="summarize_session",
+                subject_key=session_id,
+                subject_kind="session",
+                worker_id="summarizer",
+            )
+        if outcome == "dead_lettered":
+            ledger_shadow.fail_and_dead_letter(
+                self.duckdb_path,
+                ledger_job_id,
+                error_message=str(exc),
+                error_category="summarizer",
+            )
+        else:
+            ledger_shadow.retry(
+                self.duckdb_path,
+                ledger_job_id,
+                error_message=str(exc),
+                next_run_at=next_run_at,
+            )
+        return outcome
+
+    def _defer_stream_delivery(self, session_id: str, delivery: Delivery) -> None:
+        con = _open_summarizer_db(self.duckdb_path)
+        try:
+            row = con.execute(
+                "SELECT next_run_at FROM summarize_jobs WHERE session_id=?",
+                [session_id],
+            ).fetchone()
+        finally:
+            con.close()
+        if row and row[0] is not None:
+            self._defer_delivery(delivery, row[0])
+
+    def _defer_delivery(self, delivery: Delivery, next_run_at: datetime) -> None:
+        defer = getattr(self.job_stream, "defer", None)
+        if defer is None:
+            return
+        due = next_run_at
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        defer(delivery.id, until_ms=int(due.timestamp() * 1000))
+
+    def _publish_downstream_jobs(
+        self,
+        session_id: str,
+        source_version: Optional[str],
+        completion: _SummaryCompletion,
+    ) -> None:
+        """Publish durable downstream jobs after their fenced transaction commits."""
+        try:
+            if (
+                self.embed_job_stream is not None
+                and completion.embed_outcome in ("queued", "requeued")
+                and self._embed_generation_is_current(session_id, source_version)
+            ):
+                self.embed_job_stream.add(
+                    {"session_id": session_id, "source_version": source_version}
+                )
         except Exception:  # noqa: BLE001
             log.exception(
-                "embed enqueue for session %s failed (continuing)", session_id
+                "embed publish for session %s failed (continuing)", session_id
+            )
+        try:
+            if (
+                self.brief_job_stream is not None
+                and completion.project_key is not None
+                and completion.brief_outcome in ("queued", "requeued")
+                and self._brief_generation_is_current(
+                    completion.project_key, session_id, source_version
+                )
+            ):
+                self.brief_job_stream.add(
+                    {
+                        "project_key": completion.project_key,
+                        "source_session_id": session_id,
+                        "source_version": source_version,
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "brief publish for session %s failed (continuing)", session_id
             )
 
-    def _maybe_enqueue_brief(self, session_id: str) -> None:
-        """If the session has a (repo_owner, repo_name), enqueue a brief regen.
-
-        Best-effort: failures are logged and swallowed so the summarize itself
-        is not marked errored.
-        """
+    def _embed_generation_is_current(
+        self, session_id: str, source_version: Optional[str]
+    ) -> bool:
+        con = _open_summarizer_db(self.duckdb_path)
         try:
-            # Read-write connection to match sibling threads' connection mode
-            # (DuckDB rejects mixing read-only and read-write conns to the same file).
-            con = _open_summarizer_db(self.duckdb_path)
-            try:
-                row = con.execute(
-                    f"""WITH {_session_agent_events_ctes()}
-                       SELECT any_value(repo_owner), any_value(repo_name)
-                       FROM canonical_agent_events
-                       WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL""",
-                    [session_id],
+            return (
+                con.execute(
+                    """SELECT 1 FROM embed_jobs e
+                         JOIN summarize_jobs s USING (session_id)
+                        WHERE e.session_id=? AND e.status='pending'
+                          AND e.source_version IS NOT DISTINCT FROM ?
+                          AND s.source_version IS NOT DISTINCT FROM ?
+                          AND s.status='done'""",
+                    [session_id, source_version, source_version],
                 ).fetchone()
-            finally:
-                con.close()
-            if not row or not row[0] or not row[1]:
-                return
-            project_key = f"{row[0]}/{row[1]}"
-            from drover.server.briefs.worker import enqueue_brief
-
-            outcome = enqueue_brief(self.duckdb_path, project_key)
-            if self.brief_job_stream is not None and outcome in ("queued", "requeued"):
-                self.brief_job_stream.add({"project_key": project_key})
-            log.debug("brief enqueue %s → %s", project_key, outcome)
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "brief enqueue for session %s failed (continuing)", session_id
+                is not None
             )
+        finally:
+            con.close()
+
+    def _brief_generation_is_current(
+        self,
+        project_key: str,
+        session_id: str,
+        source_version: Optional[str],
+    ) -> bool:
+        con = _open_summarizer_db(self.duckdb_path)
+        try:
+            return (
+                con.execute(
+                    """SELECT 1 FROM brief_jobs b
+                         JOIN summarize_jobs s ON s.session_id=b.source_session_id
+                        WHERE b.project_key=? AND b.status='pending'
+                          AND b.source_session_id=?
+                          AND b.source_version IS NOT DISTINCT FROM ?
+                          AND s.source_version IS NOT DISTINCT FROM ?
+                          AND s.status='done'""",
+                    [project_key, session_id, source_version, source_version],
+                ).fetchone()
+                is not None
+            )
+        finally:
+            con.close()
 
     def _summarize_session(
-        self, session_id: str, backend: Optional[LLMBackend] = None
-    ) -> None:
+        self,
+        session_id: str,
+        source_version: Optional[str],
+        backend: Optional[LLMBackend] = None,
+        *,
+        ledger_job_id: Optional[str] = None,
+    ) -> Optional[_SummaryCompletion]:
         con = _open_summarizer_db(self.duckdb_path)
         try:
             cur = con.execute(
@@ -474,10 +710,26 @@ class SummarizerWorker:
                 raise RuntimeError("ANTHROPIC_API_KEY not configured (no_api_key)")
             generator_model = self.model
 
-        # Persist (retry on optimistic-concurrency conflicts)
+        # The test seam is deliberately before the single completion transaction:
+        # any superseding generation either wins first and makes this stale, or is
+        # ordered after all durable success effects commit together.
+        self._before_success_effects()
+
+        # Persist and create every durable success effect in one generation-fenced
+        # transaction (retry on optimistic-concurrency conflicts).
         for attempt in range(8):
             con = _open_summarizer_db(self.duckdb_path)
             try:
+                con.execute("BEGIN TRANSACTION")
+                current = con.execute(
+                    """SELECT 1 FROM summarize_jobs
+                         WHERE session_id=? AND status='running'
+                           AND source_version IS NOT DISTINCT FROM ?""",
+                    [session_id, source_version],
+                ).fetchone()
+                if current is None:
+                    con.execute("ROLLBACK")
+                    return None
                 con.execute(
                     """INSERT OR REPLACE INTO session_summaries
                        (session_id, task_id, agent_id, ended_at, summary_md,
@@ -499,38 +751,67 @@ class SummarizerWorker:
                         generator_model,
                     ],
                 )
-                return
+                finalized = con.execute(
+                    """UPDATE summarize_jobs
+                          SET status='done', last_error=NULL, next_run_at=NULL,
+                              updated_at=now()
+                        WHERE session_id=? AND status='running'
+                          AND source_version IS NOT DISTINCT FROM ?
+                        RETURNING session_id""",
+                    [session_id, source_version],
+                ).fetchone()
+                if finalized is None:
+                    con.execute("ROLLBACK")
+                    return None
+                project_row = con.execute(
+                    f"""WITH {_session_agent_events_ctes()}
+                       SELECT any_value(repo_owner), any_value(repo_name)
+                       FROM canonical_agent_events
+                       WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL""",
+                    [session_id],
+                ).fetchone()
+                project_key = (
+                    f"{project_row[0]}/{project_row[1]}"
+                    if project_row and project_row[0] and project_row[1]
+                    else None
+                )
+                brief_outcome = (
+                    _enqueue_brief_on_connection(
+                        con, project_key, session_id, source_version
+                    )
+                    if project_key is not None
+                    else None
+                )
+                embed_outcome = _enqueue_embed_on_connection(
+                    con, session_id, source_version
+                )
+                if ledger_job_id is not None:
+                    Ledger(con).succeed_job(
+                        ledger_job_id,
+                        artifact=ArtifactSpec(
+                            artifact_kind="session_summary",
+                            subject_key=session_id,
+                            storage_uri=f"session_summaries/{session_id}",
+                            version_token=source_version,
+                        ),
+                    )
+                con.execute("COMMIT")
+                return _SummaryCompletion(
+                    project_key=project_key,
+                    brief_outcome=brief_outcome,
+                    embed_outcome=embed_outcome,
+                )
             except duckdb.TransactionException:
+                try:
+                    con.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
                 time.sleep(0.05 * (attempt + 1))
             finally:
                 con.close()
         raise RuntimeError(
             f"persist session_summaries for {session_id} failed after retries"
         )
-
-    def _mark_done(self, session_id: str) -> None:
-        self._update_status(session_id, "done", error=None)
-
-    def _mark_errored(self, session_id: str, message: str) -> None:
-        self._update_status(session_id, "errored", error=message)
-
-    def _update_status(
-        self, session_id: str, status: str, *, error: Optional[str]
-    ) -> None:
-        # Retry on optimistic-concurrency conflicts; finalizing a job is critical.
-        for attempt in range(8):
-            con = _open_summarizer_db(self.duckdb_path)
-            try:
-                con.execute(
-                    "UPDATE summarize_jobs SET status=?, last_error=?, updated_at=now() WHERE session_id=?",
-                    [status, error, session_id],
-                )
-                return
-            except duckdb.TransactionException:
-                time.sleep(0.05 * (attempt + 1))
-            finally:
-                con.close()
-        log.error("failed to mark %s as %s after retries", session_id, status)
 
 
 def _iso(ts: Any) -> Optional[str]:
@@ -552,3 +833,85 @@ def _safe_task_id(con: duckdb.DuckDBPyConnection, session_id: str) -> Optional[s
         return row[0] if row else None
     except duckdb.Error:
         return None
+
+
+def _enqueue_embed_on_connection(
+    con: duckdb.DuckDBPyConnection,
+    session_id: str,
+    source_version: Optional[str],
+) -> str:
+    """Create/requeue the embed job on the caller's completion transaction."""
+    existing = con.execute(
+        "SELECT status, source_version FROM embed_jobs WHERE session_id=?", [session_id]
+    ).fetchone()
+    if existing:
+        status, existing_version = existing
+        if existing_version != source_version:
+            con.execute(
+                """UPDATE embed_jobs SET status='pending', attempts=0,
+                          last_error=NULL, updated_at=now(), source_version=?
+                     WHERE session_id=?""",
+                [source_version, session_id],
+            )
+            return "requeued"
+        if status == "done":
+            return "already_done"
+        if status in ("pending", "running"):
+            return "already_queued"
+        con.execute(
+            """UPDATE embed_jobs
+                  SET status='pending', last_error=NULL, updated_at=now()
+                WHERE session_id=?""",
+            [session_id],
+        )
+        return "requeued"
+    con.execute(
+        """INSERT INTO embed_jobs (session_id, status, attempts, source_version)
+           VALUES (?, 'pending', 0, ?)""",
+        [session_id, source_version],
+    )
+    return "queued"
+
+
+def _enqueue_brief_on_connection(
+    con: duckdb.DuckDBPyConnection,
+    project_key: str,
+    source_session_id: str,
+    source_version: Optional[str],
+) -> str:
+    """Create/requeue the brief job on the caller's completion transaction."""
+    existing = con.execute(
+        """SELECT status, source_session_id, source_version
+             FROM brief_jobs WHERE project_key=?""",
+        [project_key],
+    ).fetchone()
+    if existing:
+        status, existing_session_id, existing_version = existing
+        if (existing_session_id, existing_version) != (
+            source_session_id,
+            source_version,
+        ):
+            con.execute(
+                """UPDATE brief_jobs SET status='pending', attempts=0,
+                          last_error=NULL, updated_at=now(),
+                          source_session_id=?, source_version=?
+                     WHERE project_key=?""",
+                [source_session_id, source_version, project_key],
+            )
+            return "requeued"
+        if status in ("pending", "running"):
+            return "already_queued"
+        con.execute(
+            """UPDATE brief_jobs
+                  SET status='pending', last_error=NULL, updated_at=now()
+                WHERE project_key=?""",
+            [project_key],
+        )
+        return "requeued"
+    con.execute(
+        """INSERT INTO brief_jobs
+             (project_key, status, attempts, source_session_id, source_version)
+           VALUES (?, 'pending', 0, ?, ?)""",
+        [project_key, source_session_id, source_version],
+    )
+    return "queued"

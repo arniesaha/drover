@@ -23,6 +23,7 @@ def build_mcp_server(
     host: str = "0.0.0.0",
     port: int = 7077,
     backend_config: Optional[SummarizerBackendConfig] = None,
+    summarize_job_stream: object | None = None,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
@@ -113,9 +114,12 @@ def build_mcp_server(
 
     @mcp.tool()
     def drover_session_close(session_id: str) -> dict:
-        """Enqueue a summarize_jobs row for the session. Idempotent — re-queuing
-        a session that already has a pending/running job is a no-op."""
-        return t.drover_session_close(duckdb_path=db, session_id=session_id)
+        """Enqueue a source-versioned summary generation for the session."""
+        return t.drover_session_close(
+            duckdb_path=db,
+            session_id=session_id,
+            summarize_job_stream=summarize_job_stream,
+        )
 
     @mcp.tool()
     def drover_project_brief(

@@ -13,6 +13,11 @@ class FakeRedis:
         self.groups: dict[tuple[str, str], dict] = {}
         self.hashes: dict[str, dict[str, str]] = {}
         self.seq = 0
+        self.now_ms = 1_000_000
+        self.xclaim_calls: list[dict] = []
+
+    def advance(self, milliseconds: int) -> None:
+        self.now_ms += milliseconds
 
     def ping(self) -> bool:
         return True
@@ -45,7 +50,7 @@ class FakeRedis:
             group["pel"][entry_id] = {
                 "consumer": consumername,
                 "times_delivered": 1,
-                "time_since_delivered": 0,
+                "last_delivered_ms": self.now_ms,
             }
             out.append((entry_id, dict(fields)))
         return [(name, out)] if out else []
@@ -55,12 +60,20 @@ class FakeRedis:
         if min not in {"-", "0-0"} and max == min:
             ids = [min] if min in pel else []
         else:
-            ids = sorted(pel, key=lambda s: tuple(map(int, s.split("-"))))[:count]
+            ids = sorted(pel, key=_id_key)
+            if isinstance(min, str) and min.startswith("("):
+                cursor = _id_key(min[1:])
+                ids = [entry_id for entry_id in ids if _id_key(entry_id) > cursor]
+            ids = ids[:count]
         return [
             {
                 "message_id": entry_id,
                 "consumer": pel[entry_id]["consumer"],
-                "time_since_delivered": pel[entry_id]["time_since_delivered"],
+                "time_since_delivered": (
+                    self.now_ms - pel[entry_id]["last_delivered_ms"]
+                    if self.now_ms >= pel[entry_id]["last_delivered_ms"]
+                    else 0
+                ),
                 "times_delivered": pel[entry_id]["times_delivered"],
             }
             for entry_id in ids
@@ -78,10 +91,51 @@ class FakeRedis:
             if len(out) >= count:
                 break
             pe = group["pel"][entry_id]
+            if self.now_ms - pe["last_delivered_ms"] < min_idle_time:
+                continue
             pe["consumer"] = consumername
             pe["times_delivered"] += 1
+            pe["last_delivered_ms"] = self.now_ms
             out.append((entry_id, dict(entries_by_id[entry_id])))
         return ("0-0", out, [])
+
+    def xclaim(
+        self,
+        name,
+        groupname,
+        consumername,
+        min_idle_time,
+        message_ids,
+        **kwargs,
+    ):
+        self.xclaim_calls.append(
+            {
+                "name": name,
+                "group": groupname,
+                "consumer": consumername,
+                "min_idle_time": min_idle_time,
+                "message_ids": list(message_ids),
+                **kwargs,
+            }
+        )
+        pel = self.groups[(name, groupname)]["pel"]
+        entries = dict(self.streams.get(name, []))
+        out = []
+        for entry_id in message_ids:
+            if entry_id not in pel:
+                continue
+            pe = pel[entry_id]
+            pe["consumer"] = consumername
+            if kwargs.get("time") is not None:
+                # Redis clamps future XCLAIM TIME values to server time.
+                pe["last_delivered_ms"] = min(int(kwargs["time"]), self.now_ms)
+            if kwargs.get("retrycount") is not None:
+                pe["times_delivered"] = int(kwargs["retrycount"])
+            else:
+                pe["times_delivered"] += 1
+            pe["last_delivered_ms"] = self.now_ms
+            out.append((entry_id, dict(entries[entry_id])))
+        return out
 
     def xack(self, name, groupname, entry_id):
         return 1 if self.groups[(name, groupname)]["pel"].pop(entry_id, None) else 0
@@ -109,6 +163,19 @@ class FakeRedis:
 
     def hdel(self, name, key):
         self.hashes.get(name, {}).pop(key, None)
+
+    def time(self):
+        return self.now_ms // 1000, (self.now_ms % 1000) * 1000
+
+    def zadd(self, name, mapping):
+        self.hashes.setdefault(name, {}).update(mapping)
+        return len(mapping)
+
+    def zscore(self, name, key):
+        return self.hashes.get(name, {}).get(key)
+
+    def zrem(self, name, key):
+        return 1 if self.hashes.get(name, {}).pop(key, None) is not None else 0
 
 
 def _id_key(entry_id: str) -> tuple[int, int]:
@@ -154,6 +221,102 @@ def test_redis_adapter_recovers_crash_before_ack_with_xautoclaim():
     assert reclaimed.fields["session_id"] == "s1"
     assert reclaimed.delivery_count == 2
     assert stream.pending()[0].consumer == "worker-b"
+
+
+def test_redis_adapter_defers_without_spending_transport_attempts():
+    client = FakeRedis()
+    stream = RedisJobStream(
+        client,
+        RedisJobStreamConfig(
+            stream="summarize_jobs",
+            visibility_timeout_ms=60_000,
+            max_deliveries=5,
+        ),
+    )
+    stream.add({"session_id": "s1"})
+    (delivery,) = stream.read_group("worker-a")
+    due_ms = client.now_ms + 240_000
+
+    assert stream.defer(delivery.id, until_ms=due_ms) is True
+    for _ in range(3):
+        client.advance(60_000)
+        assert stream.reclaim("worker-b") == []
+        assert stream.pending()[0].delivery_count == 1
+
+    client.advance(60_000)
+    (reclaimed,) = stream.reclaim("worker-b")
+    assert reclaimed.delivery_count == 2
+    assert client.xclaim_calls[0].get("time") is None
+
+
+def test_redis_adapter_backoffs_preserve_five_backend_executions():
+    client = FakeRedis()
+    stream = RedisJobStream(
+        client,
+        RedisJobStreamConfig(
+            stream="summarize_jobs",
+            visibility_timeout_ms=60_000,
+            max_deliveries=5,
+        ),
+    )
+    stream.add({"session_id": "s1", "source_version": "v1"})
+    (delivery,) = stream.read_group("worker-a")
+    backend_executions = 1
+
+    while backend_executions < 5:
+        base_seconds = min(60 * (2 ** (backend_executions - 1)), 3600)
+        due_ms = client.now_ms + base_seconds * 1000
+        stream.fail(delivery.id, "backend failed")
+        assert stream.defer(delivery.id, until_ms=due_ms) is True
+        while client.now_ms < due_ms:
+            client.advance(min(60_000, due_ms - client.now_ms))
+            reclaimed = stream.reclaim("worker-b")
+            if client.now_ms < due_ms:
+                assert reclaimed == []
+                continue
+            (delivery,) = reclaimed
+        backend_executions += 1
+
+    assert backend_executions == 5
+    assert delivery.delivery_count == 5
+    assert stream.dead_letters() == []
+    assert stream.ack(delivery.id) is True
+
+
+def test_redis_reclaim_pages_past_deferred_prefix_without_claiming_it():
+    client = FakeRedis()
+    stream = RedisJobStream(
+        client,
+        RedisJobStreamConfig(
+            stream="summarize_jobs",
+            visibility_timeout_ms=0,
+            max_deliveries=5,
+        ),
+    )
+    deferred_ids = []
+    for index in range(1_001):
+        stream.add({"session_id": f"deferred-{index}"})
+        (delivery,) = stream.read_group("worker-a")
+        deferred_ids.append(delivery.id)
+        assert stream.defer(delivery.id, until_ms=client.now_ms + 60_000)
+    stream.add({"session_id": "due"})
+    (due_delivery,) = stream.read_group("worker-a")
+
+    (reclaimed,) = stream.reclaim("worker-b", count=1)
+
+    assert reclaimed.id == due_delivery.id
+    assert reclaimed.delivery_count == 2
+    assert client.xclaim_calls == [
+        {
+            "name": "summarize_jobs",
+            "group": "workers",
+            "consumer": "worker-b",
+            "min_idle_time": 0,
+            "message_ids": [due_delivery.id],
+        }
+    ]
+    pending_by_id = {entry.id: entry for entry in stream.pending()}
+    assert pending_by_id[deferred_ids[0]].delivery_count == 1
 
 
 def test_redis_adapter_crash_after_durable_write_before_ack_is_redelivered_once():

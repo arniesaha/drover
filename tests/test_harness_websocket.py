@@ -19,6 +19,7 @@ from drover.server.harness.daemon import (
     create_harness_server,
     register_daemon_host,
 )
+from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import (
@@ -128,6 +129,19 @@ def _wait_for_event(
         if event_type in events:
             return
     raise AssertionError(f"event {event_type!r} was not recorded")
+
+
+def test_wire_payload_rejects_null_canonical_event_metadata():
+    event = HarnessEvent(
+        event_id="legacy-e1",
+        session_id="legacy",
+        event_type="assistant_output",
+        payload={"text": "hello"},
+        seq=None,
+    )
+
+    with pytest.raises(ValueError, match="sequence"):
+        event.wire_payload()
 
 
 def test_terminal_websocket_sends_input_and_captures_transcript(tmp_path):

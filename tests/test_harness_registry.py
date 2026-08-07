@@ -8,6 +8,7 @@ import duckdb
 
 from drover.schema import bootstrap
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.schema import migrate_legacy_harness_event_sequences
 
 
 def _registry(tmp_path):
@@ -580,3 +581,83 @@ def test_bootstrap_drops_legacy_transcript_chunk_table(tmp_path):
 
     assert "harness_transcript_chunks" not in tables
     assert {"harness_hosts", "harness_sessions", "harness_events"}.issubset(tables)
+
+
+def test_bootstrap_sequences_all_null_legacy_events_deterministically(tmp_path):
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute("UPDATE harness_events SET seq=NULL")
+        con.executemany(
+            "INSERT INTO harness_events(event_id,session_id,event_type,payload_json,created_at,seq) VALUES (?,?,?,?,?,NULL)",
+            [
+                (
+                    "event-b",
+                    "legacy",
+                    "assistant_output",
+                    '{"text":"unchanged-b"}',
+                    "2026-06-01 10:00:00",
+                ),
+                (
+                    "event-a",
+                    "legacy",
+                    "user_input",
+                    '{"text":"unchanged-a"}',
+                    "2026-06-01 10:00:00",
+                ),
+            ],
+        )
+        report = migrate_legacy_harness_event_sequences(con)
+        rows = con.execute(
+            "SELECT event_id,seq,payload_json FROM harness_events "
+            "WHERE session_id='legacy' ORDER BY seq"
+        ).fetchall()
+
+    assert rows == [
+        ("event-a", 1, '{"text":"unchanged-a"}'),
+        ("event-b", 2, '{"text":"unchanged-b"}'),
+    ]
+    assert report.migrated_sessions == 1
+    assert report.migrated_events == 2
+
+
+def test_migration_refuses_mixed_sequence_session_without_mutation(tmp_path):
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.executemany(
+            "INSERT INTO harness_events(event_id,session_id,event_type,payload_json,created_at,seq) VALUES (?,?,?,?,?,?)",
+            [
+                ("event-1", "mixed", "user_input", "{}", "2026-06-01", 1),
+                ("event-2", "mixed", "assistant_output", "{}", "2026-06-02", None),
+            ],
+        )
+        report = migrate_legacy_harness_event_sequences(con)
+        rows = con.execute(
+            "SELECT event_id,seq FROM harness_events "
+            "WHERE session_id='mixed' ORDER BY event_id"
+        ).fetchall()
+
+    assert report.mixed_sessions == ("mixed",)
+    assert report.migrated_sessions == 0
+    assert report.migrated_events == 0
+    assert rows == [("event-1", 1), ("event-2", None)]
+
+
+def test_migration_is_idempotent(tmp_path):
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute(
+            "INSERT INTO harness_events(event_id,session_id,event_type,payload_json,created_at,seq) "
+            "VALUES ('event-1','legacy','user_input','{}','2026-06-01',NULL)"
+        )
+        first = migrate_legacy_harness_event_sequences(con)
+        second = migrate_legacy_harness_event_sequences(con)
+        rows = con.execute(
+            "SELECT event_id,seq FROM harness_events WHERE session_id='legacy'"
+        ).fetchall()
+
+    assert first.migrated_sessions == 1
+    assert first.migrated_events == 1
+    assert second.migrated_sessions == 0
+    assert second.migrated_events == 0
+    assert second.mixed_sessions == ()
+    assert rows == [("event-1", 1)]

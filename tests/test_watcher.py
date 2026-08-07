@@ -421,9 +421,57 @@ def test_handler_publishes_summarize_jobs_to_stream(
 
     handler._maybe_ingest(batch)
 
-    assert published == [{"session_id": "sess-stream-enqueue"}]
+    assert len(published) == 1
+    assert published[0]["session_id"] == "sess-stream-enqueue"
+    assert len(published[0]["source_version"]) == 64
     assert not batch.exists()
     assert (host_dir / ".processed" / "openclaw.jsonl").exists()
+
+
+def test_handler_publishes_only_when_source_generation_is_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incoming = tmp_path / "incoming"
+    host_dir = incoming / "nas-claude"
+    host_dir.mkdir(parents=True)
+    batch = host_dir / "duplicate.jsonl"
+    _write_event(batch, "duplicate-generation")
+    parquet_dir = tmp_path / "parquet"
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
+    published: list[dict] = []
+
+    class Stats:
+        read = 1
+        inserted = 0
+        skipped_dupes = 1
+        errors = 0
+        shadow_published = 0
+        ledger_receipts = 0
+        new_session_ids = {"sess-x"}
+
+    class FakeStream:
+        def add(self, fields: dict) -> str:
+            published.append(fields)
+            return "1-0"
+
+    monkeypatch.setattr("drover.server.watcher.ingest_file", lambda *a, **kw: Stats())
+    monkeypatch.setattr(
+        "drover.server.watcher.source_version_for_session", lambda con, sid: "v1"
+    )
+    monkeypatch.setattr(
+        "drover.server.watcher.enqueue_summary_generation",
+        lambda con, sid, version: False,
+    )
+    handler = _Handler(
+        parquet_dir=parquet_dir,
+        duckdb_path=db_path,
+        summarize_job_stream=FakeStream(),
+    )
+
+    handler._maybe_ingest(batch)
+
+    assert published == []
 
 
 def test_handler_leaves_file_in_place_when_duckdb_lock_retries_exhaust(

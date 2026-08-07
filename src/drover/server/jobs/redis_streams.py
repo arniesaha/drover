@@ -3,7 +3,8 @@
 The pure-Python :mod:`drover.server.jobs.streams` model is the executable
 contract. This module is the production-shaped adapter for the same contract:
 one stream, one consumer group, at-least-once delivery, ACK only after durable
-effects, XAUTOCLAIM recovery, DLQ streams, replay, and backpressure snapshots.
+effects, due-aware pending recovery, DLQ streams, replay, and backpressure
+snapshots.
 
 Redis is still execution coordination only. The DuckDB ledger / serving tables
 remain the durable source of truth, so this adapter is safe to enable
@@ -66,6 +67,7 @@ class RedisJobStream:
         self.group = config.group
         self.dead_stream = f"{config.stream}:dead"
         self.error_hash = f"{config.stream}:errors"
+        self.deferred_zset = f"{config.stream}:deferred"
         if ensure_group:
             self._ensure_group()
 
@@ -119,22 +121,65 @@ class RedisJobStream:
         if acked:
             self._client.xdel(self.name, entry_id)
             self._client.hdel(self.error_hash, entry_id)
+            self._client.zrem(self.deferred_zset, entry_id)
         return bool(acked)
 
     def fail(self, entry_id: str, error: str) -> None:
         self._client.hset(self.error_hash, entry_id, _redact_error(error))
 
-    # -- janitor: XAUTOCLAIM + DLQ -------------------------------------
+    def defer(self, entry_id: str, *, until_ms: int) -> bool:
+        """Record a server-visible due time without touching delivery metadata."""
+        pending = self._pending_entry(entry_id)
+        if pending is None:
+            return False
+        self._client.zadd(self.deferred_zset, {entry_id: int(until_ms)})
+        return True
+
+    # -- janitor: due-aware XCLAIM + DLQ -------------------------------
 
     def reclaim(self, consumer: str, count: int = 10) -> List[Delivery]:
-        claimed = self._xautoclaim(consumer=consumer, count=count)
+        now_ms = self._server_time_ms()
+        claim_ids: list[str] = []
+        page_start = "-"
+        page_size = 1000
+        while len(claim_ids) < count:
+            pending_rows = self._client.xpending_range(
+                self.name, self.group, page_start, "+", page_size
+            )
+            if not pending_rows:
+                break
+            for row in pending_rows:
+                pending = self._pending_from_row(row)
+                if self._pending_idle_ms(row) < self.config.visibility_timeout_ms:
+                    continue
+                deferred_until = self._client.zscore(self.deferred_zset, pending.id)
+                if deferred_until is not None and float(deferred_until) > now_ms:
+                    continue
+                claim_ids.append(pending.id)
+                if len(claim_ids) >= count:
+                    break
+            if len(pending_rows) < page_size or len(claim_ids) >= count:
+                break
+            last_pending = self._pending_from_row(pending_rows[-1])
+            page_start = f"({last_pending.id}"
+        if not claim_ids:
+            return []
+        claimed = self._client.xclaim(
+            self.name,
+            self.group,
+            consumer,
+            self.config.visibility_timeout_ms,
+            claim_ids,
+        )
         out: list[Delivery] = []
         for entry_id, raw_fields in claimed:
+            entry_id = _to_str(entry_id)
             pending = self._pending_entry(entry_id)
             delivery_count = pending.delivery_count if pending else 1
             if delivery_count > self.config.max_deliveries:
                 self._dead_letter(entry_id, raw_fields, delivery_count)
                 continue
+            self._client.zrem(self.deferred_zset, entry_id)
             out.append(
                 Delivery(
                     id=entry_id,
@@ -143,6 +188,16 @@ class RedisJobStream:
                 )
             )
         return out
+
+    def _server_time_ms(self) -> int:
+        seconds, micros = self._client.time()
+        return int(seconds) * 1000 + int(micros) // 1000
+
+    @staticmethod
+    def _pending_idle_ms(row: Any) -> int:
+        if isinstance(row, dict):
+            return int(_field(row, "time_since_delivered") or 0)
+        return int(row[2])
 
     def _dead_letter(
         self, entry_id: str, raw_fields: Dict[str, Any], delivery_count: int

@@ -97,6 +97,22 @@ def test_stalled_job_is_reclaimed_and_redelivered():
     assert [p.consumer for p in stream.pending()] == ["worker-b"]
 
 
+def test_deferred_job_does_not_spend_delivery_before_due():
+    stream, clock = make_stream(visibility_timeout_ms=60_000, max_deliveries=5)
+    stream.add({"session_id": "s1"})
+    (delivery,) = stream.read_group("worker-a")
+
+    assert stream.defer(delivery.id, until_ms=clock.now + 240_000) is True
+    for _ in range(3):
+        clock.advance(60_000)
+        assert stream.reclaim("worker-b") == []
+        assert stream.pending()[0].delivery_count == 1
+
+    clock.advance(60_000)
+    (reclaimed,) = stream.reclaim("worker-b")
+    assert reclaimed.delivery_count == 2
+
+
 def test_exhausted_retries_go_to_dead_letter_with_replay_context():
     stream, clock = make_stream(visibility_timeout_ms=1_000, max_deliveries=3)
     stream.add({"session_id": "s1", "kind": "incremental"})

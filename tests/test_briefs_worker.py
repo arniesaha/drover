@@ -471,3 +471,48 @@ def test_brief_worker_acks_redelivery_when_brief_already_done(tmp_path: Path) ->
     assert worker.drain_once() == 1
     assert stream.pending() == []
     assert stream.length() == 0
+
+
+def test_brief_worker_acks_obsolete_versioned_job_without_backend_execution(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('S-stale', 'pending', 'v2')"
+        )
+        con.execute("""INSERT INTO brief_jobs
+               (project_key, status, attempts, source_session_id, source_version)
+               VALUES ('arniesaha/nexus', 'pending', 0, 'S-stale', 'v1')""")
+    finally:
+        con.close()
+    stream = JobStream("brief_jobs")
+    stream.add(
+        {
+            "project_key": "arniesaha/nexus",
+            "source_session_id": "S-stale",
+            "source_version": "v1",
+        }
+    )
+
+    class CountingBackend(_StubBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def summarize(self, prompt: str) -> dict:
+            self.calls += 1
+            return super().summarize(prompt)
+
+    backend = CountingBackend()
+    worker = BriefWorker(
+        duckdb_path=duckdb_path,
+        backend=backend,
+        job_stream=stream,
+    )
+
+    assert worker.drain_once() == 1
+    assert backend.calls == 0
+    assert stream.pending() == []
+    assert stream.length() == 0

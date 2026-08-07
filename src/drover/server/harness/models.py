@@ -117,6 +117,15 @@ class HarnessEvent:
     created_at: datetime | None = None
     seq: int | None = None
 
+    def wire_payload(self) -> dict[str, Any]:
+        if self.seq is None:
+            raise ValueError("cannot serialize harness event without a sequence")
+        payload = dict(self.payload)
+        payload["event_id"] = self.event_id
+        payload["session_id"] = self.session_id
+        payload["seq"] = self.seq
+        return payload
+
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "HarnessEvent":
         return cls(

@@ -160,8 +160,14 @@ class BriefWorker:
     def _oldest_pending_project(self) -> Optional[str]:
         con = open_duckdb_connection(self.duckdb_path)
         try:
-            row = con.execute("""SELECT project_key FROM brief_jobs
-                   WHERE status='pending'
+            row = con.execute("""SELECT b.project_key FROM brief_jobs b
+                   WHERE b.status='pending'
+                     AND (b.source_version IS NULL OR EXISTS (
+                       SELECT 1 FROM summarize_jobs s
+                        WHERE s.session_id=b.source_session_id
+                          AND s.source_version IS NOT DISTINCT FROM b.source_version
+                          AND s.status='done'
+                     ))
                    ORDER BY enqueued_at ASC LIMIT 1""").fetchone()
             return row[0] if row else None
         finally:
@@ -192,18 +198,33 @@ class BriefWorker:
     def _claim_duckdb_job(self) -> Optional[tuple[str, Optional[Delivery]]]:
         con = open_duckdb_connection(self.duckdb_path)
         try:
-            row = con.execute("""SELECT project_key, attempts FROM brief_jobs
-                   WHERE status='pending'
+            row = con.execute("""SELECT b.project_key, b.attempts FROM brief_jobs b
+                   WHERE b.status='pending'
+                     AND (b.source_version IS NULL OR EXISTS (
+                       SELECT 1 FROM summarize_jobs s
+                        WHERE s.session_id=b.source_session_id
+                          AND s.source_version IS NOT DISTINCT FROM b.source_version
+                          AND s.status='done'
+                     ))
                    ORDER BY enqueued_at ASC LIMIT 1""").fetchone()
             if row is None:
                 return None
             project_key, attempts = row[0], row[1] or 0
-            con.execute(
-                """UPDATE brief_jobs
+            claimed = con.execute(
+                """UPDATE brief_jobs b
                    SET status='running', attempts=?, updated_at=now()
-                   WHERE project_key=?""",
+                   WHERE b.project_key=? AND b.status='pending'
+                     AND (b.source_version IS NULL OR EXISTS (
+                       SELECT 1 FROM summarize_jobs s
+                        WHERE s.session_id=b.source_session_id
+                          AND s.source_version IS NOT DISTINCT FROM b.source_version
+                          AND s.status='done'
+                     ))
+                   RETURNING b.project_key""",
                 [attempts + 1, project_key],
-            )
+            ).fetchone()
+            if claimed is None:
+                return None
         finally:
             con.close()
         return project_key, None
@@ -220,13 +241,46 @@ class BriefWorker:
             self.job_stream.fail(delivery.id, "missing project_key")
             return None, delivery
         project_key = str(project_key)
+        delivery_source_session_id = delivery.fields.get("source_session_id")
+        delivery_source_version = delivery.fields.get("source_version")
+        if delivery_source_session_id is not None:
+            delivery_source_session_id = str(delivery_source_session_id)
+        if delivery_source_version is not None:
+            delivery_source_version = str(delivery_source_version)
 
         con = open_duckdb_connection(self.duckdb_path)
         try:
             row = con.execute(
-                "SELECT status, attempts FROM brief_jobs WHERE project_key=?",
+                """SELECT status, attempts, source_session_id, source_version
+                     FROM brief_jobs WHERE project_key=?""",
                 [project_key],
             ).fetchone()
+            if delivery_source_version is not None:
+                if row is None:
+                    self.job_stream.ack(delivery.id)
+                    return None, None
+                claimed = con.execute(
+                    """UPDATE brief_jobs b
+                          SET status='running',
+                              attempts=COALESCE(attempts, 0)+1,
+                              updated_at=now()
+                        WHERE b.project_key=?
+                          AND b.status NOT IN ('done', 'superseded')
+                          AND b.source_session_id IS NOT DISTINCT FROM ?
+                          AND b.source_version IS NOT DISTINCT FROM ?
+                          AND EXISTS (
+                            SELECT 1 FROM summarize_jobs s
+                             WHERE s.session_id=b.source_session_id
+                               AND s.source_version IS NOT DISTINCT FROM b.source_version
+                               AND s.status='done'
+                          )
+                        RETURNING b.project_key""",
+                    [project_key, delivery_source_session_id, delivery_source_version],
+                ).fetchone()
+                if claimed is None:
+                    self.job_stream.ack(delivery.id)
+                    return None, None
+                return project_key, delivery
             if row is None:
                 con.execute(
                     """INSERT INTO brief_jobs

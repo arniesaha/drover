@@ -596,6 +596,38 @@ def test_worker_acks_session_stream_redelivery_when_embedding_already_done(
     assert stream.length() == 0
 
 
+def test_worker_acks_obsolete_versioned_embed_without_backend_execution(
+    tmp_path: Path,
+) -> None:
+    duckdb_path = _seed(tmp_path)
+    _insert_summary(duckdb_path, "S-stale", "obsolete summary")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('S-stale', 'pending', 'v2')"
+        )
+        con.execute(
+            "INSERT INTO embed_jobs (session_id, status, attempts, source_version) "
+            "VALUES ('S-stale', 'pending', 0, 'v1')"
+        )
+    finally:
+        con.close()
+    stream = JobStream("embed_jobs")
+    stream.add({"session_id": "S-stale", "source_version": "v1"})
+    embedder = _StubEmbedder()
+    worker = EmbedWorker(
+        duckdb_path=duckdb_path,
+        embedder=embedder,
+        session_job_stream=stream,
+    )
+
+    assert worker.drain_batch(max_jobs=1) == 0
+    assert embedder.calls == 0
+    assert stream.pending() == []
+    assert stream.length() == 0
+
+
 def _insert_span_for_stream(duckdb_path: Path, span_id: str) -> None:
     con = duckdb.connect(str(duckdb_path))
     try:
