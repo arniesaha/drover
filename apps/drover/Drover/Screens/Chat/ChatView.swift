@@ -113,7 +113,11 @@ struct ChatView: View {
             // on each scroll-phase change.
             let items = model.items
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
+                // Cold open is bounded to the newest 200 raw messages, which
+                // fold to substantially fewer rows. Keep that bounded tail
+                // materialized so keyboard/composer geometry changes cannot
+                // briefly evict the visible transcript.
+                VStack(alignment: .leading, spacing: 8) {
                     if model.hasOlderHistory {
                         Button {
                             let anchorMessageID = items.first?.anchorMessageID
@@ -143,9 +147,8 @@ struct ChatView: View {
                                 try? await Task.sleep(for: .milliseconds(50))
                                 guard !Task.isCancelled else { return }
                                 proxy.scrollTo(anchorRowID, anchor: .top)
-                                // Tall lazy rows can finish measuring after
-                                // the first pass; settle once more against the
-                                // raw anchor's current rendered row.
+                                // Settle once more against the raw anchor's
+                                // current rendered row after layout completes.
                                 try? await Task.sleep(for: .milliseconds(200))
                                 guard !Task.isCancelled,
                                       prependScrollGeneration == generation,
@@ -216,13 +219,10 @@ struct ChatView: View {
             }
             // Auto-scroll is coalesced and unanimated on purpose: firing an
             // animated scrollTo per appended message piles up overlapping
-            // animations faster than they can finish, and a LazyVStack under
-            // that load de-materializes the visible rows — the screen goes
-            // blank until the subtree is rebuilt (the "leave and come back"
-            // workaround). One unanimated scroll per ~120ms window, always
-            // to whatever is newest by the time it fires, keeps the
-            // transcript following the stream without the animation storm.
-            // Gated on pinning so it never fights the user's finger.
+            // animations faster than they can finish. One unanimated scroll
+            // per ~120ms window, always to the visual tail at fire time,
+            // keeps the transcript following the stream without an animation
+            // storm. Gated on pinning so it never fights the user's finger.
             .onChange(of: model.messages.last?.id) { _, newestID in
                 guard newestID != nil, isPinnedToBottom else { return }
                 scheduleScroll(with: proxy)
@@ -256,14 +256,13 @@ struct ChatView: View {
     private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
         Button {
             cancelPrependScroll()
-            guard let rowID = model.latestRowID else { return }
+            guard let rowID = model.visualTailRowID else { return }
             withAnimation(.snappy) {
                 isPinnedToBottom = true
                 proxy.scrollTo(rowID, anchor: .bottom)
             }
-            // Late-measuring lazy rows (tall diffs) can land the animated
-            // scroll short; one unanimated follow-up after layout settles
-            // closes the gap so pinning actually holds.
+            // One unanimated follow-up after layout settles closes any gap
+            // left by a tall row changing size during the animated scroll.
             scheduleScroll(with: proxy)
         } label: {
             Image(systemName: "arrow.down")
@@ -285,18 +284,18 @@ struct ChatView: View {
         guard pendingScroll == nil else { return }
         pendingScroll = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, isPinnedToBottom, let rowID = model.latestRowID else {
+            guard !Task.isCancelled, isPinnedToBottom,
+                  let rowID = model.visualTailRowID else {
                 pendingScroll = nil
                 return
             }
             proxy.scrollTo(rowID, anchor: .bottom)
-            // Settle pass: rows that finish measuring after the first scroll
-            // (LazyVStack + tall code/diff blocks) grow the content under us;
-            // one more unanimated scroll pins the real bottom.
+            // A row can still grow after the first scroll (for example a
+            // disclosure or tall diff), so pin once more after layout settles.
             try? await Task.sleep(for: .milliseconds(200))
             pendingScroll = nil
             guard !Task.isCancelled, isPinnedToBottom,
-                  let settledRowID = model.latestRowID else { return }
+                  let settledRowID = model.visualTailRowID else { return }
             proxy.scrollTo(settledRowID, anchor: .bottom)
         }
     }
