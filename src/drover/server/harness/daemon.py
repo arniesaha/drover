@@ -1826,6 +1826,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         text = append_attachment_lines(text, saved)
         model = _optional_text(body.get("model"))
         thinking_effort = _optional_text(body.get("thinking_effort"))
+        # Claude owns one persistent process, so later turn preferences cannot
+        # affect the running model. Silently ignore overrides from older/direct
+        # clients and preserve the startup preferences stored in the registry.
+        if self.server.state.structured.harness_for(session_id) == "claude-code":
+            model = None
+            thinking_effort = None
         try:
             turn_id = self.server.state.structured.send_turn(
                 session_id,

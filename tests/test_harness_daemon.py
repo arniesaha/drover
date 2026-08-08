@@ -1699,6 +1699,43 @@ def test_structured_session_inventory_includes_run_preferences(tmp_path):
         server.server_close()
 
 
+def test_claude_turn_cannot_change_persistent_session_preferences(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+                "model": "sonnet",
+                "thinking_effort": "high",
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+
+        turn_status, _ = _json_request(
+            f"{base_url}/sessions/{sid}/turns",
+            payload={
+                "text": "try another model",
+                "model": "opus",
+                "thinking_effort": "xhigh",
+            },
+        )
+        assert turn_status == 202
+
+        _, session = _json_request(f"{base_url}/sessions/{sid}")
+        assert session["model"] == "sonnet"
+        assert session["thinking_effort"] == "high"
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_structured_turn_appends_user_input_and_seq_is_monotonic(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     try:

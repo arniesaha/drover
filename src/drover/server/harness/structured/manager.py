@@ -65,6 +65,11 @@ class StructuredSessionManager:
         with self._entries_lock:
             return session_id in self._entries
 
+    def harness_for(self, session_id: str) -> str | None:
+        with self._entries_lock:
+            entry = self._entries.get(session_id)
+        return entry.harness if entry else None
+
     def awaiting(self, session_id: str) -> str | None:
         with self._entries_lock:
             entry = self._entries.get(session_id)
