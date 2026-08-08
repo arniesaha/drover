@@ -52,12 +52,6 @@ git clone https://github.com/arniesaha/drover.git
 cd drover
 uv sync --extra dev
 uv run drover-server init
-```
-
-Set `metrics_http_port = 7080` in `~/.drover/config.toml`, then start the
-central process:
-
-```bash
 uv run drover-server run
 ```
 
@@ -71,7 +65,8 @@ uv run drover-harnessd \
   --local-url http://127.0.0.1:7081
 ```
 
-The first server start creates `~/.drover/api_token` with mode `0600`. Use
+`init` enables the local cockpit on `127.0.0.1:7080`. The first server start
+creates `~/.drover/api_token` with mode `0600`. Use
 that token when configuring the iOS app or calling the harness API.
 
 Continue with [Getting Started](docs/getting-started.md) for verification,

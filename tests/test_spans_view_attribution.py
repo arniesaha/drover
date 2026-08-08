@@ -124,7 +124,7 @@ def test_spans_view_derives_repo_from_safe_agentweave_cwd_attr(tmp_path: Path) -
     finally:
         con.close()
 
-    assert row == ("OpenClaw", "arniesaha", "openclaw")
+    assert row == ("OpenClaw", None, None)
 
 
 def test_span_inherits_repo_from_same_agent_same_day(tmp_path: Path) -> None:

@@ -114,8 +114,14 @@ def test_ingest_new_session_ids_empty_on_reingest(tmp_lh):
     assert stats2.new_session_ids == set()
 
 
-def test_ingest_propagates_unique_session_repo_to_unattributed_events(tmp_lh, tmp_path):
+def test_ingest_propagates_unique_session_repo_to_unattributed_events(
+    tmp_lh, tmp_path, monkeypatch
+):
     """Observer/hook events in a session should inherit the session's only repo."""
+    monkeypatch.setenv(
+        "DROVER_REPO_ROOTS_JSON",
+        '{"/Users/arnabmac/jenny/nexus": "arniesaha/nexus"}',
+    )
     parquet_dir, db_path = tmp_lh
     incoming = tmp_path / "session_attribution.jsonl"
     rows = [

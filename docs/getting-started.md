@@ -20,8 +20,8 @@ uv sync --extra dev
 uv run drover-server init
 ```
 
-The generated config lives at `~/.drover/config.toml`. For the cockpit API,
-change the server section to:
+The generated config lives at `~/.drover/config.toml` and enables the local
+cockpit on port `7080`:
 
 ```toml
 [server]
@@ -86,8 +86,9 @@ Install Tailscale on the server machine and iPhone, sign both into the same
 tailnet, and verify the phone can reach the machine's private Tailscale address.
 Keep port `7080` private to the tailnet.
 
-Set `--metrics-host 0.0.0.0` when starting `drover-server` if the process must
-listen beyond loopback:
+Central listeners bind to `127.0.0.1` by default. Bind only the cockpit HTTP
+surface to the private interface when the iOS app must connect from another
+device:
 
 ```bash
 uv run drover-server run --metrics-host 0.0.0.0
@@ -95,6 +96,9 @@ uv run drover-server run --metrics-host 0.0.0.0
 
 Use `http://<private-tailscale-ip>:7080` in the app. The bearer token is still
 required. Review [Security](security.md) before changing bind addresses.
+
+OTLP and MCP remain loopback-only unless you also set `--otlp-host` or
+`--mcp-host` explicitly.
 
 ## 6. Verify The Context Surface
 

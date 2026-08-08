@@ -57,6 +57,10 @@ content. Git history is not a suitable place for sensitive runtime evidence.
 
 ## Network Checklist
 
+Central OTLP, MCP, and cockpit listeners bind to `127.0.0.1` by default. The
+host daemon also defaults to `127.0.0.1:7081`. Reaching Drover from another
+machine therefore requires an explicit bind override.
+
 Before binding beyond `127.0.0.1`:
 
 1. Confirm unauthenticated `/harness/hosts` returns `401` or `403`.

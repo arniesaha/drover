@@ -1,4 +1,4 @@
-"""DuckDB tables for Drover Meta Harness control-plane state."""
+"""DuckDB tables for Drover harness control-plane state."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def migrate_legacy_harness_event_sequences(
 
 
 def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
-    """Create Meta Harness control-plane tables. Idempotent."""
+    """Create Drover harness control-plane tables. Idempotent."""
     con.execute(_HARNESS_HOSTS_DDL)
     _ensure_harness_columns(
         con,

@@ -1,4 +1,4 @@
-"""HTTP host daemon for the Drover Meta Harness."""
+"""HTTP host daemon for the Drover command plane."""
 
 from __future__ import annotations
 

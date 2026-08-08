@@ -1,4 +1,4 @@
-"""Registry helpers for Drover Meta Harness hosts and sessions."""
+"""Registry helpers for Drover harness hosts and sessions."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _rows(
 
 
 class HarnessRegistry:
-    """Small DuckDB-backed registry for Meta Harness control-plane state."""
+    """Small DuckDB-backed registry for Drover command-plane state."""
 
     def __init__(self, duckdb_path: str | Path):
         self.duckdb_path = Path(duckdb_path)

@@ -9,6 +9,25 @@ The collector recognizes local session records from Claude Code, Codex,
 Gemini, OpenClaw, Hermes, and compatible tools. Parsers preserve source-native
 identifiers and raw metadata while producing normalized agent events.
 
+Repository identity is taken from source metadata or the local Git checkout.
+For paths collected on a different machine, add an explicit prefix map instead
+of relying on machine-specific defaults:
+
+```bash
+export DROVER_REPO_ROOTS_JSON='{ "/srv/projects/example": "acme/example" }'
+```
+
+Claude Code encodes project paths into directory names and cannot distinguish
+every literal hyphen from a path separator. Add ambiguous prefixes explicitly:
+
+```bash
+export DROVER_CLAUDE_CWD_MAP='{ "-srv-projects-agent-tools": "/srv/projects/agent-tools" }'
+```
+
+`DROVER_GENERAL_WORKSPACE_ROOTS` accepts an OS-path-separator-delimited list of
+exact directories that should be classified as non-project workspace activity.
+All three settings are optional and empty by default.
+
 ## AgentWeave And OpenTelemetry
 
 Drover accepts OTLP spans and retains trace, span, session, model, token, cost,

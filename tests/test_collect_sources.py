@@ -115,7 +115,7 @@ def test_hermes_source_parses_session_json() -> None:
     assert files, "should find at least one hermes session fixture"
     events = list(src.parse(files[0]))
     assert len(events) == 2
-    assert events[0].agent_id == "macmini-hermes"
+    assert events[0].agent_id == "hermes"
 
 
 # --- OpenClawSource ---
@@ -128,7 +128,7 @@ def test_openclaw_source_parses_jsonl() -> None:
     events = list(src.parse(files[0]))
     assert len(events) == 2
     assert events[0].session_id == "oc-sess-1"
-    assert events[0].agent_id == "nas-openclaw"
+    assert events[0].agent_id == "openclaw"
 
 
 # --- PiMonoSource (sqlite) ---

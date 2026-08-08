@@ -48,6 +48,7 @@ RULES = (
         ),
     ),
     Rule("legacy-public-name", re.compile(r"\bNexusKit\b")),
+    Rule("legacy-harness-name", re.compile(r"\bMeta Harness\b")),
 )
 
 ENVIRONMENT_RULES = frozenset(
@@ -77,6 +78,7 @@ RULE_ALLOWLIST = {
         {
             "credential-value",
             "legacy-public-name",
+            "legacy-harness-name",
             "personal-home-path",
             "private-ip-address",
             "private-tailnet-hostname",
@@ -87,6 +89,7 @@ RULE_ALLOWLIST = {
 
 RULE_PREFIX_ALLOWLIST = {
     "credential-value": ("tests/", "apps/drover/DroverKit/Tests/"),
+    "legacy-harness-name": ("tests/", "apps/drover/DroverKit/Tests/"),
 }
 
 
@@ -115,6 +118,7 @@ def _redact_credential(match: re.Match[str]) -> str:
 def _is_release_facing(path: Path) -> bool:
     return (
         bool(set(path.parts) & RELEASE_FACING_PARTS)
+        or "src" in path.parts
         or path.name.lower() == "readme.md"
         or path.suffix.lower() in RELEASE_FACING_SUFFIXES
     )
@@ -124,7 +128,10 @@ def check_paths(paths: Sequence[Path]) -> list[Finding]:
     findings: list[Finding] = []
     for path in paths:
         normalized = f"/{path.as_posix().lstrip('/')}"
-        if normalized.endswith("/docs/roadmap.md") or "/docs/superpowers/" in normalized:
+        if (
+            normalized.endswith("/docs/roadmap.md")
+            or "/docs/superpowers/" in normalized
+        ):
             findings.append(
                 Finding(
                     path=str(path),

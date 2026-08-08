@@ -28,61 +28,20 @@ class AgentAdoptionRecord:
         )
 
 
-DEFAULT_AGENT_ADOPTION: tuple[AgentAdoptionRecord, ...] = (
-    AgentAdoptionRecord(
-        runtime="mac-mini-max",
-        agent_id_patterns=("macmini-claude", "max*", "max-v1"),
-        emits_to_drover=True,
-        mcp_configured=True,
-        drover_skill_configured=True,
-        status="active",
-        smoke_check="drover_data_quality, drover_recent_sessions, drover_session_replay",
-    ),
-    AgentAdoptionRecord(
-        runtime="openclaw-main",
-        agent_id_patterns=("openclaw*", "nix*", "nix-v1"),
-        emits_to_drover=True,
-        mcp_configured=True,
-        drover_skill_configured=True,
-        status="active",
-        smoke_check="drover_handoff, drover_project_brief, drover_data_quality",
-    ),
-    AgentAdoptionRecord(
-        runtime="paperclip-agents",
-        agent_id_patterns=("paperclip*", "claude_local", "codex_local"),
-        emits_to_drover=True,
-        mcp_configured=False,
-        drover_skill_configured=True,
-        status="needs-mcp-rollout",
-        smoke_check="quality snapshot in completion evidence bundle",
-    ),
-    AgentAdoptionRecord(
-        runtime="codex-cli",
-        agent_id_patterns=("codex*", "codex_local"),
-        emits_to_drover=True,
-        mcp_configured=False,
-        drover_skill_configured=True,
-        status="needs-validation",
-        smoke_check="drover_handoff and drover_data_quality before non-trivial work",
-    ),
-    AgentAdoptionRecord(
-        runtime="work-macbook-claude",
-        agent_id_patterns=("work-macbook*", "work-claude*"),
-        emits_to_drover=True,
-        mcp_configured=False,
-        drover_skill_configured=False,
-        status="data-source-only",
-        smoke_check="shipper event freshness plus MCP setup check",
-    ),
-)
+# Adoption records describe an operator's rollout, so Drover ships no
+# machine-specific registry. Callers may supply their own records.
+DEFAULT_AGENT_ADOPTION: tuple[AgentAdoptionRecord, ...] = ()
 
 
 def _matches(patterns: Iterable[str], agent_id: str) -> bool:
     return any(fnmatch(agent_id, pattern) for pattern in patterns)
 
 
-def adoption_snapshot(audit: dict[str, Any]) -> dict[str, Any]:
-    """Return the static rollout matrix annotated with observed event volume."""
+def adoption_snapshot(
+    audit: dict[str, Any],
+    records: Iterable[AgentAdoptionRecord] = DEFAULT_AGENT_ADOPTION,
+) -> dict[str, Any]:
+    """Return an operator-supplied rollout matrix with observed event volume."""
 
     attribution = audit.get("repo_attribution", {}) or {}
     latest_events = audit.get("latest_events", {}) or {}
@@ -107,7 +66,7 @@ def adoption_snapshot(audit: dict[str, Any]) -> dict[str, Any]:
     matched_agents: set[str] = set()
     high_volume_unready: list[str] = []
 
-    for record in DEFAULT_AGENT_ADOPTION:
+    for record in records:
         observed_ids = sorted(
             agent_id
             for agent_id in observed_agent_ids

@@ -68,7 +68,7 @@ def test_parse_claude(mock_claude_log):
     events = parse_claude_audit_log(mock_claude_log)
     assert len(events) == 1
     assert events[0].session_id == "test-session"
-    assert events[0].agent_id == "nas-claude"
+    assert events[0].agent_id == "claude-code"
     assert events[0].token_usage["input_tokens"] == 10
     assert len(events[0].tool_calls) == 1
     assert events[0].tool_calls[0].tool_name == "bash"
@@ -109,7 +109,9 @@ def test_parse_claude_preserves_cwd_in_raw_data(tmp_path):
         assert event.raw_data.get(key) == event_in[key]
 
 
-def test_parse_claude_populates_missing_cwd_from_project_directory(tmp_path: Path):
+def test_parse_claude_populates_missing_cwd_from_project_directory(
+    tmp_path: Path, monkeypatch
+):
     """Claude Code project files encode cwd in the parent directory name.
 
     Some producer-side rows such as ai-title/permission-mode/queue-operation do
@@ -117,7 +119,15 @@ def test_parse_claude_populates_missing_cwd_from_project_directory(tmp_path: Pat
     a project. The parser should recover that cwd from the project directory so
     downstream attribution does not report these as missing producer metadata.
     """
-    project_dir = tmp_path / "-Users-arnabmac-jenny-nexus"
+    monkeypatch.setenv(
+        "DROVER_CLAUDE_CWD_MAP",
+        '{"-srv-projects-example": "/srv/projects/example"}',
+    )
+    monkeypatch.setenv(
+        "DROVER_REPO_ROOTS_JSON",
+        '{"/srv/projects/example": "acme/example"}',
+    )
+    project_dir = tmp_path / "-srv-projects-example"
     project_dir.mkdir()
     f = project_dir / "session.jsonl"
     event_types = ["ai-title", "permission-mode", "queue-operation", "file-history"]
@@ -135,14 +145,14 @@ def test_parse_claude_populates_missing_cwd_from_project_directory(tmp_path: Pat
         )
     )
 
-    events = parse_claude_audit_log(str(f), agent_id="macmini-claude")
+    events = parse_claude_audit_log(str(f), agent_id="laptop-claude")
 
     assert len(events) == len(event_types)
     for event in events:
         raw = event.raw_data
-        assert raw["cwd"] == "/Users/arnabmac/jenny/nexus"
-        assert raw["_repo_owner"] == "arniesaha"
-        assert raw["_repo_name"] == "nexus"
+        assert raw["cwd"] == "/srv/projects/example"
+        assert raw["_repo_owner"] == "acme"
+        assert raw["_repo_name"] == "example"
 
 
 def test_parse_claude_does_not_override_explicit_cwd_with_project_directory(
@@ -171,16 +181,19 @@ def test_parse_claude_does_not_override_explicit_cwd_with_project_directory(
 
 
 def test_parse_claude_home_and_observer_project_dirs_stay_general_context(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ):
+    monkeypatch.setenv(
+        "DROVER_CLAUDE_CWD_MAP",
+        '{"-srv-operator": "/srv/operator", "-srv-operator--agent-memory": "/srv/operator/.agent-memory"}',
+    )
+    monkeypatch.setenv(
+        "DROVER_GENERAL_WORKSPACE_ROOTS",
+        "/srv/operator:/srv/operator/.agent-memory",
+    )
     for dirname, expected_cwd in {
-        "-Users-arnabmac": "/Users/arnabmac",
-        # Live Claude Code project directories encode the leading dot in
-        # `.claude-mem` as a double hyphen. Keep this exact so observer-memory
-        # traffic remains general context instead of becoming a malformed path.
-        "-Users-arnabmac--claude-mem-observer-sessions": "/Users/arnabmac/.claude-mem/observer-sessions",
-        # Historical compatibility spelling retained by the decoder.
-        "-Users-arnabmac-.claude-mem-observer-sessions": "/Users/arnabmac/.claude-mem/observer-sessions",
+        "-srv-operator": "/srv/operator",
+        "-srv-operator--agent-memory": "/srv/operator/.agent-memory",
     }.items():
         project_dir = tmp_path / dirname
         project_dir.mkdir()
@@ -205,18 +218,21 @@ def test_parse_claude_home_and_observer_project_dirs_stay_general_context(
         assert raw["_nexus_activity_type"] == "general_workspace"
 
 
-def test_parse_claude_decodes_live_hyphenated_project_directories(tmp_path: Path):
+def test_parse_claude_decodes_configured_hyphenated_project_directories(
+    tmp_path: Path, monkeypatch
+):
     """Known live project-dir names include hyphenated repo segments.
 
     A generic hyphen-to-slash decode would turn `agent-max` into `agent/max`;
     known prefixes preserve the actual cwd so the existing git/known-root
     enrichment can attribute project sessions correctly.
     """
+    monkeypatch.setenv(
+        "DROVER_CLAUDE_CWD_MAP",
+        '{"-srv-projects-agent-tools": "/srv/projects/agent-tools"}',
+    )
     for dirname, expected_cwd in {
-        "-Users-arnabmac-max-projects-agent-max": "/Users/arnabmac/max/projects/agent-max",
-        "-Users-arnabmac-max-projects-agentweave": "/Users/arnabmac/max/projects/agentweave",
-        "-Users-arnabmac-max-projects-NixClaw": "/Users/arnabmac/max/projects/NixClaw",
-        "-Users-arnabmac-projects-pi-mono-agent": "/Users/arnabmac/projects/pi-mono-agent",
+        "-srv-projects-agent-tools": "/srv/projects/agent-tools",
     }.items():
         project_dir = tmp_path / dirname
         project_dir.mkdir()
@@ -250,7 +266,7 @@ def test_parse_openclaw(mock_openclaw_log):
     events = parse_openclaw_sessions(mock_openclaw_log)
     assert len(events) == 1  # session event is skipped in current parser
     assert events[0].session_id == "claw-abc"
-    assert events[0].agent_id == "nas-openclaw"
+    assert events[0].agent_id == "openclaw"
     assert events[0].message.role == "user"
     assert events[0].message.content == "Run tests"
 
