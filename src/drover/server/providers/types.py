@@ -56,6 +56,8 @@ class ProviderAccountSnapshot:
     def __post_init__(self) -> None:
         if self.status not in {"ok", "usage_unavailable", "stale", "error"}:
             raise ValueError("status must be a supported provider status")
+        if self.observed_at is None:
+            raise ValueError("observed_at must be timezone-aware")
         _require_timezone_aware(self.observed_at, "observed_at")
         windows = tuple(self.windows)
         if not all(isinstance(window, ProviderUsageWindow) for window in windows):

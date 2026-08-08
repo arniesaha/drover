@@ -41,6 +41,22 @@ def test_provider_snapshot_rejects_naive_observation_time():
         )
 
 
+def test_provider_snapshot_rejects_missing_observation_time():
+    with pytest.raises(ValueError, match="observed_at"):
+        ProviderAccountSnapshot(
+            snapshot_id="snapshot-1",
+            dedup_key="dedup-1",
+            provider="codex",
+            account_label="Personal",
+            plan_label=None,
+            host_id="mac-mini",
+            status="ok",
+            observed_at=None,
+            windows=(),
+            source="codex-cli",
+        )
+
+
 def test_provider_snapshot_table_preserves_each_usage_window():
     observed_at = datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)
     snapshot = ProviderAccountSnapshot(
