@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
@@ -398,6 +400,43 @@ def test_harnessd_health_and_capabilities(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {
+        "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
+        "gemini": replace(DEFAULT_PRESETS["gemini"], enabled=True),
+    }
+    try:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _json_request(f"{base_url}/providers/usage")
+        assert error.value.code == 401
+
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    assert {account["provider"] for account in body["accounts"]} == {
+        "anthropic",
+        "google",
+    }
+    assert {account["usage_status"] for account in body["accounts"]} == {
+        "usage_unavailable"
+    }
+    assert {account["status"] for account in body["accounts"]} == {"usage_unavailable"}
+    assert all(account["windows"] == [] for account in body["accounts"])
+    assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
 
 
 def test_harnessd_auth_status_route(tmp_path):

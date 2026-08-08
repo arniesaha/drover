@@ -7,6 +7,7 @@ import base64
 import binascii
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import hashlib
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,9 @@ from drover.server.harness.auth import (
     executable_path_prefix,
     resolve_executable,
 )
+from drover.server.providers.codex import CodexUsageProbe
+from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
+from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
@@ -1234,6 +1238,7 @@ class HarnessDaemonState:
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
+    provider_usage_probe: CodexUsageProbe = field(default_factory=CodexUsageProbe)
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -1291,6 +1296,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/capabilities":
             self._write_json(self.server.state.capabilities())
+            return
+        if parsed.path == "/providers/usage":
+            self._provider_usage()
             return
         if parsed.path == "/native-sessions":
             self._list_native_sessions(parsed.query)
@@ -1422,6 +1430,21 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         snapshot["host_id"] = self.server.state.host_id
         self._write_json(snapshot)
+
+    def _provider_usage(self) -> None:
+        observed_at = datetime.now(timezone.utc)
+        accounts: list[dict[str, Any]] = []
+        for detected in detect_provider_accounts(self.server.state.capabilities()):
+            if detected.provider == "openai":
+                snapshot = self.server.state.provider_usage_probe.read(
+                    host_id=self.server.state.host_id
+                )
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+                continue
+            if detected.provider == "anthropic":
+                detected = _with_claude_plan_label(detected, self.server.state.auth)
+            accounts.append(_unavailable_provider_json(detected, observed_at))
+        self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -2525,6 +2548,91 @@ def reconcile_structured_sessions(state: HarnessDaemonState) -> None:
             )
         except Exception:
             continue
+
+
+def _with_claude_plan_label(
+    detected: DetectedProvider, auth: AuthFlowManager
+) -> DetectedProvider:
+    try:
+        status = auth.status("claude-code")
+    except (KeyError, RuntimeError):
+        return detected
+    plan_label = (
+        status.get("detail") if status.get("state") == "authenticated" else None
+    )
+    return replace(
+        detected,
+        plan_label=plan_label if isinstance(plan_label, str) and plan_label else None,
+    )
+
+
+def _detected_provider_json(detected: DetectedProvider) -> dict[str, Any]:
+    return {
+        "provider": detected.provider,
+        "account_label": detected.account_label,
+        "host_id": detected.host_id,
+        "harnesses": list(detected.harnesses),
+        "plan_label": detected.plan_label,
+        "usage_status": detected.usage_status,
+    }
+
+
+def _unavailable_provider_json(
+    detected: DetectedProvider, observed_at: datetime
+) -> dict[str, Any]:
+    payload = _detected_provider_json(detected)
+    fingerprint = json.dumps(
+        {
+            "provider": detected.provider,
+            "account_label": detected.account_label,
+            "host_id": detected.host_id,
+            "plan_label": detected.plan_label,
+            "status": "usage_unavailable",
+            "source": "harness-inventory",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        **payload,
+        "snapshot_id": str(uuid4()),
+        "dedup_key": hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
+        "status": "usage_unavailable",
+        "observed_at": observed_at.isoformat(),
+        "source": "harness-inventory",
+        "error_category": None,
+        "windows": [],
+    }
+
+
+def _provider_snapshot_json(
+    snapshot: ProviderAccountSnapshot, detected: DetectedProvider
+) -> dict[str, Any]:
+    return {
+        **_detected_provider_json(detected),
+        "account_label": snapshot.account_label,
+        "plan_label": snapshot.plan_label,
+        "status": snapshot.status,
+        "snapshot_id": snapshot.snapshot_id,
+        "dedup_key": snapshot.dedup_key,
+        "observed_at": snapshot.observed_at.isoformat(),
+        "source": snapshot.source,
+        "error_category": snapshot.error_category,
+        "windows": [_provider_window_json(window) for window in snapshot.windows],
+    }
+
+
+def _provider_window_json(window: ProviderUsageWindow) -> dict[str, Any]:
+    return {
+        "kind": window.kind,
+        "used_percent": window.used_percent,
+        "limit_value": window.limit_value,
+        "remaining_value": window.remaining_value,
+        "unit": window.unit,
+        "window_minutes": window.window_minutes,
+        "starts_at": window.starts_at.isoformat() if window.starts_at else None,
+        "resets_at": window.resets_at.isoformat() if window.resets_at else None,
+    }
 
 
 def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
