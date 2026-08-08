@@ -320,9 +320,7 @@ class HarnessRegistry:
                 [awaiting, stamp, session_id],
             )
 
-    def update_session_native_id(
-        self, session_id: str, native_session_id: str
-    ) -> None:
+    def update_session_native_id(self, session_id: str, native_session_id: str) -> None:
         native_session_id = native_session_id.strip()
         if not native_session_id:
             return

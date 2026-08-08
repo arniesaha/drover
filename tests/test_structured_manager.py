@@ -223,10 +223,12 @@ def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_
 
     assert [text for text, _turn_id in driver.sent_turns] == ["first", "second"]
     assert second_turn != first_turn
-    assert sum(
-        event.event_type == "user_input"
-        for event in registry.list_events("sess-1")
-    ) == 2
+    assert (
+        sum(
+            event.event_type == "user_input" for event in registry.list_events("sess-1")
+        )
+        == 2
+    )
 
 
 def test_manager_does_not_duplicate_per_turn_driver_inflight_state(

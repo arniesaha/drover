@@ -5,7 +5,6 @@ from typing import Any
 
 import yaml
 
-
 WORKFLOWS_DIR = Path(__file__).parents[1] / ".github" / "workflows"
 TRUSTED_RUNNER = ["self-hosted", "macOS", "ARM64", "drover-ci"]
 
