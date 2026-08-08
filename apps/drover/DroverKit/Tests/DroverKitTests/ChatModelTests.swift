@@ -289,6 +289,52 @@ struct ChatModelTests {
     #expect(sentThinking == "xhigh")
 }
 
+@Test @MainActor func sendTurnOmitsLockedClaudePreferences() async throws {
+    nonisolated(unsafe) var sentModel = false
+    nonisolated(unsafe) var sentThinking = false
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentModel = body.keys.contains("model")
+        sentThinking = body.keys.contains("thinking_effort")
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "claude-code")
+    model.composerText = "hi"
+    model.selectedModel = "opus"
+    model.thinkingEffort = "high"
+
+    await model.sendTurn()
+
+    #expect(sentModel == false)
+    #expect(sentThinking == false)
+}
+
+@Test @MainActor func queuedTurnOmitsLockedClaudePreferences() async throws {
+    nonisolated(unsafe) var preferenceKeys: [[String]] = []
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        preferenceKeys.append(body.keys.filter { $0 == "model" || $0 == "thinking_effort" })
+        if preferenceKeys.count == 1 {
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        }
+        return (202, Data(#"{"turn_id": "t2"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "claude-code")
+    model.composerText = "queued"
+    model.selectedModel = "opus"
+    model.thinkingEffort = "high"
+    await model.sendTurn()
+
+    model.ingest(.message(.fixture(
+        seq: 9,
+        type: .status,
+        payload: ["turn_complete": .bool(true), "awaiting": .string("input")]
+    )))
+    try await waitUntil { preferenceKeys.count == 2 }
+
+    #expect(preferenceKeys == [[], []])
+}
+
 @Test @MainActor func imageOnlyTurnSends() async throws {
     nonisolated(unsafe) var sentTexts: [String] = []
     MockURLProtocol.handler = { request in

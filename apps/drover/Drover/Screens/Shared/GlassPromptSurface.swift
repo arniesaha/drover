@@ -9,6 +9,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     @Binding var thinkingEffort: String
 
     let harness: String
+    let arePreferencesEditable: Bool
     let placeholder: String
     let sendSystemImage: String
     let isSending: Bool
@@ -26,6 +27,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         selectedModel: Binding<String>,
         thinkingEffort: Binding<String>,
         harness: String,
+        arePreferencesEditable: Bool = true,
         placeholder: String,
         sendSystemImage: String = "arrow.up",
         isSending: Bool = false,
@@ -40,6 +42,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         _selectedModel = selectedModel
         _thinkingEffort = thinkingEffort
         self.harness = harness
+        self.arePreferencesEditable = arePreferencesEditable
         self.placeholder = placeholder
         self.sendSystemImage = sendSystemImage
         self.isSending = isSending
@@ -82,6 +85,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
 
                 HarnessPreferenceControls(
                     harness: harness,
+                    isEditable: arePreferencesEditable,
                     selectedModel: $selectedModel,
                     thinkingEffort: $thinkingEffort
                 )
