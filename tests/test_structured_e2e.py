@@ -282,11 +282,11 @@ def test_two_concurrent_structured_sessions_do_not_corrupt_registry(tmp_path):
             assert events[0].event_type == "user_input"
             assert events[-1].event_type == "status"
 
-        # Both sessions' pump threads stayed alive and reachable throughout --
-        # a DuckDB write-write conflict killing a pump thread mid-loop would
-        # have left a session short of 23 events, or stuck never reaching
-        # "input". (This does happen intermittently -- see the task report.)
-        assert all(state.structured.has(sid) for sid in session_ids)
+        # Both sessions' pump threads reached their process-exit events without
+        # registry corruption. Completed process drivers are deliberately
+        # removed from the live manager so later recovery cannot mistake a
+        # dead entry for an idempotently recovered session.
+        assert all(not state.structured.has(sid) for sid in session_ids)
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()

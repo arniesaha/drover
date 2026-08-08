@@ -53,11 +53,18 @@ def default_command(binary: str | None = None) -> list[str]:
 class CodexDriver:
     """Owns one `codex exec` subprocess per turn; no persistent process."""
 
-    def __init__(self, command: list[str], cwd: str | None, emit: EmitFn) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        cwd: str | None,
+        emit: EmitFn,
+        *,
+        native_session_id: str | None = None,
+    ) -> None:
         self.command = command
         self.cwd = cwd
         self.emit = emit
-        self._thread_id: str | None = None
+        self._thread_id = native_session_id
         # _turn_lock guards _turn_active/_turn_process/_turn_thread. A turn
         # is "in flight" from send_turn setting _turn_active (under the
         # lock) until the worker's finally clears it -- never inferred from
