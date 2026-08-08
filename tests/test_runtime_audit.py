@@ -415,7 +415,8 @@ def test_runtime_audit_groups_pending_incoming_by_source_without_db_writes(
     assert "nas-claude" in rendered
     assert "count=2" in rendered
     assert "oldest_age=3h" in rendered
-    assert "Mac watcher bottleneck" in rendered
+    assert "destination watcher bottleneck" in rendered
+    assert "Mac watcher bottleneck" not in rendered
 
 
 def test_runtime_audit_separates_stale_running_span_jobs_and_bounds_coverage(
