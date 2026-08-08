@@ -253,5 +253,4 @@ final class E2EValidationUITests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
     }
-
 }
