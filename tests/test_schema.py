@@ -22,8 +22,31 @@ def tmp_lakehouse(tmp_path):
 def test_bootstrap_creates_parquet_dirs(tmp_lakehouse):
     parquet_dir, db_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
-    for sub in ["agent_events", "spans", "pr_events", "routing"]:
+    for sub in [
+        "agent_events",
+        "spans",
+        "pr_events",
+        "routing",
+        "provider_usage_snapshots",
+    ]:
         assert (parquet_dir / sub).is_dir(), f"missing {sub} dir"
+
+
+def test_bootstrap_creates_provider_storage(tmp_lakehouse):
+    parquet_dir, db_path = tmp_lakehouse
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
+
+    assert (parquet_dir / "provider_usage_snapshots").is_dir()
+    con = duckdb.connect(str(db_path))
+    try:
+        assert con.execute(
+            "SELECT count(*) FROM provider_usage_snapshots"
+        ).fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM provider_connections").fetchone() == (
+            0,
+        )
+    finally:
+        con.close()
 
 
 def test_bootstrap_creates_expected_tables(tmp_lakehouse):

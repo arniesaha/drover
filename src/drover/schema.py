@@ -23,7 +23,13 @@ from drover.agent_aliases import canonicalize_sql
 from drover.event_identity import canonical_agent_events_cte
 from drover.server.harness.schema import HARNESS_TABLES, bootstrap_harness_tables
 
-PARQUET_SUBDIRS = ("agent_events", "spans", "pr_events", "routing")
+PARQUET_SUBDIRS = (
+    "agent_events",
+    "spans",
+    "pr_events",
+    "routing",
+    "provider_usage_snapshots",
+)
 
 EXPECTED_TABLES = (
     "tasks",
@@ -44,6 +50,7 @@ EXPECTED_TABLES = (
     "pipeline_jobs",
     "pipeline_job_attempts",
     "pipeline_artifacts",
+    "provider_connections",
     *HARNESS_TABLES,
 )
 EXPECTED_VIEWS = (
@@ -54,6 +61,7 @@ EXPECTED_VIEWS = (
     "openclaw_span_links",
     "pr_events",
     "routing",
+    "provider_usage_snapshots",
     "sessions",
     "active_sessions",
 )
@@ -418,6 +426,26 @@ CREATE TABLE IF NOT EXISTS pipeline_artifacts (
   is_current        BOOLEAN DEFAULT TRUE,
   created_at        TIMESTAMPTZ DEFAULT now(),
   metadata_json     VARCHAR
+);
+"""
+
+_PROVIDER_CONNECTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS provider_connections (
+  provider                     VARCHAR NOT NULL,
+  account_label                VARCHAR NOT NULL,
+  host_id                      VARCHAR NOT NULL,
+  enabled                      BOOLEAN NOT NULL DEFAULT TRUE,
+  supports_usage               BOOLEAN NOT NULL DEFAULT FALSE,
+  supports_limits              BOOLEAN NOT NULL DEFAULT FALSE,
+  supports_account_discovery   BOOLEAN NOT NULL DEFAULT FALSE,
+  supports_refresh             BOOLEAN NOT NULL DEFAULT FALSE,
+  capabilities_json            VARCHAR,
+  last_attempt_at              TIMESTAMPTZ,
+  last_success_at              TIMESTAMPTZ,
+  error_category               VARCHAR,
+  credential_reference         VARCHAR,
+  updated_at                   TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (provider, account_label, host_id)
 );
 """
 
@@ -852,6 +880,16 @@ def _routing_view(parquet_dir: Path) -> str:
 CREATE OR REPLACE VIEW routing AS
 SELECT * FROM read_parquet(
   '{parquet_dir}/routing/**/*.parquet',
+  union_by_name=true
+);
+"""
+
+
+def _provider_usage_snapshots_view(parquet_dir: Path) -> str:
+    return f"""
+CREATE OR REPLACE VIEW provider_usage_snapshots AS
+SELECT * FROM read_parquet(
+  '{parquet_dir}/provider_usage_snapshots/**/*.parquet',
   union_by_name=true
 );
 """
@@ -1366,6 +1404,18 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
         if not seed_file.exists():
             pq.write_table(flat_empty, seed_file)
 
+    # Provider usage snapshots are flattened to one row per reported window.
+    # A typed seed lets a fresh lakehouse expose the view before the first
+    # provider refresh writes an observation.
+    from drover.server.providers.types import provider_snapshot_schema
+
+    provider_seed_dir = parquet_dir / "provider_usage_snapshots" / "_seed"
+    provider_seed_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist([], schema=provider_snapshot_schema()),
+        provider_seed_dir / "empty.parquet",
+    )
+
 
 def _ensure_table_columns(
     con: duckdb.DuckDBPyConnection, table: str, columns: dict[str, str]
@@ -1414,6 +1464,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_JOBS_DDL)
         con.execute(_PIPELINE_JOB_ATTEMPTS_DDL)
         con.execute(_PIPELINE_ARTIFACTS_DDL)
+        con.execute(_PROVIDER_CONNECTIONS_DDL)
         bootstrap_harness_tables(con)
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))
@@ -1422,6 +1473,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
         con.execute(_pr_events_view(parquet_dir))
         con.execute(_routing_view(parquet_dir))
+        con.execute(_provider_usage_snapshots_view(parquet_dir))
         con.execute(_SESSIONS_VIEW)
         con.execute(_ACTIVE_SESSIONS_VIEW)
     finally:
