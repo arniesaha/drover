@@ -89,7 +89,8 @@ def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
 
     driver_holder: dict[str, _StubDriver] = {}
 
-    def build(command, cwd, emit):
+    def build(command, cwd, emit, native_session_id=None):
+        del native_session_id
         driver = _StubDriver(command, cwd, emit)
         driver_holder["driver"] = driver
         return driver
@@ -278,6 +279,45 @@ def test_driver_event_persists_native_session_id(monkeypatch, tmp_path):
     assert session is not None
     assert session.native_session_id == "provider-thread-1"
     assert [event.seq for event in registry.list_events("sess-1")] == [1]
+
+
+def test_start_passes_native_session_id_to_driver_factory(monkeypatch, tmp_path):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.create_session(
+        host_id="test-host",
+        harness="stub-resume",
+        command="stub",
+        session_id="sess-resume",
+        status="errored",
+        mode="structured",
+    )
+    captured: dict[str, str | None] = {}
+
+    def build(command, cwd, emit, native_session_id=None):
+        captured["native_session_id"] = native_session_id
+        return _StubDriver(command, cwd, emit)
+
+    monkeypatch.setitem(
+        manager_module._FACTORIES,
+        "stub-resume",
+        (build, lambda: ["stub"]),
+    )
+    manager = StructuredSessionManager()
+
+    manager.start(
+        "sess-resume",
+        harness="stub-resume",
+        cwd=None,
+        command=None,
+        registry=registry,
+        on_message=lambda _sid, _event: None,
+        finalize=lambda _sid, _returncode: None,
+        native_session_id="provider-thread-1",
+    )
+
+    assert captured == {"native_session_id": "provider-thread-1"}
 
 
 def test_seq_is_monotonic_across_emitted_messages(monkeypatch, tmp_path):

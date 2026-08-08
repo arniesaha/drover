@@ -90,6 +90,17 @@ def test_default_command_falls_back_to_which(monkeypatch):
     assert default_command(None) == ["codex"]
 
 
+def test_restored_driver_resumes_native_thread_on_first_turn():
+    driver = CodexDriver(
+        ["codex"], None, lambda _message: None, native_session_id="thread-1"
+    )
+
+    argv = driver._argv_for("continue the task")
+
+    assert argv[1:4] == ["exec", "resume", "thread-1"]
+    assert argv[-1] == "continue the task"
+
+
 # -- parse_line, literal lines from FINDINGS.md / the golden fixtures -------
 
 

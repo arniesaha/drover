@@ -29,17 +29,24 @@ from drover.server.harness.structured.driver import StructuredMessage
 # spawned CLI); Codex/Gemini's constructors take no env kwarg at all.
 _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
     "claude-code": (
-        lambda command, cwd, emit: claude.ClaudeDriver(
-            command, cwd, emit, env=claude.child_env()
+        lambda command, cwd, emit, native_session_id: claude.ClaudeDriver(
+            claude.resume_command(command, native_session_id),
+            cwd,
+            emit,
+            env=claude.child_env(),
         ),
         claude.default_command,
     ),
     "codex": (
-        lambda command, cwd, emit: codex.CodexDriver(command, cwd, emit),
+        lambda command, cwd, emit, native_session_id: codex.CodexDriver(
+            command, cwd, emit, native_session_id=native_session_id
+        ),
         codex.default_command,
     ),
     "gemini": (
-        lambda command, cwd, emit: gemini.GeminiDriver(command, cwd, emit),
+        lambda command, cwd, emit, _native_session_id: gemini.GeminiDriver(
+            command, cwd, emit
+        ),
         gemini.default_command,
     ),
 }
@@ -89,6 +96,7 @@ class StructuredSessionManager:
         registry: HarnessRegistry,
         on_message: Callable[[str, dict[str, Any]], None],
         finalize: Callable[[str, int], None],
+        native_session_id: str | None = None,
     ) -> None:
         if harness not in _FACTORIES:
             raise ValueError(f"harness has no structured driver: {harness}")
@@ -190,7 +198,9 @@ class StructuredSessionManager:
             ):
                 finalize(session_id, int(payload["exited"]))
 
-        entry.driver = builder(command or default_command(), cwd, emit)
+        entry.driver = builder(
+            command or default_command(), cwd, emit, native_session_id
+        )
         with self._entries_lock:
             self._entries[session_id] = entry
         entry.driver.start()
