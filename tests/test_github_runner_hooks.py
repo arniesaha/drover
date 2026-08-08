@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,15 @@ assert SPEC is not None and SPEC.loader is not None
 PRE_JOB = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = PRE_JOB
 SPEC.loader.exec_module(PRE_JOB)
+
+POST_JOB_PATH = Path(__file__).parents[1] / "scripts/github_runner/post_job_cleanup.py"
+POST_JOB_SPEC = importlib.util.spec_from_file_location(
+    "post_job_cleanup", POST_JOB_PATH
+)
+assert POST_JOB_SPEC is not None and POST_JOB_SPEC.loader is not None
+POST_JOB = importlib.util.module_from_spec(POST_JOB_SPEC)
+sys.modules[POST_JOB_SPEC.name] = POST_JOB
+POST_JOB_SPEC.loader.exec_module(POST_JOB)
 
 
 def push_payload() -> dict[str, object]:
@@ -136,3 +146,78 @@ def test_pre_job_cli_rejects_malformed_json(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "json" in result.stderr.lower()
     assert "arniesaha" not in result.stderr
+
+
+def runner_cleanup_layout(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    work_root = tmp_path / "runner"
+    workspace = work_root / "_work" / "drover" / "drover"
+    temp_dir = work_root / "_work" / "_temp"
+    unrelated = work_root / "_work" / "drover" / "unrelated"
+    workspace.mkdir(parents=True)
+    temp_dir.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    (workspace / "checkout.txt").write_text("remove")
+    (temp_dir / "temp.txt").write_text("remove")
+    (unrelated / "keep.txt").write_text("keep")
+    return work_root, workspace, temp_dir, unrelated
+
+
+def cleanup_environment(
+    work_root: Path, workspace: Path, temp_dir: Path
+) -> dict[str, str]:
+    return {
+        "DROVER_RUNNER_WORK_ROOT": str(work_root),
+        "GITHUB_WORKSPACE": str(workspace),
+        "RUNNER_TEMP": str(temp_dir),
+    }
+
+
+def test_cleanup_job_removes_only_validated_targets(tmp_path: Path) -> None:
+    work_root, workspace, temp_dir, unrelated = runner_cleanup_layout(tmp_path)
+
+    removed = POST_JOB.cleanup_job(cleanup_environment(work_root, workspace, temp_dir))
+
+    assert removed == (workspace.resolve(), temp_dir.resolve())
+    assert not workspace.exists()
+    assert not temp_dir.exists()
+    assert (unrelated / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.parametrize(
+    "unsafe_target",
+    [
+        "empty-root",
+        "filesystem-root",
+        "home-directory",
+        "workspace-equal-root",
+        "workspace-outside-root",
+        "workspace-name",
+        "temp-name",
+    ],
+)
+def test_cleanup_job_rejects_unsafe_targets(tmp_path: Path, unsafe_target: str) -> None:
+    work_root, workspace, temp_dir, _ = runner_cleanup_layout(tmp_path)
+    environ = cleanup_environment(work_root, workspace, temp_dir)
+
+    if unsafe_target == "empty-root":
+        environ["DROVER_RUNNER_WORK_ROOT"] = ""
+    elif unsafe_target == "filesystem-root":
+        environ["DROVER_RUNNER_WORK_ROOT"] = os.sep
+    elif unsafe_target == "home-directory":
+        environ["DROVER_RUNNER_WORK_ROOT"] = str(Path.home())
+    elif unsafe_target == "workspace-equal-root":
+        environ["GITHUB_WORKSPACE"] = str(work_root)
+    elif unsafe_target == "workspace-outside-root":
+        environ["GITHUB_WORKSPACE"] = str(tmp_path / "outside" / "drover")
+    elif unsafe_target == "workspace-name":
+        environ["GITHUB_WORKSPACE"] = str(work_root / "_work" / "drover" / "checkout")
+    elif unsafe_target == "temp-name":
+        environ["RUNNER_TEMP"] = str(work_root / "_work" / "temp")
+    else:  # pragma: no cover - protects the parameterized test itself
+        raise AssertionError(f"unknown unsafe target: {unsafe_target}")
+
+    with pytest.raises(POST_JOB.CleanupError):
+        POST_JOB.cleanup_job(environ)
+
+    assert workspace.exists()
+    assert temp_dir.exists()
