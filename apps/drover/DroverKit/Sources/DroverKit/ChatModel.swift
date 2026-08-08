@@ -42,7 +42,7 @@ public final class ChatModel {
     /// Derived transcript state, cached against `messagesVersion`.
     ///
     /// These used to be plain computed properties, which meant a full O(n)
-    /// pass *per read*: the view body reads `items`, `latestRowID`,
+    /// pass *per read*: the view body reads `items`, the visual tail,
     /// `artifacts` (twice) and `contextGauge`, so one render walked a
     /// 3,000-message transcript five times. Sessions here really do reach
     /// 3,316 messages, and the body re-runs on every scroll phase change.
@@ -71,9 +71,9 @@ public final class ChatModel {
         return folded
     }
 
-    /// The row the newest message actually rendered into — what auto-scroll
-    /// must target, since a message can fold into a run that sits earlier
-    /// than later arrivals.
+    /// The row updated by the newest raw message. This may sit earlier than
+    /// the visual tail when a tool result attaches to a prior step, so pinned
+    /// scrolling must use `visualTailRowID` instead.
     public var latestRowID: String? {
         if let rowIDCache, rowIDCache.version == messagesVersion { return rowIDCache.id }
         let id = TranscriptItem.latestRowID(of: messages)

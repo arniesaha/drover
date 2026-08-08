@@ -81,9 +81,9 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         fold(messages).items
     }
 
-    /// ID of the row the newest message renders in. This is what auto-scroll
-    /// must target; scrolling to `messages.last!.id` would miss when that id
-    /// is folded into a run or a step.
+    /// ID of the row the newest raw message updates. Scrolling to
+    /// `messages.last!.id` would miss when that id is folded into a run or a
+    /// step, but pinned bottom scrolling must use the final grouped item's ID.
     ///
     /// Deliberately *not* `group(messages).last?.id`: a `.step` row updates
     /// in place at its original index when its result arrives (so the row
