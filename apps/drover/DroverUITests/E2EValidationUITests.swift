@@ -193,6 +193,57 @@ final class E2EValidationUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 3)
     }
 
+    /// Diagnostic reproduction against an explicitly selected long session.
+    /// This does not create or terminate a session; it records transcript
+    /// visibility before/after the composer collapses on send, then after a
+    /// back-and-reopen navigation cycle.
+    @MainActor
+    func testExistingLongChatDoesNotBlankAcrossSendAndReopen() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
+            throw XCTSkip("DROVER_SMOKE_TOKEN not set — live diagnostic skipped")
+        }
+        let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
+        guard let sessionID = env["DROVER_SMOKE_SESSION_ID"], !sessionID.isEmpty else {
+            throw XCTSkip("DROVER_SMOKE_SESSION_ID not set — live diagnostic skipped")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_BASE_URL"] = serverURL
+        app.launchEnvironment["DROVER_TOKEN"] = token
+        app.launch()
+
+        let row = app.buttons[sessionID]
+        XCTAssertTrue(row.waitForExistence(timeout: 30), "target session should be listed")
+        row.tap()
+        XCTAssertTrue(app.buttons["composer-send"].waitForExistence(timeout: 30))
+        XCTAssertTrue(app.buttons["session-events-row"].firstMatch.waitForExistence(timeout: 30),
+                      "the structured transcript should render a folded status row")
+        shoot(app, "reset-01-loaded")
+
+        var composer = app.textFields["Add feedback..."]
+        if !composer.waitForExistence(timeout: 3) {
+            composer = app.textViews["Add feedback..."]
+            XCTAssertTrue(composer.waitForExistence(timeout: 3))
+        }
+        composer.tap()
+        composer.typeText("Viewport stability diagnostic. Reply with exactly: STABLE")
+        app.buttons["composer-send"].tap()
+
+        for (index, delay) in [0.05, 0.15, 0.4, 1.0].enumerated() {
+            Thread.sleep(forTimeInterval: delay)
+            shoot(app, "reset-02-after-send-\(index)")
+        }
+
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(row.waitForExistence(timeout: 15))
+        row.tap()
+        XCTAssertTrue(app.buttons["composer-send"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.buttons["session-events-row"].firstMatch.waitForExistence(timeout: 30),
+                      "reopening should render the structured transcript")
+        shoot(app, "reset-03-reopened")
+    }
+
     // MARK: - Helpers
 
     @MainActor

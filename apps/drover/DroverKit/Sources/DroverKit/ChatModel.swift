@@ -20,6 +20,8 @@ public final class ChatModel {
     /// suppress its "reconnecting" indicator during the initial connect
     /// (when there is nothing to *re*-connect to yet).
     public private(set) var hasConnectedOnce = false
+    public private(set) var hasOlderHistory = false
+    public private(set) var isLoadingOlderHistory = false
     /// True while an `approve(_:)` network call is in flight; the UI should
     /// disable the Approve/Deny controls to prevent double-submission.
     public private(set) var isAnswering = false
@@ -40,7 +42,7 @@ public final class ChatModel {
     /// Derived transcript state, cached against `messagesVersion`.
     ///
     /// These used to be plain computed properties, which meant a full O(n)
-    /// pass *per read*: the view body reads `items`, `latestRowID`,
+    /// pass *per read*: the view body reads `items`, the visual tail,
     /// `artifacts` (twice) and `contextGauge`, so one render walked a
     /// 3,000-message transcript five times. Sessions here really do reach
     /// 3,316 messages, and the body re-runs on every scroll phase change.
@@ -69,14 +71,21 @@ public final class ChatModel {
         return folded
     }
 
-    /// The row the newest message actually rendered into — what auto-scroll
-    /// must target, since a message can fold into a run that sits earlier
-    /// than later arrivals.
+    /// The row updated by the newest raw message. This may sit earlier than
+    /// the visual tail when a tool result attaches to a prior step, so pinned
+    /// scrolling must use `visualTailRowID` instead.
     public var latestRowID: String? {
         if let rowIDCache, rowIDCache.version == messagesVersion { return rowIDCache.id }
         let id = TranscriptItem.latestRowID(of: messages)
         rowIDCache = (messagesVersion, id)
         return id
+    }
+
+    /// The bottom-most row in visual transcript order. A newly-arrived raw
+    /// event can update an earlier folded row, so pinned scrolling must use
+    /// this rather than `latestRowID`.
+    public var visualTailRowID: String? {
+        items.last?.id
     }
 
     /// Live context pressure for the header gauge; nil when the harness
@@ -194,6 +203,9 @@ public final class ChatModel {
                 // (and hit belt one) while this loop is between events.
                 guard let self else { break }
                 self.ingest(event)
+                if case .history = event {
+                    self.hasOlderHistory = await stream.olderHistoryAvailable()
+                }
             }
         }
     }
@@ -207,6 +219,27 @@ public final class ChatModel {
         // events() pump and wedge the stream.)
         pumpTask?.cancel()
         pumpTask = nil
+    }
+
+    @discardableResult
+    public func loadOlderHistory() async -> Bool {
+        guard hasOlderHistory, !isLoadingOlderHistory else { return false }
+        isLoadingOlderHistory = true
+        defer { isLoadingOlderHistory = false }
+        do {
+            guard let page = try await stream.loadOlderHistory() else { return false }
+            mergeHistory(page.messages)
+            hasOlderHistory = page.hasOlder
+            if hint == "Could not load earlier messages — try again." {
+                hint = nil
+            }
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            hint = "Could not load earlier messages — try again."
+            return false
+        }
     }
 
     /// Reducer driving both the live pump above and the unit tests — funnels

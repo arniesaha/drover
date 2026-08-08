@@ -66,6 +66,11 @@ public enum StreamEvent: Sendable, Equatable {
     case unauthorized
 }
 
+public struct OlderHistoryPage: Sendable, Equatable {
+    public let messages: [HarnessMessage]
+    public let hasOlder: Bool
+}
+
 // MARK: - MessageStream
 
 /// Resumable message stream for a single harness session: replays REST
@@ -88,6 +93,11 @@ public actor MessageStream {
     private let reconnectBaseDelay: Duration
 
     private var lastSeq = 0
+    private var coldHistoryComplete = false
+    private var olderBeforeSeq: Int?
+    private var hasOlderHistory = false
+    private var isLoadingOlderHistory = false
+    private var coldSnapshotMaxSeq = 0
     private var pumpTask: Task<Void, Never>?
 
     public init(
@@ -122,6 +132,42 @@ public actor MessageStream {
     public func stop() {
         pumpTask?.cancel()
         pumpTask = nil
+    }
+
+    public func olderHistoryAvailable() -> Bool {
+        hasOlderHistory
+    }
+
+    /// Fetches exactly one page above the currently loaded tail. The cursor
+    /// advances only after a fully validated response, so a failed request is
+    /// safely retryable and never makes older history disappear.
+    public func loadOlderHistory() async throws -> OlderHistoryPage? {
+        guard coldHistoryComplete, hasOlderHistory,
+              let beforeSeq = olderBeforeSeq,
+              !isLoadingOlderHistory else { return nil }
+        isLoadingOlderHistory = true
+        defer { isLoadingOlderHistory = false }
+
+        let page = try await client.messagePage(
+            sessionID: sessionID,
+            request: .older(beforeSeq: beforeSeq, limit: Self.historyPageSize)
+        )
+        try Task.checkCancellation()
+        try validate(page: page)
+        guard page.maxSeq >= coldSnapshotMaxSeq,
+              let pageFirst = page.messages.first?.seq,
+              page.messages.last?.seq == beforeSeq - 1,
+              page.hasNewer else {
+            throw CatchUpError.sequenceGap
+        }
+
+        let visible = page.messages.filter { $0.seq > 0 }
+        guard page.hasOlder || visible.first?.seq == 1 else {
+            throw CatchUpError.sequenceGap
+        }
+        olderBeforeSeq = pageFirst
+        hasOlderHistory = page.hasOlder
+        return OlderHistoryPage(messages: visible, hasOlder: page.hasOlder)
     }
 
     // MARK: - Pump
@@ -197,6 +243,60 @@ public actor MessageStream {
     private func catchUp(
         continuation: AsyncStream<StreamEvent>.Continuation
     ) async throws -> Int {
+        if !coldHistoryComplete {
+            return try await coldCatchUp(continuation: continuation)
+        }
+        return try await forwardCatchUp(continuation: continuation)
+    }
+
+    /// A cold open publishes only the newest bounded page, then attaches the
+    /// live socket immediately. Older pages remain behind an explicit request
+    /// so opening a session never shifts the viewport with automatic prepends.
+    private func coldCatchUp(
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) async throws -> Int {
+        let newest = try await client.messagePage(
+            sessionID: sessionID,
+            request: .newest(limit: Self.historyPageSize)
+        )
+        try Task.checkCancellation()
+        try validate(page: newest)
+
+        let fixedMaxSeq = newest.maxSeq
+        guard fixedMaxSeq >= 0, !newest.hasNewer else {
+            throw CatchUpError.snapshotChanged
+        }
+        if newest.messages.isEmpty {
+            guard fixedMaxSeq == 0, !newest.hasOlder else {
+                throw CatchUpError.snapshotChanged
+            }
+            coldHistoryComplete = true
+            return fixedMaxSeq
+        }
+        guard newest.messages.last?.seq == fixedMaxSeq else {
+            throw CatchUpError.snapshotChanged
+        }
+
+        let newestVisible = newest.messages.filter { $0.seq > 0 }
+        guard newest.hasOlder || fixedMaxSeq == 0 || newestVisible.first?.seq == 1 else {
+            throw CatchUpError.sequenceGap
+        }
+        olderBeforeSeq = newest.messages.first?.seq
+        hasOlderHistory = newest.hasOlder
+        coldSnapshotMaxSeq = fixedMaxSeq
+        lastSeq = fixedMaxSeq
+        coldHistoryComplete = true
+        if !newestVisible.isEmpty {
+            continuation.yield(.history(newestVisible, decodeIssues: newest.decodeIssues))
+        }
+        return fixedMaxSeq
+    }
+
+    /// Reconnects retain the forward, fixed-bound path: only events newer
+    /// than the last delivered live sequence are eligible for replay.
+    private func forwardCatchUp(
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) async throws -> Int {
         var cursor = lastSeq
         var fixedMaxSeq: Int?
 
@@ -252,6 +352,22 @@ public actor MessageStream {
         }
 
         throw CancellationError()
+    }
+
+    private func validate(page: MessagePage) throws {
+        guard page.decodeIssues.isEmpty else {
+            throw CatchUpError.malformedPage
+        }
+        guard !page.messages.isEmpty else { return }
+        guard page.pageMinSeq == nil || page.pageMinSeq == page.messages.first?.seq,
+              page.pageMaxSeq == nil || page.pageMaxSeq == page.messages.last?.seq else {
+            throw CatchUpError.snapshotChanged
+        }
+        for (previous, next) in zip(page.messages, page.messages.dropFirst()) {
+            guard next.seq == previous.seq + 1 else {
+                throw CatchUpError.sequenceGap
+            }
+        }
     }
 
     /// Duplicate replay at or below `lastSeq` is harmless. A jump above the
