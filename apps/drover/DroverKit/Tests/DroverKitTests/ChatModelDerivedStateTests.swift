@@ -110,6 +110,38 @@ import Testing
         #expect(model.artifacts == model.artifacts)
     }
 
+    @Test func visualTailDoesNotMoveBackwardWhenAResultUpdatesAnEarlierStep() {
+        let model = ChatModel.fixture()
+        let action = HarnessMessage(
+            id: "action",
+            seq: 1,
+            type: .toolAction,
+            role: "assistant",
+            text: "Bash",
+            payload: ["tool_use_id": .string("tool-1")]
+        )
+        let status = HarnessMessage(id: "status", seq: 2, type: .status, text: "Working")
+        let result = HarnessMessage(
+            id: "result",
+            seq: 3,
+            type: .toolResult,
+            role: "tool",
+            text: "ok",
+            payload: ["tool_use_id": .string("tool-1")]
+        )
+
+        model.ingest(.message(action))
+        model.ingest(.message(status))
+        model.ingest(.message(result))
+
+        #expect(model.latestRowID == "action")
+        #expect(model.visualTailRowID == "status")
+
+        let answer = HarnessMessage(id: "answer", seq: 4, type: .assistantOutput, text: "Done")
+        model.ingest(.message(answer))
+        #expect(model.visualTailRowID == "answer")
+    }
+
     @Test func versionAdvancesOncePerMessage() {
         let model = ChatModel.fixture()
         let start = model.messagesVersion

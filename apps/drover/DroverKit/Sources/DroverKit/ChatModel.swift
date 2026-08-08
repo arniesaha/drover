@@ -81,6 +81,13 @@ public final class ChatModel {
         return id
     }
 
+    /// The bottom-most row in visual transcript order. A newly-arrived raw
+    /// event can update an earlier folded row, so pinned scrolling must use
+    /// this rather than `latestRowID`.
+    public var visualTailRowID: String? {
+        items.last?.id
+    }
+
     /// Live context pressure for the header gauge; nil when the harness
     /// reports no per-call usage.
     public var contextGauge: ContextGauge? {
