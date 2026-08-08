@@ -369,17 +369,14 @@ public final class ChatModel {
         guard !text.isEmpty || !images.isEmpty else { return }
         isSending = true
         defer { isSending = false }
-        let model = HarnessRunPreferences.optional(selectedModel)
-        let thinking = HarnessRunPreferences.supportsThinkingEffort(harnessPresentation.harness)
-            ? HarnessRunPreferences.optional(thinkingEffort)
-            : nil
+        let preferences = turnPreferences
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
                 text: text,
                 images: images,
-                model: model,
-                thinkingEffort: thinking
+                model: preferences.model,
+                thinkingEffort: preferences.thinking
             )
             composerText = ""
             pendingAttachments = []
@@ -417,17 +414,14 @@ public final class ChatModel {
     }
 
     private func sendQueued(_ text: String, images: [TurnAttachment]) async {
-        let model = HarnessRunPreferences.optional(selectedModel)
-        let thinking = HarnessRunPreferences.supportsThinkingEffort(harnessPresentation.harness)
-            ? HarnessRunPreferences.optional(thinkingEffort)
-            : nil
+        let preferences = turnPreferences
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
                 text: text,
                 images: images,
-                model: model,
-                thinkingEffort: thinking
+                model: preferences.model,
+                thinkingEffort: preferences.thinking
             )
             hint = nil
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
@@ -444,6 +438,18 @@ public final class ChatModel {
             pendingAttachments = images + pendingAttachments
             applyHint(for: error, action: "send")
         }
+    }
+
+    private var turnPreferences: (model: String?, thinking: String?) {
+        let harness = harnessPresentation.harness
+        guard HarnessRunPreferences.canChangeInExistingSession(harness) else {
+            return (nil, nil)
+        }
+        let model = HarnessRunPreferences.optional(selectedModel)
+        let thinking = HarnessRunPreferences.supportsThinkingEffort(harness)
+            ? HarnessRunPreferences.optional(thinkingEffort)
+            : nil
+        return (model, thinking)
     }
 
     public func approve(_ decision: String) async {
