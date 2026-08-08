@@ -243,10 +243,12 @@ class StructuredSessionManager:
         entry = self._require_entry(session_id)
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
-        with entry.turn_lock:
-            if entry.turn_active:
-                raise RuntimeError("turn already in flight")
-            entry.turn_active = True
+        guard_persistent_turn = entry.harness == "claude-code"
+        if guard_persistent_turn:
+            with entry.turn_lock:
+                if entry.turn_active:
+                    raise RuntimeError("turn already in flight")
+                entry.turn_active = True
         turn_id = f"turn-{uuid4()}"
         # Dispatch first: Codex/Gemini raise RuntimeError here ("turn
         # already in flight" / "driver is closed") when a turn can't be
@@ -261,8 +263,9 @@ class StructuredSessionManager:
                 thinking_effort=thinking_effort,
             )
         except Exception:
-            with entry.turn_lock:
-                entry.turn_active = False
+            if guard_persistent_turn:
+                with entry.turn_lock:
+                    entry.turn_active = False
             raise
         payload: dict = {}
         if images:

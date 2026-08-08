@@ -624,6 +624,10 @@ class MetricsCollector:
     _cached_until: float = field(default=0.0, init=False)
     _harness_cached_json: str | None = field(default=None, init=False)
     _harness_cached_until: float = field(default=0.0, init=False)
+    _session_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False)
+    _session_locks_guard: threading.Lock = field(
+        default_factory=threading.Lock, init=False
+    )
 
     def render_prometheus(self) -> str:
         self._refresh_if_needed()
@@ -705,6 +709,10 @@ class MetricsCollector:
         return status, body
 
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
+        with self._session_lock_for(session_id):
+            return self._proxy_terminate_harness_session(session_id)
+
+    def _proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         session = self._harness_session(session_id)
         if session is None:
             return _json_response(
@@ -748,6 +756,15 @@ class MetricsCollector:
     ) -> tuple[int, str]:
         """Proxy a structured-session action (turns/permission/interrupt) to
         the owning host's harnessd, forwarding the JSON body verbatim."""
+        with self._session_lock_for(session_id):
+            return self._proxy_harness_session_action(session_id, action, payload)
+
+    def _proxy_harness_session_action(
+        self,
+        session_id: str,
+        action: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, str]:
         session = self._harness_session(session_id)
         if session is None:
             return _json_response(
@@ -833,6 +850,10 @@ class MetricsCollector:
                 "failed to resolve native session id for %s: %s", session_id, exc
             )
         return None
+
+    def _session_lock_for(self, session_id: str) -> threading.Lock:
+        with self._session_locks_guard:
+            return self._session_locks.setdefault(session_id, threading.Lock())
 
     def proxy_harness_native_sessions(
         self,

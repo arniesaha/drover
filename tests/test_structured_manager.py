@@ -204,6 +204,7 @@ def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path
     )
+    mgr._require_entry("sess-1").harness = "claude-code"
 
     first_turn = mgr.send_turn("sess-1", "first")
     with pytest.raises(RuntimeError, match="turn already in flight"):
@@ -226,6 +227,22 @@ def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_
         event.event_type == "user_input"
         for event in registry.list_events("sess-1")
     ) == 2
+
+
+def test_manager_does_not_duplicate_per_turn_driver_inflight_state(
+    monkeypatch, tmp_path
+):
+    mgr, driver, _registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    first_turn = mgr.send_turn("sess-1", "first")
+    second_turn = mgr.send_turn("sess-1", "second after worker cleanup")
+
+    assert [turn_id for _text, turn_id in driver.sent_turns] == [
+        first_turn,
+        second_turn,
+    ]
 
 
 def test_process_exit_removes_dead_manager_entry(monkeypatch, tmp_path):

@@ -3060,6 +3060,64 @@ def test_turn_recovery_retries_original_payload_once(monkeypatch, tmp_path):
     ]
 
 
+def test_central_terminate_waits_for_recovery_retry(monkeypatch, tmp_path):
+    collector = _recovery_collector(tmp_path)
+    recovery_reached = threading.Event()
+    allow_recovery = threading.Event()
+    terminate_started = threading.Event()
+    terminate_reached = threading.Event()
+    turn_calls = 0
+
+    def request(_host, path, **_kwargs):
+        nonlocal turn_calls
+        if path.endswith("/turns"):
+            turn_calls += 1
+            if turn_calls == 1:
+                return 404, '{"error":"unknown structured session: harness-recover"}\n'
+            return 202, '{"turn_id":"turn-recovered"}\n'
+        if path.endswith("/recover"):
+            recovery_reached.set()
+            assert allow_recovery.wait(timeout=5)
+            return 200, '{"status":"running","recovered":true}\n'
+        if path.endswith("/terminate"):
+            terminate_reached.set()
+            return 200, '{"session_id":"harness-recover","status":"terminated"}\n'
+        raise AssertionError(path)
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+    results: dict[str, tuple[int, str]] = {}
+    recovery = threading.Thread(
+        target=lambda: results.setdefault(
+            "recovery",
+            collector.proxy_harness_session_action(
+                "harness-recover", "turns", {"text": "x"}
+            ),
+        )
+    )
+
+    def terminate():
+        terminate_started.set()
+        results["terminate"] = collector.proxy_terminate_harness_session(
+            "harness-recover"
+        )
+
+    termination = threading.Thread(target=terminate)
+    recovery.start()
+    assert recovery_reached.wait(timeout=5)
+    termination.start()
+    assert terminate_started.wait(timeout=5)
+    assert not terminate_reached.wait(timeout=0.1)
+    allow_recovery.set()
+    recovery.join(timeout=5)
+    termination.join(timeout=5)
+
+    assert results["recovery"][0] == 202
+    assert results["terminate"][0] == 200
+    assert HarnessRegistry(collector.duckdb_path).get_session(
+        "harness-recover"
+    ).status == "terminated"
+
+
 @pytest.mark.parametrize(
     ("action", "status", "body"),
     [
