@@ -44,6 +44,16 @@ Every registered host and every client holding the shared token belongs to the
 same trust domain. Run agent CLIs with the operating-system account and file
 permissions you intend them to have.
 
+## GitHub Actions Runner
+
+The trusted GitHub Actions runner executes code using its existing macOS
+account. Anyone who can change the protected `main` branch or control that
+account is therefore inside the runner's trust domain. Public pull requests
+remain on GitHub-hosted runners; labels alone do not protect the Mac, and
+approving an external workflow does not authorize it there. Follow the
+[trusted GitHub Actions runner runbook](github-actions-runner.md) to install,
+operate, update, and remove the host-owned runner hooks safely.
+
 ## Data Handling
 
 The context store may contain prompts, responses, repository paths, diffs,

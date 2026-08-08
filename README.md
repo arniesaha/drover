@@ -117,6 +117,7 @@ device signing, and server configuration.
 - [Integrations](docs/integrations.md)
 - [Multi-Host](docs/multi-host.md)
 - [Security](docs/security.md)
+- [GitHub Actions Runner](docs/github-actions-runner.md)
 - [Agent Skills](skills/README.md)
 
 ## Status And Limitations
