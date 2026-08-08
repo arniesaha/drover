@@ -250,7 +250,7 @@ Expected: no whitespace errors; only intentional committed changes are present. 
 Verify that Arnab's iPhone (`D3684608-B2AF-5EF5-B739-73B449A85C1E`) is available with `xcrun devicectl list devices`, then run:
 
 ```bash
-xcodebuild -project apps/drover/Drover.xcodeproj -scheme Drover -configuration Release -destination 'id=D3684608-B2AF-5EF5-B739-73B449A85C1E' -derivedDataPath /private/tmp/drover-chat-reset-device -allowProvisioningUpdates build
+xcodebuild -project apps/drover/Drover.xcodeproj -scheme Drover -configuration Release -destination 'generic/platform=iOS' -derivedDataPath /private/tmp/drover-chat-reset-device DEVELOPMENT_TEAM=DK2PC4RH5G CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates build
 ```
 
 Expected: `** BUILD SUCCEEDED **`, with a signed `Drover.app` under the derived-data Release products directory.
@@ -259,7 +259,7 @@ Expected: `** BUILD SUCCEEDED **`, with a signed `Drover.app` under the derived-
 
 ```bash
 xcrun devicectl device install app --device D3684608-B2AF-5EF5-B739-73B449A85C1E /private/tmp/drover-chat-reset-device/Build/Products/Release-iphoneos/Drover.app
-xcrun devicectl device process launch --device D3684608-B2AF-5EF5-B739-73B449A85C1E com.arnabsaha.Drover
+xcrun devicectl device process launch --device D3684608-B2AF-5EF5-B739-73B449A85C1E com.arnab.drover
 ```
 
 Expected: installation and launch succeed. Open the known long structured session, send a wrapping reply, observe an intervening tool/status/result sequence, then navigate back and reopen. The transcript must not blank or jump upward.
