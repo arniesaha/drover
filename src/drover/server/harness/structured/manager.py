@@ -59,6 +59,7 @@ class _Entry:
         self.seq = 0
         self.awaiting: str | None = None
         self.lock = threading.Lock()
+        self.emit: Callable[[StructuredMessage], None] | None = None
 
 
 class StructuredSessionManager:
@@ -198,12 +199,25 @@ class StructuredSessionManager:
             ):
                 finalize(session_id, int(payload["exited"]))
 
+        entry.emit = emit
         entry.driver = builder(
             command or default_command(), cwd, emit, native_session_id
         )
         with self._entries_lock:
             self._entries[session_id] = entry
         entry.driver.start()
+
+    def record_recovered(self, session_id: str, native_session_id: str) -> None:
+        entry = self._require_entry(session_id)
+        assert entry.emit is not None
+        entry.emit(
+            StructuredMessage(
+                type="session.recovered",
+                role="system",
+                text="session recovered after harness restart",
+                payload={"native_session_id": native_session_id},
+            )
+        )
 
     def send_turn(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
@@ -1392,6 +1393,219 @@ def test_harnessd_reconciles_orphaned_pty_sessions_on_startup(tmp_path):
         assert elsewhere.ended_at is None
     finally:
         state.pty.close_all()
+        server.server_close()
+
+
+def _seed_restart_lost_structured_session(
+    state, tmp_path, *, session_id="harness-recoverable", harness="codex"
+):
+    cwd = tmp_path / session_id
+    cwd.mkdir()
+    state.registry.create_session(
+        host_id=state.host_id,
+        harness=harness,
+        command=harness,
+        session_id=session_id,
+        status="running",
+        mode="structured",
+        cwd=str(cwd),
+        native_session_id="provider-session-1",
+    )
+    state.registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={"native_session_id": "provider-session-1"},
+        seq=7,
+    )
+    state.registry.update_session_status(
+        session_id,
+        "errored",
+        last_error="daemon restarted; structured session lost",
+        ended_at=datetime.now(timezone.utc),
+    )
+    return session_id
+
+
+def test_harnessd_recovers_restart_lost_structured_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={"native_session_id": "provider-session-1"},
+        )
+
+        assert status == 200
+        assert payload == {
+            "native_session_id": "provider-session-1",
+            "recovered": True,
+            "session_id": session_id,
+            "status": "running",
+        }
+        assert state.structured.has(session_id)
+        recovered = state.registry.get_session(session_id)
+        assert recovered is not None
+        assert recovered.status == "running"
+        assert recovered.ended_at is None
+        assert recovered.last_error is None
+        events = state.registry.list_events(session_id)
+        assert [event.seq for event in events] == [7, 8, 9]
+        assert [event.event_type for event in events][-1] == "session.recovered"
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_is_idempotent_when_session_is_live(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    try:
+        first = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={"native_session_id": "provider-session-1"},
+        )[1]
+        second = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={"native_session_id": "provider-session-1"},
+        )[1]
+
+        assert first["recovered"] is True
+        assert second["recovered"] is False
+        assert state.structured.session_ids() == [session_id]
+        assert sum(
+            event.event_type == "session.recovered"
+            for event in state.registry.list_events(session_id)
+        ) == 1
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovers_claude_with_native_resume_command(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
+        "claude-code",
+        lambda: list(FAKE_STRUCTURED_CLI),
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(
+        state, tmp_path, harness="claude-code"
+    )
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={"native_session_id": "provider-session-1"},
+        )
+
+        assert status == 200
+        assert payload["recovered"] is True
+        driver = state.structured._require_entry(session_id).driver
+        assert driver.command[-2:] == ["--resume", "provider-session-1"]
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_concurrent_recovery_creates_one_driver(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    barrier = threading.Barrier(3)
+    results: list[dict] = []
+
+    def recover():
+        barrier.wait()
+        results.append(
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )[1]
+        )
+
+    workers = [threading.Thread(target=recover) for _ in range(2)]
+    try:
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert sorted(item["recovered"] for item in results) == [False, True]
+        assert state.structured.session_ids() == [session_id]
+        assert sum(
+            event.event_type == "session.recovered"
+            for event in state.registry.list_events(session_id)
+        ) == 1
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("harness", "native_session_id", "cwd_exists"),
+    [
+        ("gemini", "provider-session-1", True),
+        ("codex", "", True),
+        ("codex", "provider-session-1", False),
+    ],
+)
+def test_harnessd_recovery_rejects_unsupported_or_incomplete_session(
+    tmp_path, harness, native_session_id, cwd_exists
+):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(
+        state, tmp_path, harness=harness
+    )
+    if not cwd_exists:
+        state.registry.get_session(session_id)
+        (tmp_path / session_id).rmdir()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": native_session_id},
+            )
+
+        assert raised.value.code == 409
+        error = json.loads(raised.value.read().decode("utf-8"))["error"]
+        assert error == (
+            "Session cannot be resumed after the harness restart. "
+            "Continue it in a new session."
+        )
+        assert not state.structured.has(session_id)
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_rejects_terminated_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    state.registry.update_session_status(
+        session_id, "terminated", ended_at=datetime.now(timezone.utc)
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )
+
+        assert raised.value.code == 409
+        error = json.loads(raised.value.read().decode("utf-8"))["error"]
+        assert "Continue it in a new session" in error
+        assert not state.structured.has(session_id)
+    finally:
+        state.pty.close_all()
+        server.shutdown()
         server.server_close()
 
 
