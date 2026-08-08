@@ -55,8 +55,9 @@ provenance rules.
 - OTLP: gRPC ingest, normally port `4317`
 - Files: JSONL inputs under `~/.drover/incoming/`
 
-Ports and bind addresses are configurable. Only localhost, private LAN, and
-private Tailscale deployments are supported for v0.1.
+All central listeners bind to localhost by default. Ports and bind addresses
+are configurable for deliberate private-LAN or private-Tailscale deployments.
+Public-internet exposure is not supported for v0.1.
 
 ## Failure And Recovery
 

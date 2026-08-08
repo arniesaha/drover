@@ -787,8 +787,7 @@ class MetricsCollector:
         if (
             action == "turns"
             and status == 404
-            and _error_text(body)
-            == f"unknown structured session: {session_id}"
+            and _error_text(body) == f"unknown structured session: {session_id}"
         ):
             native_session_id = self._native_session_id_for_recovery(session_id)
             if (

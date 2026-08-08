@@ -104,7 +104,7 @@ processed_retention_days = 7
 [server]
 otlp_grpc_port = 4317
 mcp_http_port  = 7077
-metrics_http_port = 0  # set to 7080 to expose /metrics for Prometheus
+metrics_http_port = 7080  # cockpit HTTP API and Prometheus metrics
 
 [auth]
 # Central API auth. Token resolution order: DROVER_API_TOKEN env var,
@@ -358,7 +358,7 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
 
 
 @main.command(name="harnessd")
-@click.option("--host-id", required=True, help="Stable host id, e.g. nas")
+@click.option("--host-id", required=True, help="Stable host id, e.g. workstation")
 @click.option("--display-name", default=None, help="Human-readable host label")
 @click.option("--kind", default="linux", show_default=True, help="Host kind")
 @click.option(
@@ -392,7 +392,7 @@ def harnessd_cmd(
     central_url: Optional[str],
     host_token: Optional[str],
 ) -> None:
-    """Run the Meta Harness host daemon."""
+    """Run the Drover host daemon."""
     from drover.server.harness.cli import run_harnessd_from_options
 
     run_harnessd_from_options(
@@ -427,7 +427,7 @@ def session_cmd() -> None:
 
 @main.group(name="harness")
 def harness_cmd() -> None:
-    """Audit and migrate Meta Harness data."""
+    """Audit and migrate Drover harness data."""
 
 
 def _sequence_command_payload(db_path: Path, *, apply: bool) -> dict[str, Any]:
@@ -1007,7 +1007,7 @@ def init(ctx: click.Context) -> None:
         sys.exit(1)
     p.parent.mkdir(parents=True, exist_ok=True)
     home = os.path.expanduser("~")
-    default_agent_id = os.uname().nodename.split(".")[0] + "-claude"
+    default_agent_id = os.uname().nodename.split(".")[0] + "-agent"
     p.write_text(
         _DEFAULT_CONFIG_TEMPLATE.format(home=home, default_agent_id=default_agent_id)
     )
@@ -1172,25 +1172,25 @@ def export_bundle_cmd(
 @click.option("--no-otlp", is_flag=True, help="Skip starting the OTLP gRPC receiver")
 @click.option(
     "--otlp-host",
-    default="0.0.0.0",
+    default="127.0.0.1",
     show_default=True,
-    help="OTLP bind host (use 127.0.0.1 to restrict to localhost)",
+    help="OTLP bind host (set explicitly for a trusted private network)",
 )
 @click.option("--no-mcp", is_flag=True, help="Skip starting the MCP HTTP server")
 @click.option(
     "--mcp-host",
-    default="0.0.0.0",
+    default="127.0.0.1",
     show_default=True,
-    help="MCP HTTP bind host",
+    help="MCP HTTP bind host (set explicitly for a trusted private network)",
 )
 @click.option(
     "--no-metrics", is_flag=True, help="Skip starting the metrics HTTP server"
 )
 @click.option(
     "--metrics-host",
-    default="0.0.0.0",
+    default="127.0.0.1",
     show_default=True,
-    help="Metrics HTTP bind host",
+    help="Cockpit/metrics HTTP bind host (set explicitly for a trusted private network)",
 )
 @click.option(
     "--no-summarizer", is_flag=True, help="Skip starting the summarizer worker"

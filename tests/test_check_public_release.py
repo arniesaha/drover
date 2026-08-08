@@ -24,6 +24,7 @@ def test_check_paths_finds_private_environment_and_stale_names(tmp_path: Path) -
         write_file(tmp_path, "docs/network.md", "server: http://192.168.1.70:7080\n"),
         write_file(tmp_path, "docs/tailnet.md", "host.private-name.ts.net\n"),
         write_file(tmp_path, "docs/sdk.md", "Import NexusKit in your application.\n"),
+        write_file(tmp_path, "docs/harness.md", "Start the Meta Harness daemon.\n"),
     ]
 
     findings = check_paths(paths)
@@ -33,7 +34,20 @@ def test_check_paths_finds_private_environment_and_stale_names(tmp_path: Path) -
         "private-ip-address",
         "private-tailnet-hostname",
         "legacy-public-name",
+        "legacy-harness-name",
     }
+
+
+def test_check_paths_scans_release_runtime_source(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "src/drover/defaults.py",
+        'DEFAULT_ROOT = "/Users/example/projects/drover"\n',
+    )
+
+    findings = check_paths([path])
+
+    assert [finding.rule for finding in findings] == ["personal-home-path"]
 
 
 def test_check_paths_redacts_credential_values(tmp_path: Path) -> None:

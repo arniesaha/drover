@@ -20,7 +20,9 @@ from drover.server.doctor import format_runtime_audit, runtime_audit  # noqa: E4
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only Drover runtime health audit")
+    parser = argparse.ArgumentParser(
+        description="Read-only Drover runtime health audit"
+    )
     parser.add_argument("--db", required=True, type=Path, help="DuckDB database path")
     parser.add_argument(
         "--incoming-dir", type=Path, default=None, help="Incoming directory to scan"

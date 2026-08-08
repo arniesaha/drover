@@ -1,4 +1,4 @@
-"""PTY-backed local process sessions for Drover Meta Harness."""
+"""PTY-backed local process sessions for Drover harnesses."""
 
 from __future__ import annotations
 

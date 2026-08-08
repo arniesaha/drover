@@ -448,7 +448,7 @@ def test_from_runtime_builds_local_ollama_with_launchd_wake() -> None:
     assert cfg.local_ollama_launchd_label == "com.drover.mac-ollama-embeddings"
     assert (
         cfg.local_ollama_launchd_plist
-        == "/Users/arnabmac/Library/LaunchAgents/com.drover.mac-ollama-embeddings.plist"
+        == "~/Library/LaunchAgents/com.drover.mac-ollama-embeddings.plist"
     )
 
 

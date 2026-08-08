@@ -235,7 +235,13 @@ def test_ingest_derives_repo_from_agentweave_repository_attr(tmp_path: Path) -> 
     assert row == ("arniesaha", "healthos", "main")
 
 
-def test_ingest_derives_repo_from_agentweave_prov_cwd(tmp_path: Path) -> None:
+def test_ingest_derives_repo_from_agentweave_prov_cwd(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(
+        "DROVER_REPO_ROOTS_JSON",
+        '{"/home/Arnab/clawd/projects/healthos": "arniesaha/healthos"}',
+    )
     parquet_dir, duckdb_path = _bootstrap(tmp_path)
     req = ExportTraceServiceRequest(
         resource_spans=[

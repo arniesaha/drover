@@ -47,6 +47,7 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
         # Rolling handoff brief for OPEN sessions:
         "drover_active_handoff",
     }
+    assert server.settings.host == "127.0.0.1"
 
 
 def test_each_tool_has_a_description(tmp_path: Path) -> None:

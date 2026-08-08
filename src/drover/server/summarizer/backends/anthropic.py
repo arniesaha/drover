@@ -21,7 +21,7 @@ class AnthropicBackend:
 
     Auth precedence: ``auth_token`` (OAuth Bearer) wins over ``api_key``
     if both are supplied. ``base_url`` is forwarded to the SDK so traffic
-    can be routed through a proxy (e.g. AgentWeave on the NAS).
+    can be routed through a configured compatible proxy.
     """
 
     name = "anthropic"

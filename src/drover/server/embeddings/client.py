@@ -27,7 +27,7 @@ DEFAULT_API_EMBED_MODEL = "text-embedding-3-small"
 DEFAULT_OLLAMA_KEEP_ALIVE = "5m"
 DEFAULT_MAC_OLLAMA_LAUNCHD_LABEL = "com.drover.mac-ollama-embeddings"
 DEFAULT_MAC_OLLAMA_LAUNCHD_PLIST = (
-    "/Users/arnabmac/Library/LaunchAgents/com.drover.mac-ollama-embeddings.plist"
+    "~/Library/LaunchAgents/com.drover.mac-ollama-embeddings.plist"
 )
 
 
@@ -49,7 +49,12 @@ def _launchctl_kickstart(label: str, plist_path: Optional[str] = None) -> None:
         if plist_path:
             try:
                 subprocess.run(
-                    ["/bin/launchctl", "bootstrap", f"gui/{uid}", plist_path],
+                    [
+                        "/bin/launchctl",
+                        "bootstrap",
+                        f"gui/{uid}",
+                        os.path.expanduser(plist_path),
+                    ],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,

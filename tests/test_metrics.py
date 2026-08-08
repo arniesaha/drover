@@ -3113,9 +3113,10 @@ def test_central_terminate_waits_for_recovery_retry(monkeypatch, tmp_path):
 
     assert results["recovery"][0] == 202
     assert results["terminate"][0] == 200
-    assert HarnessRegistry(collector.duckdb_path).get_session(
-        "harness-recover"
-    ).status == "terminated"
+    assert (
+        HarnessRegistry(collector.duckdb_path).get_session("harness-recover").status
+        == "terminated"
+    )
 
 
 @pytest.mark.parametrize(
@@ -3206,8 +3207,7 @@ def test_recovery_native_id_falls_back_to_structured_event_payload(tmp_path):
     )
 
     assert (
-        collector._native_session_id_for_recovery("harness-recover")
-        == "event-thread-1"
+        collector._native_session_id_for_recovery("harness-recover") == "event-thread-1"
     )
 
 

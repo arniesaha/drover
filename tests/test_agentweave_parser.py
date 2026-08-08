@@ -56,9 +56,13 @@ def test_parse_agentweave_openclaw_contract_extracts_harness_session_key_and_rou
     assert tool["routing_reason"] == "tool-span-route"
 
 
-def test_parser_derives_repo_from_safe_agentweave_cwd_without_changing_session() -> (
-    None
-):
+def test_parser_derives_repo_from_configured_agentweave_cwd_without_changing_session(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "DROVER_REPO_ROOTS_JSON",
+        '{"/home/Arnab/dev/openclaw": "arniesaha/openclaw"}',
+    )
     trace = {
         "batches": [
             {
