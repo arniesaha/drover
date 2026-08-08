@@ -389,6 +389,25 @@ struct ChatModelTests {
     #expect(model.hint == "approval pending; answer it first")
 }
 
+@Test @MainActor func unavailableRecoveryPreservesComposerForNewSession() async throws {
+    let message = "Session cannot be resumed after the harness restart. Continue it in a new session."
+    let attachment = TurnAttachment(mediaType: "image/png", data: Data([0x0C, 0x0D]))
+    MockURLProtocol.handler = { _ in
+        (409, Data(#"{"error": "\#(message)"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "continue from here"
+    model.pendingAttachments = [attachment]
+
+    await model.sendTurn()
+
+    #expect(model.composerText == "continue from here")
+    #expect(model.pendingAttachments.count == 1)
+    #expect(model.pendingAttachments[0].data == attachment.data)
+    #expect(model.queuedTurn == nil)
+    #expect(model.hint == message)
+}
+
 @Test @MainActor func turnCompleteWithoutQueueIsANoOp() async throws {
     nonisolated(unsafe) var posts = 0
     MockURLProtocol.handler = { _ in

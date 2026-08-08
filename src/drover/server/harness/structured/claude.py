@@ -41,6 +41,13 @@ def default_command(binary: str | None = None) -> list[str]:
     ]
 
 
+def resume_command(command: list[str], native_session_id: str | None) -> list[str]:
+    resumed = list(command)
+    if native_session_id:
+        resumed.extend(["--resume", native_session_id])
+    return resumed
+
+
 def child_env() -> dict[str, str]:
     """Sanitized environment for a spawned ``claude`` child process.
 
