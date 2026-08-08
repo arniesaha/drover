@@ -1813,19 +1813,13 @@ def test_structured_command_preferences_map_to_cli_flags():
         harness="codex",
         model="gpt-5.6-sol",
         thinking_effort="high",
-    ) == [
-        "codex",
-        "--model",
-        "gpt-5.6-sol",
-        "-c",
-        'model_reasoning_effort="high"',
-    ]
+    ) == ["codex"]
     assert harness_daemon.apply_structured_preferences(
         ["gemini"],
         harness="gemini",
         model="gemini-2.5-pro",
         thinking_effort="high",
-    ) == ["gemini", "--model", "gemini-2.5-pro"]
+    ) == ["gemini"]
 
 
 def _structured_session_awaiting_input(tmp_path, base_url, state):

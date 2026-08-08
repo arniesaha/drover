@@ -259,7 +259,12 @@ def test_first_turn_argv_has_exec_not_resume(tmp_path, monkeypatch):
     got: list = []
     driver = CodexDriver([sys.executable, "-c", FAKE_CODEX], None, got.append)
     driver.start()
-    driver.send_turn("do it", turn_id="t1")
+    driver.send_turn(
+        "do it",
+        turn_id="t1",
+        model="gpt-5.6-sol",
+        thinking_effort="high",
+    )
     _wait_for(
         got,
         lambda g: any(m.type == "status" and m.payload.get("turn_complete") for m in g),
@@ -268,6 +273,9 @@ def test_first_turn_argv_has_exec_not_resume(tmp_path, monkeypatch):
     assert "exec" in argv1
     assert "resume" not in argv1
     assert argv1[-1] == "do it"
+    assert argv1.count("--model") == 1
+    assert argv1[argv1.index("--model") + 1] == "gpt-5.6-sol"
+    assert argv1.count('model_reasoning_effort="high"') == 1
     sandbox_flag = argv1.index("--sandbox")
     assert argv1[sandbox_flag + 1] == "danger-full-access"
     driver.close()
@@ -279,12 +287,22 @@ def test_second_turn_argv_has_resume_and_captured_thread_id(tmp_path, monkeypatc
     got: list = []
     driver = CodexDriver([sys.executable, "-c", FAKE_CODEX], None, got.append)
     driver.start()
-    driver.send_turn("first", turn_id="t1")
+    driver.send_turn(
+        "first",
+        turn_id="t1",
+        model="gpt-5.6-sol",
+        thinking_effort="high",
+    )
     _wait_for(
         got,
         lambda g: any(m.type == "status" and m.payload.get("turn_complete") for m in g),
     )
-    driver.send_turn("second", turn_id="t2")
+    driver.send_turn(
+        "second",
+        turn_id="t2",
+        model="gpt-5.6-sol",
+        thinking_effort="high",
+    )
     _wait_for(
         got,
         lambda g: sum(
@@ -296,12 +314,14 @@ def test_second_turn_argv_has_resume_and_captured_thread_id(tmp_path, monkeypatc
     assert "resume" in argv2
     assert "thread-abc" in argv2
     assert argv2[-1] == "second"
+    assert argv2.count("--model") == 1
+    assert argv2[argv2.index("--model") + 1] == "gpt-5.6-sol"
+    assert argv2.count('model_reasoning_effort="high"') == 1
     # ``codex exec resume`` rejects ``--sandbox``; full access is requested via
     # the ``-c`` config override instead. Asserting the *absence* of the flag
     # keeps the regression (every follow-up turn dying at arg-parse) locked out.
     assert "--sandbox" not in argv2
-    config_flag = argv2.index("-c")
-    assert argv2[config_flag + 1] == "sandbox_mode=danger-full-access"
+    assert argv2.count("sandbox_mode=danger-full-access") == 1
     driver.close()
 
 

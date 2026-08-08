@@ -284,15 +284,17 @@ def apply_structured_preferences(
     model: str | None,
     thinking_effort: str | None,
 ) -> list[str]:
-    """Add harness-native model/thinking flags to a structured CLI command."""
+    """Add startup preferences for a persistent structured CLI process."""
     preferred = list(command)
-    if model and harness in {"claude-code", "codex", "gemini"}:
+    # Claude owns one process for the whole session, so its preferences must
+    # be fixed when that process starts. Codex and Gemini spawn per turn and
+    # their drivers apply the current preferences to each child process.
+    if harness != "claude-code":
+        return preferred
+    if model:
         preferred.extend(["--model", model])
     if thinking_effort:
-        if harness == "claude-code":
-            preferred.extend(["--effort", thinking_effort])
-        elif harness == "codex":
-            preferred.extend(["-c", f'model_reasoning_effort="{thinking_effort}"'])
+        preferred.extend(["--effort", thinking_effort])
     return preferred
 
 

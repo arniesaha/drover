@@ -194,7 +194,7 @@ def test_argv_includes_approval_mode_yolo(tmp_path, monkeypatch):
     got: list = []
     driver = GeminiDriver([sys.executable, "-c", FAKE_GEMINI_LOGGING], None, got.append)
     driver.start()
-    driver.send_turn("hello", turn_id="t1")
+    driver.send_turn("hello", turn_id="t1", model="gemini-2.5-pro")
     _wait_for(
         got,
         lambda g: any(m.type == "status" and m.payload.get("turn_complete") for m in g),
@@ -207,6 +207,8 @@ def test_argv_includes_approval_mode_yolo(tmp_path, monkeypatch):
     assert argv[argv.index("--approval-mode") + 1] == "yolo"
     assert "--skip-trust" in argv
     assert "--resume" not in argv
+    assert argv.count("--model") == 1
+    assert argv[argv.index("--model") + 1] == "gemini-2.5-pro"
     driver.close()
 
 
