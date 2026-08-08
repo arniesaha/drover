@@ -1,9 +1,7 @@
-name: iOS CI
+name: Trusted Mac verification
 
 on:
   push:
-    branches: [ "main", "production" ]
-  pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
@@ -11,25 +9,68 @@ permissions:
   contents: read
 
 concurrency:
-  group: ios-ci-${{ github.ref }}
+  group: trusted-mac-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build and test iOS app
-    runs-on: macos-15
+  python:
+    name: Python on trusted Mac
+    runs-on: [self-hosted, macOS, ARM64, drover-ci]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: pip
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Configure git identity for tests
+      run: |
+        git config user.email "ci@drover.local"
+        git config user.name "Drover CI"
+
+    - name: Check changed Python files with Black
+      env:
+        BASE_SHA: ${{ github.event.before }}
+      run: |
+        if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+          BASE_SHA="$(git rev-parse HEAD~1)"
+        fi
+        PY_FILES="$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA"...HEAD -- 'src/**/*.py' 'tests/*.py' 'tests/**/*.py')"
+        if [ -z "$PY_FILES" ]; then
+          echo "No changed Python files to format-check."
+        else
+          echo "$PY_FILES" | xargs black --check
+        fi
+
+    - name: Run tests with pytest
+      run: pytest tests/
+
+  ios:
+    name: iOS on trusted Mac
+    runs-on: [self-hosted, macOS, ARM64, drover-ci]
     defaults:
       run:
         working-directory: apps/drover
-
     steps:
     - uses: actions/checkout@v4
 
     - name: Show Xcode version
       run: xcodebuild -version
 
-    - name: Install XcodeGen
-      run: brew install xcodegen
+    - name: Ensure XcodeGen is available
+      run: |
+        if ! command -v xcodegen >/dev/null 2>&1; then
+          brew install xcodegen
+        fi
 
     - name: Generate Xcode project
       run: xcodegen generate
