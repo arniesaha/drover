@@ -55,6 +55,11 @@ RELAY_MIN_TIMEOUT_S = 5.0
 # delivers the handoff text as the first turn -- strictly more reliable than
 # typing it into a cold PTY (no startup-gate race).
 _STRUCTURED_HANDOFF_HARNESSES = frozenset(_STRUCTURED_DEFAULT_COMMANDS)
+_RECOVERABLE_STRUCTURED_HARNESSES = frozenset({"claude-code", "codex"})
+_RECOVERY_UNAVAILABLE = (
+    "Session cannot be resumed after the harness restart. "
+    "Continue it in a new session."
+)
 
 _SUMMARIZE_JOB_STATUSES = (
     "pending",
@@ -445,6 +450,14 @@ def _json_response(status: int, payload: Mapping[str, Any]) -> tuple[int, str]:
     return status, json.dumps(dict(payload), sort_keys=True, default=str) + "\n"
 
 
+def _error_text(body: str) -> str:
+    try:
+        error = json.loads(body).get("error")
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        return ""
+    return error if isinstance(error, str) else ""
+
+
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -754,9 +767,70 @@ class MetricsCollector:
             # larger than any other proxied payload.
             timeout_s=60.0 if action == "turns" else 15.0,
         )
+        if (
+            action == "turns"
+            and status == 404
+            and _error_text(body)
+            == f"unknown structured session: {session_id}"
+        ):
+            native_session_id = self._native_session_id_for_recovery(session_id)
+            if (
+                session.harness not in _RECOVERABLE_STRUCTURED_HARNESSES
+                or native_session_id is None
+            ):
+                return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+            recovery_status, _recovery_body = self._harness_request(
+                host,
+                f"/sessions/{session_id}/recover",
+                method="POST",
+                payload={"native_session_id": native_session_id},
+                timeout_s=15.0,
+            )
+            if not 200 <= recovery_status < 300:
+                return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+            try:
+                HarnessRegistry(self.duckdb_path).mark_session_recovered(
+                    session_id, native_session_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "failed to sync recovered harness session %s: %s",
+                    session_id,
+                    exc,
+                )
+            self._harness_cached_json = None
+            self._harness_cached_until = 0.0
+            status, body = self._harness_request(
+                host,
+                f"/sessions/{session_id}/{action}",
+                method="POST",
+                payload=payload,
+                timeout_s=60.0,
+            )
         if action == "turns" and 200 <= status < 300:
             self._sync_harness_session_preferences(session_id, payload)
         return status, body
+
+    def _native_session_id_for_recovery(self, session_id: str) -> str | None:
+        try:
+            registry = HarnessRegistry(self.duckdb_path)
+            session = registry.get_session(session_id)
+            if session is not None and session.native_session_id:
+                return session.native_session_id
+            for event in reversed(registry.list_events(session_id)):
+                payload = event.payload or {}
+                candidates = [payload.get("native_session_id")]
+                nested = payload.get("payload")
+                if isinstance(nested, dict):
+                    candidates.append(nested.get("native_session_id"))
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "failed to resolve native session id for %s: %s", session_id, exc
+            )
+        return None
 
     def proxy_harness_native_sessions(
         self,
