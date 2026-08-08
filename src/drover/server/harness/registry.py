@@ -297,6 +297,20 @@ class HarnessRegistry:
                 [awaiting, stamp, session_id],
             )
 
+    def update_session_native_id(
+        self, session_id: str, native_session_id: str
+    ) -> None:
+        native_session_id = native_session_id.strip()
+        if not native_session_id:
+            return
+        with self._connect() as con:
+            con.execute(
+                "UPDATE harness_sessions "
+                "SET native_session_id = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                [native_session_id, _now(), session_id],
+            )
+
     def update_session_preferences(
         self,
         session_id: str,

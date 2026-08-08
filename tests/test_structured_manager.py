@@ -260,6 +260,26 @@ def test_awaiting_transitions_through_approval_and_input(monkeypatch, tmp_path):
     assert mgr.awaiting("sess-1") == "input"
 
 
+def test_driver_event_persists_native_session_id(monkeypatch, tmp_path):
+    _mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="provider session started",
+            payload={"native_session_id": "provider-thread-1"},
+        )
+    )
+
+    session = registry.get_session("sess-1")
+    assert session is not None
+    assert session.native_session_id == "provider-thread-1"
+    assert [event.seq for event in registry.list_events("sess-1")] == [1]
+
+
 def test_seq_is_monotonic_across_emitted_messages(monkeypatch, tmp_path):
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path

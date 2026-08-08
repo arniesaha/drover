@@ -132,6 +132,14 @@ class StructuredSessionManager:
                 recorded = False
                 for attempt in range(3):
                     try:
+                        native_session_id = payload.get("native_session_id")
+                        if (
+                            isinstance(native_session_id, str)
+                            and native_session_id.strip()
+                        ):
+                            registry.update_session_native_id(
+                                session_id, native_session_id
+                            )
                         registry.append_event(
                             session_id=session_id,
                             event_type=message.type,
