@@ -289,6 +289,52 @@ struct ChatModelTests {
     #expect(sentThinking == "xhigh")
 }
 
+@Test @MainActor func sendTurnOmitsLockedClaudePreferences() async throws {
+    nonisolated(unsafe) var sentModel = false
+    nonisolated(unsafe) var sentThinking = false
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        sentModel = body.keys.contains("model")
+        sentThinking = body.keys.contains("thinking_effort")
+        return (202, Data(#"{"turn_id": "t1"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "claude-code")
+    model.composerText = "hi"
+    model.selectedModel = "opus"
+    model.thinkingEffort = "high"
+
+    await model.sendTurn()
+
+    #expect(sentModel == false)
+    #expect(sentThinking == false)
+}
+
+@Test @MainActor func queuedTurnOmitsLockedClaudePreferences() async throws {
+    nonisolated(unsafe) var preferenceKeys: [[String]] = []
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        preferenceKeys.append(body.keys.filter { $0 == "model" || $0 == "thinking_effort" })
+        if preferenceKeys.count == 1 {
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        }
+        return (202, Data(#"{"turn_id": "t2"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "claude-code")
+    model.composerText = "queued"
+    model.selectedModel = "opus"
+    model.thinkingEffort = "high"
+    await model.sendTurn()
+
+    model.ingest(.message(.fixture(
+        seq: 9,
+        type: .status,
+        payload: ["turn_complete": .bool(true), "awaiting": .string("input")]
+    )))
+    try await waitUntil { preferenceKeys.count == 2 }
+
+    #expect(preferenceKeys == [[], []])
+}
+
 @Test @MainActor func imageOnlyTurnSends() async throws {
     nonisolated(unsafe) var sentTexts: [String] = []
     MockURLProtocol.handler = { request in
@@ -341,6 +387,25 @@ struct ChatModelTests {
     #expect(model.queuedTurn == nil)
     #expect(model.composerText == "do it anyway")   // preserved for retry
     #expect(model.hint == "approval pending; answer it first")
+}
+
+@Test @MainActor func unavailableRecoveryPreservesComposerForNewSession() async throws {
+    let message = "Session cannot be resumed after the harness restart. Continue it in a new session."
+    let attachment = TurnAttachment(mediaType: "image/png", data: Data([0x0C, 0x0D]))
+    MockURLProtocol.handler = { _ in
+        (409, Data(#"{"error": "\#(message)"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "continue from here"
+    model.pendingAttachments = [attachment]
+
+    await model.sendTurn()
+
+    #expect(model.composerText == "continue from here")
+    #expect(model.pendingAttachments.count == 1)
+    #expect(model.pendingAttachments[0].data == attachment.data)
+    #expect(model.queuedTurn == nil)
+    #expect(model.hint == message)
 }
 
 @Test @MainActor func turnCompleteWithoutQueueIsANoOp() async throws {
@@ -491,6 +556,71 @@ struct ChatModelTests {
     #expect(model.hasConnectedOnce == true)
     model.ingest(.connection(false))
     #expect(model.hasConnectedOnce == true)    // latches
+}
+
+@Test @MainActor func olderHistoryIsLoadedOnlyAfterExplicitRequest() async throws {
+    MockURLProtocol.handler = { request in
+        switch request.url?.query {
+        case "limit=200":
+            return (200, Data("""
+            {"messages": [\(chatWireMessage(seq: 4, text: "four")), \(chatWireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
+            """.utf8))
+        case "before_seq=4&limit=200":
+            return (200, Data("""
+            {"messages": [\(chatWireMessage(seq: 1, text: "one")), \(chatWireMessage(seq: 2, text: "two")), \(chatWireMessage(seq: 3, text: "three"))],
+             "page_min_seq": 1, "page_max_seq": 3, "max_seq": 5,
+             "has_older": false, "has_newer": true}
+            """.utf8))
+        default:
+            Issue.record("unexpected request: \(request.url?.absoluteString ?? "nil")")
+            return (500, Data())
+        }
+    }
+    let connector = FakeConnector([.frames([], thenError: false)])
+    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+        MessageStream(client: client, sessionID: sessionID, connector: connector)
+    })
+
+    model.start()
+    try await waitUntil { model.messages.map(\.seq) == [4, 5] }
+    #expect(model.hasOlderHistory)
+
+    let didLoad = await model.loadOlderHistory()
+
+    #expect(didLoad)
+    #expect(model.messages.map(\.seq) == [1, 2, 3, 4, 5])
+    #expect(model.hasOlderHistory == false)
+    #expect(model.isLoadingOlderHistory == false)
+    model.stop()
+}
+
+@Test @MainActor func failedOlderHistoryLoadReportsNoPrepend() async throws {
+    MockURLProtocol.handler = { request in
+        if request.url?.query == "limit=200" {
+            return (200, Data("""
+            {"messages": [\(chatWireMessage(seq: 4, text: "four")), \(chatWireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
+            """.utf8))
+        }
+        return (500, Data(#"{"error": "transient"}"#.utf8))
+    }
+    let connector = FakeConnector([.frames([], thenError: false)])
+    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+        MessageStream(client: client, sessionID: sessionID, connector: connector)
+    })
+
+    model.start()
+    try await waitUntil { model.messages.map(\.seq) == [4, 5] }
+
+    let didLoad = await model.loadOlderHistory()
+
+    #expect(didLoad == false)
+    #expect(model.messages.map(\.seq) == [4, 5])
+    #expect(model.hint == "Could not load earlier messages — try again.")
+    model.stop()
 }
 
 /// Regression: a 401 mid-chat (surfaced via REST catch-up) must not leave

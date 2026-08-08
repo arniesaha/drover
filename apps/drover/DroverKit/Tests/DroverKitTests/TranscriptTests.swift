@@ -153,6 +153,16 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         #expect(TranscriptItem.group([s1, s2]).first?.id == "s1")
     }
 
+    @Test func rawAnchorResolvesAfterOlderStatusesJoinItsRenderedRun() {
+        let older = status("s1", seq: 1, "hook_started")
+        let originalFirst = status("s2", seq: 2, "hook_response")
+
+        #expect(TranscriptItem.rowID(containing: originalFirst.id,
+                                     in: [originalFirst]) == "s2")
+        #expect(TranscriptItem.rowID(containing: originalFirst.id,
+                                     in: [older, originalFirst]) == "s1")
+    }
+
     @Test func latestRowIDTargetsTheRunStartForAStatusTail() {
         let answer = output("a", seq: 1)
         let s1 = status("s1", seq: 2, "hook_started")

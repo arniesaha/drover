@@ -40,7 +40,7 @@ struct StreamTests {
 @Test func historyThenLiveDedupedAndOrdered() async throws {
     // REST returns history seq 1-2; WS replays 2 (dup) then delivers 3.
     MockURLProtocol.handler = { request in
-        #expect(request.url!.query!.contains("after_seq=0"))
+        #expect(request.url!.query == "limit=200")
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
          "max_seq": 2}
@@ -182,7 +182,7 @@ struct StreamTests {
     #expect(restCalls == 1)
 }
 
-@Test func catchUpEmitsFixedBoundPagesBeforeLiveMessages() async throws {
+@Test func coldCatchUpEmitsOnlyTheNewestPageBeforeLiveMessages() async throws {
     nonisolated(unsafe) var queries: [String] = []
     MockURLProtocol.handler = { request in
         let query = request.url?.query ?? ""
@@ -190,21 +190,21 @@ struct StreamTests {
         switch queries.count {
         case 1:
             return (200, Data("""
-            {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
-             "page_min_seq": 1, "page_max_seq": 2, "max_seq": 5,
-             "has_older": false, "has_newer": true}
+            {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
             """.utf8))
         case 2:
             return (200, Data("""
-            {"messages": [\(wireMessage(seq: 3, text: "three")), \(wireMessage(seq: 4, text: "four"))],
-             "page_min_seq": 3, "page_max_seq": 4, "max_seq": 5,
+            {"messages": [\(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
+             "page_min_seq": 2, "page_max_seq": 3, "max_seq": 6,
              "has_older": true, "has_newer": true}
             """.utf8))
         default:
             return (200, Data("""
-            {"messages": [\(wireMessage(seq: 5, text: "five"))],
-             "page_min_seq": 5, "page_max_seq": 5, "max_seq": 5,
-             "has_older": true, "has_newer": false}
+            {"messages": [\(wireMessage(seq: 1, text: "one"))],
+             "page_min_seq": 1, "page_max_seq": 1, "max_seq": 6,
+             "has_older": false, "has_newer": true}
             """.utf8))
         }
     }
@@ -218,25 +218,142 @@ struct StreamTests {
 
     var batches: [[Int]] = []
     var live: [Int] = []
+    var catchUpFailed = false
     for await event in await stream.events() {
         switch event {
         case let .history(messages, issues):
             #expect(issues.isEmpty)
             batches.append(messages.map(\.seq))
         case let .message(message): live.append(message.seq)
-        case .connection, .unauthorized: break
+        case .connection(false): catchUpFailed = true
+        case .connection(true), .unauthorized: break
         }
-        if live == [6] { break }
+        if live == [6] || catchUpFailed { break }
     }
 
-    #expect(batches == [[1, 2], [3, 4], [5]])
+    // The newest useful content must become observable after the first
+    // request, without any automatic older-page fetch shifting the viewport.
+    // The live stream still starts at the snapshot cursor captured at max_seq.
+    #expect(batches == [[4, 5]])
     #expect(live == [6])
-    #expect(queries == [
-        "after_seq=0&limit=200",
-        "after_seq=2&through_seq=5&limit=200",
-        "after_seq=4&through_seq=5&limit=200",
-    ])
+    #expect(queries == ["limit=200"])
     #expect(connector.requests.first?.url?.query == "after_seq=5")
+}
+
+@Test func olderHistoryLoadsOnePageOnlyWhenRequested() async throws {
+    nonisolated(unsafe) var queries: [String] = []
+    MockURLProtocol.handler = { request in
+        let query = request.url?.query ?? ""
+        queries.append(query)
+        if query == "limit=200" {
+            return (200, Data("""
+            {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
+            """.utf8))
+        }
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
+         "page_min_seq": 1, "page_max_seq": 3, "max_seq": 6,
+         "has_older": false, "has_newer": true}
+        """.utf8))
+    }
+    let connector = FakeConnector([.frames([], thenError: false)])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var iterator = await stream.events().makeAsyncIterator()
+    while let event = await iterator.next() {
+        if event == .connection(true) { break }
+    }
+
+    #expect(queries == ["limit=200"])
+    let older = try await stream.loadOlderHistory()
+    #expect(older?.messages.map(\.seq) == [1, 2, 3])
+    #expect(older?.hasOlder == false)
+    #expect(queries == ["limit=200", "before_seq=4&limit=200"])
+    #expect(try await stream.loadOlderHistory() == nil)
+    #expect(queries.count == 2)
+}
+
+@Test func coldCatchUpRejectsHistoryThatDoesNotReachSequenceOne() async throws {
+    nonisolated(unsafe) var queries: [String] = []
+    MockURLProtocol.handler = { request in
+        queries.append(request.url?.query ?? "")
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
+         "page_min_seq": 2, "page_max_seq": 3, "max_seq": 3,
+         "has_older": false, "has_newer": false}
+        """.utf8))
+    }
+    let connector = FakeConnector([.frames([], thenError: true)])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    for await event in await stream.events() {
+        if event == .connection(false) { break }
+    }
+
+    #expect(queries.first == "limit=200")
+    #expect(connector.requests.isEmpty)
+}
+
+@Test func failedOlderHistoryRequestKeepsItsCursorForRetry() async throws {
+    nonisolated(unsafe) var queries: [String] = []
+    nonisolated(unsafe) var olderAttempts = 0
+    MockURLProtocol.handler = { request in
+        let query = request.url?.query ?? ""
+        queries.append(query)
+        if query == "limit=200" {
+            return (200, Data("""
+            {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
+            """.utf8))
+        }
+        olderAttempts += 1
+        if olderAttempts == 1 {
+            return (500, Data(#"{"error": "transient"}"#.utf8))
+        }
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
+         "page_min_seq": 1, "page_max_seq": 3, "max_seq": 6,
+         "has_older": false, "has_newer": true}
+        """.utf8))
+    }
+    let connector = FakeConnector([.frames([], thenError: false)])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    let events = await stream.events()
+    let consumeTask = Task {
+        for await _ in events {
+            if Task.isCancelled { break }
+        }
+    }
+    while !(await stream.olderHistoryAvailable()) {
+        await Task.yield()
+    }
+
+    do {
+        _ = try await stream.loadOlderHistory()
+        Issue.record("expected the first older-page request to fail")
+    } catch {
+        // The same cursor must remain available for a later explicit retry.
+    }
+    let retry = try await stream.loadOlderHistory()
+    consumeTask.cancel()
+    await stream.stop()
+
+    #expect(retry?.messages.map(\.seq) == [1, 2, 3])
+    #expect(queries.first == "limit=200")
+    #expect(queries.filter { $0 == "before_seq=4&limit=200" }.count == 2)
 }
 
 @Test func catchUpGapRetriesFromLastContiguousSequenceWithoutWebSocket() async throws {
@@ -259,7 +376,7 @@ struct StreamTests {
         if event == .connection(false) { break }
     }
 
-    #expect(queries.first == "after_seq=0&limit=200")
+    #expect(queries.first == "limit=200")
     #expect(connector.requests.isEmpty)
 }
 
@@ -286,7 +403,7 @@ struct StreamTests {
         if event == .connection(false) { break }
     }
 
-    #expect(queries.first == "after_seq=0&limit=200")
+    #expect(queries.first == "limit=200")
     #expect(connector.requests.isEmpty)
 }
 
@@ -336,7 +453,7 @@ struct StreamTests {
     }
 
     #expect(delivered.isEmpty)
-    #expect(queries.first == "after_seq=0&limit=200")
+    #expect(queries.first == "limit=200")
 }
 
 }

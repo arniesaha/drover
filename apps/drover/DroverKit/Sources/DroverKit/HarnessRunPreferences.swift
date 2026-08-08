@@ -7,6 +7,10 @@ public enum HarnessRunPreferences {
         harness == "claude-code" || harness == "codex"
     }
 
+    public static func canChangeInExistingSession(_ harness: String) -> Bool {
+        harness != "claude-code"
+    }
+
     public static func modelSuggestions(for harness: String) -> [String] {
         switch harness {
         case "claude-code":

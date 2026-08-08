@@ -280,6 +280,19 @@ def test_structured_session_fields_roundtrip(tmp_path):
     assert registry.get_session(session.session_id).awaiting is None
 
 
+def test_update_session_native_id_persists_provider_identity(tmp_path):
+    registry, _ = _registry(tmp_path)
+    session = registry.create_session(
+        host_id="h1", harness="codex", command="codex", mode="structured"
+    )
+
+    registry.update_session_native_id(session.session_id, "provider-thread-1")
+
+    updated = registry.get_session(session.session_id)
+    assert updated is not None
+    assert updated.native_session_id == "provider-thread-1"
+
+
 def test_default_mode_is_pty(tmp_path):
     registry, _ = _registry(tmp_path)
     session = registry.create_session(host_id="h1", harness="shell", command="/bin/sh")

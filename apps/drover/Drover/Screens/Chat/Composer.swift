@@ -27,6 +27,7 @@ struct Composer: View {
             selectedModel: $selectedModel,
             thinkingEffort: $thinkingEffort,
             harness: harness,
+            arePreferencesEditable: HarnessRunPreferences.canChangeInExistingSession(harness),
             placeholder: "Add feedback...",
             isSending: isSending,
             canSend: !isEmpty,

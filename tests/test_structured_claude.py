@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from drover.server.harness.structured import claude as claude_module
 from drover.server.harness.structured.claude import (
     ClaudeDriver,
     child_env,
@@ -37,6 +38,22 @@ def test_default_command_bypasses_permissions():
     assert command[-2:] == ["--permission-mode", "bypassPermissions"]
     # bypass flag must come after the stream-json plumbing flags
     assert "--output-format" in command
+
+
+def test_resume_command_appends_native_session_without_mutating_source():
+    command = ["claude", "-p", "--output-format", "stream-json"]
+
+    resumed = claude_module.resume_command(command, "claude-session-1")
+
+    assert resumed == [
+        "claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--resume",
+        "claude-session-1",
+    ]
+    assert command == ["claude", "-p", "--output-format", "stream-json"]
 
 
 def test_default_command_falls_back_to_which(monkeypatch, tmp_path):
