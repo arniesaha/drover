@@ -1,4 +1,4 @@
-"""Registry helpers for Drover Meta Harness hosts and sessions."""
+"""Registry helpers for Drover harness hosts and sessions."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _rows(
 
 
 class HarnessRegistry:
-    """Small DuckDB-backed registry for Meta Harness control-plane state."""
+    """Small DuckDB-backed registry for Drover command-plane state."""
 
     def __init__(self, duckdb_path: str | Path):
         self.duckdb_path = Path(duckdb_path)
@@ -320,9 +320,7 @@ class HarnessRegistry:
                 [awaiting, stamp, session_id],
             )
 
-    def update_session_native_id(
-        self, session_id: str, native_session_id: str
-    ) -> None:
+    def update_session_native_id(self, session_id: str, native_session_id: str) -> None:
         native_session_id = native_session_id.strip()
         if not native_session_id:
             return

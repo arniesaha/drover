@@ -35,8 +35,8 @@ following to `~/.claude/settings.json`:
 ## Optional `~/.drover/hook.toml`
 
 ```toml
-agent_id = "macmini-claude"            # default: <hostname>-claude
-mcp_url  = "http://mac-mini.local:7077/mcp"  # default: http://127.0.0.1:7077/mcp
+agent_id = "laptop-claude"             # default: <hostname>-claude
+mcp_url  = "http://drover-host.local:7077/mcp"  # default: http://127.0.0.1:7077/mcp
 ```
 
 ## Behavior
@@ -45,7 +45,7 @@ mcp_url  = "http://mac-mini.local:7077/mcp"  # default: http://127.0.0.1:7077/mc
   Code injects this into the system context. If the cwd has no git
   remote, the hook prints a benign skip banner instead.
 - **SessionEnd** enqueues a summarize_jobs row by calling
-  `drover_session_close`. The summarizer worker on the Mac Mini picks
+  `drover_session_close`. The configured summarizer worker picks
   it up within a few seconds.
 
 ## Failure modes
@@ -56,7 +56,7 @@ mcp_url  = "http://mac-mini.local:7077/mcp"  # default: http://127.0.0.1:7077/mc
 
 ## Per-host paths
 
-For non-Mac hosts, set `mcp_url` to point at the Mac Mini over
+For remote hosts, set `mcp_url` to point at the central Drover machine over
 Tailscale or LAN:
 
 ```toml

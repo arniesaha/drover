@@ -211,7 +211,7 @@ def test_sessions_view_counts_canonical_logical_events(tmp_lakehouse):
     assert canonical_row == ("arniesaha", "nexus", "same logical event")
 
 
-def test_agent_events_view_attributes_paperclip_nexus_cwd(tmp_lakehouse):
+def test_agent_events_view_does_not_infer_repo_from_operator_cwd(tmp_lakehouse):
     parquet_dir, db_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
 
@@ -277,7 +277,7 @@ def test_agent_events_view_attributes_paperclip_nexus_cwd(tmp_lakehouse):
     finally:
         con.close()
 
-    assert result == ("arniesaha", "nexus")
+    assert result == (None, None)
 
 
 def test_openclaw_span_links_view_reports_non_destructive_link_methods(tmp_lakehouse):

@@ -1474,10 +1474,13 @@ def test_harnessd_recovery_is_idempotent_when_session_is_live(tmp_path):
         assert first["recovered"] is True
         assert second["recovered"] is False
         assert state.structured.session_ids() == [session_id]
-        assert sum(
-            event.event_type == "session.recovered"
-            for event in state.registry.list_events(session_id)
-        ) == 1
+        assert (
+            sum(
+                event.event_type == "session.recovered"
+                for event in state.registry.list_events(session_id)
+            )
+            == 1
+        )
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()
@@ -1537,10 +1540,13 @@ def test_harnessd_concurrent_recovery_creates_one_driver(tmp_path):
 
         assert sorted(item["recovered"] for item in results) == [False, True]
         assert state.structured.session_ids() == [session_id]
-        assert sum(
-            event.event_type == "session.recovered"
-            for event in state.registry.list_events(session_id)
-        ) == 1
+        assert (
+            sum(
+                event.event_type == "session.recovered"
+                for event in state.registry.list_events(session_id)
+            )
+            == 1
+        )
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()
@@ -1575,9 +1581,7 @@ def test_harnessd_terminate_waits_for_recovery_and_wins(tmp_path):
     terminate = threading.Thread(
         target=lambda: results.setdefault(
             "terminate",
-            _json_request(
-                f"{base_url}/sessions/{session_id}/terminate", payload={}
-            ),
+            _json_request(f"{base_url}/sessions/{session_id}/terminate", payload={}),
         )
     )
     try:
@@ -1612,9 +1616,7 @@ def test_harnessd_recovery_rejects_unsupported_or_incomplete_session(
     tmp_path, harness, native_session_id, cwd_exists
 ):
     server, state, base_url = _start_test_server(tmp_path)
-    session_id = _seed_restart_lost_structured_session(
-        state, tmp_path, harness=harness
-    )
+    session_id = _seed_restart_lost_structured_session(state, tmp_path, harness=harness)
     if not cwd_exists:
         state.registry.get_session(session_id)
         (tmp_path / session_id).rmdir()

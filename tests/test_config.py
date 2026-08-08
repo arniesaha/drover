@@ -14,7 +14,7 @@ def test_load_from_path():
     assert cfg.duckdb_path == Path("/tmp/nexus-test/nexus.duckdb")
     assert cfg.otlp_grpc_port == 4317
     assert cfg.mcp_http_port == 7077
-    assert cfg.metrics_http_port == 0
+    assert cfg.metrics_http_port == 7080
     assert cfg.agent_id == "test-agent"
     assert cfg.principal_id == "test-user"
     assert cfg.processed_retention_days == 7
@@ -35,7 +35,7 @@ def test_default_config_uses_home_dir():
     assert ".drover" in str(cfg.incoming_dir)
     assert cfg.otlp_grpc_port == 4317
     assert cfg.mcp_http_port == 7077
-    assert cfg.metrics_http_port == 0
+    assert cfg.metrics_http_port == 7080
     assert cfg.summarizer_local_ollama_url == ""
     assert cfg.embeddings_api_base_url == ""
 

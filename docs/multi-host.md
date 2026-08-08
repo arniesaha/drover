@@ -20,6 +20,16 @@ network; it does not change Drover's single-operator trust model.
 The central server presents one fleet API. Each `drover-harnessd` owns local
 agent processes, structured sessions, and terminal I/O on its machine.
 
+`drover-server` binds to localhost by default. Before adding a direct or relay
+host, start its cockpit listener on the intended private interface:
+
+```bash
+uv run drover-server run --metrics-host 0.0.0.0
+```
+
+Only add `--mcp-host` or `--otlp-host` when remote agents or collectors need
+those listeners too.
+
 ## Direct Hosts
 
 Use a direct host when the central server can reach its private address. Bind

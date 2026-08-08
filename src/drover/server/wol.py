@@ -1,8 +1,7 @@
 """Wake-on-LAN helper for the GPU rig.
 
-Always wakes via the NAS-side relay (`http://<nas>:9753/wake`) rather than
-sending magic packets directly — the relay is the canonical wake path and
-encapsulates whatever bookkeeping/throttling lives on the NAS.
+Always wakes via a configured relay rather than sending magic packets
+directly. The relay owns network routing, bookkeeping, and throttling.
 
 After a wake request, ``wait_for_ollama`` polls ``/api/tags`` until it
 responds 200 or the deadline expires. It can also require a configured model
@@ -30,8 +29,8 @@ class GpuWakeError(RuntimeError):
 class GpuRig:
     """Connection details for a Wake-on-LAN-managed Ollama host."""
 
-    relay_url: str  # e.g. "http://192.168.1.70:9753"
-    ollama_url: str  # e.g. "http://10.10.10.2:11434"
+    relay_url: str  # e.g. "http://gpu-relay.private:9753"
+    ollama_url: str  # e.g. "http://gpu-host.private:11434"
     wake_timeout_s: float = 120.0
     poll_interval_s: float = 5.0
 
@@ -78,7 +77,7 @@ def _ollama_model_ready(
 
 
 def wake_via_relay(relay_url: str, *, timeout_s: float = 5.0) -> None:
-    """POST a wake request to the NAS relay. Raises GpuWakeError on failure."""
+    """POST a wake request to the configured relay."""
     url = f"{relay_url.rstrip('/')}/wake"
     try:
         r = requests.get(url, timeout=timeout_s)

@@ -101,7 +101,7 @@ _DEFAULTS = {
     "server": {
         "otlp_grpc_port": 4317,
         "mcp_http_port": 7077,
-        "metrics_http_port": 0,
+        "metrics_http_port": 7080,
     },
     "agent": {
         "agent_id": "unknown-agent",

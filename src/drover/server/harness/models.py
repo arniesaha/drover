@@ -1,4 +1,4 @@
-"""Typed records for Drover Meta Harness state."""
+"""Typed records for Drover harness state."""
 
 from __future__ import annotations
 

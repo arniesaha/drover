@@ -20,7 +20,7 @@ def build_mcp_server(
     *,
     duckdb_path: Path,
     name: str = "drover",
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 7077,
     backend_config: Optional[SummarizerBackendConfig] = None,
     summarize_job_stream: object | None = None,

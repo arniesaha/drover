@@ -52,7 +52,12 @@ def _launchctl_kickstart(label: str, plist_path: Optional[str] = None) -> None:
         if plist_path:
             try:
                 subprocess.run(
-                    ["/bin/launchctl", "bootstrap", f"gui/{uid}", plist_path],
+                    [
+                        "/bin/launchctl",
+                        "bootstrap",
+                        f"gui/{uid}",
+                        os.path.expanduser(plist_path),
+                    ],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,

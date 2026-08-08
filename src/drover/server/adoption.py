@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import Any, Iterable
 
 HIGH_VOLUME_EVENT_THRESHOLD = 100
+AGENT_ADOPTION_ENV = "DROVER_AGENT_ADOPTION_JSON"
 
 
 @dataclass(frozen=True)
@@ -28,61 +31,111 @@ class AgentAdoptionRecord:
         )
 
 
-DEFAULT_AGENT_ADOPTION: tuple[AgentAdoptionRecord, ...] = (
-    AgentAdoptionRecord(
-        runtime="mac-mini-max",
-        agent_id_patterns=("macmini-claude", "max*", "max-v1"),
-        emits_to_drover=True,
-        mcp_configured=True,
-        drover_skill_configured=True,
-        status="active",
-        smoke_check="drover_data_quality, drover_recent_sessions, drover_session_replay",
-    ),
-    AgentAdoptionRecord(
-        runtime="openclaw-main",
-        agent_id_patterns=("openclaw*", "nix*", "nix-v1"),
-        emits_to_drover=True,
-        mcp_configured=True,
-        drover_skill_configured=True,
-        status="active",
-        smoke_check="drover_handoff, drover_project_brief, drover_data_quality",
-    ),
-    AgentAdoptionRecord(
-        runtime="paperclip-agents",
-        agent_id_patterns=("paperclip*", "claude_local", "codex_local"),
-        emits_to_drover=True,
-        mcp_configured=False,
-        drover_skill_configured=True,
-        status="needs-mcp-rollout",
-        smoke_check="quality snapshot in completion evidence bundle",
-    ),
-    AgentAdoptionRecord(
-        runtime="codex-cli",
-        agent_id_patterns=("codex*", "codex_local"),
-        emits_to_drover=True,
-        mcp_configured=False,
-        drover_skill_configured=True,
-        status="needs-validation",
-        smoke_check="drover_handoff and drover_data_quality before non-trivial work",
-    ),
-    AgentAdoptionRecord(
-        runtime="work-macbook-claude",
-        agent_id_patterns=("work-macbook*", "work-claude*"),
-        emits_to_drover=True,
-        mcp_configured=False,
-        drover_skill_configured=False,
-        status="data-source-only",
-        smoke_check="shipper event freshness plus MCP setup check",
-    ),
-)
+@dataclass(frozen=True)
+class AgentAdoptionRegistry:
+    configured: bool
+    records: tuple[AgentAdoptionRecord, ...] = ()
+    error: str | None = None
+
+
+def load_agent_adoption_registry(raw: str | None = None) -> AgentAdoptionRegistry:
+    """Load the optional operator adoption registry.
+
+    The environment value is a JSON array of records. Configuration is loaded
+    when a snapshot is requested rather than at import time, which keeps tests,
+    CLI invocations, and long-running processes predictable. Invalid input is
+    reported as data instead of raising from the quality or observatory paths.
+    """
+    value = os.environ.get(AGENT_ADOPTION_ENV, "") if raw is None else raw
+    value = value.strip()
+    if not value:
+        return AgentAdoptionRegistry(configured=False)
+    try:
+        entries = json.loads(value)
+    except json.JSONDecodeError as exc:
+        return AgentAdoptionRegistry(
+            configured=True,
+            error=f"invalid JSON at character {exc.pos}",
+        )
+    if not isinstance(entries, list):
+        return AgentAdoptionRegistry(
+            configured=True,
+            error="top-level value must be an array",
+        )
+
+    records: list[AgentAdoptionRecord] = []
+    required_booleans = (
+        "emits_to_drover",
+        "mcp_configured",
+        "drover_skill_configured",
+    )
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            return AgentAdoptionRegistry(
+                configured=True,
+                error=f"entry {index} must be an object",
+            )
+        runtime = entry.get("runtime")
+        patterns = entry.get("agent_id_patterns")
+        if not isinstance(runtime, str) or not runtime.strip():
+            return AgentAdoptionRegistry(
+                configured=True,
+                error=f"entry {index}.runtime must be a non-empty string",
+            )
+        if (
+            not isinstance(patterns, list)
+            or not patterns
+            or any(not isinstance(pattern, str) or not pattern for pattern in patterns)
+        ):
+            return AgentAdoptionRegistry(
+                configured=True,
+                error=(
+                    f"entry {index}.agent_id_patterns must be a non-empty "
+                    "array of strings"
+                ),
+            )
+        for field in required_booleans:
+            if not isinstance(entry.get(field), bool):
+                return AgentAdoptionRegistry(
+                    configured=True,
+                    error=f"entry {index}.{field} must be a boolean",
+                )
+        status = entry.get("status", "unknown")
+        smoke_check = entry.get("smoke_check", "")
+        if not isinstance(status, str) or not isinstance(smoke_check, str):
+            return AgentAdoptionRegistry(
+                configured=True,
+                error=f"entry {index}.status and smoke_check must be strings",
+            )
+        records.append(
+            AgentAdoptionRecord(
+                runtime=runtime.strip(),
+                agent_id_patterns=tuple(patterns),
+                emits_to_drover=entry["emits_to_drover"],
+                mcp_configured=entry["mcp_configured"],
+                drover_skill_configured=entry["drover_skill_configured"],
+                status=status,
+                smoke_check=smoke_check,
+            )
+        )
+    return AgentAdoptionRegistry(configured=True, records=tuple(records))
 
 
 def _matches(patterns: Iterable[str], agent_id: str) -> bool:
     return any(fnmatch(agent_id, pattern) for pattern in patterns)
 
 
-def adoption_snapshot(audit: dict[str, Any]) -> dict[str, Any]:
-    """Return the static rollout matrix annotated with observed event volume."""
+def adoption_snapshot(
+    audit: dict[str, Any],
+    records: Iterable[AgentAdoptionRecord] | None = None,
+) -> dict[str, Any]:
+    """Return an operator-supplied rollout matrix with observed event volume."""
+
+    registry = (
+        load_agent_adoption_registry()
+        if records is None
+        else AgentAdoptionRegistry(configured=True, records=tuple(records))
+    )
 
     attribution = audit.get("repo_attribution", {}) or {}
     latest_events = audit.get("latest_events", {}) or {}
@@ -107,7 +160,7 @@ def adoption_snapshot(audit: dict[str, Any]) -> dict[str, Any]:
     matched_agents: set[str] = set()
     high_volume_unready: list[str] = []
 
-    for record in DEFAULT_AGENT_ADOPTION:
+    for record in registry.records:
         observed_ids = sorted(
             agent_id
             for agent_id in observed_agent_ids
@@ -138,13 +191,19 @@ def adoption_snapshot(audit: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    unmatched_high_volume = sorted(
-        agent_id
-        for agent_id, total in project_totals.items()
-        if agent_id not in matched_agents and total >= HIGH_VOLUME_EVENT_THRESHOLD
+    unmatched_high_volume = (
+        sorted(
+            agent_id
+            for agent_id, total in project_totals.items()
+            if agent_id not in matched_agents and total >= HIGH_VOLUME_EVENT_THRESHOLD
+        )
+        if registry.configured and registry.error is None
+        else []
     )
     warnings: list[str] = []
-    if high_volume_unready:
+    if registry.error:
+        warnings.append(f"invalid {AGENT_ADOPTION_ENV}: {registry.error}")
+    elif high_volume_unready:
         warnings.append(
             "high-volume runtimes need Drover MCP/skill rollout: "
             + ", ".join(high_volume_unready)
@@ -157,6 +216,8 @@ def adoption_snapshot(audit: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "version": 1,
+        "configured": registry.configured,
+        "configuration_error": registry.error,
         "high_volume_event_threshold": HIGH_VOLUME_EVENT_THRESHOLD,
         "runtimes": runtimes,
         "observed_agent_ids": sorted(observed_agent_ids),

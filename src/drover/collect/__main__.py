@@ -42,7 +42,7 @@ _DEFAULT_CONFIG_TEMPLATE = """\
 # drover-collect host config
 
 host_id     = "{host_id}"
-remote_host = "mac-mini.local"
+remote_host = "127.0.0.1"
 remote_user = "{user}"
 state_dir   = "{home}/.drover/state"
 staging_dir = "{home}/.drover/staging"
@@ -72,9 +72,9 @@ db_path = "{home}/max/data/task-journal.db"
 # gRPC receiver. Independent of the file-shipper above.
 [tempo]
 enabled              = false
-tempo_base           = "http://192.168.1.70:31989"
-services             = ["agentweave-proxy", "mux-router"]
-target_otlp_endpoint = "Arnabs-Mac-mini.local:4317"
+tempo_base           = "http://127.0.0.1:3200"
+services             = []
+target_otlp_endpoint = "127.0.0.1:4317"
 lookback_seconds     = 60
 initial_window_s     = 3600
 max_window_seconds   = 3600

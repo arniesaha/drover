@@ -1,0 +1,9 @@
+# Classified historical false positives from the public-release audit.
+# Keep these fingerprint-specific so new findings still fail the scan.
+6f6320a91c599cee9758534f18c5dd21891a25ca:docs/architecture.md:generic-api-key:132
+6f6320a91c599cee9758534f18c5dd21891a25ca:src/drover/config.py:generic-api-key:156
+6f6320a91c599cee9758534f18c5dd21891a25ca:src/drover/server/__main__.py:generic-api-key:123
+6f6320a91c599cee9758534f18c5dd21891a25ca:src/drover/server/summarizer/backends/config.py:generic-api-key:15
+6f6320a91c599cee9758534f18c5dd21891a25ca:tests/test_config.py:generic-api-key:137
+6f6320a91c599cee9758534f18c5dd21891a25ca:tests/test_context_catalog.py:github-oauth:90
+6f6320a91c599cee9758534f18c5dd21891a25ca:tests/test_summarizer_diagnostics.py:generic-api-key:179
