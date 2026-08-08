@@ -59,6 +59,8 @@ class _Entry:
         self.seq = 0
         self.awaiting: str | None = None
         self.lock = threading.Lock()
+        self.turn_lock = threading.Lock()
+        self.turn_active = False
         self.emit: Callable[[StructuredMessage], None] | None = None
 
 
@@ -72,6 +74,11 @@ class StructuredSessionManager:
     def has(self, session_id: str) -> bool:
         with self._entries_lock:
             return session_id in self._entries
+
+    def is_alive(self, session_id: str) -> bool:
+        with self._entries_lock:
+            entry = self._entries.get(session_id)
+        return bool(entry and entry.driver.is_alive())
 
     def harness_for(self, session_id: str) -> str | None:
         with self._entries_lock:
@@ -130,6 +137,11 @@ class StructuredSessionManager:
                     entry.awaiting = "input"
                 elif message.type == "user_input":
                     entry.awaiting = None
+                if message.type == "status" and (
+                    payload.get("turn_complete") or "exited" in payload
+                ):
+                    with entry.turn_lock:
+                        entry.turn_active = False
                 awaiting = entry.awaiting
                 event_payload = message.to_payload()
                 event_payload["seq"] = seq
@@ -197,6 +209,7 @@ class StructuredSessionManager:
                 and "exited" in payload
                 and message.turn_id is None
             ):
+                self._discard_entry(session_id, entry)
                 finalize(session_id, int(payload["exited"]))
 
         entry.emit = emit
@@ -230,18 +243,27 @@ class StructuredSessionManager:
         entry = self._require_entry(session_id)
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
+        with entry.turn_lock:
+            if entry.turn_active:
+                raise RuntimeError("turn already in flight")
+            entry.turn_active = True
         turn_id = f"turn-{uuid4()}"
         # Dispatch first: Codex/Gemini raise RuntimeError here ("turn
         # already in flight" / "driver is closed") when a turn can't be
         # accepted, and we must not record a user_input event for a turn
         # that was never actually sent.
-        entry.driver.send_turn(
-            text,
-            turn_id,
-            images=images,
-            model=model,
-            thinking_effort=thinking_effort,
-        )
+        try:
+            entry.driver.send_turn(
+                text,
+                turn_id,
+                images=images,
+                model=model,
+                thinking_effort=thinking_effort,
+            )
+        except Exception:
+            with entry.turn_lock:
+                entry.turn_active = False
+            raise
         payload: dict = {}
         if images:
             # Metadata only — the base64 payload never enters the event
@@ -297,3 +319,8 @@ class StructuredSessionManager:
         if entry is None:
             raise KeyError(f"unknown structured session {session_id!r}")
         return entry
+
+    def _discard_entry(self, session_id: str, expected: _Entry) -> None:
+        with self._entries_lock:
+            if self._entries.get(session_id) is expected:
+                self._entries.pop(session_id, None)

@@ -2260,8 +2260,8 @@ def test_ingest_harness_events_derives_session_awaiting_state(tmp_path):
                     "event_id": "harness-event-a1",
                     "session_id": "harness-s3",
                     "seq": 1,
-                    "type": "user_input",
-                    "payload": {},
+                    "type": "status",
+                    "payload": {"native_session_id": "provider-session-3"},
                     "ts": "2026-07-06T00:00:01+00:00",
                 },
                 {
@@ -2277,6 +2277,7 @@ def test_ingest_harness_events_derives_session_awaiting_state(tmp_path):
         session = registry.get_session("harness-s3")
         assert session.awaiting == "approval"
         assert session.last_activity is not None
+        assert session.native_session_id == "provider-session-3"
 
         _ingest_events(
             port,
@@ -3112,6 +3113,29 @@ def test_turn_recovery_without_native_id_returns_actionable_conflict(
         "Session cannot be resumed after the harness restart. "
         "Continue it in a new session."
     )
+
+
+@pytest.mark.parametrize("recovery_status", [401, 403, 404, 500, 502])
+def test_turn_recovery_preserves_transient_or_unexpected_recovery_failure(
+    monkeypatch, tmp_path, recovery_status
+):
+    collector = _recovery_collector(tmp_path)
+    responses = iter(
+        [
+            (404, '{"error":"unknown structured session: harness-recover"}\n'),
+            (recovery_status, '{"error":"recovery service unavailable"}\n'),
+        ]
+    )
+    monkeypatch.setattr(
+        collector, "_harness_request", lambda *_args, **_kwargs: next(responses)
+    )
+
+    status, body = collector.proxy_harness_session_action(
+        "harness-recover", "turns", {"text": "x"}
+    )
+
+    assert status == recovery_status
+    assert json.loads(body)["error"] == "recovery service unavailable"
 
 
 def test_recovery_native_id_falls_back_to_structured_event_payload(tmp_path):

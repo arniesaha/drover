@@ -1548,6 +1548,58 @@ def test_harnessd_concurrent_recovery_creates_one_driver(tmp_path):
         server.server_close()
 
 
+def test_harnessd_terminate_waits_for_recovery_and_wins(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    original_start = state.structured.start
+    driver_started = threading.Event()
+    allow_recovery_to_finish = threading.Event()
+    results: dict[str, tuple[int, dict]] = {}
+
+    def blocking_start(*args, **kwargs):
+        original_start(*args, **kwargs)
+        driver_started.set()
+        assert allow_recovery_to_finish.wait(timeout=5)
+
+    state.structured.start = blocking_start
+
+    recovery = threading.Thread(
+        target=lambda: results.setdefault(
+            "recovery",
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            ),
+        )
+    )
+    terminate = threading.Thread(
+        target=lambda: results.setdefault(
+            "terminate",
+            _json_request(
+                f"{base_url}/sessions/{session_id}/terminate", payload={}
+            ),
+        )
+    )
+    try:
+        recovery.start()
+        assert driver_started.wait(timeout=5)
+        terminate.start()
+        allow_recovery_to_finish.set()
+        recovery.join(timeout=5)
+        terminate.join(timeout=5)
+
+        assert results["recovery"][0] == 200
+        assert results["terminate"][0] == 200
+        assert state.registry.get_session(session_id).status == "terminated"
+        assert not state.structured.has(session_id)
+    finally:
+        allow_recovery_to_finish.set()
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 @pytest.mark.parametrize(
     ("harness", "native_session_id", "cwd_exists"),
     [
@@ -1603,6 +1655,57 @@ def test_harnessd_recovery_rejects_terminated_session(tmp_path):
         error = json.loads(raised.value.read().decode("utf-8"))["error"]
         assert "Continue it in a new session" in error
         assert not state.structured.has(session_id)
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_rejects_generic_errored_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    state.registry.update_session_status(
+        session_id,
+        "errored",
+        last_error="provider authentication failed",
+        ended_at=datetime.now(timezone.utc),
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )
+
+        assert raised.value.code == 409
+        assert not state.structured.has(session_id)
+        assert state.registry.get_session(session_id).last_error == (
+            "provider authentication failed"
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_can_terminate_restart_lost_structured_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session_id}/terminate", payload={}
+        )
+
+        assert status == 200
+        assert payload["status"] == "terminated"
+        assert state.registry.get_session(session_id).status == "terminated"
+        assert not state.structured.has(session_id)
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )
+        assert raised.value.code == 409
     finally:
         state.pty.close_all()
         server.shutdown()

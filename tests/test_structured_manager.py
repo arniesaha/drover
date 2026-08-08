@@ -200,6 +200,55 @@ def test_send_turn_forwards_images_and_records_attachments(monkeypatch, tmp_path
     ]
 
 
+def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_path):
+    mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    first_turn = mgr.send_turn("sess-1", "first")
+    with pytest.raises(RuntimeError, match="turn already in flight"):
+        mgr.send_turn("sess-1", "second")
+
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="turn complete",
+            payload={"turn_complete": True, "awaiting": "input"},
+            turn_id=first_turn,
+        )
+    )
+    second_turn = mgr.send_turn("sess-1", "second")
+
+    assert [text for text, _turn_id in driver.sent_turns] == ["first", "second"]
+    assert second_turn != first_turn
+    assert sum(
+        event.event_type == "user_input"
+        for event in registry.list_events("sess-1")
+    ) == 2
+
+
+def test_process_exit_removes_dead_manager_entry(monkeypatch, tmp_path):
+    mgr, driver, _registry, _on_messages, finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    driver.closed = True
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="process exited",
+            payload={"exited": 1},
+            turn_id=None,
+        )
+    )
+
+    assert finalized == [("sess-1", 1)]
+    assert not mgr.has("sess-1")
+    assert not mgr.is_alive("sess-1")
+
+
 def test_answer_permission_dispatches_before_recording_and_skips_event_on_failure(
     monkeypatch, tmp_path
 ):

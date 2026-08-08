@@ -786,8 +786,10 @@ class MetricsCollector:
                 payload={"native_session_id": native_session_id},
                 timeout_s=15.0,
             )
-            if not 200 <= recovery_status < 300:
+            if recovery_status == 409:
                 return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+            if not 200 <= recovery_status < 300:
+                return recovery_status, _recovery_body
             try:
                 HarnessRegistry(self.duckdb_path).mark_session_recovered(
                     session_id, native_session_id

@@ -1883,7 +1883,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             body.get("native_session_id") if body is not None else None
         )
         with self.server.state.recovery_lock_for(session_id):
-            if self.server.state.structured.has(session_id):
+            if self.server.state.structured.is_alive(session_id):
                 session = self.server.state.registry.get_session(session_id)
                 self._write_json(
                     {
@@ -1896,12 +1896,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if self.server.state.structured.has(session_id):
+                self.server.state.structured.close(session_id)
 
             session = self.server.state.registry.get_session(session_id)
             if (
                 session is None
                 or session.mode != "structured"
                 or session.status != "errored"
+                or session.last_error != _ORPHANED_STRUCTURED_ERROR
                 or session.harness not in _RECOVERY_HARNESSES
                 or not native_session_id
                 or (
@@ -1941,6 +1944,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     finalize=self._finalize_structured_session,
                     native_session_id=native_session_id,
                 )
+                if not self.server.state.structured.is_alive(session_id):
+                    raise RuntimeError("recovered driver exited during startup")
                 self.server.state.registry.mark_session_recovered(
                     session_id, native_session_id
                 )
@@ -2215,11 +2220,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._reconcile_exited_sessions()
-        session = self.server.state.pty.get(session_id)
-        if session is None:
-            if self.server.state.structured.has(session_id):
-                self._terminate_structured_session(session_id)
-                return
+        pty_session = self.server.state.pty.get(session_id)
+        if pty_session is None:
+            with self.server.state.recovery_lock_for(session_id):
+                try:
+                    registry_session = self.server.state.registry.get_session(
+                        session_id
+                    )
+                except Exception:
+                    registry_session = None
+                if self.server.state.structured.has(session_id) or (
+                    registry_session is not None
+                    and registry_session.mode == "structured"
+                    and registry_session.status not in {"completed", "terminated"}
+                ):
+                    self._terminate_structured_session(session_id)
+                    return
             self._write_json(
                 {"error": f"unknown terminal session: {session_id}"},
                 status=HTTPStatus.NOT_FOUND,
