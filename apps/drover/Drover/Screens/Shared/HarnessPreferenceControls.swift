@@ -3,6 +3,7 @@ import DroverKit
 
 struct HarnessPreferenceControls: View {
     let harness: String
+    let isEditable: Bool
     @Binding var selectedModel: String
     @Binding var thinkingEffort: String
 
@@ -29,8 +30,17 @@ struct HarnessPreferenceControls: View {
                 }
                 .buttonStyle(.plain)
             }
+
+            if !isEditable {
+                Image(systemName: "lock.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Run preferences locked for this session")
+            }
         }
         .layoutPriority(1)
+        .disabled(!isEditable)
+        .opacity(isEditable ? 1 : 0.7)
     }
 
     private var modelLabel: String {
