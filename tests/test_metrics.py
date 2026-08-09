@@ -1862,6 +1862,57 @@ def test_content_consent_reports_partial_and_revoke_fails_on_reachable_nack(
     assert json.loads(revoked_body)["propagation"] == "failed"
 
 
+def test_offline_registered_host_keeps_consent_and_revoke_partial(tmp_path) -> None:
+    """Catches known offline hosts disappearing from fleet consent results."""
+
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="offline-laptop",
+        display_name="Offline Laptop",
+        kind="macos",
+        connection_kind="relay",
+        status="offline",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    enabled_status, enabled_body = collector.consent_content_analysis(
+        {"backend": "local"}
+    )
+    revoked_status, revoked_body = collector.revoke_content_analysis({})
+
+    assert enabled_status == 207
+    assert json.loads(enabled_body)["hosts"] == [
+        {"host_id": "offline-laptop", "state": "disconnected"}
+    ]
+    assert revoked_status == 207
+    assert json.loads(revoked_body)["hosts"] == [
+        {"host_id": "offline-laptop", "state": "disconnected"}
+    ]
+
+
+def test_empty_registry_is_complete_local_only_content_consent(tmp_path) -> None:
+    """Defines no registered hosts as an intentional local-only deployment."""
+
+    collector = _make_collector(tmp_path)
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    enabled_status, enabled_body = collector.consent_content_analysis(
+        {"backend": "local"}
+    )
+    revoked_status, revoked_body = collector.revoke_content_analysis({})
+
+    assert enabled_status == 200
+    assert json.loads(enabled_body)["propagation"] == "complete"
+    assert json.loads(enabled_body)["hosts"] == []
+    assert revoked_status == 200
+    assert json.loads(revoked_body)["propagation"] == "complete"
+    assert json.loads(revoked_body)["hosts"] == []
+
+
 def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     collector = collector_with_hosts
     fake = _FakeRelay()

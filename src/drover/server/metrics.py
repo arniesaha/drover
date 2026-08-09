@@ -855,10 +855,14 @@ class MetricsCollector:
         try:
             validate_action_body(body, allowed=set())
             payload = self._insights().revoke_content_analysis()
-            return _json_response(
-                503 if payload.get("propagation") == "failed" else 200,
-                payload,
-            )
+            propagation = payload.get("propagation")
+            if propagation == "failed":
+                status = 503
+            elif propagation == "complete":
+                status = 200
+            else:
+                status = 207
+            return _json_response(status, payload)
         except Exception as exc:
             return _insight_error_response(exc)
 
@@ -1006,12 +1010,18 @@ class MetricsCollector:
         self, enabled: bool, epoch: int
     ) -> list[dict[str, str]]:
         try:
-            hosts = HarnessRegistry(self.duckdb_path).list_hosts(status="online")
+            hosts = HarnessRegistry(self.duckdb_path).list_hosts()
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to enumerate hosts for content consent: %s", exc)
             return [{"host_id": "fleet", "state": "failed"}]
         consent = {"enabled": enabled, "epoch": epoch}
-        return [self._push_content_consent(host, consent) for host in hosts]
+        results: list[dict[str, str]] = []
+        for host in hosts:
+            if str(getattr(host, "status", "offline")) != "online":
+                results.append({"host_id": host.host_id, "state": "disconnected"})
+                continue
+            results.append(self._push_content_consent(host, consent))
+        return results
 
     def _push_content_consent(
         self, host: Any, consent: Mapping[str, Any]
