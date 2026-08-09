@@ -24,6 +24,42 @@ struct DroverColorTests {
         }
     }
 
+    // MARK: - Tide
+
+    /// Tide retired the purple accent, and the hexes are not what is locked
+    /// here — steps get rebalanced. What is locked is the hue *family*: an
+    /// accent whose red channel leads is the old purple creeping back through
+    /// a rebalance.
+    @Test func theAccentIsTealInBothRamps() {
+        let accents = [("accent", DroverColor.accent), ("accentHi", DroverColor.accentHi)]
+        for scheme in [ColorScheme.dark, .light] {
+            for (name, token) in accents {
+                let rgb = token.rgb(for: scheme)
+                let (red, green, blue) = channels(rgb)
+                #expect(green > red && blue > red,
+                        "\(name) in \(scheme) leads with red — that is the retired purple")
+            }
+        }
+    }
+
+    /// The other half of the swap: the grounds dropped their blue-violet cast
+    /// so the teal is the only chromatic thing on screen. A ground that leans
+    /// hard on one channel is décor competing with signal.
+    @Test func theGroundsAreNearNeutral() {
+        for scheme in [ColorScheme.dark, .light] {
+            for (name, token) in [("bg", DroverColor.bg), ("surface", DroverColor.surface)] {
+                let (red, green, blue) = channels(token.rgb(for: scheme))
+                let spread = max(red, green, blue) - min(red, green, blue)
+                #expect(spread <= 12,
+                        "\(name) in \(scheme) spreads \(spread) across channels — it is tinted, not neutral")
+            }
+        }
+    }
+
+    private func channels(_ rgb: UInt32) -> (Int, Int, Int) {
+        (Int((rgb >> 16) & 0xFF), Int((rgb >> 8) & 0xFF), Int(rgb & 0xFF))
+    }
+
     // MARK: - The "cards read as lifted" rule
 
     /// Light mode grounds one step *down* (neutral-200) precisely so that
