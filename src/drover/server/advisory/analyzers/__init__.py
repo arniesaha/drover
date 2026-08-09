@@ -154,6 +154,7 @@ class HookDescriptor:
     harness_id: str
     canonical_config_path: str
     canonical_executable_path: str
+    target_hash: str
     enabled: bool
     executable_exists: bool
     executable_is_file: bool
@@ -169,11 +170,21 @@ class HookDescriptor:
             "harness_id",
             "canonical_config_path",
             "canonical_executable_path",
+            "target_hash",
             "source_ref",
         ):
             _require_nonempty(getattr(self, field_name), field_name)
         if not self.allowlisted:
             raise ValueError("hook descriptor must be allowlisted by the caller")
+        for field_name in (
+            "enabled",
+            "executable_exists",
+            "executable_is_file",
+            "executable_is_executable",
+            "allowlisted",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"{field_name} must be a boolean")
         for field_name in ("canonical_config_path", "canonical_executable_path"):
             path = PurePath(getattr(self, field_name))
             if not path.is_absolute() or ".." in path.parts:

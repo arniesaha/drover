@@ -48,6 +48,7 @@ class HookValidityAnalyzer:
                                 "executable_exists": hook.executable_exists,
                                 "executable_is_file": hook.executable_is_file,
                                 "executable_is_executable": hook.executable_is_executable,
+                                "target_hash": hook.target_hash,
                             },
                         ),
                     ),

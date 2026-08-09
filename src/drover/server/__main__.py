@@ -57,6 +57,7 @@ from drover.server.advisory.worker import (
     ContentAnalysisScheduler,
     ContentAnalysisWorker,
     load_operational_snapshot,
+    operational_snapshot_source_version,
     operational_analyzers,
 )
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
@@ -1326,6 +1327,9 @@ def run(
             duckdb_path=cfg.duckdb_path,
             analyzer_ids=(item.analyzer_id for item in advisory_analyzers),
             full_review_interval_seconds=cfg.advisory_full_review_interval_seconds,
+            source_version_factory=lambda analyzer_id, target_id: operational_snapshot_source_version(
+                cfg.duckdb_path, analyzer_id, target_id
+            ),
         )
         advisory_worker = AdvisoryWorker(
             duckdb_path=cfg.duckdb_path,

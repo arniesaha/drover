@@ -39,6 +39,7 @@ from drover.server.advisory.worker import (
     ContentAnalysisScheduler,
     ContentAnalysisWorker,
     load_operational_snapshot,
+    operational_snapshot_source_version,
     operational_analyzers,
 )
 from drover.server.advisory.content_targets import BundledTarget, ContentBundle
@@ -313,6 +314,50 @@ def test_empty_snapshot_is_not_treated_as_passing_evidence(db_path: Path) -> Non
     worker.run_once([PassingAnalyzer()])
 
     assert AdvisoryRepository(db_path).list_findings()[0].state.value == "open"
+
+
+def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
+    db_path: Path, monkeypatch
+) -> None:
+    job = enqueue_advisory_check(
+        db_path, analyzer_id="healthy", target_id="mac-mini", source_version="v1"
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda _analyzer, _target, version: _snapshot(version),
+        retry_delay=timedelta(0),
+        clock=lambda: NOW,
+    )
+    original = Ledger.succeed_job
+
+    def fail_after_completion(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise RuntimeError("fault after ledger completion")
+
+    monkeypatch.setattr(Ledger, "succeed_job", fail_after_completion)
+    assert worker.run_once([HealthyAnalyzer()]).failed == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 0
+        assert (
+            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 0
+        )
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 0
+        assert (
+            con.execute(
+                "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+            ).fetchone()[0]
+            == "retry_wait"
+        )
+
+    monkeypatch.setattr(Ledger, "succeed_job", original)
+    assert worker.run_once([HealthyAnalyzer()]).succeeded == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 1
+        assert (
+            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 1
+        )
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 1
 
 
 def test_new_source_version_reopens_dead_lettered_subject(db_path: Path) -> None:
@@ -1349,7 +1394,179 @@ def test_runtime_registers_only_analyzers_with_snapshot_evidence() -> None:
     assert [item.analyzer_id for item in operational_analyzers()] == [
         "deterministic.connector_freshness",
         "deterministic.provider_reset_windows",
+        "deterministic.telemetry_coverage",
+        "deterministic.routing_mismatch",
+        "deterministic.cache_read_efficiency",
+        "deterministic.hook_validity",
     ]
+
+
+def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              session_id VARCHAR, start_time TIMESTAMPTZ, llm_provider VARCHAR,
+              routing_provider VARCHAR, routing_model VARCHAR,
+              prompt_tokens BIGINT, total_tokens BIGINT,
+              cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, repo_owner, repo_name, command,
+              status, model, started_at, updated_at
+            ) VALUES
+              ('s1', 'mac-mini', 'codex', 'acme', 'drover', 'codex', 'completed',
+               'gpt-5', ?, ?),
+              ('s2', 'mac-mini', 'codex', NULL, NULL, 'codex', 'completed',
+               'gpt-5', ?, ?)
+            """,
+            [NOW, NOW, NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched VALUES
+              ('s1', ?, 'openai', 'openai', 'gpt-4', 20000, 21000, 0, 1.5)
+            """,
+            [NOW],
+        )
+        descriptor = {
+            "advisory": {
+                "hooks": [
+                    {
+                        "hook_id": "session-start",
+                        "harness_id": "codex",
+                        "canonical_config_path": "/Users/operator/.codex/config.toml",
+                        "canonical_executable_path": "/opt/drover/bin/drover-hook",
+                        "enabled": True,
+                        "executable_exists": False,
+                        "executable_is_file": False,
+                        "executable_is_executable": False,
+                        "target_hash": "sha256:missing",
+                        "allowlisted": True,
+                    }
+                ]
+            },
+            "secret": "do-not-copy",
+            "config_content": "PRIVATE PROMPT",
+        }
+        con.execute(
+            """
+            INSERT INTO harness_hosts (
+              host_id, display_name, kind, status, capabilities_json,
+              last_seen_at, updated_at
+            ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', ?, ?, ?)
+            """,
+            [json.dumps(descriptor), NOW, NOW],
+        )
+
+    telemetry = load_operational_snapshot(
+        db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
+    )
+    routing = load_operational_snapshot(
+        db_path, "deterministic.routing_mismatch", "fleet", "facts:v1"
+    )
+    hooks = load_operational_snapshot(
+        db_path, "deterministic.hook_validity", "fleet", "facts:v1"
+    )
+
+    assert len(telemetry.telemetry) == 1
+    assert telemetry.telemetry[0].total_sessions == 2
+    assert telemetry.telemetry[0].repository_attributed_sessions == 1
+    assert telemetry.telemetry[0].token_observed_sessions == 1
+    assert len(routing.routing) == 1
+    assert (routing.routing[0].decision_count, routing.routing[0].mismatch_count) == (
+        1,
+        1,
+    )
+    assert len(hooks.hooks) == 1
+    assert hooks.hooks[0].target_hash == "sha256:missing"
+    assert "PRIVATE PROMPT" not in repr(hooks)
+    assert "do-not-copy" not in repr(hooks)
+
+    findings = {
+        analyzer.analyzer_id: analyzer.analyze(
+            load_operational_snapshot(db_path, analyzer.analyzer_id, "fleet", "v1")
+        )
+        for analyzer in operational_analyzers()
+    }
+    assert findings["deterministic.telemetry_coverage"]
+    assert findings["deterministic.cache_read_efficiency"]
+    assert findings["deterministic.hook_validity"]
+
+
+def test_operational_fact_hash_coalesces_unchanged_rows(db_path: Path) -> None:
+    first = operational_snapshot_source_version(
+        db_path, "deterministic.telemetry_coverage", "fleet"
+    )
+    second = operational_snapshot_source_version(
+        db_path, "deterministic.telemetry_coverage", "fleet"
+    )
+
+    assert first == second
+    assert first.startswith("operational-facts:")
+
+
+def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              session_id VARCHAR, start_time TIMESTAMPTZ,
+              prompt_tokens BIGINT, total_tokens BIGINT,
+              cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, started_at, updated_at
+            )
+            SELECT 'session-' || i, 'mac-mini', 'codex', 'codex', 'completed',
+                   ? - i * INTERVAL 1 SECOND, ? - i * INTERVAL 1 SECOND
+            FROM range(513) rows(i)
+            """,
+            [NOW, NOW],
+        )
+
+    snapshot = load_operational_snapshot(
+        db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
+    )
+
+    assert snapshot.telemetry[0].total_sessions == 512
+
+
+def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(
+    db_path: Path,
+) -> None:
+    now = [0.0]
+    scheduler = AdvisoryScheduler(
+        duckdb_path=db_path,
+        analyzer_ids=("deterministic.telemetry_coverage",),
+        full_review_interval_seconds=60,
+        clock=lambda: now[0],
+        source_version_factory=lambda analyzer_id, target_id: (
+            f"facts:{analyzer_id}:{target_id}:stable"
+        ),
+    )
+
+    first = scheduler.enqueue_due_full_review()[0]
+    now[0] = 60.0
+    second = scheduler.enqueue_due_full_review()[0]
+
+    assert second.job_id == first.job_id
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM pipeline_receipts WHERE source_key = ?",
+                ["deterministic.telemetry_coverage:fleet"],
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_runtime_snapshot_includes_latest_provider_reset_windows(

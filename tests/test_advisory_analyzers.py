@@ -228,6 +228,7 @@ def test_missing_hook_executable_is_confirmed_without_opening_hook_files() -> No
         harness_id="claude",
         canonical_config_path="/Users/operator/.claude/settings.json",
         canonical_executable_path="/opt/drover/bin/drover-hook",
+        target_hash="sha256:hook-target",
         enabled=True,
         executable_exists=False,
         executable_is_file=False,
@@ -248,6 +249,7 @@ def test_missing_hook_executable_is_confirmed_without_opening_hook_files() -> No
         "executable_exists": False,
         "executable_is_file": False,
         "executable_is_executable": False,
+        "target_hash": "sha256:hook-target",
     }
     assert finding.remediation[0].startswith("Restore executable")
 
@@ -259,6 +261,7 @@ def test_hook_descriptor_rejects_non_allowlisted_or_noncanonical_input() -> None
         "harness_id": "claude",
         "canonical_config_path": "/Users/operator/.claude/settings.json",
         "canonical_executable_path": "/opt/drover/bin/drover-hook",
+        "target_hash": "sha256:hook-target",
         "enabled": True,
         "executable_exists": True,
         "executable_is_file": True,
@@ -276,6 +279,8 @@ def test_hook_descriptor_rejects_non_allowlisted_or_noncanonical_input() -> None
         HookDescriptor(
             **(fields | {"canonical_executable_path": "/opt/drover/../bin/drover-hook"})
         )
+    with pytest.raises(ValueError, match="enabled"):
+        HookDescriptor(**(fields | {"enabled": "true"}))
 
 
 @pytest.mark.parametrize(

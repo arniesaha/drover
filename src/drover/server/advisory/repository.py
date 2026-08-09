@@ -196,27 +196,10 @@ class AdvisoryRepository:
         return finding_id
 
     def mark_passing(self, finding_id: str, *, run_id: str) -> Finding:
-        now = datetime.now(timezone.utc)
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
             con.execute("BEGIN TRANSACTION")
-            self._require_finding(con, finding_id)
-            con.execute(
-                """
-                UPDATE advisory_findings
-                SET state = ?, resolved_at = ?, latest_run_id = ?
-                WHERE finding_id = ?
-                """,
-                [FindingState.RESOLVED.value, now, run_id, finding_id],
-            )
-            con.execute(
-                """
-                INSERT INTO advisory_occurrences (
-                  occurrence_id, finding_id, run_id, outcome, observed_at
-                ) VALUES (?, ?, ?, 'passing', ?)
-                """,
-                [uuid4().hex, finding_id, run_id, now],
-            )
+            self.mark_passing_in_transaction(con, finding_id, run_id=run_id)
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")
@@ -224,6 +207,36 @@ class AdvisoryRepository:
         finally:
             con.close()
         return self.get_finding(finding_id)
+
+    def mark_passing_in_transaction(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        finding_id: str,
+        *,
+        run_id: str,
+    ) -> None:
+        """Resolve one finding using the caller's existing transaction."""
+
+        if not run_id.strip():
+            raise ValueError("run_id is required")
+        now = datetime.now(timezone.utc)
+        self._require_finding(con, finding_id)
+        con.execute(
+            """
+            UPDATE advisory_findings
+            SET state = ?, resolved_at = ?, latest_run_id = ?
+            WHERE finding_id = ?
+            """,
+            [FindingState.RESOLVED.value, now, run_id, finding_id],
+        )
+        con.execute(
+            """
+            INSERT INTO advisory_occurrences (
+              occurrence_id, finding_id, run_id, outcome, observed_at
+            ) VALUES (?, ?, ?, 'passing', ?)
+            """,
+            [uuid4().hex, finding_id, run_id, now],
+        )
 
     def acknowledge(self, finding_id: str) -> Finding:
         return self._operator_transition(

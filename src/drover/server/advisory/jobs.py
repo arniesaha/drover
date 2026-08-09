@@ -131,6 +131,7 @@ class AdvisoryScheduler:
         analyzer_ids: Iterable[str],
         full_review_interval_seconds: float = DEFAULT_FULL_REVIEW_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.time,
+        source_version_factory: Callable[[str, str], str] | None = None,
     ) -> None:
         interval = float(full_review_interval_seconds)
         if not math.isfinite(interval) or interval <= 0:
@@ -139,19 +140,23 @@ class AdvisoryScheduler:
         self.analyzer_ids = tuple(analyzer_ids)
         self.full_review_interval_seconds = interval
         self.clock = clock
+        self.source_version_factory = source_version_factory
         self._last_bucket: int | None = None
 
     def enqueue_due_full_review(self) -> list[Job]:
         bucket = math.floor(self.clock() / self.full_review_interval_seconds)
         if bucket == self._last_bucket:
             return []
-        source_version = f"scheduled:{bucket}"
         jobs = [
             enqueue_advisory_check(
                 self.duckdb_path,
                 analyzer_id=analyzer_id,
                 target_id="fleet",
-                source_version=source_version,
+                source_version=(
+                    self.source_version_factory(analyzer_id, "fleet")
+                    if self.source_version_factory is not None
+                    else f"scheduled:{bucket}"
+                ),
             )
             for analyzer_id in self.analyzer_ids
         ]

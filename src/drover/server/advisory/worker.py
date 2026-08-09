@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -18,12 +18,21 @@ from drover.server.advisory.analyzers import (
     MAX_SNAPSHOT_RECORDS,
     AnalysisSnapshot,
     Analyzer,
+    HookDescriptor,
     ProviderConnectionObservation,
     ProviderResetWindow,
+    RoutingAggregate,
+    TelemetryAggregate,
 )
 from drover.server.advisory.analyzers.connectors import (
     ConnectorFreshnessAnalyzer,
     ProviderResetWindowAnalyzer,
+)
+from drover.server.advisory.analyzers.hooks import HookValidityAnalyzer
+from drover.server.advisory.analyzers.routing import RoutingMismatchAnalyzer
+from drover.server.advisory.analyzers.telemetry import (
+    CacheReadEfficiencyAnalyzer,
+    TelemetryCoverageAnalyzer,
 )
 from drover.server.advisory.jobs import (
     ADVISORY_ARTIFACT_KIND,
@@ -43,7 +52,7 @@ from drover.server.advisory.model_analyzer import (
     ModelConfigurationAnalyzer,
     ModelFindingError,
 )
-from drover.server.advisory.types import FindingCandidate, FindingState
+from drover.server.advisory.types import FindingCandidate
 from drover.server.db import open_duckdb_connection
 from drover.server.ledger import ArtifactSpec, Job, Ledger
 
@@ -691,42 +700,56 @@ class AdvisoryWorker:
         if snapshot.source_version != source_version:
             raise ValueError("snapshot source version does not match the durable job")
 
-        existing = {
-            item.finding_id: item
-            for item in self.repository.list_findings()
-            if item.analyzer_id == analyzer.analyzer_id
-            and _finding_in_job_scope(target_id, item.target_id)
-            and item.state not in {FindingState.RESOLVED, FindingState.DISMISSED}
-        }
-        affected: list[str] = []
-        observed_fingerprints: set[str] = set()
-        for candidate in analyzer.analyze(snapshot):
+        candidates = analyzer.analyze(snapshot)
+        for candidate in candidates:
             if candidate.analyzer_id != analyzer.analyzer_id:
                 raise ValueError(
                     "analyzer emitted a candidate with another analyzer_id"
                 )
-            finding = self.repository.observe(
-                candidate, run_id=job.latest_attempt_id or job.job_id
-            )
-            affected.append(finding.finding_id)
-            observed_fingerprints.add(finding.fingerprint)
-        for finding in existing.values():
-            if (
-                finding.fingerprint not in observed_fingerprints
-                and _snapshot_covers_finding(
-                    snapshot, finding.target_type, finding.target_id
-                )
-            ):
-                passing = self.repository.mark_passing(
-                    finding.finding_id, run_id=job.latest_attempt_id or job.job_id
-                )
-                affected.append(passing.finding_id)
-
-        finding_ids = tuple(dict.fromkeys(affected))
-        payload = json.dumps(finding_ids, separators=(",", ":"))
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
             con.execute("BEGIN TRANSACTION")
+            run_id = job.latest_attempt_id or job.job_id
+            existing = con.execute(
+                """
+                SELECT finding_id, fingerprint, target_type, target_id
+                FROM advisory_findings
+                WHERE analyzer_id = ? AND state NOT IN ('resolved', 'dismissed')
+                """,
+                [analyzer.analyzer_id],
+            ).fetchall()
+            affected: list[str] = []
+            observed_fingerprints: set[str] = set()
+            for candidate in candidates:
+                finding_id = self.repository.observe_in_transaction(
+                    con, candidate, run_id=run_id
+                )
+                fingerprint = con.execute(
+                    "SELECT fingerprint FROM advisory_findings WHERE finding_id = ?",
+                    [finding_id],
+                ).fetchone()[0]
+                affected.append(finding_id)
+                observed_fingerprints.add(str(fingerprint))
+            for (
+                finding_id,
+                fingerprint,
+                finding_target_type,
+                finding_target_id,
+            ) in existing:
+                if (
+                    _finding_in_job_scope(target_id, str(finding_target_id))
+                    and str(fingerprint) not in observed_fingerprints
+                    and _snapshot_covers_finding(
+                        snapshot, str(finding_target_type), str(finding_target_id)
+                    )
+                ):
+                    self.repository.mark_passing_in_transaction(
+                        con, str(finding_id), run_id=run_id
+                    )
+                    affected.append(str(finding_id))
+
+            finding_ids = tuple(dict.fromkeys(affected))
+            payload = json.dumps(finding_ids, separators=(",", ":"))
             ledger = Ledger(con)
             ledger.succeed_job(
                 job.job_id,
@@ -861,77 +884,134 @@ def _finding_in_job_scope(job_target_id: str, finding_target_id: str) -> bool:
 
 def load_operational_snapshot(
     duckdb_path: str | Path,
-    _analyzer_id: str,
+    analyzer_id: str,
     target_id: str,
     source_version: str,
 ) -> AnalysisSnapshot:
-    """Build a bounded, credential-free snapshot from durable connector state.
-
-    Other fact families remain empty until their bounded query producers have
-    evidence. The worker therefore cannot treat them as passing evidence.
-    """
+    """Build analyzer-scoped bounded facts from normalized runtime state."""
 
     analyzed_at = datetime.now(timezone.utc)
     con = open_duckdb_connection(Path(duckdb_path), read_only=True, role="diagnostic")
     try:
-        params: list[object] = []
-        where = ""
-        if target_id != "fleet":
-            where = "WHERE host_id = ?"
-            params.append(target_id)
-        rows = con.execute(
-            f"""
-            SELECT provider, account_label, host_id, enabled, last_attempt_at,
-                   last_success_at, error_category, updated_at
-            FROM provider_connections
-            {where}
-            ORDER BY host_id, provider, account_label
-            LIMIT {MAX_SNAPSHOT_RECORDS}
-            """,
-            params,
-        ).fetchall()
-        windows = con.execute(
-            f"""
-            WITH chosen AS (
-              SELECT provider, account_label, host_id,
-                     arg_max(snapshot_id, observed_at) FILTER (
-                       WHERE status IN ('ok', 'usage_unavailable')
-                     ) AS snapshot_id
-              FROM provider_usage_snapshots
-              {where}
-              GROUP BY provider, account_label, host_id
-            )
-            SELECT p.provider, p.account_label, p.host_id, p.window_kind,
-                   p.starts_at, p.resets_at
-            FROM provider_usage_snapshots p
-            JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
-            WHERE p.window_kind IS NOT NULL
-            ORDER BY p.host_id, p.provider, p.account_label, p.window_kind
-            LIMIT {MAX_SNAPSHOT_RECORDS}
-            """,
-            params,
-        ).fetchall()
+        providers: tuple[ProviderConnectionObservation, ...] = ()
+        telemetry: tuple[TelemetryAggregate, ...] = ()
+        routing: tuple[RoutingAggregate, ...] = ()
+        hooks: tuple[HookDescriptor, ...] = ()
+        if analyzer_id in {
+            ConnectorFreshnessAnalyzer.analyzer_id,
+            ProviderResetWindowAnalyzer.analyzer_id,
+        }:
+            providers = _load_provider_facts(con, target_id, analyzed_at)
+        elif analyzer_id in {
+            TelemetryCoverageAnalyzer.analyzer_id,
+            CacheReadEfficiencyAnalyzer.analyzer_id,
+        }:
+            telemetry = _load_telemetry_facts(con, target_id, analyzed_at)
+        elif analyzer_id == RoutingMismatchAnalyzer.analyzer_id:
+            routing = _load_routing_facts(con, target_id, analyzed_at)
+        elif analyzer_id == HookValidityAnalyzer.analyzer_id:
+            hooks = _load_hook_facts(con, target_id, analyzed_at)
+        else:
+            raise ValueError(f"unsupported operational analyzer: {analyzer_id}")
     finally:
         con.close()
+    return AnalysisSnapshot(
+        source_version=source_version,
+        analyzed_at=analyzed_at,
+        provider_connections=providers,
+        telemetry=telemetry,
+        routing=routing,
+        hooks=hooks,
+    )
+
+
+def operational_analyzers() -> tuple[Analyzer, ...]:
+    """Return analyzers whose complete bounded facts are produced above."""
+
+    return (
+        ConnectorFreshnessAnalyzer(),
+        ProviderResetWindowAnalyzer(),
+        TelemetryCoverageAnalyzer(),
+        RoutingMismatchAnalyzer(),
+        CacheReadEfficiencyAnalyzer(),
+        HookValidityAnalyzer(),
+    )
+
+
+def _host_filter(target_id: str, *, alias: str = "") -> tuple[str, list[object]]:
+    if target_id == "fleet":
+        return "", []
+    prefix = f"{alias}." if alias else ""
+    return f"WHERE {prefix}host_id = ?", [target_id]
+
+
+def _aware(value: datetime | None, fallback: datetime) -> datetime:
+    if value is None:
+        return fallback
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _optional_aware(value: datetime | None) -> datetime | None:
+    return None if value is None else _aware(value, datetime.now(timezone.utc))
+
+
+def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
+    where, params = _host_filter(target_id)
+    rows = con.execute(
+        f"""
+        SELECT provider, account_label, host_id, enabled, last_attempt_at,
+               last_success_at, error_category, updated_at
+        FROM provider_connections
+        {where}
+        ORDER BY host_id, provider, account_label
+        LIMIT {MAX_SNAPSHOT_RECORDS}
+        """,
+        params,
+    ).fetchall()
+    windows = con.execute(
+        f"""
+        WITH chosen AS (
+          SELECT provider, account_label, host_id,
+                 arg_max(snapshot_id, observed_at) FILTER (
+                   WHERE status IN ('ok', 'usage_unavailable')
+                 ) AS snapshot_id
+          FROM provider_usage_snapshots
+          {where}
+          GROUP BY provider, account_label, host_id
+        )
+        SELECT p.provider, p.account_label, p.host_id, p.window_kind,
+               p.starts_at, p.resets_at
+        FROM provider_usage_snapshots p
+        JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
+        WHERE p.window_kind IS NOT NULL
+        ORDER BY p.host_id, p.provider, p.account_label, p.window_kind
+        LIMIT {MAX_SNAPSHOT_RECORDS}
+        """,
+        params,
+    ).fetchall()
     windows_by_account: dict[tuple[str, str, str], list[ProviderResetWindow]] = {}
     for provider, account_label, host_id, kind, starts_at, resets_at in windows:
         windows_by_account.setdefault(
             (str(provider), str(account_label), str(host_id)), []
         ).append(
             ProviderResetWindow(
-                kind=str(kind), starts_at=starts_at, resets_at=resets_at
+                kind=str(kind),
+                starts_at=_optional_aware(starts_at),
+                resets_at=_optional_aware(resets_at),
             )
         )
-    providers = tuple(
+    return tuple(
         ProviderConnectionObservation(
             provider=str(row[0]),
             account_label=str(row[1]),
             host_id=str(row[2]),
             enabled=bool(row[3]),
             status="error" if row[6] else "ok",
-            observed_at=row[7] or row[4] or row[5] or analyzed_at,
-            last_attempt_at=row[4],
-            last_success_at=row[5],
+            observed_at=_aware(row[7] or row[4] or row[5], analyzed_at),
+            last_attempt_at=_optional_aware(row[4]),
+            last_success_at=_optional_aware(row[5]),
             error_category=str(row[6]) if row[6] else None,
             reset_windows=tuple(
                 windows_by_account.get((str(row[0]), str(row[1]), str(row[2])), ())
@@ -940,17 +1020,180 @@ def load_operational_snapshot(
         )
         for row in rows
     )
-    return AnalysisSnapshot(
-        source_version=source_version,
-        analyzed_at=analyzed_at,
-        provider_connections=providers,
+
+
+def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
+    where, params = _host_filter(target_id, alias="h")
+    rows = con.execute(
+        f"""
+        WITH bounded_sessions AS (
+          SELECT * FROM harness_sessions h
+          {where}
+          ORDER BY COALESCE(updated_at, started_at) DESC, session_id
+          LIMIT {MAX_SNAPSHOT_RECORDS}
+        ),
+        span_sessions AS (
+          SELECT s.session_id, max(s.start_time) AS observed_at,
+                 count(*) > 0 AS has_spans,
+                 bool_or(s.total_tokens IS NOT NULL OR s.prompt_tokens IS NOT NULL)
+                   AS has_tokens,
+                 bool_or(s.cost_usd IS NOT NULL) AS has_cost,
+                 COALESCE(sum(s.prompt_tokens), 0)::BIGINT AS prompt_tokens,
+                 COALESCE(sum(s.cache_read_tokens), 0)::BIGINT AS cache_read_tokens
+          FROM spans_enriched s
+          JOIN bounded_sessions h USING (session_id)
+          GROUP BY s.session_id
+        )
+        SELECT h.host_id, h.harness,
+               max(COALESCE(s.observed_at, h.updated_at, h.started_at)),
+               count(DISTINCT h.session_id),
+               count(DISTINCT h.session_id) FILTER (WHERE s.has_spans),
+               count(DISTINCT h.session_id) FILTER (
+                 WHERE h.repo_owner IS NOT NULL AND h.repo_name IS NOT NULL
+               ),
+               count(DISTINCT h.session_id) FILTER (WHERE s.has_tokens),
+               count(DISTINCT h.session_id) FILTER (WHERE s.has_cost),
+               COALESCE(sum(s.prompt_tokens), 0)::BIGINT,
+               COALESCE(sum(s.cache_read_tokens), 0)::BIGINT
+        FROM bounded_sessions h
+        LEFT JOIN span_sessions s USING (session_id)
+        GROUP BY h.host_id, h.harness
+        ORDER BY h.host_id, h.harness
+        LIMIT {MAX_SNAPSHOT_RECORDS}
+        """,
+        params,
+    ).fetchall()
+    return tuple(
+        TelemetryAggregate(
+            target_id=f"{row[0]}/{row[1]}",
+            host_id=str(row[0]),
+            harness_id=str(row[1]),
+            observed_at=_aware(row[2], analyzed_at),
+            total_sessions=int(row[3]),
+            sessions_with_spans=int(row[4]),
+            repository_attributed_sessions=int(row[5]),
+            token_observed_sessions=int(row[6]),
+            cost_observed_sessions=int(row[7]),
+            prompt_tokens=int(row[8]),
+            cache_read_tokens=int(row[9]),
+            source_ref=f"normalized-telemetry:{row[0]}/{row[1]}",
+        )
+        for row in rows
     )
 
 
-def operational_analyzers() -> tuple[Analyzer, ...]:
-    """Return only analyzers backed by complete runtime snapshot producers."""
+def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
+    where, params = _host_filter(target_id, alias="h")
+    rows = con.execute(
+        f"""
+        WITH bounded_sessions AS (
+          SELECT * FROM harness_sessions h
+          {where}
+          ORDER BY COALESCE(updated_at, started_at) DESC, session_id
+          LIMIT {MAX_SNAPSHOT_RECORDS}
+        )
+        SELECT h.host_id, h.harness,
+               COALESCE(s.routing_provider, s.llm_provider, 'unknown') AS provider,
+               max(COALESCE(s.start_time, h.updated_at, h.started_at)),
+               count(*),
+               count(*) FILTER (WHERE s.routing_model <> h.model)
+        FROM bounded_sessions h
+        JOIN spans_enriched s USING (session_id)
+        WHERE h.model IS NOT NULL
+          AND s.routing_model IS NOT NULL
+        GROUP BY h.host_id, h.harness, provider
+        ORDER BY h.host_id, h.harness, provider
+        LIMIT {MAX_SNAPSHOT_RECORDS}
+        """,
+        params,
+    ).fetchall()
+    return tuple(
+        RoutingAggregate(
+            target_id=f"{row[0]}/{row[1]}/{row[2]}",
+            host_id=str(row[0]),
+            harness_id=str(row[1]),
+            provider=str(row[2]),
+            observed_at=_aware(row[3], analyzed_at),
+            decision_count=int(row[4]),
+            mismatch_count=int(row[5]),
+            source_ref=f"normalized-routing:{row[0]}/{row[1]}/{row[2]}",
+        )
+        for row in rows
+    )
 
-    return (ConnectorFreshnessAnalyzer(), ProviderResetWindowAnalyzer())
+
+def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
+    where, params = _host_filter(target_id)
+    rows = con.execute(
+        f"""
+        SELECT host_id, capabilities_json, updated_at, last_seen_at
+        FROM harness_hosts
+        {where}
+        ORDER BY host_id
+        LIMIT {MAX_SNAPSHOT_RECORDS}
+        """,
+        params,
+    ).fetchall()
+    descriptors: list[HookDescriptor] = []
+    for host_id, raw_capabilities, updated_at, last_seen_at in rows:
+        try:
+            capabilities = json.loads(raw_capabilities or "{}")
+            hooks = capabilities.get("advisory", {}).get("hooks", [])
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not isinstance(hooks, list):
+            continue
+        for raw in hooks:
+            if len(descriptors) >= MAX_SNAPSHOT_RECORDS:
+                return tuple(descriptors)
+            if not isinstance(raw, dict) or raw.get("allowlisted") is not True:
+                continue
+            try:
+                descriptors.append(
+                    HookDescriptor(
+                        hook_id=str(raw["hook_id"]),
+                        host_id=str(host_id),
+                        harness_id=str(raw["harness_id"]),
+                        canonical_config_path=str(raw["canonical_config_path"]),
+                        canonical_executable_path=str(raw["canonical_executable_path"]),
+                        target_hash=str(raw["target_hash"]),
+                        enabled=raw["enabled"],
+                        executable_exists=raw["executable_exists"],
+                        executable_is_file=raw["executable_is_file"],
+                        executable_is_executable=raw["executable_is_executable"],
+                        allowlisted=True,
+                        observed_at=_aware(updated_at or last_seen_at, analyzed_at),
+                        source_ref=f"harness-inventory:{host_id}/{raw['harness_id']}/hooks/{raw['hook_id']}",
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    return tuple(descriptors)
+
+
+def operational_snapshot_source_version(
+    duckdb_path: str | Path, analyzer_id: str, target_id: str
+) -> str:
+    """Hash only the complete analyzer facts so unchanged reviews coalesce."""
+
+    snapshot = load_operational_snapshot(
+        duckdb_path, analyzer_id, target_id, "operational-facts:material"
+    )
+    facts = (
+        snapshot.provider_connections
+        or snapshot.telemetry
+        or snapshot.routing
+        or snapshot.hooks
+    )
+    material = json.dumps(
+        [asdict(item) for item in facts],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=lambda value: (
+            value.isoformat() if isinstance(value, datetime) else str(value)
+        ),
+    )
+    return f"operational-facts:{hashlib.sha256(material.encode()).hexdigest()}"
 
 
 __all__ = [
@@ -961,5 +1204,6 @@ __all__ = [
     "ContentAnalysisWorker",
     "SnapshotFactory",
     "load_operational_snapshot",
+    "operational_snapshot_source_version",
     "operational_analyzers",
 ]
