@@ -33,6 +33,7 @@ def _analytics_connection() -> duckdb.DuckDBPyConnection:
           span_id VARCHAR,
           session_id VARCHAR,
           start_time TIMESTAMPTZ,
+          end_time TIMESTAMPTZ,
           duration_ms DOUBLE,
           harness VARCHAR,
           llm_provider VARCHAR,
@@ -96,12 +97,13 @@ def _insert_session(
     con.execute(
         """
         INSERT INTO spans_enriched VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         [
             f"span-{session_id}",
             session_id,
+            now,
             now,
             100.0 if tokens is not None else None,
             harness,
@@ -274,6 +276,96 @@ def test_analytics_bounds_harness_sessions_by_latest_activity():
         con.close()
 
     assert result.totals.session_count == 1
+
+
+def test_analytics_freshness_uses_recent_span_end_for_old_started_session():
+    con = _analytics_connection()
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+    _insert_session(
+        con,
+        session_id="long-span",
+        project="acme/long-span",
+        host="mac-mini",
+        harness="codex",
+        tokens=10,
+    )
+    con.execute(
+        "UPDATE harness_sessions SET started_at=?, ended_at=?, updated_at=?",
+        [old, old, old],
+    )
+    con.execute("UPDATE sessions SET started_at=?, ended_at=?", [old, old])
+    con.execute("UPDATE spans_enriched SET start_time=?, end_time=?", [old, recent])
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 1
+    assert result.metadata.observed_at == recent
+    assert result.metadata.freshness == "fresh"
+
+
+def test_paginated_dimension_freshness_uses_harness_and_session_latest_activity():
+    con = _analytics_connection()
+    old = datetime.now(timezone.utc) - timedelta(days=2)
+    harness_recent = datetime.now(timezone.utc) - timedelta(minutes=4)
+    session_recent = datetime.now(timezone.utc) - timedelta(minutes=3)
+    for session_id, host in (
+        ("old", "host-a-old"),
+        ("harness", "host-harness-recent"),
+        ("session", "host-session-recent"),
+    ):
+        _insert_session(
+            con,
+            session_id=session_id,
+            project=f"acme/{session_id}",
+            host=host,
+            harness="codex",
+            tokens=10,
+        )
+        con.execute(
+            "UPDATE harness_sessions SET started_at=?, ended_at=?, updated_at=? WHERE session_id=?",
+            [old, old, old, session_id],
+        )
+        con.execute(
+            "UPDATE sessions SET started_at=?, ended_at=? WHERE session_id=?",
+            [old, old, session_id],
+        )
+        con.execute(
+            "UPDATE spans_enriched SET start_time=?, end_time=? WHERE session_id=?",
+            [old, old, session_id],
+        )
+    con.execute(
+        "UPDATE harness_sessions SET updated_at=? WHERE session_id='harness'",
+        [harness_recent],
+    )
+    con.execute(
+        "UPDATE sessions SET ended_at=? WHERE session_id='session'",
+        [session_recent],
+    )
+    codec = AnalyticsCursorCodec(b"test-cursor-secret")
+    pages = []
+    cursor = None
+    try:
+        while True:
+            page = activity_analytics(
+                con,
+                AnalyticsFilters(days=7, limit=1, host_cursor=cursor),
+                cursor_codec=codec,
+            )
+            pages.extend(page.hosts)
+            cursor = page.pagination.hosts.next_cursor
+            if cursor is None:
+                break
+    finally:
+        con.close()
+
+    hosts = {item.key: item for item in pages}
+    assert hosts["host-harness-recent"].metadata.observed_at == harness_recent
+    assert hosts["host-harness-recent"].metadata.freshness == "fresh"
+    assert hosts["host-session-recent"].metadata.observed_at == session_recent
+    assert hosts["host-session-recent"].metadata.freshness == "fresh"
 
 
 @pytest.mark.parametrize("days", [0, -1, 366])

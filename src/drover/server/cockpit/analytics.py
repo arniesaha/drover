@@ -186,7 +186,7 @@ def activity_analytics(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cost) AS cost_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
-          max(started_at) AS observed_at
+          max(latest_activity_at) AS observed_at
         FROM filtered_sessions
         """,
         params,
@@ -268,6 +268,9 @@ def _session_facts_sql(filters: AnalyticsFilters) -> tuple[str, list[Any]]:
           SELECT
             session_id,
             min(start_time) AS started_at,
+            max(
+              COALESCE(GREATEST(end_time, start_time), end_time, start_time)
+            ) AS latest_activity_at,
             any_value(harness) FILTER (WHERE harness IS NOT NULL) AS harness,
             any_value(llm_provider) FILTER (WHERE llm_provider IS NOT NULL) AS provider,
             COALESCE(
@@ -301,23 +304,38 @@ def _session_facts_sql(filters: AnalyticsFilters) -> tuple[str, list[Any]]:
             bool_or(duration_ms IS NOT NULL) AS has_latency
           FROM spans_enriched, bounds
           WHERE session_id IS NOT NULL
-            AND start_time >= bounds.cutoff
+            AND COALESCE(GREATEST(end_time, start_time), end_time, start_time)
+                >= bounds.cutoff
           GROUP BY session_id
-        ),
-        harness_base AS (
-          SELECT hs.*
-          FROM harness_sessions hs, bounds
-          WHERE COALESCE(hs.updated_at, hs.ended_at, hs.started_at) >= bounds.cutoff
         ),
         session_base AS (
           SELECT s.*
           FROM sessions s, bounds
           WHERE COALESCE(s.ended_at, s.started_at) >= bounds.cutoff
         ),
+        harness_base AS (
+          SELECT hs.*
+          FROM harness_sessions hs, bounds
+          WHERE COALESCE(hs.updated_at, hs.ended_at, hs.started_at) >= bounds.cutoff
+             OR EXISTS (
+               SELECT 1 FROM span_sessions ss WHERE ss.session_id = hs.session_id
+             )
+             OR EXISTS (
+               SELECT 1 FROM session_base s WHERE s.session_id = hs.session_id
+             )
+        ),
         session_facts AS (
           SELECT
             hs.session_id,
             COALESCE(hs.started_at, ss.started_at) AS started_at,
+            COALESCE(
+              GREATEST(
+                hs.updated_at, hs.ended_at, hs.started_at,
+                ss.latest_activity_at, sb.ended_at, sb.started_at
+              ),
+              hs.updated_at, hs.ended_at, hs.started_at,
+              ss.latest_activity_at, sb.ended_at, sb.started_at
+            ) AS latest_activity_at,
             hs.host_id,
             COALESCE(ss.harness, hs.harness) AS harness,
             ss.provider,
@@ -341,16 +359,23 @@ def _session_facts_sql(filters: AnalyticsFilters) -> tuple[str, list[Any]]:
             COALESCE(ss.has_latency, FALSE) AS has_latency
           FROM harness_base hs
           LEFT JOIN span_sessions ss USING (session_id)
+          LEFT JOIN session_base sb USING (session_id)
 
           UNION ALL
 
           SELECT
-            ss.session_id, ss.started_at, NULL AS host_id, ss.harness,
+            ss.session_id, ss.started_at,
+            COALESCE(
+              GREATEST(ss.latest_activity_at, sb.ended_at, sb.started_at),
+              ss.latest_activity_at, sb.ended_at, sb.started_at
+            ) AS latest_activity_at,
+            NULL AS host_id, ss.harness,
             ss.provider, ss.model, ss.project_key,
             ss.total_tokens, ss.cost_usd, ss.cache_read_tokens,
             ss.cache_write_tokens, ss.total_latency_ms, ss.has_tokens,
             ss.has_cost, ss.has_cache, ss.has_latency
           FROM span_sessions ss
+          LEFT JOIN session_base sb USING (session_id)
           WHERE NOT EXISTS (
             SELECT 1 FROM harness_base hs WHERE hs.session_id = ss.session_id
           )
@@ -358,7 +383,9 @@ def _session_facts_sql(filters: AnalyticsFilters) -> tuple[str, list[Any]]:
           UNION ALL
 
           SELECT
-            s.session_id, s.started_at, NULL AS host_id, NULL AS harness,
+            s.session_id, s.started_at,
+            COALESCE(s.ended_at, s.started_at) AS latest_activity_at,
+            NULL AS host_id, NULL AS harness,
             NULL AS provider, NULL AS model, NULL AS project_key,
             NULL AS total_tokens, NULL AS cost_usd,
             NULL AS cache_read_tokens, NULL AS cache_write_tokens,
@@ -416,7 +443,7 @@ def _project_breakdowns(
           count(*) FILTER (WHERE has_cost) AS cost_sessions,
           count(*) FILTER (WHERE has_cache) AS cache_sessions,
           count(*) FILTER (WHERE has_latency) AS latency_sessions,
-          max(started_at) AS observed_at
+          max(latest_activity_at) AS observed_at
         FROM filtered_sessions
         WHERE project_key IS NOT NULL
         GROUP BY project_key
@@ -499,7 +526,7 @@ def _dimension_breakdowns(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cost) AS cost_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
-          max(started_at) AS observed_at
+          max(latest_activity_at) AS observed_at
         FROM filtered_sessions
         WHERE {column} IS NOT NULL
         GROUP BY {column}
