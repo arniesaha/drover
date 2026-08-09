@@ -128,6 +128,8 @@ class ProviderResetWindowAnalyzer:
         ):
             if not connection.enabled:
                 continue
+            if not connection.reset_windows_complete:
+                continue
             invalid = [
                 window
                 for window in connection.reset_windows

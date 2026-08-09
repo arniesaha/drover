@@ -59,6 +59,7 @@ def _provider(**overrides: object) -> ProviderConnectionObservation:
         "last_success_at": NOW - timedelta(minutes=20),
         "error_category": None,
         "reset_windows": (),
+        "reset_windows_complete": True,
         "source_ref": "provider_connections:openai/personal/mac-mini",
     }
     values.update(overrides)
@@ -78,6 +79,7 @@ def _telemetry(**overrides: object) -> TelemetryAggregate:
         "cost_observed_sessions": 10,
         "prompt_tokens": 10_000,
         "cache_read_tokens": 5_000,
+        "facts_complete": True,
         "source_ref": "analytics:mac-mini/codex/24h",
     }
     values.update(overrides)
@@ -354,6 +356,7 @@ def test_routing_mismatch_frequency_is_confirmed() -> None:
         observed_at=NOW,
         decision_count=20,
         mismatch_count=5,
+        facts_complete=True,
         source_ref="routing:mac-mini/codex/openai/24h",
     )
 

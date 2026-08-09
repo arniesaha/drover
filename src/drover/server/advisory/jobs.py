@@ -142,9 +142,27 @@ class AdvisoryScheduler:
         self.clock = clock
         self.source_version_factory = source_version_factory
         self._last_bucket: int | None = None
+        self._last_source_versions: dict[str, str] = {}
 
     def enqueue_due_full_review(self) -> list[Job]:
         bucket = math.floor(self.clock() / self.full_review_interval_seconds)
+        if self.source_version_factory is not None:
+            jobs: list[Job] = []
+            for analyzer_id in self.analyzer_ids:
+                source_version = self.source_version_factory(analyzer_id, "fleet")
+                if self._last_source_versions.get(analyzer_id) == source_version:
+                    continue
+                jobs.append(
+                    enqueue_advisory_check(
+                        self.duckdb_path,
+                        analyzer_id=analyzer_id,
+                        target_id="fleet",
+                        source_version=source_version,
+                    )
+                )
+                self._last_source_versions[analyzer_id] = source_version
+            self._last_bucket = bucket
+            return jobs
         if bucket == self._last_bucket:
             return []
         jobs = [
@@ -152,11 +170,7 @@ class AdvisoryScheduler:
                 self.duckdb_path,
                 analyzer_id=analyzer_id,
                 target_id="fleet",
-                source_version=(
-                    self.source_version_factory(analyzer_id, "fleet")
-                    if self.source_version_factory is not None
-                    else f"scheduled:{bucket}"
-                ),
+                source_version=f"scheduled:{bucket}",
             )
             for analyzer_id in self.analyzer_ids
         ]

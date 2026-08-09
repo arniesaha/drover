@@ -80,6 +80,8 @@ class TelemetryCoverageAnalyzer:
     def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
         findings: list[FindingCandidate] = []
         for aggregate in sorted(snapshot.telemetry, key=lambda item: item.target_id):
+            if not aggregate.facts_complete:
+                continue
             if aggregate.total_sessions == 0:
                 continue
             for rule in _COVERAGE_RULES:
@@ -137,6 +139,8 @@ class CacheReadEfficiencyAnalyzer:
     def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
         findings: list[FindingCandidate] = []
         for aggregate in sorted(snapshot.telemetry, key=lambda item: item.target_id):
+            if not aggregate.facts_complete:
+                continue
             reusable_input = aggregate.prompt_tokens + aggregate.cache_read_tokens
             if reusable_input < self.minimum_input_tokens or reusable_input == 0:
                 continue

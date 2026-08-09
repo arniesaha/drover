@@ -15,7 +15,12 @@ import pytest
 from drover.config import default_config, load_config
 from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
-from drover.server.advisory.analyzers import AnalysisSnapshot, TelemetryAggregate
+from drover.server.advisory.analyzers import (
+    AnalysisSnapshot,
+    ProviderConnectionObservation,
+    ProviderResetWindow,
+    TelemetryAggregate,
+)
 from drover.server.advisory.analyzers.connectors import ConnectorFreshnessAnalyzer
 from drover.server.advisory.jobs import (
     AdvisoryScheduler,
@@ -186,6 +191,7 @@ def _telemetry_snapshot(source_version: str) -> AnalysisSnapshot:
                 cost_observed_sessions=1,
                 prompt_tokens=1,
                 cache_read_tokens=0,
+                facts_complete=True,
                 source_ref="test:telemetry",
             ),
         ),
@@ -1408,7 +1414,8 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
         con.execute("DROP VIEW spans_enriched")
         con.execute("""
             CREATE TABLE spans_enriched (
-              session_id VARCHAR, start_time TIMESTAMPTZ, llm_provider VARCHAR,
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR,
               routing_provider VARCHAR, routing_model VARCHAR,
               prompt_tokens BIGINT, total_tokens BIGINT,
               cache_read_tokens BIGINT, cost_usd DOUBLE
@@ -1430,7 +1437,7 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
         con.execute(
             """
             INSERT INTO spans_enriched VALUES
-              ('s1', ?, 'openai', 'openai', 'gpt-4', 20000, 21000, 0, 1.5)
+              ('span-1', 's1', ?, 'openai', 'openai', 'gpt-4', 20000, 21000, 0, 1.5)
             """,
             [NOW],
         )
@@ -1516,7 +1523,7 @@ def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
         con.execute("DROP VIEW spans_enriched")
         con.execute("""
             CREATE TABLE spans_enriched (
-              session_id VARCHAR, start_time TIMESTAMPTZ,
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               prompt_tokens BIGINT, total_tokens BIGINT,
               cache_read_tokens BIGINT, cost_usd DOUBLE
             )
@@ -1538,34 +1545,322 @@ def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
     )
 
     assert snapshot.telemetry[0].total_sessions == 512
+    assert snapshot.telemetry[0].facts_complete is False
+
+
+def test_runtime_snapshot_caps_latest_spans_per_selected_session(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR, routing_provider VARCHAR,
+              routing_model VARCHAR, prompt_tokens BIGINT,
+              total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at
+            ) VALUES ('selected', 'mac-mini', 'codex', 'codex', 'completed',
+                      'gpt-5', ?, ?)
+            """,
+            [NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched
+            SELECT 'span-' || i, 'selected', ? - i * INTERVAL 1 SECOND,
+                   'openai', 'openai', 'gpt-4', 1, 1, 0, 0.1
+            FROM range(70) rows(i)
+            """,
+            [NOW],
+        )
+
+    telemetry = load_operational_snapshot(
+        db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
+    )
+    routing = load_operational_snapshot(
+        db_path, "deterministic.routing_mismatch", "fleet", "facts:v1"
+    )
+
+    assert telemetry.telemetry[0].prompt_tokens == 64
+    assert routing.routing[0].decision_count == 64
+    assert telemetry.telemetry[0].facts_complete is False
+    assert routing.routing[0].facts_complete is False
+    assert operational_analyzers()[2].analyze(telemetry) == []
+    assert operational_analyzers()[3].analyze(routing) == []
+
+
+def test_incomplete_reset_window_facts_cannot_resolve_existing_finding(
+    db_path: Path,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.provider_reset_windows",
+            rule_id="connector.contradictory_reset_window",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI reports a contradictory reset window",
+            impact="The reset countdown cannot be trusted.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=NOW,
+                    fields={"invalid_window_count": 1},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.provider_reset_windows",
+        target_id="fleet",
+        source_version="truncated:v2",
+    )
+    incomplete = AnalysisSnapshot(
+        source_version="truncated:v2",
+        analyzed_at=NOW,
+        provider_connections=(
+            ProviderConnectionObservation(
+                provider="openai",
+                account_label="personal",
+                host_id="mac-mini",
+                enabled=True,
+                status="ok",
+                observed_at=NOW,
+                last_attempt_at=NOW,
+                last_success_at=NOW,
+                error_category=None,
+                reset_windows=(
+                    ProviderResetWindow(
+                        kind="primary",
+                        starts_at=NOW,
+                        resets_at=NOW + timedelta(hours=1),
+                    ),
+                ),
+                reset_windows_complete=False,
+                source_ref="provider_connections:mac-mini/openai/personal",
+            ),
+        ),
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: incomplete,
+    )
+
+    assert worker.run_once([operational_analyzers()[1]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "open"
+
+
+def test_truncated_span_facts_cannot_resolve_existing_cache_finding(
+    db_path: Path,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.cache_read_efficiency",
+            rule_id="telemetry.cache_read_inefficiency",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Cache-read efficiency is low",
+            impact="Repeated input is not using cache reads.",
+            remediation=("Inspect repeated context, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="normalized-telemetry:mac-mini/codex",
+                    observed_at=NOW,
+                    fields={"cache_read_percent": 0},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.cache_read_efficiency",
+        target_id="fleet",
+        source_version="truncated-spans:v2",
+    )
+    aggregate = replace(
+        _telemetry_snapshot("unused").telemetry[0],
+        prompt_tokens=20_000,
+        facts_complete=False,
+    )
+    incomplete = AnalysisSnapshot(
+        source_version="truncated-spans:v2",
+        analyzed_at=NOW,
+        telemetry=(aggregate,),
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: incomplete,
+    )
+
+    assert worker.run_once([operational_analyzers()[4]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "open"
+
+
+def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute(
+            """
+            INSERT INTO provider_connections (
+              provider, account_label, host_id, enabled, last_attempt_at,
+              last_success_at, updated_at
+            ) VALUES ('openai', 'personal', 'mac-mini', TRUE, ?, ?, ?)
+            """,
+            [NOW, NOW, NOW],
+        )
+    first = operational_snapshot_source_version(
+        db_path,
+        "deterministic.connector_freshness",
+        "fleet",
+        analyzed_at=NOW + timedelta(minutes=5),
+    )
+    with duckdb.connect(str(db_path)) as con:
+        con.execute(
+            """
+            UPDATE provider_connections
+            SET last_attempt_at = ?, last_success_at = ?, updated_at = ?
+            WHERE host_id = 'mac-mini'
+            """,
+            [NOW + timedelta(minutes=1)] * 3,
+        )
+    heartbeat = operational_snapshot_source_version(
+        db_path,
+        "deterministic.connector_freshness",
+        "fleet",
+        analyzed_at=NOW + timedelta(minutes=6),
+    )
+    stale = operational_snapshot_source_version(
+        db_path,
+        "deterministic.connector_freshness",
+        "fleet",
+        analyzed_at=NOW + timedelta(minutes=17),
+    )
+    with duckdb.connect(str(db_path)) as con:
+        con.execute(
+            "UPDATE provider_connections SET error_category = 'auth' "
+            "WHERE host_id = 'mac-mini'"
+        )
+    error = operational_snapshot_source_version(
+        db_path,
+        "deterministic.connector_freshness",
+        "fleet",
+        analyzed_at=NOW + timedelta(minutes=17),
+    )
+
+    assert heartbeat == first
+    assert stale != heartbeat
+    assert error != stale
+
+
+def test_reset_window_snapshot_marks_truncation_and_hash_tracks_window_change(
+    db_path: Path, tmp_path: Path
+) -> None:
+    service = ProviderUsageService(db_path, tmp_path / "lake")
+    host = type("Host", (), {"host_id": "mac-mini"})()
+
+    def payload(snapshot_id: str, reset_hours: int, window_count: int = 1):
+        return {
+            "accounts": [
+                {
+                    "snapshot_id": snapshot_id,
+                    "dedup_key": f"dedup-{snapshot_id}",
+                    "provider": "openai",
+                    "account_label": "personal",
+                    "plan_label": "plus",
+                    "status": "ok",
+                    "observed_at": (
+                        NOW
+                        + timedelta(
+                            minutes={"one": 1, "two": 2, "many": 3}[snapshot_id]
+                        )
+                    ).isoformat(),
+                    "source": "codex-app-server",
+                    "windows": [
+                        {
+                            "kind": f"window-{index:02d}",
+                            "used_percent": 25,
+                            "starts_at": NOW.isoformat(),
+                            "resets_at": (
+                                NOW + timedelta(hours=reset_hours + index)
+                            ).isoformat(),
+                        }
+                        for index in range(window_count)
+                    ],
+                }
+            ]
+        }
+
+    service.refresh_host(host, fetch=lambda _host: payload("one", 1))
+    first = operational_snapshot_source_version(
+        db_path, "deterministic.provider_reset_windows", "fleet"
+    )
+    service.refresh_host(host, fetch=lambda _host: payload("two", 2))
+    changed = operational_snapshot_source_version(
+        db_path, "deterministic.provider_reset_windows", "fleet"
+    )
+    service.refresh_host(host, fetch=lambda _host: payload("many", 1, 33))
+    truncated = load_operational_snapshot(
+        db_path, "deterministic.provider_reset_windows", "fleet", "facts:many"
+    )
+
+    assert changed != first
+    assert len(truncated.provider_connections[0].reset_windows) == 32
+    assert truncated.provider_connections[0].reset_windows_complete is False
+    assert operational_analyzers()[1].analyze(truncated) == []
 
 
 def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(
     db_path: Path,
 ) -> None:
     now = [0.0]
+    version = ["stable"]
     scheduler = AdvisoryScheduler(
         duckdb_path=db_path,
         analyzer_ids=("deterministic.telemetry_coverage",),
         full_review_interval_seconds=60,
         clock=lambda: now[0],
         source_version_factory=lambda analyzer_id, target_id: (
-            f"facts:{analyzer_id}:{target_id}:stable"
+            f"facts:{analyzer_id}:{target_id}:{version[0]}"
         ),
     )
 
     first = scheduler.enqueue_due_full_review()[0]
+    assert scheduler.enqueue_due_full_review() == []
+    version[0] = "stale-threshold-crossed"
+    changed_in_same_bucket = scheduler.enqueue_due_full_review()
     now[0] = 60.0
-    second = scheduler.enqueue_due_full_review()[0]
+    unchanged_next_bucket = scheduler.enqueue_due_full_review()
 
-    assert second.job_id == first.job_id
+    assert changed_in_same_bucket[0].job_id == first.job_id
+    assert unchanged_next_bucket == []
     with duckdb.connect(str(db_path), read_only=True) as con:
         assert (
             con.execute(
                 "SELECT count(*) FROM pipeline_receipts WHERE source_key = ?",
                 ["deterministic.telemetry_coverage:fleet"],
             ).fetchone()[0]
-            == 1
+            == 2
         )
 
 

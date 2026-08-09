@@ -31,6 +31,8 @@ class RoutingMismatchAnalyzer:
     def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
         findings: list[FindingCandidate] = []
         for aggregate in sorted(snapshot.routing, key=lambda item: item.target_id):
+            if not aggregate.facts_complete:
+                continue
             if aggregate.decision_count < self.minimum_decisions:
                 continue
             mismatch_percent = round(

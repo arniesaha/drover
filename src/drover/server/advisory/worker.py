@@ -58,6 +58,9 @@ from drover.server.ledger import ArtifactSpec, Job, Ledger
 
 log = logging.getLogger("drover.advisory")
 SnapshotFactory = Callable[[str, str, str], AnalysisSnapshot]
+MAX_SNAPSHOT_SPANS = 4096
+MAX_SNAPSHOT_SPANS_PER_SESSION = 64
+MAX_RESET_WINDOWS_PER_CONNECTION = 32
 
 
 @dataclass(frozen=True)
@@ -740,7 +743,10 @@ class AdvisoryWorker:
                     _finding_in_job_scope(target_id, str(finding_target_id))
                     and str(fingerprint) not in observed_fingerprints
                     and _snapshot_covers_finding(
-                        snapshot, str(finding_target_type), str(finding_target_id)
+                        snapshot,
+                        analyzer.analyzer_id,
+                        str(finding_target_type),
+                        str(finding_target_id),
                     )
                 ):
                     self.repository.mark_passing_in_transaction(
@@ -853,19 +859,32 @@ class AdvisoryWorker:
 
 
 def _snapshot_covers_finding(
-    snapshot: AnalysisSnapshot, target_type: str, target_id: str
+    snapshot: AnalysisSnapshot,
+    analyzer_id: str,
+    target_type: str,
+    target_id: str,
 ) -> bool:
     """Require concrete passing evidence before resolving a prior finding."""
 
     if target_type == "provider_connector":
         return any(
             f"{item.host_id}/{item.provider}/{item.account_label}" == target_id
+            and (
+                analyzer_id != ProviderResetWindowAnalyzer.analyzer_id
+                or item.reset_windows_complete
+            )
             for item in snapshot.provider_connections
         )
     if target_type == "telemetry_source":
-        return any(item.target_id == target_id for item in snapshot.telemetry)
+        return any(
+            item.target_id == target_id and item.facts_complete
+            for item in snapshot.telemetry
+        )
     if target_type == "routing_policy":
-        return any(item.target_id == target_id for item in snapshot.routing)
+        return any(
+            item.target_id == target_id and item.facts_complete
+            for item in snapshot.routing
+        )
     if target_type == "hook":
         return any(
             f"{item.host_id}/{item.harness_id}/{item.hook_id}" == target_id
@@ -887,10 +906,12 @@ def load_operational_snapshot(
     analyzer_id: str,
     target_id: str,
     source_version: str,
+    *,
+    analyzed_at: datetime | None = None,
 ) -> AnalysisSnapshot:
     """Build analyzer-scoped bounded facts from normalized runtime state."""
 
-    analyzed_at = datetime.now(timezone.utc)
+    analyzed_at = analyzed_at or datetime.now(timezone.utc)
     con = open_duckdb_connection(Path(duckdb_path), read_only=True, role="diagnostic")
     try:
         providers: tuple[ProviderConnectionObservation, ...] = ()
@@ -972,36 +993,56 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
     ).fetchall()
     windows = con.execute(
         f"""
-        WITH chosen AS (
-          SELECT provider, account_label, host_id,
+        WITH bounded_connections AS (
+          SELECT provider, account_label, host_id
+          FROM provider_connections
+          {where}
+          ORDER BY host_id, provider, account_label
+          LIMIT {MAX_SNAPSHOT_RECORDS}
+        ),
+        chosen AS (
+          SELECT p.provider, p.account_label, p.host_id,
                  arg_max(snapshot_id, observed_at) FILTER (
                    WHERE status IN ('ok', 'usage_unavailable')
                  ) AS snapshot_id
-          FROM provider_usage_snapshots
-          {where}
-          GROUP BY provider, account_label, host_id
+          FROM provider_usage_snapshots p
+          JOIN bounded_connections c USING (provider, account_label, host_id)
+          GROUP BY p.provider, p.account_label, p.host_id
+        ),
+        ranked AS (
+          SELECT p.provider, p.account_label, p.host_id, p.window_kind,
+                 p.starts_at, p.resets_at,
+                 count(p.window_kind) OVER (
+                   PARTITION BY p.provider, p.account_label, p.host_id
+                 ) AS window_count,
+                 row_number() OVER (
+                   PARTITION BY p.provider, p.account_label, p.host_id
+                   ORDER BY p.window_kind NULLS LAST, p.starts_at, p.resets_at
+                 ) AS window_no
+          FROM provider_usage_snapshots p
+          JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
         )
-        SELECT p.provider, p.account_label, p.host_id, p.window_kind,
-               p.starts_at, p.resets_at
-        FROM provider_usage_snapshots p
-        JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
-        WHERE p.window_kind IS NOT NULL
-        ORDER BY p.host_id, p.provider, p.account_label, p.window_kind
-        LIMIT {MAX_SNAPSHOT_RECORDS}
+        SELECT provider, account_label, host_id, window_kind, starts_at,
+               resets_at, window_count
+        FROM ranked
+        WHERE window_no <= {MAX_RESET_WINDOWS_PER_CONNECTION}
+        ORDER BY host_id, provider, account_label, window_no
         """,
         params,
     ).fetchall()
     windows_by_account: dict[tuple[str, str, str], list[ProviderResetWindow]] = {}
-    for provider, account_label, host_id, kind, starts_at, resets_at in windows:
-        windows_by_account.setdefault(
-            (str(provider), str(account_label), str(host_id)), []
-        ).append(
-            ProviderResetWindow(
-                kind=str(kind),
-                starts_at=_optional_aware(starts_at),
-                resets_at=_optional_aware(resets_at),
+    reset_completeness: dict[tuple[str, str, str], bool] = {}
+    for provider, account_label, host_id, kind, starts_at, resets_at, count in windows:
+        key = (str(provider), str(account_label), str(host_id))
+        reset_completeness[key] = int(count) <= MAX_RESET_WINDOWS_PER_CONNECTION
+        if kind is not None:
+            windows_by_account.setdefault(key, []).append(
+                ProviderResetWindow(
+                    kind=str(kind),
+                    starts_at=_optional_aware(starts_at),
+                    resets_at=_optional_aware(resets_at),
+                )
             )
-        )
     return tuple(
         ProviderConnectionObservation(
             provider=str(row[0]),
@@ -1016,6 +1057,9 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
             reset_windows=tuple(
                 windows_by_account.get((str(row[0]), str(row[1]), str(row[2])), ())
             ),
+            reset_windows_complete=reset_completeness.get(
+                (str(row[0]), str(row[1]), str(row[2])), False
+            ),
             source_ref=f"provider_connections:{row[2]}/{row[0]}/{row[1]}",
         )
         for row in rows
@@ -1026,11 +1070,48 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
     where, params = _host_filter(target_id, alias="h")
     rows = con.execute(
         f"""
-        WITH bounded_sessions AS (
-          SELECT * FROM harness_sessions h
+        WITH ranked_sessions AS (
+          SELECT h.*,
+                 row_number() OVER (
+                   ORDER BY COALESCE(updated_at, started_at) DESC, session_id
+                 ) AS snapshot_session_no,
+                 count(*) OVER () AS snapshot_session_count
+          FROM harness_sessions h
           {where}
-          ORDER BY COALESCE(updated_at, started_at) DESC, session_id
-          LIMIT {MAX_SNAPSHOT_RECORDS}
+        ),
+        bounded_sessions AS (
+          SELECT * FROM ranked_sessions
+          WHERE snapshot_session_no <= {MAX_SNAPSHOT_RECORDS}
+        ),
+        ranked_spans AS (
+          SELECT s.*,
+                 row_number() OVER (
+                   PARTITION BY s.session_id
+                   ORDER BY s.start_time DESC NULLS LAST, s.span_id
+                 ) AS session_span_no,
+                 count(*) OVER (PARTITION BY s.session_id) AS session_span_count
+          FROM spans_enriched s
+          JOIN bounded_sessions h USING (session_id)
+        ),
+        per_session_spans AS (
+          SELECT * FROM ranked_spans
+          WHERE session_span_no <= {MAX_SNAPSHOT_SPANS_PER_SESSION}
+        ),
+        span_candidates AS (
+          SELECT *,
+                 row_number() OVER (
+                   ORDER BY start_time DESC NULLS LAST, span_id
+                 ) AS global_span_no,
+                 count(*) OVER () AS bounded_span_count
+          FROM per_session_spans
+        ),
+        span_status AS (
+          SELECT count(*) > {MAX_SNAPSHOT_SPANS} AS global_spans_truncated
+          FROM per_session_spans
+        ),
+        bounded_spans AS (
+          SELECT * FROM span_candidates
+          WHERE global_span_no <= {MAX_SNAPSHOT_SPANS}
         ),
         span_sessions AS (
           SELECT s.session_id, max(s.start_time) AS observed_at,
@@ -1039,9 +1120,12 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                    AS has_tokens,
                  bool_or(s.cost_usd IS NOT NULL) AS has_cost,
                  COALESCE(sum(s.prompt_tokens), 0)::BIGINT AS prompt_tokens,
-                 COALESCE(sum(s.cache_read_tokens), 0)::BIGINT AS cache_read_tokens
-          FROM spans_enriched s
-          JOIN bounded_sessions h USING (session_id)
+                 COALESCE(sum(s.cache_read_tokens), 0)::BIGINT AS cache_read_tokens,
+                 bool_or(
+                   s.session_span_count > {MAX_SNAPSHOT_SPANS_PER_SESSION}
+                   OR s.bounded_span_count > {MAX_SNAPSHOT_SPANS}
+                 ) AS spans_truncated
+          FROM bounded_spans s
           GROUP BY s.session_id
         )
         SELECT h.host_id, h.harness,
@@ -1054,9 +1138,15 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                count(DISTINCT h.session_id) FILTER (WHERE s.has_tokens),
                count(DISTINCT h.session_id) FILTER (WHERE s.has_cost),
                COALESCE(sum(s.prompt_tokens), 0)::BIGINT,
-               COALESCE(sum(s.cache_read_tokens), 0)::BIGINT
+               COALESCE(sum(s.cache_read_tokens), 0)::BIGINT,
+               NOT (
+                 max(h.snapshot_session_count) > {MAX_SNAPSHOT_RECORDS}
+                 OR any_value(bounds.global_spans_truncated)
+                 OR COALESCE(bool_or(s.spans_truncated), FALSE)
+               )
         FROM bounded_sessions h
         LEFT JOIN span_sessions s USING (session_id)
+        CROSS JOIN span_status bounds
         GROUP BY h.host_id, h.harness
         ORDER BY h.host_id, h.harness
         LIMIT {MAX_SNAPSHOT_RECORDS}
@@ -1076,6 +1166,7 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
             cost_observed_sessions=int(row[7]),
             prompt_tokens=int(row[8]),
             cache_read_tokens=int(row[9]),
+            facts_complete=bool(row[10]),
             source_ref=f"normalized-telemetry:{row[0]}/{row[1]}",
         )
         for row in rows
@@ -1086,19 +1177,59 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
     where, params = _host_filter(target_id, alias="h")
     rows = con.execute(
         f"""
-        WITH bounded_sessions AS (
-          SELECT * FROM harness_sessions h
+        WITH ranked_sessions AS (
+          SELECT h.*,
+                 row_number() OVER (
+                   ORDER BY COALESCE(updated_at, started_at) DESC, session_id
+                 ) AS snapshot_session_no,
+                 count(*) OVER () AS snapshot_session_count
+          FROM harness_sessions h
           {where}
-          ORDER BY COALESCE(updated_at, started_at) DESC, session_id
-          LIMIT {MAX_SNAPSHOT_RECORDS}
+        ),
+        bounded_sessions AS (
+          SELECT * FROM ranked_sessions
+          WHERE snapshot_session_no <= {MAX_SNAPSHOT_RECORDS}
+        ),
+        ranked_spans AS (
+          SELECT s.*,
+                 row_number() OVER (
+                   PARTITION BY s.session_id
+                   ORDER BY s.start_time DESC NULLS LAST, s.span_id
+                 ) AS session_span_no,
+                 count(*) OVER (PARTITION BY s.session_id) AS session_span_count
+          FROM spans_enriched s
+          JOIN bounded_sessions h USING (session_id)
+        ),
+        per_session_spans AS (
+          SELECT * FROM ranked_spans
+          WHERE session_span_no <= {MAX_SNAPSHOT_SPANS_PER_SESSION}
+        ),
+        span_candidates AS (
+          SELECT *,
+                 row_number() OVER (
+                   ORDER BY start_time DESC NULLS LAST, span_id
+                 ) AS global_span_no,
+                 count(*) OVER () AS bounded_span_count
+          FROM per_session_spans
+        ),
+        bounded_spans AS (
+          SELECT * FROM span_candidates
+          WHERE global_span_no <= {MAX_SNAPSHOT_SPANS}
         )
         SELECT h.host_id, h.harness,
                COALESCE(s.routing_provider, s.llm_provider, 'unknown') AS provider,
                max(COALESCE(s.start_time, h.updated_at, h.started_at)),
                count(*),
-               count(*) FILTER (WHERE s.routing_model <> h.model)
+               count(*) FILTER (WHERE s.routing_model <> h.model),
+               NOT (
+                 max(h.snapshot_session_count) > {MAX_SNAPSHOT_RECORDS}
+                 OR bool_or(
+                   s.session_span_count > {MAX_SNAPSHOT_SPANS_PER_SESSION}
+                   OR s.bounded_span_count > {MAX_SNAPSHOT_SPANS}
+                 )
+               )
         FROM bounded_sessions h
-        JOIN spans_enriched s USING (session_id)
+        JOIN bounded_spans s USING (session_id)
         WHERE h.model IS NOT NULL
           AND s.routing_model IS NOT NULL
         GROUP BY h.host_id, h.harness, provider
@@ -1116,6 +1247,7 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
             observed_at=_aware(row[3], analyzed_at),
             decision_count=int(row[4]),
             mismatch_count=int(row[5]),
+            facts_complete=bool(row[6]),
             source_ref=f"normalized-routing:{row[0]}/{row[1]}/{row[2]}",
         )
         for row in rows
@@ -1172,21 +1304,24 @@ def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
 
 
 def operational_snapshot_source_version(
-    duckdb_path: str | Path, analyzer_id: str, target_id: str
+    duckdb_path: str | Path,
+    analyzer_id: str,
+    target_id: str,
+    *,
+    analyzed_at: datetime | None = None,
 ) -> str:
     """Hash only the complete analyzer facts so unchanged reviews coalesce."""
 
+    analyzed_at = analyzed_at or datetime.now(timezone.utc)
     snapshot = load_operational_snapshot(
-        duckdb_path, analyzer_id, target_id, "operational-facts:material"
-    )
-    facts = (
-        snapshot.provider_connections
-        or snapshot.telemetry
-        or snapshot.routing
-        or snapshot.hooks
+        duckdb_path,
+        analyzer_id,
+        target_id,
+        "operational-facts:material",
+        analyzed_at=analyzed_at,
     )
     material = json.dumps(
-        [asdict(item) for item in facts],
+        _operational_material(snapshot, analyzer_id),
         sort_keys=True,
         separators=(",", ":"),
         default=lambda value: (
@@ -1194,6 +1329,94 @@ def operational_snapshot_source_version(
         ),
     )
     return f"operational-facts:{hashlib.sha256(material.encode()).hexdigest()}"
+
+
+def _operational_material(
+    snapshot: AnalysisSnapshot, analyzer_id: str
+) -> list[dict[str, Any]]:
+    if analyzer_id == ConnectorFreshnessAnalyzer.analyzer_id:
+        maximum_age_seconds = int(ConnectorFreshnessAnalyzer().max_age.total_seconds())
+        return [
+            {
+                "provider": item.provider,
+                "account_label": item.account_label,
+                "host_id": item.host_id,
+                "enabled": item.enabled,
+                "status": item.status,
+                "error_category": item.error_category,
+                "freshness_stale": item.status == "stale"
+                or int(
+                    (
+                        snapshot.analyzed_at
+                        - (item.last_success_at or item.observed_at)
+                    ).total_seconds()
+                )
+                > maximum_age_seconds,
+            }
+            for item in snapshot.provider_connections
+        ]
+    if analyzer_id == ProviderResetWindowAnalyzer.analyzer_id:
+        return [
+            {
+                "provider": item.provider,
+                "account_label": item.account_label,
+                "host_id": item.host_id,
+                "enabled": item.enabled,
+                "reset_windows_complete": item.reset_windows_complete,
+                "reset_windows": [asdict(window) for window in item.reset_windows],
+            }
+            for item in snapshot.provider_connections
+        ]
+    if analyzer_id in {
+        TelemetryCoverageAnalyzer.analyzer_id,
+        CacheReadEfficiencyAnalyzer.analyzer_id,
+    }:
+        return [
+            {
+                "target_id": item.target_id,
+                "host_id": item.host_id,
+                "harness_id": item.harness_id,
+                "total_sessions": item.total_sessions,
+                "sessions_with_spans": item.sessions_with_spans,
+                "repository_attributed_sessions": item.repository_attributed_sessions,
+                "token_observed_sessions": item.token_observed_sessions,
+                "cost_observed_sessions": item.cost_observed_sessions,
+                "prompt_tokens": item.prompt_tokens,
+                "cache_read_tokens": item.cache_read_tokens,
+                "facts_complete": item.facts_complete,
+            }
+            for item in snapshot.telemetry
+        ]
+    if analyzer_id == RoutingMismatchAnalyzer.analyzer_id:
+        return [
+            {
+                "target_id": item.target_id,
+                "host_id": item.host_id,
+                "harness_id": item.harness_id,
+                "provider": item.provider,
+                "decision_count": item.decision_count,
+                "mismatch_count": item.mismatch_count,
+                "facts_complete": item.facts_complete,
+            }
+            for item in snapshot.routing
+        ]
+    if analyzer_id == HookValidityAnalyzer.analyzer_id:
+        return [
+            {
+                "hook_id": item.hook_id,
+                "host_id": item.host_id,
+                "harness_id": item.harness_id,
+                "canonical_config_path": item.canonical_config_path,
+                "canonical_executable_path": item.canonical_executable_path,
+                "target_hash": item.target_hash,
+                "enabled": item.enabled,
+                "executable_exists": item.executable_exists,
+                "executable_is_file": item.executable_is_file,
+                "executable_is_executable": item.executable_is_executable,
+            }
+            for item in snapshot.hooks
+        ]
+    raise ValueError(f"unsupported operational analyzer: {analyzer_id}")
 
 
 __all__ = [

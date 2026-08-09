@@ -56,6 +56,7 @@ class ProviderConnectionObservation:
     last_success_at: datetime | None
     error_category: str | None
     reset_windows: tuple[ProviderResetWindow, ...]
+    reset_windows_complete: bool
     source_ref: str
 
     def __post_init__(self) -> None:
@@ -63,6 +64,8 @@ class ProviderConnectionObservation:
             _require_nonempty(getattr(self, field_name), field_name)
         if self.status not in _PROVIDER_STATUSES:
             raise ValueError("status must be a supported provider status")
+        if type(self.reset_windows_complete) is not bool:
+            raise ValueError("reset_windows_complete must be a boolean")
         _require_aware(self.observed_at, "observed_at")
         if self.last_attempt_at is not None:
             _require_aware(self.last_attempt_at, "last_attempt_at")
@@ -91,12 +94,15 @@ class TelemetryAggregate:
     cost_observed_sessions: int
     prompt_tokens: int
     cache_read_tokens: int
+    facts_complete: bool
     source_ref: str
 
     def __post_init__(self) -> None:
         for field_name in ("target_id", "host_id", "harness_id", "source_ref"):
             _require_nonempty(getattr(self, field_name), field_name)
         _require_aware(self.observed_at, "observed_at")
+        if type(self.facts_complete) is not bool:
+            raise ValueError("facts_complete must be a boolean")
         count_fields = (
             "total_sessions",
             "sessions_with_spans",
@@ -127,6 +133,7 @@ class RoutingAggregate:
     observed_at: datetime
     decision_count: int
     mismatch_count: int
+    facts_complete: bool
     source_ref: str
 
     def __post_init__(self) -> None:
@@ -139,6 +146,8 @@ class RoutingAggregate:
         ):
             _require_nonempty(getattr(self, field_name), field_name)
         _require_aware(self.observed_at, "observed_at")
+        if type(self.facts_complete) is not bool:
+            raise ValueError("facts_complete must be a boolean")
         _require_nonnegative(self.decision_count, "decision_count")
         _require_nonnegative(self.mismatch_count, "mismatch_count")
         if self.mismatch_count > self.decision_count:
