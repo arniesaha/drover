@@ -134,3 +134,49 @@ def test_check_paths_rejects_private_planning_paths(tmp_path: Path) -> None:
         "private-planning-path",
         "private-planning-path",
     ]
+
+
+def test_check_paths_rejects_em_dash_in_public_prose(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "docs/overview.md",
+        "Drover is local-first — sessions stay under your control.\n",
+    )
+
+    findings = check_paths([path])
+
+    assert [finding.rule for finding in findings] == ["public-em-dash"]
+
+
+def test_check_paths_rejects_legacy_product_positioning(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "README.md",
+        "Drover, formerly Nexus, manages coding-agent sessions.\n",
+    )
+
+    findings = check_paths([path])
+
+    assert [finding.rule for finding in findings] == [
+        "legacy-positioning-copy"
+    ]
+
+
+def test_check_paths_limits_copy_rules_to_public_prose(tmp_path: Path) -> None:
+    paths = [
+        write_file(tmp_path, "src/drover/client.py", "# retry — then fail\n"),
+        write_file(tmp_path, "src/drover/prompts/system.md", "Think — then act.\n"),
+        write_file(tmp_path, "tests/fixtures/session.md", "Captured — unchanged.\n"),
+    ]
+
+    assert check_paths(paths) == []
+
+
+def test_check_paths_allows_nexus_compatibility_contract(tmp_path: Path) -> None:
+    path = write_file(
+        tmp_path,
+        "docs/compatibility.md",
+        "The `nexus.*` telemetry keys remain readable for compatibility.\n",
+    )
+
+    assert check_paths([path]) == []
