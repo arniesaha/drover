@@ -701,6 +701,47 @@ class InsightsService:
                     "Run content analysis before checking again."
                 )
             return host_id, source_version
+        operational_scopes = {
+            "deterministic.telemetry_coverage": ("telemetry_source", 2),
+            "deterministic.cache_read_efficiency": ("telemetry_source", 2),
+            "deterministic.routing_mismatch": ("routing_policy", 3),
+            "deterministic.hook_validity": ("hook", 3),
+        }
+        expected = operational_scopes.get(finding.analyzer_id)
+        if expected is not None and finding.target_type == expected[0]:
+            parts = finding.target_id.split("/")
+            if len(parts) != expected[1] or not all(parts):
+                raise InvalidInsightTransition(
+                    "finding has no executable operational target scope"
+                )
+            from drover.server.advisory.worker import (
+                load_operational_snapshot,
+                operational_snapshot_source_version,
+            )
+
+            snapshot = load_operational_snapshot(
+                self.duckdb_path,
+                finding.analyzer_id,
+                finding.target_id,
+                "operational-facts:scope-probe",
+            )
+            facts = (
+                snapshot.hooks
+                if finding.analyzer_id == "deterministic.hook_validity"
+                else (
+                    snapshot.routing
+                    if finding.analyzer_id == "deterministic.routing_mismatch"
+                    else snapshot.telemetry
+                )
+            )
+            if not facts:
+                raise InvalidInsightTransition(
+                    "Check Again is unavailable because no current facts exist "
+                    "for this finding target."
+                )
+            return finding.target_id, operational_snapshot_source_version(
+                self.duckdb_path, finding.analyzer_id, finding.target_id
+            )
         raise InvalidInsightTransition(
             "scoped reanalysis is unavailable for this finding analyzer"
         )

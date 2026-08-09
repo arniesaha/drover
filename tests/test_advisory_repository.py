@@ -431,6 +431,49 @@ def test_acknowledge_and_dismiss_require_valid_transitions(repository, candidate
     )
 
 
+def test_concurrent_dismissals_cannot_both_commit_or_overwrite_reason(
+    repository, candidate, monkeypatch
+):
+    finding = repository.observe(candidate, run_id="run-1")
+    barrier = threading.Barrier(2)
+    original = AdvisoryRepository._require_finding
+
+    def synchronize_after_read(con, finding_id):
+        row = original(con, finding_id)
+        barrier.wait(timeout=2)
+        return row
+
+    monkeypatch.setattr(
+        AdvisoryRepository, "_require_finding", staticmethod(synchronize_after_read)
+    )
+    outcomes: list[tuple[str, str]] = []
+
+    def dismiss(reason: str) -> None:
+        try:
+            result = AdvisoryRepository(repository.duckdb_path).dismiss(
+                finding.finding_id, reason=reason
+            )
+            outcomes.append(("ok", result.dismissal_reason or ""))
+        except ValueError as exc:
+            outcomes.append(("conflict", str(exc)))
+
+    threads = [
+        threading.Thread(target=dismiss, args=("first client",)),
+        threading.Thread(target=dismiss, args=("second client",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(kind for kind, _ in outcomes) == ["conflict", "ok"]
+    winner = next(value for kind, value in outcomes if kind == "ok")
+    persisted = repository.get_finding(finding.finding_id)
+    assert persisted.state == FindingState.DISMISSED
+    assert persisted.dismissal_reason == winner
+
+
 def test_mark_passing_is_the_only_resolution_path(repository, candidate):
     finding = repository.observe(candidate, run_id="run-1")
     repository.acknowledge(finding.finding_id)

@@ -356,24 +356,40 @@ class AdvisoryRepository:
     ) -> Finding:
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
+            con.execute("BEGIN TRANSACTION")
             current = FindingState(self._require_finding(con, finding_id)[0])
             if current not in allowed:
                 raise ValueError(
                     f"cannot {state.value} finding in {current.value} state"
                 )
             now = datetime.now(timezone.utc)
-            con.execute(
-                """
+            row = con.execute(
+                f"""
                 UPDATE advisory_findings
                 SET state = ?, dismissal_reason = ?,
                     dismissed_at = CASE WHEN ? = 'dismissed' THEN ? ELSE dismissed_at END
-                WHERE finding_id = ?
+                WHERE finding_id = ? AND state = ?
+                RETURNING {_FINDING_COLUMNS}
                 """,
-                [state.value, reason, state.value, now, finding_id],
-            )
+                [state.value, reason, state.value, now, finding_id, current.value],
+            ).fetchone()
+            if row is None:
+                raise ValueError("finding state changed during lifecycle transition")
+            con.execute("COMMIT")
+            return _finding_from_row(row)
+        except duckdb.TransactionException as exc:
+            try:
+                con.execute("ROLLBACK")
+            except duckdb.Error:
+                pass
+            raise ValueError(
+                "finding state changed during lifecycle transition"
+            ) from exc
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
         finally:
             con.close()
-        return self.get_finding(finding_id)
 
     @staticmethod
     def _require_finding(

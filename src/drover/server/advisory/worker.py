@@ -488,7 +488,15 @@ class ContentAnalysisWorker:
                 if not current or not live.enabled:
                     return ContentAnalysisResult(status="revoked", artifact={})
                 if job is not None:
-                    artifact = self._record_success(job, candidates, artifact_base)
+                    artifact = self._record_success(
+                        job,
+                        candidates,
+                        artifact_base,
+                        covered_target_ids=tuple(
+                            f"{bundle.host_id}/{target.target_id}"
+                            for target in bundle.targets
+                        ),
+                    )
                 else:
                     sink = self.finding_sink or _candidate_reference
                     artifact = {
@@ -509,6 +517,8 @@ class ContentAnalysisWorker:
         job: Job,
         candidates: list[FindingCandidate],
         artifact_base: Mapping[str, Any],
+        *,
+        covered_target_ids: tuple[str, ...],
     ) -> Mapping[str, Any]:
         if self.duckdb_path is None or self.repository is None:
             raise ValueError(
@@ -518,10 +528,38 @@ class ContentAnalysisWorker:
         try:
             con.execute("BEGIN TRANSACTION")
             run_id = job.latest_attempt_id or job.job_id
-            finding_ids = [
-                self.repository.observe_in_transaction(con, candidate, run_id=run_id)
-                for candidate in candidates
-            ]
+            observed_fingerprints: set[str] = set()
+            finding_ids: list[str] = []
+            for candidate in candidates:
+                finding_id = self.repository.observe_in_transaction(
+                    con, candidate, run_id=run_id
+                )
+                fingerprint = con.execute(
+                    "SELECT fingerprint FROM advisory_findings WHERE finding_id = ?",
+                    [finding_id],
+                ).fetchone()[0]
+                finding_ids.append(finding_id)
+                observed_fingerprints.add(str(fingerprint))
+            if covered_target_ids:
+                placeholders = ", ".join("?" for _ in covered_target_ids)
+                existing = con.execute(
+                    f"""
+                    SELECT finding_id, fingerprint
+                    FROM advisory_findings
+                    WHERE analyzer_id = ?
+                      AND target_type = 'configuration_target'
+                      AND state IN ('open', 'acknowledged', 'regressed')
+                      AND target_id IN ({placeholders})
+                    """,
+                    [MODEL_ANALYZER_ID, *covered_target_ids],
+                ).fetchall()
+                for finding_id, fingerprint in existing:
+                    if str(fingerprint) in observed_fingerprints:
+                        continue
+                    self.repository.mark_passing_in_transaction(
+                        con, str(finding_id), run_id=run_id
+                    )
+                    finding_ids.append(str(finding_id))
             artifact = {**artifact_base, "finding_ids": finding_ids}
             serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
             ledger = Ledger(con)
@@ -1013,6 +1051,25 @@ def _host_filter(target_id: str, *, alias: str = "") -> tuple[str, list[object]]
     return f"WHERE {prefix}host_id = ?", [target_id]
 
 
+def _runtime_session_filter(
+    target_id: str, analyzed_at: datetime, *, alias: str = "h"
+) -> tuple[str, list[object]]:
+    prefix = f"{alias}." if alias else ""
+    clauses = [
+        f"COALESCE({prefix}updated_at, {prefix}started_at) >= ?",
+        f"COALESCE({prefix}updated_at, {prefix}started_at) <= ?",
+    ]
+    params: list[object] = [
+        analyzed_at - OPERATIONAL_SPAN_LOOKBACK,
+        analyzed_at,
+    ]
+    if target_id != "fleet":
+        parts = target_id.split("/")
+        clauses.extend([f"{prefix}host_id = ?", f"{prefix}harness = ?"])
+        params.extend(parts[:2])
+    return "WHERE " + " AND ".join(clauses), params
+
+
 def _aware(value: datetime | None, fallback: datetime) -> datetime:
     if value is None:
         return fallback
@@ -1114,7 +1171,7 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
 
 
 def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
-    where, params = _host_filter(target_id, alias="h")
+    where, params = _runtime_session_filter(target_id, analyzed_at)
     rows = con.execute(
         f"""
         WITH ranked_sessions AS (
@@ -1131,11 +1188,12 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
           WHERE snapshot_session_no <= {MAX_SNAPSHOT_RECORDS}
         ),
         raw_span_candidates AS (
-          SELECT span_id, session_id, start_time, total_tokens, prompt_tokens,
-                 cost_usd, cache_read_tokens
-          FROM spans_enriched
-          WHERE start_time >= ? AND start_time <= ?
-          ORDER BY start_time DESC NULLS LAST, span_id
+          SELECT s.span_id, s.session_id, s.start_time, s.total_tokens,
+                 s.prompt_tokens, s.cost_usd, s.cache_read_tokens
+          FROM spans_enriched s
+          JOIN bounded_sessions h USING (session_id)
+          WHERE s.start_time >= ? AND s.start_time <= ?
+          ORDER BY s.start_time DESC NULLS LAST, s.span_id
           LIMIT {MAX_RAW_SNAPSHOT_SPANS + 1}
         ),
         raw_span_status AS (
@@ -1248,7 +1306,11 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
 
 
 def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
-    where, params = _host_filter(target_id, alias="h")
+    where, params = _runtime_session_filter(target_id, analyzed_at)
+    target_parts = target_id.split("/")
+    provider = (
+        target_parts[2] if target_id != "fleet" and len(target_parts) == 3 else None
+    )
     rows = con.execute(
         f"""
         WITH ranked_sessions AS (
@@ -1265,11 +1327,12 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
           WHERE snapshot_session_no <= {MAX_SNAPSHOT_RECORDS}
         ),
         raw_span_candidates AS (
-          SELECT span_id, session_id, start_time, routing_provider,
-                 llm_provider, routing_model
-          FROM spans_enriched
-          WHERE start_time >= ? AND start_time <= ?
-          ORDER BY start_time DESC NULLS LAST, span_id
+          SELECT s.span_id, s.session_id, s.start_time, s.routing_provider,
+                 s.llm_provider, s.routing_model
+          FROM spans_enriched s
+          JOIN bounded_sessions h USING (session_id)
+          WHERE s.start_time >= ? AND s.start_time <= ?
+          ORDER BY s.start_time DESC NULLS LAST, s.span_id
           LIMIT {MAX_RAW_SNAPSHOT_SPANS + 1}
         ),
         raw_span_status AS (
@@ -1328,6 +1391,7 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
         CROSS JOIN raw_span_status raw_bounds
         WHERE h.model IS NOT NULL
           AND s.routing_model IS NOT NULL
+          AND (? IS NULL OR COALESCE(s.routing_provider, s.llm_provider, 'unknown') = ?)
         GROUP BY h.host_id, h.harness, provider
         ORDER BY h.host_id, h.harness, provider
         LIMIT {MAX_SNAPSHOT_RECORDS}
@@ -1336,6 +1400,8 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
             *params,
             analyzed_at - OPERATIONAL_SPAN_LOOKBACK,
             analyzed_at,
+            provider,
+            provider,
         ],
     ).fetchall()
     return tuple(
@@ -1356,7 +1422,11 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
 
 
 def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
-    where, params = _host_filter(target_id)
+    parts = target_id.split("/")
+    host_scope = parts[0] if target_id != "fleet" else "fleet"
+    harness_scope = parts[1] if len(parts) == 3 else None
+    hook_scope = parts[2] if len(parts) == 3 else None
+    where, params = _host_filter(host_scope)
     rows = con.execute(
         f"""
         SELECT host_id, capabilities_json, updated_at, last_seen_at
@@ -1380,6 +1450,11 @@ def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
             if len(descriptors) >= MAX_SNAPSHOT_RECORDS:
                 return tuple(descriptors)
             if not isinstance(raw, dict) or raw.get("allowlisted") is not True:
+                continue
+            if harness_scope is not None and (
+                raw.get("harness_id") != harness_scope
+                or raw.get("hook_id") != hook_scope
+            ):
                 continue
             try:
                 descriptors.append(

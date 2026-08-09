@@ -95,6 +95,35 @@ def _content_bundle(
     )
 
 
+def _model_candidate(
+    target_id: str,
+    *,
+    rule_id: str = "prompt.repetition",
+    content_hash: str = "old-target-hash",
+) -> FindingCandidate:
+    return FindingCandidate(
+        analyzer_id="model.configuration",
+        rule_id=rule_id,
+        target_type="configuration_target",
+        target_id=f"mac-mini/{target_id}",
+        analyzer_class=AnalyzerClass.MODEL,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.LIKELY,
+        title="Repeated instruction",
+        impact="Repeated text consumes context.",
+        remediation=("Keep one copy.",),
+        evidence=(
+            FindingEvidence(
+                source_ref=f"content:mac-mini/{target_id}#old",
+                observed_at=NOW,
+                fields={"bundle_hash": "old"},
+                excerpt="Repeated instruction",
+            ),
+        ),
+        content_hash=content_hash,
+    )
+
+
 @pytest.fixture()
 def db_path(tmp_path: Path) -> Path:
     path = tmp_path / "drover.duckdb"
@@ -1537,6 +1566,52 @@ def test_content_job_rolls_back_findings_when_ledger_completion_fails(
     assert AdvisoryRepository(db_path).list_findings() == []
 
 
+def test_clean_model_bundle_resolves_only_covered_nondismissed_targets(
+    db_path: Path,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    covered = repository.observe(
+        _model_candidate("global-agents"), run_id="old-covered"
+    )
+    dismissed = repository.observe(
+        _model_candidate("global-agents", rule_id="prompt.inefficiency"),
+        run_id="old-dismissed",
+    )
+    repository.dismiss(dismissed.finding_id, reason="accepted tradeoff")
+    unrequested = repository.observe(
+        _model_candidate("project-agents"), run_id="old-unrequested"
+    )
+    bundle = _content_bundle("No issue remains.")
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version=bundle.bundle_hash,
+    )
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=lambda _host, _targets: bundle,
+        backend_factory=lambda _config: type(
+            "Backend", (), {"complete": lambda self, _system, _user: '{"findings":[]}'}
+        )(),
+        duckdb_path=db_path,
+        repository=repository,
+    )
+
+    assert worker.run_once().succeeded == 1
+
+    assert repository.get_finding(covered.finding_id).state.value == "resolved"
+    assert repository.get_finding(dismissed.finding_id).state.value == "dismissed"
+    assert repository.get_finding(unrequested.finding_id).state.value == "open"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        passing = con.execute(
+            "SELECT outcome FROM advisory_occurrences WHERE finding_id = ? "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            [covered.finding_id],
+        ).fetchone()
+    assert passing == ("passing",)
+
+
 def test_periodic_scheduler_uses_one_deterministic_version_per_interval(
     db_path: Path,
 ) -> None:
@@ -1759,13 +1834,78 @@ def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
             """,
             [NOW, NOW],
         )
-
     snapshot = load_operational_snapshot(
         db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
     )
 
     assert snapshot.telemetry[0].total_sessions == 512
     assert snapshot.telemetry[0].facts_complete is False
+
+
+def test_runtime_snapshot_bounds_sessions_inside_the_seven_day_window(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR, routing_provider VARCHAR,
+              routing_model VARCHAR, prompt_tokens BIGINT,
+              total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at
+            )
+            SELECT 'old-' || i, 'mac-mini', 'codex', 'codex', 'completed',
+                   'gpt-5', ? - INTERVAL 8 DAY - i * INTERVAL 1 SECOND,
+                   ? - INTERVAL 8 DAY - i * INTERVAL 1 SECOND
+            FROM range(600) rows(i)
+            """,
+            [NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at
+            ) VALUES ('recent', 'mac-mini', 'codex', 'codex', 'completed',
+                      'gpt-5', ?, ?)
+            """,
+            [NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched VALUES
+              ('recent-span', 'recent', ?, 'openai', 'openai', 'gpt-4',
+               100, 100, 20, 0.1)
+            """,
+            [NOW],
+        )
+
+    telemetry = load_operational_snapshot(
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+    routing = load_operational_snapshot(
+        db_path,
+        "deterministic.routing_mismatch",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+
+    assert telemetry.telemetry[0].total_sessions == 1
+    assert telemetry.telemetry[0].facts_complete is True
+    assert routing.routing[0].decision_count == 1
+    assert routing.routing[0].facts_complete is True
 
 
 def test_runtime_snapshot_caps_latest_spans_per_selected_session(
@@ -2494,3 +2634,202 @@ def test_check_again_is_truthfully_unavailable_without_runtime_or_consent(
         service.check_again(unsupported.finding_id)
     with pytest.raises(InvalidInsightTransition, match="Enable content analysis"):
         service.check_again(model.finding_id)
+
+
+def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR, routing_provider VARCHAR,
+              routing_model VARCHAR, prompt_tokens BIGINT,
+              total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at
+            ) VALUES
+              ('codex-session', 'mac-mini', 'codex', 'codex', 'completed',
+               'gpt-5', ?, ?),
+              ('claude-session', 'mac-mini', 'claude', 'claude', 'completed',
+               'claude-4', ?, ?)
+            """,
+            [NOW, NOW, NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched VALUES
+              ('codex-span', 'codex-session', ?, 'openai', 'openai', 'gpt-4',
+               100, 100, 0, 0.1),
+              ('claude-span', 'claude-session', ?, 'anthropic', 'anthropic',
+               'claude-3', 100, 100, 0, 0.1)
+            """,
+            [NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched
+            SELECT 'bulk-' || lpad(i::VARCHAR, 5, '0'), 'claude-session', ?,
+                   'anthropic', 'anthropic', 'claude-3', 1, 1, 0, 0.01
+            FROM range(8200) rows(i)
+            """,
+            [NOW],
+        )
+        descriptor = {
+            "advisory": {
+                "hooks": [
+                    {
+                        "hook_id": "pre-tool",
+                        "harness_id": "codex",
+                        "canonical_config_path": "/tmp/config",
+                        "canonical_executable_path": "/tmp/hook",
+                        "enabled": True,
+                        "executable_exists": False,
+                        "executable_is_file": False,
+                        "executable_is_executable": False,
+                        "target_hash": "sha256:missing",
+                        "allowlisted": True,
+                    },
+                    {
+                        "hook_id": "pre-tool",
+                        "harness_id": "claude",
+                        "canonical_config_path": "/tmp/other-config",
+                        "canonical_executable_path": "/tmp/other-hook",
+                        "enabled": True,
+                        "executable_exists": False,
+                        "executable_is_file": False,
+                        "executable_is_executable": False,
+                        "target_hash": "sha256:other",
+                        "allowlisted": True,
+                    },
+                ]
+            }
+        }
+        con.execute(
+            """
+            INSERT INTO harness_hosts (
+              host_id, display_name, kind, status, capabilities_json,
+              last_seen_at, updated_at
+            ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', ?, ?, ?)
+            """,
+            [json.dumps(descriptor), NOW, NOW],
+        )
+
+    repository = AdvisoryRepository(db_path)
+    candidates = (
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.span_coverage",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Telemetry coverage is low",
+            impact="Metrics are incomplete.",
+            remediation=("Repair telemetry, then run Check Again.",),
+            evidence=(FindingEvidence("telemetry:codex", NOW, {"coverage": 0}),),
+        ),
+        FindingCandidate(
+            analyzer_id="deterministic.cache_read_efficiency",
+            rule_id="cache.read_efficiency",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.LOW,
+            confidence=Confidence.CONFIRMED,
+            title="Cache efficiency is low",
+            impact="Repeated prompts cost more.",
+            remediation=("Review prompts, then run Check Again.",),
+            evidence=(FindingEvidence("telemetry:codex", NOW, {"ratio": 0}),),
+        ),
+        FindingCandidate(
+            analyzer_id="deterministic.routing_mismatch",
+            rule_id="routing.mismatch_frequency",
+            target_type="routing_policy",
+            target_id="mac-mini/codex/openai",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Routing mismatch",
+            impact="Requests use an unexpected model.",
+            remediation=("Review routing, then run Check Again.",),
+            evidence=(FindingEvidence("routing:codex", NOW, {"count": 1}),),
+        ),
+        FindingCandidate(
+            analyzer_id="deterministic.hook_validity",
+            rule_id="hook.missing",
+            target_type="hook",
+            target_id="mac-mini/codex/pre-tool",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="Hook is missing",
+            impact="The hook cannot run.",
+            remediation=("Restore the hook, then run Check Again.",),
+            evidence=(FindingEvidence("hook:codex", NOW, {"exists": False}),),
+        ),
+    )
+    findings = [repository.observe(item, run_id="old") for item in candidates]
+    service = InsightsService(db_path)
+
+    queued = [service.check_again(item.finding_id) for item in findings]
+
+    assert all(
+        service.get_insight(item.finding_id)["actions"]["check_again"]
+        == {"available": True, "reason": None}
+        for item in findings
+    )
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        jobs = con.execute(
+            """
+            SELECT j.subject_key, r.source_version, j.status
+            FROM pipeline_jobs j
+            JOIN pipeline_receipts r ON r.receipt_id = j.caused_by_receipt_id
+            WHERE j.job_id IN (?, ?, ?, ?)
+            ORDER BY j.subject_key
+            """,
+            [item["job_id"] for item in queued],
+        ).fetchall()
+    assert [(subject, status) for subject, _, status in jobs] == [
+        ("deterministic.cache_read_efficiency:mac-mini/codex", "pending"),
+        ("deterministic.hook_validity:mac-mini/codex/pre-tool", "pending"),
+        ("deterministic.routing_mismatch:mac-mini/codex/openai", "pending"),
+        ("deterministic.telemetry_coverage:mac-mini/codex", "pending"),
+    ]
+    assert all(version.startswith("operational-facts:") for _, version, _ in jobs)
+    scoped_telemetry = load_operational_snapshot(
+        db_path,
+        "deterministic.telemetry_coverage",
+        "mac-mini/codex",
+        "current",
+        analyzed_at=NOW,
+    )
+    scoped_routing = load_operational_snapshot(
+        db_path,
+        "deterministic.routing_mismatch",
+        "mac-mini/codex/openai",
+        "current",
+        analyzed_at=NOW,
+    )
+    scoped_hooks = load_operational_snapshot(
+        db_path,
+        "deterministic.hook_validity",
+        "mac-mini/codex/pre-tool",
+        "current",
+        analyzed_at=NOW,
+    )
+    assert [item.target_id for item in scoped_telemetry.telemetry] == ["mac-mini/codex"]
+    assert [item.target_id for item in scoped_routing.routing] == [
+        "mac-mini/codex/openai"
+    ]
+    assert [
+        f"{item.host_id}/{item.harness_id}/{item.hook_id}"
+        for item in scoped_hooks.hooks
+    ] == ["mac-mini/codex/pre-tool"]
