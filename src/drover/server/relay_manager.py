@@ -27,6 +27,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from drover.server.harness.relay_protocol import (
+    FRAMED_RESPONSES_CAPABILITY,
+    RELAY_CONTROL_FRAME_BYTES,
     RelayProtocolError,
     close_frame,
     data_frame,
@@ -35,6 +37,7 @@ from drover.server.harness.relay_protocol import (
     req_frame,
 )
 from drover.server.harness.websocket import (
+    MAX_FRAME_BYTES,
     OPCODE_CLOSE,
     OPCODE_PING,
     OPCODE_PONG,
@@ -184,10 +187,17 @@ class RelayChannel:
 class _Connection:
     """One live relay websocket plus everything multiplexed over it."""
 
-    def __init__(self, manager: "RelayManager", host_id: str, sock: socket.socket):
+    def __init__(
+        self,
+        manager: "RelayManager",
+        host_id: str,
+        sock: socket.socket,
+        capabilities: frozenset[str],
+    ):
         self.manager = manager
         self.host_id = host_id
         self.sock = sock
+        self.capabilities = capabilities
         self.write_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.pending: dict[str, queue.Queue[Any]] = {}
@@ -263,6 +273,10 @@ class _Connection:
         with self.state_lock:
             return self.response_limits.get(key)
 
+    def response_contract(self, key: str) -> tuple[bool, int | None]:
+        with self.state_lock:
+            return key in self.pending, self.response_limits.get(key)
+
     def add_channel(self, channel: RelayChannel) -> bool:
         with self.state_lock:
             if self.dead.is_set():
@@ -288,7 +302,13 @@ class RelayManager:
 
     # -- lifecycle -----------------------------------------------------
 
-    def attach(self, host_id: str, sock: socket.socket) -> None:
+    def attach(
+        self,
+        host_id: str,
+        sock: socket.socket,
+        *,
+        capabilities: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
         """Take ownership of an already-upgraded server-role socket.
 
         Newest wins: a reconnecting spoke must never be blocked by its own
@@ -300,7 +320,7 @@ class RelayManager:
         # platforms reject it, and the watchdog is the real guarantee.
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        connection = _Connection(self, host_id, sock)
+        connection = _Connection(self, host_id, sock, frozenset(capabilities))
         with self._lock:
             previous = self._connections.get(host_id)
             self._connections[host_id] = connection
@@ -343,6 +363,9 @@ class RelayManager:
         connection = self._live(host_id)
         if connection is None:
             return _error(f"relay host not connected: {host_id}")
+        framed = FRAMED_RESPONSES_CAPABILITY in connection.capabilities
+        if max_response_bytes is not None and not framed:
+            return _error("relay host lacks framed response capability")
         request_id = uuid.uuid4().hex
         waiter: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=1)
         if not connection.register(
@@ -357,6 +380,7 @@ class RelayManager:
                     path,
                     body,
                     max_response_bytes=max_response_bytes,
+                    response_framing=(FRAMED_RESPONSES_CAPABILITY if framed else None),
                 ),
                 timeout_s=_remaining(deadline),
             )
@@ -475,7 +499,12 @@ class RelayManager:
 
     def _read_loop(self, connection: _Connection) -> None:
         while connection.alive.is_set():
-            frame = recv_frame(connection.sock)
+            control_cap = (
+                RELAY_CONTROL_FRAME_BYTES
+                if FRAMED_RESPONSES_CAPABILITY in connection.capabilities
+                else None
+            )
+            frame = recv_frame(connection.sock, max_frame_bytes=control_cap)
             # Every frame counts as proof of life, pongs included - see
             # SILENCE_TIMEOUT_S.
             connection.last_rx = time.monotonic()
@@ -501,9 +530,10 @@ class RelayManager:
         request_id = str(frame.get("id"))
         status = frame.get("status")
         body_bytes = frame.get("body_bytes")
-        limit = connection.response_limit(request_id)
-        if limit is None:
-            raise RelayProtocolError("bounded response has no pending request limit")
+        pending, response_limit = connection.response_contract(request_id)
+        if not pending:
+            raise RelayProtocolError("framed response has no pending request")
+        limit = response_limit or MAX_FRAME_BYTES
         if type(status) is not int:
             raise RelayProtocolError("bounded response status must be an integer")
         if type(body_bytes) is not int or body_bytes < 0:
@@ -543,10 +573,15 @@ class RelayManager:
     def _dispatch(self, connection: _Connection, frame: dict[str, Any]) -> None:
         kind = frame["kind"]
         if kind == "res":
+            request_id = str(frame.get("id"))
+            if connection.response_limit(request_id) is not None:
+                raise RelayProtocolError(
+                    "bounded request received a legacy relay response"
+                )
             status = frame.get("status")
             body = frame.get("body")
             connection.resolve(
-                str(frame.get("id")),
+                request_id,
                 (int(status) if isinstance(status, int) else 502, str(body or "")),
             )
         elif kind == "data":

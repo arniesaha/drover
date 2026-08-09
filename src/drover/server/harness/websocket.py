@@ -58,8 +58,10 @@ def send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
     send_frame(sock, OPCODE_TEXT, json.dumps(payload, sort_keys=True).encode("utf-8"))
 
 
-def recv_json(sock: socket.socket) -> dict[str, Any] | None:
-    frame = recv_frame(sock)
+def recv_json(
+    sock: socket.socket, *, max_frame_bytes: int | None = None
+) -> dict[str, Any] | None:
+    frame = recv_frame(sock, max_frame_bytes=max_frame_bytes)
     if frame.opcode == OPCODE_CLOSE:
         raise WebSocketClosed()
     if frame.opcode == OPCODE_PING:

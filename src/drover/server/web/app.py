@@ -37,6 +37,7 @@ from drover.server.harness.websocket import (
     send_frame,
     send_json,
 )
+from drover.server.harness.relay_protocol import RELAY_CONTROL_FRAME_BYTES
 from drover.server.web.auth import (
     DISABLED,
     AuthSettings,
@@ -1144,7 +1145,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         f"no hello frame within {RELAY_HELLO_TIMEOUT_S}s"
                     )
                 sock.settimeout(max(0.1, remaining))
-                frame = recv_json(sock)
+                frame = recv_json(sock, max_frame_bytes=RELAY_CONTROL_FRAME_BYTES)
             parsed = parse_frame(frame)
             if parsed.get("kind") != "hello":
                 raise RelayProtocolError(
@@ -1153,6 +1154,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             host_id = str(parsed.get("host_id") or "").strip()
             if not host_id:
                 raise RelayProtocolError("hello frame missing host_id")
+            raw_capabilities = parsed.get("capabilities") or []
+            if not isinstance(raw_capabilities, list) or any(
+                not isinstance(item, str) for item in raw_capabilities
+            ):
+                raise RelayProtocolError("hello capabilities must be a string list")
+            capabilities = set(raw_capabilities)
         except (OSError, WebSocketClosed, RelayProtocolError, ValueError) as exc:
             log.info("relay handshake for %s failed: %s", self.client_address, exc)
             sock.close()
@@ -1173,7 +1180,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         # no-op) while the fd itself, rewrapped below, keeps working.
         fd = sock.detach()
         relay_sock = socket.socket(fileno=fd)
-        self.collector.relay_manager.attach(host_id, relay_sock)
+        self.collector.relay_manager.attach(
+            host_id, relay_sock, capabilities=capabilities
+        )
 
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)

@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from drover.server.harness.relay_protocol import (
+    FRAMED_RESPONSES_CAPABILITY,
     RelayProtocolError,
     close_frame,
     data_frame,
@@ -362,7 +363,13 @@ class RelayClient:
                 path=target.path,
                 headers={"Authorization": f"Bearer {self.token}"},
             )
-            client_send_json(sock, hello_frame(self.host_id))
+            client_send_json(
+                sock,
+                hello_frame(
+                    self.host_id,
+                    capabilities=[FRAMED_RESPONSES_CAPABILITY],
+                ),
+            )
         except Exception:
             with contextlib.suppress(OSError):
                 sock.close()
@@ -473,6 +480,19 @@ class RelayClient:
         except (OSError, WebSocketClosed) as exc:
             self._teardown(connection, f"relay send failed: {exc}")
 
+    def _send_response(
+        self,
+        connection: _Conn,
+        request: dict[str, Any],
+        status: int,
+        body: str,
+    ) -> None:
+        request_id = str(request.get("id"))
+        if request.get("response_framing") == FRAMED_RESPONSES_CAPABILITY:
+            self._send_bounded_response(connection, request_id, status, body)
+        else:
+            self._send(connection, res_frame(request_id, status, body))
+
     # -- req/res -------------------------------------------------------
 
     def _start_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
@@ -485,15 +505,13 @@ class RelayClient:
                     self._refused_reqs,
                     MAX_INFLIGHT_REQS,
                 )
-            self._send(
+            self._send_response(
                 connection,
-                res_frame(
-                    str(frame.get("id")),
-                    503,
-                    json.dumps(
-                        {"error": "harness host is saturated"},
-                        sort_keys=True,
-                    ),
+                frame,
+                503,
+                json.dumps(
+                    {"error": "harness host is saturated"},
+                    sort_keys=True,
                 ),
             )
             return
@@ -504,7 +522,6 @@ class RelayClient:
             raise
 
     def _handle_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
-        request_id = str(frame.get("id"))
         method = str(frame.get("method") or "GET").upper()
         path = str(frame.get("path") or "/")
         try:
@@ -529,10 +546,7 @@ class RelayClient:
                 body = json.dumps(
                     {"error": f"loopback request failed: {exc}"}, sort_keys=True
                 )
-            if type(max_response_bytes) is int and max_response_bytes > 0:
-                self._send_bounded_response(connection, request_id, status, body)
-            else:
-                self._send(connection, res_frame(request_id, status, body))
+            self._send_response(connection, frame, status, body)
         finally:
             self._req_slots.release()
 

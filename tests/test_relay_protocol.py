@@ -51,6 +51,22 @@ def test_res_start_frame_declares_request_identity_and_body_size() -> None:
     }
 
 
+def test_hello_and_request_negotiate_framed_responses() -> None:
+    assert hello_frame("laptop", capabilities=["framed_responses_v1"])[
+        "capabilities"
+    ] == ["framed_responses_v1"]
+    assert (
+        req_frame(
+            "abc",
+            "GET",
+            "/sessions",
+            None,
+            response_framing="framed_responses_v1",
+        )["response_framing"]
+        == "framed_responses_v1"
+    )
+
+
 def test_channel_frames() -> None:
     assert open_frame("c1", "/sessions/s1/terminal")["kind"] == "open"
     assert opened_frame("c1") == {"kind": "opened", "chan": "c1"}

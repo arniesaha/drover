@@ -101,7 +101,14 @@ def test_bounded_req_uses_metadata_then_raw_body_frame(harnessd_server):
     ).start()
     send_json(
         hub_side,
-        req_frame("r1", "GET", "/sessions", None, max_response_bytes=4096),
+        req_frame(
+            "r1",
+            "GET",
+            "/sessions",
+            None,
+            max_response_bytes=4096,
+            response_framing="framed_responses_v1",
+        ),
     )
 
     start = recv_json(hub_side)
@@ -111,6 +118,41 @@ def test_bounded_req_uses_metadata_then_raw_body_frame(harnessd_server):
     assert body_frame.opcode == OPCODE_TEXT
     assert len(body_frame.payload) == start["body_bytes"]
     assert "sessions" in json.loads(body_frame.payload)
+    hub_side.close()
+
+
+def test_saturated_bounded_req_still_uses_framed_error_response(
+    harnessd_server, monkeypatch
+):
+    monkeypatch.setattr(relay_client, "MAX_INFLIGHT_REQS", 1)
+    client = RelayClient(
+        central_url="https://unused.example",
+        host_id="laptop",
+        token="test-token",
+        loopback_port=harnessd_server.server_port,
+    )
+    assert client._req_slots.acquire(blocking=False)
+    hub_side, spoke_side = socket.socketpair()
+    threading.Thread(
+        target=client.serve_connection, args=(spoke_side,), daemon=True
+    ).start()
+    send_json(
+        hub_side,
+        req_frame(
+            "r1",
+            "GET",
+            "/sessions",
+            None,
+            max_response_bytes=4096,
+            response_framing="framed_responses_v1",
+        ),
+    )
+
+    start = recv_json(hub_side)
+    assert start["kind"] == "res_start"
+    assert start["status"] == 503
+    body = recv_frame(hub_side).payload
+    assert "saturated" in json.loads(body)["error"]
     hub_side.close()
 
 
