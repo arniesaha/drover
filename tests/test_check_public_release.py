@@ -157,9 +157,7 @@ def test_check_paths_rejects_legacy_product_positioning(tmp_path: Path) -> None:
 
     findings = check_paths([path])
 
-    assert [finding.rule for finding in findings] == [
-        "legacy-positioning-copy"
-    ]
+    assert [finding.rule for finding in findings] == ["legacy-positioning-copy"]
 
 
 def test_check_paths_limits_copy_rules_to_public_prose(tmp_path: Path) -> None:
