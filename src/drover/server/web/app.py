@@ -120,6 +120,37 @@ def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
     return query
 
 
+_COCKPIT_QUERY_FIELDS = frozenset(
+    {"days", "host_id", "harness", "provider", "model", "project_key"}
+)
+
+
+def _parse_cockpit_query(query: str):
+    """Parse only the bounded, documented cockpit filter surface."""
+    from drover.server.cockpit.analytics import AnalyticsFilters
+
+    params = parse_qs(query, keep_blank_values=True)
+    unknown = sorted(set(params) - _COCKPIT_QUERY_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported query field: {unknown[0]}")
+    values: dict[str, Any] = {}
+    for name, entries in params.items():
+        if len(entries) != 1:
+            raise ValueError(f"{name} must appear once")
+        value = entries[0].strip()
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        if len(value) > 256:
+            raise ValueError(f"{name} is too long")
+        values[name] = value
+    if "days" in values:
+        try:
+            values["days"] = int(values["days"])
+        except ValueError as exc:
+            raise ValueError("days must be an integer") from exc
+    return AnalyticsFilters(**values)
+
+
 def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
     """Extract the mirrorable event out of a terminal message, or ``None``.
 
@@ -432,6 +463,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/observability":
             self._send(200, "application/json", self.collector.render_json())
+            return
+        if path in {"/cockpit/overview", "/analytics"}:
+            try:
+                filters = _parse_cockpit_query(parsed.query)
+            except ValueError as exc:
+                self._send(
+                    400,
+                    "application/json",
+                    json.dumps({"error": str(exc)}) + "\n",
+                )
+                return
+            if path == "/cockpit/overview":
+                status, body = self.collector.render_cockpit_overview_json(filters)
+            else:
+                status, body = self.collector.render_analytics_json(filters)
+            self._send(status, "application/json", body)
             return
         if path == "/harness":
             self._send(200, "application/json", self.collector.render_harness_json())

@@ -45,6 +45,9 @@ from drover.server.metrics import (
     sequence_health_report,
     start_metrics_server,
 )
+from drover.server.harness.registry import HarnessRegistry
+from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
+from drover.server.providers.service import ProviderUsageService
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.web.auth import load_auth
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -1217,6 +1220,7 @@ def run(
     """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
     cfg = _resolve_config(ctx.obj["config_path"])
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    stop = threading.Event()
 
     job_streams: dict[str, RedisJobStream] = {}
     if cfg.redis_jobs_enabled:
@@ -1297,6 +1301,7 @@ def run(
             mcp_thread = None
 
     metrics_server = None
+    provider_refresh: ProviderRefreshLoop | None = None
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
             auth = load_auth(cfg)
@@ -1315,12 +1320,28 @@ def run(
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
             )
+            provider_usage = ProviderUsageService(
+                duckdb_path=cfg.duckdb_path,
+                parquet_dir=cfg.parquet_dir,
+                api_token=auth.api_token if auth.enabled else None,
+            )
+            metrics_collector.cockpit_service = CockpitService(
+                duckdb_path=cfg.duckdb_path,
+                provider_usage=provider_usage,
+            )
             metrics_server = start_metrics_server(
                 host=metrics_host,
                 port=cfg.metrics_http_port,
                 collector=metrics_collector,
                 auth=auth,
             )
+            provider_refresh = ProviderRefreshLoop(
+                provider_usage=provider_usage,
+                registry=HarnessRegistry(cfg.duckdb_path),
+                shutdown_event=stop,
+                fetch=metrics_collector.fetch_harness_provider_usage,
+            )
+            provider_refresh.start()
             log.info(
                 "metrics server starting on %s:%d",
                 metrics_host,
@@ -1450,8 +1471,6 @@ def run(
         except Exception:  # noqa: BLE001
             log.exception("brief worker failed to start; continuing without it")
             briefs = None
-
-    stop = threading.Event()
 
     def _on_signal(signum, _frame):
         log.info("received signal %d; shutting down", signum)

@@ -22,6 +22,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server import metrics
+from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -594,6 +595,75 @@ def test_metrics_collector_harness_json(tmp_path):
     assert '"cwd_suggestions"' in body
     assert '"path": "/home/Arnab/dev/nexus"' in body
     assert '"source": "recent session"' in body
+
+
+def test_harness_capabilities_advertise_cockpit_api(tmp_path):
+    payload = json.loads(_make_collector(tmp_path).render_harness_json())
+
+    assert payload["cockpit_api_version"] == 1
+    assert payload["cockpit_sections"] == [
+        "provider_capacity",
+        "activity",
+        "popular_projects",
+    ]
+
+
+def test_cockpit_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
+    collector = _make_collector(tmp_path)
+    collector.cockpit_service = CockpitService(
+        duckdb_path=collector.duckdb_path,
+        provider_usage=None,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            urlopen(base + "/analytics", timeout=3)
+        assert exc.value.code == 401
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?days=0")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?unexpected=value")
+        assert exc.value.code == 400
+
+        with _authed_get(base + "/cockpit/overview?days=7") as response:
+            payload = json.loads(response.read())
+        assert payload["activity"]["status"] == "ok"
+        assert payload["provider_capacity"]["status"] == "unavailable"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_provider_refresh_loop_only_refreshes_online_hosts_once_per_interval():
+    refreshed = []
+
+    class _Registry:
+        def list_hosts(self, *, status=None):
+            assert status == "online"
+            return [type("Host", (), {"host_id": "mac-mini"})()]
+
+    class _ProviderUsage:
+        def refresh_host(self, host):
+            refreshed.append(host.host_id)
+
+    stop = threading.Event()
+    loop = ProviderRefreshLoop(
+        provider_usage=_ProviderUsage(),
+        registry=_Registry(),
+        shutdown_event=stop,
+        interval_seconds=300,
+    )
+
+    loop.run_once()
+    loop.run_once()
+
+    assert refreshed == ["mac-mini"]
 
 
 def test_harness_snapshot_serializes_session_dates_with_timezone(tmp_path):

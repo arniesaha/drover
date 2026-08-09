@@ -10,6 +10,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.cockpit.analytics import AnalyticsFilters, activity_analytics
+from drover.server.cockpit.service import CockpitService
 
 
 def _analytics_connection() -> duckdb.DuckDBPyConnection:
@@ -265,3 +266,38 @@ def test_analytics_bounds_harness_sessions_by_latest_activity():
 def test_analytics_rejects_unbounded_day_ranges(days):
     with pytest.raises(ValueError, match="days"):
         AnalyticsFilters(days=days)
+
+
+class _FailingProviderService:
+    def latest_accounts(self):
+        raise RuntimeError("provider offline")
+
+
+def test_cockpit_overview_isolates_provider_failure(low_coverage_analytics_db):
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=_FailingProviderService(),
+        connect=lambda: low_coverage_analytics_db,
+    )
+
+    payload = service.overview(AnalyticsFilters(days=7))
+
+    assert payload["provider_capacity"]["status"] == "error"
+    assert payload["provider_capacity"]["data"] == []
+    assert payload["activity"]["status"] == "ok"
+    assert payload["popular_projects"][0]["metric"] == "sessions"
+    assert payload["popular_projects"][0]["project_key"] == "acme/alpha"
+
+
+def test_cockpit_analytics_isolates_activity_failure():
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=None,
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("duckdb offline")),
+    )
+
+    payload = service.analytics(AnalyticsFilters(days=7))
+
+    assert payload["provider_capacity"]["status"] == "unavailable"
+    assert payload["activity"]["status"] == "error"
+    assert payload["activity"]["data"] is None

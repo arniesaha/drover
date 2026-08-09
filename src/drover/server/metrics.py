@@ -28,6 +28,7 @@ from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
 
 if TYPE_CHECKING:
+    from drover.server.cockpit.service import CockpitService
     from drover.server.harness.models import HarnessHost
     from drover.server.relay_manager import RelayManager
 
@@ -605,6 +606,7 @@ class MetricsCollector:
     # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel
     # live, but N polling clients should still share one render.
     harness_ttl_seconds: float = 2.0
+    cockpit_service: "CockpitService | None" = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -648,6 +650,16 @@ class MetricsCollector:
         status = 404 if snapshot.get("error") else 200
         return status, json.dumps(snapshot, sort_keys=True, default=str) + "\n"
 
+    def render_cockpit_overview_json(self, filters: Any) -> tuple[int, str]:
+        if self.cockpit_service is None:
+            return _json_response(503, {"error": "cockpit service unavailable"})
+        return _json_response(200, self.cockpit_service.overview(filters))
+
+    def render_analytics_json(self, filters: Any) -> tuple[int, str]:
+        if self.cockpit_service is None:
+            return _json_response(503, {"error": "cockpit service unavailable"})
+        return _json_response(200, self.cockpit_service.analytics(filters))
+
     def register_harness_host(self, payload: Mapping[str, Any]) -> tuple[int, str]:
         host_id = str(payload.get("host_id") or "").strip()
         if not host_id:
@@ -690,6 +702,21 @@ class MetricsCollector:
         if 200 <= status < 300:
             self._sync_created_harness_session(host_id, payload, body)
         return status, body
+
+    def fetch_harness_provider_usage(self, host: Any) -> Mapping[str, Any]:
+        """Fetch host-local provider facts through direct or relay routing."""
+        status, body = self._harness_request(
+            host, "/providers/usage", method="GET", timeout_s=10.0
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError("unavailable")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("provider usage response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("provider usage response must be an object")
+        return payload
 
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         session = self._harness_session(session_id)
@@ -1028,6 +1055,12 @@ class MetricsCollector:
         source = Path(self.duckdb_path)
         if not source.exists():
             return {
+                "cockpit_api_version": 1,
+                "cockpit_sections": [
+                    "provider_capacity",
+                    "activity",
+                    "popular_projects",
+                ],
                 "hosts": [],
                 "sessions": [],
                 "error": f"DuckDB file does not exist: {source}",
@@ -1047,6 +1080,12 @@ class MetricsCollector:
                 [session.session_id for session in sessions]
             )
             return {
+                "cockpit_api_version": 1,
+                "cockpit_sections": [
+                    "provider_capacity",
+                    "activity",
+                    "popular_projects",
+                ],
                 "hosts": [
                     _harness_host_dict(host, self.relay_manager) for host in hosts
                 ],
