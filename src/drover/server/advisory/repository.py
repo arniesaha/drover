@@ -41,9 +41,15 @@ _SENSITIVE_KEY = re.compile(
     r"(?:authorization|cookie|credential|password|private[_-]?key|secret|token|api[_-]?key)",
     re.IGNORECASE,
 )
-_BEARER_SECRET = re.compile(r"(?i)\b(authorization\s*:\s*bearer|bearer)\s+[^\s,;]+")
+_AUTHORIZATION_SECRET = re.compile(
+    r"(?im)\b(authorization\s*[:=]\s*)(?:(?:basic|bearer|digest)\s+)?[^\r\n,;]+"
+)
+_BEARER_SECRET = re.compile(r"(?i)\b(bearer)\s+[^\s,;]+")
 _ASSIGNED_SECRET = re.compile(
-    r"(?i)\b((?:api[_-]?key|cookie|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+"
+    r"(?i)\b((?:api[_-]?key|authorization|cookie|credential|password|private[_-]?key|secret|token)\s*[:=]\s*)[^\s,;]+"
+)
+_PEM_PRIVATE_KEY = re.compile(
+    r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)"
 )
 _SEVERITY_RANK = {
     Severity.LOW: 1,
@@ -65,8 +71,15 @@ class AdvisoryRepository:
         normalized = tuple(_normalize_evidence(item) for item in candidate.evidence)
         if len(normalized) > MAX_EVIDENCE_RECORDS:
             raise ValueError(f"evidence exceeds {MAX_EVIDENCE_RECORDS} records")
+        title = _redact_text(candidate.title)
+        impact = _redact_text(candidate.impact)
+        remediation = tuple(_redact_text(step) for step in candidate.remediation)
         fingerprint = _fingerprint(candidate)
-        material_hash = _material_hash(candidate, normalized)
+        material_hash = _material_hash(
+            impact=impact,
+            remediation=remediation,
+            normalized=normalized,
+        )
         observed_at = max(item[0].observed_at for item in normalized)
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
@@ -98,9 +111,9 @@ class AdvisoryRepository:
                         candidate.analyzer_class.value,
                         candidate.severity.value,
                         candidate.confidence.value,
-                        candidate.title,
-                        candidate.impact,
-                        json.dumps(candidate.remediation),
+                        title,
+                        impact,
+                        json.dumps(remediation),
                         state.value,
                         observed_at,
                         observed_at,
@@ -143,9 +156,9 @@ class AdvisoryRepository:
                         candidate.analyzer_class.value,
                         candidate.severity.value,
                         candidate.confidence.value,
-                        candidate.title,
-                        candidate.impact,
-                        json.dumps(candidate.remediation),
+                        title,
+                        impact,
+                        json.dumps(remediation),
                         state.value,
                         clear_dismissal,
                         clear_dismissal,
@@ -398,12 +411,14 @@ def _fingerprint(candidate: FindingCandidate) -> str:
 
 
 def _material_hash(
-    candidate: FindingCandidate,
+    *,
+    impact: str,
+    remediation: tuple[str, ...],
     normalized: Sequence[tuple[FindingEvidence, str, str | None]],
 ) -> str:
     material = {
-        "impact": candidate.impact,
-        "remediation": candidate.remediation,
+        "impact": impact,
+        "remediation": remediation,
         "evidence": [
             {
                 "source_ref": evidence.source_ref,
@@ -472,5 +487,9 @@ def _redact_value(value: JSONValue, *, key: str | None = None) -> JSONValue:
 
 
 def _redact_text(value: str) -> str:
+    value = _PEM_PRIVATE_KEY.sub("[REDACTED]", value)
+    value = _AUTHORIZATION_SECRET.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", value
+    )
     value = _BEARER_SECRET.sub(lambda match: f"{match.group(1)} [REDACTED]", value)
     return _ASSIGNED_SECRET.sub(lambda match: f"{match.group(1)}[REDACTED]", value)

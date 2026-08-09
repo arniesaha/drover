@@ -10,6 +10,10 @@ from typing import Mapping, TypeAlias
 JSONValue: TypeAlias = (
     None | bool | int | float | str | list["JSONValue"] | Mapping[str, "JSONValue"]
 )
+MAX_TITLE_CHARS = 240
+MAX_IMPACT_CHARS = 1200
+MAX_REMEDIATION_STEPS = 16
+MAX_REMEDIATION_STEP_CHARS = 1000
 
 
 class AnalyzerClass(StrEnum):
@@ -90,8 +94,24 @@ class FindingCandidate:
             raise ValueError("model findings cannot be confirmed")
         object.__setattr__(self, "remediation", tuple(self.remediation))
         object.__setattr__(self, "evidence", tuple(self.evidence))
-        if not self.remediation or not all(step.strip() for step in self.remediation):
+        if not isinstance(self.title, str):
+            raise ValueError("title must be a string")
+        if len(self.title) > MAX_TITLE_CHARS:
+            raise ValueError(f"title exceeds {MAX_TITLE_CHARS} characters")
+        if not isinstance(self.impact, str):
+            raise ValueError("impact must be a string")
+        if len(self.impact) > MAX_IMPACT_CHARS:
+            raise ValueError(f"impact exceeds {MAX_IMPACT_CHARS} characters")
+        if len(self.remediation) > MAX_REMEDIATION_STEPS:
+            raise ValueError(f"remediation exceeds {MAX_REMEDIATION_STEPS} steps")
+        if not self.remediation or not all(
+            isinstance(step, str) and step.strip() for step in self.remediation
+        ):
             raise ValueError("at least one remediation step is required")
+        if any(len(step) > MAX_REMEDIATION_STEP_CHARS for step in self.remediation):
+            raise ValueError(
+                f"remediation step exceeds {MAX_REMEDIATION_STEP_CHARS} characters"
+            )
         if not self.evidence:
             raise ValueError("at least one evidence record is required")
 

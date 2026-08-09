@@ -188,6 +188,66 @@ def test_observe_appends_bounded_redacted_occurrence_atomically(repository, cand
     assert "second-secret" not in row[1]
 
 
+def test_excerpt_redacts_basic_authorization_and_private_keys(repository, candidate):
+    secret_candidate = replace(
+        candidate,
+        evidence=(
+            replace(
+                candidate.evidence[0],
+                excerpt=(
+                    "Authorization: Basic basic-credential\n"
+                    "private_key=private-key-value"
+                ),
+            ),
+        ),
+    )
+
+    finding = repository.observe(secret_candidate, run_id="run-secret-forms")
+    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    try:
+        excerpt = con.execute(
+            "SELECT excerpt FROM advisory_occurrences WHERE finding_id = ?",
+            [finding.finding_id],
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+    assert "basic-credential" not in excerpt
+    assert "private-key-value" not in excerpt
+    assert excerpt.count("[REDACTED]") == 2
+
+
+def test_finding_text_is_bounded_and_redacted_before_persistence(repository, candidate):
+    secret_candidate = replace(
+        candidate,
+        title="Authorization: Basic title-credential",
+        impact="private_key=impact-private-key",
+        remediation=("Set token=remediation-token in the protected store.",),
+    )
+
+    finding = repository.observe(secret_candidate, run_id="run-finding-text")
+    persisted = " ".join((finding.title, finding.impact, *finding.remediation))
+
+    assert "title-credential" not in persisted
+    assert "impact-private-key" not in persisted
+    assert "remediation-token" not in persisted
+    assert persisted.count("[REDACTED]") == 3
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"title": "x" * 241}, "title exceeds 240"),
+        ({"impact": "x" * 1201}, "impact exceeds 1200"),
+        ({"remediation": ("x" * 1001,)}, "remediation step exceeds 1000"),
+        ({"remediation": tuple("step" for _ in range(17))}, "remediation exceeds 16"),
+    ],
+)
+def test_finding_text_rejects_oversized_values(candidate, changes, message):
+    with pytest.raises(ValueError, match=message):
+        replace(candidate, **changes)
+
+
 def test_rejects_oversized_or_full_content_evidence(repository, candidate):
     oversized = replace(
         candidate,
