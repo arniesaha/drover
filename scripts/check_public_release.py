@@ -68,7 +68,7 @@ CREDENTIAL_PATTERN = re.compile(
     r"(?P<value>\"[^\"\r\n]+\"|'[^'\r\n]+')"
 )
 LEGACY_POSITIONING_PATTERN = re.compile(
-    r"\bformerly\b[^\r\n]{0,80}\bNexus\b",
+    r"\bformerly\b[^\r\n]{0,80}(?<![./])\bNexus\b(?!\.(?:\*|[A-Za-z0-9_]))",
     re.IGNORECASE,
 )
 
@@ -142,10 +142,11 @@ def _is_public_prose_path(path: Path) -> bool:
     return "docs" in parts or "skills" in parts
 
 
-def check_paths(paths: Sequence[Path]) -> list[Finding]:
+def check_paths(paths: Sequence[Path], *, root: Path) -> list[Finding]:
     findings: list[Finding] = []
     for path in paths:
-        normalized = f"/{path.as_posix().lstrip('/')}"
+        scope_path = path.relative_to(root)
+        normalized = f"/{scope_path.as_posix().lstrip('/')}"
         if (
             normalized.endswith("/docs/roadmap.md")
             or "/docs/superpowers/" in normalized
@@ -160,9 +161,9 @@ def check_paths(paths: Sequence[Path]) -> list[Finding]:
             )
 
         if (
-            path.name == "SKILL.md"
-            and path.parent.name == "nexus"
-            and path.parent.parent.name == "skills"
+            scope_path.name == "SKILL.md"
+            and scope_path.parent.name == "nexus"
+            and scope_path.parent.parent.name == "skills"
         ):
             findings.append(
                 Finding(
@@ -183,7 +184,7 @@ def check_paths(paths: Sequence[Path]) -> list[Finding]:
         text = data.decode("utf-8", errors="replace")
         for line_number, line in enumerate(text.splitlines(), start=1):
             credential = CREDENTIAL_PATTERN.search(line)
-            if credential and not _allowlisted(path, "credential-value"):
+            if credential and not _allowlisted(scope_path, "credential-value"):
                 findings.append(
                     Finding(
                         path=str(path),
@@ -193,7 +194,7 @@ def check_paths(paths: Sequence[Path]) -> list[Finding]:
                     )
                 )
 
-            if _is_public_prose_path(path):
+            if _is_public_prose_path(scope_path):
                 if "—" in line:
                     findings.append(
                         Finding(
@@ -214,9 +215,13 @@ def check_paths(paths: Sequence[Path]) -> list[Finding]:
                     )
 
             for rule in RULES:
-                if rule.name in ENVIRONMENT_RULES and not _is_release_facing(path):
+                if rule.name in ENVIRONMENT_RULES and not _is_release_facing(
+                    scope_path
+                ):
                     continue
-                if rule.pattern.search(line) and not _allowlisted(path, rule.name):
+                if rule.pattern.search(line) and not _allowlisted(
+                    scope_path, rule.name
+                ):
                     findings.append(
                         Finding(
                             path=str(path),
@@ -240,7 +245,7 @@ def _tracked_paths(root: Path) -> list[Path]:
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    findings = check_paths(_tracked_paths(root))
+    findings = check_paths(_tracked_paths(root), root=root)
     for finding in findings:
         path = Path(finding.path)
         try:

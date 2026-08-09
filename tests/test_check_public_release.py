@@ -27,7 +27,7 @@ def test_check_paths_finds_private_environment_and_stale_names(tmp_path: Path) -
         write_file(tmp_path, "docs/harness.md", "Start the Meta Harness daemon.\n"),
     ]
 
-    findings = check_paths(paths)
+    findings = check_paths(paths, root=tmp_path)
 
     assert {finding.rule for finding in findings} == {
         "personal-home-path",
@@ -45,7 +45,7 @@ def test_check_paths_scans_release_runtime_source(tmp_path: Path) -> None:
         'DEFAULT_ROOT = "/Users/example/projects/drover"\n',
     )
 
-    findings = check_paths([path])
+    findings = check_paths([path], root=tmp_path)
 
     assert [finding.rule for finding in findings] == ["personal-home-path"]
 
@@ -53,7 +53,7 @@ def test_check_paths_scans_release_runtime_source(tmp_path: Path) -> None:
 def test_check_paths_redacts_credential_values(tmp_path: Path) -> None:
     path = write_file(tmp_path, "config.env", 'token = "secret-value"\n')
 
-    findings = check_paths([path])
+    findings = check_paths([path], root=tmp_path)
 
     assert len(findings) == 1
     assert findings[0].rule == "credential-value"
@@ -70,20 +70,20 @@ def test_check_paths_does_not_treat_type_annotations_as_credentials(
         "func configure(token: String) async {}\n",
     )
 
-    assert check_paths([path]) == []
+    assert check_paths([path], root=tmp_path) == []
 
 
 def test_check_paths_allows_test_only_credential_fixtures(tmp_path: Path) -> None:
     path = write_file(tmp_path, "tests/test_client.py", 'token = "fake-token"\n')
 
-    assert check_paths([path]) == []
+    assert check_paths([path], root=tmp_path) == []
 
 
 def test_check_paths_skips_binary_files(tmp_path: Path) -> None:
     path = tmp_path / "fixture.bin"
     path.write_bytes(b"token=secret-value\x00binary")
 
-    assert check_paths([path]) == []
+    assert check_paths([path], root=tmp_path) == []
 
 
 def test_check_paths_allows_documented_legacy_compatibility(tmp_path: Path) -> None:
@@ -93,7 +93,7 @@ def test_check_paths_allows_documented_legacy_compatibility(tmp_path: Path) -> N
         "NexusKit is retained only as a historical compatibility name.\n",
     )
 
-    assert check_paths([path]) == []
+    assert check_paths([path], root=tmp_path) == []
 
 
 def test_check_paths_rejects_legacy_nexus_skill_entrypoint(tmp_path: Path) -> None:
@@ -103,7 +103,7 @@ def test_check_paths_rejects_legacy_nexus_skill_entrypoint(tmp_path: Path) -> No
         "---\nname: nexus\ndescription: Use when recalling prior work.\n---\n",
     )
 
-    findings = check_paths([path])
+    findings = check_paths([path], root=tmp_path)
 
     assert len(findings) == 1
     assert findings[0].rule == "legacy-skill-entrypoint"
@@ -116,7 +116,7 @@ def test_check_paths_rejects_private_roadmap_link(tmp_path: Path) -> None:
         "See https://github.com/arniesaha/drover-roadmap for private plans.\n",
     )
 
-    findings = check_paths([path])
+    findings = check_paths([path], root=tmp_path)
 
     assert len(findings) == 1
     assert findings[0].rule == "private-roadmap-link"
@@ -128,7 +128,7 @@ def test_check_paths_rejects_private_planning_paths(tmp_path: Path) -> None:
         write_file(tmp_path, "docs/superpowers/specs/design.md", "# Design\n"),
     ]
 
-    findings = check_paths(paths)
+    findings = check_paths(paths, root=tmp_path)
 
     assert [finding.rule for finding in findings] == [
         "private-planning-path",
@@ -143,7 +143,7 @@ def test_check_paths_rejects_em_dash_in_public_prose(tmp_path: Path) -> None:
         "Drover is local-first — sessions stay under your control.\n",
     )
 
-    findings = check_paths([path])
+    findings = check_paths([path], root=tmp_path)
 
     assert [finding.rule for finding in findings] == ["public-em-dash"]
 
@@ -155,7 +155,7 @@ def test_check_paths_rejects_legacy_product_positioning(tmp_path: Path) -> None:
         "Drover, formerly Nexus, manages coding-agent sessions.\n",
     )
 
-    findings = check_paths([path])
+    findings = check_paths([path], root=tmp_path)
 
     assert [finding.rule for finding in findings] == ["legacy-positioning-copy"]
 
@@ -167,14 +167,34 @@ def test_check_paths_limits_copy_rules_to_public_prose(tmp_path: Path) -> None:
         write_file(tmp_path, "tests/fixtures/session.md", "Captured — unchanged.\n"),
     ]
 
-    assert check_paths(paths) == []
+    assert check_paths(paths, root=tmp_path) == []
 
 
 def test_check_paths_allows_nexus_compatibility_contract(tmp_path: Path) -> None:
     path = write_file(
         tmp_path,
         "docs/compatibility.md",
-        "The `nexus.*` telemetry keys remain readable for compatibility.\n",
+        "Historical spans formerly used `nexus.*` telemetry keys.\n",
     )
 
-    assert check_paths([path]) == []
+    assert check_paths([path], root=tmp_path) == []
+
+
+def test_check_paths_scopes_public_prose_relative_to_repository_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "tests" / "drover"
+    path = write_file(root, "docs/overview.md", "Direct copy — under docs.\n")
+
+    findings = check_paths([path], root=root)
+
+    assert [finding.rule for finding in findings] == ["public-em-dash"]
+
+
+def test_check_paths_ignores_public_directory_names_above_repository_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "docs" / "drover"
+    path = write_file(root, "src/notes.md", "Internal note — not public prose.\n")
+
+    assert check_paths([path], root=root) == []
