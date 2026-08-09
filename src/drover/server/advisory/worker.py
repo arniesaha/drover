@@ -95,9 +95,12 @@ class ContentAnalysisScheduler:
         self._scheduled_hosts: set[str] = set()
 
     def enqueue_due(self) -> dict[str, ContentBundle]:
+        from drover.server.advisory.service import content_consent_generation
+
         config = self.consent_reader()
         if not config.enabled:
             return {}
+        consent_generation = content_consent_generation()
         target_ids = tuple(Path(target).name for target in config.targets)
         if not target_ids:
             return {}
@@ -110,6 +113,7 @@ class ContentAnalysisScheduler:
                 "max_file_bytes": config.max_file_bytes,
                 "max_bundle_bytes": config.max_bundle_bytes,
                 "excerpt_max_chars": config.excerpt_max_chars,
+                "consent_generation": consent_generation,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -126,11 +130,13 @@ class ContentAnalysisScheduler:
                 continue
             from drover.server.advisory.service import content_consent_operation
 
-            with content_consent_operation():
+            with content_consent_operation() as live_generation:
                 live = self.consent_reader()
-                if not live.enabled or _content_config_version(
-                    live
-                ) != _content_config_version(config):
+                if (
+                    live_generation != consent_generation
+                    or not live.enabled
+                    or _content_config_version(live) != _content_config_version(config)
+                ):
                     return {}
                 bundle = self.bundle_fetcher(host.host_id, target_ids)
                 enqueue_advisory_check(
@@ -337,12 +343,13 @@ class ContentAnalysisWorker:
     ) -> ContentAnalysisResult:
         from drover.server.advisory.service import content_consent_operation
 
-        with content_consent_operation():
+        with content_consent_operation() as consent_generation:
             return self._run_model_job(
                 host_id=host_id,
                 target_ids=target_ids,
                 job=job,
                 prefetched_bundle=prefetched_bundle,
+                consent_generation=consent_generation,
             )
 
     def _run_model_job(
@@ -350,6 +357,7 @@ class ContentAnalysisWorker:
         *,
         host_id: str,
         target_ids: Iterable[str],
+        consent_generation: int,
         job: Job | None = None,
         prefetched_bundle: ContentBundle | None = None,
     ) -> ContentAnalysisResult:
@@ -409,14 +417,25 @@ class ContentAnalysisWorker:
                 "bundle_hash": bundle.bundle_hash,
                 "target_hashes": [target.content_hash for target in bundle.targets],
             }
-            if job is not None:
-                artifact = self._record_success(job, candidates, artifact_base)
-            else:
-                sink = self.finding_sink or _candidate_reference
-                artifact = {
-                    **artifact_base,
-                    "finding_ids": [sink(candidate) for candidate in candidates],
-                }
+            from drover.server.advisory.service import (
+                validate_content_consent_generation,
+            )
+
+            # Keep validation and durable publication in one short critical
+            # section. Revocation can overlap remote model I/O, but a result
+            # from the prior consent epoch can never cross this boundary.
+            with validate_content_consent_generation(consent_generation) as current:
+                live = self.consent_reader()
+                if not current or not live.enabled:
+                    return ContentAnalysisResult(status="revoked", artifact={})
+                if job is not None:
+                    artifact = self._record_success(job, candidates, artifact_base)
+                else:
+                    sink = self.finding_sink or _candidate_reference
+                    artifact = {
+                        **artifact_base,
+                        "finding_ids": [sink(candidate) for candidate in candidates],
+                    }
             return ContentAnalysisResult(status="succeeded", artifact=artifact)
         finally:
             # Sever all direct references to redacted content before returning.

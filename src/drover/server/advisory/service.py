@@ -49,13 +49,15 @@ class _ContentConsentCoordinator:
         self._condition = threading.Condition(self.lock)
         self._active = 0
         self._revoking = False
+        self._generation = 0
 
     @contextmanager
     def operation(self):
         with self._condition:
             self._active += 1
+            generation = self._generation
         try:
-            yield
+            yield generation
         finally:
             with self._condition:
                 self._active -= 1
@@ -71,6 +73,19 @@ class _ContentConsentCoordinator:
 
     def begin_revocation(self) -> None:
         self._revoking = True
+
+    def advance_generation(self) -> int:
+        self._generation += 1
+        return self._generation
+
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
+
+    @contextmanager
+    def validate(self, generation: int):
+        with self._condition:
+            yield generation == self._generation and not self._revoking
 
     def finish_revocation(self) -> None:
         self._revoking = False
@@ -88,6 +103,14 @@ _CONTENT_JOB_STATUSES = ("pending", "leased", "retry_wait")
 
 def content_consent_operation():
     return _CONTENT_CONSENT_COORDINATOR.operation()
+
+
+def content_consent_generation() -> int:
+    return _CONTENT_CONSENT_COORDINATOR.generation()
+
+
+def validate_content_consent_generation(generation: int):
+    return _CONTENT_CONSENT_COORDINATOR.validate(generation)
 
 
 class InvalidInsightRequest(ValueError):
@@ -186,6 +209,7 @@ class InsightsService:
                 backend=backend,
                 external_disclosure_accepted=disclosure,
             )
+            _CONTENT_CONSENT_COORDINATOR.advance_generation()
             pending = self._pending_model_job_count()
         return {
             "enabled": True,
@@ -205,6 +229,7 @@ class InsightsService:
                     backend="local",
                     external_disclosure_accepted=False,
                 )
+                _CONTENT_CONSENT_COORDINATOR.advance_generation()
                 _CONTENT_CONSENT_COORDINATOR.wait_for_idle()
                 cancelled = self._cancel_pending_model_jobs()
                 pending = self._pending_model_job_count()
@@ -665,6 +690,8 @@ def _wire_datetime(value: datetime | None) -> str | None:
 __all__ = [
     "CONTENT_CONSENT_FENCE",
     "content_consent_operation",
+    "content_consent_generation",
+    "validate_content_consent_generation",
     "InsightFilters",
     "InsightsService",
     "InvalidInsightRequest",

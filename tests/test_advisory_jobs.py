@@ -916,6 +916,164 @@ excerpt_max_chars = 320
     assert fetches == ["mac-mini"]
 
 
+def test_backend_result_returning_during_revoke_is_not_persisted(
+    db_path: Path, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "local"
+external_consent = false
+targets = ["/allowed/global-agents"]
+allowed_roots = ["/allowed"]
+max_file_bytes = 1024
+max_bundle_bytes = 4096
+excerpt_max_chars = 320
+""")
+    bundle = _content_bundle(
+        "Always inspect the repository. Always inspect the repository."
+    )
+    job = enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version=bundle.bundle_hash,
+    )
+    backend_entered = threading.Event()
+    backend_release = threading.Event()
+    revoked = threading.Event()
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            backend_entered.set()
+            assert backend_release.wait(2)
+            return json.dumps(
+                {
+                    "findings": [
+                        {
+                            "rule_id": "prompt.repetition",
+                            "target_id": "global-agents",
+                            "severity": "medium",
+                            "confidence": "likely",
+                            "title": "Repeated instruction",
+                            "impact": "Repeated text consumes context.",
+                            "evidence_excerpt": "Always inspect the repository.",
+                            "remediation": ["Keep one copy of the instruction."],
+                        }
+                    ]
+                }
+            )
+
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: load_config(config_path).advisory_content,
+        bundle_fetcher=lambda _host, _targets: bundle,
+        backend_factory=lambda _config: Backend(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+    )
+    working = threading.Thread(target=worker.run_once)
+    working.start()
+    assert backend_entered.wait(2)
+
+    service = InsightsService(db_path, config_path=config_path)
+
+    def revoke() -> None:
+        service.revoke_content_analysis()
+        revoked.set()
+
+    revoker = threading.Thread(target=revoke)
+    revoker.start()
+    for _ in range(100):
+        if not load_config(config_path).advisory_content.enabled:
+            break
+        threading.Event().wait(0.01)
+    assert load_config(config_path).advisory_content.enabled is False
+    assert revoked.is_set() is False
+    backend_release.set()
+    working.join(2)
+    revoker.join(2)
+
+    assert working.is_alive() is False
+    assert revoker.is_alive() is False
+    assert revoked.is_set()
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        status, artifact_id = con.execute(
+            "SELECT status, latest_artifact_id FROM pipeline_jobs WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone()
+        finding_count = con.execute(
+            "SELECT count(*) FROM advisory_findings"
+        ).fetchone()[0]
+        occurrence_count = con.execute(
+            "SELECT count(*) FROM advisory_occurrences"
+        ).fetchone()[0]
+        artifact_count = con.execute(
+            "SELECT count(*) FROM pipeline_artifacts WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone()[0]
+    assert status == "cancelled"
+    assert artifact_id is None
+    assert finding_count == 0
+    assert occurrence_count == 0
+    assert artifact_count == 0
+
+
+def test_reconsent_same_settings_replaces_cancelled_job_in_same_bucket(
+    db_path: Path, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "local"
+external_consent = false
+targets = ["/allowed/global-agents"]
+allowed_roots = ["/allowed"]
+max_file_bytes = 1024
+max_bundle_bytes = 4096
+excerpt_max_chars = 320
+""")
+    bundle = _content_bundle("No issue.")
+    fetches: list[str] = []
+
+    class Registry:
+        def list_hosts(self):
+            return [type("Host", (), {"host_id": "mac-mini"})()]
+
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=Registry(),
+        consent_reader=lambda: load_config(config_path).advisory_content,
+        bundle_fetcher=lambda host_id, _targets: (
+            fetches.append(host_id),
+            bundle,
+        )[1],
+        interval_seconds=300,
+        clock=lambda: 1_000,
+    )
+    assert scheduler.enqueue_due() == {"mac-mini": bundle}
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        first_job_id = con.execute(
+            "SELECT job_id FROM pipeline_jobs WHERE status = 'pending'"
+        ).fetchone()[0]
+
+    service = InsightsService(db_path, config_path=config_path)
+    service.revoke_content_analysis()
+    service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+
+    assert scheduler.enqueue_due() == {"mac-mini": bundle}
+    assert scheduler.enqueue_due() == {}
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        rows = con.execute("SELECT job_id, status FROM pipeline_jobs").fetchall()
+    states = dict(rows)
+    replacement_ids = [job_id for job_id, status in rows if status == "pending"]
+    assert states[first_job_id] == "cancelled"
+    assert len(replacement_ids) == 1
+    assert replacement_ids[0] != first_job_id
+    assert fetches == ["mac-mini", "mac-mini"]
+
+
 def test_revocation_after_lease_requeues_job_and_resumes_after_enable(
     db_path: Path,
 ) -> None:
