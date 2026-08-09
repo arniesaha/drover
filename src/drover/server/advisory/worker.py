@@ -9,7 +9,9 @@ import json
 import logging
 from pathlib import Path
 import threading
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Protocol
+
+from drover.config import AdvisoryContentConfig
 
 from drover.server.advisory.analyzers import (
     MAX_SNAPSHOT_RECORDS,
@@ -29,7 +31,17 @@ from drover.server.advisory.jobs import (
     enqueue_advisory_check,
 )
 from drover.server.advisory.repository import AdvisoryRepository
-from drover.server.advisory.types import FindingState
+from drover.server.advisory.content_targets import (
+    BundledTarget,
+    ContentBundle,
+)
+from drover.server.advisory.model_analyzer import (
+    AnalysisBackend,
+    AnalysisConsentRevoked,
+    ModelConfigurationAnalyzer,
+    ModelFindingError,
+)
+from drover.server.advisory.types import FindingCandidate, FindingState
 from drover.server.db import open_duckdb_connection
 from drover.server.ledger import ArtifactSpec, Job, Ledger
 
@@ -42,6 +54,188 @@ class AdvisoryRunResult:
     succeeded: int = 0
     failed: int = 0
     skipped: int = 0
+
+
+@dataclass(frozen=True)
+class ContentAnalysisResult:
+    """Content-free result safe to attach to attempt metrics or artifacts."""
+
+    status: str
+    artifact: Mapping[str, Any]
+
+
+class ContentBundleFetcher(Protocol):
+    def __call__(
+        self, host_id: str, target_ids: tuple[str, ...]
+    ) -> ContentBundle | Mapping[str, Any]: ...
+
+
+class ContentAnalysisWorker:
+    """Run one ephemeral model analysis behind two live consent fences."""
+
+    def __init__(
+        self,
+        *,
+        consent_reader: Callable[[], AdvisoryContentConfig],
+        bundle_fetcher: ContentBundleFetcher,
+        backend_factory: Callable[[AdvisoryContentConfig], AnalysisBackend],
+        finding_sink: Callable[[FindingCandidate], str] | None = None,
+        duckdb_path: str | Path | None = None,
+        repository: AdvisoryRepository | None = None,
+    ) -> None:
+        self.consent_reader = consent_reader
+        self.bundle_fetcher = bundle_fetcher
+        self.backend_factory = backend_factory
+        self.finding_sink = finding_sink
+        self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
+        self.repository = repository
+
+    def run_model_job(
+        self, *, host_id: str, target_ids: Iterable[str], job: Job | None = None
+    ) -> ContentAnalysisResult:
+        requested = tuple(target_ids)
+        if not requested:
+            raise ValueError("at least one content target ID is required")
+        config = self.consent_reader()
+        if not config.enabled:
+            return ContentAnalysisResult(status="disabled", artifact={})
+
+        bundle: ContentBundle | None = None
+        fetched: ContentBundle | Mapping[str, Any] | None = None
+        backend: AnalysisBackend | None = None
+        analyzer: ModelConfigurationAnalyzer | None = None
+        candidates: list[FindingCandidate] | None = None
+        try:
+            # This read is adjacent to the fetch. Revocation therefore prevents
+            # even an ephemeral content response from being requested.
+            config = self.consent_reader()
+            if not config.enabled:
+                return ContentAnalysisResult(status="revoked", artifact={})
+            try:
+                fetched = self.bundle_fetcher(host_id, requested)
+            except Exception:
+                raise ModelFindingError("content bundle fetch failed") from None
+            bundle = _coerce_content_bundle(fetched, host_id=host_id)
+            fetched = None
+
+            # Backend creation is also fenced so cloud credentials/transports
+            # are never selected from stale consent.
+            config = self.consent_reader()
+            if not config.enabled:
+                return ContentAnalysisResult(status="revoked", artifact={})
+            try:
+                backend = self.backend_factory(config)
+            except Exception:
+                raise ModelFindingError("analysis backend creation failed") from None
+            fenced_backend = _ConsentFencedBackend(
+                backend=backend,
+                consent_reader=self.consent_reader,
+                selected_policy=config.backend_policy,
+            )
+            analyzer = ModelConfigurationAnalyzer(
+                fenced_backend, excerpt_max_chars=config.excerpt_max_chars
+            )
+            try:
+                candidates = analyzer.analyze(bundle)
+            except AnalysisConsentRevoked:
+                return ContentAnalysisResult(status="revoked", artifact={})
+
+            sink = self.finding_sink
+            if sink is None and self.repository is not None:
+                run_id = (
+                    job.latest_attempt_id
+                    if job is not None and job.latest_attempt_id
+                    else (job.job_id if job is not None else bundle.bundle_hash)
+                )
+                sink = lambda candidate: self.repository.observe(
+                    candidate, run_id=run_id
+                ).finding_id
+            sink = sink or _candidate_reference
+            finding_ids = [sink(candidate) for candidate in candidates]
+            artifact = {
+                "bundle_hash": bundle.bundle_hash,
+                "target_hashes": [target.content_hash for target in bundle.targets],
+                "finding_ids": finding_ids,
+            }
+            if job is not None:
+                self._record_success(job, artifact)
+            return ContentAnalysisResult(status="succeeded", artifact=artifact)
+        finally:
+            # Sever all direct references to redacted content before returning.
+            candidates = None
+            analyzer = None
+            backend = None
+            fetched = None
+            bundle = None
+
+    def _record_success(self, job: Job, artifact: Mapping[str, Any]) -> None:
+        if self.duckdb_path is None:
+            raise ValueError("duckdb_path is required to record a content job")
+        serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            Ledger(con).succeed_job(
+                job.job_id,
+                artifact=ArtifactSpec(
+                    artifact_kind=ADVISORY_ARTIFACT_KIND,
+                    subject_key=job.subject_key,
+                    storage_uri=f"duckdb://advisory_findings/{job.subject_key}",
+                    content_hash=hashlib.sha256(serialized.encode()).hexdigest(),
+                    version_token=str(artifact["bundle_hash"]),
+                    metadata=artifact,
+                ),
+                metrics=artifact,
+            )
+        finally:
+            con.close()
+
+
+@dataclass
+class _ConsentFencedBackend:
+    backend: AnalysisBackend
+    consent_reader: Callable[[], AdvisoryContentConfig]
+    selected_policy: str
+
+    def complete(self, system: str, user: str) -> str:
+        config = self.consent_reader()
+        if (
+            not config.enabled
+            or config.backend_policy != self.selected_policy
+            or (config.backend_policy == "cloud" and not config.external_consent)
+        ):
+            raise AnalysisConsentRevoked("content analysis consent was revoked")
+        return self.backend.complete(system, user)
+
+
+def _candidate_reference(candidate: FindingCandidate) -> str:
+    return f"{candidate.analyzer_id}:{candidate.rule_id}:{candidate.target_id}"
+
+
+def _coerce_content_bundle(
+    value: ContentBundle | Mapping[str, Any], *, host_id: str
+) -> ContentBundle:
+    if isinstance(value, ContentBundle):
+        if value.host_id != host_id:
+            raise ValueError("content bundle host does not match request")
+        return value
+    try:
+        created_at = datetime.fromisoformat(str(value["created_at"]))
+        targets = tuple(
+            BundledTarget(
+                target_id=str(item["target_id"]),
+                content_hash=str(item["content_hash"]),
+                redacted_content=str(item["redacted_content"]),
+            )
+            for item in value["targets"]
+        )
+        return ContentBundle(
+            host_id=host_id,
+            created_at=created_at,
+            targets=targets,
+            bundle_hash=str(value["bundle_hash"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("content bundle response is invalid") from None
 
 
 class AdvisoryWorker:
@@ -465,6 +659,8 @@ def operational_analyzers() -> tuple[Analyzer, ...]:
 __all__ = [
     "AdvisoryRunResult",
     "AdvisoryWorker",
+    "ContentAnalysisResult",
+    "ContentAnalysisWorker",
     "SnapshotFactory",
     "load_operational_snapshot",
     "operational_analyzers",

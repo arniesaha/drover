@@ -10,6 +10,7 @@ import duckdb
 import pytest
 
 from drover.config import load_config
+from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server.advisory.analyzers import AnalysisSnapshot, TelemetryAggregate
 from drover.server.advisory.analyzers.connectors import ConnectorFreshnessAnalyzer
@@ -29,14 +30,29 @@ from drover.server.advisory.types import (
 )
 from drover.server.advisory.worker import (
     AdvisoryWorker,
+    ContentAnalysisWorker,
     load_operational_snapshot,
     operational_analyzers,
 )
+from drover.server.advisory.content_targets import BundledTarget, ContentBundle
 from drover.server.cockpit.service import ProviderRefreshLoop
 from drover.server.ledger import Ledger
 from drover.server.providers.service import ProviderUsageService
 
 NOW = datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc)
+
+
+def _content_config(*, enabled: bool = True, external_consent: bool = False):
+    return AdvisoryContentConfig(
+        enabled=enabled,
+        backend_policy="cloud" if external_consent else "local",
+        external_consent=external_consent,
+        targets=("/allowed/global-agents",),
+        allowed_roots=(Path("/allowed"),),
+        max_file_bytes=1024,
+        max_bundle_bytes=4096,
+        excerpt_max_chars=320,
+    )
 
 
 @pytest.fixture()
@@ -399,6 +415,276 @@ def test_operational_change_enqueues_only_lightweight_analyzers(db_path: Path) -
         "connectors:mac-mini",
         "telemetry:mac-mini",
     ]
+
+
+def test_disabled_content_job_never_fetches_bundle() -> None:
+    calls: list[str] = []
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(enabled=False),
+        bundle_fetcher=lambda _host, _targets: calls.append("fetch"),
+        backend_factory=lambda _config: calls.append("backend"),
+    )
+
+    result = worker.run_model_job(host_id="mac-mini", target_ids=("global-agents",))
+
+    assert result.status == "disabled"
+    assert calls == []
+
+
+def test_content_job_rereads_consent_before_fetch_and_backend_creation() -> None:
+    configs = iter(
+        (
+            _content_config(),
+            _content_config(),
+            _content_config(enabled=False),
+        )
+    )
+    calls: list[str] = []
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            calls.append("complete")
+            return '{"findings":[]}'
+
+    bundle = ContentBundle(
+        host_id="mac-mini",
+        created_at=NOW,
+        bundle_hash="b" * 64,
+        targets=(
+            BundledTarget(
+                target_id="global-agents",
+                content_hash="c" * 64,
+                redacted_content="Review this instruction.",
+            ),
+        ),
+    )
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: next(configs),
+        bundle_fetcher=lambda _host, _targets: (calls.append("fetch"), bundle)[1],
+        backend_factory=lambda _config: (calls.append("backend"), Backend())[1],
+    )
+
+    result = worker.run_model_job(host_id="mac-mini", target_ids=("global-agents",))
+
+    assert result.status == "revoked"
+    assert calls == ["fetch"]
+
+
+def test_content_job_rereads_consent_immediately_before_backend_call() -> None:
+    configs = iter(
+        (
+            _content_config(),
+            _content_config(),
+            _content_config(),
+            _content_config(enabled=False),
+        )
+    )
+    calls: list[str] = []
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            calls.append("complete")
+            return '{"findings":[]}'
+
+    bundle = ContentBundle(
+        host_id="mac-mini",
+        created_at=NOW,
+        bundle_hash="b" * 64,
+        targets=(
+            BundledTarget(
+                target_id="global-agents",
+                content_hash="c" * 64,
+                redacted_content="Review this instruction.",
+            ),
+        ),
+    )
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: next(configs),
+        bundle_fetcher=lambda _host, _targets: (calls.append("fetch"), bundle)[1],
+        backend_factory=lambda _config: (calls.append("backend"), Backend())[1],
+    )
+
+    result = worker.run_model_job(host_id="mac-mini", target_ids=("global-agents",))
+
+    assert result.status == "revoked"
+    assert calls == ["fetch", "backend"]
+
+
+@pytest.mark.parametrize("failing_stage", ["fetch", "backend"])
+def test_content_job_exceptions_do_not_echo_request_or_config_content(
+    failing_stage: str,
+) -> None:
+    sensitive = "private prompt content"
+
+    def fetch(_host, _targets):
+        if failing_stage == "fetch":
+            raise RuntimeError(sensitive)
+        return ContentBundle(
+            host_id="mac-mini",
+            created_at=NOW,
+            bundle_hash="b" * 64,
+            targets=(
+                BundledTarget(
+                    target_id="global-agents",
+                    content_hash="c" * 64,
+                    redacted_content=sensitive,
+                ),
+            ),
+        )
+
+    def backend_factory(_config):
+        raise RuntimeError(sensitive)
+
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=fetch,
+        backend_factory=backend_factory,
+    )
+
+    with pytest.raises(ValueError) as captured:
+        worker.run_model_job(host_id="mac-mini", target_ids=("global-agents",))
+
+    assert sensitive not in str(captured.value)
+
+
+def test_content_job_returns_only_hashes_and_finding_ids() -> None:
+    content = "Always inspect the repository. Always inspect the repository."
+    bundle = ContentBundle(
+        host_id="mac-mini",
+        created_at=NOW,
+        bundle_hash="b" * 64,
+        targets=(
+            BundledTarget(
+                target_id="global-agents",
+                content_hash="c" * 64,
+                redacted_content=content,
+            ),
+        ),
+    )
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            return json.dumps(
+                {
+                    "findings": [
+                        {
+                            "rule_id": "prompt.repetition",
+                            "target_id": "global-agents",
+                            "severity": "medium",
+                            "confidence": "likely",
+                            "title": "Repeated instruction",
+                            "impact": "Repeated text consumes context.",
+                            "evidence_excerpt": "Always inspect the repository.",
+                            "remediation": ["Keep one copy of the instruction."],
+                        }
+                    ]
+                }
+            )
+
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=lambda _host, _targets: bundle,
+        backend_factory=lambda _config: Backend(),
+    )
+
+    result = worker.run_model_job(host_id="mac-mini", target_ids=("global-agents",))
+
+    encoded = json.dumps(result.artifact)
+    assert result.status == "succeeded"
+    assert result.artifact == {
+        "bundle_hash": "b" * 64,
+        "target_hashes": ["c" * 64],
+        "finding_ids": ["model.configuration:prompt.repetition:mac-mini/global-agents"],
+    }
+    assert content not in encoded
+
+
+def test_content_job_persists_only_hashes_and_finding_ids_in_ledger(
+    db_path: Path,
+) -> None:
+    content = "Always inspect the repository. Always inspect the repository."
+    bundle = ContentBundle(
+        host_id="mac-mini",
+        created_at=NOW,
+        bundle_hash="b" * 64,
+        targets=(
+            BundledTarget(
+                target_id="global-agents",
+                content_hash="c" * 64,
+                redacted_content=content,
+            ),
+        ),
+    )
+    job = enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version="b" * 64,
+    )
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).lease_job(
+            job.job_id,
+            worker_id="content-test",
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+        job = Ledger(con).latest_job("analyze_advisory_target", job.subject_key)
+    assert job is not None
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            return json.dumps(
+                {
+                    "findings": [
+                        {
+                            "rule_id": "prompt.repetition",
+                            "target_id": "global-agents",
+                            "severity": "medium",
+                            "confidence": "likely",
+                            "title": "Repeated instruction",
+                            "impact": "Repeated text consumes context.",
+                            "evidence_excerpt": "Always inspect the repository.",
+                            "remediation": ["Keep one copy of the instruction."],
+                        }
+                    ]
+                }
+            )
+
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=lambda _host, _targets: bundle,
+        backend_factory=lambda _config: Backend(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+    )
+
+    result = worker.run_model_job(
+        host_id="mac-mini", target_ids=("global-agents",), job=job
+    )
+
+    assert result.status == "succeeded"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        metrics, metadata = con.execute(
+            """
+            SELECT a.metrics_json, p.metadata_json
+            FROM pipeline_jobs j
+            JOIN pipeline_job_attempts a ON a.attempt_id = j.latest_attempt_id
+            JOIN pipeline_artifacts p ON p.artifact_id = j.latest_artifact_id
+            WHERE j.job_id = ?
+            """,
+            [job.job_id],
+        ).fetchone()
+    persisted = metrics + metadata
+    assert content not in persisted
+    assert set(json.loads(metrics)) == {
+        "bundle_hash",
+        "target_hashes",
+        "finding_ids",
+    }
+    assert set(json.loads(metadata)) == {
+        "bundle_hash",
+        "target_hashes",
+        "finding_ids",
+    }
 
 
 def test_periodic_scheduler_uses_one_deterministic_version_per_interval(
