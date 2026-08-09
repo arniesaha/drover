@@ -322,6 +322,42 @@ def test_stale_lease_is_reclaimed_before_analyzer_runs(db_path: Path) -> None:
         ] == ["retryable_failed", "succeeded"]
 
 
+def test_expired_lease_at_attempt_cap_is_dead_lettered(db_path: Path) -> None:
+    job = enqueue_advisory_check(
+        db_path,
+        analyzer_id="healthy",
+        target_id="mac-mini",
+        source_version="v1",
+        max_attempts=1,
+    )
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).lease_job(
+            job.job_id,
+            worker_id="crashed-worker",
+            lease_expires_at=NOW - timedelta(seconds=1),
+        )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda _analyzer, _target, version: _snapshot(version),
+        clock=lambda: NOW,
+    )
+
+    result = worker.run_once([HealthyAnalyzer()])
+
+    assert (result.succeeded, result.skipped) == (0, 1)
+    with duckdb.connect(str(db_path)) as con:
+        assert con.execute(
+            "SELECT status, attempt_count FROM pipeline_jobs WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone() == ("dead_lettered", 1)
+        assert con.execute(
+            "SELECT result, error_category FROM pipeline_job_attempts "
+            "WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone() == ("terminal_failed", "lease_expired")
+
+
 def test_passing_evidence_preserves_dismissed_finding(db_path: Path) -> None:
     enqueue_advisory_check(
         db_path, analyzer_id="healthy", target_id="mac-mini", source_version="v1"

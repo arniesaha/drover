@@ -129,7 +129,7 @@ class AdvisoryWorker:
         try:
             ledger = Ledger(con)
             now = self.clock()
-            ledger.reclaim_stale_leases(job_kind=ADVISORY_JOB_KIND, stale_before=now)
+            self._reclaim_stale_leases(ledger, now)
             retry_rows = con.execute(
                 """
                 SELECT job_id, subject_key FROM pipeline_jobs
@@ -171,6 +171,25 @@ class AdvisoryWorker:
             return ledger.latest_job(ADVISORY_JOB_KIND, job.subject_key)
         finally:
             con.close()
+
+    @staticmethod
+    def _reclaim_stale_leases(ledger: Ledger, now: datetime) -> None:
+        for job in ledger.list_leased_jobs(
+            job_kind=ADVISORY_JOB_KIND, stale_before=now
+        ):
+            if job.attempt_count >= job.max_attempts:
+                ledger.fail_job(
+                    job.job_id,
+                    error_category="lease_expired",
+                    error_message="advisory lease expired at the attempt limit",
+                )
+                ledger.dead_letter_job(job.job_id)
+            else:
+                ledger.reclaim_lease(
+                    job.job_id,
+                    error_category="lease_expired",
+                    error_message="advisory lease expired before completion",
+                )
 
     def _execute(self, analyzer: Analyzer, job: Job) -> None:
         target_id = job.subject_key.partition(":")[2]
