@@ -42,3 +42,16 @@ def test_trusted_workflow_has_no_pull_request_trigger() -> None:
     job_names = [job["name"] for job in workflow["jobs"].values()]
     assert len(job_names) == len(set(job_names))
     assert set(job_names) == {"Python on trusted Mac", "iOS on trusted Mac"}
+
+
+def test_trusted_python_uses_bounded_host_interpreter_venv() -> None:
+    workflow = load_workflow("trusted-mac.yml")
+    steps = workflow["jobs"]["python"]["steps"]
+    setup = next(step for step in steps if step.get("name") == "Set up Python")
+
+    assert "uses" not in setup
+    assert setup["run"] == (
+        '"$HOME/.local/bin/python3.11" -m venv "$RUNNER_TEMP/python-venv"\n'
+        'echo "$RUNNER_TEMP/python-venv/bin" >> "$GITHUB_PATH"\n'
+        '"$RUNNER_TEMP/python-venv/bin/python" --version\n'
+    )
