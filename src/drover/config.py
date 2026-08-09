@@ -8,6 +8,7 @@ defaults for any missing field so a brand-new install Just Works after
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 import os
 
 try:
@@ -223,11 +224,16 @@ def _from_dict(d: dict) -> DroverConfig:
     r = d["redis_shadow"]
     j = d["redis_jobs"]
     content = d["advisory_content"]
-    provider_freshness_threshold_seconds = float(
-        d["provider"]["freshness_threshold_seconds"]
-    )
-    if provider_freshness_threshold_seconds <= 0:
-        raise ValueError("provider.freshness_threshold_seconds must be positive")
+    provider_freshness_threshold = d["provider"]["freshness_threshold_seconds"]
+    if (
+        type(provider_freshness_threshold) not in (int, float)
+        or not math.isfinite(provider_freshness_threshold)
+        or provider_freshness_threshold <= 0
+    ):
+        raise ValueError(
+            "provider.freshness_threshold_seconds must be a finite positive number"
+        )
+    provider_freshness_threshold_seconds = float(provider_freshness_threshold)
     return DroverConfig(
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),

@@ -526,13 +526,53 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
     assert refreshes == ["mac-mini", "mac-mini"]
 
 
-def test_provider_freshness_threshold_is_runtime_configurable(tmp_path):
+@pytest.mark.parametrize(("toml_value", "expected"), [("900", 900.0), ("900.5", 900.5)])
+def test_provider_freshness_threshold_is_runtime_configurable(
+    tmp_path, toml_value, expected
+):
     config_path = tmp_path / "config.toml"
-    config_path.write_text("[provider]\nfreshness_threshold_seconds = 900\n")
+    config_path.write_text(f"[provider]\nfreshness_threshold_seconds = {toml_value}\n")
 
     config = load_config(config_path)
 
-    assert config.provider_freshness_threshold_seconds == 900.0
+    assert config.provider_freshness_threshold_seconds == expected
+
+
+@pytest.mark.parametrize(
+    "toml_value",
+    ["nan", "inf", "+inf", "-inf", "true", "false", "0", "-1", '"300"'],
+)
+def test_config_rejects_non_positive_or_non_finite_provider_freshness_thresholds(
+    tmp_path, toml_value
+):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f"[provider]\nfreshness_threshold_seconds = {toml_value}\n")
+
+    with pytest.raises(ValueError, match="finite positive number"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), -float("inf"), True, False, 0, -1, "300"]
+)
+def test_provider_service_rejects_invalid_freshness_thresholds(tmp_path, value):
+    with pytest.raises(ValueError, match="finite positive number"):
+        ProviderUsageService(
+            tmp_path / "drover.duckdb",
+            tmp_path / "parquet",
+            freshness_threshold_seconds=value,
+        )
+
+
+@pytest.mark.parametrize("value", [1, 300.5])
+def test_provider_service_accepts_finite_positive_numeric_thresholds(tmp_path, value):
+    service = ProviderUsageService(
+        tmp_path / "drover.duckdb",
+        tmp_path / "parquet",
+        freshness_threshold_seconds=value,
+    )
+
+    assert service.freshness_threshold_seconds == float(value)
 
 
 def test_legacy_codex_source_is_normalized_to_canonical_contract(

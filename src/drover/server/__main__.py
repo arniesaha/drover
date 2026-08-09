@@ -184,6 +184,7 @@ principal_id = "unknown"
 [provider]
 # Provider fetches run every five minutes. Retain provider-reported quota facts,
 # but label them stale when no successful fetch has completed within this age.
+# This value must be a finite positive integer or float in seconds.
 freshness_threshold_seconds = 600
 
 [summarizer]

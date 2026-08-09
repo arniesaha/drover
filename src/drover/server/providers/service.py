@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Callable, Mapping
@@ -90,8 +91,14 @@ class ProviderUsageService:
         clock: Callable[[], datetime] | None = None,
         freshness_threshold_seconds: float = 600.0,
     ) -> None:
-        if freshness_threshold_seconds <= 0:
-            raise ValueError("provider freshness threshold must be positive")
+        if (
+            type(freshness_threshold_seconds) not in (int, float)
+            or not math.isfinite(freshness_threshold_seconds)
+            or freshness_threshold_seconds <= 0
+        ):
+            raise ValueError(
+                "provider freshness threshold must be a finite positive number"
+            )
         self.duckdb_path = Path(duckdb_path)
         self.parquet_dir = Path(parquet_dir)
         self.api_token = api_token
