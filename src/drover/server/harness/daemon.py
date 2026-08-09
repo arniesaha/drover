@@ -1254,6 +1254,7 @@ class HarnessDaemonState:
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     provider_usage_probe: CodexUsageProbe | None = None
+    claude_usage_probe: Any | None = None
     advisory_content: "AdvisoryContentConfig | None" = None
     content_consent: DurableContentConsent | None = None
 
@@ -1485,6 +1486,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 continue
             if detected.provider == "anthropic":
                 detected = _with_claude_plan_label(detected, self.server.state.auth)
+                probe = self.server.state.claude_usage_probe
+                if probe is None:
+                    from drover.server.providers.claude import ClaudeUsageProbe
+
+                    probe = ClaudeUsageProbe()
+                    self.server.state.claude_usage_probe = probe
+                snapshot = probe.read(host_id=self.server.state.host_id)
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+                continue
             accounts.append(_unavailable_provider_json(detected, observed_at))
         self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
 

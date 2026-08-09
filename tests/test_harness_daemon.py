@@ -46,6 +46,8 @@ from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import client_handshake
+from drover.server.providers.claude import ClaudeUsageProbe
+from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
 
 class _FailingRegistry:
@@ -501,11 +503,20 @@ def test_harnessd_health_and_capabilities(tmp_path):
 def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     tmp_path,
 ):
+    """Gemini has no pollable quota source, so it always reports
+    usage_unavailable. Claude Code is now polled via a real probe pointed at
+    credentials that don't exist, so it independently lands on
+    usage_unavailable too (not_authenticated) -- this keeps the test hermetic
+    against whatever the machine running it happens to have logged in.
+    """
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
     state.presets = {
         "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
         "gemini": replace(DEFAULT_PRESETS["gemini"], enabled=True),
     }
+    state.claude_usage_probe = ClaudeUsageProbe(
+        credentials_path=tmp_path / "missing-credentials.json"
+    )
     try:
         with pytest.raises(urllib.error.HTTPError) as error:
             _json_request(f"{base_url}/providers/usage")
@@ -528,11 +539,62 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
         "google",
     }
     assert {account["usage_status"] for account in body["accounts"]} == {
-        "usage_unavailable"
+        "supported",
+        "usage_unavailable",
     }
     assert {account["status"] for account in body["accounts"]} == {"usage_unavailable"}
     assert all(account["windows"] == [] for account in body["accounts"])
     assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
+
+
+def test_harnessd_provider_usage_reports_claude_windows(tmp_path):
+    """The anthropic branch must emit a snapshot-shaped account, not the
+    unavailable placeholder, when the probe has real windows to report."""
+    observed_at = datetime(2026, 8, 9, 18, tzinfo=timezone.utc)
+
+    class _StubClaudeProbe:
+        def read(self, *, host_id):
+            return ProviderAccountSnapshot(
+                snapshot_id="snap-1",
+                dedup_key="key-1",
+                provider="anthropic",
+                account_label="Claude Code",
+                plan_label="max",
+                host_id=host_id,
+                status="ok",
+                observed_at=observed_at,
+                windows=(
+                    ProviderUsageWindow(
+                        kind="five_hour", used_percent=34.5, window_minutes=300
+                    ),
+                ),
+                source="claude-oauth-usage",
+            )
+
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {
+        "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
+    }
+    state.claude_usage_probe = _StubClaudeProbe()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    claude = [a for a in body["accounts"] if a["provider"] == "anthropic"][0]
+    assert claude["usage_status"] == "supported"
+    assert claude["status"] == "ok"
+    assert claude["host_id"] == "test-host"
+    assert claude["windows"][0]["kind"] == "five_hour"
+    assert claude["windows"][0]["used_percent"] == 34.5
 
 
 def test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default(tmp_path):
