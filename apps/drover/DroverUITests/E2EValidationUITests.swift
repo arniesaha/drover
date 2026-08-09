@@ -83,10 +83,11 @@ final class E2EValidationUITests: XCTestCase {
             launchButton.tap()
             if launchBar.waitForExistence(timeout: 3) { break }
             // Interruption monitors only fire on an interaction; if a system
-            // alert swallowed the tap, tapping a neutral element (the nav-bar
-            // title — never a session row) fires the monitor so the next
-            // loop's launch tap lands.
-            app.navigationBars["Sessions"].tap()
+            // alert swallowed the tap, tapping a neutral element (the
+            // wordmark in the header row — never a session row, and never the
+            // theme toggle beside it) fires the monitor so the next loop's
+            // launch tap lands.
+            app.staticTexts["drover-wordmark"].tap()
         }
         XCTAssertTrue(launchBar.exists, "tapping + should present the New Session sheet")
 

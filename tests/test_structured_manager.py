@@ -89,7 +89,8 @@ def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
 
     driver_holder: dict[str, _StubDriver] = {}
 
-    def build(command, cwd, emit):
+    def build(command, cwd, emit, native_session_id=None):
+        del native_session_id
         driver = _StubDriver(command, cwd, emit)
         driver_holder["driver"] = driver
         return driver
@@ -199,6 +200,74 @@ def test_send_turn_forwards_images_and_records_attachments(monkeypatch, tmp_path
     ]
 
 
+def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_path):
+    mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    mgr._require_entry("sess-1").harness = "claude-code"
+
+    first_turn = mgr.send_turn("sess-1", "first")
+    with pytest.raises(RuntimeError, match="turn already in flight"):
+        mgr.send_turn("sess-1", "second")
+
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="turn complete",
+            payload={"turn_complete": True, "awaiting": "input"},
+            turn_id=first_turn,
+        )
+    )
+    second_turn = mgr.send_turn("sess-1", "second")
+
+    assert [text for text, _turn_id in driver.sent_turns] == ["first", "second"]
+    assert second_turn != first_turn
+    assert (
+        sum(
+            event.event_type == "user_input" for event in registry.list_events("sess-1")
+        )
+        == 2
+    )
+
+
+def test_manager_does_not_duplicate_per_turn_driver_inflight_state(
+    monkeypatch, tmp_path
+):
+    mgr, driver, _registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    first_turn = mgr.send_turn("sess-1", "first")
+    second_turn = mgr.send_turn("sess-1", "second after worker cleanup")
+
+    assert [turn_id for _text, turn_id in driver.sent_turns] == [
+        first_turn,
+        second_turn,
+    ]
+
+
+def test_process_exit_removes_dead_manager_entry(monkeypatch, tmp_path):
+    mgr, driver, _registry, _on_messages, finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    driver.closed = True
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="process exited",
+            payload={"exited": 1},
+            turn_id=None,
+        )
+    )
+
+    assert finalized == [("sess-1", 1)]
+    assert not mgr.has("sess-1")
+    assert not mgr.is_alive("sess-1")
+
+
 def test_answer_permission_dispatches_before_recording_and_skips_event_on_failure(
     monkeypatch, tmp_path
 ):
@@ -258,6 +327,65 @@ def test_awaiting_transitions_through_approval_and_input(monkeypatch, tmp_path):
         )
     )
     assert mgr.awaiting("sess-1") == "input"
+
+
+def test_driver_event_persists_native_session_id(monkeypatch, tmp_path):
+    _mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="provider session started",
+            payload={"native_session_id": "provider-thread-1"},
+        )
+    )
+
+    session = registry.get_session("sess-1")
+    assert session is not None
+    assert session.native_session_id == "provider-thread-1"
+    assert [event.seq for event in registry.list_events("sess-1")] == [1]
+
+
+def test_start_passes_native_session_id_to_driver_factory(monkeypatch, tmp_path):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.create_session(
+        host_id="test-host",
+        harness="stub-resume",
+        command="stub",
+        session_id="sess-resume",
+        status="errored",
+        mode="structured",
+    )
+    captured: dict[str, str | None] = {}
+
+    def build(command, cwd, emit, native_session_id=None):
+        captured["native_session_id"] = native_session_id
+        return _StubDriver(command, cwd, emit)
+
+    monkeypatch.setitem(
+        manager_module._FACTORIES,
+        "stub-resume",
+        (build, lambda: ["stub"]),
+    )
+    manager = StructuredSessionManager()
+
+    manager.start(
+        "sess-resume",
+        harness="stub-resume",
+        cwd=None,
+        command=None,
+        registry=registry,
+        on_message=lambda _sid, _event: None,
+        finalize=lambda _sid, _returncode: None,
+        native_session_id="provider-thread-1",
+    )
+
+    assert captured == {"native_session_id": "provider-thread-1"}
 
 
 def test_seq_is_monotonic_across_emitted_messages(monkeypatch, tmp_path):

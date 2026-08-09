@@ -1,4 +1,4 @@
-"""Normalized Drover session event helpers for Meta Harness."""
+"""Normalized Drover session event helpers."""
 
 from __future__ import annotations
 

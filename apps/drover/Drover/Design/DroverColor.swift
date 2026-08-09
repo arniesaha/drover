@@ -1,13 +1,21 @@
 import SwiftUI
 
-/// The Nocturne palette contract: nine tokens, two ramps.
+/// The Tide palette contract: ten tokens, two ramps, one accent.
 ///
 /// The whole theme lives here, so no view branches on `colorScheme` — a token
-/// resolves its own ramp from the environment. Both ramps are Nocturne ramp
-/// steps rather than new hues: light grounds one step down (neutral-200) so
-/// `surface` cards read as lifted off `bg`, and the accent drops to
-/// accent-600, the step that keeps outlined controls above 3:1 on a light
-/// ground.
+/// resolves its own ramp from the environment. Light grounds one step down
+/// (neutral-200) so `surface` cards read as lifted off `bg`, and the accent
+/// drops to tide-700, the step that keeps outlined controls above 3:1 on a
+/// light ground.
+///
+/// Purple is retired: Tide is now *the* ramp rather than an alternative to
+/// flip to. Two things moved with the hue. The grounds lost their blue-violet
+/// cast — near-neutral charcoal dark, cool paper light — so the teal is the
+/// only chromatic thing on screen and reads as signal rather than décor. And
+/// the accent splits by job: `accent` carries chrome (icons, outlines, the
+/// send disc) where 3:1 is the bar, while accent-coloured *text* steps to
+/// `accentHi` — tide-400 dark, tide-800 light, 8.8:1 and 7.0:1 on their
+/// grounds.
 ///
 /// Two carve-outs deliberately do *not* resolve through these tokens:
 ///
@@ -19,22 +27,22 @@ import SwiftUI
 ///     ground. That is why there is exactly one accent here and no
 ///     per-state palette.
 enum DroverColor {
-    static let bg = PaletteToken(dark: 0x16_18_26, light: 0xE4_E7_F5)
-    static let surface = PaletteToken(dark: 0x1D_1F_2B, light: 0xF3_F5_FE)
-    static let sheet = PaletteToken(dark: 0x23_25_32, light: 0xF3_F5_FE)
-    static let text = PaletteToken(dark: 0xE9_E9_ED, light: 0x29_2B_31)
-    static let muted = PaletteToken(dark: 0xA4_A4_AB, light: 0x59_5D_6C)
-    static let faint = PaletteToken(dark: 0x8D_8D_96, light: 0x75_79_8C)
-    static let line = PaletteToken(dark: 0x2F_31_3B, light: 0xCF_D3_E5)
-    static let accent = PaletteToken(dark: 0x91_84_D9, light: 0x79_6C_BF)
-    /// The accent one step further from the ground (accent-400 dark,
-    /// accent-700 light). The system guide is explicit that the base accent is
-    /// tuned to only ~3:1 — "enough for icons, large text and interface
-    /// chrome, not for body copy" — so accent-coloured *text*, live marks and
-    /// active states use this step instead. `accentTextClearsBodyCopyFloor`
-    /// is what stops the base accent creeping back into prose.
-    static let accentHi = PaletteToken(dark: 0xB5_AB_FC, light: 0x5D_52_94)
-    static let accentTint = PaletteToken(dark: 0x2B_27_41, light: 0xE7_E5_FE)
+    static let bg = PaletteToken(dark: 0x15_16_1A, light: 0xE4_E7_E5)
+    static let surface = PaletteToken(dark: 0x1D_1F_24, light: 0xF5_F7_F6)
+    static let sheet = PaletteToken(dark: 0x23_26_2C, light: 0xF5_F7_F6)
+    static let text = PaletteToken(dark: 0xE9_E9_EC, light: 0x2A_2B_2E)
+    static let muted = PaletteToken(dark: 0xA4_A6_AD, light: 0x5B_5D_65)
+    static let faint = PaletteToken(dark: 0x8C_8E_96, light: 0x76_78_81)
+    static let line = PaletteToken(dark: 0x2F_32_3A, light: 0xD3_D6_D4)
+    static let accent = PaletteToken(dark: 0x2A_A7_9C, light: 0x11_6E_68)
+    /// The accent one step further from the ground (tide-400 dark, tide-800
+    /// light). The system guide is explicit that the base accent is tuned for
+    /// "icons, large text and interface chrome, not for body copy" — so
+    /// accent-coloured *text*, live marks and active states use this step
+    /// instead. `accentTextClearsBodyCopyFloor` is what stops the base accent
+    /// creeping back into prose.
+    static let accentHi = PaletteToken(dark: 0x4F_C7_BB, light: 0x0E_54_50)
+    static let accentTint = PaletteToken(dark: 0x11_26_28, light: 0xD8_F0_EC)
 
     /// The contract as data, in the design doc's order. Tests walk this so a
     /// token added here without a ramp — or with the two ramps swapped —

@@ -246,7 +246,11 @@ def _seed_runtime_db(tmp_path: Path) -> tuple[Path, Path]:
     return db, incoming
 
 
-def test_runtime_audit_reports_operational_health(tmp_path: Path) -> None:
+def test_runtime_audit_reports_operational_health(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "DROVER_GENERAL_WORKSPACE_ROOTS",
+        "/Users/arnabmac:/home/Arnab:/Users/arnabmac/.claude-mem/observer-sessions",
+    )
     db, incoming = _seed_runtime_db(tmp_path)
 
     report = runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24)
@@ -411,7 +415,8 @@ def test_runtime_audit_groups_pending_incoming_by_source_without_db_writes(
     assert "nas-claude" in rendered
     assert "count=2" in rendered
     assert "oldest_age=3h" in rendered
-    assert "Mac watcher bottleneck" in rendered
+    assert "destination watcher bottleneck" in rendered
+    assert "Mac watcher bottleneck" not in rendered
 
 
 def test_runtime_audit_separates_stale_running_span_jobs_and_bounds_coverage(
@@ -1524,7 +1529,11 @@ def test_runtime_audit_handles_missing_tables_and_incoming_dir(tmp_path: Path) -
     assert report["warnings"] == []
 
 
-def test_format_runtime_audit_is_concise(tmp_path: Path) -> None:
+def test_format_runtime_audit_is_concise(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "DROVER_GENERAL_WORKSPACE_ROOTS",
+        "/Users/arnabmac:/home/Arnab:/Users/arnabmac/.claude-mem/observer-sessions",
+    )
     db, incoming = _seed_runtime_db(tmp_path)
     text = format_runtime_audit(
         runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24)

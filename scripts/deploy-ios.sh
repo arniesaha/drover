@@ -37,8 +37,16 @@ echo "==> regenerating project"
 xcodegen generate >/dev/null
 
 echo "==> finding device matching '${DEVICE_MATCH}'"
+# The state column has to be matched as a whole field: "unavailable" contains
+# "available", so a bare /available/ picks up offline devices and the run dies
+# much later with an opaque CoreDevice 1011 instead of the message below.
+# devicectl reports a usable device as either "available" or "connected"
+# depending on how it is attached, so both count as reachable.
 DEVICE_ID="$(xcrun devicectl list devices 2>/dev/null \
-  | awk -v m="$DEVICE_MATCH" '$0 ~ m && /available/ {
+  | awk -v m="$DEVICE_MATCH" '$0 ~ m {
+      online = 0
+      for (i = 1; i <= NF; i++) if ($i == "available" || $i == "connected") online = 1
+      if (!online) next
       for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F]{8}-/) { print $i; exit }
     }')"
 if [[ -z "${DEVICE_ID}" ]]; then

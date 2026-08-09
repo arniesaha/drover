@@ -1,4 +1,4 @@
-"""Skinny CLI entry point for the Meta Harness host daemon."""
+"""Skinny CLI entry point for the Drover host daemon."""
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ def run_harnessd_from_options(
 @click.command(name="drover-harnessd")
 @click.option("--config", "config_path", default=None, help="Path to config TOML")
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG logging")
-@click.option("--host-id", required=True, help="Stable host id, e.g. nas")
+@click.option("--host-id", required=True, help="Stable host id, e.g. workstation")
 @click.option("--display-name", default=None, help="Human-readable host label")
 @click.option("--kind", default="linux", show_default=True, help="Host kind")
 @click.option(
@@ -128,7 +128,7 @@ def main(
     host_token: str | None,
     relay: bool,
 ) -> None:
-    """Run the Meta Harness host daemon without loading full drover-server."""
+    """Run the Drover host daemon without loading full drover-server."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",

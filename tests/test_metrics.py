@@ -2836,8 +2836,8 @@ def test_ingest_harness_events_derives_session_awaiting_state(tmp_path):
                     "event_id": "harness-event-a1",
                     "session_id": "harness-s3",
                     "seq": 1,
-                    "type": "user_input",
-                    "payload": {},
+                    "type": "status",
+                    "payload": {"native_session_id": "provider-session-3"},
                     "ts": "2026-07-06T00:00:01+00:00",
                 },
                 {
@@ -2853,6 +2853,7 @@ def test_ingest_harness_events_derives_session_awaiting_state(tmp_path):
         session = registry.get_session("harness-s3")
         assert session.awaiting == "approval"
         assert session.last_activity is not None
+        assert session.native_session_id == "provider-session-3"
 
         _ingest_events(
             port,
@@ -3567,6 +3568,223 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
         "decision": "allow",
     }
     assert "/sessions/harness-running/interrupt" in forwarded
+
+
+def _recovery_collector(tmp_path, *, native_session_id="provider-thread-1"):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        local_url="http://127.0.0.1:1",
+    )
+    registry.create_session(
+        session_id="harness-recover",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+        mode="structured",
+        status="running",
+        cwd="/tmp/recovery-worktree",
+        native_session_id=native_session_id,
+    )
+    return MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+
+
+def test_turn_recovery_retries_original_payload_once(monkeypatch, tmp_path):
+    collector = _recovery_collector(tmp_path)
+    responses = iter(
+        [
+            (404, '{"error":"unknown structured session: harness-recover"}\n'),
+            (
+                200,
+                '{"session_id":"harness-recover","status":"running",'
+                '"recovered":true,"native_session_id":"provider-thread-1"}\n',
+            ),
+            (202, '{"turn_id":"turn-recovered"}\n'),
+        ]
+    )
+    calls: list[tuple[str, str, dict]] = []
+
+    def request(_host, path, *, method, payload, **_kwargs):
+        calls.append((method, path, dict(payload)))
+        return next(responses)
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+    turn = {"text": "continue safely", "model": "gpt-5.6"}
+
+    status, body = collector.proxy_harness_session_action(
+        "harness-recover", "turns", turn
+    )
+
+    assert status == 202
+    assert json.loads(body)["turn_id"] == "turn-recovered"
+    assert calls == [
+        ("POST", "/sessions/harness-recover/turns", turn),
+        (
+            "POST",
+            "/sessions/harness-recover/recover",
+            {"native_session_id": "provider-thread-1"},
+        ),
+        ("POST", "/sessions/harness-recover/turns", turn),
+    ]
+
+
+def test_central_terminate_waits_for_recovery_retry(monkeypatch, tmp_path):
+    collector = _recovery_collector(tmp_path)
+    recovery_reached = threading.Event()
+    allow_recovery = threading.Event()
+    terminate_started = threading.Event()
+    terminate_reached = threading.Event()
+    turn_calls = 0
+
+    def request(_host, path, **_kwargs):
+        nonlocal turn_calls
+        if path.endswith("/turns"):
+            turn_calls += 1
+            if turn_calls == 1:
+                return 404, '{"error":"unknown structured session: harness-recover"}\n'
+            return 202, '{"turn_id":"turn-recovered"}\n'
+        if path.endswith("/recover"):
+            recovery_reached.set()
+            assert allow_recovery.wait(timeout=5)
+            return 200, '{"status":"running","recovered":true}\n'
+        if path.endswith("/terminate"):
+            terminate_reached.set()
+            return 200, '{"session_id":"harness-recover","status":"terminated"}\n'
+        raise AssertionError(path)
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+    results: dict[str, tuple[int, str]] = {}
+    recovery = threading.Thread(
+        target=lambda: results.setdefault(
+            "recovery",
+            collector.proxy_harness_session_action(
+                "harness-recover", "turns", {"text": "x"}
+            ),
+        )
+    )
+
+    def terminate():
+        terminate_started.set()
+        results["terminate"] = collector.proxy_terminate_harness_session(
+            "harness-recover"
+        )
+
+    termination = threading.Thread(target=terminate)
+    recovery.start()
+    assert recovery_reached.wait(timeout=5)
+    termination.start()
+    assert terminate_started.wait(timeout=5)
+    assert not terminate_reached.wait(timeout=0.1)
+    allow_recovery.set()
+    recovery.join(timeout=5)
+    termination.join(timeout=5)
+
+    assert results["recovery"][0] == 202
+    assert results["terminate"][0] == 200
+    assert (
+        HarnessRegistry(collector.duckdb_path).get_session("harness-recover").status
+        == "terminated"
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "status", "body"),
+    [
+        ("turns", 404, '{"error":"some other missing resource"}\n'),
+        ("turns", 409, '{"error":"turn already in flight"}\n'),
+        ("turns", 500, '{"error":"driver failed"}\n'),
+        ("turns", 502, '{"error":"host unreachable"}\n'),
+        ("permission", 404, '{"error":"unknown structured session"}\n'),
+        ("interrupt", 404, '{"error":"unknown structured session"}\n'),
+    ],
+)
+def test_session_action_does_not_recover_unqualified_failure(
+    monkeypatch, tmp_path, action, status, body
+):
+    collector = _recovery_collector(tmp_path)
+    calls: list[str] = []
+
+    def request(_host, path, **_kwargs):
+        calls.append(path)
+        return status, body
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+
+    actual = collector.proxy_harness_session_action(
+        "harness-recover", action, {"text": "x"}
+    )
+
+    assert actual == (status, body)
+    assert calls == [f"/sessions/harness-recover/{action}"]
+
+
+def test_turn_recovery_without_native_id_returns_actionable_conflict(
+    monkeypatch, tmp_path
+):
+    collector = _recovery_collector(tmp_path, native_session_id=None)
+    monkeypatch.setattr(
+        collector,
+        "_harness_request",
+        lambda *_args, **_kwargs: (
+            404,
+            '{"error":"unknown structured session: harness-recover"}\n',
+        ),
+    )
+
+    status, body = collector.proxy_harness_session_action(
+        "harness-recover", "turns", {"text": "x"}
+    )
+
+    assert status == 409
+    assert json.loads(body)["error"] == (
+        "Session cannot be resumed after the harness restart. "
+        "Continue it in a new session."
+    )
+
+
+@pytest.mark.parametrize("recovery_status", [401, 403, 404, 500, 502])
+def test_turn_recovery_preserves_transient_or_unexpected_recovery_failure(
+    monkeypatch, tmp_path, recovery_status
+):
+    collector = _recovery_collector(tmp_path)
+    responses = iter(
+        [
+            (404, '{"error":"unknown structured session: harness-recover"}\n'),
+            (recovery_status, '{"error":"recovery service unavailable"}\n'),
+        ]
+    )
+    monkeypatch.setattr(
+        collector, "_harness_request", lambda *_args, **_kwargs: next(responses)
+    )
+
+    status, body = collector.proxy_harness_session_action(
+        "harness-recover", "turns", {"text": "x"}
+    )
+
+    assert status == recovery_status
+    assert json.loads(body)["error"] == "recovery service unavailable"
+
+
+def test_recovery_native_id_falls_back_to_structured_event_payload(tmp_path):
+    collector = _recovery_collector(tmp_path, native_session_id=None)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.append_event(
+        session_id="harness-recover",
+        event_type="status",
+        payload={"payload": {"native_session_id": "event-thread-1"}},
+    )
+
+    assert (
+        collector._native_session_id_for_recovery("harness-recover") == "event-thread-1"
+    )
 
 
 def test_session_snapshot_has_no_transcript_chunks_key(tmp_path):

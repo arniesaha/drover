@@ -1369,6 +1369,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         )
         session_awaiting: dict[str, str | None] = {}
         session_last_activity: dict[str, datetime] = {}
+        session_native_ids: dict[str, str] = {}
         touched_sessions: set[str] = set()
         for event in ordered:
             event_id = str(event["event_id"])
@@ -1393,6 +1394,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 existing = registry.get_session(session_id)
                 session_awaiting[session_id] = existing.awaiting if existing else None
             inner_payload = event.get("payload")
+            if isinstance(inner_payload, dict):
+                native_session_id = inner_payload.get("native_session_id")
+                if isinstance(native_session_id, str) and native_session_id.strip():
+                    session_native_ids[session_id] = native_session_id.strip()
             session_awaiting[session_id] = _derive_awaiting(
                 event_type=str(event["type"]),
                 payload=inner_payload if isinstance(inner_payload, dict) else {},
@@ -1402,6 +1407,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if latest is None or created_at > latest:
                 session_last_activity[session_id] = created_at
         for session_id in touched_sessions:
+            native_session_id = session_native_ids.get(session_id)
+            if native_session_id is not None:
+                registry.update_session_native_id(session_id, native_session_id)
             registry.update_session_activity(
                 session_id,
                 awaiting=session_awaiting.get(session_id),

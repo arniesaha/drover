@@ -29,17 +29,24 @@ from drover.server.harness.structured.driver import StructuredMessage
 # spawned CLI); Codex/Gemini's constructors take no env kwarg at all.
 _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
     "claude-code": (
-        lambda command, cwd, emit: claude.ClaudeDriver(
-            command, cwd, emit, env=claude.child_env()
+        lambda command, cwd, emit, native_session_id: claude.ClaudeDriver(
+            claude.resume_command(command, native_session_id),
+            cwd,
+            emit,
+            env=claude.child_env(),
         ),
         claude.default_command,
     ),
     "codex": (
-        lambda command, cwd, emit: codex.CodexDriver(command, cwd, emit),
+        lambda command, cwd, emit, native_session_id: codex.CodexDriver(
+            command, cwd, emit, native_session_id=native_session_id
+        ),
         codex.default_command,
     ),
     "gemini": (
-        lambda command, cwd, emit: gemini.GeminiDriver(command, cwd, emit),
+        lambda command, cwd, emit, _native_session_id: gemini.GeminiDriver(
+            command, cwd, emit
+        ),
         gemini.default_command,
     ),
 }
@@ -52,6 +59,9 @@ class _Entry:
         self.seq = 0
         self.awaiting: str | None = None
         self.lock = threading.Lock()
+        self.turn_lock = threading.Lock()
+        self.turn_active = False
+        self.emit: Callable[[StructuredMessage], None] | None = None
 
 
 class StructuredSessionManager:
@@ -64,6 +74,11 @@ class StructuredSessionManager:
     def has(self, session_id: str) -> bool:
         with self._entries_lock:
             return session_id in self._entries
+
+    def is_alive(self, session_id: str) -> bool:
+        with self._entries_lock:
+            entry = self._entries.get(session_id)
+        return bool(entry and entry.driver.is_alive())
 
     def harness_for(self, session_id: str) -> str | None:
         with self._entries_lock:
@@ -89,6 +104,7 @@ class StructuredSessionManager:
         registry: HarnessRegistry,
         on_message: Callable[[str, dict[str, Any]], None],
         finalize: Callable[[str, int], None],
+        native_session_id: str | None = None,
     ) -> None:
         if harness not in _FACTORIES:
             raise ValueError(f"harness has no structured driver: {harness}")
@@ -121,6 +137,11 @@ class StructuredSessionManager:
                     entry.awaiting = "input"
                 elif message.type == "user_input":
                     entry.awaiting = None
+                if message.type == "status" and (
+                    payload.get("turn_complete") or "exited" in payload
+                ):
+                    with entry.turn_lock:
+                        entry.turn_active = False
                 awaiting = entry.awaiting
                 event_payload = message.to_payload()
                 event_payload["seq"] = seq
@@ -132,6 +153,14 @@ class StructuredSessionManager:
                 recorded = False
                 for attempt in range(3):
                     try:
+                        native_session_id = payload.get("native_session_id")
+                        if (
+                            isinstance(native_session_id, str)
+                            and native_session_id.strip()
+                        ):
+                            registry.update_session_native_id(
+                                session_id, native_session_id
+                            )
                         registry.append_event(
                             session_id=session_id,
                             event_type=message.type,
@@ -180,12 +209,28 @@ class StructuredSessionManager:
                 and "exited" in payload
                 and message.turn_id is None
             ):
+                self._discard_entry(session_id, entry)
                 finalize(session_id, int(payload["exited"]))
 
-        entry.driver = builder(command or default_command(), cwd, emit)
+        entry.emit = emit
+        entry.driver = builder(
+            command or default_command(), cwd, emit, native_session_id
+        )
         with self._entries_lock:
             self._entries[session_id] = entry
         entry.driver.start()
+
+    def record_recovered(self, session_id: str, native_session_id: str) -> None:
+        entry = self._require_entry(session_id)
+        assert entry.emit is not None
+        entry.emit(
+            StructuredMessage(
+                type="session.recovered",
+                role="system",
+                text="session recovered after harness restart",
+                payload={"native_session_id": native_session_id},
+            )
+        )
 
     def send_turn(
         self,
@@ -198,18 +243,30 @@ class StructuredSessionManager:
         entry = self._require_entry(session_id)
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
+        guard_persistent_turn = entry.harness == "claude-code"
+        if guard_persistent_turn:
+            with entry.turn_lock:
+                if entry.turn_active:
+                    raise RuntimeError("turn already in flight")
+                entry.turn_active = True
         turn_id = f"turn-{uuid4()}"
         # Dispatch first: Codex/Gemini raise RuntimeError here ("turn
         # already in flight" / "driver is closed") when a turn can't be
         # accepted, and we must not record a user_input event for a turn
         # that was never actually sent.
-        entry.driver.send_turn(
-            text,
-            turn_id,
-            images=images,
-            model=model,
-            thinking_effort=thinking_effort,
-        )
+        try:
+            entry.driver.send_turn(
+                text,
+                turn_id,
+                images=images,
+                model=model,
+                thinking_effort=thinking_effort,
+            )
+        except Exception:
+            if guard_persistent_turn:
+                with entry.turn_lock:
+                    entry.turn_active = False
+            raise
         payload: dict = {}
         if images:
             # Metadata only — the base64 payload never enters the event
@@ -265,3 +322,8 @@ class StructuredSessionManager:
         if entry is None:
             raise KeyError(f"unknown structured session {session_id!r}")
         return entry
+
+    def _discard_entry(self, session_id: str, expected: _Entry) -> None:
+        with self._entries_lock:
+            if self._entries.get(session_id) is expected:
+                self._entries.pop(session_id, None)

@@ -16,69 +16,41 @@ from drover.attribution import (
 )
 from drover.models import AgentEvent, Message, ToolCall
 
-_CLAUDE_ENCODED_CWD_PREFIXES = (
-    ("-Users-arnabmac-jenny-nexus", "/Users/arnabmac/jenny/nexus"),
-    ("-Users-arnabmac-jenny-agent-foundry", "/Users/arnabmac/jenny/agent-foundry"),
-    ("-Users-arnabmac-jenny-agent-shared", "/Users/arnabmac/jenny/agent-shared"),
-    ("-Users-arnabmac-.hermes-hermes-agent", "/Users/arnabmac/.hermes/hermes-agent"),
-    # Observed live Claude Code project directory names encode a leading dot as
-    # a double hyphen before the segment. Keep the historical single-dot form as
-    # a compatibility alias, but prefer the live double-hyphen spelling.
-    (
-        "-Users-arnabmac--claude-mem-observer-sessions",
-        "/Users/arnabmac/.claude-mem/observer-sessions",
-    ),
-    (
-        "-Users-arnabmac-.claude-mem-observer-sessions",
-        "/Users/arnabmac/.claude-mem/observer-sessions",
-    ),
-    # Max workspaces live under /Users/arnabmac/max. These mappings only recover
-    # cwd from Claude's project directory; repo attribution still comes from the
-    # existing git/known-root enrichment path.
-    (
-        "-Users-arnabmac-max-projects-agent-max",
-        "/Users/arnabmac/max/projects/agent-max",
-    ),
-    (
-        "-Users-arnabmac-max-projects-agentweave",
-        "/Users/arnabmac/max/projects/agentweave",
-    ),
-    ("-Users-arnabmac-max-projects-NixClaw", "/Users/arnabmac/max/projects/NixClaw"),
-    (
-        "-Users-arnabmac-projects-pi-mono-agent",
-        "/Users/arnabmac/projects/pi-mono-agent",
-    ),
-    ("-Users-arnabmac", "/Users/arnabmac"),
-    ("-home-Arnab-clawd-projects-healthos", "/home/Arnab/clawd/projects/healthos"),
-    (
-        "-home-Arnab-clawd-projects-ai-ops-studio",
-        "/home/Arnab/clawd/projects/ai-ops-studio",
-    ),
-    ("-home-Arnab-dev-agent-shared", "/home/Arnab/dev/agent-shared"),
-    ("-home-Arnab-dev-agentweave", "/home/Arnab/dev/agentweave"),
-    ("-home-Arnab-dev-agent-max", "/home/Arnab/dev/agent-max"),
-    ("-home-Arnab-dev-openclaw", "/home/Arnab/dev/openclaw"),
-    ("-home-Arnab-dev-portfolio", "/home/Arnab/dev/portfolio"),
-    ("-home-Arnab-dev-nexus", "/home/Arnab/dev/nexus"),
-    ("-home-Arnab-dev-mux", "/home/Arnab/dev/mux"),
-    ("-home-Arnab-clawd", "/home/Arnab/clawd"),
-    ("-home-Arnab", "/home/Arnab"),
-)
+
+def _configured_claude_cwd_prefixes() -> tuple[tuple[str, str], ...]:
+    """Load optional encoded-directory mappings from JSON configuration."""
+    raw = os.environ.get("DROVER_CLAUDE_CWD_MAP", "").strip()
+    if not raw:
+        return ()
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(values, dict):
+        return ()
+    return tuple(
+        (encoded, cwd.rstrip("/") or "/")
+        for encoded, cwd in values.items()
+        if isinstance(encoded, str)
+        and encoded.startswith("-")
+        and isinstance(cwd, str)
+        and cwd.startswith("/")
+    )
 
 
 def _decode_claude_project_dir_name(name: str) -> Optional[str]:
     """Best-effort decode of Claude Code's project directory cwd encoding.
 
     Claude stores project JSONL under names such as
-    ``-Users-arnabmac-jenny-nexus``. Hyphens are ambiguous because they can be
+    ``-Users-alice-projects-example``. Hyphens are ambiguous because they can be
     either path separators or literal characters in a path segment, so prefer
-    known safe prefixes (including hyphenated repo names) and only use the
+    operator-configured prefixes (including hyphenated repo names) and use the
     generic slash replacement for simple absolute names.
     """
     if not name.startswith("-"):
         return None
     for encoded_prefix, cwd_prefix in sorted(
-        _CLAUDE_ENCODED_CWD_PREFIXES, key=lambda item: len(item[0]), reverse=True
+        _configured_claude_cwd_prefixes(), key=lambda item: len(item[0]), reverse=True
     ):
         if name == encoded_prefix or name.startswith(f"{encoded_prefix}-"):
             suffix = name[len(encoded_prefix) :].removeprefix("-")
@@ -93,7 +65,7 @@ def _claude_project_cwd_from_file(filepath: str) -> Optional[str]:
 
 
 def parse_claude_audit_log(
-    filepath: str, agent_id: str = "nas-claude"
+    filepath: str, agent_id: str = "claude-code"
 ) -> List[AgentEvent]:
     events = []
     inferred_cwd = _claude_project_cwd_from_file(filepath)
@@ -194,7 +166,7 @@ def parse_hermes_sessions(filepath: str) -> List[AgentEvent]:
                 id=uuid,
                 session_id=session_id,
                 timestamp=timestamp,
-                agent_id="macmini-hermes",
+                agent_id="hermes",
                 event_type=role,
                 message=Message(role=role, content=content),
                 raw_data=msg,
@@ -539,7 +511,7 @@ def parse_openclaw_sessions(filepath: str) -> List[AgentEvent]:
                 id=uuid,
                 session_id=session_id,
                 timestamp=timestamp,
-                agent_id="nas-openclaw",
+                agent_id="openclaw",
                 event_type=normalized_type,
                 raw_data=_openclaw_raw_data(data, session_state),
             )

@@ -514,40 +514,13 @@ normalized_agent_events AS (
          CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data, '$._repo_owner') END AS raw_repo_owner,
          CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data, '$._repo_name') END AS raw_repo_name
   FROM raw_agent_events
-),
-attributed_agent_events AS (
-  SELECT *,
-         COALESCE(
-           raw_repo_owner,
-           CASE
-             WHEN inferred_cwd = '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus'
-               OR inferred_cwd LIKE '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus/%'
-               OR inferred_cwd = '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus'
-               OR inferred_cwd LIKE '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus/%'
-               THEN 'arniesaha'
-             ELSE NULL
-           END
-         ) AS inferred_repo_owner,
-         COALESCE(
-           raw_repo_name,
-           CASE
-             WHEN inferred_cwd = '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus'
-               OR inferred_cwd LIKE '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus/%'
-               OR inferred_cwd = '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus'
-               OR inferred_cwd LIKE '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus/%'
-               THEN 'nexus'
-             ELSE NULL
-           END
-         ) AS inferred_repo_name
-  FROM normalized_agent_events
 )
 SELECT * EXCLUDE (
-         repo_owner, repo_name, inferred_cwd, raw_repo_owner, raw_repo_name,
-         inferred_repo_owner, inferred_repo_name
+         repo_owner, repo_name, inferred_cwd, raw_repo_owner, raw_repo_name
        ),
-       COALESCE(repo_owner, inferred_repo_owner) AS repo_owner,
-       COALESCE(repo_name, inferred_repo_name) AS repo_name
-FROM attributed_agent_events;
+       COALESCE(repo_owner, raw_repo_owner) AS repo_owner,
+       COALESCE(repo_name, raw_repo_name) AS repo_name
+FROM normalized_agent_events;
 """
 
 
@@ -715,58 +688,11 @@ def _span_attr_select() -> str:
     )
     cwd = _json_first_attr("s", "prov.cwd", "cwd")
     repository = _json_first_attr("s", "prov.repository", "repository")
-    cwd_repo_owner = f"""
-    CASE
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/openclaw'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/openclaw/%'
-        OR COALESCE(s.cwd, {cwd}) = '/home/Arnab/clawd'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/clawd/%'
-        THEN 'arniesaha'
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/nexus/%'
-        OR COALESCE(s.cwd, {cwd}) = '/Users/arnabmac/jenny/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/Users/arnabmac/jenny/nexus/%'
-        OR COALESCE(s.cwd, {cwd}) = '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus/%'
-        OR COALESCE(s.cwd, {cwd}) = '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus/%'
-        THEN 'arniesaha'
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/agentweave'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/agentweave/%'
-        THEN 'arniesaha'
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/mux'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/mux/%'
-        THEN 'arniesaha'
-      ELSE NULL
-    END
-    """
-    cwd_repo_name = f"""
-    CASE
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/openclaw'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/openclaw/%'
-        OR COALESCE(s.cwd, {cwd}) = '/home/Arnab/clawd'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/clawd/%'
-        THEN 'openclaw'
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/nexus/%'
-        OR COALESCE(s.cwd, {cwd}) = '/Users/arnabmac/jenny/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/Users/arnabmac/jenny/nexus/%'
-        OR COALESCE(s.cwd, {cwd}) = '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/paperclip/home/instances/default/workspaces/e46aa686-4fa6-414c-94a7-946538fb308f/nexus/%'
-        OR COALESCE(s.cwd, {cwd}) = '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/paperclip/home/instances/default/workspaces/e46aa686/4fa6/414c/94a7/946538fb308f/nexus/%'
-        THEN 'nexus'
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/agentweave'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/agentweave/%'
-        THEN 'agentweave'
-      WHEN COALESCE(s.cwd, {cwd}) = '/home/Arnab/dev/mux'
-        OR COALESCE(s.cwd, {cwd}) LIKE '/home/Arnab/dev/mux/%'
-        THEN 'mux'
-      ELSE NULL
-    END
-    """
-    repo_owner = f"COALESCE(s.repo_owner, {_json_first_attr('s', 'prov.repo.owner', '_repo_owner')}, {cwd_repo_owner})"
-    repo_name = f"COALESCE(s.repo_name, {_json_first_attr('s', 'prov.repo.name', '_repo_name')}, {cwd_repo_name})"
+    # Repository identity must come from producer metadata or collector-side
+    # attribution. A central schema cannot safely infer it from one operator's
+    # filesystem layout.
+    repo_owner = f"COALESCE(s.repo_owner, {_json_first_attr('s', 'prov.repo.owner', '_repo_owner')})"
+    repo_name = f"COALESCE(s.repo_name, {_json_first_attr('s', 'prov.repo.name', '_repo_name')})"
     return f"""
 SELECT
   s.* EXCLUDE (

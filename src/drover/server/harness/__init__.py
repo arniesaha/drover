@@ -1,4 +1,4 @@
-"""Meta Harness registry and host-control primitives."""
+"""Drover harness registry and host-control primitives."""
 
 from drover.server.harness.models import (
     HarnessEvent,

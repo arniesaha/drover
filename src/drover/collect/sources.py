@@ -47,10 +47,8 @@ def _files_modified_after(
 class ClaudeCodeSource:
     """Standard Claude Code project sessions in ``~/.claude/projects``.
 
-    ``agent_id`` defaults to the host_id from collect.toml, threaded
-    through by the CLI. The previous hard-coded ``"nas-claude"`` was a
-    bug: it tagged every Claude Code session with the same agent_id no
-    matter which machine the shipper ran on.
+    ``agent_id`` defaults to the host_id from collect.toml, threaded through
+    by the CLI so each installation gets a portable, operator-owned identity.
     """
 
     root: Path
@@ -69,7 +67,7 @@ class ClaudeMacMiniSource:
     """Claude Code's local-agent-mode-sessions variant on macOS."""
 
     root: Path
-    agent_id: str = "macmini-claude"
+    agent_id: str = "claude-code"
     id: str = "claude_macmini"
 
     def list_files_since(self, watermark: Optional[datetime]) -> list[Path]:

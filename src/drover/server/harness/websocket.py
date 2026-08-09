@@ -1,7 +1,7 @@
 """Small WebSocket framing helpers for drover-harnessd.
 
 This intentionally implements only the subset harnessd needs: JSON text frames,
-ping/pong, and close. It keeps the first Meta Harness data-plane slice free from
+ping/pong, and close. It keeps the first Drover data-plane slice free from
 an ASGI server dependency.
 """
 

@@ -18,7 +18,10 @@ import duckdb
 
 from drover.server.db import open_duckdb_connection
 
-from drover.attribution import GENERAL_WORKSPACE_ACTIVITY_TYPE, GENERAL_WORKSPACE_ROOTS
+from drover.attribution import (
+    GENERAL_WORKSPACE_ACTIVITY_TYPE,
+    configured_general_workspace_roots,
+)
 from drover.event_identity import audit_agent_event_identity, canonical_agent_events_cte
 from drover.server.summarizer.retry import classify_summarize_error
 from drover.session_audit import audit_session_consistency
@@ -51,7 +54,7 @@ def _sql_string_list(values: list[str]) -> str:
 
 
 def _general_workspace_sql(cwd_expr: str = "cwd") -> str:
-    roots = _sql_string_list(sorted(GENERAL_WORKSPACE_ROOTS))
+    roots = _sql_string_list(sorted(configured_general_workspace_roots())) or "NULL"
     return f"""(
         (json_valid(raw_data)
          AND json_extract_string(raw_data, '$._nexus_activity_type') = ?)
@@ -403,7 +406,7 @@ def _claude_attribution_gap_categories_for_window(
             FROM canonical_agent_events
             WHERE date >= strftime(current_date - ? * INTERVAL '1 day', '%Y-%m-%d')
               AND TRY_CAST(timestamp AS TIMESTAMP) >= now() - ? * INTERVAL '1 hour'
-              AND agent_id IN ('macmini-claude', 'nas-claude', 'work-macbook-claude')
+              AND lower(agent_id) LIKE '%claude%'
               AND (repo_owner IS NULL OR repo_name IS NULL)
             GROUP BY 1, 2, 3
         ),
@@ -661,7 +664,7 @@ def _openclaw_agentweave_health_for_window(
         WITH recent AS (
             SELECT session_id, event_type, raw_data
             FROM agent_events
-            WHERE agent_id = 'nas-openclaw'
+            WHERE lower(agent_id) LIKE '%openclaw%'
               AND date >= strftime(current_date - ? * INTERVAL '1 day', '%Y-%m-%d')
               AND TRY_CAST(timestamp AS TIMESTAMP) >= now() - ? * INTERVAL '1 hour'
         )
@@ -709,7 +712,7 @@ def _openclaw_agentweave_health_for_window(
         """
         SELECT count(*)
         FROM agent_events
-        WHERE agent_id = 'nas-openclaw'
+        WHERE lower(agent_id) LIKE '%openclaw%'
           AND date >= strftime(current_date - ? * INTERVAL '1 day', '%Y-%m-%d')
           AND session_id = 'unknown_openclaw'
           AND (
@@ -806,7 +809,7 @@ def _openclaw_agentweave_health_for_window(
         WITH native_session_ids AS (
             SELECT DISTINCT session_id
             FROM agent_events
-            WHERE agent_id = 'nas-openclaw'
+            WHERE lower(agent_id) LIKE '%openclaw%'
               AND date >= strftime(current_date - ? * INTERVAL '1 day', '%Y-%m-%d')
               AND TRY_CAST(timestamp AS TIMESTAMP) >= now() - ? * INTERVAL '1 hour'
               AND session_id IS NOT NULL
@@ -815,7 +818,7 @@ def _openclaw_agentweave_health_for_window(
         ), native_session_keys AS (
             SELECT DISTINCT NULLIF(json_extract_string(raw_data, '$.session_key'), '') AS session_key
             FROM agent_events
-            WHERE agent_id = 'nas-openclaw'
+            WHERE lower(agent_id) LIKE '%openclaw%'
               AND date >= strftime(current_date - ? * INTERVAL '1 day', '%Y-%m-%d')
               AND TRY_CAST(timestamp AS TIMESTAMP) >= now() - ? * INTERVAL '1 hour'
               AND json_valid(raw_data)
@@ -1864,7 +1867,7 @@ def format_runtime_audit(report: dict) -> str:
                 f"oldest_file={row.get('oldest_file', '-')}"
             )
         lines.append(
-            "  status: Mac watcher bottleneck likely if NAS shipper logs show "
+            "  status: destination watcher bottleneck likely if shipper logs show "
             "successful rsync while these root-level files keep aging."
         )
     else:

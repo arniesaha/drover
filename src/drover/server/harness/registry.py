@@ -1,4 +1,4 @@
-"""Registry helpers for Drover Meta Harness hosts and sessions."""
+"""Registry helpers for Drover harness hosts and sessions."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _rows(
 
 
 class HarnessRegistry:
-    """Small DuckDB-backed registry for Meta Harness control-plane state."""
+    """Small DuckDB-backed registry for Drover command-plane state."""
 
     def __init__(self, duckdb_path: str | Path):
         self.duckdb_path = Path(duckdb_path)
@@ -282,6 +282,29 @@ class HarnessRegistry:
             raise KeyError(f"unknown harness session {session_id!r}")
         return session
 
+    def mark_session_recovered(
+        self, session_id: str, native_session_id: str
+    ) -> HarnessSession:
+        now = _now()
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE harness_sessions
+                   SET status = 'running',
+                       updated_at = ?,
+                       ended_at = NULL,
+                       last_error = NULL,
+                       awaiting = 'input',
+                       native_session_id = ?
+                 WHERE session_id = ?
+                """,
+                [now, native_session_id, session_id],
+            )
+        session = self.get_session(session_id)
+        if session is None:
+            raise KeyError(f"unknown harness session {session_id!r}")
+        return session
+
     def update_session_activity(
         self,
         session_id: str,
@@ -295,6 +318,18 @@ class HarnessRegistry:
                 "UPDATE harness_sessions SET awaiting = ?, last_activity = ? "
                 "WHERE session_id = ?",
                 [awaiting, stamp, session_id],
+            )
+
+    def update_session_native_id(self, session_id: str, native_session_id: str) -> None:
+        native_session_id = native_session_id.strip()
+        if not native_session_id:
+            return
+        with self._connect() as con:
+            con.execute(
+                "UPDATE harness_sessions "
+                "SET native_session_id = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                [native_session_id, _now(), session_id],
             )
 
     def update_session_preferences(

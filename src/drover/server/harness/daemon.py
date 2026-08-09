@@ -1,4 +1,4 @@
-"""HTTP host daemon for the Drover Meta Harness."""
+"""HTTP host daemon for the Drover command plane."""
 
 from __future__ import annotations
 
@@ -1170,6 +1170,11 @@ def _path_hint(path: Path) -> str:
 # genuinely quiet-but-ready REPL still gets seeded.
 _SEED_SETTLE_S = 0.4
 _SEED_COLD_QUIET_S = 1.5
+_RECOVERY_HARNESSES = {"claude-code", "codex"}
+_RECOVERY_UNAVAILABLE = (
+    "Session cannot be resumed after the harness restart. "
+    "Continue it in a new session."
+)
 
 
 # claude-code's ink renderer emits UI text word-by-word with cursor-position
@@ -1241,12 +1246,18 @@ class HarnessDaemonState:
     # _create_session / _maybe_deliver_pending_seed for why this is deferred
     # rather than written with a fixed delay at spawn time.
     pending_initial_input: dict[str, PendingSeed] = field(default_factory=dict)
+    recovery_locks: dict[str, threading.Lock] = field(default_factory=dict)
+    recovery_locks_guard: threading.Lock = field(default_factory=threading.Lock)
     # run_harnessd() replaces this with EventPusher.push when a central URL
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     provider_usage_probe: CodexUsageProbe | None = None
     advisory_content: "AdvisoryContentConfig | None" = None
+
+    def recovery_lock_for(self, session_id: str) -> threading.Lock:
+        with self.recovery_locks_guard:
+            return self.recovery_locks.setdefault(session_id, threading.Lock())
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -1353,6 +1364,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/sessions":
             self._create_session()
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/recover"):
+            session_id = (
+                parsed.path.removeprefix("/sessions/")
+                .removesuffix("/recover")
+                .strip("/")
+            )
+            self._recover_structured_session(session_id)
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/terminate"):
             session_id = (
@@ -1997,6 +2016,104 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         self._write_json({"turn_id": turn_id}, status=HTTPStatus.ACCEPTED)
 
+    def _recover_structured_session(self, session_id: str) -> None:
+        body = self._read_json()
+        native_session_id = _optional_text(
+            body.get("native_session_id") if body is not None else None
+        )
+        with self.server.state.recovery_lock_for(session_id):
+            if self.server.state.structured.is_alive(session_id):
+                session = self.server.state.registry.get_session(session_id)
+                self._write_json(
+                    {
+                        "session_id": session_id,
+                        "status": "running",
+                        "recovered": False,
+                        "native_session_id": (
+                            session.native_session_id if session else native_session_id
+                        ),
+                    }
+                )
+                return
+            if self.server.state.structured.has(session_id):
+                self.server.state.structured.close(session_id)
+
+            session = self.server.state.registry.get_session(session_id)
+            if (
+                session is None
+                or session.mode != "structured"
+                or session.status != "errored"
+                or session.last_error != _ORPHANED_STRUCTURED_ERROR
+                or session.harness not in _RECOVERY_HARNESSES
+                or not native_session_id
+                or (
+                    session.native_session_id
+                    and session.native_session_id != native_session_id
+                )
+                or not session.cwd
+                or not Path(session.cwd).is_dir()
+            ):
+                self._write_json(
+                    {"error": _RECOVERY_UNAVAILABLE},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+
+            default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(session.harness)
+            if default_command_fn is None:
+                self._write_json(
+                    {"error": _RECOVERY_UNAVAILABLE},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+            command = apply_structured_preferences(
+                default_command_fn(),
+                harness=session.harness,
+                model=session.model,
+                thinking_effort=session.thinking_effort,
+            )
+            try:
+                self.server.state.structured.start(
+                    session_id,
+                    harness=session.harness,
+                    cwd=session.cwd,
+                    command=command,
+                    registry=self.server.state.registry,
+                    on_message=self.server.state.push_event,
+                    finalize=self._finalize_structured_session,
+                    native_session_id=native_session_id,
+                )
+                if not self.server.state.structured.is_alive(session_id):
+                    raise RuntimeError("recovered driver exited during startup")
+                self.server.state.registry.mark_session_recovered(
+                    session_id, native_session_id
+                )
+                self.server.state.structured.record_recovered(
+                    session_id, native_session_id
+                )
+            except Exception:
+                self.server.state.structured.close(session_id)
+                self._safe_update_session_status(
+                    session_id,
+                    "errored",
+                    last_error=_ORPHANED_STRUCTURED_ERROR,
+                    ended_at=datetime.now(timezone.utc),
+                )
+                self._write_json(
+                    {"error": _RECOVERY_UNAVAILABLE},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+
+            self._write_json(
+                {
+                    "session_id": session_id,
+                    "status": "running",
+                    "recovered": True,
+                    "native_session_id": native_session_id,
+                }
+            )
+
     def _answer_permission(self, session_id: str) -> None:
         if not self.server.state.structured.has(session_id):
             self._write_json(
@@ -2242,11 +2359,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._reconcile_exited_sessions()
-        session = self.server.state.pty.get(session_id)
-        if session is None:
-            if self.server.state.structured.has(session_id):
-                self._terminate_structured_session(session_id)
-                return
+        pty_session = self.server.state.pty.get(session_id)
+        if pty_session is None:
+            with self.server.state.recovery_lock_for(session_id):
+                try:
+                    registry_session = self.server.state.registry.get_session(
+                        session_id
+                    )
+                except Exception:
+                    registry_session = None
+                if self.server.state.structured.has(session_id) or (
+                    registry_session is not None
+                    and registry_session.mode == "structured"
+                    and registry_session.status not in {"completed", "terminated"}
+                ):
+                    self._terminate_structured_session(session_id)
+                    return
             self._write_json(
                 {"error": f"unknown terminal session: {session_id}"},
                 status=HTTPStatus.NOT_FOUND,

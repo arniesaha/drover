@@ -242,8 +242,17 @@ def test_cli_init_writes_default_config(tmp_path):
     assert "[paths]" in text
     assert 'principal_id = "unknown"' in text
     assert 'principal_id = "arnab"' not in text
+    assert "metrics_http_port = 7080" in text
+    assert '-agent"' in text
+    assert '-claude"' not in text
     assert "192.168." not in text
     assert "10.10." not in text
+
+
+def test_run_help_uses_loopback_bind_defaults():
+    result = CliRunner().invoke(main, ["run", "--help"])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("[default: 127.0.0.1]") == 3
 
 
 def test_cli_init_does_not_overwrite_existing(tmp_path):
