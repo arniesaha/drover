@@ -445,3 +445,24 @@ private func providerAccount(
     #expect(groups.count == 1)
     #expect(groups[0].reasonText == nil)
 }
+
+/// Hosts disagree about the plan: the same Anthropic account reported "max"
+/// from two machines and nothing from a third, which split one subscription
+/// back into the duplicate cards grouping exists to remove.
+@Test func hostsDisagreeingAboutThePlanStillFormOneSubscription() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "anthropic", label: "Claude Code",
+                        plan: "max", host: "mac-mini", status: "usage_unavailable",
+                        observedAt: "2026-08-09T18:00:00Z"),
+        providerAccount(snapshot: "s2", provider: "anthropic", label: "Claude Code",
+                        host: "work-laptop", status: "usage_unavailable",
+                        observedAt: "2026-08-09T18:01:00Z"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(accounts)
+
+    #expect(groups.count == 1)
+    #expect(groups[0].hostIDs == ["mac-mini", "work-laptop"])
+    // The host that could read the plan speaks for the subscription.
+    #expect(groups[0].planLabel == "max")
+}

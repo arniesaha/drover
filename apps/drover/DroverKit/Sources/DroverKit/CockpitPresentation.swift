@@ -508,7 +508,10 @@ public enum ProviderSubscriptionGrouping {
                 title: "\(representative.provider.capitalized) · \(representative.accountLabel)",
                 provider: representative.provider,
                 accountLabel: representative.accountLabel,
-                planLabel: representative.planLabel,
+                // Any host that could read the plan speaks for the whole
+                // subscription; a host that could not should not blank it.
+                planLabel: representative.planLabel
+                    ?? members.compactMap(\.planLabel).first,
                 hostIDs: hostIDs,
                 hostsText: ListFormatter.localizedString(byJoining: titles),
                 representative: representative,
@@ -519,9 +522,14 @@ public enum ProviderSubscriptionGrouping {
         }
     }
 
+    /// Provider and account only — the plan is an attribute of the
+    /// subscription, not part of its identity. Hosts disagree about it: the
+    /// same Anthropic account reports `max` from one machine and nothing at
+    /// all from another, depending on what that host's CLI could see. Keying
+    /// on it split one subscription back into the duplicate cards this exists
+    /// to remove.
     private static func identity(for account: ProviderAccount) -> String {
-        let plan = account.planLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return [account.provider, account.accountLabel, plan]
+        [account.provider, account.accountLabel]
             .map { $0.lowercased() }
             .joined(separator: "|")
     }

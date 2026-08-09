@@ -935,10 +935,32 @@ def test_one_failing_probe_does_not_mark_the_whole_section_stale():
     assert failed[0]["error_category"] == "unavailable"
 
 
-def test_a_genuinely_stale_reading_still_marks_the_section_stale():
+def test_one_host_going_dark_does_not_stale_the_whole_section():
+    """A host whose probes stop reporting is one card's problem.
+
+    NAS lost its provider CLIs and every account it reported went stale,
+    which marked the section stale and relabelled mac-mini's freshly
+    refreshed accounts "Stale" under a fleet-wide banner.
+    """
     accounts = [
         _capacity_account("mac-mini", "ok"),
-        _capacity_account("nas", "stale"),
+        _capacity_account("nas", "stale", error_category="unavailable"),
+    ]
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: accounts),
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    )
+
+    capacity = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
+
+    assert capacity["status"] == "ok"
+
+
+def test_section_is_stale_only_when_nothing_refreshed():
+    accounts = [
+        _capacity_account("mac-mini", "stale"),
+        _capacity_account("nas", "error", error_category="unavailable"),
     ]
     service = CockpitService(
         duckdb_path=None,
