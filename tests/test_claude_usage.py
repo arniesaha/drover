@@ -393,3 +393,54 @@ def test_the_keychain_secret_never_reaches_the_snapshot(tmp_path):
             "error": snapshot.error_category,
         }
     )
+
+
+def test_unreadable_credentials_path_is_a_protocol_error_not_absent(tmp_path):
+    """A directory at credentials_path raises IsADirectoryError on read_text.
+    That is a present-but-broken source, not an absent one -- it must not be
+    silently downgraded to not_authenticated. Using a directory instead of
+    chmod 000 keeps this deterministic regardless of the test runner's
+    privileges."""
+    credentials_dir = tmp_path / ".credentials.json"
+    credentials_dir.mkdir()
+    probe = ClaudeUsageProbe(
+        credentials_path=credentials_dir,
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "protocol_error"
+
+
+def test_invalid_json_in_the_file_is_a_protocol_error(tmp_path):
+    path = tmp_path / ".credentials.json"
+    path.write_text("not json")
+    probe = ClaudeUsageProbe(
+        credentials_path=path,
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "protocol_error"
+
+
+def test_missing_file_with_empty_keychain_still_reports_not_authenticated(tmp_path):
+    """Guard against over-correcting the protocol_error fix: a genuinely
+    absent file (FileNotFoundError) must still fall through to the next
+    source, not be treated as an error."""
+    probe = ClaudeUsageProbe(
+        credentials_path=tmp_path / "absent.json",
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "not_authenticated"

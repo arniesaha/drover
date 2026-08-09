@@ -119,6 +119,10 @@ class ClaudeUsageProbe:
         for load in (self._keychain_blob, self._file_blob):
             try:
                 raw = load()
+            except _ProbeFailure:
+                # A source that is present but broken (e.g. an unreadable
+                # credentials file) is a real error, not an absent source.
+                raise
             except Exception:
                 # A source that cannot be read is a source we do not have. This
                 # includes a Keychain prompt we declined to wait for.
@@ -159,6 +163,10 @@ class ClaudeUsageProbe:
             return self.credentials_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
+        except (OSError, ValueError) as exc:
+            # Present but unreadable (permission denied, a directory, a
+            # decode failure, ...) is a real error, not an absent source.
+            raise _ProbeFailure("protocol_error", status="error") from exc
 
     def _keychain_blob(self) -> str | None:
         return self.keychain_reader()
