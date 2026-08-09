@@ -5,15 +5,66 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import duckdb
 import pytest
 
+from drover.schema import bootstrap
 from drover.server.providers.codex import CodexUsageProbe
 from drover.server.providers.inventory import detect_provider_accounts
+from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import (
     ProviderAccountSnapshot,
     ProviderUsageWindow,
     provider_snapshot_table,
 )
+
+GOOD_PAYLOAD = {
+    "accounts": [
+        {
+            "snapshot_id": "snapshot-good",
+            "dedup_key": "dedup-good",
+            "provider": "openai",
+            "account_label": "person@example.com",
+            "plan_label": "plus",
+            "host_id": "mac-mini",
+            "usage_status": "supported",
+            "status": "ok",
+            "observed_at": "2026-08-08T10:00:00+00:00",
+            "source": "codex-app-server",
+            "error_category": None,
+            "windows": [
+                {
+                    "kind": "primary",
+                    "used_percent": 25.0,
+                    "limit_value": None,
+                    "remaining_value": None,
+                    "unit": None,
+                    "window_minutes": 300,
+                    "starts_at": None,
+                    "resets_at": "2026-08-08T15:00:00+00:00",
+                }
+            ],
+        }
+    ],
+    "observed_at": "2026-08-08T10:00:00+00:00",
+}
+
+
+@pytest.fixture
+def provider_service(tmp_path):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    return ProviderUsageService(duckdb_path, parquet_dir)
+
+
+@pytest.fixture
+def provider_host():
+    return SimpleNamespace(
+        host_id="mac-mini",
+        local_url="http://127.0.0.1:7081",
+        tailscale_url=None,
+    )
 
 
 @pytest.fixture
@@ -204,3 +255,54 @@ def test_inventory_omits_disabled_harnesses_and_keeps_supported_codex():
         ("openai", "supported")
     ]
     assert accounts[0].host_id == "mac-mini"
+
+
+def test_last_good_provider_snapshot_survives_refresh_failure(
+    provider_service, provider_host
+):
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    provider_service.refresh_host(
+        provider_host,
+        fetch=lambda _: (_ for _ in ()).throw(TimeoutError()),
+    )
+
+    account = provider_service.latest_accounts()[0]
+
+    assert account.status == "stale"
+    assert account.error_category == "timeout"
+    assert account.windows[0].used_percent == 25.0
+
+
+def test_provider_refresh_is_atomic_deduplicated_and_records_every_attempt(
+    provider_service, provider_host
+):
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+
+    parts = list(
+        (provider_service.parquet_dir / "provider_usage_snapshots").glob("*.parquet")
+    )
+    temporary_parts = list(
+        (provider_service.parquet_dir / "provider_usage_snapshots").glob("*.tmp")
+    )
+    con = duckdb.connect(str(provider_service.duckdb_path))
+    try:
+        snapshot_count = con.execute(
+            "SELECT count(DISTINCT snapshot_id) FROM provider_usage_snapshots"
+        ).fetchone()[0]
+        connection = con.execute("""
+            SELECT last_attempt_at, last_success_at, error_category
+            FROM provider_connections
+            WHERE provider = 'openai'
+              AND account_label = 'person@example.com'
+              AND host_id = 'mac-mini'
+            """).fetchone()
+    finally:
+        con.close()
+
+    assert len(parts) == 1
+    assert temporary_parts == []
+    assert snapshot_count == 1
+    assert connection[0] is not None
+    assert connection[1] is not None
+    assert connection[2] is None
