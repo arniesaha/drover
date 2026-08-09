@@ -539,6 +539,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 status, body = 400, json.dumps({"error": str(exc)}) + "\n"
             self._send(status, "application/json", body)
             return
+        if path == "/insights/content-analysis":
+            status, body = self.collector.render_content_analysis_status_json()
+            self._send(status, "application/json", body)
+            return
         insight_route = _parse_insight_route(path)
         if insight_route and insight_route[1] is None:
             status, body = self.collector.render_insight_json(insight_route[0])
@@ -706,6 +710,30 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/auth/login":
             self._handle_login()
             return
+        if path == "/insights/content-analysis/consent":
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.consent_content_analysis(body)
+            self._send(status, "application/json", payload)
+            return
+        if path == "/insights/content-analysis/revoke":
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.revoke_content_analysis(body)
+            self._send(status, "application/json", payload)
+            return
         insight_route = _parse_insight_route(path)
         if insight_route and insight_route[1] in {
             "acknowledge",
@@ -847,6 +875,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 )
                 return
             status, payload = self.collector.continue_harness_session(session_id, body)
+            self._send(status, "application/json", payload)
+            return
+        self._send(404, "text/plain; charset=utf-8", "not found\n")
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if not self._gate(path):
+            return
+        if path == "/insights/content-excerpts":
+            status, payload = self.collector.purge_content_excerpts()
             self._send(status, "application/json", payload)
             return
         self._send(404, "text/plain; charset=utf-8", "not found\n")

@@ -6,14 +6,20 @@ import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
+import threading
 from typing import Any, Mapping
 
+from drover.config import default_config, default_config_path, load_config
 from drover.server.advisory.jobs import (
+    ADVISORY_JOB_KIND,
     LIGHTWEIGHT_ANALYZER_IDS,
     enqueue_advisory_check,
 )
+from drover.server.advisory.model_analyzer import MODEL_ANALYZER_ID
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.types import (
     AnalyzerClass,
@@ -32,6 +38,8 @@ _SEVERITY_RANK_SQL = (
     "CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
     "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 END"
 )
+CONTENT_CONSENT_FENCE = threading.RLock()
+_CONTENT_JOB_STATUSES = ("pending", "leased", "retry_wait")
 
 
 class InvalidInsightRequest(ValueError):
@@ -80,9 +88,235 @@ class InsightFilters:
 class InsightsService:
     """Serialize bounded findings and delegate lifecycle persistence."""
 
-    def __init__(self, duckdb_path: str | Path) -> None:
+    def __init__(
+        self,
+        duckdb_path: str | Path,
+        *,
+        config_path: str | Path | None = None,
+    ) -> None:
         self.duckdb_path = Path(duckdb_path)
+        self.config_path = Path(config_path or default_config_path()).expanduser()
         self.repository = AdvisoryRepository(self.duckdb_path)
+
+    def content_analysis_status(self) -> dict[str, Any]:
+        """Return only consent state and a bounded pending-job count."""
+
+        config = (
+            load_config(self.config_path).advisory_content
+            if self.config_path.exists()
+            else default_config().advisory_content
+        )
+        return {
+            "enabled": config.enabled,
+            "backend": config.backend_policy,
+            "external_disclosure_accepted": config.external_consent,
+            "pending_model_jobs": self._pending_model_job_count(),
+        }
+
+    def consent_content_analysis(
+        self,
+        *,
+        backend: str,
+        external_disclosure_accepted: bool,
+    ) -> dict[str, Any]:
+        if backend not in {"local", "cloud"}:
+            raise InvalidInsightRequest("backend must be local or cloud")
+        if type(external_disclosure_accepted) is not bool:
+            raise InvalidInsightRequest(
+                "external_disclosure_accepted must be a boolean"
+            )
+        if backend == "cloud" and not external_disclosure_accepted:
+            raise InvalidInsightRequest(
+                "cloud analysis requires explicit external disclosure acceptance"
+            )
+        # Local consent never carries cloud disclosure forward implicitly.
+        disclosure = backend == "cloud" and external_disclosure_accepted
+        with CONTENT_CONSENT_FENCE:
+            self._persist_content_consent(
+                enabled=True,
+                backend=backend,
+                external_disclosure_accepted=disclosure,
+            )
+            pending = self._pending_model_job_count()
+        return {
+            "enabled": True,
+            "backend": backend,
+            "external_disclosure_accepted": disclosure,
+            "pending_model_jobs": pending,
+        }
+
+    def revoke_content_analysis(self) -> dict[str, Any]:
+        """Disable model analysis before atomically cancelling runnable jobs."""
+
+        with CONTENT_CONSENT_FENCE:
+            self._persist_content_consent(
+                enabled=False,
+                backend="local",
+                external_disclosure_accepted=False,
+            )
+            cancelled = self._cancel_pending_model_jobs()
+            pending = self._pending_model_job_count()
+        return {
+            "enabled": False,
+            "backend": "local",
+            "external_disclosure_accepted": False,
+            "pending_model_jobs": pending,
+            "cancelled_model_jobs": cancelled,
+        }
+
+    def pending_model_jobs(self) -> list[dict[str, str]]:
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            rows = con.execute(
+                """
+                SELECT job_id, status FROM pipeline_jobs
+                WHERE job_kind = ? AND starts_with(subject_key, ?)
+                  AND status IN (?, ?, ?)
+                ORDER BY created_at, job_id
+                """,
+                [
+                    ADVISORY_JOB_KIND,
+                    f"{MODEL_ANALYZER_ID}:",
+                    *_CONTENT_JOB_STATUSES,
+                ],
+            ).fetchall()
+        finally:
+            con.close()
+        return [{"job_id": str(row[0]), "status": str(row[1])} for row in rows]
+
+    def _pending_model_job_count(self) -> int:
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            return int(
+                con.execute(
+                    """
+                    SELECT count(*) FROM pipeline_jobs
+                    WHERE job_kind = ? AND starts_with(subject_key, ?)
+                      AND status IN (?, ?, ?)
+                    """,
+                    [
+                        ADVISORY_JOB_KIND,
+                        f"{MODEL_ANALYZER_ID}:",
+                        *_CONTENT_JOB_STATUSES,
+                    ],
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+
+    def purge_content_excerpts(self) -> int:
+        """Null only bounded excerpts, retaining all lifecycle evidence."""
+
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            con.execute("BEGIN TRANSACTION")
+            count = int(
+                con.execute(
+                    "SELECT count(*) FROM advisory_occurrences "
+                    "WHERE excerpt IS NOT NULL"
+                ).fetchone()[0]
+            )
+            con.execute(
+                "UPDATE advisory_occurrences SET excerpt = NULL "
+                "WHERE excerpt IS NOT NULL"
+            )
+            con.execute("COMMIT")
+            return count
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+
+    def _cancel_pending_model_jobs(self) -> int:
+        from drover.server.ledger import Ledger
+
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            con.execute("BEGIN TRANSACTION")
+            job_ids = [
+                str(row[0])
+                for row in con.execute(
+                    """
+                    SELECT job_id FROM pipeline_jobs
+                    WHERE job_kind = ? AND starts_with(subject_key, ?)
+                      AND status IN (?, ?, ?)
+                    ORDER BY created_at, job_id
+                    """,
+                    [
+                        ADVISORY_JOB_KIND,
+                        f"{MODEL_ANALYZER_ID}:",
+                        *_CONTENT_JOB_STATUSES,
+                    ],
+                ).fetchall()
+            ]
+            ledger = Ledger(con)
+            for job_id in job_ids:
+                ledger.cancel_job(job_id)
+            con.execute("COMMIT")
+            return len(job_ids)
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+
+    def _persist_content_consent(
+        self,
+        *,
+        enabled: bool,
+        backend: str,
+        external_disclosure_accepted: bool,
+    ) -> None:
+        for name, value in {
+            "enabled": enabled,
+            "external_disclosure_accepted": external_disclosure_accepted,
+        }.items():
+            if type(value) is not bool:
+                raise InvalidInsightRequest(f"{name} must be a boolean")
+        original = (
+            self.config_path.read_text(encoding="utf-8")
+            if self.config_path.exists()
+            else ""
+        )
+        rendered = _replace_advisory_content_values(
+            original,
+            enabled=enabled,
+            backend=backend,
+            external_consent=external_disclosure_accepted,
+        )
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = (
+            self.config_path.stat().st_mode & 0o777
+            if self.config_path.exists()
+            else 0o600
+        )
+        temp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.config_path.parent,
+                prefix=f".{self.config_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_name = handle.name
+                handle.write(rendered)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_name, mode)
+            # Validate the complete file before it can replace live consent.
+            load_config(Path(temp_name))
+            os.replace(temp_name, self.config_path)
+            temp_name = None
+        finally:
+            if temp_name is not None:
+                Path(temp_name).unlink(missing_ok=True)
 
     def list_insights(self, filters: InsightFilters) -> dict[str, Any]:
         clauses: list[str] = []
@@ -250,6 +484,51 @@ def validate_action_body(body: Mapping[str, Any], *, allowed: set[str]) -> None:
         raise InvalidInsightRequest(f"unsupported body field: {unknown[0]}")
 
 
+def _replace_advisory_content_values(
+    source: str,
+    *,
+    enabled: bool,
+    backend: str,
+    external_consent: bool,
+) -> str:
+    """Patch only consent fields in the existing TOML section."""
+
+    section_match = re.search(r"(?m)^\[advisory_content\]\s*(?:#.*)?$", source)
+    if section_match is None:
+        separator = "" if not source or source.endswith("\n") else "\n"
+        return (
+            source
+            + separator
+            + "\n[advisory_content]\n"
+            + f"enabled = {str(enabled).lower()}\n"
+            + f'backend_policy = "{backend}"\n'
+            + f"external_consent = {str(external_consent).lower()}\n"
+        )
+    next_section = re.search(
+        r"(?m)^\[[^\]]+\]\s*(?:#.*)?$", source[section_match.end() :]
+    )
+    end = (
+        section_match.end() + next_section.start()
+        if next_section is not None
+        else len(source)
+    )
+    before = source[: section_match.end()]
+    section = source[section_match.end() : end]
+    after = source[end:]
+    replacements = {
+        "enabled": str(enabled).lower(),
+        "backend_policy": f'"{backend}"',
+        "external_consent": str(external_consent).lower(),
+    }
+    for key, value in replacements.items():
+        pattern = re.compile(rf"(?m)^(\s*{re.escape(key)}\s*=\s*).*$")
+        if pattern.search(section):
+            section = pattern.sub(rf"\g<1>{value}", section, count=1)
+        else:
+            section = section.rstrip("\n") + f"\n{key} = {value}\n"
+    return before + section + after
+
+
 def _summary_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
     return {
         "finding_id": row[0],
@@ -322,6 +601,7 @@ def _wire_datetime(value: datetime | None) -> str | None:
 
 
 __all__ = [
+    "CONTENT_CONSENT_FENCE",
     "InsightFilters",
     "InsightsService",
     "InvalidInsightRequest",

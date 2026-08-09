@@ -49,6 +49,7 @@ from drover.server.metrics import (
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightsService
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
 from drover.server.advisory.worker import (
@@ -1400,6 +1401,9 @@ def run(
     metrics_server = None
     metrics_collector: MetricsCollector | None = None
     provider_refresh: ProviderRefreshLoop | None = None
+    config_path = (
+        Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
+    )
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
             auth = load_auth(cfg)
@@ -1417,6 +1421,9 @@ def run(
                 job_streams=job_streams,
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
+                advisory_service=InsightsService(
+                    cfg.duckdb_path, config_path=config_path
+                ),
             )
             provider_usage = ProviderUsageService(
                 duckdb_path=cfg.duckdb_path,
@@ -1473,6 +1480,9 @@ def run(
                 job_streams=job_streams,
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
+                advisory_service=InsightsService(
+                    cfg.duckdb_path, config_path=config_path
+                ),
             )
         content_backend_cfg = SummarizerBackendConfig.from_runtime(
             api_model=cfg.summarizer_api_model,
@@ -1482,11 +1492,6 @@ def run(
             gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
             gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
             wake_timeout_s=cfg.summarizer_wake_timeout_s,
-        )
-        config_path = (
-            Path(ctx.obj["config_path"])
-            if ctx.obj["config_path"]
-            else _DEFAULT_CONFIG_PATH
         )
         content_advisory_worker = _create_content_analysis_worker(
             cfg=cfg,

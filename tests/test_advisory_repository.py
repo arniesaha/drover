@@ -7,9 +7,15 @@ import json
 import duckdb
 import pytest
 
+from drover.config import load_config
 from drover.schema import bootstrap
+from drover.server.advisory.jobs import enqueue_advisory_check
 from drover.server.advisory.repository import AdvisoryRepository
-from drover.server.advisory.service import InsightFilters, InsightsService
+from drover.server.advisory.service import (
+    InsightFilters,
+    InsightsService,
+    InvalidInsightRequest,
+)
 from drover.server.advisory.types import (
     AnalyzerClass,
     Confidence,
@@ -52,9 +58,172 @@ def candidate():
     )
 
 
+@pytest.fixture
+def content_config_path(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "cloud"
+external_consent = true
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+""")
+    return path
+
+
 def test_model_candidate_cannot_be_confirmed(candidate):
     with pytest.raises(ValueError, match="model findings cannot be confirmed"):
         replace(candidate, analyzer_class=AnalyzerClass.MODEL)
+
+
+def test_content_analysis_consent_requires_explicit_cloud_disclosure(
+    repository, content_config_path
+):
+    service = InsightsService(repository.duckdb_path, config_path=content_config_path)
+
+    with pytest.raises(InvalidInsightRequest, match="external disclosure"):
+        service.consent_content_analysis(
+            backend="cloud", external_disclosure_accepted=False
+        )
+    with pytest.raises(InvalidInsightRequest, match="must be a boolean"):
+        service.consent_content_analysis(
+            backend="cloud", external_disclosure_accepted=1
+        )
+
+    status = service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+    persisted = load_config(content_config_path).advisory_content
+    assert status == {
+        "enabled": True,
+        "backend": "local",
+        "external_disclosure_accepted": False,
+        "pending_model_jobs": 0,
+    }
+    assert persisted.enabled is True
+    assert persisted.backend_policy == "local"
+    assert persisted.external_consent is False
+
+
+def test_content_analysis_consent_creates_missing_default_deny_config(
+    repository, tmp_path
+):
+    config_path = tmp_path / "missing-config.toml"
+    service = InsightsService(repository.duckdb_path, config_path=config_path)
+
+    assert service.content_analysis_status()["enabled"] is False
+    status = service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+
+    assert status["enabled"] is True
+    assert config_path.exists()
+    assert load_config(config_path).advisory_content.enabled is True
+
+
+def test_content_analysis_revoke_cancels_model_jobs_but_keeps_findings(
+    repository, candidate, content_config_path
+):
+    model_candidate = replace(
+        candidate,
+        analyzer_id="model.configuration",
+        analyzer_class=AnalyzerClass.MODEL,
+        confidence=Confidence.LIKELY,
+    )
+    finding = repository.observe(model_candidate, run_id="model-run")
+    pending = enqueue_advisory_check(
+        repository.duckdb_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version="bundle-1",
+    )
+    leased = enqueue_advisory_check(
+        repository.duckdb_path,
+        analyzer_id="model.configuration",
+        target_id="laptop",
+        source_version="bundle-2",
+    )
+    con = duckdb.connect(str(repository.duckdb_path))
+    try:
+        from drover.server.ledger import Ledger
+
+        Ledger(con).lease_job(leased.job_id, worker_id="model-worker")
+    finally:
+        con.close()
+
+    service = InsightsService(repository.duckdb_path, config_path=content_config_path)
+    status = service.revoke_content_analysis()
+
+    assert status["enabled"] is False
+    assert status["cancelled_model_jobs"] == 2
+    assert service.pending_model_jobs() == []
+    assert repository.get_finding(finding.finding_id).finding_id == finding.finding_id
+    assert load_config(content_config_path).advisory_content.enabled is False
+    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    try:
+        states = dict(
+            con.execute(
+                "SELECT job_id, status FROM pipeline_jobs WHERE job_id IN (?, ?)",
+                [pending.job_id, leased.job_id],
+            ).fetchall()
+        )
+        attempt_result = con.execute(
+            "SELECT result FROM pipeline_job_attempts WHERE job_id = ?",
+            [leased.job_id],
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert states == {pending.job_id: "cancelled", leased.job_id: "cancelled"}
+    assert attempt_result == "cancelled"
+
+
+def test_purge_removes_excerpts_not_occurrence_metadata(
+    repository, candidate, content_config_path
+):
+    first = repository.observe(candidate, run_id="run-one")
+    second = repository.observe(
+        replace(
+            candidate,
+            rule_id="hook.second",
+            content_hash="hash-2",
+            evidence=(
+                replace(
+                    candidate.evidence[0],
+                    source_ref="host:mac-mini/hooks/second",
+                    excerpt="second bounded excerpt",
+                ),
+            ),
+        ),
+        run_id="run-two",
+    )
+    service = InsightsService(repository.duckdb_path, config_path=content_config_path)
+
+    assert service.purge_content_excerpts() == 2
+
+    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    try:
+        rows = con.execute("""
+            SELECT o.finding_id, o.run_id, o.observed_at, o.source_ref,
+                   o.evidence_json, o.excerpt, o.evidence_hash,
+                   o.recorded_at, f.evaluated_content_hash
+            FROM advisory_occurrences o
+            JOIN advisory_findings f USING (finding_id)
+            ORDER BY o.run_id
+            """).fetchall()
+    finally:
+        con.close()
+    assert {row[0] for row in rows} == {first.finding_id, second.finding_id}
+    assert [row[1] for row in rows] == ["run-one", "run-two"]
+    assert all(row[2] is not None for row in rows)
+    assert all(row[3] for row in rows)
+    assert all(row[4] for row in rows)
+    assert all(row[5] is None for row in rows)
+    assert all(row[6] for row in rows)
+    assert all(row[7] is not None for row in rows)
+    assert {row[8] for row in rows} == {"hash-v1", "hash-2"}
 
 
 @pytest.mark.parametrize(

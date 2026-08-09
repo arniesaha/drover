@@ -24,6 +24,7 @@ import pytest
 from drover.schema import bootstrap
 from drover.server import metrics
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightsService
 from drover.server.advisory.types import (
     AnalyzerClass,
     Confidence,
@@ -283,6 +284,11 @@ def _authed_post(url: str, payload: object):
         headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
         method="POST",
     )
+    return urllib.request.urlopen(request, timeout=5)
+
+
+def _authed_delete(url: str):
+    request = urllib.request.Request(url, headers=_AUTH_HEADERS, method="DELETE")
     return urllib.request.urlopen(request, timeout=5)
 
 
@@ -740,6 +746,86 @@ def test_insights_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
         with _authed_get(base + "/insights?severity=high&limit=1") as response:
             payload = json.loads(response.read())
         assert payload["findings"][0]["severity"] == "high"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_content_analysis_privacy_routes_require_auth_and_return_bounded_status(
+    tmp_path,
+):
+    collector = _make_collector(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = false
+backend_policy = "local"
+external_consent = false
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+""")
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=config_path
+    )
+    _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        for method, path, payload in (
+            ("GET", "/insights/content-analysis", None),
+            ("POST", "/insights/content-analysis/consent", {"backend": "local"}),
+            ("POST", "/insights/content-analysis/revoke", {}),
+            ("DELETE", "/insights/content-excerpts", None),
+        ):
+            request = urllib.request.Request(
+                base + path,
+                data=(json.dumps(payload).encode() if payload is not None else None),
+                headers=(
+                    {"Content-Type": "application/json"} if payload is not None else {}
+                ),
+                method=method,
+            )
+            with pytest.raises(HTTPError) as exc:
+                urlopen(request, timeout=3)
+            assert exc.value.code == 401
+
+        with _authed_get(base + "/insights/content-analysis") as response:
+            status = json.loads(response.read())
+        assert status == {
+            "backend": "local",
+            "enabled": False,
+            "external_disclosure_accepted": False,
+            "pending_model_jobs": 0,
+        }
+        assert "content" not in json.dumps(status).lower().replace(
+            "content_analysis", ""
+        )
+
+        with _authed_post(
+            base + "/insights/content-analysis/consent", {"backend": "local"}
+        ) as response:
+            consent = json.loads(response.read())
+        assert consent["enabled"] is True
+        assert consent["external_disclosure_accepted"] is False
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(
+                base + "/insights/content-analysis/consent",
+                {"backend": "cloud", "external_disclosure_accepted": False},
+            )
+        assert exc.value.code == 400
+
+        with _authed_post(base + "/insights/content-analysis/revoke", {}) as response:
+            revoked = json.loads(response.read())
+        assert revoked["enabled"] is False
+
+        with _authed_delete(base + "/insights/content-excerpts") as response:
+            purged = json.loads(response.read())
+        assert purged == {"purged_excerpt_count": 1}
     finally:
         server.shutdown()
         server.server_close()

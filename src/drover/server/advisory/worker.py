@@ -460,14 +460,20 @@ class _ConsentFencedBackend:
     selected_policy: str
 
     def complete(self, system: str, user: str) -> str:
-        config = self.consent_reader()
-        if (
-            not config.enabled
-            or config.backend_policy != self.selected_policy
-            or (config.backend_policy == "cloud" and not config.external_consent)
-        ):
-            raise AnalysisConsentRevoked("content analysis consent was revoked")
-        return self.backend.complete(system, user)
+        from drover.server.advisory.service import CONTENT_CONSENT_FENCE
+
+        # Revocation uses this same boundary while it atomically disables
+        # consent and cancels runnable jobs. Once the revoke response returns,
+        # no already-leased worker can cross into a backend call.
+        with CONTENT_CONSENT_FENCE:
+            config = self.consent_reader()
+            if (
+                not config.enabled
+                or config.backend_policy != self.selected_policy
+                or (config.backend_policy == "cloud" and not config.external_consent)
+            ):
+                raise AnalysisConsentRevoked("content analysis consent was revoked")
+            return self.backend.complete(system, user)
 
 
 def _candidate_reference(candidate: FindingCandidate) -> str:

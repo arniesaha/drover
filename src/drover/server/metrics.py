@@ -801,6 +801,45 @@ class MetricsCollector:
     def render_insight_json(self, finding_id: str) -> tuple[int, str]:
         return _insight_response(lambda: self._insights().get_insight(finding_id))
 
+    def render_content_analysis_status_json(self) -> tuple[int, str]:
+        return _insight_response(lambda: self._insights().content_analysis_status())
+
+    def consent_content_analysis(self, body: Mapping[str, Any]) -> tuple[int, str]:
+        from drover.server.advisory.service import (
+            InvalidInsightRequest,
+            validate_action_body,
+        )
+
+        try:
+            validate_action_body(
+                body, allowed={"backend", "external_disclosure_accepted"}
+            )
+            backend = body.get("backend")
+            if not isinstance(backend, str):
+                raise InvalidInsightRequest("backend must be local or cloud")
+            disclosure = body.get("external_disclosure_accepted", False)
+            payload = self._insights().consent_content_analysis(
+                backend=backend,
+                external_disclosure_accepted=disclosure,
+            )
+            return _json_response(200, payload)
+        except Exception as exc:
+            return _insight_error_response(exc)
+
+    def revoke_content_analysis(self, body: Mapping[str, Any]) -> tuple[int, str]:
+        from drover.server.advisory.service import validate_action_body
+
+        try:
+            validate_action_body(body, allowed=set())
+            return _json_response(200, self._insights().revoke_content_analysis())
+        except Exception as exc:
+            return _insight_error_response(exc)
+
+    def purge_content_excerpts(self) -> tuple[int, str]:
+        return _insight_response(
+            lambda: {"purged_excerpt_count": self._insights().purge_content_excerpts()}
+        )
+
     def act_on_insight(
         self, finding_id: str, action: str, body: Mapping[str, Any]
     ) -> tuple[int, str]:

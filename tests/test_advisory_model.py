@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import threading
 
 import pytest
 
+from drover.config import load_config
+from drover.schema import bootstrap
 from drover.server.advisory.content_targets import (
     BundledTarget,
     ContentBundle,
@@ -18,6 +21,8 @@ from drover.server.advisory.model_analyzer import (
     select_analysis_backend,
 )
 from drover.server.advisory.types import AnalyzerClass, Confidence
+from drover.server.advisory.service import InsightsService
+from drover.server.advisory.worker import _ConsentFencedBackend
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig
 
@@ -66,6 +71,57 @@ def _response(**updates: object) -> str:
     }
     finding.update(updates)
     return json.dumps({"findings": [finding]})
+
+
+def test_revocation_waits_for_leased_backend_boundary(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "local"
+external_consent = false
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+""")
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    entered = threading.Event()
+    release = threading.Event()
+    revoked = threading.Event()
+
+    class BlockingBackend:
+        def complete(self, system: str, user: str) -> str:
+            entered.set()
+            assert release.wait(2)
+            return '{"findings":[]}'
+
+    backend = _ConsentFencedBackend(
+        backend=BlockingBackend(),
+        consent_reader=lambda: load_config(config_path).advisory_content,
+        selected_policy="local",
+    )
+    analysis = threading.Thread(target=lambda: backend.complete("system", "user"))
+    analysis.start()
+    assert entered.wait(2)
+
+    service = InsightsService(db_path, config_path=config_path)
+
+    def revoke() -> None:
+        service.revoke_content_analysis()
+        revoked.set()
+
+    revoker = threading.Thread(target=revoke)
+    revoker.start()
+    revoked_before_release = revoked.wait(0.2)
+    release.set()
+    analysis.join(2)
+    revoker.join(2)
+
+    assert revoked_before_release is False
+    assert revoked.is_set()
+    assert load_config(config_path).advisory_content.enabled is False
 
 
 def test_model_analyzer_returns_only_uncertain_advisory_candidates(
