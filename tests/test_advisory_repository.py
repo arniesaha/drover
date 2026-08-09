@@ -234,6 +234,65 @@ def test_finding_text_is_bounded_and_redacted_before_persistence(repository, can
     assert persisted.count("[REDACTED]") == 3
 
 
+def test_compound_sensitive_keys_are_redacted_everywhere(repository, candidate):
+    secret_candidate = replace(
+        candidate,
+        title="client_secret=title-secret",
+        impact="access_token=impact-secret",
+        remediation=(
+            "Replace refresh_token=refresh-secret.",
+            "Clear session_token=session-secret.",
+        ),
+        evidence=(
+            replace(
+                candidate.evidence[0],
+                fields={
+                    "access_token": "metadata-access-secret",
+                    "nested": {"client_secret": "metadata-client-secret"},
+                },
+                excerpt=(
+                    "access_token=excerpt-access-secret\n"
+                    "refresh_token=excerpt-refresh-secret\n"
+                    "client_secret=excerpt-client-secret\n"
+                    "session_token=excerpt-session-secret"
+                ),
+            ),
+        ),
+    )
+
+    finding = repository.observe(secret_candidate, run_id="run-compound-secrets")
+    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    try:
+        evidence_json, excerpt = con.execute(
+            "SELECT evidence_json, excerpt FROM advisory_occurrences "
+            "WHERE finding_id = ?",
+            [finding.finding_id],
+        ).fetchone()
+    finally:
+        con.close()
+
+    persisted = " ".join(
+        (finding.title, finding.impact, *finding.remediation, evidence_json, excerpt)
+    )
+    for secret in (
+        "title-secret",
+        "impact-secret",
+        "refresh-secret",
+        "session-secret",
+        "metadata-access-secret",
+        "metadata-client-secret",
+        "excerpt-access-secret",
+        "excerpt-refresh-secret",
+        "excerpt-client-secret",
+        "excerpt-session-secret",
+    ):
+        assert secret not in persisted
+    assert json.loads(evidence_json) == {
+        "access_token": "[REDACTED]",
+        "nested": {"client_secret": "[REDACTED]"},
+    }
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [

@@ -46,7 +46,7 @@ _AUTHORIZATION_SECRET = re.compile(
 )
 _BEARER_SECRET = re.compile(r"(?i)\b(bearer)\s+[^\s,;]+")
 _ASSIGNED_SECRET = re.compile(
-    r"(?i)\b((?:api[_-]?key|authorization|cookie|credential|password|private[_-]?key|secret|token)\s*[:=]\s*)[^\s,;]+"
+    r"(?i)\b(([a-z0-9_-]*(?:api[_-]?key|authorization|cookie|credential|password|private[_-]?key|secret|token))\s*[:=]\s*)[^\s,;]+"
 )
 _PEM_PRIVATE_KEY = re.compile(
     r"(?is)-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)"
