@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 
+import pytest
+
 from drover.server.providers.claude import ClaudeUsageProbe
 
 
@@ -141,3 +143,107 @@ def test_absurd_expires_at_returns_error_snapshot(tmp_path):
     assert snapshot.status == "error"
     assert snapshot.error_category == "protocol_error"
     assert snapshot.windows == ()
+
+
+def test_missing_credentials_file_is_unavailable_not_an_error(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=tmp_path / "absent.json",
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+    )
+
+    snapshot = probe.read(host_id="work-laptop")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "not_authenticated"
+    assert snapshot.windows == ()
+
+
+def test_expired_token_short_circuits_before_spending_a_request(tmp_path):
+    calls = []
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path, expires_at_ms=1000),
+        opener=lambda url, headers, timeout: calls.append(url) or (200, USAGE_BODY),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "token_expired"
+    # The point of this test: no request was made at all.
+    assert calls == []
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_rejected_credentials_are_unavailable_not_an_error(tmp_path, code):
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda url, headers, timeout: (code, b"{}"),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "not_authenticated"
+
+
+def test_timeout_is_an_error(tmp_path):
+    def opener(url, headers, timeout):
+        raise TimeoutError("timed out")
+
+    probe = ClaudeUsageProbe(credentials_path=_credentials(tmp_path), opener=opener)
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "timeout"
+
+
+def test_connection_failure_is_an_error(tmp_path):
+    def opener(url, headers, timeout):
+        raise OSError("connection refused")
+
+    probe = ClaudeUsageProbe(credentials_path=_credentials(tmp_path), opener=opener)
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "unavailable"
+
+
+def test_unparseable_body_is_a_protocol_error(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda url, headers, timeout: (200, b"<html>nope</html>"),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "protocol_error"
+
+
+def test_a_parseable_response_with_no_windows_stays_quiet(tmp_path):
+    """An empty account and a moved endpoint look identical from here, and the
+    quieter reading is the right default for an undocumented API."""
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda url, headers, timeout: (200, b"{}"),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "no_usage_reported"
+
+
+def test_base_url_override_is_honoured(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999")
+    seen = []
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda url, headers, timeout: seen.append(url) or (200, USAGE_BODY),
+    )
+
+    probe.read(host_id="mac-mini")
+
+    assert seen == ["http://127.0.0.1:9999/api/oauth/usage"]
