@@ -253,6 +253,28 @@ struct CockpitStoreTests {
         #expect(store.contentPurgeError == nil)
     }
 
+    @Test @MainActor func confirmedRevocationCallsServerUpdatesStatusAndPreservesFindings() async throws {
+        let revoked = try decodeContentStatus(
+            enabled: false,
+            backend: "cloud",
+            disclosureAccepted: false
+        )
+        let client = CockpitClientStub(
+            insightPages: [try decodeInsightPage(ids: ["one"], nextCursor: nil)],
+            contentStatus: revoked
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadInsights()
+
+        let succeeded = await store.revokeContentAnalysis()
+
+        #expect(succeeded)
+        #expect(store.contentAnalysisStatus == revoked)
+        #expect(store.insights.map(\.findingID) == ["one"])
+        #expect(await client.revokeRequestCount == 1)
+    }
+
     @Test @MainActor func purgeReportsCountWithoutChangingConsentOrFindings() async throws {
         let status = try decodeContentStatus(
             enabled: true,
@@ -306,6 +328,7 @@ private actor CockpitClientStub: CockpitClient {
     private(set) var maximumConcurrentLifecycleRequests = 0
     private(set) var contentConsentRequestCount = 0
     private(set) var requestedContentConsents: [RequestedContentConsent] = []
+    private(set) var revokeRequestCount = 0
     private var currentLifecycleRequests = 0
 
     init(
@@ -398,6 +421,7 @@ private actor CockpitClientStub: CockpitClient {
     }
 
     func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
+        revokeRequestCount += 1
         if let contentError { throw contentError }
         guard let contentStatusValue else { throw DroverError.unavailable("not configured") }
         return contentStatusValue

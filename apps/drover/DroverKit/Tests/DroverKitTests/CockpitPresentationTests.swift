@@ -194,6 +194,26 @@ import Testing
     #expect(value.sourceText == "Provider reported")
 }
 
+@Test func disabledSelectionWaitsForConfirmedRevocationAndCancelRestoresActualBackend() {
+    var state = ContentAnalysisSelectionState()
+    state.synchronize(enabled: true, backend: .cloud, disclosureAccepted: true)
+
+    let requiresConfirmation = state.select(.disabled)
+
+    #expect(requiresConfirmation)
+    #expect(state.displayedMode == .cloud)
+    #expect(state.disclosureAccepted)
+
+    state.cancelRevocation()
+
+    #expect(state.displayedMode == .cloud)
+    #expect(!state.isRevocationPending)
+
+    state.synchronize(enabled: false, backend: .cloud, disclosureAccepted: false)
+
+    #expect(state.displayedMode == .disabled)
+}
+
 private func decodeProviderWindow(_ json: String) throws -> ProviderWindow {
     try JSONDecoder().decode(ProviderWindow.self, from: Data(json.utf8))
 }

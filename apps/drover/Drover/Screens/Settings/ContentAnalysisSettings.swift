@@ -2,18 +2,8 @@ import DroverKit
 import SwiftUI
 
 struct ContentAnalysisSettings: View {
-    private enum Mode: String, CaseIterable, Identifiable {
-        case disabled
-        case local
-        case cloud
-
-        var id: Self { self }
-        var title: String { rawValue.capitalized }
-    }
-
     @State private var store: CockpitStore
-    @State private var selectedMode: Mode = .disabled
-    @State private var disclosureAccepted = false
+    @State private var selectionState = ContentAnalysisSelectionState()
     @State private var showRevokeConfirmation = false
     @State private var showPurgeConfirmation = false
     @State private var didLoadStatus = false
@@ -24,8 +14,8 @@ struct ContentAnalysisSettings: View {
 
     var body: some View {
         Section("Content analysis") {
-            Picker("Analysis backend", selection: $selectedMode) {
-                ForEach(Mode.allCases) { mode in
+            Picker("Analysis backend", selection: modeBinding) {
+                ForEach(ContentAnalysisMode.allCases) { mode in
                     Text(mode.title).tag(mode)
                 }
             }
@@ -34,30 +24,34 @@ struct ContentAnalysisSettings: View {
 
             modeDescription
 
-            if selectedMode == .cloud {
+            if selectionState.displayedMode == .cloud {
                 Text(CockpitStore.cloudDisclosureMessage)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("content-cloud-disclosure")
 
-                Toggle("I understand this content may leave this device", isOn: $disclosureAccepted)
+                Toggle(
+                    "I understand this content may leave this device",
+                    isOn: $selectionState.disclosureAccepted
+                )
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("content-cloud-disclosure-acceptance")
             }
 
-            if selectedMode != .disabled {
+            if selectionState.displayedMode != .disabled {
                 Button(enableButtonTitle) {
                     Task {
                         _ = await store.enableContentAnalysis(
-                            backend: selectedMode == .local ? .local : .cloud,
-                            disclosureAccepted: disclosureAccepted
+                            backend: selectionState.displayedMode == .local ? .local : .cloud,
+                            disclosureAccepted: selectionState.disclosureAccepted
                         )
                     }
                 }
                 .disabled(
                     store.isUpdatingContentConsent
-                        || (selectedMode == .cloud && !disclosureAccepted)
+                        || (selectionState.displayedMode == .cloud
+                            && !selectionState.disclosureAccepted)
                 )
                 .accessibilityIdentifier("content-analysis-enable")
             }
@@ -101,6 +95,11 @@ struct ContentAnalysisSettings: View {
         .onChange(of: store.contentAnalysisStatus) { _, _ in
             syncSelectionFromStatus()
         }
+        .onChange(of: showRevokeConfirmation) { wasPresented, isPresented in
+            if wasPresented, !isPresented, store.contentAnalysisStatus?.enabled == true {
+                selectionState.cancelRevocation()
+            }
+        }
         .confirmationDialog(
             "Stop content analysis?",
             isPresented: $showRevokeConfirmation,
@@ -127,7 +126,7 @@ struct ContentAnalysisSettings: View {
 
     @ViewBuilder
     private var modeDescription: some View {
-        switch selectedMode {
+        switch selectionState.displayedMode {
         case .disabled:
             Text("Content-sensitive model analysis is off. Deterministic local checks still run.")
                 .font(.footnote)
@@ -146,7 +145,7 @@ struct ContentAnalysisSettings: View {
     private var enableButtonTitle: String {
         store.isUpdatingContentConsent
             ? "Saving…"
-            : "Enable \(selectedMode.title.lowercased()) analysis"
+            : "Enable \(selectionState.displayedMode.title.lowercased()) analysis"
     }
 
     private func statusDescription(_ status: ContentAnalysisStatus) -> String {
@@ -166,9 +165,21 @@ struct ContentAnalysisSettings: View {
 
     private func syncSelectionFromStatus() {
         guard let status = store.contentAnalysisStatus else { return }
-        selectedMode = status.enabled
-            ? (status.backend == .local ? .local : .cloud)
-            : .disabled
-        disclosureAccepted = status.externalDisclosureAccepted
+        selectionState.synchronize(
+            enabled: status.enabled,
+            backend: status.backend,
+            disclosureAccepted: status.externalDisclosureAccepted
+        )
+    }
+
+    private var modeBinding: Binding<ContentAnalysisMode> {
+        Binding(
+            get: { selectionState.displayedMode },
+            set: { mode in
+                if selectionState.select(mode) {
+                    showRevokeConfirmation = true
+                }
+            }
+        )
     }
 }

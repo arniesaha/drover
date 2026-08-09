@@ -1,5 +1,59 @@
 import Foundation
 
+public enum ContentAnalysisMode: String, CaseIterable, Identifiable, Sendable, Equatable {
+    case disabled
+    case local
+    case cloud
+
+    public var id: Self { self }
+    public var title: String { rawValue.capitalized }
+}
+
+/// Keeps the backend picker aligned with confirmed server state. Choosing
+/// Disabled is a revocation request, not a local presentation change: the
+/// confirmed backend remains visible until the destructive operation succeeds.
+public struct ContentAnalysisSelectionState: Sendable, Equatable {
+    public private(set) var displayedMode: ContentAnalysisMode = .disabled
+    public private(set) var isRevocationPending = false
+    public var disclosureAccepted = false
+
+    private var confirmedMode: ContentAnalysisMode = .disabled
+
+    public init() {}
+
+    public mutating func synchronize(
+        enabled: Bool,
+        backend: ContentAnalysisBackend,
+        disclosureAccepted: Bool
+    ) {
+        confirmedMode = enabled
+            ? (backend == .local ? .local : .cloud)
+            : .disabled
+        displayedMode = confirmedMode
+        isRevocationPending = false
+        self.disclosureAccepted = disclosureAccepted
+    }
+
+    /// Returns true when the caller must present the destructive revocation
+    /// confirmation instead of changing the visible mode.
+    @discardableResult
+    public mutating func select(_ mode: ContentAnalysisMode) -> Bool {
+        if mode == .disabled, confirmedMode != .disabled {
+            displayedMode = confirmedMode
+            isRevocationPending = true
+            return true
+        }
+        displayedMode = mode
+        isRevocationPending = false
+        return false
+    }
+
+    public mutating func cancelRevocation() {
+        displayedMode = confirmedMode
+        isRevocationPending = false
+    }
+}
+
 /// Stable information order for the analytics-first Home. Healthy sections
 /// with no content stay out of the way, while degraded provider state remains
 /// visible even when a connector cannot return an account snapshot.
