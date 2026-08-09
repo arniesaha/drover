@@ -432,6 +432,25 @@ private func providerAccount(
     #expect(reason.contains("work-laptop"))
 }
 
+/// "Couldn't reach" sends a signed-in reader looking for a network fault. A CLI
+/// the daemon cannot locate is a different repair, so it needs its own wording.
+@Test func aMissingCLIReadsAsMissingRatherThanUnreachable() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "openai", label: "Codex",
+                        host: "work-laptop", status: "error",
+                        observedAt: "2026-08-09T18:00:00Z",
+                        errorCategory: "cli_not_found"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(
+        accounts, hostTitles: ["work-laptop": "work-laptop"]
+    )
+
+    let reason = try #require(groups[0].reasonText)
+    #expect(reason.contains("CLI not found on"))
+    #expect(reason.contains("work-laptop"))
+}
+
 @Test func aHealthySubscriptionCarriesNoReason() throws {
     let accounts = try [
         providerAccount(snapshot: "s1", provider: "google", label: "Gemini",

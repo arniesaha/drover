@@ -238,6 +238,17 @@ def test_codex_probe_reads_plan_and_multiple_windows(fake_codex_app_server):
     )
 
 
+def test_codex_probe_separates_a_missing_cli_from_a_host_failure(tmp_path):
+    # "unavailable" is also the host-level catch-all, so a CLI that is simply
+    # not on the daemon's PATH needs its own category to stay actionable.
+    snapshot = CodexUsageProbe(
+        command=(str(tmp_path / "definitely-not-installed"), "app-server", "--stdio")
+    ).read()
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "cli_not_found"
+
+
 def test_codex_probe_times_out_without_exposing_stderr(fake_codex_app_server):
     snapshot = CodexUsageProbe(
         command=fake_codex_app_server.timeout_command, timeout_s=0.05

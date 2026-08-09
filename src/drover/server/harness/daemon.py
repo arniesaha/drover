@@ -183,6 +183,12 @@ class HarnessPreset:
     # the harness has no gate (shell, codex, gemini).
     startup_gate_markers: tuple[str, ...] = ()
     startup_gate_answer: str = "1\n"
+    # Absolute path to the resolved CLI. `command` wraps it in a login shell so
+    # the harness inherits the user's environment, which hides the path from
+    # anything that needs to spawn the binary directly (the Codex usage probe).
+    # harnessd's own PATH comes from launchd and omits Homebrew/nvm prefixes, so
+    # a bare binary name is not resolvable in this process.
+    executable: str | None = None
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -253,6 +259,7 @@ def resolve_harness_presets(
                 preset,
                 enabled=False,
                 description=f"{preset.description}; executable not found on this host",
+                executable=None,
             )
             continue
         path_prefix = executable_path_prefix(executable)
@@ -269,6 +276,7 @@ def resolve_harness_presets(
             command=(login_shell, "-lc", shell_command),
             enabled=True,
             description=f"{preset.description}; available at {executable}",
+            executable=executable,
         )
     return resolved
 
@@ -1474,19 +1482,26 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         accounts: list[dict[str, Any]] = []
         for detected in detect_provider_accounts(self.server.state.capabilities()):
             if detected.provider == "openai":
-                probe = self.server.state.provider_usage_probe
-                if probe is None:
-                    from drover.server.providers.codex import CodexUsageProbe
-
-                    probe = CodexUsageProbe()
-                    self.server.state.provider_usage_probe = probe
-                snapshot = probe.read(host_id=self.server.state.host_id)
+                snapshot = self._codex_usage_snapshot()
                 accounts.append(_provider_snapshot_json(snapshot, detected))
                 continue
             if detected.provider == "anthropic":
                 detected = _with_claude_plan_label(detected, self.server.state.auth)
             accounts.append(_unavailable_provider_json(detected, observed_at))
         self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
+
+    def _codex_usage_snapshot(self) -> ProviderAccountSnapshot:
+        """Probe Codex at the path its preset already resolved."""
+        from drover.server.providers.codex import CodexUsageProbe
+
+        preset = self.server.state.presets.get("codex")
+        executable = preset.executable if preset is not None else None
+        command = (executable, "app-server", "--stdio") if executable else None
+        probe = self.server.state.provider_usage_probe
+        if probe is None or probe.command != command:
+            probe = CodexUsageProbe(command=command)
+            self.server.state.provider_usage_probe = probe
+        return probe.read(host_id=self.server.state.host_id)
 
     def _advisory_content_bundle(self) -> None:
         if not self.server.state.api_token or not self._authorized():
