@@ -2,6 +2,7 @@
 
 import json
 import socket
+import struct
 import threading
 import time
 
@@ -100,6 +101,52 @@ def test_request_rejects_oversized_response_from_noncompliant_spoke() -> None:
     )
     assert status == 502
     assert "exceeds byte limit" in body
+    thread.join(timeout=5)
+
+
+def test_bounded_request_rejects_raw_body_from_frame_header_before_payload_read(
+    monkeypatch,
+) -> None:
+    manager = RelayManager()
+    observed_caps: list[int | None] = []
+    real_recv_frame = relay_manager.recv_frame
+
+    def recording_recv_frame(sock, *, max_frame_bytes=None):
+        observed_caps.append(max_frame_bytes)
+        return real_recv_frame(sock, max_frame_bytes=max_frame_bytes)
+
+    monkeypatch.setattr(relay_manager, "recv_frame", recording_recv_frame)
+    spoke = _attach(manager)
+
+    def spoke_loop() -> None:
+        frame = _spoke_recv(spoke)
+        client_send_json(
+            spoke,
+            {
+                "kind": "res_start",
+                "id": frame["id"],
+                "status": 200,
+                "body_bytes": 4096,
+            },
+        )
+        # Announce a masked 4097-byte raw frame but send neither mask nor body.
+        # A post-read check hangs; a header-stage cap rejects immediately.
+        spoke.sendall(bytes([0x81, 0x80 | 127]) + struct.pack("!Q", 4097))
+
+    thread = threading.Thread(target=spoke_loop, daemon=True)
+    thread.start()
+    status, body = manager.request(
+        "laptop",
+        "POST",
+        "/advisory/content-bundle",
+        {"target_ids": ["global-agents"]},
+        timeout_s=2,
+        max_response_bytes=4096,
+    )
+
+    assert status == 502
+    assert "connection lost" in body
+    assert observed_caps == [None, 4096]
     thread.join(timeout=5)
 
 

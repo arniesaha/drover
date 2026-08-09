@@ -39,6 +39,7 @@ from drover.server.harness.relay_protocol import (
     opened_frame,
     parse_frame,
     res_frame,
+    res_start_frame,
 )
 from drover.server.harness.websocket import (
     OPCODE_CLOSE,
@@ -228,6 +229,14 @@ class _Conn:
     ) -> None:
         with self.write_access(timeout_s):
             client_send_frame(self.sock, opcode, payload)
+
+    def send_bounded_response(self, request_id: str, status: int, body: str) -> None:
+        payload = body.encode("utf-8")
+        with self.write_access(WRITE_TIMEOUT_S):
+            client_send_json(
+                self.sock, res_start_frame(request_id, status, len(payload))
+            )
+            client_send_frame(self.sock, OPCODE_TEXT, payload)
 
     def add_channel(self, channel: _Channel) -> bool:
         with self.state_lock:
@@ -452,6 +461,18 @@ class RelayClient:
         except (OSError, WebSocketClosed) as exc:
             self._teardown(connection, f"relay send failed: {exc}")
 
+    def _send_bounded_response(
+        self, connection: _Conn, request_id: str, status: int, body: str
+    ) -> None:
+        if not connection.alive.is_set():
+            return
+        try:
+            connection.send_bounded_response(request_id, status, body)
+        except _WriteTimeout as exc:
+            self._teardown(connection, str(exc))
+        except (OSError, WebSocketClosed) as exc:
+            self._teardown(connection, f"relay send failed: {exc}")
+
     # -- req/res -------------------------------------------------------
 
     def _start_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
@@ -508,7 +529,10 @@ class RelayClient:
                 body = json.dumps(
                     {"error": f"loopback request failed: {exc}"}, sort_keys=True
                 )
-            self._send(connection, res_frame(request_id, status, body))
+            if type(max_response_bytes) is int and max_response_bytes > 0:
+                self._send_bounded_response(connection, request_id, status, body)
+            else:
+                self._send(connection, res_frame(request_id, status, body))
         finally:
             self._req_slots.release()
 

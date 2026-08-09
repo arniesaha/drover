@@ -11,7 +11,17 @@ from __future__ import annotations
 from typing import Any
 
 FRAME_KINDS = frozenset(
-    {"hello", "req", "res", "open", "opened", "open_error", "data", "close"}
+    {
+        "hello",
+        "req",
+        "res",
+        "res_start",
+        "open",
+        "opened",
+        "open_error",
+        "data",
+        "close",
+    }
 )
 
 
@@ -47,6 +57,17 @@ def req_frame(
 
 def res_frame(request_id: str, status: int, body: str) -> dict[str, Any]:
     return {"kind": "res", "id": request_id, "status": status, "body": body}
+
+
+def res_start_frame(request_id: str, status: int, body_bytes: int) -> dict[str, Any]:
+    if type(body_bytes) is not int or body_bytes < 0:
+        raise ValueError("body_bytes must be a non-negative integer")
+    return {
+        "kind": "res_start",
+        "id": request_id,
+        "status": status,
+        "body_bytes": body_bytes,
+    }
 
 
 def open_frame(chan: str, path: str) -> dict[str, Any]:

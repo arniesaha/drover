@@ -10,6 +10,7 @@ from drover.server.harness.relay_protocol import (
     opened_frame,
     parse_frame,
     req_frame,
+    res_start_frame,
     res_frame,
 )
 
@@ -39,6 +40,15 @@ def test_req_frame_carries_optional_response_bound() -> None:
         )["max_response_bytes"]
         == 4096
     )
+
+
+def test_res_start_frame_declares_request_identity_and_body_size() -> None:
+    assert parse_frame(res_start_frame("abc", 200, 4096)) == {
+        "kind": "res_start",
+        "id": "abc",
+        "status": 200,
+        "body_bytes": 4096,
+    }
 
 
 def test_channel_frames() -> None:

@@ -21,7 +21,12 @@ from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness import relay_client
 from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.relay_protocol import close_frame, open_frame, req_frame
-from drover.server.harness.websocket import recv_json, send_json
+from drover.server.harness.websocket import (
+    OPCODE_TEXT,
+    recv_frame,
+    recv_json,
+    send_json,
+)
 
 
 def _wait_for(sock, kinds, timeout_s=20.0):
@@ -80,6 +85,32 @@ def test_req_frame_dispatches_to_loopback_and_answers(harnessd_server):
     assert frame["id"] == "r1"
     assert frame["status"] == 200
     assert "sessions" in json.loads(frame["body"])
+    hub_side.close()
+
+
+def test_bounded_req_uses_metadata_then_raw_body_frame(harnessd_server):
+    client = RelayClient(
+        central_url="https://unused.example",
+        host_id="laptop",
+        token="test-token",
+        loopback_port=harnessd_server.server_port,
+    )
+    hub_side, spoke_side = socket.socketpair()
+    threading.Thread(
+        target=client.serve_connection, args=(spoke_side,), daemon=True
+    ).start()
+    send_json(
+        hub_side,
+        req_frame("r1", "GET", "/sessions", None, max_response_bytes=4096),
+    )
+
+    start = recv_json(hub_side)
+    assert start["kind"] == "res_start"
+    assert start["id"] == "r1"
+    body_frame = recv_frame(hub_side)
+    assert body_frame.opcode == OPCODE_TEXT
+    assert len(body_frame.payload) == start["body_bytes"]
+    assert "sessions" in json.loads(body_frame.payload)
     hub_side.close()
 
 
