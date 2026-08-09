@@ -40,6 +40,18 @@ def test_bundle_rejects_symlink_even_when_it_stays_in_allowlist(tmp_path):
         build_content_bundle([_target(alias)], allowed_roots=[allowed])
 
 
+def test_bundle_rejects_symlinked_allowed_root(tmp_path):
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    source = canonical_root / "source.txt"
+    source.write_text("safe")
+    symlinked_root = tmp_path / "allowed-alias"
+    symlinked_root.symlink_to(canonical_root)
+
+    with pytest.raises(ContentTargetError, match="allowed root.*symlink"):
+        build_content_bundle([_target(source)], allowed_roots=[symlinked_root])
+
+
 def test_bundle_rejects_parent_traversal_syntax(tmp_path):
     allowed = tmp_path / "allowed"
     allowed.mkdir()

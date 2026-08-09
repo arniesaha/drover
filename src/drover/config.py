@@ -50,6 +50,9 @@ class AdvisoryContentConfig:
     excerpt_max_chars: int
 
     def __post_init__(self) -> None:
+        for field_name in ("enabled", "external_consent"):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"advisory_content.{field_name} must be a boolean")
         if self.backend_policy not in {"local", "cloud"}:
             raise ValueError("advisory_content.backend_policy must be local or cloud")
         if self.backend_policy == "cloud" and not self.external_consent:
@@ -262,9 +265,9 @@ def _from_dict(d: dict) -> DroverConfig:
         ),
         advisory_poll_interval_seconds=float(d["advisory"]["poll_interval_seconds"]),
         advisory_content=AdvisoryContentConfig(
-            enabled=bool(content["enabled"]),
+            enabled=content["enabled"],
             backend_policy=str(content["backend_policy"]),
-            external_consent=bool(content["external_consent"]),
+            external_consent=content["external_consent"],
             targets=tuple(str(target) for target in content["targets"]),
             allowed_roots=tuple(Path(root) for root in content["allowed_roots"]),
             max_file_bytes=int(content["max_file_bytes"]),

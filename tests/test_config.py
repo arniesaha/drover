@@ -243,6 +243,15 @@ def test_cloud_content_analysis_requires_separate_external_consent(tmp_path):
         load_config(cfg_file)
 
 
+@pytest.mark.parametrize("field", ["enabled", "external_consent"])
+def test_content_analysis_rejects_string_booleans(tmp_path, field):
+    cfg_file = tmp_path / "content.toml"
+    cfg_file.write_text(f"[advisory_content]\n{field} = 'false'\n")
+
+    with pytest.raises(ValueError, match=field):
+        load_config(cfg_file)
+
+
 @pytest.mark.parametrize(
     "field, value",
     [

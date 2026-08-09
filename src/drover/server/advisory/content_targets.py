@@ -128,6 +128,8 @@ def _resolve_allowed_roots(roots: Sequence[str | Path]) -> tuple[_AllowedRoot, .
     resolved: list[_AllowedRoot] = []
     for root_value in roots:
         lexical = Path(root_value).absolute()
+        if lexical.is_symlink():
+            raise ContentTargetError("allowed root must not be a symlink")
         try:
             canonical = lexical.resolve(strict=True)
         except OSError as exc:
