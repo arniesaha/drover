@@ -59,6 +59,7 @@ public final class CockpitStore {
 
     public private(set) var analytics: AnalyticsSnapshot?
     public private(set) var analyticsError: String?
+    public private(set) var analyticsRefreshNotice: String?
     public private(set) var analyticsProjects: [ProjectActivity] = []
     public private(set) var analyticsHarnesses: [ActivityBreakdown] = []
     public private(set) var analyticsHosts: [ActivityBreakdown] = []
@@ -325,6 +326,7 @@ public final class CockpitStore {
         analyticsCursors = [:]
         analyticsPageErrors = [:]
         loadingAnalyticsDimensions = [:]
+        analyticsRefreshNotice = nil
         do {
             let fresh = try await client.analytics(filters: firstPage)
             guard generation == analyticsGeneration else { return }
@@ -386,6 +388,14 @@ public final class CockpitStore {
             analyticsPageErrors[dimension] = nil
         } catch {
             guard generation == analyticsGeneration, !Self.isCancellation(error) else { return }
+            if Self.isAnalyticsSnapshotChanged(error) {
+                let firstPage = analyticsFilters
+                await loadAnalytics(filters: firstPage)
+                if analyticsError == nil {
+                    analyticsRefreshNotice = "Activity changed; refreshed."
+                }
+                return
+            }
             analyticsPageErrors[dimension] = Self.errorMessage(error)
         }
     }
@@ -418,6 +428,11 @@ public final class CockpitStore {
     ) -> [ActivityBreakdown] {
         let keys = Set(existing.map(\.key))
         return existing + page.filter { !keys.contains($0.key) }
+    }
+
+    private static func isAnalyticsSnapshotChanged(_ error: Error) -> Bool {
+        guard case DroverError.conflict(let detail) = error else { return false }
+        return detail == "snapshot_changed"
     }
 
     public func loadInsights(filters: InsightFilters = InsightFilters()) async {

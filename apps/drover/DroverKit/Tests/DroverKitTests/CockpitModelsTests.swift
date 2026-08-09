@@ -14,9 +14,7 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     expectedEpoch: Int,
     expectedAffectedHosts: Int
 ) throws {
-    let url = try #require(Bundle.module.url(
-        forResource: fixtureName, withExtension: "json", subdirectory: "Fixtures"
-    ))
+    let url = try #require(droverKitFixtureURL(fixtureName))
     let status = try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
 
     #expect(status.consentEpoch == expectedEpoch)
@@ -25,10 +23,7 @@ func backendContentConsentFixturesPreserveFleetPropagation(
 }
 
 @Test func durableRepairFailureFixturePreservesCentralIntentAndFailureDetail() throws {
-    let url = try #require(Bundle.module.url(
-        forResource: "content-consent-repair-failed", withExtension: "json",
-        subdirectory: "Fixtures"
-    ))
+    let url = try #require(droverKitFixtureURL("content-consent-repair-failed"))
     let status = try JSONDecoder().decode(
         ContentAnalysisStatus.self, from: Data(contentsOf: url)
     )

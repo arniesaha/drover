@@ -21,6 +21,7 @@ from drover.server.advisory.types import (
 from drover.server.cockpit.analytics import (
     AnalyticsCursorCodec,
     AnalyticsFilters,
+    AnalyticsSnapshotChangedError,
     activity_analytics,
 )
 from drover.server.cockpit.service import CockpitService
@@ -425,6 +426,105 @@ def test_analytics_pages_each_dimension_deterministically_without_overlap():
     assert not (
         {item.key for item in first.models} & {item.key for item in second.models}
     )
+    assert first.snapshot_at == second.snapshot_at
+    assert first.snapshot_version == second.snapshot_version
+
+
+@pytest.mark.parametrize("mutation", ["append", "update", "delete", "late_span"])
+def test_analytics_rejects_cursor_when_relevant_snapshot_changes(mutation):
+    con = _analytics_connection()
+    try:
+        for index in range(3):
+            _insert_session(
+                con,
+                session_id=f"mutable-{index}",
+                project=f"acme/project-{index}",
+                host=f"host-{index}",
+                harness=f"harness-{index}",
+                tokens=100 - index,
+            )
+        codec = AnalyticsCursorCodec(b"test-cursor-secret")
+        first = activity_analytics(
+            con, AnalyticsFilters(days=7, limit=1), cursor_codec=codec
+        )
+        cursor = first.pagination.projects.next_cursor
+        assert cursor is not None
+
+        if mutation == "append":
+            _insert_session(
+                con,
+                session_id="mutable-new",
+                project="acme/new",
+                host="host-new",
+                harness="harness-new",
+                tokens=500,
+            )
+        elif mutation == "update":
+            con.execute(
+                "UPDATE spans_enriched SET total_tokens = 900 WHERE session_id = 'mutable-2'"
+            )
+        elif mutation == "delete":
+            con.execute("DELETE FROM spans_enriched WHERE session_id = 'mutable-2'")
+            con.execute("DELETE FROM sessions WHERE session_id = 'mutable-2'")
+            con.execute("DELETE FROM harness_sessions WHERE session_id = 'mutable-2'")
+        else:
+            historical = datetime.now(timezone.utc) - timedelta(days=2)
+            con.execute(
+                """
+                INSERT INTO spans_enriched VALUES (
+                  'late-span', 'mutable-2', ?, ?, 20, 'late-harness', 'openai',
+                  'late-model', NULL, 'acme', 'late', 800, NULL, NULL, 1, 0, 0
+                )
+                """,
+                [historical, historical],
+            )
+
+        with pytest.raises(AnalyticsSnapshotChangedError, match="snapshot_changed"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(days=7, limit=1, project_cursor=cursor),
+                cursor_codec=codec,
+            )
+    finally:
+        con.close()
+
+
+def test_analytics_rejects_cursors_from_different_snapshots():
+    con = _analytics_connection()
+    try:
+        for index in range(3):
+            _insert_session(
+                con,
+                session_id=f"mixed-{index}",
+                project=f"acme/project-{index}",
+                host=f"host-{index}",
+                harness=f"harness-{index}",
+                tokens=100 - index,
+            )
+        codec = AnalyticsCursorCodec(b"test-cursor-secret")
+        old = activity_analytics(
+            con, AnalyticsFilters(days=7, limit=1), cursor_codec=codec
+        )
+        con.execute(
+            "UPDATE harness_sessions SET model = 'changed' WHERE session_id = 'mixed-2'"
+        )
+        new = activity_analytics(
+            con, AnalyticsFilters(days=7, limit=1), cursor_codec=codec
+        )
+
+        with pytest.raises(AnalyticsSnapshotChangedError, match="snapshot_changed"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(
+                    days=7,
+                    limit=1,
+                    project_cursor=old.pagination.projects.next_cursor,
+                    host_cursor=new.pagination.hosts.next_cursor,
+                ),
+                cursor_codec=codec,
+            )
+    finally:
+        con.close()
 
 
 def test_analytics_cursor_is_bound_to_dimension_filters_and_sort():

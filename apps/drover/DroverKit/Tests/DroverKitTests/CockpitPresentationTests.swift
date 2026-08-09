@@ -328,9 +328,7 @@ private func decodeInsightSummary(
 }
 
 private func presentationConsentFixture(_ name: String) throws -> ContentAnalysisStatus {
-    let url = try #require(Bundle.module.url(
-        forResource: name, withExtension: "json", subdirectory: "Fixtures"
-    ))
+    let url = try #require(droverKitFixtureURL(name))
     return try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
 }
 

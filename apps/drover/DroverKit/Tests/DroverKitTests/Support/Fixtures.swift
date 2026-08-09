@@ -13,6 +13,24 @@ import Testing
 /// so nesting every handler-using suite here keeps them mutually exclusive.
 @Suite(.serialized) enum MockNetworkTests {}
 
+#if !SWIFT_PACKAGE
+private final class DroverKitTestBundleToken {}
+#endif
+
+/// SwiftPM keeps copied fixtures under a `Fixtures` directory, while the
+/// XcodeGen unit-test target copies the same JSON files into its bundle root.
+func droverKitFixtureURL(_ name: String, withExtension extensionName: String = "json") -> URL? {
+    #if SWIFT_PACKAGE
+    Bundle.module.url(
+        forResource: name, withExtension: extensionName, subdirectory: "Fixtures"
+    )
+    #else
+    Bundle(for: DroverKitTestBundleToken.self).url(
+        forResource: name, withExtension: extensionName
+    )
+    #endif
+}
+
 let snapshotJSON = Data("""
 {"hosts": [{"host_id": "mac-mini", "status": "online",
   "capabilities": {"display_name": "Mac Mini", "harnesses": [

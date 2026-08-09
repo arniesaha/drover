@@ -540,10 +540,7 @@ struct ClientTests {
 }
 
 @Test func contentConsentPreservesHTTP207PartialPropagation() async throws {
-    let fixtureURL = try #require(Bundle.module.url(
-        forResource: "content-consent-partial", withExtension: "json",
-        subdirectory: "Fixtures"
-    ))
+    let fixtureURL = try #require(droverKitFixtureURL("content-consent-partial"))
     let fixture = try Data(contentsOf: fixtureURL)
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/insights/content-analysis/consent")
@@ -560,10 +557,7 @@ struct ClientTests {
 }
 
 @Test func failedRevokeResponseStillPreservesCentralDisabledTruth() async throws {
-    let fixtureURL = try #require(Bundle.module.url(
-        forResource: "content-consent-failed", withExtension: "json",
-        subdirectory: "Fixtures"
-    ))
+    let fixtureURL = try #require(droverKitFixtureURL("content-consent-failed"))
     let fixture = try Data(contentsOf: fixtureURL)
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/insights/content-analysis/revoke")
@@ -578,10 +572,7 @@ struct ClientTests {
 }
 
 @Test func contentStatusRetainsFailed503FleetTruthOnFreshNavigation() async throws {
-    let fixtureURL = try #require(Bundle.module.url(
-        forResource: "content-consent-failed", withExtension: "json",
-        subdirectory: "Fixtures"
-    ))
+    let fixtureURL = try #require(droverKitFixtureURL("content-consent-failed"))
     let fixture = try Data(contentsOf: fixtureURL)
     MockURLProtocol.handler = { request in
         #expect(request.httpMethod == "GET")
@@ -597,10 +588,7 @@ struct ClientTests {
 }
 
 @Test func contentStatusSurfacesFailedDurableRepairWithoutHidingCentralIntent() async throws {
-    let fixtureURL = try #require(Bundle.module.url(
-        forResource: "content-consent-repair-failed", withExtension: "json",
-        subdirectory: "Fixtures"
-    ))
+    let fixtureURL = try #require(droverKitFixtureURL("content-consent-repair-failed"))
     let fixture = try Data(contentsOf: fixtureURL)
     MockURLProtocol.handler = { request in
         #expect(request.httpMethod == "GET")

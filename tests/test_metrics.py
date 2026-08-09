@@ -751,6 +751,33 @@ def test_cockpit_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
         server.server_close()
 
 
+def test_analytics_endpoint_returns_snapshot_changed_conflict(tmp_path):
+    collector = _make_collector(tmp_path)
+
+    class _ChangedCockpit:
+        def analytics(self, filters):
+            from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+
+            raise AnalyticsSnapshotChangedError()
+
+    collector.cockpit_service = _ChangedCockpit()
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?days=7")
+        assert exc.value.code == 409
+        assert json.loads(exc.value.read()) == {
+            "detail": "Activity changed; reload analytics from the first page.",
+            "error": "snapshot_changed",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_insights_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
     collector = _make_collector(tmp_path)
     _observe_insight(collector)

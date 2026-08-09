@@ -20,6 +20,13 @@ _TOKEN_COVERAGE_THRESHOLD = 80.0
 _FRESHNESS_SECONDS = 3600.0
 
 
+class AnalyticsSnapshotChangedError(ValueError):
+    """A cursor's logical activity snapshot is no longer reconstructable."""
+
+    def __init__(self) -> None:
+        super().__init__("snapshot_changed")
+
+
 @dataclass(frozen=True)
 class AnalyticsFilters:
     days: int = 7
@@ -118,6 +125,8 @@ class ProjectActivity:
 
 @dataclass(frozen=True)
 class ActivityAnalytics:
+    snapshot_at: datetime
+    snapshot_version: str
     totals: ActivityTotals
     projects: tuple[ProjectActivity, ...]
     harnesses: tuple[ActivityBreakdown, ...]
@@ -169,8 +178,12 @@ def activity_analytics(
     cursor_codec: AnalyticsCursorCodec | None = None,
 ) -> ActivityAnalytics:
     """Return observed metrics without reconciling them to provider quota."""
-    base_sql, params = _session_facts_sql(filters)
     codec = cursor_codec or _DEFAULT_CURSOR_CODEC
+    snapshot_at, cursor_snapshot = _cursor_snapshot_context(codec, filters)
+    base_sql, params = _session_facts_sql(filters, snapshot_at)
+    snapshot_version = _snapshot_fingerprint(con, base_sql, params, snapshot_at)
+    if cursor_snapshot is not None and cursor_snapshot != snapshot_version:
+        raise AnalyticsSnapshotChangedError()
     aggregate = con.execute(
         base_sql + """
         SELECT
@@ -216,18 +229,48 @@ def activity_analytics(
         metadata=metadata,
     )
     projects, projects_page = _project_breakdowns(
-        con, base_sql, params, filters, project_metric, codec
+        con,
+        base_sql,
+        params,
+        filters,
+        project_metric,
+        codec,
+        snapshot_at,
+        snapshot_version,
     )
     harnesses, harnesses_page = _dimension_breakdowns(
-        con, base_sql, params, filters, "harness", codec
+        con,
+        base_sql,
+        params,
+        filters,
+        "harness",
+        codec,
+        snapshot_at,
+        snapshot_version,
     )
     hosts, hosts_page = _dimension_breakdowns(
-        con, base_sql, params, filters, "host_id", codec
+        con,
+        base_sql,
+        params,
+        filters,
+        "host_id",
+        codec,
+        snapshot_at,
+        snapshot_version,
     )
     models, models_page = _dimension_breakdowns(
-        con, base_sql, params, filters, "model", codec
+        con,
+        base_sql,
+        params,
+        filters,
+        "model",
+        codec,
+        snapshot_at,
+        snapshot_version,
     )
     return ActivityAnalytics(
+        snapshot_at=snapshot_at,
+        snapshot_version=snapshot_version,
         totals=totals,
         projects=projects,
         harnesses=harnesses,
@@ -245,9 +288,11 @@ def activity_analytics(
     )
 
 
-def _session_facts_sql(filters: AnalyticsFilters) -> tuple[str, list[Any]]:
+def _session_facts_sql(
+    filters: AnalyticsFilters, snapshot_at: datetime
+) -> tuple[str, list[Any]]:
     where: list[str] = []
-    params: list[Any] = [filters.days]
+    params: list[Any] = [snapshot_at, filters.days]
     for column, value in (
         ("host_id", filters.host_id),
         ("harness", filters.harness),
@@ -262,7 +307,8 @@ def _session_facts_sql(filters: AnalyticsFilters) -> tuple[str, list[Any]]:
     return (
         f"""
         WITH bounds AS (
-          SELECT now() - CAST(? AS INTEGER) * INTERVAL '1 day' AS cutoff
+          SELECT CAST(? AS TIMESTAMPTZ)
+                 - CAST(? AS INTEGER) * INTERVAL '1 day' AS cutoff
         ),
         span_sessions AS (
           SELECT
@@ -414,10 +460,18 @@ def _project_breakdowns(
     filters: AnalyticsFilters,
     metric: Literal["tokens", "sessions"],
     codec: AnalyticsCursorCodec,
+    snapshot_at: datetime,
+    snapshot_version: str,
 ) -> tuple[tuple[ProjectActivity, ...], PageMetadata]:
     order_column = "total_tokens" if metric == "tokens" else "session_count"
     cursor = _cursor_position(
-        codec, filters.project_cursor, "projects", filters, metric
+        codec,
+        filters.project_cursor,
+        "projects",
+        filters,
+        metric,
+        snapshot_at,
+        snapshot_version,
     )
     having = ""
     query_params = list(params)
@@ -490,6 +544,8 @@ def _project_breakdowns(
             metric,
             int(row[2]) if metric == "tokens" else int(row[1]),
             str(row[0]),
+            snapshot_at,
+            snapshot_version,
         )
     return items, PageMetadata(limit=filters.limit, next_cursor=next_cursor)
 
@@ -501,10 +557,20 @@ def _dimension_breakdowns(
     filters: AnalyticsFilters,
     column: Literal["harness", "host_id", "model"],
     codec: AnalyticsCursorCodec,
+    snapshot_at: datetime,
+    snapshot_version: str,
 ) -> tuple[tuple[ActivityBreakdown, ...], PageMetadata]:
     dimension = {"harness": "harnesses", "host_id": "hosts", "model": "models"}[column]
     cursor_value = getattr(filters, f"{column.removesuffix('_id')}_cursor")
-    cursor = _cursor_position(codec, cursor_value, dimension, filters, "sessions")
+    cursor = _cursor_position(
+        codec,
+        cursor_value,
+        dimension,
+        filters,
+        "sessions",
+        snapshot_at,
+        snapshot_version,
+    )
     having = ""
     query_params = list(params)
     if cursor is not None:
@@ -565,7 +631,14 @@ def _dimension_breakdowns(
     if has_more:
         row = page_rows[-1]
         next_cursor = _encode_cursor(
-            codec, dimension, filters, "sessions", int(row[1]), str(row[0])
+            codec,
+            dimension,
+            filters,
+            "sessions",
+            int(row[1]),
+            str(row[0]),
+            snapshot_at,
+            snapshot_version,
         )
     return items, PageMetadata(limit=filters.limit, next_cursor=next_cursor)
 
@@ -580,6 +653,100 @@ def _filter_fingerprint(filters: AnalyticsFilters) -> str:
         "project_key": filters.project_key,
     }
     body = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
+
+
+def _cursor_snapshot_context(
+    codec: AnalyticsCursorCodec, filters: AnalyticsFilters
+) -> tuple[datetime, str | None]:
+    """Return one fixed cutoff and snapshot version shared by every cursor."""
+    contexts: set[tuple[str, str]] = set()
+    for dimension, cursor in (
+        ("projects", filters.project_cursor),
+        ("harnesses", filters.harness_cursor),
+        ("hosts", filters.host_cursor),
+        ("models", filters.model_cursor),
+    ):
+        if cursor is None:
+            continue
+        payload = codec.decode(cursor)
+        expected = {
+            "v": 2,
+            "dimension": dimension,
+            "filters": _filter_fingerprint(filters),
+        }
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                "analytics cursor does not match dimension, filters, or sort"
+            )
+        snapshot_at = payload.get("snapshot_at")
+        snapshot_version = payload.get("snapshot_version")
+        if not isinstance(snapshot_at, str) or not isinstance(snapshot_version, str):
+            raise ValueError("invalid analytics cursor")
+        contexts.add((snapshot_at, snapshot_version))
+    if len(contexts) > 1:
+        raise AnalyticsSnapshotChangedError()
+    if not contexts:
+        return datetime.now(timezone.utc), None
+    snapshot_at_text, snapshot_version = contexts.pop()
+    try:
+        snapshot_at = datetime.fromisoformat(snapshot_at_text)
+    except ValueError as exc:
+        raise ValueError("invalid analytics cursor") from exc
+    if snapshot_at.tzinfo is None:
+        raise ValueError("invalid analytics cursor")
+    return snapshot_at.astimezone(timezone.utc), snapshot_version
+
+
+def _snapshot_fingerprint(
+    con: duckdb.DuckDBPyConnection,
+    base_sql: str,
+    params: list[Any],
+    snapshot_at: datetime,
+) -> str:
+    """Bounded multiset fingerprint of every normalized fact used by analytics."""
+    row = con.execute(
+        base_sql + """
+        , fingerprint_rows AS (
+          SELECT to_json(struct_pack(
+            session_id := session_id,
+            started_at := started_at,
+            latest_activity_at := latest_activity_at,
+            host_id := host_id,
+            harness := harness,
+            provider := provider,
+            model := model,
+            project_key := project_key,
+            total_tokens := total_tokens,
+            cost_usd := cost_usd,
+            cache_read_tokens := cache_read_tokens,
+            cache_write_tokens := cache_write_tokens,
+            total_latency_ms := total_latency_ms,
+            has_tokens := has_tokens,
+            has_cost := has_cost,
+            has_cache := has_cache,
+            has_latency := has_latency
+          )) AS body
+          FROM filtered_sessions
+        )
+        SELECT
+          count(*),
+          COALESCE(bit_xor(hash(body)), 0),
+          COALESCE(sum(hash(body)), 0),
+          COALESCE(bit_xor(hash('drover-analytics-snapshot-v1', body)), 0),
+          COALESCE(sum(hash('drover-analytics-snapshot-v1', body)), 0)
+        FROM fingerprint_rows
+        """,
+        params,
+    ).fetchone()
+    assert row is not None
+    body = json.dumps(
+        [
+            snapshot_at.astimezone(timezone.utc).isoformat(),
+            *[str(value) for value in row],
+        ],
+        separators=(",", ":"),
+    ).encode()
     return hashlib.sha256(body).hexdigest()
 
 
@@ -607,15 +774,19 @@ def _encode_cursor(
     sort: str,
     value: int,
     key: str,
+    snapshot_at: datetime,
+    snapshot_version: str,
 ) -> str:
     return codec.encode(
         {
-            "v": 1,
+            "v": 2,
             "dimension": dimension,
             "filters": _filter_fingerprint(filters),
             "sort": sort,
             "value": value,
             "key": key,
+            "snapshot_at": snapshot_at.astimezone(timezone.utc).isoformat(),
+            "snapshot_version": snapshot_version,
         }
     )
 
@@ -626,15 +797,19 @@ def _cursor_position(
     dimension: str,
     filters: AnalyticsFilters,
     sort: str,
+    snapshot_at: datetime,
+    snapshot_version: str,
 ) -> tuple[int, str] | None:
     if cursor is None:
         return None
     payload = codec.decode(cursor)
     expected = {
-        "v": 1,
+        "v": 2,
         "dimension": dimension,
         "filters": _filter_fingerprint(filters),
         "sort": sort,
+        "snapshot_at": snapshot_at.astimezone(timezone.utc).isoformat(),
+        "snapshot_version": snapshot_version,
     }
     if any(payload.get(key) != value for key, value in expected.items()):
         raise ValueError("analytics cursor does not match dimension, filters, or sort")

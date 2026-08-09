@@ -839,10 +839,20 @@ class MetricsCollector:
         return _json_response(200, self.cockpit_service.overview(filters))
 
     def render_analytics_json(self, filters: Any) -> tuple[int, str]:
+        from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+
         if self.cockpit_service is None:
             return _json_response(503, {"error": "cockpit service unavailable"})
         try:
             return _json_response(200, self.cockpit_service.analytics(filters))
+        except AnalyticsSnapshotChangedError:
+            return _json_response(
+                409,
+                {
+                    "error": "snapshot_changed",
+                    "detail": "Activity changed; reload analytics from the first page.",
+                },
+            )
         except ValueError as exc:
             return _json_response(400, {"error": str(exc)})
 

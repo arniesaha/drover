@@ -187,6 +187,57 @@ struct CockpitStoreTests {
         #expect(store.analyticsProjects.map(\.projectKey) == ["one", "two"])
     }
 
+    @Test @MainActor func snapshotChangedPageAtomicallyReloadsInitialAnalytics() async throws {
+        let client = CockpitClientStub(
+            analyticsPages: [
+                try decodeAnalyticsPage(projects: ["old"], hosts: ["mac"],
+                                        projectCursor: "stale-page", hostCursor: nil),
+                try decodeAnalyticsPage(projects: ["fresh", "current"], hosts: ["nas"],
+                                        projectCursor: nil, hostCursor: nil),
+            ],
+            snapshotChangedAnalyticsCursors: ["stale-page"]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 30, limit: 2))
+        await store.loadMoreAnalytics(.projects)
+
+        #expect(store.analyticsProjects.map(\.projectKey) == ["fresh", "current"])
+        #expect(store.analyticsHosts.map(\.key) == ["nas"])
+        #expect(store.nextAnalyticsCursor(for: .projects) == nil)
+        #expect(store.analyticsRefreshNotice == "Activity changed; refreshed.")
+        #expect(store.analyticsPaginationError(for: .projects) == nil)
+        #expect(await client.analyticsRequestCount == 3)
+    }
+
+    @Test @MainActor func delayedSnapshotChangedPageCannotReloadNewerFilterGeneration() async throws {
+        let client = CockpitClientStub(
+            analyticsPages: [
+                try decodeAnalyticsPage(projects: ["old"], hosts: [],
+                                        projectCursor: "stale-page", hostCursor: nil),
+            ],
+            snapshotChangedAnalyticsCursors: ["stale-page"],
+            analyticsByDays: [
+                30: try decodeAnalyticsPage(projects: ["new"], hosts: [],
+                                            projectCursor: nil, hostCursor: nil),
+            ],
+            analyticsCursorDelays: ["stale-page": .milliseconds(80)]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 7))
+
+        let oldPage = Task { await store.loadMoreAnalytics(.projects) }
+        try await Task.sleep(for: .milliseconds(10))
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 30))
+        await oldPage.value
+
+        #expect(store.analyticsProjects.map(\.projectKey) == ["new"])
+        #expect(store.analyticsRefreshNotice == nil)
+        #expect(await client.analyticsRequestCount == 3)
+    }
+
     @Test @MainActor func newerAnalyticsFilterGenerationIgnoresOlderResponse() async throws {
         let client = CockpitClientStub(
             analyticsByDays: [
@@ -593,6 +644,7 @@ private actor CockpitClientStub: CockpitClient {
     private let purgedExcerptCount: Int
     private var refreshError: DroverError?
     private let failingAnalyticsCursors: Set<String>
+    private let snapshotChangedAnalyticsCursors: Set<String>
     private let analyticsByDays: [Int: AnalyticsSnapshot]
     private let analyticsDelays: [Int: Duration]
     private let analyticsByCursor: [String: AnalyticsSnapshot]
@@ -621,6 +673,7 @@ private actor CockpitClientStub: CockpitClient {
         analytics: AnalyticsSnapshot? = nil,
         analyticsPages: [AnalyticsSnapshot] = [],
         failingAnalyticsCursors: Set<String> = [],
+        snapshotChangedAnalyticsCursors: Set<String> = [],
         analyticsByDays: [Int: AnalyticsSnapshot] = [:],
         analyticsDelays: [Int: Duration] = [:],
         analyticsByCursor: [String: AnalyticsSnapshot] = [:],
@@ -642,6 +695,7 @@ private actor CockpitClientStub: CockpitClient {
         self.overviews = overviews
         self.analyticsValues = analyticsPages.isEmpty ? analytics.map { [$0] } ?? [] : analyticsPages
         self.failingAnalyticsCursors = failingAnalyticsCursors
+        self.snapshotChangedAnalyticsCursors = snapshotChangedAnalyticsCursors
         self.analyticsByDays = analyticsByDays
         self.analyticsDelays = analyticsDelays
         self.analyticsByCursor = analyticsByCursor
@@ -681,6 +735,9 @@ private actor CockpitClientStub: CockpitClient {
         }
         if let cursor, failingAnalyticsCursors.contains(cursor) {
             throw DroverError.unavailable("analytics page failed")
+        }
+        if let cursor, snapshotChangedAnalyticsCursors.contains(cursor) {
+            throw DroverError.conflict("snapshot_changed")
         }
         if let cursor, let value = analyticsByCursor[cursor] { return value }
         if let value = analyticsByDays[filters.days] { return value }
@@ -851,9 +908,7 @@ private func capableSnapshot() throws -> HarnessSnapshot {
 }
 
 private func contentConsentFixture(_ name: String) throws -> ContentAnalysisStatus {
-    let url = try #require(Bundle.module.url(
-        forResource: name, withExtension: "json", subdirectory: "Fixtures"
-    ))
+    let url = try #require(droverKitFixtureURL(name))
     return try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
 }
 
