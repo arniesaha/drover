@@ -58,7 +58,7 @@ def validate_job(environ: Mapping[str, str], payload: Mapping[str, object]) -> N
     if event == "workflow_dispatch":
         if (
             environ["GITHUB_REF"] != "refs/heads/main"
-            or payload.get("ref") != "main"
+            or payload.get("ref") != "refs/heads/main"
             or environ["GITHUB_ACTOR"] != EXPECTED_OWNER
             or sender.get("login") != EXPECTED_OWNER
         ):
