@@ -1908,6 +1908,67 @@ def test_runtime_snapshot_bounds_sessions_inside_the_seven_day_window(
     assert routing.routing[0].facts_complete is True
 
 
+def test_runtime_snapshot_uses_latest_session_activity_including_ended_at(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR, routing_provider VARCHAR,
+              routing_model VARCHAR, prompt_tokens BIGINT,
+              total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at, ended_at
+            ) VALUES
+              ('recently-ended', 'mac-mini', 'codex', 'codex', 'completed',
+               'gpt-5', ? - INTERVAL 10 DAY, ? - INTERVAL 8 DAY, ?),
+              ('fully-old', 'mac-mini', 'codex', 'codex', 'completed',
+               'gpt-5', ? - INTERVAL 10 DAY, ? - INTERVAL 9 DAY,
+               ? - INTERVAL 8 DAY)
+            """,
+            [NOW, NOW, NOW, NOW, NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched VALUES
+              ('recent-span', 'recently-ended', ?, 'openai', 'openai', 'gpt-4',
+               100, 100, 20, 0.1),
+              ('old-span', 'fully-old', ? - INTERVAL 8 DAY, 'openai', 'openai',
+               'gpt-4', 100, 100, 20, 0.1)
+            """,
+            [NOW, NOW],
+        )
+
+    telemetry = load_operational_snapshot(
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+    routing = load_operational_snapshot(
+        db_path,
+        "deterministic.routing_mismatch",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+
+    assert telemetry.telemetry[0].total_sessions == 1
+    assert telemetry.telemetry[0].observed_at == NOW
+    assert telemetry.telemetry[0].facts_complete is True
+    assert routing.routing[0].decision_count == 1
+    assert routing.routing[0].observed_at == NOW
+    assert routing.routing[0].facts_complete is True
+
+
 def test_runtime_snapshot_caps_latest_spans_per_selected_session(
     db_path: Path,
 ) -> None:

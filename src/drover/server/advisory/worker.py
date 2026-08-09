@@ -1055,9 +1055,12 @@ def _runtime_session_filter(
     target_id: str, analyzed_at: datetime, *, alias: str = "h"
 ) -> tuple[str, list[object]]:
     prefix = f"{alias}." if alias else ""
+    latest_activity = (
+        f"GREATEST({prefix}updated_at, {prefix}ended_at, {prefix}started_at)"
+    )
     clauses = [
-        f"COALESCE({prefix}updated_at, {prefix}started_at) >= ?",
-        f"COALESCE({prefix}updated_at, {prefix}started_at) <= ?",
+        f"{latest_activity} >= ?",
+        f"{latest_activity} <= ?",
     ]
     params: list[object] = [
         analyzed_at - OPERATIONAL_SPAN_LOOKBACK,
@@ -1177,7 +1180,8 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
         WITH ranked_sessions AS (
           SELECT h.*,
                  row_number() OVER (
-                   ORDER BY COALESCE(updated_at, started_at) DESC, session_id
+                   ORDER BY GREATEST(updated_at, ended_at, started_at) DESC,
+                            session_id
                  ) AS snapshot_session_no,
                  count(*) OVER () AS snapshot_session_count
           FROM harness_sessions h
@@ -1253,7 +1257,7 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
           GROUP BY s.session_id
         )
         SELECT h.host_id, h.harness,
-               max(COALESCE(s.observed_at, h.updated_at, h.started_at)),
+               max(GREATEST(s.observed_at, h.updated_at, h.ended_at, h.started_at)),
                count(DISTINCT h.session_id),
                count(DISTINCT h.session_id) FILTER (WHERE s.has_spans),
                count(DISTINCT h.session_id) FILTER (
@@ -1316,7 +1320,8 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
         WITH ranked_sessions AS (
           SELECT h.*,
                  row_number() OVER (
-                   ORDER BY COALESCE(updated_at, started_at) DESC, session_id
+                   ORDER BY GREATEST(updated_at, ended_at, started_at) DESC,
+                            session_id
                  ) AS snapshot_session_no,
                  count(*) OVER () AS snapshot_session_count
           FROM harness_sessions h
@@ -1374,7 +1379,7 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
         )
         SELECT h.host_id, h.harness,
                COALESCE(s.routing_provider, s.llm_provider, 'unknown') AS provider,
-               max(COALESCE(s.start_time, h.updated_at, h.started_at)),
+               max(GREATEST(s.start_time, h.updated_at, h.ended_at, h.started_at)),
                count(*),
                count(*) FILTER (WHERE s.routing_model <> h.model),
                NOT (
