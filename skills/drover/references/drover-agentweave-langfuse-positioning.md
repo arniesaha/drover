@@ -43,7 +43,8 @@ Bad: “Drover replaces tracing, evaluations, routing, and monitoring.”
 3. Score handoff sufficiency, grounding, freshness, precision, actionability,
    privacy, and absence of hallucinated project state.
 4. Feed evaluation identifiers and failure categories back as annotations that
-   improve summarization and retrieval—not as a second dashboard.
+   improve summarization and retrieval. Do not build a second dashboard from
+   those annotations.
 
 ## Public language
 
