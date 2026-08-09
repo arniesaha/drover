@@ -48,6 +48,10 @@ struct SettingsView: View {
                 }
             }
 
+            if let client = environment.client {
+                ContentAnalysisSettings(client: client)
+            }
+
             Section {
                 Button {
                     Task { await testAndSave() }

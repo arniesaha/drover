@@ -11,6 +11,13 @@ public protocol CockpitClient: Sendable {
     func acknowledgeInsight(findingID: String) async throws -> InsightFinding
     func dismissInsight(findingID: String, reason: String) async throws -> InsightFinding
     func checkInsight(findingID: String) async throws -> InsightCheckResponse
+    func contentAnalysisStatus() async throws -> ContentAnalysisStatus
+    func setContentAnalysisConsent(
+        backend: ContentAnalysisBackend,
+        externalDisclosureAccepted: Bool
+    ) async throws -> ContentAnalysisStatus
+    func revokeContentAnalysis() async throws -> ContentAnalysisStatus
+    func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse
 }
 
 extension DroverClient: CockpitClient {}
@@ -43,6 +50,28 @@ public final class CockpitStore {
     public private(set) var lifecycleError: String?
     public private(set) var lastCheckJobID: String?
     public private(set) var isPolling = false
+
+    public private(set) var contentAnalysisStatus: ContentAnalysisStatus?
+    public private(set) var contentStatusError: String?
+    public private(set) var contentConsentError: String?
+    public private(set) var contentRevocationError: String?
+    public private(set) var contentPurgeError: String?
+    public private(set) var purgedExcerptCount: Int?
+    public private(set) var isUpdatingContentConsent = false
+    public private(set) var isRevokingContentAnalysis = false
+    public private(set) var isPurgingContentExcerpts = false
+
+    public static let cloudDisclosureRequiredMessage =
+        "Review and accept the external analysis disclosure."
+    public static let cloudDisclosureMessage =
+        "System prompts, prompt excerpts, instructions, hook configuration, and skill content "
+        + "from explicitly allowed targets may be sent to the selected cloud model provider. "
+        + "Drover redacts detected secrets before sending, but this content leaves this device."
+    public static let revokeConfirmationMessage =
+        "Future model analysis will stop. Existing derived findings remain available."
+    public static let purgeConfirmationMessage =
+        "All retained redacted evidence excerpts will be deleted. This does not disable "
+        + "content analysis or delete finding lifecycle history."
 
     public init(client: any CockpitClient) {
         self.client = client
@@ -151,6 +180,73 @@ public final class CockpitStore {
         pollingTask?.cancel()
         pollingTask = nil
         isPolling = false
+    }
+
+    public func loadContentAnalysisStatus() async {
+        do {
+            contentAnalysisStatus = try await client.contentAnalysisStatus()
+            contentStatusError = nil
+        } catch {
+            guard !Self.isCancellation(error) else { return }
+            contentStatusError = Self.errorMessage(error)
+        }
+    }
+
+    @discardableResult
+    public func enableContentAnalysis(
+        backend: ContentAnalysisBackend,
+        disclosureAccepted: Bool
+    ) async -> Bool {
+        guard backend != .cloud || disclosureAccepted else {
+            contentConsentError = Self.cloudDisclosureRequiredMessage
+            return false
+        }
+        isUpdatingContentConsent = true
+        contentConsentError = nil
+        defer { isUpdatingContentConsent = false }
+        do {
+            contentAnalysisStatus = try await client.setContentAnalysisConsent(
+                backend: backend,
+                externalDisclosureAccepted: backend == .cloud && disclosureAccepted
+            )
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            contentConsentError = Self.errorMessage(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    public func revokeContentAnalysis() async -> Bool {
+        isRevokingContentAnalysis = true
+        contentRevocationError = nil
+        defer { isRevokingContentAnalysis = false }
+        do {
+            contentAnalysisStatus = try await client.revokeContentAnalysis()
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            contentRevocationError = Self.errorMessage(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    public func purgeContentExcerpts() async -> Bool {
+        isPurgingContentExcerpts = true
+        contentPurgeError = nil
+        purgedExcerptCount = nil
+        defer { isPurgingContentExcerpts = false }
+        do {
+            let response = try await client.purgeContentExcerpts()
+            purgedExcerptCount = response.purgedExcerptCount
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            contentPurgeError = Self.errorMessage(error)
+            return false
+        }
     }
 
     public func loadAnalytics(filters: AnalyticsFilters = AnalyticsFilters()) async {

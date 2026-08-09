@@ -197,6 +197,92 @@ struct CockpitStoreTests {
 
         #expect(!store.isPolling)
     }
+
+    @Test @MainActor func cloudConsentRequiresDisclosureAcknowledgementBeforeRequesting() async throws {
+        let client = CockpitClientStub()
+        let store = CockpitStore(client: client)
+
+        let succeeded = await store.enableContentAnalysis(
+            backend: .cloud,
+            disclosureAccepted: false
+        )
+
+        #expect(!succeeded)
+        #expect(store.contentConsentError == CockpitStore.cloudDisclosureRequiredMessage)
+        #expect(await client.contentConsentRequestCount == 0)
+    }
+
+    @Test @MainActor func localConsentDoesNotRequireExternalDisclosure() async throws {
+        let client = CockpitClientStub(contentStatus: try decodeContentStatus(
+            enabled: true,
+            backend: "local",
+            disclosureAccepted: false
+        ))
+        let store = CockpitStore(client: client)
+
+        let succeeded = await store.enableContentAnalysis(
+            backend: .local,
+            disclosureAccepted: false
+        )
+
+        #expect(succeeded)
+        #expect(store.contentAnalysisStatus?.enabled == true)
+        #expect(store.contentAnalysisStatus?.backend == .local)
+        #expect(store.contentConsentError == nil)
+        #expect(await client.requestedContentConsents == [.init(
+            backend: .local,
+            disclosureAccepted: false
+        )])
+    }
+
+    @Test @MainActor func revocationPreservesFindingsAndReportsItsOwnFailure() async throws {
+        let client = CockpitClientStub(
+            insightPages: [try decodeInsightPage(ids: ["one"], nextCursor: nil)],
+            contentError: .httpStatus(503, "revocation unavailable")
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadInsights()
+
+        let succeeded = await store.revokeContentAnalysis()
+
+        #expect(!succeeded)
+        #expect(store.insights.map(\.findingID) == ["one"])
+        #expect(store.contentRevocationError == "revocation unavailable")
+        #expect(store.contentConsentError == nil)
+        #expect(store.contentPurgeError == nil)
+    }
+
+    @Test @MainActor func purgeReportsCountWithoutChangingConsentOrFindings() async throws {
+        let status = try decodeContentStatus(
+            enabled: true,
+            backend: "local",
+            disclosureAccepted: false
+        )
+        let client = CockpitClientStub(
+            insightPages: [try decodeInsightPage(ids: ["one"], nextCursor: nil)],
+            contentStatus: status,
+            purgedExcerptCount: 7
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadInsights()
+        _ = await store.enableContentAnalysis(backend: .local, disclosureAccepted: false)
+
+        let succeeded = await store.purgeContentExcerpts()
+
+        #expect(succeeded)
+        #expect(store.purgedExcerptCount == 7)
+        #expect(store.contentAnalysisStatus == status)
+        #expect(store.insights.map(\.findingID) == ["one"])
+        #expect(CockpitStore.revokeConfirmationMessage.contains("findings remain"))
+        #expect(CockpitStore.purgeConfirmationMessage.contains("does not disable"))
+    }
+}
+
+private struct RequestedContentConsent: Sendable, Equatable {
+    let backend: ContentAnalysisBackend
+    let disclosureAccepted: Bool
 }
 
 private actor CockpitClientStub: CockpitClient {
@@ -206,6 +292,9 @@ private actor CockpitClientStub: CockpitClient {
     private let acknowledgedFinding: InsightFinding?
     private let lifecycleError: DroverError?
     private let lifecycleDelay: Duration
+    private let contentStatusValue: ContentAnalysisStatus?
+    private let contentError: DroverError?
+    private let purgedExcerptCount: Int
     private var refreshError: DroverError?
 
     private(set) var overviewRequestCount = 0
@@ -215,6 +304,8 @@ private actor CockpitClientStub: CockpitClient {
     private(set) var dismissRequestCount = 0
     private(set) var acknowledgeRequestCount = 0
     private(set) var maximumConcurrentLifecycleRequests = 0
+    private(set) var contentConsentRequestCount = 0
+    private(set) var requestedContentConsents: [RequestedContentConsent] = []
     private var currentLifecycleRequests = 0
 
     init(
@@ -223,7 +314,10 @@ private actor CockpitClientStub: CockpitClient {
         insightPages: [InsightPage] = [],
         acknowledgedFinding: InsightFinding? = nil,
         lifecycleError: DroverError? = nil,
-        lifecycleDelay: Duration = .zero
+        lifecycleDelay: Duration = .zero,
+        contentStatus: ContentAnalysisStatus? = nil,
+        contentError: DroverError? = nil,
+        purgedExcerptCount: Int = 0
     ) {
         self.overviews = overviews
         self.analyticsValue = analytics
@@ -231,6 +325,9 @@ private actor CockpitClientStub: CockpitClient {
         self.acknowledgedFinding = acknowledgedFinding
         self.lifecycleError = lifecycleError
         self.lifecycleDelay = lifecycleDelay
+        self.contentStatusValue = contentStatus
+        self.contentError = contentError
+        self.purgedExcerptCount = purgedExcerptCount
     }
 
     func setError(_ error: DroverError?) { refreshError = error }
@@ -278,6 +375,40 @@ private actor CockpitClientStub: CockpitClient {
 
     func checkInsight(findingID: String) async throws -> InsightCheckResponse {
         throw DroverError.unavailable("not configured")
+    }
+
+    func contentAnalysisStatus() async throws -> ContentAnalysisStatus {
+        if let contentError { throw contentError }
+        guard let contentStatusValue else { throw DroverError.unavailable("not configured") }
+        return contentStatusValue
+    }
+
+    func setContentAnalysisConsent(
+        backend: ContentAnalysisBackend,
+        externalDisclosureAccepted: Bool
+    ) async throws -> ContentAnalysisStatus {
+        contentConsentRequestCount += 1
+        requestedContentConsents.append(.init(
+            backend: backend,
+            disclosureAccepted: externalDisclosureAccepted
+        ))
+        if let contentError { throw contentError }
+        guard let contentStatusValue else { throw DroverError.unavailable("not configured") }
+        return contentStatusValue
+    }
+
+    func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
+        if let contentError { throw contentError }
+        guard let contentStatusValue else { throw DroverError.unavailable("not configured") }
+        return contentStatusValue
+    }
+
+    func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse {
+        if let contentError { throw contentError }
+        return try JSONDecoder().decode(
+            PurgeContentExcerptsResponse.self,
+            from: Data("{\"purged_excerpt_count\":\(purgedExcerptCount)}".utf8)
+        )
     }
 }
 
@@ -331,6 +462,25 @@ private actor ControlledRefreshCockpitClient: CockpitClient {
     }
 
     func checkInsight(findingID: String) async throws -> InsightCheckResponse {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func contentAnalysisStatus() async throws -> ContentAnalysisStatus {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func setContentAnalysisConsent(
+        backend: ContentAnalysisBackend,
+        externalDisclosureAccepted: Bool
+    ) async throws -> ContentAnalysisStatus {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse {
         throw DroverError.unavailable("not configured")
     }
 }
@@ -404,5 +554,16 @@ private func decodeInsightFinding(id: String, state: String) throws -> InsightFi
      "severity":"medium","confidence":"confirmed","title":"Stale host",
      "impact":"May miss work","remediation":["Reconnect"],"state":"\(state)",
      "first_seen_at":"2026-08-08T18:00:00Z","last_seen_at":"2026-08-08T18:01:00Z"}
+    """.utf8))
+}
+
+private func decodeContentStatus(
+    enabled: Bool,
+    backend: String,
+    disclosureAccepted: Bool
+) throws -> ContentAnalysisStatus {
+    try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data("""
+    {"enabled":\(enabled),"backend":"\(backend)",
+     "external_disclosure_accepted":\(disclosureAccepted),"pending_model_jobs":0}
     """.utf8))
 }

@@ -99,7 +99,13 @@ private struct ProviderAccountCard: View {
     private var accessibilityLabel: String {
         let windows = account.windows.map {
             let value = ProviderCapacityPresentation(account: account, window: $0, now: .now)
-            return "\($0.kind), \(value.remainingText), \(value.resetText)"
+            return [
+                $0.kind,
+                value.usedText,
+                value.remainingText,
+                value.resetText,
+                value.freshnessText,
+            ].compactMap { $0 }.joined(separator: ", ")
         }.joined(separator: ". ")
         return "\(account.provider), \(account.accountLabel), Provider reported, \(statusTitle). \(windows)"
     }
