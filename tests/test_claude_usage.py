@@ -43,7 +43,11 @@ def test_usage_response_becomes_windows(tmp_path, monkeypatch):
         calls.append((url, headers, timeout))
         return 200, USAGE_BODY
 
-    probe = ClaudeUsageProbe(credentials_path=_credentials(tmp_path), opener=opener)
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=opener,
+        keychain_reader=lambda: None,
+    )
     snapshot = probe.read(host_id="mac-mini")
 
     assert snapshot.status == "ok"
@@ -70,6 +74,7 @@ def test_unknown_window_passes_through_without_a_guessed_duration(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (200, body),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="nas")
@@ -84,6 +89,7 @@ def test_the_access_token_never_appears_in_the_snapshot(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (200, USAGE_BODY),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -108,6 +114,7 @@ def test_out_of_range_utilization_returns_error_snapshot(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (200, body),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -123,6 +130,7 @@ def test_nan_utilization_returns_error_snapshot(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (200, body),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -136,6 +144,7 @@ def test_absurd_expires_at_returns_error_snapshot(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path, expires_at_ms=10**20),
         opener=lambda url, headers, timeout: (200, USAGE_BODY),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -149,6 +158,7 @@ def test_missing_credentials_file_is_unavailable_not_an_error(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=tmp_path / "absent.json",
         opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="work-laptop")
@@ -163,6 +173,7 @@ def test_expired_token_short_circuits_before_spending_a_request(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path, expires_at_ms=1000),
         opener=lambda url, headers, timeout: calls.append(url) or (200, USAGE_BODY),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -178,6 +189,7 @@ def test_rejected_credentials_are_unavailable_not_an_error(tmp_path, code):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (code, b"{}"),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -190,7 +202,11 @@ def test_timeout_is_an_error(tmp_path):
     def opener(url, headers, timeout):
         raise TimeoutError("timed out")
 
-    probe = ClaudeUsageProbe(credentials_path=_credentials(tmp_path), opener=opener)
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=opener,
+        keychain_reader=lambda: None,
+    )
 
     snapshot = probe.read(host_id="mac-mini")
 
@@ -202,7 +218,11 @@ def test_connection_failure_is_an_error(tmp_path):
     def opener(url, headers, timeout):
         raise OSError("connection refused")
 
-    probe = ClaudeUsageProbe(credentials_path=_credentials(tmp_path), opener=opener)
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=opener,
+        keychain_reader=lambda: None,
+    )
 
     snapshot = probe.read(host_id="mac-mini")
 
@@ -214,6 +234,7 @@ def test_unparseable_body_is_a_protocol_error(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (200, b"<html>nope</html>"),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -228,6 +249,7 @@ def test_a_parseable_response_with_no_windows_stays_quiet(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: (200, b"{}"),
+        keychain_reader=lambda: None,
     )
 
     snapshot = probe.read(host_id="mac-mini")
@@ -242,8 +264,132 @@ def test_base_url_override_is_honoured(tmp_path, monkeypatch):
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path),
         opener=lambda url, headers, timeout: seen.append(url) or (200, USAGE_BODY),
+        keychain_reader=lambda: None,
     )
 
     probe.read(host_id="mac-mini")
 
     assert seen == ["http://127.0.0.1:9999/api/oauth/usage"]
+
+
+KEYCHAIN_BODY = (
+    json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "sk-keychain-token",
+                "expiresAt": 4102444800000,
+                "subscriptionType": "max",
+            }
+        }
+    )
+    .encode()
+    .decode()
+)
+
+
+def test_keychain_wins_when_the_file_token_has_expired(tmp_path):
+    """The bug this fixes: on macOS the file is a stale leftover and its token
+    expired days ago, while the live credential sits in the Keychain."""
+    seen = {}
+
+    def opener(url, headers, timeout):
+        seen["auth"] = headers["Authorization"]
+        return 200, USAGE_BODY
+
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path, expires_at_ms=1000),
+        opener=opener,
+        keychain_reader=lambda: KEYCHAIN_BODY,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "ok"
+    assert seen["auth"] == "Bearer sk-keychain-token"
+
+
+def test_the_file_is_used_when_the_keychain_is_empty(tmp_path):
+    seen = {}
+
+    def opener(url, headers, timeout):
+        seen["auth"] = headers["Authorization"]
+        return 200, USAGE_BODY
+
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=opener,
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="nas")
+
+    assert snapshot.status == "ok"
+    assert seen["auth"] == "Bearer sk-test-token"
+
+
+def test_both_sources_expired_reports_token_expired(tmp_path):
+    expired_keychain = json.dumps(
+        {"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1000}}
+    )
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path, expires_at_ms=1000),
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: expired_keychain,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "token_expired"
+
+
+def test_no_source_at_all_reports_not_authenticated(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=tmp_path / "absent.json",
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="work-laptop")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "not_authenticated"
+
+
+def test_a_keychain_that_prompts_or_fails_does_not_break_the_probe(tmp_path):
+    """A daemon without the Keychain grant must look like a host that was never
+    signed in, not like breakage, and must never hang the refresh cycle."""
+
+    def reader():
+        raise TimeoutError("security prompted and we gave up")
+
+    probe = ClaudeUsageProbe(
+        credentials_path=tmp_path / "absent.json",
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=reader,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "not_authenticated"
+
+
+def test_the_keychain_secret_never_reaches_the_snapshot(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=tmp_path / "absent.json",
+        opener=lambda url, headers, timeout: (200, USAGE_BODY),
+        keychain_reader=lambda: KEYCHAIN_BODY,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert "sk-keychain-token" not in json.dumps(
+        {
+            "label": snapshot.account_label,
+            "plan": snapshot.plan_label,
+            "dedup": snapshot.dedup_key,
+            "source": snapshot.source,
+            "error": snapshot.error_category,
+        }
+    )

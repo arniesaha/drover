@@ -507,7 +507,10 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     usage_unavailable. Claude Code is now polled via a real probe pointed at
     credentials that don't exist, so it independently lands on
     usage_unavailable too (not_authenticated) -- this keeps the test hermetic
-    against whatever the machine running it happens to have logged in.
+    against whatever the machine running it happens to have logged in. The
+    Keychain reader is stubbed out too: the probe now checks the macOS
+    Keychain before the file, and a real signed-in host would otherwise leak
+    its live credential into this test.
     """
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
     state.presets = {
@@ -515,7 +518,8 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
         "gemini": replace(DEFAULT_PRESETS["gemini"], enabled=True),
     }
     state.claude_usage_probe = ClaudeUsageProbe(
-        credentials_path=tmp_path / "missing-credentials.json"
+        credentials_path=tmp_path / "missing-credentials.json",
+        keychain_reader=lambda: None,
     )
     try:
         with pytest.raises(urllib.error.HTTPError) as error:

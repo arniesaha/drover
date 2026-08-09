@@ -9,11 +9,14 @@ render rather than surfacing as an error.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import getpass
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -36,6 +39,8 @@ _WINDOW_MINUTES = {
     "seven_day_opus": 10080,
     "seven_day_sonnet": 10080,
 }
+_KEYCHAIN_SERVICE = "Claude Code-credentials"
+_KEYCHAIN_TIMEOUT_S = 5.0
 
 
 class _ProbeFailure(RuntimeError):
@@ -52,6 +57,7 @@ class ClaudeUsageProbe:
         opener: Callable[[str, dict[str, str], float], tuple[int, bytes]] | None = None,
         timeout_s: float = 5.0,
         base_url: str | None = None,
+        keychain_reader: Callable[[], str | None] | None = None,
     ):
         self.credentials_path = (
             Path(credentials_path)
@@ -63,6 +69,7 @@ class ClaudeUsageProbe:
         self.base_url = (
             base_url or os.environ.get("ANTHROPIC_BASE_URL") or _DEFAULT_BASE_URL
         ).rstrip("/")
+        self.keychain_reader = keychain_reader or _read_keychain
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = datetime.now(timezone.utc)
@@ -107,28 +114,54 @@ class ClaudeUsageProbe:
         )
 
     def _credentials(self) -> tuple[str, str | None]:
+        saw_expired = False
+        saw_malformed = False
+        for load in (self._keychain_blob, self._file_blob):
+            try:
+                raw = load()
+            except Exception:
+                # A source that cannot be read is a source we do not have. This
+                # includes a Keychain prompt we declined to wait for.
+                continue
+            if raw is None:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                saw_malformed = True
+                continue
+            oauth = parsed.get("claudeAiOauth") if isinstance(parsed, Mapping) else None
+            if not isinstance(oauth, Mapping):
+                saw_malformed = True
+                continue
+            token = oauth.get("accessToken")
+            if not isinstance(token, str) or not token:
+                continue
+            expires_at = oauth.get("expiresAt")
+            if isinstance(expires_at, (int, float)) and not isinstance(
+                expires_at, bool
+            ):
+                expiry = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+                if expiry <= datetime.now(timezone.utc):
+                    saw_expired = True
+                    continue
+            plan = oauth.get("subscriptionType")
+            return token, plan if isinstance(plan, str) and plan else None
+
+        if saw_expired:
+            raise _ProbeFailure("token_expired", status="usage_unavailable")
+        if saw_malformed:
+            raise _ProbeFailure("protocol_error", status="error")
+        raise _ProbeFailure("not_authenticated", status="usage_unavailable")
+
+    def _file_blob(self) -> str | None:
         try:
-            raw = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+            return self.credentials_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            raise _ProbeFailure(
-                "not_authenticated", status="usage_unavailable"
-            ) from None
-        except (OSError, ValueError):
-            raise _ProbeFailure("protocol_error", status="error") from None
+            return None
 
-        oauth = raw.get("claudeAiOauth") if isinstance(raw, Mapping) else None
-        token = (oauth or {}).get("accessToken") if isinstance(oauth, Mapping) else None
-        if not isinstance(token, str) or not token:
-            raise _ProbeFailure("not_authenticated", status="usage_unavailable")
-
-        expires_at = (oauth or {}).get("expiresAt")
-        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-            expiry = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
-            if expiry <= datetime.now(timezone.utc):
-                raise _ProbeFailure("token_expired", status="usage_unavailable")
-
-        plan = (oauth or {}).get("subscriptionType")
-        return token, plan if isinstance(plan, str) and plan else None
+    def _keychain_blob(self) -> str | None:
+        return self.keychain_reader()
 
     def _fetch(self, token: str) -> Mapping[str, Any]:
         headers = {
@@ -168,6 +201,41 @@ def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, b
         if isinstance(exc.reason, TimeoutError):
             raise TimeoutError(str(exc.reason)) from None
         raise OSError(str(exc.reason)) from None
+
+
+def _read_keychain() -> str | None:
+    """The live credential on macOS. Returns None on any failure.
+
+    harnessd is a different binary from claude, so macOS may put up a prompt
+    before granting access to the item. The timeout is what stops a refresh
+    cycle hanging behind that dialog; a host whose grant has not been given
+    simply looks like a host that was never signed in.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                _KEYCHAIN_SERVICE,
+                "-a",
+                getpass.getuser(),
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_KEYCHAIN_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Includes TimeoutExpired. Never log: stderr can echo the item.
+        return None
+    if result.returncode != 0:
+        return None
+    blob = result.stdout.strip()
+    return blob or None
 
 
 def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
