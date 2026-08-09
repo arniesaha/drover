@@ -80,6 +80,7 @@ def run_harnessd_from_options(
         central_url=central_url,
         host_token=host_token,
         relay=relay,
+        advisory_content=cfg.advisory_content,
     )
 
 

@@ -1593,6 +1593,114 @@ def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     assert fake.calls == [("laptop", "GET", "/sessions", {})]
 
 
+def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
+    collector_with_hosts, caplog
+) -> None:
+    collector = collector_with_hosts
+
+    class _BundleRelay(_FakeRelay):
+        def request(self, host_id, method, path, body, timeout_s=15):
+            self.calls.append((host_id, method, path, body))
+            self.timeouts.append(timeout_s)
+            return 200, json.dumps(
+                {
+                    "bundle_hash": "a" * 64,
+                    "created_at": "2026-08-08T12:00:00+00:00",
+                    "targets": [
+                        {
+                            "target_id": "global-agents",
+                            "content_hash": "b" * 64,
+                            "redacted_content": "private prompt body",
+                        }
+                    ],
+                }
+            )
+
+    fake = _BundleRelay()
+    collector.relay_manager = fake
+
+    with caplog.at_level("INFO", logger="drover.metrics"):
+        payload = collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+
+    assert payload["bundle_hash"] == "a" * 64
+    assert fake.calls == [
+        (
+            "laptop",
+            "POST",
+            "/advisory/content-bundle",
+            {"target_ids": ["global-agents"]},
+        )
+    ]
+    assert "host=laptop" in caplog.text
+    assert "targets=1" in caplog.text
+    assert f"bundle_hash={'a' * 64}" in caplog.text
+    assert "private prompt body" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"bundle_hash": "a" * 64, "created_at": "not-a-time", "targets": []},
+        {
+            "bundle_hash": "a" * 64,
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "targets": [
+                {
+                    "target_id": "different-target",
+                    "content_hash": "b" * 64,
+                    "redacted_content": "content",
+                }
+            ],
+        },
+    ],
+)
+def test_fetch_advisory_content_bundle_rejects_malformed_host_response(
+    collector_with_hosts, payload
+) -> None:
+    collector = collector_with_hosts
+
+    class _MalformedRelay(_FakeRelay):
+        def request(self, host_id, method, path, body, timeout_s=15):
+            return 200, json.dumps(payload)
+
+    collector.relay_manager = _MalformedRelay()
+
+    with pytest.raises(ValueError, match="content bundle response"):
+        collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+
+
+def test_fetch_advisory_content_bundle_rejects_oversized_relay_response(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+
+    class _OversizedRelay(_FakeRelay):
+        def request(self, host_id, method, path, body, timeout_s=15):
+            return 200, "x" * (4 * 1024 * 1024 + 1)
+
+    collector.relay_manager = _OversizedRelay()
+
+    with pytest.raises(ValueError, match="exceeds byte limit"):
+        collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+
+
+@pytest.mark.parametrize(
+    "target_ids",
+    [[], ["global-agents", "global-agents"], ["../AGENTS.md"], ["global-agents", 1]],
+)
+def test_fetch_advisory_content_bundle_rejects_invalid_target_ids_before_transport(
+    collector_with_hosts, target_ids
+) -> None:
+    collector = collector_with_hosts
+    fake = _FakeRelay()
+    collector.relay_manager = fake
+
+    with pytest.raises(ValueError, match="target_ids"):
+        collector.fetch_advisory_content_bundle("laptop", target_ids)
+
+    assert fake.calls == []
+
+
 def test_harness_request_falls_back_to_direct_url(collector_with_hosts) -> None:
     collector = collector_with_hosts
     collector.relay_manager = _FakeRelay()  # not live for "mini"

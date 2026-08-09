@@ -18,9 +18,11 @@ import urllib.request
 from click.testing import CliRunner
 import pytest
 
+from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server.harness.cli import main as harnessd_cli
 from drover.server.harness import daemon as harness_daemon
+from drover.server.harness import cli as harness_cli
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
@@ -105,6 +107,38 @@ def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
         )
 
     assert calls == ["pty", "auth", "server"]
+
+
+def test_harnessd_cli_passes_content_consent_config_to_server(monkeypatch, tmp_path):
+    target = tmp_path / "AGENTS.md"
+    config = type(
+        "Config",
+        (),
+        {
+            "duckdb_path": tmp_path / "drover.duckdb",
+            "advisory_content": _content_config(target),
+        },
+    )()
+    captured = {}
+    monkeypatch.setattr(harness_cli, "resolve_config", lambda path: config)
+    monkeypatch.setattr(harness_cli, "bootstrap_harnessd_schema", lambda cfg: True)
+    monkeypatch.setattr(
+        harness_cli, "run_harnessd", lambda **kwargs: captured.update(kwargs)
+    )
+
+    harness_cli.run_harnessd_from_options(
+        config_path=None,
+        host_id="test-host",
+        display_name=None,
+        kind="linux",
+        listen="127.0.0.1:0",
+        local_url=None,
+        tailscale_url=None,
+        central_url=None,
+        host_token=None,
+    )
+
+    assert captured["advisory_content"] is config.advisory_content
 
 
 class _CentralRegistrationHandler(BaseHTTPRequestHandler):
@@ -194,7 +228,12 @@ FAKE_STRUCTURED_CLI = [
 ]
 
 
-def _start_test_server(tmp_path, *, api_token: str = ""):
+def _start_test_server(
+    tmp_path,
+    *,
+    api_token: str = "",
+    advisory_content: AdvisoryContentConfig | None = None,
+):
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -209,6 +248,7 @@ def _start_test_server(tmp_path, *, api_token: str = ""):
         local_url="http://127.0.0.1:0",
         api_token=api_token,
         worktrees_dir=tmp_path / "worktrees",
+        advisory_content=advisory_content,
     )
     register_daemon_host(state)
     server = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
@@ -216,6 +256,23 @@ def _start_test_server(tmp_path, *, api_token: str = ""):
     thread.start()
     host, port = server.server_address
     return server, state, f"http://{host}:{port}"
+
+
+def _content_config(
+    target,
+    *,
+    enabled: bool = True,
+) -> AdvisoryContentConfig:
+    return AdvisoryContentConfig(
+        enabled=enabled,
+        backend_policy="local",
+        external_consent=False,
+        targets=(str(target),),
+        allowed_roots=(target.parent,),
+        max_file_bytes=1024,
+        max_bundle_bytes=2048,
+        excerpt_max_chars=320,
+    )
 
 
 def test_cli_harnessd_help_documents_core_options():
@@ -437,6 +494,118 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     assert {account["status"] for account in body["accounts"]} == {"usage_unavailable"}
     assert all(account["windows"] == [] for account in body["accounts"])
     assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
+
+
+def test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            _json_request(
+                f"{base_url}/advisory/content-bundle",
+                payload={"target_ids": ["AGENTS.md"]},
+            )
+        assert unauthorized.value.code == 401
+
+        request = urllib.request.Request(
+            f"{base_url}/advisory/content-bundle",
+            data=json.dumps({"target_ids": ["AGENTS.md"]}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as disabled:
+            urllib.request.urlopen(request, timeout=5)
+        assert disabled.value.code == 403
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral(
+    tmp_path,
+):
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "api_token = 'top-secret'\nUse the deployment skill.\n",
+        encoding="utf-8",
+    )
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+
+    def post(payload):
+        request = urllib.request.Request(
+            f"{base_url}/advisory/content-bundle",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as arbitrary_path:
+            post({"target_ids": [str(target)]})
+        assert arbitrary_path.value.code == 400
+
+        with post({"target_ids": ["AGENTS.md"]}) as response:
+            body_bytes = response.read()
+            body = json.loads(body_bytes.decode("utf-8"))
+            headers = response.headers
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert headers["Cache-Control"] == "no-store"
+    assert set(body) == {"bundle_hash", "created_at", "targets"}
+    assert set(body["targets"][0]) == {
+        "target_id",
+        "content_hash",
+        "redacted_content",
+    }
+    assert body["targets"][0]["target_id"] == "AGENTS.md"
+    assert "top-secret" not in body_bytes.decode("utf-8")
+    assert body["targets"][0]["redacted_content"].endswith(
+        "Use the deployment skill.\n"
+    )
+    assert not list(tmp_path.rglob("*bundle*"))
+
+
+def test_harnessd_content_bundle_rejects_oversized_request_before_parsing(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+    request = urllib.request.Request(
+        f"{base_url}/advisory/content-bundle",
+        data=json.dumps({"target_ids": ["x" * 140_000]}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as oversized:
+            urllib.request.urlopen(request, timeout=5)
+        assert oversized.value.code == 413
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_harnessd_auth_status_route(tmp_path):

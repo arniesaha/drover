@@ -63,6 +63,7 @@ from drover.server.harness.websocket import (
 )
 
 if TYPE_CHECKING:
+    from drover.config import AdvisoryContentConfig
     from drover.server.providers.codex import CodexUsageProbe
     from drover.server.providers.types import (
         ProviderAccountSnapshot,
@@ -104,6 +105,7 @@ _ATTACHMENT_EXTENSIONS = {
     "image/webp": "webp",
 }
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ADVISORY_BUNDLE_REQUEST_BYTES = 128 * 1024
 
 
 def save_turn_attachments(
@@ -1244,6 +1246,7 @@ class HarnessDaemonState:
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     provider_usage_probe: CodexUsageProbe | None = None
+    advisory_content: "AdvisoryContentConfig | None" = None
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -1344,6 +1347,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if auth_route and auth_route[2] == "cancel":
             self._auth_cancel(auth_route[0], auth_route[1] or "")
+            return
+        if parsed.path == "/advisory/content-bundle":
+            self._advisory_content_bundle()
             return
         if parsed.path == "/sessions":
             self._create_session()
@@ -1454,6 +1460,101 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 detected = _with_claude_plan_label(detected, self.server.state.auth)
             accounts.append(_unavailable_provider_json(detected, observed_at))
         self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
+
+    def _advisory_content_bundle(self) -> None:
+        config = self.server.state.advisory_content
+        if config is None or not config.enabled:
+            self._write_json(
+                {"error": "content analysis is disabled"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._write_json(
+                {"error": "invalid Content-Length"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if content_length > MAX_ADVISORY_BUNDLE_REQUEST_BYTES:
+            self._write_json(
+                {"error": "content bundle request exceeds byte limit"},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
+        body = self._read_json()
+        if body is None or set(body) != {"target_ids"}:
+            self._write_json(
+                {"error": "request must contain only target_ids"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        target_ids = body.get("target_ids")
+        if not _valid_content_target_ids(target_ids):
+            self._write_json(
+                {"error": "target_ids must be a non-empty list of unique IDs"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        from drover.server.advisory.content_targets import (
+            ContentTarget,
+            ContentTargetError,
+            build_content_bundle,
+        )
+
+        configured: dict[str, ContentTarget] = {}
+        for configured_path in config.targets:
+            target = ContentTarget(Path(configured_path))
+            if target.target_id in configured:
+                self._write_json(
+                    {"error": "configured advisory target IDs must be unique"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            configured[target.target_id] = target
+        if any(target_id not in configured for target_id in target_ids):
+            self._write_json(
+                {"error": "unknown advisory content target ID"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        bundle = None
+        payload = None
+        selected = [configured[target_id] for target_id in target_ids]
+        try:
+            bundle = build_content_bundle(
+                selected,
+                allowed_roots=config.allowed_roots,
+                host_id=self.server.state.host_id,
+                max_file_bytes=config.max_file_bytes,
+                max_bundle_bytes=config.max_bundle_bytes,
+            )
+            payload = {
+                "bundle_hash": bundle.bundle_hash,
+                "created_at": bundle.created_at.isoformat(),
+                "targets": [
+                    {
+                        "target_id": target.target_id,
+                        "content_hash": target.content_hash,
+                        "redacted_content": target.redacted_content,
+                    }
+                    for target in bundle.targets
+                ],
+            }
+            self._write_json(payload, headers={"Cache-Control": "no-store"})
+        except ContentTargetError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        finally:
+            # Content is intentionally scoped to this request. Explicitly sever
+            # the largest references as soon as serialization has completed.
+            selected.clear()
+            bundle = None
+            payload = None
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -2421,12 +2522,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def _write_json(
-        self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
+        self,
+        payload: dict[str, Any],
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self._write_cors_headers()
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -2660,6 +2767,23 @@ def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
     return None
 
 
+def _valid_content_target_ids(value: Any) -> bool:
+    if not isinstance(value, list) or not value or len(value) > 256:
+        return False
+    if any(
+        not isinstance(item, str)
+        or not item
+        or len(item) > 256
+        or item.strip() != item
+        or item in {".", ".."}
+        or "/" in item
+        or "\\" in item
+        for item in value
+    ):
+        return False
+    return len(set(value)) == len(value)
+
+
 def create_harness_server(
     *,
     listen_host: str,
@@ -2785,6 +2909,7 @@ def run_harnessd(
     central_url: str | None = None,
     host_token: str | None = None,
     relay: bool = False,
+    advisory_content: "AdvisoryContentConfig | None" = None,
 ) -> None:
     state = HarnessDaemonState(
         host_id=host_id,
@@ -2798,6 +2923,7 @@ def run_harnessd(
         central_url=central_url,
         host_token=host_token,
         relay=relay,
+        advisory_content=advisory_content,
     )
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token

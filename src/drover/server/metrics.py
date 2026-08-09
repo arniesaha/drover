@@ -51,6 +51,7 @@ _HARNESS_STALE_AFTER_SECONDS = 45
 # Presence is now trustworthy within a minute, so a live relay socket is
 # decent evidence the host is really there and worth waiting for.
 RELAY_MIN_TIMEOUT_S = 5.0
+_MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
 # gemini). A nexus handoff to one of these launches mode="structured" and
@@ -66,6 +67,70 @@ _SUMMARIZE_JOB_STATUSES = (
     "errored",
     "dead_lettered",
 )
+
+
+def _valid_advisory_target_ids(value: Any) -> bool:
+    if not isinstance(value, list) or not value or len(value) > 256:
+        return False
+    if any(
+        not isinstance(item, str)
+        or not item
+        or len(item) > 256
+        or item.strip() != item
+        or item in {".", ".."}
+        or "/" in item
+        or "\\" in item
+        for item in value
+    ):
+        return False
+    return len(set(value)) == len(value)
+
+
+def _validate_advisory_content_bundle(
+    payload: Any, *, requested_ids: list[str]
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "bundle_hash",
+        "created_at",
+        "targets",
+    }:
+        raise ValueError("content bundle response has invalid fields")
+    if not _is_sha256(payload["bundle_hash"]):
+        raise ValueError("content bundle response has invalid bundle_hash")
+    try:
+        created_at = datetime.fromisoformat(payload["created_at"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("content bundle response has invalid created_at") from exc
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("content bundle response has invalid created_at")
+    targets = payload["targets"]
+    if not isinstance(targets, list) or len(targets) != len(requested_ids):
+        raise ValueError("content bundle response has invalid targets")
+    returned_ids: list[str] = []
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != {
+            "target_id",
+            "content_hash",
+            "redacted_content",
+        }:
+            raise ValueError("content bundle response has invalid target fields")
+        if not isinstance(target["target_id"], str):
+            raise ValueError("content bundle response has invalid target ID")
+        if not _is_sha256(target["content_hash"]):
+            raise ValueError("content bundle response has invalid content_hash")
+        if not isinstance(target["redacted_content"], str):
+            raise ValueError("content bundle response has invalid redacted content")
+        returned_ids.append(target["target_id"])
+    if returned_ids != requested_ids:
+        raise ValueError("content bundle response target IDs do not match request")
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _label_value(value: object) -> str:
@@ -783,6 +848,41 @@ class MetricsCollector:
             raise ValueError("provider usage response must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("provider usage response must be an object")
+        return payload
+
+    def fetch_advisory_content_bundle(
+        self, host_id: str, target_ids: list[str]
+    ) -> Mapping[str, Any]:
+        """Fetch one ephemeral, redacted bundle through normal host routing."""
+        if not _valid_advisory_target_ids(target_ids):
+            raise ValueError("target_ids must be a non-empty list of unique IDs")
+        host = self._harness_host(host_id)
+        if host is None:
+            raise ValueError(f"unknown harness host: {host_id}")
+        status, body = self._harness_request(
+            host,
+            "/advisory/content-bundle",
+            method="POST",
+            payload={"target_ids": target_ids},
+            timeout_s=15.0,
+        )
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > _MAX_CONTENT_BUNDLE_RESPONSE_BYTES:
+            raise ValueError("content bundle response exceeds byte limit")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"content bundle request failed with status {status}")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("content bundle response must be valid JSON") from exc
+        _validate_advisory_content_bundle(payload, requested_ids=target_ids)
+        log.info(
+            "fetched advisory content bundle host=%s targets=%d bytes=%d bundle_hash=%s",
+            host_id,
+            len(payload["targets"]),
+            len(body_bytes),
+            payload["bundle_hash"],
+        )
         return payload
 
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
