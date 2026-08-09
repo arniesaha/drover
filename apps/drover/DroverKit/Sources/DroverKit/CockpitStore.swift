@@ -23,6 +23,7 @@ public final class CockpitStore {
     private var cockpitAPIVersion: Int?
     private var insightFilters = InsightFilters()
     private var stateOverrides: [String: InsightState] = [:]
+    private var refreshGeneration = 0
     private var lifecycleTail: Task<Void, Never>?
     private nonisolated(unsafe) var pollingTask: Task<Void, Never>?
 
@@ -74,18 +75,26 @@ public final class CockpitStore {
 
     public func refresh(days: Int = 7) async {
         guard isCockpitAvailable else { return }
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         do {
             let fresh = try await client.cockpitOverview(days: days)
+            guard generation == refreshGeneration, isCockpitAvailable else { return }
             overview = fresh
 
             switch fresh.providerCapacity.status {
-            case .ok, .stale:
+            case .ok:
                 if let data = fresh.providerCapacity.data { providerAccounts = data }
-                providerError = fresh.providerCapacity.status == .stale
-                    ? "Provider capacity is stale."
-                    : nil
+                providerError = nil
+            case .stale:
+                if let data = fresh.providerCapacity.data, !data.isEmpty {
+                    providerAccounts = data
+                }
+                providerError = "Provider capacity is stale."
             case .unavailable:
-                if let data = fresh.providerCapacity.data { providerAccounts = data }
+                if let data = fresh.providerCapacity.data, !data.isEmpty {
+                    providerAccounts = data
+                }
                 providerError = "Provider usage is unavailable."
             case .error, .unknown:
                 providerError = "Provider capacity could not be refreshed."
@@ -108,6 +117,7 @@ public final class CockpitStore {
             }
             insightCounts = fresh.insightCounts
         } catch {
+            guard generation == refreshGeneration, isCockpitAvailable else { return }
             guard !Self.isCancellation(error) else { return }
             let message = Self.errorMessage(error)
             providerError = message
@@ -137,6 +147,7 @@ public final class CockpitStore {
     }
 
     public func stopForegroundPolling() {
+        refreshGeneration &+= 1
         pollingTask?.cancel()
         pollingTask = nil
         isPolling = false

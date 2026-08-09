@@ -22,6 +22,50 @@ struct CockpitStoreTests {
         #expect(store.activityError == nil)
     }
 
+    @Test @MainActor func unavailableEmptyProviderSectionKeepsLastGoodCards() async throws {
+        let client = CockpitClientStub(overviews: [
+            try decodeOverview(providerStatus: "ok", activitySessions: 10),
+            try decodeOverview(providerStatus: "unavailable", activitySessions: 18),
+        ])
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        await store.refresh()
+        let originalProviders = store.providerAccounts
+        await store.refresh()
+
+        #expect(store.providerAccounts == originalProviders)
+        #expect(store.providerError == "Provider usage is unavailable.")
+        #expect(store.activity?.totals.sessionCount == 18)
+        #expect(store.activityError == nil)
+    }
+
+    @Test @MainActor func olderRefreshCompletionCannotOverwriteNewerStateOrErrors() async throws {
+        let client = ControlledRefreshCockpitClient(
+            responses: [
+                7: try decodeOverview(providerStatus: "error", activitySessions: 7),
+                30: try decodeOverview(providerStatus: "ok", activitySessions: 30),
+            ]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        let older = Task { await store.refresh(days: 7) }
+        await client.waitUntilRequested(days: 7)
+        let newer = Task { await store.refresh(days: 30) }
+        await client.waitUntilRequested(days: 30)
+
+        await client.release(days: 30)
+        await newer.value
+        await client.release(days: 7)
+        await older.value
+
+        #expect(store.activity?.totals.sessionCount == 30)
+        #expect(store.providerAccounts.count == 1)
+        #expect(store.providerError == nil)
+        #expect(store.activityError == nil)
+    }
+
     @Test @MainActor func olderServerNeverRequestsCockpitOrShowsAnError() async throws {
         let client = CockpitClientStub(overviews: [
             try decodeOverview(providerStatus: "error", activitySessions: 10),
@@ -237,6 +281,60 @@ private actor CockpitClientStub: CockpitClient {
     }
 }
 
+private actor ControlledRefreshCockpitClient: CockpitClient {
+    private let responses: [Int: CockpitOverview]
+    private var requestedDays: Set<Int> = []
+    private var requestWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var releaseWaiters: [Int: CheckedContinuation<Void, Never>] = [:]
+
+    init(responses: [Int: CockpitOverview]) {
+        self.responses = responses
+    }
+
+    func waitUntilRequested(days: Int) async {
+        guard !requestedDays.contains(days) else { return }
+        await withCheckedContinuation { continuation in
+            requestWaiters[days, default: []].append(continuation)
+        }
+    }
+
+    func release(days: Int) {
+        releaseWaiters.removeValue(forKey: days)?.resume()
+    }
+
+    func cockpitOverview(days: Int) async throws -> CockpitOverview {
+        requestedDays.insert(days)
+        requestWaiters.removeValue(forKey: days)?.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseWaiters[days] = continuation
+        }
+        guard let response = responses[days] else {
+            throw DroverError.unavailable("no response for \(days) days")
+        }
+        return response
+    }
+
+    func analytics(filters: AnalyticsFilters) async throws -> AnalyticsSnapshot {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func insights(filters: InsightFilters) async throws -> InsightPage {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func acknowledgeInsight(findingID: String) async throws -> InsightFinding {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func dismissInsight(findingID: String, reason: String) async throws -> InsightFinding {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func checkInsight(findingID: String) async throws -> InsightCheckResponse {
+        throw DroverError.unavailable("not configured")
+    }
+}
+
 private func capableSnapshot() throws -> HarnessSnapshot {
     try HarnessSnapshot.decode(from: Data(
         #"{"hosts":[],"sessions":[],"cockpit_api_version":1}"#.utf8
@@ -253,7 +351,7 @@ private func decodeOverview(providerStatus: String, activitySessions: Int) throw
       "provider":"openai","account_label":"Personal","plan_label":"Plus",
       "host_id":"mac-mini","status":"ok","observed_at":"2026-08-08T18:00:00Z",
       "windows":[],"source":"codex_app_server"}]
-    """ : "null"
+    """ : (providerStatus == "unavailable" ? "[]" : "null")
     return try JSONDecoder().decode(CockpitOverview.self, from: Data("""
     {"cockpit_api_version":1,
      "provider_capacity":{"status":"\(providerStatus)","observed_at":"2026-08-08T18:00:00Z",
