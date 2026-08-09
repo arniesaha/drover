@@ -151,6 +151,56 @@ def _parse_cockpit_query(query: str):
     return AnalyticsFilters(**values)
 
 
+_INSIGHT_QUERY_FIELDS = frozenset(
+    {
+        "state",
+        "severity",
+        "confidence",
+        "analyzer_class",
+        "host",
+        "harness",
+        "target_type",
+        "target_id",
+        "cursor",
+        "limit",
+    }
+)
+
+
+def _parse_insight_query(query: str):
+    from drover.server.advisory.service import InsightFilters
+
+    params = parse_qs(query, keep_blank_values=True)
+    unknown = sorted(set(params) - _INSIGHT_QUERY_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported query field: {unknown[0]}")
+    values: dict[str, Any] = {}
+    for name, entries in params.items():
+        if len(entries) != 1:
+            raise ValueError(f"{name} must appear once")
+        value = entries[0].strip()
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        if len(value) > 512:
+            raise ValueError(f"{name} is too long")
+        values[name] = value
+    if "limit" in values:
+        try:
+            values["limit"] = int(values["limit"])
+        except ValueError as exc:
+            raise ValueError("limit must be an integer") from exc
+    return InsightFilters(**values)
+
+
+def _parse_insight_route(path: str) -> tuple[str, str | None] | None:
+    parts = path.strip("/").split("/")
+    if len(parts) not in {2, 3} or parts[0] != "insights":
+        return None
+    finding_id = unquote(parts[1])
+    action = parts[2] if len(parts) == 3 else None
+    return finding_id, action
+
+
 def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
     """Extract the mirrorable event out of a terminal message, or ``None``.
 
@@ -480,6 +530,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 status, body = self.collector.render_analytics_json(filters)
             self._send(status, "application/json", body)
             return
+        if path == "/insights":
+            try:
+                filters = _parse_insight_query(parsed.query)
+                status, body = self.collector.render_insights_json(filters)
+            except ValueError as exc:
+                status, body = 400, json.dumps({"error": str(exc)}) + "\n"
+            self._send(status, "application/json", body)
+            return
+        insight_route = _parse_insight_route(path)
+        if insight_route and insight_route[1] is None:
+            status, body = self.collector.render_insight_json(insight_route[0])
+            self._send(status, "application/json", body)
+            return
         if path == "/harness":
             self._send(200, "application/json", self.collector.render_harness_json())
             return
@@ -641,6 +704,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/auth/login":
             self._handle_login()
+            return
+        insight_route = _parse_insight_route(path)
+        if insight_route and insight_route[1] in {
+            "acknowledge",
+            "dismiss",
+            "check",
+        }:
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.act_on_insight(
+                insight_route[0], insight_route[1], body
+            )
+            self._send(status, "application/json", payload)
             return
         if path == "/harness/events":
             self._ingest_harness_events()

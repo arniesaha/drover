@@ -28,6 +28,7 @@ from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
 
 if TYPE_CHECKING:
+    from drover.server.advisory.service import InsightFilters, InsightsService
     from drover.server.cockpit.service import CockpitService
     from drover.server.harness.models import HarnessHost
     from drover.server.relay_manager import RelayManager
@@ -446,6 +447,29 @@ def _json_response(status: int, payload: Mapping[str, Any]) -> tuple[int, str]:
     return status, json.dumps(dict(payload), sort_keys=True, default=str) + "\n"
 
 
+def _insight_response(render) -> tuple[int, str]:
+    try:
+        return _json_response(200, render())
+    except Exception as exc:  # noqa: BLE001 - advisory failure stays section-local
+        return _insight_error_response(exc)
+
+
+def _insight_error_response(exc: Exception) -> tuple[int, str]:
+    from drover.server.advisory.service import (
+        InvalidInsightRequest,
+        InvalidInsightTransition,
+    )
+
+    if isinstance(exc, InvalidInsightRequest):
+        return _json_response(400, {"error": str(exc)})
+    if isinstance(exc, InvalidInsightTransition):
+        return _json_response(409, {"error": str(exc)})
+    if isinstance(exc, KeyError):
+        return _json_response(404, {"error": "insight not found"})
+    log.warning("advisory API failed: %s", exc)
+    return _json_response(503, {"error": "insights temporarily unavailable"})
+
+
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -607,6 +631,7 @@ class MetricsCollector:
     # live, but N polling clients should still share one render.
     harness_ttl_seconds: float = 2.0
     cockpit_service: "CockpitService | None" = None
+    advisory_service: "InsightsService | None" = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -659,6 +684,48 @@ class MetricsCollector:
         if self.cockpit_service is None:
             return _json_response(503, {"error": "cockpit service unavailable"})
         return _json_response(200, self.cockpit_service.analytics(filters))
+
+    def _insights(self) -> "InsightsService":
+        if self.advisory_service is None:
+            from drover.server.advisory.service import InsightsService
+
+            self.advisory_service = InsightsService(self.duckdb_path)
+        return self.advisory_service
+
+    def render_insights_json(self, filters: "InsightFilters") -> tuple[int, str]:
+        return _insight_response(lambda: self._insights().list_insights(filters))
+
+    def render_insight_json(self, finding_id: str) -> tuple[int, str]:
+        return _insight_response(lambda: self._insights().get_insight(finding_id))
+
+    def act_on_insight(
+        self, finding_id: str, action: str, body: Mapping[str, Any]
+    ) -> tuple[int, str]:
+        from drover.server.advisory.service import (
+            InvalidInsightRequest,
+            validate_action_body,
+        )
+
+        try:
+            if action == "acknowledge":
+                validate_action_body(body, allowed=set())
+                payload = self._insights().acknowledge(finding_id)
+                status = 200
+            elif action == "dismiss":
+                validate_action_body(body, allowed={"reason"})
+                payload = self._insights().dismiss(
+                    finding_id, reason=body.get("reason")
+                )
+                status = 200
+            elif action == "check":
+                validate_action_body(body, allowed=set())
+                payload = self._insights().check_again(finding_id)
+                status = 202
+            else:
+                raise InvalidInsightRequest("invalid insight action")
+            return _json_response(status, payload)
+        except Exception as exc:  # normalized below, isolated from other APIs
+            return _insight_error_response(exc)
 
     def register_harness_host(self, payload: Mapping[str, Any]) -> tuple[int, str]:
         host_id = str(payload.get("host_id") or "").strip()

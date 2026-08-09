@@ -22,6 +22,14 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server import metrics
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.types import (
+    AnalyzerClass,
+    Confidence,
+    FindingCandidate,
+    FindingEvidence,
+    Severity,
+)
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
@@ -265,6 +273,43 @@ _AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 def _authed_get(url: str, headers: dict[str, str] | None = None):
     request = urllib.request.Request(url, headers={**_AUTH_HEADERS, **(headers or {})})
     return urllib.request.urlopen(request, timeout=5)
+
+
+def _authed_post(url: str, payload: object):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
+        method="POST",
+    )
+    return urllib.request.urlopen(request, timeout=5)
+
+
+def _observe_insight(collector: MetricsCollector):
+    return AdvisoryRepository(collector.duckdb_path).observe(
+        FindingCandidate(
+            analyzer_id="hooks",
+            rule_id="hook.executable_missing",
+            target_type="hook",
+            target_id="mac-mini:session-start",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="SessionStart hook executable is missing",
+            impact="New sessions skip required setup.",
+            remediation=("Restore the executable.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="host:mac-mini/hooks/session-start",
+                    observed_at=datetime(2026, 8, 8, 17, tzinfo=timezone.utc),
+                    fields={"exists": False},
+                    excerpt="missing executable",
+                ),
+            ),
+            content_hash="hash-v1",
+        ),
+        run_id="analysis-run-1",
+    )
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -635,6 +680,146 @@ def test_cockpit_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
             payload = json.loads(response.read())
         assert payload["activity"]["status"] == "ok"
         assert payload["provider_capacity"]["status"] == "unavailable"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_insights_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
+    collector = _make_collector(tmp_path)
+    _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            urlopen(base + "/insights", timeout=3)
+        assert exc.value.code == 401
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/insights?unexpected=value")
+        assert exc.value.code == 400
+
+        with _authed_get(base + "/insights?severity=high&limit=1") as response:
+            payload = json.loads(response.read())
+        assert payload["findings"][0]["severity"] == "high"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_insight_detail_and_lifecycle_actions_are_validated(tmp_path):
+    collector = _make_collector(tmp_path)
+    finding = _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with _authed_get(base + f"/insights/{finding.finding_id}") as response:
+            detail = json.loads(response.read())
+        assert detail["finding"]["finding_id"] == finding.finding_id
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + f"/insights/{finding.finding_id}/dismiss", {})
+        assert exc.value.code == 400
+
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/acknowledge", {}
+        ) as response:
+            acknowledged = json.loads(response.read())
+        assert acknowledged["finding"]["state"] == "acknowledged"
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + f"/insights/{finding.finding_id}/acknowledge", {})
+        assert exc.value.code == 409
+
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/dismiss",
+            {"reason": "accepted tradeoff"},
+        ) as response:
+            dismissed = json.loads(response.read())
+        assert dismissed["finding"]["state"] == "dismissed"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_check_again_enqueues_without_configuration_mutation(tmp_path):
+    collector = _make_collector(tmp_path)
+    finding = _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/check", {}
+        ) as response:
+            assert response.status == 202
+            payload = json.loads(response.read())
+        assert payload["status"] == "queued"
+
+        con = duckdb.connect(str(collector.duckdb_path), read_only=True)
+        try:
+            jobs = con.execute(
+                "SELECT job_kind, subject_key FROM pipeline_jobs"
+            ).fetchall()
+        finally:
+            con.close()
+        assert jobs == [("analyze_advisory_target", "hooks:mac-mini:session-start")]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/insights/not-a-finding/check", {}),
+        ("/insights/00000000000000000000000000000000/dismiss", []),
+        ("/insights/00000000000000000000000000000000/acknowledge", {"extra": 1}),
+    ],
+)
+def test_insight_routes_reject_invalid_ids_and_json(tmp_path, path, payload):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + path, payload)
+        assert exc.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_insight_api_failure_is_section_local(tmp_path):
+    class _FailedInsights:
+        def list_insights(self, filters):
+            raise RuntimeError("analyzer database unavailable")
+
+    collector = _make_collector(tmp_path)
+    collector.advisory_service = _FailedInsights()
+    collector.cockpit_service = CockpitService(
+        duckdb_path=collector.duckdb_path,
+        provider_usage=None,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/insights")
+        assert exc.value.code == 503
+        assert "analyzer database unavailable" not in exc.value.read().decode()
+
+        with _authed_get(base + "/cockpit/overview") as response:
+            assert json.loads(response.read())["activity"]["status"] == "ok"
     finally:
         server.shutdown()
         server.server_close()

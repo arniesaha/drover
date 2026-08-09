@@ -9,6 +9,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightFilters, InsightsService
 from drover.server.advisory.types import (
     AnalyzerClass,
     Confidence,
@@ -334,3 +335,80 @@ def test_observe_rolls_back_finding_when_occurrence_insert_fails(
         repository.observe(candidate, run_id="run-1")
 
     assert repository.list_findings() == []
+
+
+def test_insights_service_paginates_by_severity_recency_and_id(repository, candidate):
+    medium = repository.observe(
+        replace(
+            candidate,
+            rule_id="hook.medium",
+            severity=Severity.MEDIUM,
+            evidence=(
+                replace(
+                    candidate.evidence[0],
+                    observed_at=datetime(2026, 8, 8, 19, tzinfo=timezone.utc),
+                ),
+            ),
+        ),
+        run_id="run-medium",
+    )
+    older_high = repository.observe(candidate, run_id="run-high-old")
+    newer_high = repository.observe(
+        replace(
+            candidate,
+            rule_id="hook.high-new",
+            evidence=(
+                replace(
+                    candidate.evidence[0],
+                    observed_at=datetime(2026, 8, 8, 20, tzinfo=timezone.utc),
+                ),
+            ),
+        ),
+        run_id="run-high-new",
+    )
+    service = InsightsService(repository.duckdb_path)
+
+    first = service.list_insights(InsightFilters(limit=2))
+    second = service.list_insights(InsightFilters(limit=2, cursor=first["next_cursor"]))
+
+    assert [item["finding_id"] for item in first["findings"]] == [
+        newer_high.finding_id,
+        older_high.finding_id,
+    ]
+    assert [item["finding_id"] for item in second["findings"]] == [medium.finding_id]
+    assert second["next_cursor"] is None
+
+
+def test_insights_service_filters_and_returns_bounded_redacted_detail(
+    repository, candidate
+):
+    candidate = replace(candidate, target_id="mac-mini/codex/session-start")
+    finding = repository.observe(candidate, run_id="run-1")
+    service = InsightsService(repository.duckdb_path)
+
+    page = service.list_insights(
+        InsightFilters(
+            state="open",
+            severity="high",
+            confidence="confirmed",
+            analyzer_class="deterministic",
+            host="mac-mini",
+            harness="codex",
+            target_type="hook",
+            target_id="mac-mini/codex/session-start",
+        )
+    )
+    detail = service.get_insight(finding.finding_id)
+
+    assert [item["finding_id"] for item in page["findings"]] == [finding.finding_id]
+    assert detail["finding"]["remediation"] == [
+        "Restore executable /opt/drover/bin/session-start."
+    ]
+    assert detail["evidence"] == [
+        {
+            "observed_at": "2026-08-08T17:00:00+00:00",
+            "source_ref": "host:mac-mini/hooks/session-start",
+            "fields": {"exists": False, "exit_code": 127},
+            "excerpt": "exec: /opt/drover/bin/session-start",
+        }
+    ]
