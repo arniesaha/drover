@@ -535,6 +535,83 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
 
 
+def test_harnessd_provider_usage_probes_codex_at_its_resolved_executable(tmp_path):
+    # harnessd inherits a launchd PATH that omits the CLI's install prefix, so a
+    # probe spawning a bare "codex" cannot find it. The preset already resolved
+    # the absolute path through the login shell; the probe must reuse it.
+    codex = tmp_path / "codex-cli"
+    codex.write_text(f"""\
+#!{sys.executable}
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    if request["method"] == "initialize":
+        result = {{"userAgent": "fake"}}
+    elif request["method"] == "account/read":
+        result = {{"account": {{"email": "person@example.com", "planType": "plus"}}}}
+    elif request["method"] == "account/rateLimits/read":
+        result = {{"rateLimits": {{"primary": {{"usedPercent": 25}}}}}}
+    else:
+        continue
+    print(json.dumps({{"id": request["id"], "result": result}}), flush=True)
+""")
+    codex.chmod(0o755)
+
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {
+        "codex": replace(
+            DEFAULT_PRESETS["codex"],
+            command=("/bin/zsh", "-lc", f"exec {codex}"),
+            enabled=True,
+            executable=str(codex),
+        ),
+    }
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert [account["provider"] for account in body["accounts"]] == ["openai"]
+    account = body["accounts"][0]
+    assert account["status"] == "ok"
+    assert account["error_category"] is None
+    assert account["plan_label"] == "plus"
+    assert [window["used_percent"] for window in account["windows"]] == [25.0]
+
+
+def test_harnessd_provider_usage_reports_codex_cli_not_found(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {
+        "codex": replace(DEFAULT_PRESETS["codex"], enabled=True, executable=None),
+    }
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    account = body["accounts"][0]
+    assert account["status"] == "error"
+    assert account["error_category"] == "cli_not_found"
+
+
 def test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default(tmp_path):
     target = tmp_path / "AGENTS.md"
     target.write_text("Use the deployment skill.\n", encoding="utf-8")
@@ -1114,6 +1191,63 @@ def test_resolve_harness_presets_enables_available_login_shell_clis(
     )
     assert presets["gemini"].enabled is False
     assert "not found" in presets["gemini"].description
+
+
+def test_resolve_harness_presets_records_resolved_executable(monkeypatch, tmp_path):
+    class _Completed:
+        def __init__(self, *, returncode: int, stdout: str):
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def fake_run(argv, **kwargs):
+        command = argv[-1]
+        if command.endswith("codex"):
+            return _Completed(returncode=0, stdout="/opt/homebrew/bin/codex\n")
+        return _Completed(returncode=1, stdout="")
+
+    monkeypatch.setattr("drover.server.harness.auth.subprocess.run", fake_run)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
+
+    presets = resolve_harness_presets(
+        {
+            "shell": DEFAULT_PRESETS["shell"],
+            "codex": DEFAULT_PRESETS["codex"],
+            "gemini": DEFAULT_PRESETS["gemini"],
+        },
+        shell="/bin/zsh",
+    )
+
+    # The launch command wraps the binary in a login shell, so the bare path has
+    # to be carried separately for probes that spawn the CLI directly.
+    assert presets["codex"].executable == "/opt/homebrew/bin/codex"
+    assert presets["shell"].executable is None
+    assert presets["gemini"].executable is None
+
+
+def test_resolve_harness_presets_clears_the_executable_when_the_cli_disappears(
+    monkeypatch, tmp_path
+):
+    class _Completed:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "drover.server.harness.auth.subprocess.run",
+        lambda *args, **kwargs: _Completed(),
+    )
+
+    presets = resolve_harness_presets(
+        {
+            "codex": replace(
+                DEFAULT_PRESETS["codex"], executable="/opt/homebrew/bin/codex"
+            )
+        },
+        shell="/bin/zsh",
+    )
+
+    assert presets["codex"].enabled is False
+    assert presets["codex"].executable is None
 
 
 def test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path(

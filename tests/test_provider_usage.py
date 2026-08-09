@@ -74,6 +74,15 @@ CODEX_ERROR_PAYLOAD = {
 }
 
 
+def _relabelled_payload(payload, *, snapshot_id, dedup_key):
+    account = {
+        **payload["accounts"][0],
+        "snapshot_id": snapshot_id,
+        "dedup_key": dedup_key,
+    }
+    return {**payload, "accounts": [account]}
+
+
 @pytest.fixture
 def provider_service(tmp_path):
     parquet_dir = tmp_path / "parquet"
@@ -145,6 +154,77 @@ for line in sys.stdin:
         timeout_command=(sys.executable, "-u", str(script), "timeout"),
         noisy_command=(sys.executable, "-u", str(script), "stderr_flood"),
     )
+
+
+def test_provider_refresh_retires_a_label_the_host_stopped_reporting(
+    provider_service, provider_host
+):
+    # A probe that fails before it can read the account falls back to the
+    # "Codex" label, which becomes its own identity. Once the host starts
+    # reporting the real account, the fallback must not linger as a second
+    # card frozen at the failure.
+    provider_service.refresh_host(provider_host, fetch=lambda host: CODEX_ERROR_PAYLOAD)
+    provider_service.refresh_host(provider_host, fetch=lambda host: GOOD_PAYLOAD)
+
+    openai = [
+        account
+        for account in provider_service.latest_accounts()
+        if account.provider == "openai"
+    ]
+
+    assert [account.account_label for account in openai] == ["person@example.com"]
+
+
+def test_provider_refresh_restores_a_retired_label_the_host_reports_again(
+    provider_service, provider_host
+):
+    # Retirement follows the host, it is not a tombstone: an account that comes
+    # back (a re-login under the earlier identity) has to project again.
+    provider_service.refresh_host(provider_host, fetch=lambda host: CODEX_ERROR_PAYLOAD)
+    provider_service.refresh_host(provider_host, fetch=lambda host: GOOD_PAYLOAD)
+
+    returning = _relabelled_payload(
+        {
+            **GOOD_PAYLOAD,
+            "accounts": [{**GOOD_PAYLOAD["accounts"][0], "account_label": "Codex"}],
+        },
+        snapshot_id="snapshot-returning",
+        dedup_key="dedup-returning",
+    )
+    provider_service.refresh_host(provider_host, fetch=lambda host: returning)
+
+    labels = {
+        account.account_label
+        for account in provider_service.latest_accounts()
+        if account.provider == "openai"
+    }
+
+    assert labels == {"Codex"}
+
+
+def test_provider_refresh_retires_only_within_the_reporting_host(provider_service):
+    mac_mini = SimpleNamespace(
+        host_id="mac-mini", local_url="http://127.0.0.1:7081", tailscale_url=None
+    )
+    nas = SimpleNamespace(
+        host_id="nas", local_url="http://127.0.0.1:7082", tailscale_url=None
+    )
+    provider_service.refresh_host(nas, fetch=lambda host: CODEX_ERROR_PAYLOAD)
+    provider_service.refresh_host(
+        mac_mini,
+        fetch=lambda host: _relabelled_payload(
+            GOOD_PAYLOAD, snapshot_id="snapshot-mac", dedup_key="dedup-mac"
+        ),
+    )
+
+    labels = {
+        (account.host_id, account.account_label)
+        for account in provider_service.latest_accounts()
+        if account.provider == "openai"
+    }
+
+    # One host reporting a real account says nothing about another host.
+    assert labels == {("mac-mini", "person@example.com"), ("nas", "Codex")}
 
 
 def test_provider_window_rejects_negative_percent():
@@ -236,6 +316,17 @@ def test_codex_probe_reads_plan_and_multiple_windows(fake_codex_app_server):
     assert snapshot.windows[0].resets_at == datetime(
         2024, 11, 7, 2, 40, tzinfo=timezone.utc
     )
+
+
+def test_codex_probe_separates_a_missing_cli_from_a_host_failure(tmp_path):
+    # "unavailable" is also the host-level catch-all, so a CLI that is simply
+    # not on the daemon's PATH needs its own category to stay actionable.
+    snapshot = CodexUsageProbe(
+        command=(str(tmp_path / "definitely-not-installed"), "app-server", "--stdio")
+    ).read()
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "cli_not_found"
 
 
 def test_codex_probe_times_out_without_exposing_stderr(fake_codex_app_server):

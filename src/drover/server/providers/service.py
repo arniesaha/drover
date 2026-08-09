@@ -132,6 +132,7 @@ class ProviderUsageService:
             snapshots = self._scope_connector_errors(snapshots)
             self._persist_new_snapshots(snapshots, host_id=host_id)
             self._record_snapshot_attempts(snapshots, attempted_at=attempted_at)
+            self._retire_unreported_accounts(snapshots, host_id=host_id)
             return snapshots
         except Exception as exc:  # A connector failure must not stop refresh loops.
             self._record_host_failure(
@@ -159,6 +160,7 @@ class ProviderUsageService:
             existing = con.execute("""
                 SELECT provider, host_id, account_label
                 FROM provider_connections
+                WHERE enabled
                 ORDER BY provider, host_id, account_label
                 """).fetchall()
         finally:
@@ -188,6 +190,42 @@ class ProviderUsageService:
             )
         return tuple(scoped)
 
+    def _retire_unreported_accounts(
+        self,
+        snapshots: tuple[ProviderAccountSnapshot, ...],
+        *,
+        host_id: str,
+    ) -> None:
+        """Disable identities a host has stopped reporting for a provider.
+
+        An account label can be abandoned: a probe that fails before reading
+        the account falls back to a provider-generic label, and that label
+        becomes its own identity. Nothing rewrites it once the host starts
+        reporting the real account, so without this it stays projected forever
+        at the reading that stranded it. Scoped to the providers named in this
+        refresh, so a host reporting one provider cannot retire another.
+        """
+        if not snapshots:
+            return
+        reported: dict[str, set[str]] = {}
+        for snapshot in snapshots:
+            reported.setdefault(snapshot.provider, set()).add(snapshot.account_label)
+        con = open_duckdb_connection(self.duckdb_path)
+        try:
+            for provider, labels in reported.items():
+                placeholders = ",".join("?" for _ in labels)
+                con.execute(
+                    f"""
+                    UPDATE provider_connections
+                    SET enabled = FALSE, updated_at = ?
+                    WHERE host_id = ? AND provider = ?
+                      AND account_label NOT IN ({placeholders})
+                    """,
+                    [self.clock(), host_id, provider, *sorted(labels)],
+                )
+        finally:
+            con.close()
+
     def latest_accounts(self) -> list[ProviderAccountSnapshot]:
         """Return last-good accounts with current connector state overlaid."""
         con = open_duckdb_connection(
@@ -215,6 +253,10 @@ class ProviderUsageService:
         latest: list[ProviderAccountSnapshot] = []
         now = self.clock()
         for key, account_snapshots in by_account.items():
+            if connections.get(key, {}).get("enabled") is False:
+                # Retired identity: its snapshots stay as history, but the host
+                # no longer reports it, so it is not a current account.
+                continue
             base = next(
                 (
                     snapshot
