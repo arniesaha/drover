@@ -95,6 +95,7 @@ class TelemetryAggregate:
     prompt_tokens: int
     cache_read_tokens: int
     facts_complete: bool
+    input_span_records: int
     source_ref: str
 
     def __post_init__(self) -> None:
@@ -111,6 +112,7 @@ class TelemetryAggregate:
             "cost_observed_sessions",
             "prompt_tokens",
             "cache_read_tokens",
+            "input_span_records",
         )
         for field_name in count_fields:
             _require_nonnegative(getattr(self, field_name), field_name)
@@ -134,6 +136,7 @@ class RoutingAggregate:
     decision_count: int
     mismatch_count: int
     facts_complete: bool
+    input_span_records: int
     source_ref: str
 
     def __post_init__(self) -> None:
@@ -150,6 +153,7 @@ class RoutingAggregate:
             raise ValueError("facts_complete must be a boolean")
         _require_nonnegative(self.decision_count, "decision_count")
         _require_nonnegative(self.mismatch_count, "mismatch_count")
+        _require_nonnegative(self.input_span_records, "input_span_records")
         if self.mismatch_count > self.decision_count:
             raise ValueError("mismatch_count cannot exceed decision_count")
 

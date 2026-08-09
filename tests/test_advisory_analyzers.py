@@ -80,6 +80,7 @@ def _telemetry(**overrides: object) -> TelemetryAggregate:
         "prompt_tokens": 10_000,
         "cache_read_tokens": 5_000,
         "facts_complete": True,
+        "input_span_records": 10,
         "source_ref": "analytics:mac-mini/codex/24h",
     }
     values.update(overrides)
@@ -357,6 +358,7 @@ def test_routing_mismatch_frequency_is_confirmed() -> None:
         decision_count=20,
         mismatch_count=5,
         facts_complete=True,
+        input_span_records=20,
         source_ref="routing:mac-mini/codex/openai/24h",
     )
 

@@ -51,6 +51,7 @@ from drover.server.advisory.content_targets import BundledTarget, ContentBundle
 from drover.server.cockpit.service import ProviderRefreshLoop
 from drover.server.ledger import Ledger
 from drover.server.providers.service import ProviderUsageService
+from drover.server.providers.types import ProviderAccountSnapshot
 from drover.server.__main__ import _create_content_analysis_worker
 from drover.server.harness.registry import HarnessRegistry
 
@@ -192,6 +193,7 @@ def _telemetry_snapshot(source_version: str) -> AnalysisSnapshot:
                 prompt_tokens=1,
                 cache_read_tokens=0,
                 facts_complete=True,
+                input_span_records=1,
                 source_ref="test:telemetry",
             ),
         ),
@@ -1576,7 +1578,7 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
             INSERT INTO spans_enriched
             SELECT 'span-' || i, 'selected', ? - i * INTERVAL 1 SECOND,
                    'openai', 'openai', 'gpt-4', 1, 1, 0, 0.1
-            FROM range(70) rows(i)
+            FROM range(9000) rows(i)
             """,
             [NOW],
         )
@@ -1590,6 +1592,8 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
 
     assert telemetry.telemetry[0].prompt_tokens == 64
     assert routing.routing[0].decision_count == 64
+    assert telemetry.telemetry[0].input_span_records == 8192
+    assert routing.routing[0].input_span_records == 8192
     assert telemetry.telemetry[0].facts_complete is False
     assert routing.routing[0].facts_complete is False
     assert operational_analyzers()[2].analyze(telemetry) == []
@@ -1828,6 +1832,68 @@ def test_reset_window_snapshot_marks_truncation_and_hash_tracks_window_change(
     assert len(truncated.provider_connections[0].reset_windows) == 32
     assert truncated.provider_connections[0].reset_windows_complete is False
     assert operational_analyzers()[1].analyze(truncated) == []
+
+
+def test_empty_production_provider_windows_cannot_resolve_reset_finding(
+    db_path: Path, tmp_path: Path
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.provider_reset_windows",
+            rule_id="connector.contradictory_reset_window",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI reports a contradictory reset window",
+            impact="The reset countdown cannot be trusted.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=NOW,
+                    fields={"invalid_window_count": 1},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    snapshot = ProviderAccountSnapshot(
+        snapshot_id="empty-windows",
+        dedup_key="empty-windows-dedup",
+        provider="openai",
+        account_label="personal",
+        plan_label="plus",
+        host_id="mac-mini",
+        status="ok",
+        observed_at=NOW,
+        windows=(),
+        source="codex-app-server",
+    )
+    service = ProviderUsageService(db_path, tmp_path / "lake")
+    service._persist_new_snapshots((snapshot,), host_id="mac-mini")
+    service._record_snapshot_attempts((snapshot,), attempted_at=NOW)
+    loaded = load_operational_snapshot(
+        db_path, "deterministic.provider_reset_windows", "fleet", "empty:v2"
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.provider_reset_windows",
+        target_id="fleet",
+        source_version="empty:v2",
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: loaded,
+    )
+
+    assert loaded.provider_connections[0].reset_windows == ()
+    assert loaded.provider_connections[0].reset_windows_complete is False
+    assert worker.run_once([operational_analyzers()[1]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "open"
 
 
 def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(

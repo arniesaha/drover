@@ -60,7 +60,12 @@ log = logging.getLogger("drover.advisory")
 SnapshotFactory = Callable[[str, str, str], AnalysisSnapshot]
 MAX_SNAPSHOT_SPANS = 4096
 MAX_SNAPSHOT_SPANS_PER_SESSION = 64
+# Immutable span evidence is the deterministic latest slice from this bounded
+# lookback. The cap+1 probe marks a busy slice incomplete without feeding more
+# than MAX_RAW_SNAPSHOT_SPANS rows into any join, window, or aggregate.
+MAX_RAW_SNAPSHOT_SPANS = 8192
 MAX_RESET_WINDOWS_PER_CONNECTION = 32
+OPERATIONAL_SPAN_LOOKBACK = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -1034,7 +1039,7 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
     reset_completeness: dict[tuple[str, str, str], bool] = {}
     for provider, account_label, host_id, kind, starts_at, resets_at, count in windows:
         key = (str(provider), str(account_label), str(host_id))
-        reset_completeness[key] = int(count) <= MAX_RESET_WINDOWS_PER_CONNECTION
+        reset_completeness[key] = 0 < int(count) <= MAX_RESET_WINDOWS_PER_CONNECTION
         if kind is not None:
             windows_by_account.setdefault(key, []).append(
                 ProviderResetWindow(
@@ -1083,6 +1088,25 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
           SELECT * FROM ranked_sessions
           WHERE snapshot_session_no <= {MAX_SNAPSHOT_RECORDS}
         ),
+        raw_span_candidates AS (
+          SELECT span_id, session_id, start_time, total_tokens, prompt_tokens,
+                 cost_usd, cache_read_tokens
+          FROM spans_enriched
+          WHERE start_time >= ? AND start_time <= ?
+          ORDER BY start_time DESC NULLS LAST, span_id
+          LIMIT {MAX_RAW_SNAPSHOT_SPANS + 1}
+        ),
+        raw_span_status AS (
+          SELECT count(*) > {MAX_RAW_SNAPSHOT_SPANS} AS raw_spans_truncated,
+                 least(count(*), {MAX_RAW_SNAPSHOT_SPANS})::BIGINT
+                   AS input_span_records
+          FROM raw_span_candidates
+        ),
+        raw_spans AS (
+          SELECT * FROM raw_span_candidates
+          ORDER BY start_time DESC NULLS LAST, span_id
+          LIMIT {MAX_RAW_SNAPSHOT_SPANS}
+        ),
         ranked_spans AS (
           SELECT s.*,
                  row_number() OVER (
@@ -1090,7 +1114,7 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                    ORDER BY s.start_time DESC NULLS LAST, s.span_id
                  ) AS session_span_no,
                  count(*) OVER (PARTITION BY s.session_id) AS session_span_count
-          FROM spans_enriched s
+          FROM raw_spans s
           JOIN bounded_sessions h USING (session_id)
         ),
         per_session_spans AS (
@@ -1141,17 +1165,24 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                COALESCE(sum(s.cache_read_tokens), 0)::BIGINT,
                NOT (
                  max(h.snapshot_session_count) > {MAX_SNAPSHOT_RECORDS}
+                 OR any_value(raw_bounds.raw_spans_truncated)
                  OR any_value(bounds.global_spans_truncated)
                  OR COALESCE(bool_or(s.spans_truncated), FALSE)
-               )
+               ),
+               any_value(raw_bounds.input_span_records)
         FROM bounded_sessions h
         LEFT JOIN span_sessions s USING (session_id)
         CROSS JOIN span_status bounds
+        CROSS JOIN raw_span_status raw_bounds
         GROUP BY h.host_id, h.harness
         ORDER BY h.host_id, h.harness
         LIMIT {MAX_SNAPSHOT_RECORDS}
         """,
-        params,
+        [
+            *params,
+            analyzed_at - OPERATIONAL_SPAN_LOOKBACK,
+            analyzed_at,
+        ],
     ).fetchall()
     return tuple(
         TelemetryAggregate(
@@ -1167,6 +1198,7 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
             prompt_tokens=int(row[8]),
             cache_read_tokens=int(row[9]),
             facts_complete=bool(row[10]),
+            input_span_records=int(row[11]),
             source_ref=f"normalized-telemetry:{row[0]}/{row[1]}",
         )
         for row in rows
@@ -1190,6 +1222,25 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
           SELECT * FROM ranked_sessions
           WHERE snapshot_session_no <= {MAX_SNAPSHOT_RECORDS}
         ),
+        raw_span_candidates AS (
+          SELECT span_id, session_id, start_time, routing_provider,
+                 llm_provider, routing_model
+          FROM spans_enriched
+          WHERE start_time >= ? AND start_time <= ?
+          ORDER BY start_time DESC NULLS LAST, span_id
+          LIMIT {MAX_RAW_SNAPSHOT_SPANS + 1}
+        ),
+        raw_span_status AS (
+          SELECT count(*) > {MAX_RAW_SNAPSHOT_SPANS} AS raw_spans_truncated,
+                 least(count(*), {MAX_RAW_SNAPSHOT_SPANS})::BIGINT
+                   AS input_span_records
+          FROM raw_span_candidates
+        ),
+        raw_spans AS (
+          SELECT * FROM raw_span_candidates
+          ORDER BY start_time DESC NULLS LAST, span_id
+          LIMIT {MAX_RAW_SNAPSHOT_SPANS}
+        ),
         ranked_spans AS (
           SELECT s.*,
                  row_number() OVER (
@@ -1197,7 +1248,7 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
                    ORDER BY s.start_time DESC NULLS LAST, s.span_id
                  ) AS session_span_no,
                  count(*) OVER (PARTITION BY s.session_id) AS session_span_count
-          FROM spans_enriched s
+          FROM raw_spans s
           JOIN bounded_sessions h USING (session_id)
         ),
         per_session_spans AS (
@@ -1223,20 +1274,27 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
                count(*) FILTER (WHERE s.routing_model <> h.model),
                NOT (
                  max(h.snapshot_session_count) > {MAX_SNAPSHOT_RECORDS}
+                 OR any_value(raw_bounds.raw_spans_truncated)
                  OR bool_or(
                    s.session_span_count > {MAX_SNAPSHOT_SPANS_PER_SESSION}
                    OR s.bounded_span_count > {MAX_SNAPSHOT_SPANS}
                  )
-               )
+               ),
+               any_value(raw_bounds.input_span_records)
         FROM bounded_sessions h
         JOIN bounded_spans s USING (session_id)
+        CROSS JOIN raw_span_status raw_bounds
         WHERE h.model IS NOT NULL
           AND s.routing_model IS NOT NULL
         GROUP BY h.host_id, h.harness, provider
         ORDER BY h.host_id, h.harness, provider
         LIMIT {MAX_SNAPSHOT_RECORDS}
         """,
-        params,
+        [
+            *params,
+            analyzed_at - OPERATIONAL_SPAN_LOOKBACK,
+            analyzed_at,
+        ],
     ).fetchall()
     return tuple(
         RoutingAggregate(
@@ -1248,6 +1306,7 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
             decision_count=int(row[4]),
             mismatch_count=int(row[5]),
             facts_complete=bool(row[6]),
+            input_span_records=int(row[7]),
             source_ref=f"normalized-routing:{row[0]}/{row[1]}/{row[2]}",
         )
         for row in rows
@@ -1384,6 +1443,7 @@ def _operational_material(
                 "prompt_tokens": item.prompt_tokens,
                 "cache_read_tokens": item.cache_read_tokens,
                 "facts_complete": item.facts_complete,
+                "input_span_records": item.input_span_records,
             }
             for item in snapshot.telemetry
         ]
@@ -1397,6 +1457,7 @@ def _operational_material(
                 "decision_count": item.decision_count,
                 "mismatch_count": item.mismatch_count,
                 "facts_complete": item.facts_complete,
+                "input_span_records": item.input_span_records,
             }
             for item in snapshot.routing
         ]
