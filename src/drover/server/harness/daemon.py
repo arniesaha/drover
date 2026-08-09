@@ -38,6 +38,7 @@ from drover.server.harness.auth import (
     executable_path_prefix,
     resolve_executable,
 )
+from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import HarnessEvent
@@ -1254,6 +1255,7 @@ class HarnessDaemonState:
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     provider_usage_probe: CodexUsageProbe | None = None
     advisory_content: "AdvisoryContentConfig | None" = None
+    content_consent: DurableContentConsent | None = None
 
     def recovery_lock_for(self, session_id: str) -> threading.Lock:
         with self.recovery_locks_guard:
@@ -1361,6 +1363,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/advisory/content-bundle":
             self._advisory_content_bundle()
+            return
+        if parsed.path == "/advisory/content-consent":
+            self._advisory_content_consent()
             return
         if parsed.path == "/sessions":
             self._create_session()
@@ -1488,12 +1493,19 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         config = self.server.state.advisory_content
-        if config is None or not config.enabled:
+        live_consent = self.server.state.content_consent
+        enabled = (
+            live_consent.snapshot()["enabled"]
+            if live_consent is not None
+            else bool(config is not None and config.enabled)
+        )
+        if config is None or not enabled:
             self._write_json(
                 {"error": "content analysis is disabled"},
                 status=HTTPStatus.FORBIDDEN,
             )
             return
+
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -1580,6 +1592,36 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             selected.clear()
             bundle = None
             payload = None
+
+    def _advisory_content_consent(self) -> None:
+        # Unlike the daemon's ordinary endpoints, auth-off mode is never
+        # accepted for consent mutation: an empty token is fail-closed.
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json(
+                {"error": "authentication required"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        body = self._read_json()
+        if body is None or set(body) != {"enabled", "epoch"}:
+            self._write_json(
+                {"error": "request must contain only enabled and epoch"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        consent = self.server.state.content_consent
+        if consent is None:
+            self._write_json(
+                {"error": "content consent storage is unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            applied = consent.apply(enabled=body["enabled"], epoch=body["epoch"])
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        self._write_json(applied)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -2997,8 +3039,30 @@ def _post_central_json(
         request.add_header("Authorization", f"Bearer {state.host_token}")
     try:
         with urlopen(request, timeout=5) as response:
-            return 200 <= response.status < 300
-    except (OSError, URLError):
+            if not 200 <= response.status < 300:
+                return False
+            body = response.read(64 * 1024 + 1)
+            if len(body) > 64 * 1024:
+                return False
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            remote_consent = (
+                payload.get("content_consent") if isinstance(payload, dict) else None
+            )
+            if remote_consent is not None:
+                if (
+                    not isinstance(remote_consent, dict)
+                    or set(remote_consent) != {"enabled", "epoch"}
+                    or state.content_consent is None
+                ):
+                    return False
+                state.content_consent.apply(
+                    enabled=remote_consent["enabled"], epoch=remote_consent["epoch"]
+                )
+            return True
+    except (OSError, URLError, ValueError):
         return False
 
 
@@ -3044,7 +3108,19 @@ def run_harnessd(
     host_token: str | None = None,
     relay: bool = False,
     advisory_content: "AdvisoryContentConfig | None" = None,
+    content_consent_path: Path | None = None,
 ) -> None:
+    consent_path = content_consent_path or (
+        Path(duckdb_path).parent / ".harness-content-consent.json"
+    )
+    content_consent = DurableContentConsent(
+        consent_path,
+        initial_enabled=bool(
+            not central_url
+            and advisory_content is not None
+            and advisory_content.enabled
+        ),
+    )
     state = HarnessDaemonState(
         host_id=host_id,
         display_name=display_name,
@@ -3058,6 +3134,7 @@ def run_harnessd(
         host_token=host_token,
         relay=relay,
         advisory_content=advisory_content,
+        content_consent=content_consent,
     )
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token

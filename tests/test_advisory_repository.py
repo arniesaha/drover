@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 import stat
+import threading
 
 import duckdb
 import pytest
@@ -127,6 +128,85 @@ def test_content_analysis_consent_creates_missing_default_deny_config(
     assert load_config(config_path).advisory_content.enabled is True
 
 
+def test_content_consent_propagates_monotonic_epoch_and_reports_partial_hosts(
+    repository, content_config_path
+):
+    """Catches central consent changing only its own config file."""
+
+    calls = []
+
+    def propagate(enabled, epoch):
+        calls.append((enabled, epoch))
+        return [
+            {"host_id": "mac-mini", "state": "acknowledged"},
+            {"host_id": "laptop", "state": "disconnected"},
+        ]
+
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=propagate,
+    )
+
+    enabled = service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+    revoked = service.revoke_content_analysis()
+
+    assert calls == [(True, 1), (False, 2)]
+    assert enabled["consent_epoch"] == 1
+    assert enabled["propagation"] == "partial"
+    assert enabled["hosts"] == [
+        {"host_id": "mac-mini", "state": "acknowledged"},
+        {"host_id": "laptop", "state": "disconnected"},
+    ]
+    assert revoked["consent_epoch"] == 2
+    assert revoked["propagation"] == "partial"
+    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
+
+
+def test_consent_mutations_serialize_without_holding_content_operation_fence(
+    repository, content_config_path
+):
+    """Catches overlapping enable/revoke responses publishing stale outcomes."""
+
+    enable_entered = threading.Event()
+    release_enable = threading.Event()
+    revoke_entered = threading.Event()
+
+    def propagate(enabled, epoch):
+        if enabled:
+            enable_entered.set()
+            assert release_enable.wait(2)
+        else:
+            revoke_entered.set()
+        return []
+
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=propagate,
+    )
+    enabling = threading.Thread(
+        target=lambda: service.consent_content_analysis(
+            backend="local", external_disclosure_accepted=False
+        )
+    )
+    revoking = threading.Thread(target=service.revoke_content_analysis)
+    enabling.start()
+    assert enable_entered.wait(2)
+    revoking.start()
+
+    assert revoke_entered.wait(0.2) is False
+    release_enable.set()
+    enabling.join(2)
+    revoking.join(2)
+
+    assert not enabling.is_alive()
+    assert not revoking.is_alive()
+    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
+
+
 def test_content_consent_fsyncs_directory_after_atomic_replace(
     repository, content_config_path, monkeypatch
 ):
@@ -152,7 +232,14 @@ def test_content_consent_fsyncs_directory_after_atomic_replace(
         backend="local", external_disclosure_accepted=False
     )
 
-    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert events == [
+        "file_fsync",
+        "replace",
+        "directory_fsync",
+        "file_fsync",
+        "replace",
+        "directory_fsync",
+    ]
 
 
 def test_content_analysis_revoke_cancels_model_jobs_but_keeps_findings(

@@ -65,6 +65,7 @@ def run_harnessd_from_options(
     relay: bool = False,
 ) -> None:
     cfg = resolve_config(config_path)
+    resolved_config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     bootstrap_harnessd_schema(cfg)
     listen_host, listen_port = parse_listen_address(listen)
     click.echo(f"drover-harnessd {host_id} listening on {listen_host}:{listen_port}")
@@ -81,6 +82,9 @@ def run_harnessd_from_options(
         host_token=host_token,
         relay=relay,
         advisory_content=cfg.advisory_content,
+        content_consent_path=resolved_config_path.with_name(
+            f".{resolved_config_path.name}.harness-content-consent.json"
+        ),
     )
 
 

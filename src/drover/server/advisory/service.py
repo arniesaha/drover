@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from drover.config import default_config, default_config_path, load_config
 from drover.server.advisory.jobs import (
@@ -31,6 +31,7 @@ from drover.server.advisory.types import (
     Severity,
 )
 from drover.server.db import open_duckdb_connection
+from drover.server.harness.content_consent import DurableContentConsent
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
@@ -47,6 +48,7 @@ class _ContentConsentCoordinator:
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self._mutation_lock = threading.Lock()
         self._condition = threading.Condition(self.lock)
         self._active = 0
         self._revoking = False
@@ -95,6 +97,13 @@ class _ContentConsentCoordinator:
     def wait_for_revocation(self) -> None:
         while self._revoking:
             self._condition.wait()
+
+    @contextmanager
+    def mutation(self):
+        # Consent mutations include bounded host I/O. Serialize them without
+        # holding ``lock``, which remains the content-operation fence.
+        with self._mutation_lock:
+            yield
 
 
 _CONTENT_CONSENT_COORDINATOR = _ContentConsentCoordinator()
@@ -165,10 +174,23 @@ class InsightsService:
         duckdb_path: str | Path,
         *,
         config_path: str | Path | None = None,
+        consent_propagator: Callable[[bool, int], list[dict[str, str]]] | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.config_path = Path(config_path or default_config_path()).expanduser()
         self.repository = AdvisoryRepository(self.duckdb_path)
+        self._content_consent = DurableContentConsent(
+            self.config_path.with_name(f".{self.config_path.name}.content-consent.json")
+        )
+        self._consent_propagator = consent_propagator
+
+    def set_content_consent_propagator(
+        self, propagator: Callable[[bool, int], list[dict[str, str]]]
+    ) -> None:
+        self._consent_propagator = propagator
+
+    def content_consent_state(self) -> dict[str, Any]:
+        return self._content_consent.snapshot()
 
     def content_analysis_status(self) -> dict[str, Any]:
         """Return only consent state and a bounded pending-job count."""
@@ -186,6 +208,18 @@ class InsightsService:
         }
 
     def consent_content_analysis(
+        self,
+        *,
+        backend: str,
+        external_disclosure_accepted: bool,
+    ) -> dict[str, Any]:
+        with _CONTENT_CONSENT_COORDINATOR.mutation():
+            return self._consent_content_analysis(
+                backend=backend,
+                external_disclosure_accepted=external_disclosure_accepted,
+            )
+
+    def _consent_content_analysis(
         self,
         *,
         backend: str,
@@ -211,16 +245,25 @@ class InsightsService:
                 external_disclosure_accepted=disclosure,
             )
             _CONTENT_CONSENT_COORDINATOR.advance_generation()
+            consent = self._advance_content_consent(enabled=True)
             pending = self._pending_model_job_count()
-        return {
+        result = {
             "enabled": True,
             "backend": backend,
             "external_disclosure_accepted": disclosure,
             "pending_model_jobs": pending,
         }
+        self._append_propagation(result, consent)
+        return result
 
     def revoke_content_analysis(self) -> dict[str, Any]:
         """Disable model analysis before atomically cancelling runnable jobs."""
+
+        with _CONTENT_CONSENT_COORDINATOR.mutation():
+            return self._revoke_content_analysis()
+
+    def _revoke_content_analysis(self) -> dict[str, Any]:
+        """Perform one serialized revocation without locking across host I/O."""
 
         with CONTENT_CONSENT_FENCE:
             _CONTENT_CONSENT_COORDINATOR.begin_revocation()
@@ -231,18 +274,69 @@ class InsightsService:
                     external_disclosure_accepted=False,
                 )
                 _CONTENT_CONSENT_COORDINATOR.advance_generation()
+                consent = self._advance_content_consent(enabled=False)
+            except Exception:
+                _CONTENT_CONSENT_COORDINATOR.finish_revocation()
+                raise
+        hosts = self._propagate_content_consent(consent)
+        with CONTENT_CONSENT_FENCE:
+            try:
                 _CONTENT_CONSENT_COORDINATOR.wait_for_idle()
                 cancelled = self._cancel_pending_model_jobs()
                 pending = self._pending_model_job_count()
             finally:
                 _CONTENT_CONSENT_COORDINATOR.finish_revocation()
-        return {
+        result = {
             "enabled": False,
             "backend": "local",
             "external_disclosure_accepted": False,
             "pending_model_jobs": pending,
             "cancelled_model_jobs": cancelled,
         }
+        self._append_propagation(result, consent, hosts=hosts)
+        return result
+
+    def _advance_content_consent(self, *, enabled: bool) -> dict[str, Any]:
+        current = self._content_consent.snapshot()
+        return self._content_consent.apply(
+            enabled=enabled, epoch=int(current["epoch"]) + 1
+        )
+
+    def _propagate_content_consent(
+        self, consent: Mapping[str, Any]
+    ) -> list[dict[str, str]]:
+        if self._consent_propagator is None:
+            return []
+        try:
+            return self._consent_propagator(
+                bool(consent["enabled"]), int(consent["epoch"])
+            )
+        except Exception:
+            return [{"host_id": "fleet", "state": "failed"}]
+
+    def _append_propagation(
+        self,
+        result: dict[str, Any],
+        consent: Mapping[str, Any],
+        *,
+        hosts: list[dict[str, str]] | None = None,
+    ) -> None:
+        if self._consent_propagator is None:
+            return
+        if hosts is None:
+            hosts = self._propagate_content_consent(consent)
+        states = {host.get("state") for host in hosts}
+        if "failed" in states:
+            propagation = "failed"
+        elif "disconnected" in states:
+            propagation = "partial"
+        else:
+            propagation = "complete"
+        result.update(
+            consent_epoch=int(consent["epoch"]),
+            propagation=propagation,
+            hosts=hosts,
+        )
 
     def pending_model_jobs(self) -> list[dict[str, str]]:
         con = open_duckdb_connection(

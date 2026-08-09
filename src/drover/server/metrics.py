@@ -810,6 +810,9 @@ class MetricsCollector:
             from drover.server.advisory.service import InsightsService
 
             self.advisory_service = InsightsService(self.duckdb_path)
+        self.advisory_service.set_content_consent_propagator(
+            self._propagate_content_consent
+        )
         return self.advisory_service
 
     def render_insights_json(self, filters: "InsightFilters") -> tuple[int, str]:
@@ -839,7 +842,10 @@ class MetricsCollector:
                 backend=backend,
                 external_disclosure_accepted=disclosure,
             )
-            return _json_response(200, payload)
+            return _json_response(
+                200 if payload.get("propagation") == "complete" else 207,
+                payload,
+            )
         except Exception as exc:
             return _insight_error_response(exc)
 
@@ -848,7 +854,11 @@ class MetricsCollector:
 
         try:
             validate_action_body(body, allowed=set())
-            return _json_response(200, self._insights().revoke_content_analysis())
+            payload = self._insights().revoke_content_analysis()
+            return _json_response(
+                503 if payload.get("propagation") == "failed" else 200,
+                payload,
+            )
         except Exception as exc:
             return _insight_error_response(exc)
 
@@ -911,7 +921,13 @@ class MetricsCollector:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)
             return _json_response(500, {"error": str(exc)})
-        return _json_response(200, {"host": host.__dict__})
+        return _json_response(
+            200,
+            {
+                "host": host.__dict__,
+                "content_consent": self._insights().content_consent_state(),
+            },
+        )
 
     def proxy_create_harness_session(
         self, host_id: str, payload: Mapping[str, Any]
@@ -953,6 +969,12 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             raise ValueError(f"unknown harness host: {host_id}")
+        consent = self._insights().content_consent_state()
+        if not consent["enabled"] or int(consent["epoch"]) <= 0:
+            raise RuntimeError("content analysis is disabled")
+        reconciliation = self._push_content_consent(host, consent)
+        if reconciliation["state"] != "acknowledged":
+            raise RuntimeError("content consent is not reconciled on host")
         status, body = self._harness_request(
             host,
             "/advisory/content-bundle",
@@ -979,6 +1001,46 @@ class MetricsCollector:
             payload["bundle_hash"],
         )
         return payload
+
+    def _propagate_content_consent(
+        self, enabled: bool, epoch: int
+    ) -> list[dict[str, str]]:
+        try:
+            hosts = HarnessRegistry(self.duckdb_path).list_hosts(status="online")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to enumerate hosts for content consent: %s", exc)
+            return [{"host_id": "fleet", "state": "failed"}]
+        consent = {"enabled": enabled, "epoch": epoch}
+        return [self._push_content_consent(host, consent) for host in hosts]
+
+    def _push_content_consent(
+        self, host: Any, consent: Mapping[str, Any]
+    ) -> dict[str, str]:
+        status, body = self._harness_request(
+            host,
+            "/advisory/content-consent",
+            method="POST",
+            payload={
+                "enabled": bool(consent["enabled"]),
+                "epoch": int(consent["epoch"]),
+            },
+            timeout_s=10.0,
+        )
+        if status == 502:
+            return {"host_id": host.host_id, "state": "disconnected"}
+        if not 200 <= status < 300:
+            return {"host_id": host.host_id, "state": "failed"}
+        try:
+            acknowledged = json.loads(body)
+        except json.JSONDecodeError:
+            acknowledged = None
+        expected = {
+            "enabled": bool(consent["enabled"]),
+            "epoch": int(consent["epoch"]),
+        }
+        if acknowledged != expected:
+            return {"host_id": host.host_id, "state": "failed"}
+        return {"host_id": host.host_id, "state": "acknowledged"}
 
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         with self._session_lock_for(session_id):
