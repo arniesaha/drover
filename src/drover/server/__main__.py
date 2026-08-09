@@ -124,11 +124,20 @@ def _create_content_analysis_worker(
             payload, host_id=host_id, requested_ids=target_ids
         )
 
+    def _probe(host_id: str, target_ids: tuple[str, ...]) -> str:
+        payload = metrics_collector.fetch_advisory_content_version(
+            host_id, list(target_ids)
+        )
+        bundle_hash = payload.get("bundle_hash")
+        if not isinstance(bundle_hash, str):
+            raise ValueError("content version response has invalid bundle_hash")
+        return bundle_hash
+
     scheduler = ContentAnalysisScheduler(
         duckdb_path=cfg.duckdb_path,
         registry=HarnessRegistry(cfg.duckdb_path),
         consent_reader=consent_reader,
-        bundle_fetcher=_fetch,
+        version_fetcher=_probe,
         interval_seconds=cfg.advisory_full_review_interval_seconds,
     )
     return ContentAnalysisWorker(

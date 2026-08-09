@@ -68,6 +68,31 @@ MAX_RESET_WINDOWS_PER_CONNECTION = 32
 OPERATIONAL_SPAN_LOOKBACK = timedelta(days=7)
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _job_source_version(duckdb_path: Path, job_id: str) -> str | None:
+    con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")
+    try:
+        row = con.execute(
+            """
+            SELECT r.source_version
+            FROM pipeline_jobs j
+            JOIN pipeline_receipts r ON r.receipt_id = j.caused_by_receipt_id
+            WHERE j.job_id = ?
+            """,
+            [job_id],
+        ).fetchone()
+    finally:
+        con.close()
+    return str(row[0]) if row is not None and row[0] is not None else None
+
+
 @dataclass(frozen=True)
 class AdvisoryRunResult:
     succeeded: int = 0
@@ -87,8 +112,12 @@ class ContentBundleFetcher(Protocol):
     def __call__(self, host_id: str, target_ids: tuple[str, ...]) -> ContentBundle: ...
 
 
+class ContentVersionFetcher(Protocol):
+    def __call__(self, host_id: str, target_ids: tuple[str, ...]) -> str: ...
+
+
 class ContentAnalysisScheduler:
-    """Discover consented bundle versions and enqueue coalesced model jobs."""
+    """Discover content hashes and enqueue model jobs without fetching content."""
 
     def __init__(
         self,
@@ -96,7 +125,7 @@ class ContentAnalysisScheduler:
         duckdb_path: str | Path,
         registry,
         consent_reader: Callable[[], AdvisoryContentConfig],
-        bundle_fetcher: ContentBundleFetcher,
+        version_fetcher: ContentVersionFetcher,
         interval_seconds: float,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -105,13 +134,13 @@ class ContentAnalysisScheduler:
         self.duckdb_path = Path(duckdb_path)
         self.registry = registry
         self.consent_reader = consent_reader
-        self.bundle_fetcher = bundle_fetcher
+        self.version_fetcher = version_fetcher
         self.interval_seconds = interval_seconds
         self.clock = clock
-        self._last_signature: tuple[int, str] | None = None
-        self._scheduled_hosts: set[str] = set()
+        self._last_host_signatures: dict[str, tuple[int, str, str]] = {}
+        self.last_failures: dict[str, str] = {}
 
-    def enqueue_due(self) -> dict[str, ContentBundle]:
+    def enqueue_due(self) -> dict[str, str]:
         from drover.server.advisory.service import content_consent_generation
 
         config = self.consent_reader()
@@ -137,36 +166,50 @@ class ContentAnalysisScheduler:
         )
         material_hash = hashlib.sha256(material.encode()).hexdigest()
         bucket = int(self.clock() // self.interval_seconds)
-        signature = (bucket, material_hash)
-        if signature != self._last_signature:
-            self._scheduled_hosts.clear()
-
-        discovered: dict[str, ContentBundle] = {}
+        discovered: dict[str, str] = {}
+        failures: dict[str, str] = {}
         for host in self.registry.list_hosts():
-            if host.host_id in self._scheduled_hosts:
-                continue
             from drover.server.advisory.service import content_consent_operation
 
-            with content_consent_operation() as live_generation:
-                live = self.consent_reader()
-                if (
-                    live_generation != consent_generation
-                    or not live.enabled
-                    or _content_config_version(live) != _content_config_version(config)
-                ):
-                    return {}
-                bundle = self.bundle_fetcher(host.host_id, target_ids)
-                enqueue_advisory_check(
-                    self.duckdb_path,
-                    analyzer_id=MODEL_ANALYZER_ID,
-                    target_id=host.host_id,
-                    source_version=(
-                        f"{bundle.bundle_hash}:scheduled:{bucket}:{material_hash}"
-                    ),
+            try:
+                with content_consent_operation() as live_generation:
+                    live = self.consent_reader()
+                    if (
+                        live_generation != consent_generation
+                        or not live.enabled
+                        or _content_config_version(live)
+                        != _content_config_version(config)
+                    ):
+                        self.last_failures = failures
+                        return {}
+                    bundle_hash = self.version_fetcher(host.host_id, target_ids)
+                    if not _is_sha256(bundle_hash):
+                        raise ValueError("content version must be a SHA-256 hash")
+                    signature = (bucket, material_hash, bundle_hash)
+                    if self._last_host_signatures.get(host.host_id) == signature:
+                        continue
+                    source_version = f"{bundle_hash}:scheduled:{bucket}:{material_hash}"
+                    job = enqueue_advisory_check(
+                        self.duckdb_path,
+                        analyzer_id=MODEL_ANALYZER_ID,
+                        target_id=host.host_id,
+                        source_version=source_version,
+                    )
+                    if (
+                        _job_source_version(self.duckdb_path, job.job_id)
+                        != source_version
+                    ):
+                        # A currently leased older generation cannot be retargeted.
+                        # Leave the signature unsaved so the next poll retries it.
+                        continue
+                    discovered[host.host_id] = source_version
+                    self._last_host_signatures[host.host_id] = signature
+            except Exception:  # noqa: BLE001 - isolate one unreachable host
+                failures[host.host_id] = "version_probe_failed"
+                log.warning(
+                    "content advisory version probe failed host=%s", host.host_id
                 )
-                discovered[host.host_id] = bundle
-                self._scheduled_hosts.add(host.host_id)
-        self._last_signature = signature
+        self.last_failures = failures
         return discovered
 
 
@@ -208,13 +251,11 @@ class ContentAnalysisWorker:
 
         from drover.server.advisory.service import content_consent_operation
 
-        prefetched: dict[str, ContentBundle] = {}
         if self.scheduler is not None:
-            prefetched = self.scheduler.enqueue_due()
+            self.scheduler.enqueue_due()
         with content_consent_operation():
             config = self.consent_reader()
             if not config.enabled:
-                prefetched.clear()
                 return AdvisoryRunResult(skipped=1)
             if self.duckdb_path is None or self.repository is None:
                 raise ValueError(
@@ -230,7 +271,6 @@ class ContentAnalysisWorker:
                     host_id=host_id,
                     target_ids=target_ids,
                     job=job,
-                    prefetched_bundle=prefetched.get(host_id),
                 )
                 if result.status == "succeeded":
                     return AdvisoryRunResult(succeeded=1)
@@ -240,8 +280,6 @@ class ContentAnalysisWorker:
                 self._record_content_failure(job)
                 log.warning("content advisory job failed")
                 return AdvisoryRunResult(failed=1)
-            finally:
-                prefetched.clear()
 
     def start(
         self,
@@ -290,20 +328,20 @@ class ContentAnalysisWorker:
             for job_id, subject_key in retry_rows:
                 if str(subject_key).partition(":")[0] == MODEL_ANALYZER_ID:
                     ledger.requeue_job(str(job_id))
-            row = con.execute(
+            rows = con.execute(
                 """
                 SELECT job_id, job_kind, subject_key, status, attempt_count,
                        max_attempts, latest_attempt_id, latest_artifact_id
                 FROM pipeline_jobs
                 WHERE job_kind = ? AND status = 'pending'
                   AND starts_with(subject_key, ?)
-                ORDER BY priority DESC, created_at, job_id LIMIT 1
+                ORDER BY priority DESC, updated_at, created_at, job_id
                 """,
                 [ADVISORY_JOB_KIND, f"{MODEL_ANALYZER_ID}:"],
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            if not rows:
                 return None
-            job = Job(*row)
+            job = Job(*rows[0])
             ledger.lease_job(
                 job.job_id,
                 worker_id=self.worker_id,
@@ -356,7 +394,6 @@ class ContentAnalysisWorker:
         host_id: str,
         target_ids: Iterable[str],
         job: Job | None = None,
-        prefetched_bundle: ContentBundle | None = None,
     ) -> ContentAnalysisResult:
         from drover.server.advisory.service import content_consent_operation
 
@@ -365,7 +402,6 @@ class ContentAnalysisWorker:
                 host_id=host_id,
                 target_ids=target_ids,
                 job=job,
-                prefetched_bundle=prefetched_bundle,
                 consent_generation=consent_generation,
             )
 
@@ -376,7 +412,6 @@ class ContentAnalysisWorker:
         target_ids: Iterable[str],
         consent_generation: int,
         job: Job | None = None,
-        prefetched_bundle: ContentBundle | None = None,
     ) -> ContentAnalysisResult:
         requested = tuple(target_ids)
         if not requested:
@@ -396,17 +431,24 @@ class ContentAnalysisWorker:
             config = self.consent_reader()
             if not config.enabled:
                 return ContentAnalysisResult(status="revoked", artifact={})
-            if prefetched_bundle is None:
-                try:
-                    fetched = self.bundle_fetcher(host_id, requested)
-                except Exception:
-                    raise ModelFindingError("content bundle fetch failed") from None
-            else:
-                fetched = prefetched_bundle
+            try:
+                fetched = self.bundle_fetcher(host_id, requested)
+            except Exception:
+                raise ModelFindingError("content bundle fetch failed") from None
             bundle = validate_content_bundle(
                 fetched, host_id=host_id, requested_ids=requested
             )
             fetched = None
+            if job is not None:
+                assert self.duckdb_path is not None
+                source_version = _job_source_version(self.duckdb_path, job.job_id)
+                expected_hash = (
+                    source_version.partition(":")[0]
+                    if source_version is not None
+                    else None
+                )
+                if _is_sha256(expected_hash) and bundle.bundle_hash != expected_hash:
+                    raise ModelFindingError("content changed after version probe")
 
             # Backend creation is also fenced so cloud credentials/transports
             # are never selected from stale consent.

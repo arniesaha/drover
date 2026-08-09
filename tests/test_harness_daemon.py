@@ -751,6 +751,50 @@ def test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephem
     assert not list(tmp_path.rglob("*bundle*"))
 
 
+def test_harnessd_content_version_is_authenticated_hashes_only_and_no_store(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("private prompt body\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+    state.content_consent = DurableContentConsent(tmp_path / "consent.json")
+    state.content_consent.apply(enabled=True, epoch=1)
+
+    def post(*, authorized: bool):
+        headers = {"Content-Type": "application/json"}
+        if authorized:
+            headers["Authorization"] = "Bearer secret"
+        request = urllib.request.Request(
+            f"{base_url}/advisory/content-version",
+            data=json.dumps({"target_ids": ["AGENTS.md"]}).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            post(authorized=False)
+        assert unauthorized.value.code == 401
+
+        with post(authorized=True) as response:
+            body_bytes = response.read()
+            body = json.loads(body_bytes)
+            headers = response.headers
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert headers["Cache-Control"] == "no-store"
+    assert set(body) == {"bundle_hash", "targets"}
+    assert set(body["targets"][0]) == {"target_id", "content_hash"}
+    assert body["targets"][0]["target_id"] == "AGENTS.md"
+    assert b"private prompt body" not in body_bytes
+
+
 def test_harnessd_content_bundle_rejects_oversized_request_before_parsing(tmp_path):
     target = tmp_path / "AGENTS.md"
     target.write_text("Use the deployment skill.\n", encoding="utf-8")

@@ -1364,6 +1364,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/advisory/content-bundle":
             self._advisory_content_bundle()
             return
+        if parsed.path == "/advisory/content-version":
+            self._advisory_content_version()
+            return
         if parsed.path == "/advisory/content-consent":
             self._advisory_content_consent()
             return
@@ -1591,6 +1594,113 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             # the largest references as soon as serialization has completed.
             selected.clear()
             bundle = None
+            payload = None
+
+    def _advisory_content_version(self) -> None:
+        """Return only redacted target hashes behind the live consent epoch."""
+
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json(
+                {"error": "authentication required"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        config = self.server.state.advisory_content
+        live_consent = self.server.state.content_consent
+        snapshot = live_consent.snapshot() if live_consent is not None else None
+        if (
+            config is None
+            or snapshot is None
+            or not snapshot["enabled"]
+            or int(snapshot["epoch"]) <= 0
+        ):
+            self._write_json(
+                {"error": "content analysis is disabled"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._write_json(
+                {"error": "invalid Content-Length"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if content_length > MAX_ADVISORY_BUNDLE_REQUEST_BYTES:
+            self._write_json(
+                {"error": "content version request exceeds byte limit"},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
+        body = self._read_json()
+        if body is None or set(body) != {"target_ids"}:
+            self._write_json(
+                {"error": "request must contain only target_ids"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        target_ids = body.get("target_ids")
+        if not _valid_content_target_ids(target_ids):
+            self._write_json(
+                {"error": "target_ids must be a non-empty list of unique IDs"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        from drover.server.advisory.content_targets import (
+            ContentTarget,
+            ContentTargetError,
+            build_content_version,
+        )
+
+        configured: dict[str, ContentTarget] = {}
+        for configured_path in config.targets:
+            target = ContentTarget(Path(configured_path))
+            if target.target_id in configured:
+                self._write_json(
+                    {"error": "configured advisory target IDs must be unique"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            configured[target.target_id] = target
+        if any(target_id not in configured for target_id in target_ids):
+            self._write_json(
+                {"error": "unknown advisory content target ID"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        selected = [configured[target_id] for target_id in target_ids]
+        version = None
+        payload = None
+        try:
+            version = build_content_version(
+                selected,
+                allowed_roots=config.allowed_roots,
+                host_id=self.server.state.host_id,
+                max_file_bytes=config.max_file_bytes,
+                max_bundle_bytes=config.max_bundle_bytes,
+            )
+            payload = {
+                "bundle_hash": version.bundle_hash,
+                "targets": [
+                    {
+                        "target_id": target.target_id,
+                        "content_hash": target.content_hash,
+                    }
+                    for target in version.targets
+                ],
+            }
+            self._write_json(payload, headers={"Cache-Control": "no-store"})
+        except ContentTargetError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        finally:
+            selected.clear()
+            version = None
             payload = None
 
     def _advisory_content_consent(self) -> None:

@@ -392,6 +392,16 @@ def test_live_content_consent_and_revoke_round_trip_over_real_relay(relay_env):
     }
     bundle = env.hub_collector.fetch_advisory_content_bundle(HOST_ID, ["AGENTS.md"])
     assert bundle["targets"][0]["target_id"] == "AGENTS.md"
+    version = env.hub_collector.fetch_advisory_content_version(HOST_ID, ["AGENTS.md"])
+    assert version == {
+        "bundle_hash": bundle["bundle_hash"],
+        "targets": [
+            {
+                "target_id": "AGENTS.md",
+                "content_hash": bundle["targets"][0]["content_hash"],
+            }
+        ],
+    }
 
     status, revoked = _hub_post(env, "/insights/content-analysis/revoke", {})
     assert status == 200, revoked
@@ -401,3 +411,5 @@ def test_live_content_consent_and_revoke_round_trip_over_real_relay(relay_env):
     }
     with pytest.raises(RuntimeError, match="disabled"):
         env.hub_collector.fetch_advisory_content_bundle(HOST_ID, ["AGENTS.md"])
+    with pytest.raises(RuntimeError, match="disabled"):
+        env.hub_collector.fetch_advisory_content_version(HOST_ID, ["AGENTS.md"])

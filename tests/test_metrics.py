@@ -1995,6 +1995,61 @@ def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
     assert "private prompt body" not in caplog.text
 
 
+def test_fetch_advisory_content_version_uses_bounded_relay_hashes_only(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    _enable_collector_content(collector)
+    content_hash = "a" * 64
+    bundle_hash = hashlib.sha256(
+        json.dumps(
+            [["global-agents", content_hash]],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    class _VersionRelay(_FakeRelay):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
+            self.calls.append((host_id, method, path, body))
+            self.max_response_bytes = max_response_bytes
+            if path == "/advisory/content-consent":
+                return 200, json.dumps(body)
+            return 200, json.dumps(
+                {
+                    "bundle_hash": bundle_hash,
+                    "targets": [
+                        {"target_id": "global-agents", "content_hash": content_hash}
+                    ],
+                }
+            )
+
+    fake = _VersionRelay()
+    collector.relay_manager = fake
+
+    payload = collector.fetch_advisory_content_version("laptop", ["global-agents"])
+
+    assert payload == {
+        "bundle_hash": bundle_hash,
+        "targets": [{"target_id": "global-agents", "content_hash": content_hash}],
+    }
+    assert fake.calls[-1] == (
+        "laptop",
+        "POST",
+        "/advisory/content-version",
+        {"target_ids": ["global-agents"]},
+    )
+    assert fake.max_response_bytes == metrics._MAX_CONTENT_VERSION_RESPONSE_BYTES
+
+
 @pytest.mark.parametrize(
     "payload",
     [

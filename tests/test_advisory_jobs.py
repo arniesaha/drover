@@ -841,7 +841,7 @@ def test_disabled_content_worker_leaves_pending_job_without_fetch(
         )
 
 
-def test_revoke_waits_for_scheduler_fetch_then_cancels_post_fetch_job(
+def test_revoke_waits_for_scheduler_probe_then_cancels_post_probe_job(
     db_path: Path, tmp_path: Path
 ) -> None:
     config_path = tmp_path / "config.toml"
@@ -858,24 +858,24 @@ excerpt_max_chars = 320
     entered = threading.Event()
     release = threading.Event()
     revoked = threading.Event()
-    fetches: list[str] = []
+    probes: list[str] = []
     bundle = _content_bundle("No issue.")
 
     class Registry:
         def list_hosts(self):
             return [type("Host", (), {"host_id": "mac-mini"})()]
 
-    def fetch(host_id, _target_ids):
-        fetches.append(host_id)
+    def probe(host_id, _target_ids):
+        probes.append(host_id)
         entered.set()
         assert release.wait(2)
-        return bundle
+        return bundle.bundle_hash
 
     scheduler = ContentAnalysisScheduler(
         duckdb_path=db_path,
         registry=Registry(),
         consent_reader=lambda: load_config(config_path).advisory_content,
-        bundle_fetcher=fetch,
+        version_fetcher=probe,
         interval_seconds=300,
         clock=lambda: 1_000,
     )
@@ -899,9 +899,9 @@ excerpt_max_chars = 320
     assert revoked_before_release is False
     assert revoked.is_set()
     assert service.pending_model_jobs() == []
-    assert fetches == ["mac-mini"]
+    assert probes == ["mac-mini"]
     assert scheduler.enqueue_due() == {}
-    assert fetches == ["mac-mini"]
+    assert probes == ["mac-mini"]
 
 
 def test_revoke_waits_for_leased_worker_fetch_and_prevents_future_reads(
@@ -1089,7 +1089,7 @@ max_bundle_bytes = 4096
 excerpt_max_chars = 320
 """)
     bundle = _content_bundle("No issue.")
-    fetches: list[str] = []
+    probes: list[str] = []
 
     class Registry:
         def list_hosts(self):
@@ -1099,14 +1099,14 @@ excerpt_max_chars = 320
         duckdb_path=db_path,
         registry=Registry(),
         consent_reader=lambda: load_config(config_path).advisory_content,
-        bundle_fetcher=lambda host_id, _targets: (
-            fetches.append(host_id),
-            bundle,
+        version_fetcher=lambda host_id, _targets: (
+            probes.append(host_id),
+            bundle.bundle_hash,
         )[1],
         interval_seconds=300,
         clock=lambda: 1_000,
     )
-    assert scheduler.enqueue_due() == {"mac-mini": bundle}
+    assert set(scheduler.enqueue_due()) == {"mac-mini"}
     with duckdb.connect(str(db_path), read_only=True) as con:
         first_job_id = con.execute(
             "SELECT job_id FROM pipeline_jobs WHERE status = 'pending'"
@@ -1118,7 +1118,7 @@ excerpt_max_chars = 320
         backend="local", external_disclosure_accepted=False
     )
 
-    assert scheduler.enqueue_due() == {"mac-mini": bundle}
+    assert set(scheduler.enqueue_due()) == {"mac-mini"}
     assert scheduler.enqueue_due() == {}
     with duckdb.connect(str(db_path), read_only=True) as con:
         rows = con.execute("SELECT job_id, status FROM pipeline_jobs").fetchall()
@@ -1127,7 +1127,7 @@ excerpt_max_chars = 320
     assert states[first_job_id] == "cancelled"
     assert len(replacement_ids) == 1
     assert replacement_ids[0] != first_job_id
-    assert fetches == ["mac-mini", "mac-mini"]
+    assert probes == ["mac-mini", "mac-mini", "mac-mini"]
 
 
 def test_revocation_after_lease_requeues_job_and_resumes_after_enable(
@@ -1189,9 +1189,25 @@ def test_server_factory_wires_collector_backend_and_durable_content_job(
         local_url="http://127.0.0.1:7081",
         status="online",
     )
+    probes: list[str] = []
     fetches: list[str] = []
 
     class Collector:
+        def fetch_advisory_content_version(self, host_id, target_ids):
+            probes.append(host_id)
+            assert host_id == "mac-mini"
+            assert target_ids == ["global-agents"]
+            return {
+                "bundle_hash": bundle.bundle_hash,
+                "targets": [
+                    {
+                        "target_id": item.target_id,
+                        "content_hash": item.content_hash,
+                    }
+                    for item in bundle.targets
+                ],
+            }
+
         def fetch_advisory_content_bundle(self, host_id, target_ids):
             fetches.append(host_id)
             assert host_id == "mac-mini"
@@ -1225,11 +1241,14 @@ def test_server_factory_wires_collector_backend_and_durable_content_job(
     )
 
     assert worker.run_once().skipped == 1
+    assert probes == []
     assert fetches == []
     current[0] = _content_config()
     assert worker.run_once().succeeded == 1
+    assert probes == ["mac-mini"]
     assert fetches == ["mac-mini"]
     assert worker.run_once().skipped == 1
+    assert probes == ["mac-mini", "mac-mini"]
     assert fetches == ["mac-mini"]
 
 
@@ -1244,14 +1263,15 @@ def test_content_scheduler_coalesces_startup_and_enqueues_periodic_versions(
         status="online",
     )
     now = [0.0]
-    fetches: list[str] = []
+    probes: list[str] = []
+    bundle_hash = _content_bundle("No issue.").bundle_hash
     scheduler = ContentAnalysisScheduler(
         duckdb_path=db_path,
         registry=HarnessRegistry(db_path),
         consent_reader=lambda: _content_config(),
-        bundle_fetcher=lambda host_id, _targets: (
-            fetches.append(host_id),
-            _content_bundle("No issue."),
+        version_fetcher=lambda host_id, _targets: (
+            probes.append(host_id),
+            bundle_hash,
         )[1],
         interval_seconds=3600,
         clock=lambda: now[0],
@@ -1261,7 +1281,7 @@ def test_content_scheduler_coalesces_startup_and_enqueues_periodic_versions(
     assert scheduler.enqueue_due() == {}
     now[0] = 3600
     assert set(scheduler.enqueue_due()) == {"mac-mini"}
-    assert fetches == ["mac-mini", "mac-mini"]
+    assert probes == ["mac-mini", "mac-mini", "mac-mini"]
     with duckdb.connect(str(db_path), read_only=True) as con:
         assert (
             con.execute(
@@ -1270,6 +1290,204 @@ def test_content_scheduler_coalesces_startup_and_enqueues_periodic_versions(
             ).fetchone()[0]
             == 2
         )
+
+
+def test_content_scheduler_isolates_host_probe_failures_and_detects_changes(
+    db_path: Path,
+) -> None:
+    registry = HarnessRegistry(db_path)
+    for host_id in ("a-offline", "b-healthy"):
+        registry.register_host(
+            host_id=host_id,
+            display_name=host_id,
+            kind="mac",
+            local_url=f"http://{host_id}:7081",
+            status="online",
+        )
+    versions = {"b-healthy": "a" * 64}
+    probes: list[str] = []
+
+    def probe(host_id, _target_ids):
+        probes.append(host_id)
+        if host_id == "a-offline":
+            raise RuntimeError("host is unreachable")
+        return versions[host_id]
+
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=registry,
+        consent_reader=lambda: _content_config(),
+        version_fetcher=probe,
+        interval_seconds=3600,
+        clock=lambda: 100,
+    )
+
+    first = scheduler.enqueue_due()
+    unchanged = scheduler.enqueue_due()
+    versions["b-healthy"] = "b" * 64
+    changed = scheduler.enqueue_due()
+
+    assert set(first) == {"b-healthy"}
+    assert unchanged == {}
+    assert set(changed) == {"b-healthy"}
+    assert scheduler.last_failures == {"a-offline": "version_probe_failed"}
+    assert probes == [
+        "a-offline",
+        "b-healthy",
+        "a-offline",
+        "b-healthy",
+        "a-offline",
+        "b-healthy",
+    ]
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM pipeline_receipts WHERE source_key = ?",
+                ["model.configuration:b-healthy"],
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_content_worker_fetches_one_bundle_only_after_each_claimed_attempt(
+    db_path: Path,
+) -> None:
+    registry = HarnessRegistry(db_path)
+    bundles = {
+        "a-offline": _content_bundle("offline", host_id="a-offline"),
+        "b-healthy": _content_bundle("healthy", host_id="b-healthy"),
+    }
+    for host_id in bundles:
+        registry.register_host(
+            host_id=host_id,
+            display_name=host_id,
+            kind="mac",
+            local_url=f"http://{host_id}:7081",
+            status="online",
+        )
+    probes: list[str] = []
+    full_fetches: list[str] = []
+
+    def probe(host_id, _target_ids):
+        probes.append(host_id)
+        return bundles[host_id].bundle_hash
+
+    def fetch(host_id, _target_ids):
+        full_fetches.append(host_id)
+        if host_id == "a-offline":
+            raise RuntimeError("host went offline after discovery")
+        return bundles[host_id]
+
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=registry,
+        consent_reader=lambda: _content_config(),
+        version_fetcher=probe,
+        interval_seconds=3600,
+        clock=lambda: 100,
+    )
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=fetch,
+        backend_factory=lambda _config: type(
+            "Backend", (), {"complete": lambda self, _system, _user: '{"findings":[]}'}
+        )(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        retry_delay=timedelta(0),
+        scheduler=scheduler,
+    )
+
+    assert worker.run_once().failed == 1
+    assert worker.run_once().succeeded == 1
+
+    assert probes == ["a-offline", "b-healthy", "a-offline", "b-healthy"]
+    assert full_fetches == ["a-offline", "b-healthy"]
+
+
+def test_content_scheduler_retries_changed_version_after_current_lease_finishes(
+    db_path: Path,
+) -> None:
+    registry = HarnessRegistry(db_path)
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="mac",
+        local_url="http://mac-mini:7081",
+        status="online",
+    )
+    current_hash = ["a" * 64]
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=registry,
+        consent_reader=lambda: _content_config(),
+        version_fetcher=lambda _host, _targets: current_hash[0],
+        interval_seconds=3600,
+        clock=lambda: 100,
+    )
+    assert set(scheduler.enqueue_due()) == {"mac-mini"}
+    with duckdb.connect(str(db_path)) as con:
+        ledger = Ledger(con)
+        job = ledger.latest_job(
+            "analyze_advisory_target", "model.configuration:mac-mini"
+        )
+        assert job is not None
+        ledger.lease_job(
+            job.job_id,
+            worker_id="busy-worker",
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+    current_hash[0] = "b" * 64
+    assert scheduler.enqueue_due() == {}
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).succeed_job(job.job_id)
+
+    assert set(scheduler.enqueue_due()) == {"mac-mini"}
+
+
+def test_content_worker_retries_when_bundle_changes_after_version_probe(
+    db_path: Path,
+) -> None:
+    registry = HarnessRegistry(db_path)
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="mac",
+        local_url="http://mac-mini:7081",
+        status="online",
+    )
+    old = _content_bundle("old")
+    new = _content_bundle("new")
+    probe_hash = [old.bundle_hash]
+    fetches: list[str] = []
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=registry,
+        consent_reader=lambda: _content_config(),
+        version_fetcher=lambda _host, _targets: probe_hash[0],
+        interval_seconds=3600,
+        clock=lambda: 100,
+    )
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=lambda _host, _targets: (fetches.append("fetch"), new)[1],
+        backend_factory=lambda _config: type(
+            "Backend", (), {"complete": lambda self, _system, _user: '{"findings":[]}'}
+        )(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        retry_delay=timedelta(0),
+        scheduler=scheduler,
+    )
+
+    assert worker.run_once().failed == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 0
+
+    probe_hash[0] = new.bundle_hash
+    assert worker.run_once().succeeded == 1
+    assert fetches == ["fetch", "fetch"]
 
 
 def test_content_job_rolls_back_findings_when_ledger_completion_fails(

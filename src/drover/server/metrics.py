@@ -53,6 +53,7 @@ _HARNESS_STALE_AFTER_SECONDS = 45
 # decent evidence the host is really there and worth waiting for.
 RELAY_MIN_TIMEOUT_S = 5.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
 # gemini). A nexus handoff to one of these launches mode="structured" and
@@ -145,6 +146,43 @@ def _validate_advisory_content_bundle(
     ).hexdigest()
     if payload["bundle_hash"] != computed_bundle_hash:
         raise ValueError("content bundle response bundle_hash does not match")
+
+
+def _validate_advisory_content_version(
+    payload: Any, *, requested_ids: list[str]
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != {"bundle_hash", "targets"}:
+        raise ValueError("content version response has invalid fields")
+    if not _is_sha256(payload["bundle_hash"]):
+        raise ValueError("content version response has invalid bundle_hash")
+    targets = payload["targets"]
+    if not isinstance(targets, list) or len(targets) != len(requested_ids):
+        raise ValueError("content version response has invalid targets")
+    returned_ids: list[str] = []
+    hash_pairs: list[tuple[str, str]] = []
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != {
+            "target_id",
+            "content_hash",
+        }:
+            raise ValueError("content version response has invalid target fields")
+        if not isinstance(target["target_id"], str):
+            raise ValueError("content version response has invalid target ID")
+        if not _is_sha256(target["content_hash"]):
+            raise ValueError("content version response has invalid content_hash")
+        returned_ids.append(target["target_id"])
+        hash_pairs.append((target["target_id"], target["content_hash"]))
+    if returned_ids != requested_ids:
+        raise ValueError("content version response target IDs do not match request")
+    computed_bundle_hash = hashlib.sha256(
+        json.dumps(
+            hash_pairs,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload["bundle_hash"] != computed_bundle_hash:
+        raise ValueError("content version response bundle_hash does not match")
 
 
 def _is_sha256(value: Any) -> bool:
@@ -1002,6 +1040,48 @@ class MetricsCollector:
             host_id,
             len(payload["targets"]),
             len(body_bytes),
+            payload["bundle_hash"],
+        )
+        return payload
+
+    def fetch_advisory_content_version(
+        self, host_id: str, target_ids: list[str]
+    ) -> Mapping[str, Any]:
+        """Fetch one bounded hashes-only version through normal host routing."""
+
+        if not _valid_advisory_target_ids(target_ids):
+            raise ValueError("target_ids must be a non-empty list of unique IDs")
+        host = self._harness_host(host_id)
+        if host is None:
+            raise ValueError(f"unknown harness host: {host_id}")
+        consent = self._insights().content_consent_state()
+        if not consent["enabled"] or int(consent["epoch"]) <= 0:
+            raise RuntimeError("content analysis is disabled")
+        reconciliation = self._push_content_consent(host, consent)
+        if reconciliation["state"] != "acknowledged":
+            raise RuntimeError("content consent is not reconciled on host")
+        status, body = self._harness_request(
+            host,
+            "/advisory/content-version",
+            method="POST",
+            payload={"target_ids": target_ids},
+            timeout_s=10.0,
+            max_response_bytes=_MAX_CONTENT_VERSION_RESPONSE_BYTES,
+        )
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > _MAX_CONTENT_VERSION_RESPONSE_BYTES:
+            raise ValueError("content version response exceeds byte limit")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"content version request failed with status {status}")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("content version response must be valid JSON") from exc
+        _validate_advisory_content_version(payload, requested_ids=target_ids)
+        log.info(
+            "fetched advisory content version host=%s targets=%d bundle_hash=%s",
+            host_id,
+            len(payload["targets"]),
             payload["bundle_hash"],
         )
         return payload

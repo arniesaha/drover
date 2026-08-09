@@ -56,6 +56,21 @@ class ContentBundle:
             raise ValueError("created_at must be timezone-aware")
 
 
+@dataclass(frozen=True)
+class ContentTargetVersion:
+    target_id: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class ContentVersion:
+    """Hashes-only content identity safe for scheduler discovery."""
+
+    host_id: str
+    targets: tuple[ContentTargetVersion, ...]
+    bundle_hash: str
+
+
 def validate_content_bundle(
     bundle: ContentBundle,
     *,
@@ -194,6 +209,70 @@ def build_content_bundle(
         host_id=host_id,
         created_at=datetime.now(timezone.utc),
         targets=tuple(bundled),
+        bundle_hash=hashlib.sha256(hash_input).hexdigest(),
+    )
+
+
+def build_content_version(
+    targets: Iterable[ContentTarget],
+    *,
+    allowed_roots: Sequence[str | Path],
+    host_id: str = "local",
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    max_bundle_bytes: int = DEFAULT_MAX_BUNDLE_BYTES,
+) -> ContentVersion:
+    """Hash redacted allowlisted files without constructing a content bundle."""
+
+    if max_file_bytes <= 0:
+        raise ValueError("max_file_bytes must be positive")
+    if max_bundle_bytes <= 0:
+        raise ValueError("max_bundle_bytes must be positive")
+    roots = _resolve_allowed_roots(allowed_roots)
+    if not roots:
+        raise ContentTargetError("at least one allowed root is required")
+
+    versions: list[ContentTargetVersion] = []
+    seen_ids: set[str] = set()
+    raw_total = 0
+    redacted_total = 0
+    for target in targets:
+        if target.target_id in seen_ids:
+            raise ContentTargetError("target IDs must be unique")
+        seen_ids.add(target.target_id)
+        path = _resolve_target(target.path, roots)
+        payload = _read_regular_file(path, max_file_bytes=max_file_bytes)
+        raw_total += len(payload)
+        if raw_total > max_bundle_bytes:
+            raise ContentTargetError("content bundle exceeds aggregate byte limit")
+        redacted: str | None = None
+        redacted_bytes: bytes | None = None
+        try:
+            redacted = redact_content(payload.decode("utf-8", errors="strict"))
+            redacted_bytes = redacted.encode("utf-8")
+            redacted_total += len(redacted_bytes)
+            if redacted_total > max_bundle_bytes:
+                raise ContentTargetError("content bundle exceeds aggregate byte limit")
+            versions.append(
+                ContentTargetVersion(
+                    target_id=target.target_id,
+                    content_hash=hashlib.sha256(redacted_bytes).hexdigest(),
+                )
+            )
+        except UnicodeDecodeError as exc:
+            raise ContentTargetError("content target is not valid UTF-8") from exc
+        finally:
+            payload = b""
+            redacted_bytes = None
+            redacted = None
+
+    hash_input = json.dumps(
+        [(item.target_id, item.content_hash) for item in versions],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return ContentVersion(
+        host_id=host_id,
+        targets=tuple(versions),
         bundle_hash=hashlib.sha256(hash_input).hexdigest(),
     )
 
