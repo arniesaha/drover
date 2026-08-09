@@ -55,6 +55,51 @@ public enum ContentAnalysisMode: String, CaseIterable, Identifiable, Sendable, E
     public var title: String { rawValue.capitalized }
 }
 
+public struct ContentAnalysisPropagationPresentation: Sendable, Equatable {
+    public let isWarning: Bool
+    public let title: String
+    public let hostLines: [String]
+    public let accessibilityLabel: String
+
+    public init(
+        status: ContentAnalysisStatus,
+        outcome: ContentAnalysisMutationOutcome
+    ) {
+        isWarning = outcome != .complete
+        switch outcome {
+        case .complete: title = "Fleet propagation complete"
+        case .partial: title = "Fleet propagation incomplete"
+        case .failed: title = "Fleet propagation failed"
+        }
+        hostLines = status.affectedHosts.map(Self.hostLine)
+        let accessibleHosts = status.affectedHosts.map {
+            let state = Self.stateText($0.state)
+            let error = Self.nonEmpty($0.error).map { ", \($0)" } ?? ""
+            return "\($0.hostID), \(state)\(error)"
+        }
+        accessibilityLabel = ([title] + accessibleHosts).joined(separator: ". ")
+    }
+
+    private static func hostLine(_ host: ContentAnalysisHostResult) -> String {
+        let base = "\(host.hostID) · \(stateText(host.state))"
+        return nonEmpty(host.error).map { "\(base) · \($0)" } ?? base
+    }
+
+    private static func stateText(_ state: ContentAnalysisHostState) -> String {
+        switch state {
+        case .acknowledged: return "Acknowledged"
+        case .disconnected: return "Disconnected"
+        case .failed: return "Failed"
+        case .unknown: return "Unknown status"
+        }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 /// Keeps the backend picker aligned with confirmed server state. Choosing
 /// Disabled is a revocation request, not a local presentation change: the
 /// confirmed backend remains visible until the destructive operation succeeds.

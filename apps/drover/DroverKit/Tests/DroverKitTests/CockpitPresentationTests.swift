@@ -2,6 +2,34 @@ import Foundation
 import Testing
 @testable import DroverKit
 
+@Test func partialConsentPresentationNamesEveryAffectedHostAndState() throws {
+    let status = try presentationConsentFixture("content-consent-partial")
+
+    let value = ContentAnalysisPropagationPresentation(
+        status: status, outcome: .partial
+    )
+
+    #expect(value.isWarning)
+    #expect(value.title == "Fleet propagation incomplete")
+    #expect(value.hostLines == ["offline-laptop · Disconnected · host is offline"])
+    #expect(value.accessibilityLabel.contains("offline-laptop, Disconnected"))
+}
+
+@Test func failedAndUnknownHostStatesNeverPresentAsComplete() throws {
+    let status = try presentationConsentFixture("content-consent-failed")
+
+    let value = ContentAnalysisPropagationPresentation(
+        status: status, outcome: .failed
+    )
+
+    #expect(value.isWarning)
+    #expect(value.title == "Fleet propagation failed")
+    #expect(value.hostLines == [
+        "workstation · Failed · epoch conflict",
+        "future-host · Unknown status",
+    ])
+}
+
 @Test func homeSectionsFollowApprovedHierarchy() throws {
     let overview = try decodeOverview(
         providerStatus: "ok",
@@ -253,6 +281,24 @@ import Testing
     #expect(state.displayedMode == .disabled)
 }
 
+@Test func partialPropagationSelectionStillMirrorsCentralConsentTruth() throws {
+    let enabled = try presentationConsentFixture("content-consent-partial")
+    let disabled = try presentationConsentFixture("content-consent-failed")
+    var state = ContentAnalysisSelectionState()
+
+    state.synchronize(
+        enabled: enabled.enabled, backend: enabled.backend,
+        disclosureAccepted: enabled.externalDisclosureAccepted
+    )
+    #expect(state.displayedMode == .cloud)
+
+    state.synchronize(
+        enabled: disabled.enabled, backend: disabled.backend,
+        disclosureAccepted: disabled.externalDisclosureAccepted
+    )
+    #expect(state.displayedMode == .disabled)
+}
+
 private func decodeProviderWindow(_ json: String) throws -> ProviderWindow {
     try JSONDecoder().decode(ProviderWindow.self, from: Data(json.utf8))
 }
@@ -280,6 +326,13 @@ private func decodeInsightSummary(
      "first_seen_at":"2026-08-08T18:00:00Z",
      "last_seen_at":"2026-08-08T18:01:00Z"}
     """.utf8))
+}
+
+private func presentationConsentFixture(_ name: String) throws -> ContentAnalysisStatus {
+    let url = try #require(Bundle.module.url(
+        forResource: name, withExtension: "json", subdirectory: "Fixtures"
+    ))
+    return try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
 }
 
 private let populatedActivity = #"{"totals":{"session_count":12,"total_tokens":1234,"cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,"total_latency_ms":500},"projects":[],"harnesses":[],"hosts":[],"models":[],"project_metric":"tokens","coverage":{"token_percent":86.4}}"#

@@ -1,0 +1,1 @@
+{"enabled":false,"backend":"local","external_disclosure_accepted":false,"pending_model_jobs":0,"cancelled_model_jobs":3,"consent_epoch":9,"propagation":"failed","hosts":[{"host_id":"workstation","state":"failed","error":"epoch conflict"},{"host_id":"future-host","status":"new_server_state"}]}

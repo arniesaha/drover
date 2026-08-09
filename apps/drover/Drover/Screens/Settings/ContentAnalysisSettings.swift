@@ -62,6 +62,8 @@ struct ContentAnalysisSettings: View {
                 operationMessage(statusDescription(status), isError: false)
             }
 
+            propagationWarning
+
             if store.contentAnalysisStatus?.enabled == true {
                 Button("Stop future model analysis…", role: .destructive) {
                     showRevokeConfirmation = true
@@ -161,6 +163,45 @@ struct ContentAnalysisSettings: View {
             .font(.footnote)
             .foregroundStyle(isError ? Color.red : Color.secondary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private var propagationWarning: some View {
+        if let status = store.contentAnalysisStatus,
+           let outcome = currentPropagationOutcome,
+           outcome != .complete {
+            let value = ContentAnalysisPropagationPresentation(
+                status: status, outcome: outcome
+            )
+            VStack(alignment: .leading, spacing: 6) {
+                Label(value.title, systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                Text(
+                    "Central consent is \(status.enabled ? "enabled" : "disabled"), "
+                        + "but these hosts did not confirm the same state:"
+                )
+                .font(.footnote)
+                ForEach(value.hostLines, id: \.self) { line in
+                    Text(line).font(.footnote.monospaced())
+                }
+                Button("Retry fleet propagation") {
+                    Task { _ = await store.retryContentAnalysisPropagation() }
+                }
+                .disabled(store.isUpdatingContentConsent || store.isRevokingContentAnalysis)
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("content-analysis-propagation-retry")
+            }
+            .foregroundStyle(outcome == .failed ? Color.red : Color.orange)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(value.accessibilityLabel)
+            .accessibilityIdentifier("content-analysis-propagation-warning")
+        }
+    }
+
+    private var currentPropagationOutcome: ContentAnalysisMutationOutcome? {
+        guard let status = store.contentAnalysisStatus else { return nil }
+        return status.enabled ? store.contentConsentOutcome : store.contentRevocationOutcome
     }
 
     private func syncSelectionFromStatus() {

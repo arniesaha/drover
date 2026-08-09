@@ -15,8 +15,8 @@ public protocol CockpitClient: Sendable {
     func setContentAnalysisConsent(
         backend: ContentAnalysisBackend,
         externalDisclosureAccepted: Bool
-    ) async throws -> ContentAnalysisStatus
-    func revokeContentAnalysis() async throws -> ContentAnalysisStatus
+    ) async throws -> ContentAnalysisConsentResult
+    func revokeContentAnalysis() async throws -> ContentAnalysisConsentResult
     func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse
 }
 
@@ -34,6 +34,11 @@ public final class CockpitStore {
     private var cockpitAPIVersion: Int?
     private var cockpitSections: Set<String> = []
     private var insightFilters = InsightFilters()
+    private var insightsGeneration = 0
+    private var insightsLoadTask: Task<InsightPage, Error>?
+    private var insightsPageTask: Task<InsightPage, Error>?
+    private var loadingInsightsGeneration: Int?
+    private var loadingInsightsPageGeneration: Int?
     private var stateOverrides: [String: InsightState] = [:]
     private var refreshGeneration = 0
     private var analyticsGeneration = 0
@@ -69,6 +74,8 @@ public final class CockpitStore {
     public private(set) var contentStatusError: String?
     public private(set) var contentConsentError: String?
     public private(set) var contentRevocationError: String?
+    public private(set) var contentConsentOutcome: ContentAnalysisMutationOutcome?
+    public private(set) var contentRevocationOutcome: ContentAnalysisMutationOutcome?
     public private(set) var contentPurgeError: String?
     public private(set) var purgedExcerptCount: Int?
     public private(set) var isUpdatingContentConsent = false
@@ -113,6 +120,13 @@ public final class CockpitStore {
             analyticsError = nil
             insightsError = nil
             lifecycleError = nil
+            insightsGeneration &+= 1
+            insightsLoadTask?.cancel()
+            insightsPageTask?.cancel()
+            insightsLoadTask = nil
+            insightsPageTask = nil
+            loadingInsightsGeneration = nil
+            loadingInsightsPageGeneration = nil
         }
     }
 
@@ -203,7 +217,15 @@ public final class CockpitStore {
 
     public func loadContentAnalysisStatus() async {
         do {
-            contentAnalysisStatus = try await client.contentAnalysisStatus()
+            let status = try await client.contentAnalysisStatus()
+            contentAnalysisStatus = status
+            if let outcome = status.propagationOutcome {
+                if status.enabled {
+                    contentConsentOutcome = outcome
+                } else {
+                    contentRevocationOutcome = outcome
+                }
+            }
             contentStatusError = nil
         } catch {
             guard !Self.isCancellation(error) else { return }
@@ -222,13 +244,17 @@ public final class CockpitStore {
         }
         isUpdatingContentConsent = true
         contentConsentError = nil
+        contentConsentOutcome = nil
         defer { isUpdatingContentConsent = false }
         do {
-            contentAnalysisStatus = try await client.setContentAnalysisConsent(
+            let result = try await client.setContentAnalysisConsent(
                 backend: backend,
                 externalDisclosureAccepted: backend == .cloud && disclosureAccepted
             )
-            return true
+            contentAnalysisStatus = result.status
+            contentConsentOutcome = result.outcome
+            contentStatusError = nil
+            return result.outcome == .complete
         } catch {
             guard !Self.isCancellation(error) else { return false }
             contentConsentError = Self.errorMessage(error)
@@ -240,15 +266,33 @@ public final class CockpitStore {
     public func revokeContentAnalysis() async -> Bool {
         isRevokingContentAnalysis = true
         contentRevocationError = nil
+        contentRevocationOutcome = nil
         defer { isRevokingContentAnalysis = false }
         do {
-            contentAnalysisStatus = try await client.revokeContentAnalysis()
-            return true
+            let result = try await client.revokeContentAnalysis()
+            contentAnalysisStatus = result.status
+            contentRevocationOutcome = result.outcome
+            contentStatusError = nil
+            return result.outcome == .complete
         } catch {
             guard !Self.isCancellation(error) else { return false }
             contentRevocationError = Self.errorMessage(error)
             return false
         }
+    }
+
+    /// Reconciles only the currently confirmed consent state. This cannot
+    /// alter prompts, hooks, skills, or any other host configuration.
+    @discardableResult
+    public func retryContentAnalysisPropagation() async -> Bool {
+        guard let status = contentAnalysisStatus else { return false }
+        if status.enabled {
+            return await enableContentAnalysis(
+                backend: status.backend,
+                disclosureAccepted: status.externalDisclosureAccepted
+            )
+        }
+        return await revokeContentAnalysis()
     }
 
     @discardableResult
@@ -378,37 +422,91 @@ public final class CockpitStore {
 
     public func loadInsights(filters: InsightFilters = InsightFilters()) async {
         guard isCockpitAvailable else { return }
+        insightsGeneration &+= 1
+        let generation = insightsGeneration
+        insightsLoadTask?.cancel()
+        insightsPageTask?.cancel()
+        insightsPageTask = nil
         var firstPageFilters = filters
         firstPageFilters.cursor = nil
+        insightFilters = firstPageFilters
+        insights = []
+        nextInsightsCursor = nil
+        insightsError = nil
+        loadingInsightsGeneration = generation
+        loadingInsightsPageGeneration = nil
+        let task = Task { [client] in
+            try await client.insights(filters: firstPageFilters)
+        }
+        insightsLoadTask = task
+        defer {
+            if loadingInsightsGeneration == generation {
+                loadingInsightsGeneration = nil
+                insightsLoadTask = nil
+            }
+        }
         do {
-            let page = try await client.insights(filters: firstPageFilters)
-            insightFilters = firstPageFilters
+            let page = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard generation == insightsGeneration,
+                  insightFilters == firstPageFilters else { return }
             insights = page.findings
             nextInsightsCursor = page.nextCursor
             insightsError = nil
             for finding in page.findings { stateOverrides[finding.findingID] = finding.state }
         } catch {
+            guard generation == insightsGeneration else { return }
             guard !Self.isCancellation(error) else { return }
             insightsError = Self.errorMessage(error)
         }
     }
 
     public func loadMoreInsights() async {
-        guard isCockpitAvailable, let cursor = nextInsightsCursor else { return }
+        guard isCockpitAvailable,
+              loadingInsightsPageGeneration == nil,
+              let cursor = nextInsightsCursor else { return }
+        let generation = insightsGeneration
+        let baseFilters = insightFilters
         var filters = insightFilters
         filters.cursor = cursor
+        loadingInsightsPageGeneration = generation
+        let task = Task { [client] in try await client.insights(filters: filters) }
+        insightsPageTask = task
+        defer {
+            if loadingInsightsPageGeneration == generation {
+                loadingInsightsPageGeneration = nil
+                insightsPageTask = nil
+            }
+        }
         do {
-            let page = try await client.insights(filters: filters)
+            let page = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard generation == insightsGeneration,
+                  insightFilters == baseFilters,
+                  nextInsightsCursor == cursor else { return }
             let existing = Set(insights.map(\.findingID))
             insights.append(contentsOf: page.findings.filter { !existing.contains($0.findingID) })
             nextInsightsCursor = page.nextCursor
             insightsError = nil
             for finding in page.findings { stateOverrides[finding.findingID] = finding.state }
         } catch {
+            guard generation == insightsGeneration,
+                  insightFilters == baseFilters,
+                  nextInsightsCursor == cursor else { return }
             guard !Self.isCancellation(error) else { return }
             insightsError = Self.errorMessage(error)
         }
     }
+
+    public var isLoadingInsights: Bool { loadingInsightsGeneration != nil }
+
+    public var isLoadingMoreInsights: Bool { loadingInsightsPageGeneration != nil }
 
     public func state(forFindingID findingID: String) -> InsightState? {
         stateOverrides[findingID]

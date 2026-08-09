@@ -261,6 +261,101 @@ struct CockpitStoreTests {
         #expect(await client.requestedCursors == [nil, "page-2"])
     }
 
+    @Test @MainActor func newerInsightFilterCancelsAndIgnoresOlderCompletion() async throws {
+        let client = CockpitClientStub(
+            insightsByHost: [
+                "old": try decodeInsightPage(ids: ["old"], nextCursor: "old-page"),
+                "new": try decodeInsightPage(ids: ["new"], nextCursor: nil),
+            ],
+            insightDelaysByHost: ["old": .milliseconds(80)]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        let old = Task { await store.loadInsights(filters: InsightFilters(host: "old")) }
+        try await Task.sleep(for: .milliseconds(10))
+        await store.loadInsights(filters: InsightFilters(host: "new"))
+        await old.value
+
+        #expect(store.insights.map(\.findingID) == ["new"])
+        #expect(store.nextInsightsCursor == nil)
+        #expect(store.insightsError == nil)
+        #expect(!store.isLoadingInsights)
+    }
+
+    @Test @MainActor func staleInsightFilterErrorCannotOverwriteNewerSuccess() async throws {
+        let client = CockpitClientStub(
+            insightsByHost: [
+                "new": try decodeInsightPage(ids: ["new"], nextCursor: nil),
+            ],
+            insightDelaysByHost: ["old": .milliseconds(80)],
+            failingInsightHosts: ["old"]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        let old = Task { await store.loadInsights(filters: InsightFilters(host: "old")) }
+        try await Task.sleep(for: .milliseconds(10))
+        await store.loadInsights(filters: InsightFilters(host: "new"))
+        await old.value
+
+        #expect(store.insights.map(\.findingID) == ["new"])
+        #expect(store.insightsError == nil)
+    }
+
+    @Test @MainActor func newInsightFilterImmediatelyResetsOldCursorWhileLoading() async throws {
+        let client = CockpitClientStub(
+            insightsByHost: [
+                "old": try decodeInsightPage(ids: ["old"], nextCursor: "old-page"),
+                "new": try decodeInsightPage(ids: ["new"], nextCursor: nil),
+            ],
+            insightDelaysByHost: ["new": .milliseconds(80)]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadInsights(filters: InsightFilters(host: "old"))
+
+        let loading = Task { await store.loadInsights(filters: InsightFilters(host: "new")) }
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(store.nextInsightsCursor == nil)
+        #expect(store.isLoadingInsights)
+        await loading.value
+    }
+
+    @Test @MainActor func staleInsightPageCannotAppendOrClearNewPageLoadingState() async throws {
+        let client = CockpitClientStub(
+            insightsByHost: [
+                "old": try decodeInsightPage(ids: ["old"], nextCursor: "old-page"),
+                "new": try decodeInsightPage(ids: ["new"], nextCursor: "new-page"),
+            ],
+            insightsByCursor: [
+                "old-page": try decodeInsightPage(ids: ["old-more"], nextCursor: nil),
+                "new-page": try decodeInsightPage(ids: ["new-more"], nextCursor: nil),
+            ],
+            insightCursorDelays: [
+                "old-page": .milliseconds(80), "new-page": .milliseconds(300),
+            ]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadInsights(filters: InsightFilters(host: "old"))
+
+        let oldPage = Task { await store.loadMoreInsights() }
+        try await Task.sleep(for: .milliseconds(10))
+        await store.loadInsights(filters: InsightFilters(host: "new"))
+        let newPage = Task { await store.loadMoreInsights() }
+        try await Task.sleep(for: .milliseconds(20))
+        await oldPage.value
+
+        #expect(store.insights.map(\.findingID) == ["new"])
+        #expect(store.nextInsightsCursor == "new-page")
+        #expect(store.isLoadingMoreInsights)
+        await newPage.value
+        #expect(store.insights.map(\.findingID) == ["new", "new-more"])
+        #expect(!store.isLoadingMoreInsights)
+    }
+
     @Test @MainActor func optimisticAcknowledgeRollsBackOnFailure() async throws {
         let client = CockpitClientStub(
             insightPages: [try decodeInsightPage(ids: ["one"], nextCursor: nil)],
@@ -357,6 +452,51 @@ struct CockpitStoreTests {
         )])
     }
 
+    @Test @MainActor func partialEnableKeepsCentralEnabledTruthAndFleetOutcome() async throws {
+        let status = try contentConsentFixture("content-consent-partial")
+        let client = CockpitClientStub(
+            contentStatus: status, contentMutationOutcome: .partial
+        )
+        let store = CockpitStore(client: client)
+
+        let completed = await store.enableContentAnalysis(
+            backend: .cloud, disclosureAccepted: true
+        )
+
+        #expect(!completed)
+        #expect(store.contentAnalysisStatus?.enabled == true)
+        #expect(store.contentConsentOutcome == .partial)
+        #expect(store.contentAnalysisStatus?.affectedHosts.map(\.hostID) == ["offline-laptop"])
+    }
+
+    @Test @MainActor func statusReloadSurfacesServerReportedPartialPropagation() async throws {
+        let status = try contentConsentFixture("content-consent-partial")
+        let store = CockpitStore(client: CockpitClientStub(contentStatus: status))
+
+        await store.loadContentAnalysisStatus()
+
+        #expect(store.contentAnalysisStatus?.enabled == true)
+        #expect(store.contentConsentOutcome == .partial)
+    }
+
+    @Test @MainActor func failedRevokeKeepsCentralDisabledTruthAndCanRetryConsentOnly() async throws {
+        let status = try contentConsentFixture("content-consent-failed")
+        let client = CockpitClientStub(
+            contentStatus: status, contentMutationOutcome: .failed
+        )
+        let store = CockpitStore(client: client)
+
+        let completed = await store.revokeContentAnalysis()
+        let retried = await store.retryContentAnalysisPropagation()
+
+        #expect(!completed)
+        #expect(!retried)
+        #expect(store.contentAnalysisStatus?.enabled == false)
+        #expect(store.contentRevocationOutcome == .failed)
+        #expect(await client.revokeRequestCount == 2)
+        #expect(await client.contentConsentRequestCount == 0)
+    }
+
     @Test @MainActor func revocationPreservesFindingsAndReportsItsOwnFailure() async throws {
         let client = CockpitClientStub(
             insightPages: [try decodeInsightPage(ids: ["one"], nextCursor: nil)],
@@ -437,6 +577,7 @@ private actor CockpitClientStub: CockpitClient {
     private let lifecycleError: DroverError?
     private let lifecycleDelay: Duration
     private let contentStatusValue: ContentAnalysisStatus?
+    private let contentMutationOutcome: ContentAnalysisMutationOutcome
     private let contentError: DroverError?
     private let purgedExcerptCount: Int
     private var refreshError: DroverError?
@@ -445,6 +586,11 @@ private actor CockpitClientStub: CockpitClient {
     private let analyticsDelays: [Int: Duration]
     private let analyticsByCursor: [String: AnalyticsSnapshot]
     private let analyticsCursorDelays: [String: Duration]
+    private let insightsByHost: [String: InsightPage]
+    private let insightDelaysByHost: [String: Duration]
+    private let insightsByCursor: [String: InsightPage]
+    private let insightCursorDelays: [String: Duration]
+    private let failingInsightHosts: Set<String>
 
     private(set) var overviewRequestCount = 0
     private(set) var analyticsRequestCount = 0
@@ -469,10 +615,16 @@ private actor CockpitClientStub: CockpitClient {
         analyticsByCursor: [String: AnalyticsSnapshot] = [:],
         analyticsCursorDelays: [String: Duration] = [:],
         insightPages: [InsightPage] = [],
+        insightsByHost: [String: InsightPage] = [:],
+        insightDelaysByHost: [String: Duration] = [:],
+        insightsByCursor: [String: InsightPage] = [:],
+        insightCursorDelays: [String: Duration] = [:],
+        failingInsightHosts: Set<String> = [],
         acknowledgedFinding: InsightFinding? = nil,
         lifecycleError: DroverError? = nil,
         lifecycleDelay: Duration = .zero,
         contentStatus: ContentAnalysisStatus? = nil,
+        contentMutationOutcome: ContentAnalysisMutationOutcome = .complete,
         contentError: DroverError? = nil,
         purgedExcerptCount: Int = 0
     ) {
@@ -484,10 +636,16 @@ private actor CockpitClientStub: CockpitClient {
         self.analyticsByCursor = analyticsByCursor
         self.analyticsCursorDelays = analyticsCursorDelays
         self.pages = insightPages
+        self.insightsByHost = insightsByHost
+        self.insightDelaysByHost = insightDelaysByHost
+        self.insightsByCursor = insightsByCursor
+        self.insightCursorDelays = insightCursorDelays
+        self.failingInsightHosts = failingInsightHosts
         self.acknowledgedFinding = acknowledgedFinding
         self.lifecycleError = lifecycleError
         self.lifecycleDelay = lifecycleDelay
         self.contentStatusValue = contentStatus
+        self.contentMutationOutcome = contentMutationOutcome
         self.contentError = contentError
         self.purgedExcerptCount = purgedExcerptCount
     }
@@ -522,6 +680,17 @@ private actor CockpitClientStub: CockpitClient {
     func insights(filters: InsightFilters) async throws -> InsightPage {
         insightsRequestCount += 1
         requestedCursors.append(filters.cursor)
+        if let host = filters.host, let delay = insightDelaysByHost[host] {
+            try? await Task.sleep(for: delay)
+        }
+        if let cursor = filters.cursor, let delay = insightCursorDelays[cursor] {
+            try? await Task.sleep(for: delay)
+        }
+        if let host = filters.host, failingInsightHosts.contains(host) {
+            throw DroverError.unavailable("insights filter failed")
+        }
+        if let cursor = filters.cursor, let page = insightsByCursor[cursor] { return page }
+        if let host = filters.host, let page = insightsByHost[host] { return page }
         guard !pages.isEmpty else { throw DroverError.unavailable("no insights") }
         return pages.removeFirst()
     }
@@ -560,7 +729,7 @@ private actor CockpitClientStub: CockpitClient {
     func setContentAnalysisConsent(
         backend: ContentAnalysisBackend,
         externalDisclosureAccepted: Bool
-    ) async throws -> ContentAnalysisStatus {
+    ) async throws -> ContentAnalysisConsentResult {
         contentConsentRequestCount += 1
         requestedContentConsents.append(.init(
             backend: backend,
@@ -568,14 +737,18 @@ private actor CockpitClientStub: CockpitClient {
         ))
         if let contentError { throw contentError }
         guard let contentStatusValue else { throw DroverError.unavailable("not configured") }
-        return contentStatusValue
+        return ContentAnalysisConsentResult(
+            status: contentStatusValue, outcome: contentMutationOutcome
+        )
     }
 
-    func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
+    func revokeContentAnalysis() async throws -> ContentAnalysisConsentResult {
         revokeRequestCount += 1
         if let contentError { throw contentError }
         guard let contentStatusValue else { throw DroverError.unavailable("not configured") }
-        return contentStatusValue
+        return ContentAnalysisConsentResult(
+            status: contentStatusValue, outcome: contentMutationOutcome
+        )
     }
 
     func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse {
@@ -647,11 +820,11 @@ private actor ControlledRefreshCockpitClient: CockpitClient {
     func setContentAnalysisConsent(
         backend: ContentAnalysisBackend,
         externalDisclosureAccepted: Bool
-    ) async throws -> ContentAnalysisStatus {
+    ) async throws -> ContentAnalysisConsentResult {
         throw DroverError.unavailable("not configured")
     }
 
-    func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
+    func revokeContentAnalysis() async throws -> ContentAnalysisConsentResult {
         throw DroverError.unavailable("not configured")
     }
 
@@ -664,6 +837,13 @@ private func capableSnapshot() throws -> HarnessSnapshot {
     try HarnessSnapshot.decode(from: Data(
         #"{"hosts":[],"sessions":[],"cockpit_api_version":1,"cockpit_sections":["provider_capacity","activity","popular_projects","insights"]}"#.utf8
     ))
+}
+
+private func contentConsentFixture(_ name: String) throws -> ContentAnalysisStatus {
+    let url = try #require(Bundle.module.url(
+        forResource: name, withExtension: "json", subdirectory: "Fixtures"
+    ))
+    return try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
 }
 
 private func oldSnapshot() throws -> HarnessSnapshot {

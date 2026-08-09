@@ -539,6 +539,44 @@ struct ClientTests {
     ])
 }
 
+@Test func contentConsentPreservesHTTP207PartialPropagation() async throws {
+    let fixtureURL = try #require(Bundle.module.url(
+        forResource: "content-consent-partial", withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let fixture = try Data(contentsOf: fixtureURL)
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/insights/content-analysis/consent")
+        return (207, fixture)
+    }
+
+    let result = try await client().setContentAnalysisConsent(
+        backend: .cloud, externalDisclosureAccepted: true
+    )
+
+    #expect(result.outcome == .partial)
+    #expect(result.status.enabled)
+    #expect(result.status.affectedHosts.map(\.hostID) == ["offline-laptop"])
+}
+
+@Test func failedRevokeResponseStillPreservesCentralDisabledTruth() async throws {
+    let fixtureURL = try #require(Bundle.module.url(
+        forResource: "content-consent-failed", withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let fixture = try Data(contentsOf: fixtureURL)
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/insights/content-analysis/revoke")
+        return (503, fixture)
+    }
+
+    let result = try await client().revokeContentAnalysis()
+
+    #expect(result.outcome == .failed)
+    #expect(!result.status.enabled)
+    #expect(result.status.cancelledModelJobs == 3)
+}
+
 private let emptyOverviewJSON = Data(#"""
 {"cockpit_api_version":1,
  "provider_capacity":{"status":"unavailable","observed_at":null,"coverage":null,"data":[]},

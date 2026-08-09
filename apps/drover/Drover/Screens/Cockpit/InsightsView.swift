@@ -21,7 +21,12 @@ struct InsightsView: View {
                         .droverText(.nested)
                         .foregroundStyle(DroverColor.accentHi)
                 }
-                if store.insights.isEmpty, store.insightsError == nil {
+                if store.isLoadingInsights {
+                    ProgressView("Loading insights…")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                        .accessibilityIdentifier("insights-loading")
+                } else if store.insights.isEmpty, store.insightsError == nil {
                     ContentUnavailableView(
                         "No matching insights", systemImage: "checkmark.circle",
                         description: Text("Try another filter or check again later.")
@@ -38,9 +43,19 @@ struct InsightsView: View {
                         .buttonStyle(.plain)
                     }
                     if store.nextInsightsCursor != nil {
-                        Button("Load more") { Task { await store.loadMoreInsights() } }
+                        Button {
+                            Task { await store.loadMoreInsights() }
+                        } label: {
+                            if store.isLoadingMoreInsights {
+                                ProgressView()
+                            } else {
+                                Text("Load more")
+                            }
+                        }
+                            .disabled(store.isLoadingMoreInsights)
                             .buttonStyle(.bordered)
                             .frame(maxWidth: .infinity)
+                            .accessibilityIdentifier("insights-load-more")
                     }
                 }
             }

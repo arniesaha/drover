@@ -715,18 +715,128 @@ public enum ContentAnalysisBackend: String, Codable, Sendable, Equatable {
     case local, cloud
 }
 
+public enum ContentAnalysisPropagation: Sendable, Equatable, Decodable {
+    case complete, partial, failed, unknown
+
+    public init(from decoder: Decoder) throws {
+        switch try decoder.singleValueContainer().decode(String.self) {
+        case "complete": self = .complete
+        case "partial": self = .partial
+        case "failed": self = .failed
+        default: self = .unknown
+        }
+    }
+}
+
+public enum ContentAnalysisHostState: Sendable, Equatable, Decodable {
+    case acknowledged, disconnected, failed, unknown
+
+    public init(from decoder: Decoder) throws {
+        switch try decoder.singleValueContainer().decode(String.self) {
+        case "acknowledged": self = .acknowledged
+        case "disconnected": self = .disconnected
+        case "failed": self = .failed
+        default: self = .unknown
+        }
+    }
+}
+
+public struct ContentAnalysisHostResult: Decodable, Sendable, Equatable {
+    public let hostID: String
+    public let state: ContentAnalysisHostState
+    public let error: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID = "host_id"
+        case state, status, error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedID = try container.decodeIfPresent(String.self, forKey: .hostID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let decodedID, !decodedID.isEmpty {
+            hostID = decodedID
+        } else {
+            hostID = "Unknown host"
+        }
+        let wireState = try container.decodeIfPresent(String.self, forKey: .state)
+            ?? container.decodeIfPresent(String.self, forKey: .status)
+        switch wireState {
+        case "acknowledged": state = .acknowledged
+        case "disconnected": state = .disconnected
+        case "failed": state = .failed
+        default: state = .unknown
+        }
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
 public struct ContentAnalysisStatus: Decodable, Sendable, Equatable {
     public let enabled: Bool
     public let backend: ContentAnalysisBackend
     public let externalDisclosureAccepted: Bool
     public let pendingModelJobs: Int
     public let cancelledModelJobs: Int?
+    public let consentEpoch: Int?
+    public let propagation: ContentAnalysisPropagation?
+    public let hosts: [ContentAnalysisHostResult]
+
+    public var affectedHosts: [ContentAnalysisHostResult] {
+        hosts.filter { $0.state != .acknowledged }
+    }
+
+    public var propagationOutcome: ContentAnalysisMutationOutcome? {
+        switch propagation {
+        case .complete?: return .complete
+        case .partial?: return .partial
+        case .failed?, .unknown?: return .failed
+        case nil: return nil
+        }
+    }
 
     private enum CodingKeys: String, CodingKey {
         case enabled, backend
         case externalDisclosureAccepted = "external_disclosure_accepted"
         case pendingModelJobs = "pending_model_jobs"
         case cancelledModelJobs = "cancelled_model_jobs"
+        case consentEpoch = "consent_epoch"
+        case propagation, hosts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        backend = try container.decode(ContentAnalysisBackend.self, forKey: .backend)
+        externalDisclosureAccepted = try container.decode(
+            Bool.self, forKey: .externalDisclosureAccepted
+        )
+        pendingModelJobs = try container.decode(Int.self, forKey: .pendingModelJobs)
+        cancelledModelJobs = try container.decodeIfPresent(Int.self, forKey: .cancelledModelJobs)
+        consentEpoch = try container.decodeIfPresent(Int.self, forKey: .consentEpoch)
+        propagation = try container.decodeIfPresent(
+            ContentAnalysisPropagation.self, forKey: .propagation
+        )
+        hosts = try container.decodeIfPresent(
+            [ContentAnalysisHostResult].self, forKey: .hosts
+        ) ?? []
+    }
+}
+
+public enum ContentAnalysisMutationOutcome: Sendable, Equatable {
+    case complete, partial, failed
+}
+
+public struct ContentAnalysisConsentResult: Sendable, Equatable {
+    public let status: ContentAnalysisStatus
+    public let outcome: ContentAnalysisMutationOutcome
+
+    public init(
+        status: ContentAnalysisStatus,
+        outcome: ContentAnalysisMutationOutcome
+    ) {
+        self.status = status
+        self.outcome = outcome
     }
 }
 

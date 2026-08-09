@@ -154,24 +154,22 @@ public actor DroverClient {
     public func setContentAnalysisConsent(
         backend: ContentAnalysisBackend,
         externalDisclosureAccepted: Bool = false
-    ) async throws -> ContentAnalysisStatus {
+    ) async throws -> ContentAnalysisConsentResult {
         let body = try encodeJSON(ContentAnalysisConsentBody(
             backend: backend,
             externalDisclosureAccepted: externalDisclosureAccepted
         ))
-        let data = try await request(
+        return try await contentAnalysisMutationRequest(
             path: "/insights/content-analysis/consent", method: "POST", body: body
         )
-        return try decode(ContentAnalysisStatus.self, from: data)
     }
 
-    public func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
-        let data = try await request(
+    public func revokeContentAnalysis() async throws -> ContentAnalysisConsentResult {
+        try await contentAnalysisMutationRequest(
             path: "/insights/content-analysis/revoke",
             method: "POST",
             body: Data("{}".utf8)
         )
-        return try decode(ContentAnalysisStatus.self, from: data)
     }
 
     public func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse {
@@ -433,6 +431,46 @@ public actor DroverClient {
 
     private func request(url: URL, method: String, body: Data?,
                          timeout: TimeInterval? = nil) async throws -> Data {
+        let (data, http) = try await send(
+            url: url, method: method, body: body, timeout: timeout
+        )
+        return try validatedData(data, response: http)
+    }
+
+    private func contentAnalysisMutationRequest(
+        path: String, method: String, body: Data?
+    ) async throws -> ContentAnalysisConsentResult {
+        guard let url = URL(string: path, relativeTo: config.baseURL) else {
+            throw DroverError.transport("invalid URL for path \(path)")
+        }
+        let (data, http) = try await send(
+            url: url.absoluteURL, method: method, body: body, timeout: nil
+        )
+        let decoded = try? JSONDecoder().decode(ContentAnalysisStatus.self, from: data)
+        if !(200..<300).contains(http.statusCode) {
+            guard http.statusCode == 503,
+                  let decoded,
+                  decoded.propagation == .failed else {
+                _ = try validatedData(data, response: http)
+                throw DroverError.httpStatus(http.statusCode, "unexpected status")
+            }
+        }
+        guard let status = decoded else {
+            throw DroverError.decoding("invalid content-analysis mutation response")
+        }
+        let outcome: ContentAnalysisMutationOutcome
+        switch status.propagation {
+        case .failed?, .unknown?: outcome = .failed
+        case .partial?: outcome = .partial
+        case .complete?: outcome = http.statusCode == 207 ? .partial : .complete
+        case nil: outcome = http.statusCode == 207 ? .failed : .complete
+        }
+        return ContentAnalysisConsentResult(status: status, outcome: outcome)
+    }
+
+    private func send(
+        url: URL, method: String, body: Data?, timeout: TimeInterval?
+    ) async throws -> (Data, HTTPURLResponse) {
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = method
         urlRequest.timeoutInterval = timeout ?? 15
@@ -462,6 +500,10 @@ public actor DroverClient {
             throw DroverError.transport("non-HTTP response")
         }
 
+        return (data, http)
+    }
+
+    private func validatedData(_ data: Data, response http: HTTPURLResponse) throws -> Data {
         switch http.statusCode {
         case 200..<300:
             return data

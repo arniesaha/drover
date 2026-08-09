@@ -2,6 +2,47 @@ import Foundation
 import Testing
 @testable import DroverKit
 
+@Test(arguments: [
+    ("content-consent-complete", ContentAnalysisPropagation.complete, 7, 0),
+    ("content-consent-partial", ContentAnalysisPropagation.partial, 8, 1),
+    ("content-consent-failed", ContentAnalysisPropagation.failed, 9, 2),
+])
+func backendContentConsentFixturesPreserveFleetPropagation(
+    fixtureName: String,
+    expectedPropagation: ContentAnalysisPropagation,
+    expectedEpoch: Int,
+    expectedAffectedHosts: Int
+) throws {
+    let url = try #require(Bundle.module.url(
+        forResource: fixtureName, withExtension: "json", subdirectory: "Fixtures"
+    ))
+    let status = try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
+
+    #expect(status.consentEpoch == expectedEpoch)
+    #expect(status.propagation == expectedPropagation)
+    #expect(status.affectedHosts.count == expectedAffectedHosts)
+}
+
+@Test func legacyConsentStatusDefaultsToNoFleetOutcome() throws {
+    let status = try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(
+        #"{"enabled":true,"backend":"local","external_disclosure_accepted":false,"pending_model_jobs":0}"#.utf8
+    ))
+
+    #expect(status.consentEpoch == nil)
+    #expect(status.propagation == nil)
+    #expect(status.hosts.isEmpty)
+}
+
+@Test func unknownConsentPropagationAndHostStateFailSafe() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "content-consent-failed", withExtension: "json", subdirectory: "Fixtures"
+    ))
+    let status = try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
+
+    #expect(status.hosts.last?.state == .unknown)
+    #expect(status.affectedHosts.map(\.hostID) == ["workstation", "future-host"])
+}
+
 @Test func analyticsDecodesPaginationAndObservedAggregateMetadata() throws {
     let snapshot = try JSONDecoder().decode(AnalyticsSnapshot.self, from: Data(#"""
     {"cockpit_api_version":1,"filters":{"days":7,"limit":2},
