@@ -15,17 +15,21 @@ import DroverKit
 /// a whole-screen dim here.
 struct SessionsView: View {
     @State private var store: SessionStore
+    @State private var cockpitStore: CockpitStore
     private let client: DroverClient
     private let notifier: Notifying
     @Environment(\.scenePhase) private var scenePhase
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
+    @State private var showAnalytics = false
+    @State private var showInsights = false
 
     init(client: DroverClient, notifier: Notifying = LocalNotifier()) {
         self.client = client
         self.notifier = notifier
         _store = State(initialValue: SessionStore(client: client))
+        _cockpitStore = State(initialValue: CockpitStore(client: client))
     }
 
     var body: some View {
@@ -39,6 +43,44 @@ struct SessionsView: View {
                             onRetry: { Task { await store.refresh() } }
                         )
                         .padding(.bottom, 4)
+
+                        // The work that needs a human stays above every
+                        // analytics section. Remaining live sessions keep
+                        // their established inbox position below Insights.
+                        ForEach(attentionSessions) { session in
+                            row(for: session)
+                        }
+                    }
+
+                    if cockpitStore.isCockpitAvailable {
+                        if !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
+                            ProviderCapacitySection(
+                                accounts: cockpitStore.providerAccounts,
+                                statusMessage: cockpitStore.providerError,
+                                onOpenAnalytics: { showAnalytics = true }
+                            )
+                        }
+
+                        if let activity = cockpitStore.activity {
+                            ActivitySummarySection(
+                                activity: activity,
+                                statusMessage: cockpitStore.activityError,
+                                onOpenAnalytics: { showAnalytics = true }
+                            )
+                        }
+
+                        if !cockpitStore.popularProjects.isEmpty {
+                            PopularProjectsSection(
+                                projects: cockpitStore.popularProjects,
+                                tokenCoveragePercent: cockpitStore.activity?.coverage.tokenPercent,
+                                onOpenAnalytics: { showAnalytics = true }
+                            )
+                        }
+
+                        if let counts = cockpitStore.insightCounts,
+                           counts.critical + counts.high + counts.medium + counts.low > 0 {
+                            InsightsSummaryRow(counts: counts) { showInsights = true }
+                        }
                     }
 
                     // Action errors (e.g. a failed continueSession) land here.
@@ -57,7 +99,7 @@ struct SessionsView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 40)
                     } else {
-                        ForEach(activeSessions) { session in
+                        ForEach(remainingActiveSessions) { session in
                             row(for: session)
                         }
                     }
@@ -70,7 +112,12 @@ struct SessionsView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 98)
             }
-            .refreshable { await store.refresh() }
+            .refreshable {
+                await store.refresh()
+                if let snapshot = store.snapshot {
+                    await cockpitStore.refresh(for: snapshot)
+                }
+            }
 
             if store.hasLoadedOnce {
                 launchButton
@@ -100,11 +147,22 @@ struct SessionsView: View {
             }
         }
         .task { store.startPolling() }
+        .task(id: store.snapshot?.cockpitAPIVersion) {
+            guard let snapshot = store.snapshot else {
+                cockpitStore.updateCapability(from: nil)
+                return
+            }
+            cockpitStore.startForegroundPolling(for: snapshot)
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 store.startPolling()
+                if let snapshot = store.snapshot {
+                    cockpitStore.startForegroundPolling(for: snapshot)
+                }
             } else {
                 store.stopPolling()
+                cockpitStore.stopForegroundPolling()
             }
         }
         // Foreground polling drives the same AttentionWatcher diff the
@@ -138,6 +196,12 @@ struct SessionsView: View {
                 TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
             }
         }
+        .navigationDestination(isPresented: $showAnalytics) {
+            AnalyticsView(store: cockpitStore)
+        }
+        .navigationDestination(isPresented: $showInsights) {
+            InsightsView(client: client, store: cockpitStore)
+        }
     }
 
     private var summary: FleetSummaryPresentation {
@@ -150,6 +214,15 @@ struct SessionsView: View {
 
     private var activeSessions: [SessionSummary] {
         store.activeSessions
+    }
+
+    private var attentionSessions: [SessionSummary] {
+        store.needsYou
+    }
+
+    private var remainingActiveSessions: [SessionSummary] {
+        let attentionIDs = Set(attentionSessions.map(\.id))
+        return activeSessions.filter { !attentionIDs.contains($0.id) }
     }
 
     // MARK: - Pieces

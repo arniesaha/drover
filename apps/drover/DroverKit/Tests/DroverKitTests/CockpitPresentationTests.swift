@@ -2,6 +2,44 @@ import Foundation
 import Testing
 @testable import DroverKit
 
+@Test func homeSectionsFollowApprovedHierarchy() throws {
+    let overview = try decodeOverview(
+        providerStatus: "ok",
+        providerData: #"[{"snapshot_id":"snapshot-1","dedup_key":"codex:personal","provider":"openai","account_label":"Personal","host_id":"mac-mini","status":"ok","observed_at":"2026-08-08T18:00:00Z","source":"codex_app_server","windows":[]}]"#,
+        activityData: populatedActivity,
+        projects: populatedProjects,
+        insightCounts: #"{"critical":0,"high":1,"medium":0,"low":0}"#
+    )
+
+    #expect(HomeSection.visible(for: overview) == [
+        .attention, .providerCapacity, .activity, .popularProjects, .insights, .sessions,
+    ])
+}
+
+@Test func emptyHealthyHomeSectionsStayCompact() throws {
+    let overview = try decodeOverview(
+        providerStatus: "ok",
+        providerData: "[]",
+        activityData: "null",
+        projects: "[]",
+        insightCounts: #"{"critical":0,"high":0,"medium":0,"low":0}"#
+    )
+
+    #expect(HomeSection.visible(for: overview) == [.attention, .sessions])
+}
+
+@Test func unavailableProviderSectionRemainsVisibleWithoutAccounts() throws {
+    let overview = try decodeOverview(
+        providerStatus: "unavailable",
+        providerData: "[]",
+        activityData: "null",
+        projects: "[]",
+        insightCounts: "null"
+    )
+
+    #expect(HomeSection.visible(for: overview) == [.attention, .providerCapacity, .sessions])
+}
+
 @Test func expiredResetNeverShowsNegativeCountdown() throws {
     let now = Date(timeIntervalSince1970: 2_000)
     let window = try decodeProviderWindow("""
@@ -151,4 +189,18 @@ private func decodeInsightSummary(
      "first_seen_at":"2026-08-08T18:00:00Z",
      "last_seen_at":"2026-08-08T18:01:00Z"}
     """.utf8))
+}
+
+private let populatedActivity = #"{"totals":{"session_count":12,"total_tokens":1234,"cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,"total_latency_ms":500},"projects":[],"harnesses":[],"hosts":[],"models":[],"project_metric":"tokens","coverage":{"token_percent":86.4}}"#
+
+private let populatedProjects = #"[{"project_key":"arniesaha/drover","session_count":12,"total_tokens":1234,"cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,"total_latency_ms":500,"harnesses":["codex"],"hosts":["mac-mini"],"metric":"tokens"}]"#
+
+private func decodeOverview(
+    providerStatus: String,
+    providerData: String,
+    activityData: String,
+    projects: String,
+    insightCounts: String
+) throws -> CockpitOverview {
+    try JSONDecoder().decode(CockpitOverview.self, from: Data(#"{"cockpit_api_version":1,"provider_capacity":{"status":"\#(providerStatus)","data":\#(providerData)},"activity":{"status":"ok","data":\#(activityData)},"popular_projects":\#(projects),"insight_counts":\#(insightCounts)}"#.utf8))
 }

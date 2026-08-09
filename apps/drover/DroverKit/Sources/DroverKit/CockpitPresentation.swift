@@ -1,5 +1,38 @@
 import Foundation
 
+/// Stable information order for the analytics-first Home. Healthy sections
+/// with no content stay out of the way, while degraded provider state remains
+/// visible even when a connector cannot return an account snapshot.
+public enum HomeSection: Sendable, Equatable {
+    case attention
+    case providerCapacity
+    case activity
+    case popularProjects
+    case insights
+    case sessions
+
+    public static func visible(for overview: CockpitOverview) -> [Self] {
+        var sections: [Self] = [.attention]
+
+        if overview.providerCapacity.status != .ok
+            || !(overview.providerCapacity.data ?? []).isEmpty {
+            sections.append(.providerCapacity)
+        }
+        if overview.activity.data != nil {
+            sections.append(.activity)
+        }
+        if !overview.popularProjects.isEmpty {
+            sections.append(.popularProjects)
+        }
+        if let counts = overview.insightCounts,
+           counts.critical + counts.high + counts.medium + counts.low > 0 {
+            sections.append(.insights)
+        }
+        sections.append(.sessions)
+        return sections
+    }
+}
+
 /// Deterministic display values for one provider-reported quota window.
 /// SwiftUI receives strings and state only; it never derives quota semantics.
 public struct ProviderCapacityPresentation: Sendable, Equatable {
