@@ -37,6 +37,35 @@ def default_token_file() -> Path:
 
 
 @dataclass(frozen=True)
+class AdvisoryContentConfig:
+    """Explicit consent and bounds for content-sensitive advisory analysis."""
+
+    enabled: bool
+    backend_policy: str
+    external_consent: bool
+    targets: tuple[str, ...]
+    allowed_roots: tuple[Path, ...]
+    max_file_bytes: int
+    max_bundle_bytes: int
+    excerpt_max_chars: int
+
+    def __post_init__(self) -> None:
+        if self.backend_policy not in {"local", "cloud"}:
+            raise ValueError("advisory_content.backend_policy must be local or cloud")
+        if self.backend_policy == "cloud" and not self.external_consent:
+            raise ValueError(
+                "advisory_content.external_consent must be true for cloud analysis"
+            )
+        for field_name in (
+            "max_file_bytes",
+            "max_bundle_bytes",
+            "excerpt_max_chars",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"advisory_content.{field_name} must be positive")
+
+
+@dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
     parquet_dir: Path
@@ -93,6 +122,7 @@ class DroverConfig:
     # consented and is not enabled by these operational scheduler settings.
     advisory_full_review_interval_seconds: float
     advisory_poll_interval_seconds: float
+    advisory_content: AdvisoryContentConfig
 
 
 _DEFAULTS = {
@@ -158,6 +188,16 @@ _DEFAULTS = {
         "full_review_interval_seconds": 86400.0,
         "poll_interval_seconds": 5.0,
     },
+    "advisory_content": {
+        "enabled": False,
+        "backend_policy": "local",
+        "external_consent": False,
+        "targets": [],
+        "allowed_roots": [],
+        "max_file_bytes": 131072,
+        "max_bundle_bytes": 524288,
+        "excerpt_max_chars": 320,
+    },
 }
 
 
@@ -173,6 +213,7 @@ def _from_dict(d: dict) -> DroverConfig:
     e = d["embeddings"]
     r = d["redis_shadow"]
     j = d["redis_jobs"]
+    content = d["advisory_content"]
     return DroverConfig(
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
@@ -220,6 +261,16 @@ def _from_dict(d: dict) -> DroverConfig:
             d["advisory"]["full_review_interval_seconds"]
         ),
         advisory_poll_interval_seconds=float(d["advisory"]["poll_interval_seconds"]),
+        advisory_content=AdvisoryContentConfig(
+            enabled=bool(content["enabled"]),
+            backend_policy=str(content["backend_policy"]),
+            external_consent=bool(content["external_consent"]),
+            targets=tuple(str(target) for target in content["targets"]),
+            allowed_roots=tuple(Path(root) for root in content["allowed_roots"]),
+            max_file_bytes=int(content["max_file_bytes"]),
+            max_bundle_bytes=int(content["max_bundle_bytes"]),
+            excerpt_max_chars=int(content["excerpt_max_chars"]),
+        ),
     )
 
 

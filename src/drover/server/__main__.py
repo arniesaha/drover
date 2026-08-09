@@ -156,6 +156,19 @@ local_model     = "nomic-embed-text"
 full_review_interval_seconds = 86400
 poll_interval_seconds = 5
 
+[advisory_content]
+# Content-sensitive checks are separately opt-in and local by default. Cloud
+# analysis also requires external_consent = true. Targets and roots are empty
+# until the operator explicitly allowlists them.
+enabled = false
+backend_policy = "local"
+external_consent = false
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+
 [redis_jobs]
 # Optional production coordination for derived workers. Off by default; when
 # enabled, workers consume Redis Streams and keep DuckDB as the durable serving
