@@ -60,6 +60,16 @@ struct SettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(DroverColor.bg, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar {
+            // Only when this is the sheet reached from the inbox. During
+            // onboarding there is nothing behind it to go back to, and a Done
+            // button that dismissed to an unconfigured app would be a trap.
+            if environment.client != nil {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
         .onAppear {
             if urlString.isEmpty, let config = environment.config {
                 urlString = config.baseURL.absoluteString
