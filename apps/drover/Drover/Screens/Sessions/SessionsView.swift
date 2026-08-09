@@ -1,8 +1,10 @@
 import SwiftUI
 import DroverKit
 
-/// The fleet inbox: a count that says how much wants you, a host strip that
-/// says where the herd is, then one list of live sessions ordered by activity.
+/// The fleet inbox: a wordmark row carrying the two app-level controls, a
+/// count that says how much wants you, a host strip that says where the herd
+/// is, then one list of live sessions ordered by activity, over a pinned
+/// "New Session" footer.
 ///
 /// Conversation and terminal sessions share that list — `SessionRow` gives
 /// each species its own form, and the card's verb ("Answer", "Attach") carries
@@ -17,19 +19,28 @@ struct SessionsView: View {
     @State private var store: SessionStore
     private let client: DroverClient
     private let notifier: Notifying
+    private let onOpenSettings: () -> Void
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(AppearanceStore.self) private var appearance
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
 
-    init(client: DroverClient, notifier: Notifying = LocalNotifier()) {
+    init(
+        client: DroverClient,
+        notifier: Notifying = LocalNotifier(),
+        onOpenSettings: @escaping () -> Void = {}
+    ) {
         self.client = client
         self.notifier = notifier
+        self.onOpenSettings = onOpenSettings
         _store = State(initialValue: SessionStore(client: client))
     }
 
     var body: some View {
-        ZStack(alignment: .bottomLeading) {
+        VStack(spacing: 0) {
+            chromeRow
+
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     if store.hasLoadedOnce {
@@ -53,7 +64,7 @@ struct SessionsView: View {
                     if activeSessions.isEmpty, store.hasLoadedOnce {
                         ContentUnavailableView("Nothing running",
                                                systemImage: "rectangle.stack.badge.plus",
-                                               description: Text("Send one out when you're ready."))
+                                               description: Text("Start a new session when you're ready."))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 40)
                     } else {
@@ -68,37 +79,38 @@ struct SessionsView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 8)
-                .padding(.bottom, 98)
+                .padding(.bottom, 16)
             }
             .refreshable { await store.refresh() }
+            .overlay {
+                if !store.hasLoadedOnce {
+                    if let error = store.lastError {
+                        ContentUnavailableView {
+                            Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+                        } description: {
+                            Text(error)
+                        } actions: {
+                            Button("Retry") {
+                                Task { await store.refresh() }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    } else {
+                        ProgressView("Connecting…")
+                    }
+                }
+            }
 
             if store.hasLoadedOnce {
-                launchButton
+                actionBar
             }
         }
         .background(DroverColor.bg)
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(DroverColor.bg, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .overlay {
-            if !store.hasLoadedOnce {
-                if let error = store.lastError {
-                    ContentUnavailableView {
-                        Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
-                    } description: {
-                        Text(error)
-                    } actions: {
-                        Button("Retry") {
-                            Task { await store.refresh() }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                } else {
-                    ProgressView("Connecting…")
-                }
-            }
-        }
+        // The design's chrome row *is* this screen's header, so the navigation
+        // bar it would otherwise sit under has nothing left to carry. Pushed
+        // screens (chat, terminal, the launch sheet) declare their own bars
+        // and are unaffected.
+        .toolbar(.hidden, for: .navigationBar)
         .task { store.startPolling() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -154,6 +166,13 @@ struct SessionsView: View {
 
     // MARK: - Pieces
 
+    private var chromeRow: some View {
+        InboxChromeRow(
+            onToggleTheme: { appearance.toggle(displaying: colorScheme) },
+            onOpenSettings: onOpenSettings
+        )
+    }
+
     private func actionFailedRow(_ message: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.circle")
@@ -172,44 +191,23 @@ struct SessionsView: View {
 
     private var finishedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            FadingRule()
-                .padding(.vertical, 6)
+            FinishedRow(count: store.finished.count, isExpanded: showFinished) {
+                withAnimation(.snappy(duration: 0.2)) { showFinished.toggle() }
+            }
 
-            DisclosureGroup(isExpanded: $showFinished) {
+            if showFinished {
                 VStack(spacing: 10) {
                     ForEach(store.finished) { session in
                         row(for: session)
                     }
                 }
-                .padding(.top, 10)
-            } label: {
-                HStack(spacing: 8) {
-                    Text("Finished").droverText(.h3)
-                    Text("\(store.finished.count)").droverText(.marker)
-                }
             }
-            .tint(DroverColor.muted.color(for: colorScheme))
         }
+        .padding(.top, 4)
     }
 
-    private var launchButton: some View {
-        Button {
-            showLaunch = true
-        } label: {
-            Label("Send one out", systemImage: "plus")
-                .font(.system(.subheadline, design: .default, weight: .medium))
-                .foregroundStyle(DroverColor.accentHi)
-                .padding(.horizontal, 15)
-                .padding(.vertical, 11)
-                // Outlined on the ground tone, never a filled pill — the
-                // system guide reserves fills for nothing at this scale.
-                .background(DroverColor.bg, in: Capsule())
-                .overlay { Capsule().strokeBorder(DroverColor.accent, lineWidth: 1) }
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("launch-button")
-        .padding(.leading, 18)
-        .padding(.bottom, 18)
+    private var actionBar: some View {
+        NewSessionBar { showLaunch = true }
     }
 
     @Environment(\.colorScheme) private var colorScheme

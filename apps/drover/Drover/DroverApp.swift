@@ -46,35 +46,38 @@ struct DroverApp: App {
 }
 
 /// Composition root: no client configured → onboarding `SettingsView`;
-/// otherwise a `NavigationStack` over `SessionsView` with Settings reachable
-/// from the toolbar gear. `.id(environment.generation)` forces `SessionsView`
-/// (and the `SessionStore` it owns) to rebuild whenever `configure()`
-/// succeeds, including re-configuring while already authenticated.
+/// otherwise a `NavigationStack` over `SessionsView`, whose own header row
+/// carries the theme toggle and the way into Settings (the design puts both
+/// beside the wordmark rather than in a navigation bar, so there is no toolbar
+/// gear any more). `.id(environment.generation)` forces `SessionsView` (and
+/// the `SessionStore` it owns) to rebuild whenever `configure()` succeeds,
+/// including re-configuring while already authenticated.
+///
+/// The appearance preference is applied here and nowhere else: one
+/// `.preferredColorScheme` over the whole tree is what keeps every palette
+/// token — and both sheets — on the same ramp.
 private struct RootView: View {
     var environment: AppEnvironment
     let notifier: Notifying
     @State private var showSettings = false
+    @State private var appearance = AppearanceStore()
 
     var body: some View {
         Group {
             if let client = environment.client {
                 NavigationStack {
-                    SessionsView(client: client, notifier: notifier)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button {
-                                    showSettings = true
-                                } label: {
-                                    Image(systemName: "gearshape")
-                                }
-                            }
-                        }
+                    SessionsView(
+                        client: client,
+                        notifier: notifier,
+                        onOpenSettings: { showSettings = true }
+                    )
                 }
                 .id(environment.generation)
                 .sheet(isPresented: $showSettings) {
                     NavigationStack {
                         SettingsView(environment: environment)
                     }
+                    .presentationCornerRadius(24)
                 }
             } else {
                 NavigationStack {
@@ -82,6 +85,8 @@ private struct RootView: View {
                 }
             }
         }
+        .environment(appearance)
+        .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()
         // Covers both a returning user (client already configured at launch,
         // `generation` still 0) and a fresh onboarding success (`generation`
