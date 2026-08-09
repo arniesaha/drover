@@ -49,6 +49,26 @@ GOOD_PAYLOAD = {
     "observed_at": "2026-08-08T10:00:00+00:00",
 }
 
+CODEX_ERROR_PAYLOAD = {
+    "accounts": [
+        {
+            "snapshot_id": "snapshot-error",
+            "dedup_key": "dedup-error",
+            "provider": "openai",
+            "account_label": "Codex",
+            "plan_label": None,
+            "host_id": "mac-mini",
+            "usage_status": "supported",
+            "status": "error",
+            "observed_at": "2026-08-08T10:05:00+00:00",
+            "source": "codex-app-server",
+            "error_category": "timeout",
+            "windows": [],
+        }
+    ],
+    "observed_at": "2026-08-08T10:05:00+00:00",
+}
+
 
 @pytest.fixture
 def provider_service(tmp_path):
@@ -271,6 +291,41 @@ def test_last_good_provider_snapshot_survives_refresh_failure(
     assert account.status == "stale"
     assert account.error_category == "timeout"
     assert account.windows[0].used_percent == 25.0
+
+
+def test_codex_error_before_account_discovery_stales_existing_account(
+    provider_service, provider_host
+):
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    provider_service.refresh_host(provider_host, fetch=lambda _: CODEX_ERROR_PAYLOAD)
+
+    accounts = provider_service.latest_accounts()
+
+    assert len(accounts) == 1
+    assert accounts[0].account_label == "person@example.com"
+    assert accounts[0].status == "stale"
+    assert accounts[0].error_category == "timeout"
+    assert accounts[0].windows[0].used_percent == 25.0
+
+
+def test_empty_provider_inventory_stales_existing_host_accounts(
+    provider_service, provider_host
+):
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    provider_service.refresh_host(
+        provider_host,
+        fetch=lambda _: {
+            "accounts": [],
+            "observed_at": "2026-08-08T10:05:00+00:00",
+        },
+    )
+
+    accounts = provider_service.latest_accounts()
+
+    assert len(accounts) == 1
+    assert accounts[0].account_label == "person@example.com"
+    assert accounts[0].status == "stale"
+    assert accounts[0].error_category == "empty_inventory"
 
 
 def test_provider_refresh_is_atomic_deduplicated_and_records_every_attempt(

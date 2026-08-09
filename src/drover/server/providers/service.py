@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -57,6 +58,14 @@ class ProviderUsageService:
         try:
             payload = (fetch or self._fetch_host)(host)
             snapshots = _snapshots_from_payload(payload, host_id=host_id)
+            if not snapshots:
+                self._record_host_failure(
+                    host_id,
+                    attempted_at=attempted_at,
+                    error_category="empty_inventory",
+                )
+                return ()
+            snapshots = self._scope_connector_errors(snapshots)
             self._persist_new_snapshots(snapshots, host_id=host_id)
             self._record_snapshot_attempts(snapshots, attempted_at=attempted_at)
             return snapshots
@@ -67,6 +76,53 @@ class ProviderUsageService:
                 error_category=_error_category(exc),
             )
             return ()
+
+    def _scope_connector_errors(
+        self, snapshots: tuple[ProviderAccountSnapshot, ...]
+    ) -> tuple[ProviderAccountSnapshot, ...]:
+        """Map provider/host errors onto stable discovered account identities."""
+        keys = {
+            (snapshot.provider, snapshot.host_id)
+            for snapshot in snapshots
+            if snapshot.status == "error"
+        }
+        if not keys:
+            return snapshots
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            existing = con.execute("""
+                SELECT provider, host_id, account_label
+                FROM provider_connections
+                ORDER BY provider, host_id, account_label
+                """).fetchall()
+        finally:
+            con.close()
+        account_labels: dict[tuple[str, str], set[str]] = {key: set() for key in keys}
+        for provider, host_id, account_label in existing:
+            key = (str(provider), str(host_id))
+            if key in account_labels:
+                account_labels[key].add(str(account_label))
+        for snapshot in snapshots:
+            if snapshot.status in _SUCCESS_STATUSES:
+                account_labels.setdefault(
+                    (snapshot.provider, snapshot.host_id), set()
+                ).add(snapshot.account_label)
+
+        scoped: list[ProviderAccountSnapshot] = []
+        for snapshot in snapshots:
+            if snapshot.status != "error":
+                scoped.append(snapshot)
+                continue
+            labels = account_labels.get((snapshot.provider, snapshot.host_id), set())
+            if not labels or snapshot.account_label in labels:
+                scoped.append(snapshot)
+                continue
+            scoped.extend(
+                _scoped_error_snapshot(snapshot, label) for label in sorted(labels)
+            )
+        return tuple(scoped)
 
     def latest_accounts(self) -> list[ProviderAccountSnapshot]:
         """Return last-good accounts with current connector state overlaid."""
@@ -381,6 +437,22 @@ def _connection_failed(connection: Mapping[str, Any]) -> bool:
     last_success = connection.get("last_success_at")
     return last_success is None or (
         last_attempt is not None and last_attempt >= last_success
+    )
+
+
+def _scoped_error_snapshot(
+    snapshot: ProviderAccountSnapshot, account_label: str
+) -> ProviderAccountSnapshot:
+    scope = f"{snapshot.provider}|{snapshot.host_id}|{account_label}"
+    snapshot_suffix = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
+    dedup_key = hashlib.sha256(
+        f"{snapshot.dedup_key}|{scope}".encode("utf-8")
+    ).hexdigest()
+    return replace(
+        snapshot,
+        snapshot_id=f"{snapshot.snapshot_id}-{snapshot_suffix}",
+        dedup_key=dedup_key,
+        account_label=account_label,
     )
 
 
