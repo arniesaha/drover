@@ -435,3 +435,124 @@ private enum ProviderNumberFormatting {
         return formatter.string(from: NSNumber(value: value)) ?? String(value)
     }
 }
+
+/// One subscription, however many hosts report it.
+///
+/// The fleet reports provider capacity *per host*, because that is where the
+/// probe runs. Presented raw, one Codex account signed in on three machines is
+/// three identical cards with no way to tell them apart — the host is not even
+/// on the card. So identity here is the subscription (provider + account +
+/// plan), and the hosts become an attribute of it.
+///
+/// Merging is by label, which is a true identity for providers that report an
+/// account (`arnabsahacanada@gmail.com`) and a generic name for those that do
+/// not (`Claude Code`). Collapsing the generic ones assumes a single operator's
+/// account signed in on each host — the deployment Drover is built for. It is
+/// the same assumption the fleet already makes everywhere else.
+public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let provider: String
+    public let accountLabel: String
+    public let planLabel: String?
+    /// Host ids that reported this subscription, sorted.
+    public let hostIDs: [String]
+    /// "Mac Mini, NAS" — display titles when known, ids otherwise.
+    public let hostsText: String
+    /// The freshest reading across hosts; the card's numbers come from it.
+    public let representative: ProviderAccount
+    public let windows: [ProviderWindow]
+    public let status: ProviderAccountStatus
+    /// Why this subscription is degraded, naming the host it failed on, so a
+    /// single broken probe reads as one card's problem rather than a banner
+    /// over the whole section.
+    public let reasonText: String?
+
+    public var isDegraded: Bool { status != .ok }
+}
+
+public enum ProviderSubscriptionGrouping {
+    /// Groups per-host accounts into one entry per subscription.
+    ///
+    /// The representative is the most recently observed *healthy* member when
+    /// there is one — a host whose probe just failed should not blank out
+    /// numbers another host reported successfully a minute ago — falling back
+    /// to the freshest member overall.
+    public static func group(
+        _ accounts: [ProviderAccount],
+        hostTitles: [String: String] = [:]
+    ) -> [ProviderSubscriptionPresentation] {
+        var order: [String] = []
+        var buckets: [String: [ProviderAccount]] = [:]
+
+        for account in accounts {
+            let key = identity(for: account)
+            if buckets[key] == nil {
+                buckets[key] = []
+                order.append(key)
+            }
+            buckets[key]?.append(account)
+        }
+
+        return order.compactMap { key in
+            guard let members = buckets[key], let newest = members.max(by: { $0.observedAt < $1.observedAt })
+            else { return nil }
+
+            let healthy = members.filter { $0.status == .ok }
+            let representative = healthy.max(by: { $0.observedAt < $1.observedAt }) ?? newest
+            let hostIDs = Array(Set(members.map(\.hostID))).sorted()
+            let titles = hostIDs.map { hostTitles[$0] ?? $0 }
+
+            return ProviderSubscriptionPresentation(
+                id: key,
+                title: "\(representative.provider.capitalized) · \(representative.accountLabel)",
+                provider: representative.provider,
+                accountLabel: representative.accountLabel,
+                planLabel: representative.planLabel,
+                hostIDs: hostIDs,
+                hostsText: ListFormatter.localizedString(byJoining: titles),
+                representative: representative,
+                windows: representative.windows,
+                status: representative.status,
+                reasonText: reason(members: members, hostTitles: hostTitles)
+            )
+        }
+    }
+
+    private static func identity(for account: ProviderAccount) -> String {
+        let plan = account.planLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return [account.provider, account.accountLabel, plan]
+            .map { $0.lowercased() }
+            .joined(separator: "|")
+    }
+
+    /// Names the failing hosts and what went wrong, rather than asserting a
+    /// cause the probe never reported. `unavailable` means the provider CLI
+    /// would not launch on that host — which is what a machine missing the
+    /// tool, or one that was never signed in, actually looks like from here.
+    private static func reason(
+        members: [ProviderAccount],
+        hostTitles: [String: String]
+    ) -> String? {
+        let failing = members.filter { $0.status == .error || $0.status == .stale }
+        guard !failing.isEmpty else { return nil }
+
+        let hosts = ListFormatter.localizedString(
+            byJoining: failing.map { hostTitles[$0.hostID] ?? $0.hostID }.sorted()
+        )
+        let categories = Set(failing.compactMap { $0.errorCategory })
+        let detail = categories.count == 1 ? categories.first.map(explain) ?? nil : nil
+        return detail.map { "\($0) on \(hosts)" } ?? "Not reporting on \(hosts)"
+    }
+
+    private static func explain(_ category: String) -> String? {
+        switch category {
+        case "unavailable": return "Provider CLI unavailable"
+        case "timeout": return "Timed out"
+        case "process_error": return "Probe failed"
+        case "empty_inventory": return "No accounts detected"
+        case "freshness_expired", "provider_window_expired": return "Reading expired"
+        default: return nil
+        }
+    }
+}

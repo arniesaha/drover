@@ -69,6 +69,7 @@ struct SessionsView: View {
                                 accounts: cockpitStore.providerAccounts,
                                 status: providerSectionStatus,
                                 statusMessage: cockpitStore.providerError,
+                                hostTitles: hostTitles,
                                 onOpenAnalytics: { showAnalytics = true }
                             )
                         }
@@ -325,6 +326,16 @@ struct SessionsView: View {
                 }
             }
         }
+    }
+
+    /// Host id → display title from the fleet snapshot, so provider cards can
+    /// name the machines a subscription covers ("Mac Mini, NAS") rather than
+    /// showing raw ids.
+    private var hostTitles: [String: String] {
+        Dictionary(
+            (store.snapshot?.hosts ?? []).map { ($0.id, $0.title) },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     private func hostTitle(for session: SessionSummary) -> String {

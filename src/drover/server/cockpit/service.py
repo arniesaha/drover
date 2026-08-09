@@ -94,9 +94,16 @@ class CockpitService:
             observed_at = max(
                 (account.observed_at for account in accounts), default=None
             )
+            # Section status describes the *section*: whether what we are
+            # showing is current. A single account failing to report does not
+            # make the other seven stale, and the client treats section status
+            # as authoritative over every card — so folding per-account errors
+            # in here relabels healthy, freshly-observed accounts as "Stale".
+            # Account-level failures travel on the account and render on their
+            # own card.
             status = (
                 "stale"
-                if any(account.status in {"stale", "error"} for account in accounts)
+                if any(account.status == "stale" for account in accounts)
                 else "ok"
             )
             return _section(
