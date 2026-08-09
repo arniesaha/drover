@@ -479,6 +479,17 @@ struct CockpitStoreTests {
         #expect(store.contentConsentOutcome == .partial)
     }
 
+    @Test @MainActor func statusReloadKeepsEnabledIntentAndFailedRepairOutcome() async throws {
+        let status = try contentConsentFixture("content-consent-repair-failed")
+        let store = CockpitStore(client: CockpitClientStub(contentStatus: status))
+
+        await store.loadContentAnalysisStatus()
+
+        #expect(store.contentAnalysisStatus?.enabled == true)
+        #expect(store.contentConsentOutcome == .failed)
+        #expect(store.contentAnalysisStatus?.affectedHosts.first?.hostID == "fleet")
+    }
+
     @Test @MainActor func failedRevokeKeepsCentralDisabledTruthAndCanRetryConsentOnly() async throws {
         let status = try contentConsentFixture("content-consent-failed")
         let client = CockpitClientStub(

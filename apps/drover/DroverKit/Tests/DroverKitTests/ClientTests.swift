@@ -596,6 +596,25 @@ struct ClientTests {
     #expect(status.affectedHosts.map(\.hostID) == ["workstation"])
 }
 
+@Test func contentStatusSurfacesFailedDurableRepairWithoutHidingCentralIntent() async throws {
+    let fixtureURL = try #require(Bundle.module.url(
+        forResource: "content-consent-repair-failed", withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let fixture = try Data(contentsOf: fixtureURL)
+    MockURLProtocol.handler = { request in
+        #expect(request.httpMethod == "GET")
+        #expect(request.url?.path == "/insights/content-analysis")
+        return (503, fixture)
+    }
+
+    let status = try await client().contentAnalysisStatus()
+
+    #expect(status.enabled)
+    #expect(status.propagationOutcome == .failed)
+    #expect(status.affectedHosts.first?.error == "durable consent repair failed")
+}
+
 private let emptyOverviewJSON = Data(#"""
 {"cockpit_api_version":1,
  "provider_capacity":{"status":"unavailable","observed_at":null,"coverage":null,"data":[]},

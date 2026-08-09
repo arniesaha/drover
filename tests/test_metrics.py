@@ -911,6 +911,41 @@ def test_content_status_failed_registry_matches_shared_swift_fixture(tmp_path) -
     assert json.loads(body) == _swift_content_consent_fixture("failed")
 
 
+def test_content_status_repair_failure_matches_shared_swift_fixture(
+    tmp_path, monkeypatch
+) -> None:
+    """Catches durable repair failure becoming a generic or successful GET."""
+
+    collector = _make_collector(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """[advisory_content]
+enabled = true
+backend_policy = "cloud"
+external_consent = true
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+""",
+        encoding="utf-8",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=config_path
+    )
+    monkeypatch.setattr(
+        collector.advisory_service._content_consent,
+        "_persist",
+        lambda state: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 503
+    assert json.loads(body) == _swift_content_consent_fixture("repair-failed")
+
+
 def test_central_consent_and_revoke_reconcile_an_already_running_direct_daemon(
     tmp_path,
 ):

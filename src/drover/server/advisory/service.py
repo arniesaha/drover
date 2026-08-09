@@ -182,13 +182,7 @@ class InsightsService:
         consent_path = self.config_path.with_name(
             f".{self.config_path.name}.content-consent.json"
         )
-        initial_enabled = False
-        if not consent_path.exists() and self.config_path.exists():
-            initial_enabled = load_config(self.config_path).advisory_content.enabled
-        self._content_consent = DurableContentConsent(
-            consent_path,
-            initial_enabled=initial_enabled,
-        )
+        self._content_consent = DurableContentConsent(consent_path)
         self._consent_propagator = consent_propagator
 
     def set_content_consent_propagator(
@@ -197,7 +191,14 @@ class InsightsService:
         self._consent_propagator = propagator
 
     def content_consent_state(self) -> dict[str, Any]:
-        return self._content_consent.snapshot()
+        with _CONTENT_CONSENT_COORDINATOR.mutation():
+            config = (
+                load_config(self.config_path).advisory_content
+                if self.config_path.exists()
+                else default_config().advisory_content
+            )
+            consent, _ = self._reconcile_content_consent(enabled=config.enabled)
+            return consent
 
     def content_analysis_status(self) -> dict[str, Any]:
         """Return central truth plus a serialized current-epoch fleet reconcile."""
@@ -212,14 +213,19 @@ class InsightsService:
                 if self.config_path.exists()
                 else default_config().advisory_content
             )
-            consent = self._content_consent.snapshot()
+            consent, repair_error = self._reconcile_content_consent(
+                enabled=config.enabled
+            )
             result = {
                 "enabled": config.enabled,
                 "backend": config.backend_policy,
                 "external_disclosure_accepted": config.external_consent,
                 "pending_model_jobs": self._pending_model_job_count(),
             }
-            self._append_propagation(result, consent)
+            if repair_error is None:
+                self._append_propagation(result, consent)
+            else:
+                self._append_repair_failure(result, consent)
             return result
 
     def consent_content_analysis(
@@ -317,6 +323,26 @@ class InsightsService:
             enabled=enabled, epoch=int(current["epoch"]) + 1
         )
 
+    def _reconcile_content_consent(
+        self, *, enabled: bool
+    ) -> tuple[dict[str, Any], str | None]:
+        """Make the durable gate match validated central user intent."""
+
+        with CONTENT_CONSENT_FENCE:
+            if self._content_consent.reconciled(enabled=enabled):
+                return self._content_consent.snapshot(), None
+            try:
+                consent = self._content_consent.reconcile(enabled=enabled)
+            except Exception:
+                consent = self._content_consent.snapshot()
+                error = "durable consent repair failed"
+            else:
+                error = None
+            # A repaired or fail-closed gate invalidates any content operation
+            # that began under the divergent durable epoch.
+            _CONTENT_CONSENT_COORDINATOR.advance_generation()
+            return consent, error
+
     def _propagate_content_consent(
         self, consent: Mapping[str, Any]
     ) -> list[dict[str, str]]:
@@ -351,6 +377,22 @@ class InsightsService:
             consent_epoch=int(consent["epoch"]),
             propagation=propagation,
             hosts=hosts,
+        )
+
+    @staticmethod
+    def _append_repair_failure(
+        result: dict[str, Any], consent: Mapping[str, Any]
+    ) -> None:
+        result.update(
+            consent_epoch=int(consent["epoch"]),
+            propagation="failed",
+            hosts=[
+                {
+                    "host_id": "fleet",
+                    "state": "failed",
+                    "error": "durable consent repair failed",
+                }
+            ],
         )
 
     def pending_model_jobs(self) -> list[dict[str, str]]:

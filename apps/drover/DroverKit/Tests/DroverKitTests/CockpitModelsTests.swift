@@ -6,6 +6,7 @@ import Testing
     ("content-consent-complete", ContentAnalysisPropagation.complete, 0, 0),
     ("content-consent-partial", ContentAnalysisPropagation.partial, 1, 1),
     ("content-consent-failed", ContentAnalysisPropagation.failed, 0, 1),
+    ("content-consent-repair-failed", ContentAnalysisPropagation.failed, 1, 1),
 ])
 func backendContentConsentFixturesPreserveFleetPropagation(
     fixtureName: String,
@@ -21,6 +22,21 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     #expect(status.consentEpoch == expectedEpoch)
     #expect(status.propagation == expectedPropagation)
     #expect(status.affectedHosts.count == expectedAffectedHosts)
+}
+
+@Test func durableRepairFailureFixturePreservesCentralIntentAndFailureDetail() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "content-consent-repair-failed", withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let status = try JSONDecoder().decode(
+        ContentAnalysisStatus.self, from: Data(contentsOf: url)
+    )
+
+    #expect(status.enabled)
+    #expect(status.propagationOutcome == .failed)
+    #expect(status.affectedHosts.first?.hostID == "fleet")
+    #expect(status.affectedHosts.first?.error == "durable consent repair failed")
 }
 
 @Test func legacyConsentStatusDefaultsToNoFleetOutcome() throws {

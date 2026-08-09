@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import threading
 from typing import Any, Mapping
@@ -22,14 +23,51 @@ class DurableContentConsent:
         self.path = Path(path)
         self._lock = threading.RLock()
         missing = not self.path.exists()
-        self._state = self._load()
+        self._state, self._valid, self._epoch_floor = self._load()
         if initial_enabled and missing:
             initial = {"enabled": True, "epoch": 1}
             self._persist(initial)
             self._state = initial
+            self._valid = True
+            self._epoch_floor = 1
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            return dict(self._state)
+
+    def reconciled(self, *, enabled: bool) -> bool:
+        """Whether durable state is valid and matches central user intent."""
+
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        with self._lock:
+            return self._valid and self._state["enabled"] is enabled
+
+    def reconcile(self, *, enabled: bool) -> dict[str, Any]:
+        """Advance invalid or divergent state without reusing an observed epoch.
+
+        A persistence failure immediately closes the in-memory content gate.
+        The caller can then report the failed repair without permitting content
+        access from the stale on-disk state.
+        """
+
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        with self._lock:
+            if self._valid and self._state["enabled"] is enabled:
+                return dict(self._state)
+            next_epoch = max(int(self._state["epoch"]), self._epoch_floor) + 1
+            next_state = {"enabled": enabled, "epoch": next_epoch}
+            try:
+                self._persist(next_state)
+            except Exception:
+                self._state = {"enabled": False, "epoch": next_epoch}
+                self._valid = False
+                self._epoch_floor = next_epoch
+                raise
+            self._state = next_state
+            self._valid = True
+            self._epoch_floor = next_epoch
             return dict(self._state)
 
     def apply(self, *, enabled: bool, epoch: int) -> dict[str, Any]:
@@ -50,16 +88,30 @@ class DurableContentConsent:
             next_state = {"enabled": enabled, "epoch": epoch}
             self._persist(next_state)
             self._state = next_state
+            self._valid = True
+            self._epoch_floor = epoch
             return dict(self._state)
 
-    def _load(self) -> dict[str, Any]:
+    def _load(self) -> tuple[dict[str, Any], bool, int]:
         try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"enabled": False, "epoch": 0}
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {"enabled": False, "epoch": 0}, True, 0
+        except OSError:
+            return {"enabled": False, "epoch": 0}, False, 0
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            epoch = _observed_epoch(raw)
+            return {"enabled": False, "epoch": epoch}, False, epoch
         if not _valid_state(loaded):
-            return {"enabled": False, "epoch": 0}
-        return {"enabled": loaded["enabled"], "epoch": loaded["epoch"]}
+            epoch = _observed_epoch(loaded)
+            return {"enabled": False, "epoch": epoch}, False, epoch
+        return (
+            {"enabled": loaded["enabled"], "epoch": loaded["epoch"]},
+            True,
+            int(loaded["epoch"]),
+        )
 
     def _persist(self, state: Mapping[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,3 +145,15 @@ def _valid_state(value: Any) -> bool:
         and type(value["epoch"]) is int
         and value["epoch"] > 0
     )
+
+
+def _observed_epoch(value: Any) -> int:
+    """Recover a non-negative epoch floor from invalid durable content."""
+
+    if isinstance(value, dict):
+        epoch = value.get("epoch")
+        return epoch if type(epoch) is int and epoch >= 0 else 0
+    if isinstance(value, str):
+        match = re.search(r'"epoch"\s*:\s*(\d+)', value)
+        return int(match.group(1)) if match is not None else 0
+    return 0

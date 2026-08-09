@@ -28,6 +28,7 @@ from drover.server.advisory.types import (
     FindingState,
     Severity,
 )
+from drover.server.harness.content_consent import DurableContentConsent
 
 
 @pytest.fixture
@@ -153,16 +154,16 @@ def test_content_consent_propagates_monotonic_epoch_and_reports_partial_hosts(
     )
     revoked = service.revoke_content_analysis()
 
-    assert calls == [(True, 2), (False, 3)]
-    assert enabled["consent_epoch"] == 2
+    assert calls == [(True, 1), (False, 2)]
+    assert enabled["consent_epoch"] == 1
     assert enabled["propagation"] == "partial"
     assert enabled["hosts"] == [
         {"host_id": "mac-mini", "state": "acknowledged"},
         {"host_id": "laptop", "state": "disconnected"},
     ]
-    assert revoked["consent_epoch"] == 3
+    assert revoked["consent_epoch"] == 2
     assert revoked["propagation"] == "partial"
-    assert service.content_consent_state() == {"enabled": False, "epoch": 3}
+    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
 
 
 def test_content_status_reconciles_the_current_durable_epoch(
@@ -210,6 +211,193 @@ def test_content_status_bootstraps_durable_truth_from_enabled_config(
     assert calls == [(True, 1)]
 
 
+@pytest.mark.parametrize(
+    ("config_enabled", "durable_enabled", "durable_epoch", "expected_epoch"),
+    [
+        (True, False, 4, 5),
+        (False, True, 7, 8),
+    ],
+)
+def test_content_status_repairs_durable_divergence_to_central_config(
+    repository,
+    tmp_path,
+    config_enabled,
+    durable_enabled,
+    durable_epoch,
+    expected_epoch,
+):
+    """Catches GET reporting config truth while propagating the opposite gate."""
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[advisory_content]\n"
+        f"enabled = {'true' if config_enabled else 'false'}\n"
+        'backend_policy = "local"\n'
+        "external_consent = false\n",
+        encoding="utf-8",
+    )
+    durable_path = tmp_path / ".config.toml.content-consent.json"
+    DurableContentConsent(durable_path).apply(
+        enabled=durable_enabled, epoch=durable_epoch
+    )
+    calls = []
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=config_path,
+        consent_propagator=lambda enabled, epoch: (
+            calls.append((enabled, epoch)) or []
+        ),
+    )
+
+    status = service.content_analysis_status()
+
+    assert status["enabled"] is config_enabled
+    assert status["consent_epoch"] == expected_epoch
+    assert service.content_consent_state() == {
+        "enabled": config_enabled,
+        "epoch": expected_epoch,
+    }
+    assert calls == [(config_enabled, expected_epoch)]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        '{"enabled":"invalid","epoch":41}',
+        '{"enabled":true,"epoch":41',
+    ],
+)
+def test_content_status_repairs_malformed_durable_state_above_observed_epoch(
+    repository, content_config_path, tmp_path, malformed
+):
+    """Catches malformed durable state resetting a previously issued epoch."""
+
+    durable_path = tmp_path / ".config.toml.content-consent.json"
+    durable_path.write_text(malformed, encoding="utf-8")
+    calls = []
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=lambda enabled, epoch: (
+            calls.append((enabled, epoch)) or []
+        ),
+    )
+
+    status = service.content_analysis_status()
+
+    assert status["enabled"] is True
+    assert status["consent_epoch"] == 42
+    assert calls == [(True, 42)]
+    assert json.loads(durable_path.read_text(encoding="utf-8")) == {
+        "enabled": True,
+        "epoch": 42,
+    }
+
+
+def test_content_status_repair_failure_is_explicit_and_fail_closed(
+    repository, content_config_path, monkeypatch
+):
+    """Catches a failed enable repair being reported or used as enabled."""
+
+    calls = []
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=lambda enabled, epoch: (
+            calls.append((enabled, epoch)) or []
+        ),
+    )
+    monkeypatch.setattr(
+        service._content_consent,
+        "_persist",
+        lambda state: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    status = service.content_analysis_status()
+
+    assert status == {
+        "enabled": True,
+        "backend": "cloud",
+        "external_disclosure_accepted": True,
+        "pending_model_jobs": 0,
+        "consent_epoch": 1,
+        "propagation": "failed",
+        "hosts": [
+            {
+                "host_id": "fleet",
+                "state": "failed",
+                "error": "durable consent repair failed",
+            }
+        ],
+    }
+    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
+    assert calls == []
+
+
+def test_disabled_config_repair_failure_closes_stale_enabled_gate(
+    repository, tmp_path, monkeypatch
+):
+    """Catches a failed disable repair leaving content access enabled."""
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[advisory_content]\n"
+        "enabled = false\n"
+        'backend_policy = "local"\n'
+        "external_consent = false\n",
+        encoding="utf-8",
+    )
+    durable_path = tmp_path / ".config.toml.content-consent.json"
+    DurableContentConsent(durable_path).apply(enabled=True, epoch=7)
+    calls = []
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=config_path,
+        consent_propagator=lambda enabled, epoch: (
+            calls.append((enabled, epoch)) or []
+        ),
+    )
+    monkeypatch.setattr(
+        service._content_consent,
+        "_persist",
+        lambda state: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    status = service.content_analysis_status()
+
+    assert status["enabled"] is False
+    assert status["consent_epoch"] == 8
+    assert status["propagation"] == "failed"
+    assert service._content_consent.snapshot() == {"enabled": False, "epoch": 8}
+    assert calls == []
+
+
+def test_status_repairs_config_first_crash_before_propagating(repository, tmp_path):
+    """Catches recovery after config commit succeeds but durable commit crashes."""
+
+    config_path = tmp_path / "missing-config.toml"
+    service = InsightsService(repository.duckdb_path, config_path=config_path)
+    original_advance = service._advance_content_consent
+    service._advance_content_consent = lambda **kwargs: (_ for _ in ()).throw(
+        OSError("simulated crash after config commit")
+    )
+    with pytest.raises(OSError, match="simulated crash"):
+        service.consent_content_analysis(
+            backend="local", external_disclosure_accepted=False
+        )
+    service._advance_content_consent = original_advance
+    calls = []
+    service.set_content_consent_propagator(
+        lambda enabled, epoch: calls.append((enabled, epoch)) or []
+    )
+
+    status = service.content_analysis_status()
+
+    assert status["enabled"] is True
+    assert status["consent_epoch"] == 1
+    assert calls == [(True, 1)]
+
+
 def test_status_and_mutation_serialize_so_stale_epoch_response_finishes_first(
     repository, content_config_path
 ):
@@ -217,6 +405,10 @@ def test_status_and_mutation_serialize_so_stale_epoch_response_finishes_first(
     release_status = threading.Event()
     mutation_entered = threading.Event()
     calls = []
+
+    DurableContentConsent(
+        content_config_path.with_name(".config.toml.content-consent.json")
+    ).apply(enabled=False, epoch=4)
 
     def propagate(enabled, epoch):
         calls.append((enabled, epoch))
@@ -257,9 +449,9 @@ def test_status_and_mutation_serialize_so_stale_epoch_response_finishes_first(
 
     assert not status.is_alive()
     assert not mutation.is_alive()
-    assert results["status"]["consent_epoch"] == 1
-    assert results["mutation"]["consent_epoch"] == 2
-    assert calls == [(True, 1), (True, 2)]
+    assert results["status"]["consent_epoch"] == 5
+    assert results["mutation"]["consent_epoch"] == 6
+    assert calls == [(True, 5), (True, 6)]
 
 
 def test_consent_mutations_serialize_without_holding_content_operation_fence(
@@ -301,7 +493,7 @@ def test_consent_mutations_serialize_without_holding_content_operation_fence(
 
     assert not enabling.is_alive()
     assert not revoking.is_alive()
-    assert service.content_consent_state() == {"enabled": False, "epoch": 3}
+    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
 
 
 def test_content_consent_fsyncs_directory_after_atomic_replace(
@@ -330,9 +522,6 @@ def test_content_consent_fsyncs_directory_after_atomic_replace(
     )
 
     assert events == [
-        "file_fsync",
-        "replace",
-        "directory_fsync",
         "file_fsync",
         "replace",
         "directory_fsync",
