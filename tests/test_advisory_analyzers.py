@@ -200,6 +200,27 @@ def test_contradictory_provider_reset_window_is_confirmed() -> None:
     )
 
 
+def test_disabled_connector_does_not_report_contradictory_reset_window() -> None:
+    bad_window = ProviderResetWindow(
+        kind="five_hour",
+        starts_at=NOW + timedelta(hours=2),
+        resets_at=NOW + timedelta(hours=1),
+    )
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                enabled=False,
+                observed_at=NOW,
+                last_attempt_at=NOW,
+                last_success_at=NOW,
+                reset_windows=(bad_window,),
+            ),
+        )
+    )
+
+    assert ProviderResetWindowAnalyzer().analyze(snapshot) == []
+
+
 def test_missing_hook_executable_is_confirmed_without_opening_hook_files() -> None:
     hook = HookDescriptor(
         hook_id="claude.stop",

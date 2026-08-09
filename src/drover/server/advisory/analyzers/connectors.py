@@ -126,6 +126,8 @@ class ProviderResetWindowAnalyzer:
             snapshot.provider_connections,
             key=lambda item: (item.host_id, item.provider, item.account_label),
         ):
+            if not connection.enabled:
+                continue
             invalid = [
                 window
                 for window in connection.reset_windows
