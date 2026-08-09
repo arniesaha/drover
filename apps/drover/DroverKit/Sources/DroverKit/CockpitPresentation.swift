@@ -534,10 +534,14 @@ public enum ProviderSubscriptionGrouping {
             .joined(separator: "|")
     }
 
-    /// Names the failing hosts and what went wrong, rather than asserting a
-    /// cause the probe never reported. `unavailable` means the provider CLI
-    /// would not launch on that host — which is what a machine missing the
-    /// tool, or one that was never signed in, actually looks like from here.
+    /// Names the failing hosts and what went wrong.
+    ///
+    /// These categories describe the *central server's* attempt to collect
+    /// usage from a host, not the state of that host's CLI: `unavailable` is
+    /// set when the fetch of `/providers/usage` failed, which is what a
+    /// restarting daemon looks like from here. Saying "provider CLI
+    /// unavailable" read as "the tool is not installed" and sent a reader to
+    /// reinstall CLIs that were on PATH the whole time.
     private static func reason(
         members: [ProviderAccount],
         hostTitles: [String: String]
@@ -550,16 +554,16 @@ public enum ProviderSubscriptionGrouping {
         )
         let categories = Set(failing.compactMap { $0.errorCategory })
         let detail = categories.count == 1 ? categories.first.map(explain) ?? nil : nil
-        return detail.map { "\($0) on \(hosts)" } ?? "Not reporting on \(hosts)"
+        return detail.map { "\($0) \(hosts)" } ?? "Not reporting on \(hosts)"
     }
 
     private static func explain(_ category: String) -> String? {
         switch category {
-        case "unavailable": return "Provider CLI unavailable"
-        case "timeout": return "Timed out"
-        case "process_error": return "Probe failed"
-        case "empty_inventory": return "No accounts detected"
-        case "freshness_expired", "provider_window_expired": return "Reading expired"
+        case "unavailable", "host_offline": return "Couldn't reach"
+        case "timeout": return "Timed out reaching"
+        case "process_error": return "Usage probe failed on"
+        case "empty_inventory": return "No accounts detected on"
+        case "freshness_expired", "provider_window_expired": return "Reading expired on"
         default: return nil
         }
     }

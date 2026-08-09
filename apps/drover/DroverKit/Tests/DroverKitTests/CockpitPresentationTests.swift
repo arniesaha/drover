@@ -428,7 +428,7 @@ private func providerAccount(
     #expect(groups[0].status == .ok)
     #expect(groups[0].representative.snapshotID == "s1")
     let reason = try #require(groups[0].reasonText)
-    #expect(reason.contains("Provider CLI unavailable"))
+    #expect(reason.contains("Couldn't reach"))
     #expect(reason.contains("work-laptop"))
 }
 
