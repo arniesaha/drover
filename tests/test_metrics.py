@@ -312,6 +312,41 @@ def _observe_insight(collector: MetricsCollector):
     )
 
 
+def _observe_provider_insight(collector: MetricsCollector):
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        con.execute(
+            """
+            INSERT INTO provider_connections (
+              provider, account_label, host_id, enabled, updated_at
+            ) VALUES ('openai', 'personal', 'mac-mini', TRUE, ?)
+            """,
+            [datetime(2026, 8, 8, 17, tzinfo=timezone.utc)],
+        )
+    return AdvisoryRepository(collector.duckdb_path).observe(
+        FindingCandidate(
+            analyzer_id="deterministic.connector_freshness",
+            rule_id="connector.stale",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI connector data is stale",
+            impact="Provider capacity may be stale.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=datetime(2026, 8, 8, 17, tzinfo=timezone.utc),
+                    fields={"status": "stale"},
+                ),
+            ),
+            content_hash="old-hash",
+        ),
+        run_id="old-run",
+    )
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -748,7 +783,7 @@ def test_insight_detail_and_lifecycle_actions_are_validated(tmp_path):
 
 def test_check_again_enqueues_without_configuration_mutation(tmp_path):
     collector = _make_collector(tmp_path)
-    finding = _observe_insight(collector)
+    finding = _observe_provider_insight(collector)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -768,7 +803,12 @@ def test_check_again_enqueues_without_configuration_mutation(tmp_path):
             ).fetchall()
         finally:
             con.close()
-        assert jobs == [("analyze_advisory_target", "hooks:mac-mini:session-start")]
+        assert jobs == [
+            (
+                "analyze_advisory_target",
+                "deterministic.connector_freshness:mac-mini",
+            )
+        ]
     finally:
         server.shutdown()
         server.server_close()

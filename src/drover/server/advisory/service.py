@@ -10,7 +10,10 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
-from drover.server.advisory.jobs import enqueue_advisory_check
+from drover.server.advisory.jobs import (
+    LIGHTWEIGHT_ANALYZER_IDS,
+    enqueue_advisory_check,
+)
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.types import (
     AnalyzerClass,
@@ -98,7 +101,10 @@ class InsightsService:
             clauses.append("split_part(target_id, '/', 1) = ?")
             values.append(filters.host)
         if filters.harness is not None:
-            clauses.append("split_part(target_id, '/', 2) = ?")
+            clauses.append(
+                "target_type IN ('hook', 'telemetry_source', 'routing_policy') "
+                "AND split_part(target_id, '/', 2) = ?"
+            )
             values.append(filters.harness)
 
         if filters.cursor is not None:
@@ -199,14 +205,37 @@ class InsightsService:
     def check_again(self, finding_id: str) -> dict[str, Any]:
         finding_id = validate_finding_id(finding_id)
         finding = self.repository.get_finding(finding_id)
+        target_id, source_version = self._check_scope(finding)
         job = enqueue_advisory_check(
             self.duckdb_path,
             analyzer_id=finding.analyzer_id,
-            target_id=finding.target_id,
-            source_version=finding.evaluated_content_hash or finding.latest_run_id,
+            target_id=target_id,
+            source_version=source_version,
             force=True,
         )
         return {"status": "queued", "job_id": job.job_id}
+
+    def _check_scope(self, finding: Finding) -> tuple[str, str]:
+        if (
+            finding.target_type == "provider_connector"
+            and finding.analyzer_id in LIGHTWEIGHT_ANALYZER_IDS
+        ):
+            from drover.server.providers.service import (
+                provider_operational_source_version,
+            )
+
+            parts = finding.target_id.split("/")
+            if len(parts) != 3 or not all(parts):
+                raise InvalidInsightTransition(
+                    "provider finding has no executable host scope"
+                )
+            host_id = parts[0]
+            return host_id, provider_operational_source_version(
+                self.duckdb_path, host_id
+            )
+        raise InvalidInsightTransition(
+            "scoped reanalysis is unavailable for this finding analyzer"
+        )
 
 
 def validate_finding_id(value: str) -> str:

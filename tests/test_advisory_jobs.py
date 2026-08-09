@@ -12,12 +12,14 @@ import pytest
 from drover.config import load_config
 from drover.schema import bootstrap
 from drover.server.advisory.analyzers import AnalysisSnapshot, TelemetryAggregate
+from drover.server.advisory.analyzers.connectors import ConnectorFreshnessAnalyzer
 from drover.server.advisory.jobs import (
     AdvisoryScheduler,
     enqueue_advisory_check,
     enqueue_operational_checks,
 )
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightsService
 from drover.server.advisory.types import (
     AnalyzerClass,
     Confidence,
@@ -597,3 +599,69 @@ def test_provider_source_version_ignores_attempt_time_but_tracks_errors(
 
     assert unchanged == first
     assert changed != first
+
+
+def test_check_again_scopes_provider_finding_to_host_and_executes_current_facts(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute(
+            """
+            INSERT INTO provider_connections (
+              provider, account_label, host_id, enabled, error_category,
+              last_attempt_at, updated_at
+            ) VALUES ('openai', 'personal', 'mac-mini', TRUE, 'auth', ?, ?)
+            """,
+            [NOW, NOW],
+        )
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.connector_freshness",
+            rule_id="connector.stale",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI connector data is stale",
+            impact="Provider capacity may be stale.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=NOW,
+                    fields={"status": "stale"},
+                ),
+            ),
+            content_hash="old-content-hash",
+        ),
+        run_id="old-analysis-run",
+    )
+
+    queued = InsightsService(db_path).check_again(finding.finding_id)
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda analyzer_id, target_id, version: load_operational_snapshot(
+            db_path, analyzer_id, target_id, version
+        ),
+    )
+    result = worker.run_once([ConnectorFreshnessAnalyzer()])
+
+    assert result.succeeded == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        subject_key, source_version, status = con.execute(
+            """
+            SELECT j.subject_key, r.source_version, j.status
+            FROM pipeline_jobs j
+            JOIN pipeline_receipts r ON r.receipt_id = j.caused_by_receipt_id
+            WHERE j.job_id = ?
+            """,
+            [queued["job_id"]],
+        ).fetchone()
+    assert subject_key == "deterministic.connector_freshness:mac-mini"
+    assert source_version.startswith("provider-state:")
+    assert source_version != "old-content-hash"
+    assert status == "succeeded"
+    assert any(item.rule_id == "connector.error" for item in repository.list_findings())

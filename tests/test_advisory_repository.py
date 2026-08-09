@@ -412,3 +412,27 @@ def test_insights_service_filters_and_returns_bounded_redacted_detail(
             "excerpt": "exec: /opt/drover/bin/session-start",
         }
     ]
+
+
+def test_harness_filter_only_matches_harness_bearing_targets(repository, candidate):
+    hook = repository.observe(
+        replace(candidate, target_id="mac-mini/codex/session-start"),
+        run_id="run-hook",
+    )
+    repository.observe(
+        replace(
+            candidate,
+            analyzer_id="deterministic.connector_freshness",
+            rule_id="connector.stale",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+        ),
+        run_id="run-provider",
+    )
+    service = InsightsService(repository.duckdb_path)
+
+    codex = service.list_insights(InsightFilters(harness="codex"))
+    openai = service.list_insights(InsightFilters(harness="openai"))
+
+    assert [item["finding_id"] for item in codex["findings"]] == [hook.finding_id]
+    assert openai["findings"] == []
