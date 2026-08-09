@@ -40,6 +40,38 @@ import Testing
     #expect(HomeSection.visible(for: overview) == [.attention, .providerCapacity, .sessions])
 }
 
+@Test func staleProviderSectionQualifiesRetainedHealthyAccount() throws {
+    let value = ProviderSectionPresentation(status: .stale)
+
+    #expect(value.isDegraded)
+    #expect(value.warningText == "Provider capacity is stale. Showing last reported values.")
+    #expect(value.accountStatusText(accountStatus: .ok) == "Stale")
+}
+
+@Test func unavailableProviderSectionNeverCallsRetainedHealthyAccountLive() throws {
+    let value = ProviderSectionPresentation(status: .unavailable)
+
+    #expect(value.isDegraded)
+    #expect(value.warningText == "Provider usage is unavailable. Showing last reported values.")
+    #expect(value.accountStatusText(accountStatus: .ok) == "Unavailable")
+}
+
+@Test func providerSectionPreservesExplicitConnectorMessage() throws {
+    let value = ProviderSectionPresentation(
+        status: .stale, message: "Last successful refresh was two hours ago."
+    )
+
+    #expect(value.warningText == "Last successful refresh was two hours ago. Showing last reported values.")
+}
+
+@Test func unavailableProviderWithoutRetainedValuesDoesNotClaimToShowThem() throws {
+    let value = ProviderSectionPresentation(
+        status: .unavailable, hasRetainedValues: false
+    )
+
+    #expect(value.warningText == "Provider usage is unavailable.")
+}
+
 @Test func expiredResetNeverShowsNegativeCountdown() throws {
     let now = Date(timeIntervalSince1970: 2_000)
     let window = try decodeProviderWindow("""

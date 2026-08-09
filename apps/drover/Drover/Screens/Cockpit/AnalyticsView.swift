@@ -72,20 +72,36 @@ struct AnalyticsView: View {
     @ViewBuilder
     private func providerSection(_ snapshot: AnalyticsSnapshot) -> some View {
         let accounts = snapshot.providerCapacity.data ?? []
+        let section = ProviderSectionPresentation(
+            status: snapshot.providerCapacity.status,
+            hasRetainedValues: !accounts.isEmpty
+        )
         if !accounts.isEmpty || snapshot.providerCapacity.status != .ok {
             VStack(alignment: .leading, spacing: 10) {
                 CockpitSectionHeading(title: "Subscriptions", source: "Provider reported", action: nil)
-                if accounts.isEmpty {
+                if let warning = section.warningText {
                     CockpitCard {
-                        Text("Provider usage is \(snapshot.providerCapacity.status.rawValue.replacingOccurrences(of: "_", with: " ")).")
+                        Label(warning, systemImage: "gauge.with.dots.needle.33percent")
                             .droverText(.nested)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let observedAt = snapshot.providerCapacity.observedAt {
+                            Text("Last section update \(observedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .droverText(.subtitle)
+                        }
                     }
-                } else {
+                    .accessibilityIdentifier("analytics-provider-warning")
+                }
+                if !accounts.isEmpty {
                     ForEach(accounts, id: \.snapshotID) { account in
                         CockpitCard {
                             VStack(alignment: .leading, spacing: 5) {
-                                Text("\(account.provider.capitalized) · \(account.accountLabel)")
-                                    .droverText(.h2)
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text("\(account.provider.capitalized) · \(account.accountLabel)")
+                                        .droverText(.h2)
+                                    Spacer(minLength: 8)
+                                    Text(section.accountStatusText(accountStatus: account.status))
+                                        .droverText(.marker)
+                                }
                                 ForEach(Array(account.windows.enumerated()), id: \.offset) { _, window in
                                     let value = ProviderCapacityPresentation(
                                         account: account, window: window, now: .now

@@ -3,10 +3,16 @@ import SwiftUI
 
 struct ProviderCapacitySection: View {
     let accounts: [ProviderAccount]
+    let status: DataStatus
     let statusMessage: String?
     let onOpenAnalytics: () -> Void
 
     var body: some View {
+        let section = ProviderSectionPresentation(
+            status: status,
+            message: statusMessage,
+            hasRetainedValues: !accounts.isEmpty
+        )
         VStack(alignment: .leading, spacing: 10) {
             CockpitSectionHeading(
                 title: "Provider capacity",
@@ -14,18 +20,20 @@ struct ProviderCapacitySection: View {
                 action: accounts.isEmpty ? nil : onOpenAnalytics
             )
 
-            if accounts.isEmpty, let statusMessage {
+            if let warning = section.warningText {
                 CockpitCard {
-                    Label(statusMessage, systemImage: "gauge.with.dots.needle.33percent")
+                    Label(warning, systemImage: "gauge.with.dots.needle.33percent")
                         .droverText(.nested)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .accessibilityIdentifier("provider-capacity-unavailable")
-            } else {
+                .accessibilityIdentifier("provider-capacity-warning")
+            }
+
+            if !accounts.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 10) {
                         ForEach(accounts, id: \.snapshotID) { account in
-                            ProviderAccountCard(account: account, statusMessage: statusMessage)
+                            ProviderAccountCard(account: account, section: section)
                                 .frame(width: 250)
                         }
                     }
@@ -39,7 +47,7 @@ struct ProviderCapacitySection: View {
 
 private struct ProviderAccountCard: View {
     let account: ProviderAccount
-    let statusMessage: String?
+    let section: ProviderSectionPresentation
 
     var body: some View {
         CockpitCard {
@@ -52,7 +60,7 @@ private struct ProviderAccountCard: View {
                             .droverText(.subtitle)
                     }
                     Spacer(minLength: 8)
-                    Text(account.status == .ok ? "Live" : statusTitle)
+                    Text(statusTitle)
                         .droverText(.marker)
                 }
 
@@ -77,11 +85,6 @@ private struct ProviderAccountCard: View {
                     }
                 }
 
-                if let statusMessage, account.status != .ok {
-                    Text(statusMessage)
-                        .droverText(.subtitle)
-                        .foregroundStyle(DroverColor.accentHi)
-                }
             }
         }
         .accessibilityElement(children: .combine)
@@ -90,13 +93,7 @@ private struct ProviderAccountCard: View {
     }
 
     private var statusTitle: String {
-        switch account.status {
-        case .usageUnavailable: "Unavailable"
-        case .stale: "Stale"
-        case .error: "Error"
-        case .unknown: "Unknown"
-        case .ok: "Live"
-        }
+        section.accountStatusText(accountStatus: account.status)
     }
 
     private var accessibilityLabel: String {

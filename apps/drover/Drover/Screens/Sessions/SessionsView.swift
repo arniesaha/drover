@@ -56,6 +56,7 @@ struct SessionsView: View {
                         if !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
                             ProviderCapacitySection(
                                 accounts: cockpitStore.providerAccounts,
+                                status: providerSectionStatus,
                                 statusMessage: cockpitStore.providerError,
                                 onOpenAnalytics: { showAnalytics = true }
                             )
@@ -223,6 +224,14 @@ struct SessionsView: View {
     private var remainingActiveSessions: [SessionSummary] {
         let attentionIDs = Set(attentionSessions.map(\.id))
         return activeSessions.filter { !attentionIDs.contains($0.id) }
+    }
+
+    private var providerSectionStatus: DataStatus {
+        let responseStatus = cockpitStore.overview?.providerCapacity.status ?? .ok
+        if cockpitStore.providerError != nil, responseStatus == .ok {
+            return .unknown
+        }
+        return responseStatus
     }
 
     // MARK: - Pieces

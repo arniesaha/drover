@@ -33,6 +33,65 @@ public enum HomeSection: Sendable, Equatable {
     }
 }
 
+/// Section-level provider state always wins over a retained account's last
+/// successful status. This prevents a last-known-good `.ok` account from
+/// being called Live while its enclosing response is stale or unavailable.
+public struct ProviderSectionPresentation: Sendable, Equatable {
+    public let isDegraded: Bool
+    public let warningText: String?
+    private let status: DataStatus
+
+    public init(
+        status: DataStatus,
+        message: String? = nil,
+        hasRetainedValues: Bool = true
+    ) {
+        self.status = status
+        isDegraded = status != .ok
+
+        guard status != .ok else {
+            warningText = nil
+            return
+        }
+
+        let base = Self.nonEmpty(message) ?? Self.defaultWarning(for: status)
+        warningText = base.map {
+            hasRetainedValues ? "\($0) Showing last reported values." : $0
+        }
+    }
+
+    public func accountStatusText(accountStatus: ProviderAccountStatus) -> String {
+        switch status {
+        case .stale: return "Stale"
+        case .unavailable: return "Unavailable"
+        case .error: return "Error"
+        case .unknown: return "Unknown"
+        case .ok:
+            switch accountStatus {
+            case .ok: return "Live"
+            case .usageUnavailable: return "Unavailable"
+            case .stale: return "Stale"
+            case .error: return "Error"
+            case .unknown: return "Unknown"
+            }
+        }
+    }
+
+    private static func defaultWarning(for status: DataStatus) -> String? {
+        switch status {
+        case .stale: return "Provider capacity is stale."
+        case .unavailable: return "Provider usage is unavailable."
+        case .error, .unknown: return "Provider capacity could not be refreshed."
+        case .ok: return nil
+        }
+    }
+
+    private static func nonEmpty(_ message: String?) -> String? {
+        let value = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+}
+
 /// Deterministic display values for one provider-reported quota window.
 /// SwiftUI receives strings and state only; it never derives quota semantics.
 public struct ProviderCapacityPresentation: Sendable, Equatable {
