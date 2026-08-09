@@ -601,6 +601,67 @@ def test_harnessd_provider_usage_reports_claude_windows(tmp_path):
     assert claude["windows"][0]["used_percent"] == 34.5
 
 
+def test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card(
+    tmp_path,
+):
+    """Before this branch, a failing Anthropic account rendered via
+    _unavailable_provider_json, which reads detected.plan_label (populated
+    by _with_claude_plan_label). The snapshot path (_provider_snapshot_json)
+    hardcodes plan_label=None on every ClaudeUsageProbe failure, so without
+    a fallback to detected.plan_label the card would lose its plan (e.g.
+    "max") on every degraded read -- token_expired, timeout, unavailable,
+    all of it."""
+
+    class _FailingClaudeProbe:
+        def read(self, *, host_id):
+            return ProviderAccountSnapshot(
+                snapshot_id="snap-fail",
+                dedup_key="key-fail",
+                provider="anthropic",
+                account_label="Claude Code",
+                plan_label=None,
+                host_id=host_id,
+                status="usage_unavailable",
+                observed_at=datetime(2026, 8, 9, 18, tzinfo=timezone.utc),
+                windows=(),
+                source="claude-oauth-usage",
+                error_category="token_expired",
+            )
+
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {
+        "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
+    }
+    state.auth = AuthFlowManager(
+        {
+            "claude-code": StaticAuthAdapter(
+                "claude-code",
+                status_value=HarnessAuthStatus(
+                    "claude-code", "authenticated", detail="max"
+                ),
+            )
+        }
+    )
+    state.claude_usage_probe = _FailingClaudeProbe()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    claude = [a for a in body["accounts"] if a["provider"] == "anthropic"][0]
+    assert claude["status"] == "usage_unavailable"
+    assert claude["error_category"] == "token_expired"
+    assert claude["plan_label"] == "max"
+
+
 def test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default(tmp_path):
     target = tmp_path / "AGENTS.md"
     target.write_text("Use the deployment skill.\n", encoding="utf-8")

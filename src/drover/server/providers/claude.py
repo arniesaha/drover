@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import getpass
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ import subprocess
 import sys
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
@@ -40,7 +41,14 @@ _WINDOW_MINUTES = {
     "seven_day_sonnet": 10080,
 }
 _KEYCHAIN_SERVICE = "Claude Code-credentials"
-_KEYCHAIN_TIMEOUT_S = 5.0
+# The central server's fetch of /providers/usage times out at 10s (see
+# metrics.py, near line 1017), and read() spends this budget on the
+# Keychain sequentially before spending up to timeout_s (default 5s) on the
+# HTTP call. At 5.0 the two together could exhaust the whole 10s host-fetch
+# budget, losing every provider card for that host (not just this one) to a
+# single slow Keychain prompt. 2.0 leaves headroom for the HTTP leg and the
+# rest of that request.
+_KEYCHAIN_TIMEOUT_S = 2.0
 
 
 class _ProbeFailure(RuntimeError):
@@ -116,13 +124,20 @@ class ClaudeUsageProbe:
     def _credentials(self) -> tuple[str, str | None]:
         saw_expired = False
         saw_malformed = False
+        read_failure: _ProbeFailure | None = None
         for load in (self._keychain_blob, self._file_blob):
             try:
                 raw = load()
-            except _ProbeFailure:
+            except _ProbeFailure as exc:
                 # A source that is present but broken (e.g. an unreadable
-                # credentials file) is a real error, not an absent source.
-                raise
+                # credentials file) is a real error, not an absent source --
+                # but it is deferred rather than raised immediately, so an
+                # expired token already seen from an earlier source (the
+                # Keychain runs first) wins: token_expired is more
+                # actionable than a read failure on a later, unrelated
+                # source.
+                read_failure = exc
+                continue
             except Exception:
                 # A source that cannot be read is a source we do not have. This
                 # includes a Keychain prompt we declined to wait for.
@@ -154,6 +169,8 @@ class ClaudeUsageProbe:
 
         if saw_expired:
             raise _ProbeFailure("token_expired", status="usage_unavailable")
+        if read_failure is not None:
+            raise read_failure
         if saw_malformed:
             raise _ProbeFailure("protocol_error", status="error")
         raise _ProbeFailure("not_authenticated", status="usage_unavailable")
@@ -182,12 +199,22 @@ class ClaudeUsageProbe:
             )
         except TimeoutError:
             raise _ProbeFailure("timeout", status="error") from None
+        except http.client.HTTPException:
+            # Covers http.client.IncompleteRead (truncated body) and
+            # BadStatusLine (garbage status line from a proxy), among
+            # others -- these do not subclass OSError and would otherwise
+            # escape read() entirely and take the daemon handler down with
+            # them, since do_GET has no try wrapper around this call.
+            raise _ProbeFailure("unavailable", status="error") from None
         except OSError:
             raise _ProbeFailure("unavailable", status="error") from None
 
         if status in (401, 403):
             raise _ProbeFailure("not_authenticated", status="usage_unavailable")
         if status < 200 or status >= 300:
+            # Also covers 3xx: the opener below refuses to follow redirects,
+            # so any redirect response reaches here as a raw status instead
+            # of being transparently chased.
             raise _ProbeFailure("unavailable", status="error")
         try:
             payload = json.loads(body)
@@ -198,10 +225,36 @@ class ClaudeUsageProbe:
         return payload
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Refuse to follow redirects on this request.
+
+    urlopen's default opener follows 3xx responses AND copies the original
+    request's headers -- including this bearer token -- onto the new
+    request it builds, with no restriction on the target host or scheme.
+    /api/oauth/usage is undocumented; a redirect from it is not a case we
+    can reason about, so the only safe move is to refuse to chase it and
+    let the caller treat the raw 3xx as a failure.
+
+    This deliberately does NOT inspect or restrict base_url's own scheme or
+    host. ANTHROPIC_BASE_URL is honoured as-is elsewhere in this module
+    because the Claude CLI honours the same variable, and pointing it at a
+    local http:// proxy is a legitimate operator choice. Do not "harden"
+    this handler into a scheme check on the *original* request -- that
+    would break proxy support for a leak this handler already closes by
+    refusing to hop anywhere in response to a redirect.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = build_opener(_NoRedirectHandler)
+
+
 def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
     request = Request(url, headers=headers, method="GET")
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             return int(response.status), response.read()
     except HTTPError as exc:
         return int(exc.code), exc.read()

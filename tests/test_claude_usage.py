@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import http.client
+import http.server
 import json
+import threading
 
 import pytest
 
@@ -428,6 +431,128 @@ def test_invalid_json_in_the_file_is_a_protocol_error(tmp_path):
 
     assert snapshot.status == "error"
     assert snapshot.error_category == "protocol_error"
+
+
+def test_incomplete_read_from_the_opener_does_not_escape_read(tmp_path):
+    """http.client.IncompleteRead (a truncated response body) and
+    BadStatusLine (garbage from a proxy) subclass http.client.HTTPException,
+    not OSError -- they must not escape read(), because do_GET has no try
+    wrapper around this call and an escaping exception means no HTTP
+    response at all, taking the whole Codex card down with it."""
+
+    def opener(url, headers, timeout):
+        raise http.client.IncompleteRead(b"")
+
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=opener,
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "unavailable"
+
+
+def test_bad_status_line_from_the_opener_does_not_escape_read(tmp_path):
+    def opener(url, headers, timeout):
+        raise http.client.BadStatusLine("garbage")
+
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=opener,
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "unavailable"
+
+
+def test_redirect_is_refused_and_the_token_never_reaches_the_redirect_target(
+    tmp_path,
+):
+    """An undocumented endpoint that 30x's us must not be chased: the
+    default urlopen opener would copy the Authorization header onto the
+    redirected request and follow it to any host. This exercises the real
+    default opener (_http_get, via two loopback HTTP servers) rather than
+    the injected `opener` fixture, since the fix under test lives inside
+    _http_get itself."""
+    leaked_auth: list[str | None] = []
+
+    class _TargetHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            leaked_auth.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), _TargetHandler)
+    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+    target_thread.start()
+
+    class _OriginHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{target.server_port}/collect",
+            )
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    origin = http.server.HTTPServer(("127.0.0.1", 0), _OriginHandler)
+    origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+    origin_thread.start()
+
+    try:
+        probe = ClaudeUsageProbe(
+            credentials_path=_credentials(tmp_path),
+            base_url=f"http://127.0.0.1:{origin.server_port}",
+            keychain_reader=lambda: None,
+        )
+        snapshot = probe.read(host_id="mac-mini")
+    finally:
+        origin.shutdown()
+        origin_thread.join()
+        target.shutdown()
+        target_thread.join()
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "unavailable"
+    # The point of this test: the redirect target was never dialed at all,
+    # so the bearer token never left the process.
+    assert leaked_auth == []
+
+
+def test_expired_keychain_token_wins_over_an_unreadable_file(tmp_path):
+    """When the Keychain holds an expired token AND the credentials file is
+    unreadable, the file's protocol_error must not pre-empt the more
+    actionable token_expired the Keychain already told us about."""
+    expired_keychain = json.dumps(
+        {"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1000}}
+    )
+    credentials_dir = tmp_path / ".credentials.json"
+    credentials_dir.mkdir()  # reading a directory raises, simulating unreadable
+
+    probe = ClaudeUsageProbe(
+        credentials_path=credentials_dir,
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: expired_keychain,
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "token_expired"
 
 
 def test_missing_file_with_empty_keychain_still_reports_not_authenticated(tmp_path):
