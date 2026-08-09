@@ -372,6 +372,16 @@ def test_inventory_omits_disabled_harnesses_and_keeps_supported_codex():
     assert accounts[0].host_id == "mac-mini"
 
 
+def test_claude_inventories_as_supported():
+    detected = detect_provider_accounts(
+        {"host_id": "mac-mini", "harnesses": ["claude-code", "gemini"]}
+    )
+    by_provider = {d.provider: d for d in detected}
+
+    assert by_provider["anthropic"].usage_status == "supported"
+    assert by_provider["google"].usage_status == "usage_unavailable"
+
+
 def test_last_good_provider_snapshot_survives_refresh_failure(
     provider_service, provider_host
 ):

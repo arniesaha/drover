@@ -485,3 +485,27 @@ private func providerAccount(
     // The host that could read the plan speaks for the subscription.
     #expect(groups[0].planLabel == "max")
 }
+
+/// Windows are not an OpenAI-only concept. Claude Code reports them too, and
+/// the cards must render its numbers without any provider-specific branch.
+@Test func anAnthropicAccountWithWindowsRendersItsNumbers() throws {
+    let json = """
+    {"snapshot_id":"s1","dedup_key":"k1","provider":"anthropic",\
+    "account_label":"Claude Code","plan_label":"max","host_id":"mac-mini",\
+    "status":"ok","observed_at":"2026-08-09T18:00:00Z","source":"claude-oauth-usage",\
+    "windows":[{"kind":"five_hour","used_percent":34.5,"resets_at":"2026-08-09T20:00:00Z"}]}
+    """
+    let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
+
+    let groups = ProviderSubscriptionGrouping.group([account])
+    let value = ProviderCapacityPresentation(
+        account: account,
+        window: try #require(groups[0].windows.first),
+        now: Date(timeIntervalSince1970: 1786000000)
+    )
+
+    #expect(groups.count == 1)
+    #expect(groups[0].status == .ok)
+    #expect(value.usedText.contains("34.5"))
+    #expect(value.remainingText.contains("65.5"))
+}

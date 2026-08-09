@@ -1262,6 +1262,7 @@ class HarnessDaemonState:
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     provider_usage_probe: CodexUsageProbe | None = None
+    claude_usage_probe: Any | None = None
     advisory_content: "AdvisoryContentConfig | None" = None
     content_consent: DurableContentConsent | None = None
 
@@ -1487,6 +1488,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 continue
             if detected.provider == "anthropic":
                 detected = _with_claude_plan_label(detected, self.server.state.auth)
+                probe = self.server.state.claude_usage_probe
+                if probe is None:
+                    from drover.server.providers.claude import ClaudeUsageProbe
+
+                    probe = ClaudeUsageProbe()
+                    self.server.state.claude_usage_probe = probe
+                snapshot = probe.read(host_id=self.server.state.host_id)
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+                continue
             accounts.append(_unavailable_provider_json(detected, observed_at))
         self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
 
@@ -3025,10 +3035,22 @@ def _unavailable_provider_json(
 def _provider_snapshot_json(
     snapshot: ProviderAccountSnapshot, detected: DetectedProvider
 ) -> dict[str, Any]:
+    # Every failure path in ClaudeUsageProbe.read() (token_expired, timeout,
+    # unavailable, protocol_error, ...) hardcodes plan_label=None on the
+    # snapshot -- including failures that happen before credentials are even
+    # read, so there is nowhere upstream to plug this in once. Falling back
+    # to detected.plan_label here keeps the plan (e.g. "max") on a degraded
+    # Anthropic card instead of losing it on every failed refresh. This is a
+    # no-op for the openai/Codex branch: inventory.py always sets
+    # plan_label=None on DetectedProvider and _with_claude_plan_label only
+    # enriches the anthropic branch, so detected.plan_label is None there too.
+    plan_label = (
+        snapshot.plan_label if snapshot.plan_label is not None else detected.plan_label
+    )
     return {
         **_detected_provider_json(detected),
         "account_label": snapshot.account_label,
-        "plan_label": snapshot.plan_label,
+        "plan_label": plan_label,
         "status": snapshot.status,
         "snapshot_id": snapshot.snapshot_id,
         "dedup_key": snapshot.dedup_key,
