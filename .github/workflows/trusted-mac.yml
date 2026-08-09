@@ -51,8 +51,26 @@ jobs:
           echo "$PY_FILES" | xargs black --check
         fi
 
+    # Keep DuckDB/Arrow allocations bounded on the 16 GB trusted host.
     - name: Run tests with pytest
-      run: pytest tests/
+      run: |
+        python - <<'PY'
+        from pathlib import Path
+        import subprocess
+        import sys
+
+        test_files = sorted(Path("tests").rglob("test_*.py"))
+        if not test_files:
+            raise SystemExit("no Python test modules found")
+        for test_file in test_files:
+            print(f"::group::{test_file}", flush=True)
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pytest", str(test_file)], check=True
+                )
+            finally:
+                print("::endgroup::", flush=True)
+        PY
 
   ios:
     name: iOS on trusted Mac
