@@ -14,13 +14,14 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import click
 import duckdb
 
 from drover.agent_aliases import canonicalize
 from drover.config import (
+    AdvisoryContentConfig,
     DroverConfig,
     default_config,
     default_config_path,
@@ -45,6 +46,22 @@ from drover.server.metrics import (
     sequence_health_report,
     start_metrics_server,
 )
+from drover.server.harness.registry import HarnessRegistry
+from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightsService
+from drover.server.advisory.content_targets import content_bundle_from_payload
+from drover.server.advisory.model_analyzer import build_configured_analysis_backend
+from drover.server.advisory.worker import (
+    AdvisoryWorker,
+    ContentAnalysisScheduler,
+    ContentAnalysisWorker,
+    load_operational_snapshot,
+    operational_snapshot_source_version,
+    operational_analyzers,
+)
+from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
+from drover.server.providers.service import ProviderUsageService
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.web.auth import load_auth
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -90,6 +107,53 @@ def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
     )
 
 
+def _create_content_analysis_worker(
+    *,
+    cfg: DroverConfig,
+    metrics_collector: MetricsCollector,
+    backend_config: SummarizerBackendConfig,
+    consent_reader: Callable[[], AdvisoryContentConfig],
+) -> ContentAnalysisWorker:
+    """Compose the content worker from production routing and backend policy."""
+
+    def _fetch(host_id: str, target_ids: tuple[str, ...]):
+        payload = metrics_collector.fetch_advisory_content_bundle(
+            host_id, list(target_ids)
+        )
+        return content_bundle_from_payload(
+            payload, host_id=host_id, requested_ids=target_ids
+        )
+
+    def _probe(host_id: str, target_ids: tuple[str, ...]) -> str:
+        payload = metrics_collector.fetch_advisory_content_version(
+            host_id, list(target_ids)
+        )
+        bundle_hash = payload.get("bundle_hash")
+        if not isinstance(bundle_hash, str):
+            raise ValueError("content version response has invalid bundle_hash")
+        return bundle_hash
+
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=cfg.duckdb_path,
+        registry=HarnessRegistry(cfg.duckdb_path),
+        consent_reader=consent_reader,
+        version_fetcher=_probe,
+        interval_seconds=cfg.advisory_full_review_interval_seconds,
+    )
+    return ContentAnalysisWorker(
+        consent_reader=consent_reader,
+        bundle_fetcher=_fetch,
+        backend_factory=lambda content_cfg: build_configured_analysis_backend(
+            config=backend_config,
+            backend_policy=content_cfg.backend_policy,
+            external_consent=content_cfg.external_consent,
+        ),
+        duckdb_path=cfg.duckdb_path,
+        repository=AdvisoryRepository(cfg.duckdb_path),
+        scheduler=scheduler,
+    )
+
+
 _DEFAULT_CONFIG_PATH = default_config_path()
 
 _DEFAULT_CONFIG_TEMPLATE = """\
@@ -117,6 +181,12 @@ api_token = ""
 agent_id     = "{default_agent_id}"
 principal_id = "unknown"
 
+[provider]
+# Provider fetches run every five minutes. Retain provider-reported quota facts,
+# but label them stale when no successful fetch has completed within this age.
+# This value must be a finite positive integer or float in seconds.
+freshness_threshold_seconds = 600
+
 [summarizer]
 # backend_policy:
 #   hybrid = prefer Anthropic, fall back to local Ollama only when cloud auth is unavailable
@@ -140,6 +210,24 @@ api_key         = ""   # or set DROVER_EMBEDDINGS_API_KEY in the service env
 api_model       = "text-embedding-3-small"
 mac_ollama_url  = ""   # e.g. "http://127.0.0.1:11435" for Mac-local Ollama
 local_model     = "nomic-embed-text"
+
+[advisory]
+# Local deterministic checks only. Advisory actions never mutate configuration.
+full_review_interval_seconds = 86400
+poll_interval_seconds = 5
+
+[advisory_content]
+# Content-sensitive checks are separately opt-in and local by default. Cloud
+# analysis also requires external_consent = true. Targets and roots are empty
+# until the operator explicitly allowlists them.
+enabled = false
+backend_policy = "local"
+external_consent = false
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
 
 [redis_jobs]
 # Optional production coordination for derived workers. Off by default; when
@@ -1217,6 +1305,7 @@ def run(
     """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
     cfg = _resolve_config(ctx.obj["config_path"])
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    stop = threading.Event()
 
     job_streams: dict[str, RedisJobStream] = {}
     if cfg.redis_jobs_enabled:
@@ -1245,6 +1334,38 @@ def run(
         summarize_job_stream=job_streams.get("summarize"),
     )
     watcher.start()
+
+    advisory_worker: AdvisoryWorker | None = None
+    try:
+        advisory_analyzers = operational_analyzers()
+        advisory_scheduler = AdvisoryScheduler(
+            duckdb_path=cfg.duckdb_path,
+            analyzer_ids=(item.analyzer_id for item in advisory_analyzers),
+            full_review_interval_seconds=cfg.advisory_full_review_interval_seconds,
+            source_version_factory=lambda analyzer_id, target_id: operational_snapshot_source_version(
+                cfg.duckdb_path, analyzer_id, target_id
+            ),
+        )
+        advisory_worker = AdvisoryWorker(
+            duckdb_path=cfg.duckdb_path,
+            repository=AdvisoryRepository(cfg.duckdb_path),
+            snapshot_factory=lambda analyzer_id, target_id, source_version: load_operational_snapshot(
+                cfg.duckdb_path, analyzer_id, target_id, source_version
+            ),
+        )
+        advisory_worker.start(
+            analyzers=advisory_analyzers,
+            scheduler=advisory_scheduler,
+            shutdown_event=stop,
+            poll_interval_seconds=cfg.advisory_poll_interval_seconds,
+        )
+        log.info(
+            "advisory worker ready (full_review_interval=%.0fs)",
+            cfg.advisory_full_review_interval_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("advisory worker failed to start; continuing without it")
+        advisory_worker = None
 
     receiver: OTLPReceiver | None = None
     if not no_otlp:
@@ -1297,6 +1418,11 @@ def run(
             mcp_thread = None
 
     metrics_server = None
+    metrics_collector: MetricsCollector | None = None
+    provider_refresh: ProviderRefreshLoop | None = None
+    config_path = (
+        Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
+    )
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
             auth = load_auth(cfg)
@@ -1314,6 +1440,19 @@ def run(
                 job_streams=job_streams,
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
+                advisory_service=InsightsService(
+                    cfg.duckdb_path, config_path=config_path
+                ),
+            )
+            provider_usage = ProviderUsageService(
+                duckdb_path=cfg.duckdb_path,
+                parquet_dir=cfg.parquet_dir,
+                api_token=auth.api_token if auth.enabled else None,
+                freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
+            )
+            metrics_collector.cockpit_service = CockpitService(
+                duckdb_path=cfg.duckdb_path,
+                provider_usage=provider_usage,
             )
             metrics_server = start_metrics_server(
                 host=metrics_host,
@@ -1321,6 +1460,19 @@ def run(
                 collector=metrics_collector,
                 auth=auth,
             )
+            provider_refresh = ProviderRefreshLoop(
+                provider_usage=provider_usage,
+                registry=HarnessRegistry(cfg.duckdb_path),
+                shutdown_event=stop,
+                fetch=metrics_collector.fetch_harness_provider_usage,
+                operational_source_version=provider_usage.operational_source_version,
+                on_operational_change=lambda host_id, source_version: enqueue_operational_checks(
+                    cfg.duckdb_path,
+                    target_id=host_id,
+                    source_version=source_version,
+                ),
+            )
+            provider_refresh.start()
             log.info(
                 "metrics server starting on %s:%d",
                 metrics_host,
@@ -1336,6 +1488,48 @@ def run(
         except Exception:  # noqa: BLE001
             log.exception("metrics server failed to start; continuing without it")
             metrics_server = None
+
+    content_advisory_worker: ContentAnalysisWorker | None = None
+    try:
+        if metrics_collector is None:
+            auth = load_auth(cfg)
+            metrics_collector = MetricsCollector(
+                duckdb_path=cfg.duckdb_path,
+                incoming_dir=cfg.incoming_dir,
+                summarizer_report={},
+                job_streams=job_streams,
+                api_token=auth.api_token if auth.enabled else "",
+                favorite_cwds=cfg.harness_favorite_cwds,
+                advisory_service=InsightsService(
+                    cfg.duckdb_path, config_path=config_path
+                ),
+            )
+        content_backend_cfg = SummarizerBackendConfig.from_runtime(
+            api_model=cfg.summarizer_api_model,
+            backend_policy=cfg.summarizer_backend_policy,
+            local_model=cfg.summarizer_local_model,
+            local_ollama_url=cfg.summarizer_local_ollama_url or None,
+            gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
+            gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
+            wake_timeout_s=cfg.summarizer_wake_timeout_s,
+        )
+        content_advisory_worker = _create_content_analysis_worker(
+            cfg=cfg,
+            metrics_collector=metrics_collector,
+            backend_config=content_backend_cfg,
+            consent_reader=lambda: load_config(config_path).advisory_content,
+        )
+        content_advisory_worker.start(
+            shutdown_event=stop,
+            poll_interval_seconds=cfg.advisory_poll_interval_seconds,
+        )
+        log.info(
+            "content advisory worker ready (policy=%s)",
+            cfg.advisory_content.backend_policy,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("content advisory worker failed to start; continuing without it")
+        content_advisory_worker = None
 
     summarizer: SummarizerWorker | None = None
     if not no_summarizer:
@@ -1451,8 +1645,6 @@ def run(
             log.exception("brief worker failed to start; continuing without it")
             briefs = None
 
-    stop = threading.Event()
-
     def _on_signal(signum, _frame):
         log.info("received signal %d; shutting down", signum)
         stop.set()
@@ -1463,6 +1655,10 @@ def run(
     try:
         stop.wait()
     finally:
+        if content_advisory_worker is not None:
+            content_advisory_worker.join(timeout=10.0)
+        if advisory_worker is not None:
+            advisory_worker.join(timeout=10.0)
         if briefs is not None:
             briefs.stop()
         if embeddings is not None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import http.client
 import json
 import logging
@@ -28,6 +29,8 @@ from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
 
 if TYPE_CHECKING:
+    from drover.server.advisory.service import InsightFilters, InsightsService
+    from drover.server.cockpit.service import CockpitService
     from drover.server.harness.models import HarnessHost
     from drover.server.relay_manager import RelayManager
 
@@ -49,6 +52,8 @@ _HARNESS_STALE_AFTER_SECONDS = 45
 # Presence is now trustworthy within a minute, so a live relay socket is
 # decent evidence the host is really there and worth waiting for.
 RELAY_MIN_TIMEOUT_S = 5.0
+_MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
 # gemini). A nexus handoff to one of these launches mode="structured" and
@@ -69,6 +74,144 @@ _SUMMARIZE_JOB_STATUSES = (
     "errored",
     "dead_lettered",
 )
+
+
+def _valid_advisory_target_ids(value: Any) -> bool:
+    if not isinstance(value, list) or not value or len(value) > 256:
+        return False
+    if any(
+        not isinstance(item, str)
+        or not item
+        or len(item) > 256
+        or item.strip() != item
+        or item in {".", ".."}
+        or "/" in item
+        or "\\" in item
+        for item in value
+    ):
+        return False
+    return len(set(value)) == len(value)
+
+
+def _validate_advisory_content_bundle(
+    payload: Any, *, requested_ids: list[str]
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "bundle_hash",
+        "created_at",
+        "targets",
+    }:
+        raise ValueError("content bundle response has invalid fields")
+    if not _is_sha256(payload["bundle_hash"]):
+        raise ValueError("content bundle response has invalid bundle_hash")
+    try:
+        created_at = datetime.fromisoformat(payload["created_at"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("content bundle response has invalid created_at") from exc
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("content bundle response has invalid created_at")
+    targets = payload["targets"]
+    if not isinstance(targets, list) or len(targets) != len(requested_ids):
+        raise ValueError("content bundle response has invalid targets")
+    returned_ids: list[str] = []
+    hash_pairs: list[tuple[str, str]] = []
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != {
+            "target_id",
+            "content_hash",
+            "redacted_content",
+        }:
+            raise ValueError("content bundle response has invalid target fields")
+        if not isinstance(target["target_id"], str):
+            raise ValueError("content bundle response has invalid target ID")
+        if not _is_sha256(target["content_hash"]):
+            raise ValueError("content bundle response has invalid content_hash")
+        if not isinstance(target["redacted_content"], str):
+            raise ValueError("content bundle response has invalid redacted content")
+        computed_content_hash = hashlib.sha256(
+            target["redacted_content"].encode("utf-8")
+        ).hexdigest()
+        if target["content_hash"] != computed_content_hash:
+            raise ValueError("content bundle response content_hash does not match")
+        returned_ids.append(target["target_id"])
+        hash_pairs.append((target["target_id"], target["content_hash"]))
+    if returned_ids != requested_ids:
+        raise ValueError("content bundle response target IDs do not match request")
+    computed_bundle_hash = hashlib.sha256(
+        json.dumps(
+            hash_pairs,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload["bundle_hash"] != computed_bundle_hash:
+        raise ValueError("content bundle response bundle_hash does not match")
+
+
+def _validate_advisory_content_version(
+    payload: Any, *, requested_ids: list[str]
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != {"bundle_hash", "targets"}:
+        raise ValueError("content version response has invalid fields")
+    if not _is_sha256(payload["bundle_hash"]):
+        raise ValueError("content version response has invalid bundle_hash")
+    targets = payload["targets"]
+    if not isinstance(targets, list) or len(targets) != len(requested_ids):
+        raise ValueError("content version response has invalid targets")
+    returned_ids: list[str] = []
+    hash_pairs: list[tuple[str, str]] = []
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != {
+            "target_id",
+            "content_hash",
+        }:
+            raise ValueError("content version response has invalid target fields")
+        if not isinstance(target["target_id"], str):
+            raise ValueError("content version response has invalid target ID")
+        if not _is_sha256(target["content_hash"]):
+            raise ValueError("content version response has invalid content_hash")
+        returned_ids.append(target["target_id"])
+        hash_pairs.append((target["target_id"], target["content_hash"]))
+    if returned_ids != requested_ids:
+        raise ValueError("content version response target IDs do not match request")
+    computed_bundle_hash = hashlib.sha256(
+        json.dumps(
+            hash_pairs,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload["bundle_hash"] != computed_bundle_hash:
+        raise ValueError("content version response bundle_hash does not match")
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _read_bounded_http_body(response: Any, *, max_response_bytes: int | None) -> str:
+    if max_response_bytes is None:
+        return response.read().decode("utf-8")
+    if max_response_bytes <= 0:
+        raise ValueError("max_response_bytes must be positive")
+    content_length = response.getheader("Content-Length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError as exc:
+            raise ValueError("harness response has invalid Content-Length") from exc
+        if declared_bytes < 0:
+            raise ValueError("harness response has invalid Content-Length")
+        if declared_bytes > max_response_bytes:
+            raise ValueError("harness response exceeds byte limit")
+    body = response.read(max_response_bytes + 1)
+    if len(body) > max_response_bytes:
+        raise ValueError("harness response exceeds byte limit")
+    return body.decode("utf-8")
 
 
 def _label_value(value: object) -> str:
@@ -450,6 +593,29 @@ def _json_response(status: int, payload: Mapping[str, Any]) -> tuple[int, str]:
     return status, json.dumps(dict(payload), sort_keys=True, default=str) + "\n"
 
 
+def _insight_response(render) -> tuple[int, str]:
+    try:
+        return _json_response(200, render())
+    except Exception as exc:  # noqa: BLE001 - advisory failure stays section-local
+        return _insight_error_response(exc)
+
+
+def _insight_error_response(exc: Exception) -> tuple[int, str]:
+    from drover.server.advisory.service import (
+        InvalidInsightRequest,
+        InvalidInsightTransition,
+    )
+
+    if isinstance(exc, InvalidInsightRequest):
+        return _json_response(400, {"error": str(exc)})
+    if isinstance(exc, InvalidInsightTransition):
+        return _json_response(409, {"error": str(exc)})
+    if isinstance(exc, KeyError):
+        return _json_response(404, {"error": "insight not found"})
+    log.warning("advisory API failed: %s", exc)
+    return _json_response(503, {"error": "insights temporarily unavailable"})
+
+
 def _error_text(body: str) -> str:
     try:
         error = json.loads(body).get("error")
@@ -618,6 +784,8 @@ class MetricsCollector:
     # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel
     # live, but N polling clients should still share one render.
     harness_ttl_seconds: float = 2.0
+    cockpit_service: "CockpitService | None" = None
+    advisory_service: "InsightsService | None" = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -665,6 +833,135 @@ class MetricsCollector:
         status = 404 if snapshot.get("error") else 200
         return status, json.dumps(snapshot, sort_keys=True, default=str) + "\n"
 
+    def render_cockpit_overview_json(self, filters: Any) -> tuple[int, str]:
+        if self.cockpit_service is None:
+            return _json_response(503, {"error": "cockpit service unavailable"})
+        return _json_response(200, self.cockpit_service.overview(filters))
+
+    def render_analytics_json(self, filters: Any) -> tuple[int, str]:
+        from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+
+        if self.cockpit_service is None:
+            return _json_response(503, {"error": "cockpit service unavailable"})
+        try:
+            return _json_response(200, self.cockpit_service.analytics(filters))
+        except AnalyticsSnapshotChangedError:
+            return _json_response(
+                409,
+                {
+                    "error": "snapshot_changed",
+                    "detail": "Activity changed; reload analytics from the first page.",
+                },
+            )
+        except ValueError as exc:
+            return _json_response(400, {"error": str(exc)})
+
+    def _insights(self) -> "InsightsService":
+        if self.advisory_service is None:
+            from drover.server.advisory.service import InsightsService
+
+            self.advisory_service = InsightsService(self.duckdb_path)
+        self.advisory_service.set_content_consent_propagator(
+            self._propagate_content_consent
+        )
+        return self.advisory_service
+
+    def render_insights_json(self, filters: "InsightFilters") -> tuple[int, str]:
+        return _insight_response(lambda: self._insights().list_insights(filters))
+
+    def render_insight_json(self, finding_id: str) -> tuple[int, str]:
+        return _insight_response(lambda: self._insights().get_insight(finding_id))
+
+    def render_content_analysis_status_json(self) -> tuple[int, str]:
+        try:
+            payload = self._insights().content_analysis_status()
+            propagation = payload.get("propagation")
+            if propagation == "failed":
+                status = 503
+            elif propagation in {None, "complete"}:
+                status = 200
+            else:
+                status = 207
+            return _json_response(status, payload)
+        except Exception as exc:
+            return _insight_error_response(exc)
+
+    def consent_content_analysis(self, body: Mapping[str, Any]) -> tuple[int, str]:
+        from drover.server.advisory.service import (
+            InvalidInsightRequest,
+            validate_action_body,
+        )
+
+        try:
+            validate_action_body(
+                body, allowed={"backend", "external_disclosure_accepted"}
+            )
+            backend = body.get("backend")
+            if not isinstance(backend, str):
+                raise InvalidInsightRequest("backend must be local or cloud")
+            disclosure = body.get("external_disclosure_accepted", False)
+            payload = self._insights().consent_content_analysis(
+                backend=backend,
+                external_disclosure_accepted=disclosure,
+            )
+            return _json_response(
+                200 if payload.get("propagation") == "complete" else 207,
+                payload,
+            )
+        except Exception as exc:
+            return _insight_error_response(exc)
+
+    def revoke_content_analysis(self, body: Mapping[str, Any]) -> tuple[int, str]:
+        from drover.server.advisory.service import validate_action_body
+
+        try:
+            validate_action_body(body, allowed=set())
+            payload = self._insights().revoke_content_analysis()
+            propagation = payload.get("propagation")
+            if propagation == "failed":
+                status = 503
+            elif propagation == "complete":
+                status = 200
+            else:
+                status = 207
+            return _json_response(status, payload)
+        except Exception as exc:
+            return _insight_error_response(exc)
+
+    def purge_content_excerpts(self) -> tuple[int, str]:
+        return _insight_response(
+            lambda: {"purged_excerpt_count": self._insights().purge_content_excerpts()}
+        )
+
+    def act_on_insight(
+        self, finding_id: str, action: str, body: Mapping[str, Any]
+    ) -> tuple[int, str]:
+        from drover.server.advisory.service import (
+            InvalidInsightRequest,
+            validate_action_body,
+        )
+
+        try:
+            if action == "acknowledge":
+                validate_action_body(body, allowed=set())
+                payload = self._insights().acknowledge(finding_id)
+                status = 200
+            elif action == "dismiss":
+                validate_action_body(body, allowed={"reason"})
+                payload = self._insights().dismiss(
+                    finding_id, reason=body.get("reason")
+                )
+                status = 200
+            elif action == "check":
+                validate_action_body(body, allowed=set())
+                payload = self._insights().check_again(finding_id)
+                status = 202
+            else:
+                raise InvalidInsightRequest("invalid insight action")
+            return _json_response(status, payload)
+        except Exception as exc:  # normalized below, isolated from other APIs
+            return _insight_error_response(exc)
+
     def register_harness_host(self, payload: Mapping[str, Any]) -> tuple[int, str]:
         host_id = str(payload.get("host_id") or "").strip()
         if not host_id:
@@ -690,7 +987,13 @@ class MetricsCollector:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)
             return _json_response(500, {"error": str(exc)})
-        return _json_response(200, {"host": host.__dict__})
+        return _json_response(
+            200,
+            {
+                "host": host.__dict__,
+                "content_consent": self._insights().content_consent_state(),
+            },
+        )
 
     def proxy_create_harness_session(
         self, host_id: str, payload: Mapping[str, Any]
@@ -707,6 +1010,151 @@ class MetricsCollector:
         if 200 <= status < 300:
             self._sync_created_harness_session(host_id, payload, body)
         return status, body
+
+    def fetch_harness_provider_usage(self, host: Any) -> Mapping[str, Any]:
+        """Fetch host-local provider facts through direct or relay routing."""
+        status, body = self._harness_request(
+            host, "/providers/usage", method="GET", timeout_s=10.0
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError("unavailable")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("provider usage response must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("provider usage response must be an object")
+        return payload
+
+    def fetch_advisory_content_bundle(
+        self, host_id: str, target_ids: list[str]
+    ) -> Mapping[str, Any]:
+        """Fetch one ephemeral, redacted bundle through normal host routing."""
+        if not _valid_advisory_target_ids(target_ids):
+            raise ValueError("target_ids must be a non-empty list of unique IDs")
+        host = self._harness_host(host_id)
+        if host is None:
+            raise ValueError(f"unknown harness host: {host_id}")
+        consent = self._insights().content_consent_state()
+        if not consent["enabled"] or int(consent["epoch"]) <= 0:
+            raise RuntimeError("content analysis is disabled")
+        reconciliation = self._push_content_consent(host, consent)
+        if reconciliation["state"] != "acknowledged":
+            raise RuntimeError("content consent is not reconciled on host")
+        status, body = self._harness_request(
+            host,
+            "/advisory/content-bundle",
+            method="POST",
+            payload={"target_ids": target_ids},
+            timeout_s=15.0,
+            max_response_bytes=_MAX_CONTENT_BUNDLE_RESPONSE_BYTES,
+        )
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > _MAX_CONTENT_BUNDLE_RESPONSE_BYTES:
+            raise ValueError("content bundle response exceeds byte limit")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"content bundle request failed with status {status}")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("content bundle response must be valid JSON") from exc
+        _validate_advisory_content_bundle(payload, requested_ids=target_ids)
+        log.info(
+            "fetched advisory content bundle host=%s targets=%d bytes=%d bundle_hash=%s",
+            host_id,
+            len(payload["targets"]),
+            len(body_bytes),
+            payload["bundle_hash"],
+        )
+        return payload
+
+    def fetch_advisory_content_version(
+        self, host_id: str, target_ids: list[str]
+    ) -> Mapping[str, Any]:
+        """Fetch one bounded hashes-only version through normal host routing."""
+
+        if not _valid_advisory_target_ids(target_ids):
+            raise ValueError("target_ids must be a non-empty list of unique IDs")
+        host = self._harness_host(host_id)
+        if host is None:
+            raise ValueError(f"unknown harness host: {host_id}")
+        consent = self._insights().content_consent_state()
+        if not consent["enabled"] or int(consent["epoch"]) <= 0:
+            raise RuntimeError("content analysis is disabled")
+        reconciliation = self._push_content_consent(host, consent)
+        if reconciliation["state"] != "acknowledged":
+            raise RuntimeError("content consent is not reconciled on host")
+        status, body = self._harness_request(
+            host,
+            "/advisory/content-version",
+            method="POST",
+            payload={"target_ids": target_ids},
+            timeout_s=10.0,
+            max_response_bytes=_MAX_CONTENT_VERSION_RESPONSE_BYTES,
+        )
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > _MAX_CONTENT_VERSION_RESPONSE_BYTES:
+            raise ValueError("content version response exceeds byte limit")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"content version request failed with status {status}")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("content version response must be valid JSON") from exc
+        _validate_advisory_content_version(payload, requested_ids=target_ids)
+        log.info(
+            "fetched advisory content version host=%s targets=%d bundle_hash=%s",
+            host_id,
+            len(payload["targets"]),
+            payload["bundle_hash"],
+        )
+        return payload
+
+    def _propagate_content_consent(
+        self, enabled: bool, epoch: int
+    ) -> list[dict[str, str]]:
+        try:
+            hosts = HarnessRegistry(self.duckdb_path).list_hosts()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to enumerate hosts for content consent: %s", exc)
+            return [{"host_id": "fleet", "state": "failed"}]
+        consent = {"enabled": enabled, "epoch": epoch}
+        results: list[dict[str, str]] = []
+        for host in hosts:
+            if str(getattr(host, "status", "offline")) != "online":
+                results.append({"host_id": host.host_id, "state": "disconnected"})
+                continue
+            results.append(self._push_content_consent(host, consent))
+        return results
+
+    def _push_content_consent(
+        self, host: Any, consent: Mapping[str, Any]
+    ) -> dict[str, str]:
+        status, body = self._harness_request(
+            host,
+            "/advisory/content-consent",
+            method="POST",
+            payload={
+                "enabled": bool(consent["enabled"]),
+                "epoch": int(consent["epoch"]),
+            },
+            timeout_s=10.0,
+        )
+        if status == 502:
+            return {"host_id": host.host_id, "state": "disconnected"}
+        if not 200 <= status < 300:
+            return {"host_id": host.host_id, "state": "failed"}
+        try:
+            acknowledged = json.loads(body)
+        except json.JSONDecodeError:
+            acknowledged = None
+        expected = {
+            "enabled": bool(consent["enabled"]),
+            "epoch": int(consent["epoch"]),
+        }
+        if acknowledged != expected:
+            return {"host_id": host.host_id, "state": "failed"}
+        return {"host_id": host.host_id, "state": "acknowledged"}
 
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         with self._session_lock_for(session_id):
@@ -1121,9 +1569,13 @@ class MetricsCollector:
         include_hosts: bool = True,
         include_sessions: bool = True,
     ) -> dict[str, Any]:
+        from drover.server.cockpit.service import COCKPIT_SECTIONS
+
         source = Path(self.duckdb_path)
         if not source.exists():
             return {
+                "cockpit_api_version": 1,
+                "cockpit_sections": list(COCKPIT_SECTIONS),
                 "hosts": [],
                 "sessions": [],
                 "error": f"DuckDB file does not exist: {source}",
@@ -1143,6 +1595,8 @@ class MetricsCollector:
                 [session.session_id for session in sessions]
             )
             return {
+                "cockpit_api_version": 1,
+                "cockpit_sections": list(COCKPIT_SECTIONS),
                 "hosts": [
                     _harness_host_dict(host, self.relay_manager) for host in hosts
                 ],
@@ -1357,6 +1811,7 @@ class MetricsCollector:
         method: str,
         payload: Mapping[str, Any] | None = None,
         timeout_s: float = 15,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         """Single routing choke point for every hub->harnessd API call.
 
@@ -1368,6 +1823,15 @@ class MetricsCollector:
         endpoint.
         """
         if self.relay_manager is not None and self.relay_manager.is_live(host.host_id):
+            if max_response_bytes is not None:
+                return self.relay_manager.request(
+                    host.host_id,
+                    method,
+                    path,
+                    dict(payload or {}),
+                    timeout_s=max(timeout_s, RELAY_MIN_TIMEOUT_S),
+                    max_response_bytes=max_response_bytes,
+                )
             return self.relay_manager.request(
                 host.host_id,
                 method,
@@ -1396,6 +1860,7 @@ class MetricsCollector:
                 method=method,
                 payload=payload,
                 timeout_s=timeout_s,
+                max_response_bytes=max_response_bytes,
             )
         return _json_response(
             502, {"error": f"harness host has no reachable endpoint: {host.host_id}"}
@@ -1408,6 +1873,7 @@ class MetricsCollector:
         method: str,
         payload: Mapping[str, Any] | None = None,
         timeout_s: float = 15,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         body = json.dumps(dict(payload or {}), sort_keys=True)
         parsed = urlparse(url)
@@ -1429,7 +1895,9 @@ class MetricsCollector:
                 headers=headers,
             )
             response = conn.getresponse()
-            return response.status, response.read().decode("utf-8")
+            return response.status, _read_bounded_http_body(
+                response, max_response_bytes=max_response_bytes
+            )
         except OSError as exc:
             return _json_response(502, {"error": f"harness host request failed: {exc}"})
         except Exception as exc:  # noqa: BLE001

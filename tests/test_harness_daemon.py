@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -17,9 +18,11 @@ import urllib.request
 from click.testing import CliRunner
 import pytest
 
+from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server.harness.cli import main as harnessd_cli
 from drover.server.harness import daemon as harness_daemon
+from drover.server.harness import cli as harness_cli
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
@@ -39,6 +42,7 @@ from drover.server.harness.daemon import (
     resolve_harness_presets,
     wire_event_pusher,
 )
+from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import client_handshake
@@ -106,8 +110,41 @@ def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
     assert calls == ["pty", "auth", "server"]
 
 
+def test_harnessd_cli_passes_content_consent_config_to_server(monkeypatch, tmp_path):
+    target = tmp_path / "AGENTS.md"
+    config = type(
+        "Config",
+        (),
+        {
+            "duckdb_path": tmp_path / "drover.duckdb",
+            "advisory_content": _content_config(target),
+        },
+    )()
+    captured = {}
+    monkeypatch.setattr(harness_cli, "resolve_config", lambda path: config)
+    monkeypatch.setattr(harness_cli, "bootstrap_harnessd_schema", lambda cfg: True)
+    monkeypatch.setattr(
+        harness_cli, "run_harnessd", lambda **kwargs: captured.update(kwargs)
+    )
+
+    harness_cli.run_harnessd_from_options(
+        config_path=None,
+        host_id="test-host",
+        display_name=None,
+        kind="linux",
+        listen="127.0.0.1:0",
+        local_url=None,
+        tailscale_url=None,
+        central_url=None,
+        host_token=None,
+    )
+
+    assert captured["advisory_content"] is config.advisory_content
+
+
 class _CentralRegistrationHandler(BaseHTTPRequestHandler):
     payloads: list[dict] = []
+    response_payload: dict = {"ok": True}
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or "0")
@@ -119,7 +156,7 @@ class _CentralRegistrationHandler(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
-        payload = json.dumps({"ok": True}).encode("utf-8")
+        payload = json.dumps(self.__class__.response_payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -193,7 +230,12 @@ FAKE_STRUCTURED_CLI = [
 ]
 
 
-def _start_test_server(tmp_path, *, api_token: str = ""):
+def _start_test_server(
+    tmp_path,
+    *,
+    api_token: str = "",
+    advisory_content: AdvisoryContentConfig | None = None,
+):
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -208,6 +250,7 @@ def _start_test_server(tmp_path, *, api_token: str = ""):
         local_url="http://127.0.0.1:0",
         api_token=api_token,
         worktrees_dir=tmp_path / "worktrees",
+        advisory_content=advisory_content,
     )
     register_daemon_host(state)
     server = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
@@ -215,6 +258,23 @@ def _start_test_server(tmp_path, *, api_token: str = ""):
     thread.start()
     host, port = server.server_address
     return server, state, f"http://{host}:{port}"
+
+
+def _content_config(
+    target,
+    *,
+    enabled: bool = True,
+) -> AdvisoryContentConfig:
+    return AdvisoryContentConfig(
+        enabled=enabled,
+        backend_policy="local",
+        external_consent=False,
+        targets=(str(target),),
+        allowed_roots=(target.parent,),
+        max_file_bytes=1024,
+        max_bundle_bytes=2048,
+        excerpt_max_chars=320,
+    )
 
 
 def test_cli_harnessd_help_documents_core_options():
@@ -243,6 +303,7 @@ def test_skinny_harnessd_entrypoint_documents_core_options():
 def test_daemon_can_register_host_with_central_server(tmp_path):
     central = ThreadingHTTPServer(("127.0.0.1", 0), _CentralRegistrationHandler)
     _CentralRegistrationHandler.payloads = []
+    _CentralRegistrationHandler.response_payload = {"ok": True}
     thread = threading.Thread(target=central.serve_forever, daemon=True)
     thread.start()
     duckdb_path = tmp_path / "drover.duckdb"
@@ -281,6 +342,42 @@ def test_daemon_can_register_host_with_central_server(tmp_path):
             },
         }
     ]
+
+
+def test_reconnecting_daemon_reconciles_revoked_consent_from_registration(tmp_path):
+    """Catches a reconnecting host serving consent that was revoked offline."""
+
+    central = ThreadingHTTPServer(("127.0.0.1", 0), _CentralRegistrationHandler)
+    _CentralRegistrationHandler.payloads = []
+    _CentralRegistrationHandler.response_payload = {
+        "content_consent": {"enabled": False, "epoch": 5}
+    }
+    thread = threading.Thread(target=central.serve_forever, daemon=True)
+    thread.start()
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    consent = DurableContentConsent(tmp_path / "consent.json")
+    consent.apply(enabled=True, epoch=4)
+    state = HarnessDaemonState(
+        host_id="laptop",
+        display_name="Laptop",
+        kind="mac",
+        registry=HarnessRegistry(duckdb_path),
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        central_url=f"http://127.0.0.1:{central.server_address[1]}",
+        host_token="secret",
+        content_consent=consent,
+    )
+
+    try:
+        assert register_daemon_host_remote(state) is True
+    finally:
+        _CentralRegistrationHandler.response_payload = {"ok": True}
+        central.shutdown()
+        central.server_close()
+
+    assert consent.snapshot() == {"enabled": False, "epoch": 5}
 
 
 def test_relay_daemon_registers_itself_as_relay_connected(tmp_path):
@@ -395,6 +492,330 @@ def test_harnessd_health_and_capabilities(tmp_path):
         assert harnesses["shell"]["enabled"] is True
         assert harnesses["codex"]["enabled"] is False
         assert state.registry.get_host("test-host") is not None
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {
+        "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
+        "gemini": replace(DEFAULT_PRESETS["gemini"], enabled=True),
+    }
+    try:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _json_request(f"{base_url}/providers/usage")
+        assert error.value.code == 401
+
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    assert {account["provider"] for account in body["accounts"]} == {
+        "anthropic",
+        "google",
+    }
+    assert {account["usage_status"] for account in body["accounts"]} == {
+        "usage_unavailable"
+    }
+    assert {account["status"] for account in body["accounts"]} == {"usage_unavailable"}
+    assert all(account["windows"] == [] for account in body["accounts"])
+    assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
+
+
+def test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            _json_request(
+                f"{base_url}/advisory/content-bundle",
+                payload={"target_ids": ["AGENTS.md"]},
+            )
+        assert unauthorized.value.code == 401
+
+        request = urllib.request.Request(
+            f"{base_url}/advisory/content-bundle",
+            data=json.dumps({"target_ids": ["AGENTS.md"]}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as disabled:
+            urllib.request.urlopen(request, timeout=5)
+        assert disabled.value.code == 403
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_content_bundle_requires_configured_token_even_when_enabled(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        advisory_content=_content_config(target),
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            _json_request(
+                f"{base_url}/advisory/content-bundle",
+                payload={"target_ids": ["AGENTS.md"]},
+            )
+        assert unauthorized.value.code == 401
+        assert json.loads(unauthorized.value.read())["error"] == (
+            "authentication required"
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_running_harnessd_applies_live_consent_and_revoke_without_restart(tmp_path):
+    """Catches a daemon continuing to use its startup AdvisoryContentConfig."""
+
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+    state.content_consent = DurableContentConsent(tmp_path / "consent.json")
+
+    def post(path: str, payload: dict):
+        request = urllib.request.Request(
+            f"{base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as disabled:
+            post("/advisory/content-bundle", {"target_ids": ["AGENTS.md"]})
+        assert disabled.value.code == 403
+
+        with post("/advisory/content-consent", {"enabled": True, "epoch": 7}) as res:
+            assert json.loads(res.read()) == {"enabled": True, "epoch": 7}
+        with post("/advisory/content-bundle", {"target_ids": ["AGENTS.md"]}) as res:
+            assert json.loads(res.read())["targets"][0]["target_id"] == "AGENTS.md"
+
+        with post("/advisory/content-consent", {"enabled": False, "epoch": 8}) as res:
+            assert json.loads(res.read()) == {"enabled": False, "epoch": 8}
+        with pytest.raises(urllib.error.HTTPError) as revoked:
+            post("/advisory/content-bundle", {"target_ids": ["AGENTS.md"]})
+        assert revoked.value.code == 403
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_content_consent_override_survives_restart_and_rejects_stale_enable(tmp_path):
+    """Catches restart or delayed relay traffic resurrecting revoked consent."""
+
+    path = tmp_path / "consent.json"
+    first = DurableContentConsent(path)
+    assert first.apply(enabled=True, epoch=4) == {"enabled": True, "epoch": 4}
+    assert first.apply(enabled=False, epoch=5) == {"enabled": False, "epoch": 5}
+
+    restarted = DurableContentConsent(path)
+    assert restarted.snapshot() == {"enabled": False, "epoch": 5}
+    with pytest.raises(ValueError, match="stale consent epoch"):
+        restarted.apply(enabled=True, epoch=4)
+    assert restarted.snapshot() == {"enabled": False, "epoch": 5}
+
+
+def test_unknown_epoch_is_idempotent_disabled_and_cannot_enable(tmp_path):
+    """Catches default epoch zero becoming an implicit enable signal."""
+
+    consent = DurableContentConsent(tmp_path / "consent.json")
+    assert consent.apply(enabled=False, epoch=0) == {"enabled": False, "epoch": 0}
+    with pytest.raises(ValueError, match="epoch zero must be disabled"):
+        consent.apply(enabled=True, epoch=0)
+
+
+def test_standalone_config_bootstrap_cannot_override_durable_revoke(tmp_path):
+    """Catches local compatibility fallback resurrecting consent on restart."""
+
+    path = tmp_path / "consent.json"
+    first = DurableContentConsent(path, initial_enabled=True)
+    assert first.snapshot() == {"enabled": True, "epoch": 1}
+    first.apply(enabled=False, epoch=2)
+
+    restarted = DurableContentConsent(path, initial_enabled=True)
+    assert restarted.snapshot() == {"enabled": False, "epoch": 2}
+
+
+def test_content_consent_control_is_fail_closed_without_daemon_token(tmp_path):
+    """Catches auth-off harnessd accepting a control-plane consent mutation."""
+
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        advisory_content=_content_config(target),
+    )
+    state.content_consent = DurableContentConsent(tmp_path / "consent.json")
+    request = urllib.request.Request(
+        f"{base_url}/advisory/content-consent",
+        data=json.dumps({"enabled": True, "epoch": 1}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            urllib.request.urlopen(request, timeout=5)
+        assert unauthorized.value.code == 401
+        assert state.content_consent.snapshot() == {"enabled": False, "epoch": 0}
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral(
+    tmp_path,
+):
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        "api_token = 'top-secret'\nUse the deployment skill.\n",
+        encoding="utf-8",
+    )
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+
+    def post(payload):
+        request = urllib.request.Request(
+            f"{base_url}/advisory/content-bundle",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as arbitrary_path:
+            post({"target_ids": [str(target)]})
+        assert arbitrary_path.value.code == 400
+
+        with post({"target_ids": ["AGENTS.md"]}) as response:
+            body_bytes = response.read()
+            body = json.loads(body_bytes.decode("utf-8"))
+            headers = response.headers
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert headers["Cache-Control"] == "no-store"
+    assert set(body) == {"bundle_hash", "created_at", "targets"}
+    assert set(body["targets"][0]) == {
+        "target_id",
+        "content_hash",
+        "redacted_content",
+    }
+    assert body["targets"][0]["target_id"] == "AGENTS.md"
+    assert "top-secret" not in body_bytes.decode("utf-8")
+    assert body["targets"][0]["redacted_content"].endswith(
+        "Use the deployment skill.\n"
+    )
+    assert not list(tmp_path.rglob("*bundle*"))
+
+
+def test_harnessd_content_version_is_authenticated_hashes_only_and_no_store(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("private prompt body\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+    state.content_consent = DurableContentConsent(tmp_path / "consent.json")
+    state.content_consent.apply(enabled=True, epoch=1)
+
+    def post(*, authorized: bool):
+        headers = {"Content-Type": "application/json"}
+        if authorized:
+            headers["Authorization"] = "Bearer secret"
+        request = urllib.request.Request(
+            f"{base_url}/advisory/content-version",
+            data=json.dumps({"target_ids": ["AGENTS.md"]}).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            post(authorized=False)
+        assert unauthorized.value.code == 401
+
+        with post(authorized=True) as response:
+            body_bytes = response.read()
+            body = json.loads(body_bytes)
+            headers = response.headers
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert headers["Cache-Control"] == "no-store"
+    assert set(body) == {"bundle_hash", "targets"}
+    assert set(body["targets"][0]) == {"target_id", "content_hash"}
+    assert body["targets"][0]["target_id"] == "AGENTS.md"
+    assert b"private prompt body" not in body_bytes
+
+
+def test_harnessd_content_bundle_rejects_oversized_request_before_parsing(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        api_token="secret",
+        advisory_content=_content_config(target),
+    )
+    request = urllib.request.Request(
+        f"{base_url}/advisory/content-bundle",
+        data=json.dumps({"target_ids": ["x" * 140_000]}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as oversized:
+            urllib.request.urlopen(request, timeout=5)
+        assert oversized.value.code == 413
     finally:
         state.pty.close_all()
         server.shutdown()

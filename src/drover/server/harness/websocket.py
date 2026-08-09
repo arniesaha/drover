@@ -58,8 +58,10 @@ def send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
     send_frame(sock, OPCODE_TEXT, json.dumps(payload, sort_keys=True).encode("utf-8"))
 
 
-def recv_json(sock: socket.socket) -> dict[str, Any] | None:
-    frame = recv_frame(sock)
+def recv_json(
+    sock: socket.socket, *, max_frame_bytes: int | None = None
+) -> dict[str, Any] | None:
+    frame = recv_frame(sock, max_frame_bytes=max_frame_bytes)
     if frame.opcode == OPCODE_CLOSE:
         raise WebSocketClosed()
     if frame.opcode == OPCODE_PING:
@@ -90,7 +92,9 @@ def send_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:
     sock.sendall(header + payload)
 
 
-def recv_frame(sock: socket.socket) -> WebSocketFrame:
+def recv_frame(
+    sock: socket.socket, *, max_frame_bytes: int | None = None
+) -> WebSocketFrame:
     header = _recv_exact(sock, 2)
     first, second = header
     opcode = first & 0x0F
@@ -100,7 +104,13 @@ def recv_frame(sock: socket.socket) -> WebSocketFrame:
         length = struct.unpack("!H", _recv_exact(sock, 2))[0]
     elif length == 127:
         length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
-    if length > MAX_FRAME_BYTES:
+    if max_frame_bytes is not None:
+        if type(max_frame_bytes) is not int or max_frame_bytes < 0:
+            raise ValueError("max_frame_bytes must be a non-negative integer")
+        effective_max = min(MAX_FRAME_BYTES, max_frame_bytes)
+    else:
+        effective_max = MAX_FRAME_BYTES
+    if length > effective_max:
         # A 64-bit length field taken on trust is an allocation primitive:
         # _recv_exact grows a bytearray until satisfied, so a peer announcing
         # a multi-gigabyte frame exhausts hub memory, and one that announces
@@ -109,7 +119,7 @@ def recv_frame(sock: socket.socket) -> WebSocketFrame:
         # only gate. Close rather than skip: we cannot resynchronize a stream
         # without consuming the payload we just refused to read.
         raise WebSocketClosed(
-            f"websocket frame of {length} bytes exceeds {MAX_FRAME_BYTES}"
+            f"websocket frame of {length} bytes exceeds {effective_max}"
         )
     mask = _recv_exact(sock, 4) if masked else b""
     payload = _recv_exact(sock, length) if length else b""

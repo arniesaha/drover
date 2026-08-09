@@ -20,14 +20,22 @@ failure path deterministically. See
 ``docs/design/redis-job-queue-retry-dlq.md``.
 """
 
+from drover.server.advisory.jobs import (
+    ADVISORY_ARTIFACT_KIND,
+    ADVISORY_JOB_KIND,
+    enqueue_advisory_check,
+)
 from drover.server.jobs.redis_streams import RedisJobStream, RedisJobStreamConfig
 from drover.server.jobs.streams import DeadLetter, Delivery, JobStream, PendingEntry
 
 __all__ = [
+    "ADVISORY_ARTIFACT_KIND",
+    "ADVISORY_JOB_KIND",
     "JobStream",
     "RedisJobStream",
     "RedisJobStreamConfig",
     "Delivery",
     "PendingEntry",
     "DeadLetter",
+    "enqueue_advisory_check",
 ]

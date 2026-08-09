@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from drover.server.harness.relay_protocol import (
+    FRAMED_RESPONSES_CAPABILITY,
     RelayProtocolError,
     close_frame,
     data_frame,
@@ -39,6 +40,7 @@ from drover.server.harness.relay_protocol import (
     opened_frame,
     parse_frame,
     res_frame,
+    res_start_frame,
 )
 from drover.server.harness.websocket import (
     OPCODE_CLOSE,
@@ -100,6 +102,29 @@ class _WriteTimeout(RuntimeError):
 
 class RelayConfigError(ValueError):
     """The relay target is unusable no matter how many times we redial."""
+
+
+def _read_bounded_loopback_body(
+    response: Any, *, max_response_bytes: int | None
+) -> str:
+    if max_response_bytes is None:
+        return response.read().decode("utf-8", errors="replace")
+    if max_response_bytes <= 0:
+        raise ValueError("max_response_bytes must be positive")
+    content_length = response.getheader("Content-Length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError as exc:
+            raise ValueError("loopback response has invalid Content-Length") from exc
+        if declared_bytes < 0:
+            raise ValueError("loopback response has invalid Content-Length")
+        if declared_bytes > max_response_bytes:
+            raise ValueError("loopback response exceeds byte limit")
+    payload = response.read(max_response_bytes + 1)
+    if len(payload) > max_response_bytes:
+        raise ValueError("loopback response exceeds byte limit")
+    return payload.decode("utf-8", errors="replace")
 
 
 class _Target:
@@ -205,6 +230,14 @@ class _Conn:
     ) -> None:
         with self.write_access(timeout_s):
             client_send_frame(self.sock, opcode, payload)
+
+    def send_bounded_response(self, request_id: str, status: int, body: str) -> None:
+        payload = body.encode("utf-8")
+        with self.write_access(WRITE_TIMEOUT_S):
+            client_send_json(
+                self.sock, res_start_frame(request_id, status, len(payload))
+            )
+            client_send_frame(self.sock, OPCODE_TEXT, payload)
 
     def add_channel(self, channel: _Channel) -> bool:
         with self.state_lock:
@@ -330,7 +363,13 @@ class RelayClient:
                 path=target.path,
                 headers={"Authorization": f"Bearer {self.token}"},
             )
-            client_send_json(sock, hello_frame(self.host_id))
+            client_send_json(
+                sock,
+                hello_frame(
+                    self.host_id,
+                    capabilities=[FRAMED_RESPONSES_CAPABILITY],
+                ),
+            )
         except Exception:
             with contextlib.suppress(OSError):
                 sock.close()
@@ -429,6 +468,31 @@ class RelayClient:
         except (OSError, WebSocketClosed) as exc:
             self._teardown(connection, f"relay send failed: {exc}")
 
+    def _send_bounded_response(
+        self, connection: _Conn, request_id: str, status: int, body: str
+    ) -> None:
+        if not connection.alive.is_set():
+            return
+        try:
+            connection.send_bounded_response(request_id, status, body)
+        except _WriteTimeout as exc:
+            self._teardown(connection, str(exc))
+        except (OSError, WebSocketClosed) as exc:
+            self._teardown(connection, f"relay send failed: {exc}")
+
+    def _send_response(
+        self,
+        connection: _Conn,
+        request: dict[str, Any],
+        status: int,
+        body: str,
+    ) -> None:
+        request_id = str(request.get("id"))
+        if request.get("response_framing") == FRAMED_RESPONSES_CAPABILITY:
+            self._send_bounded_response(connection, request_id, status, body)
+        else:
+            self._send(connection, res_frame(request_id, status, body))
+
     # -- req/res -------------------------------------------------------
 
     def _start_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
@@ -441,15 +505,13 @@ class RelayClient:
                     self._refused_reqs,
                     MAX_INFLIGHT_REQS,
                 )
-            self._send(
+            self._send_response(
                 connection,
-                res_frame(
-                    str(frame.get("id")),
-                    503,
-                    json.dumps(
-                        {"error": "harness host is saturated"},
-                        sort_keys=True,
-                    ),
+                frame,
+                503,
+                json.dumps(
+                    {"error": "harness host is saturated"},
+                    sort_keys=True,
                 ),
             )
             return
@@ -460,24 +522,41 @@ class RelayClient:
             raise
 
     def _handle_req(self, connection: _Conn, frame: dict[str, Any]) -> None:
-        request_id = str(frame.get("id"))
         method = str(frame.get("method") or "GET").upper()
         path = str(frame.get("path") or "/")
         try:
             try:
-                status, body = self._loopback_request(method, path, frame.get("body"))
+                max_response_bytes = frame.get("max_response_bytes")
+                if max_response_bytes is None:
+                    status, body = self._loopback_request(
+                        method, path, frame.get("body")
+                    )
+                elif type(max_response_bytes) is int and max_response_bytes > 0:
+                    status, body = self._loopback_request(
+                        method,
+                        path,
+                        frame.get("body"),
+                        max_response_bytes=max_response_bytes,
+                    )
+                else:
+                    raise ValueError("invalid relay response byte limit")
             except Exception as exc:  # noqa: BLE001 - never crash the frame loop
                 log.warning("relay loopback %s %s failed: %s", method, path, exc)
                 status = 502
                 body = json.dumps(
                     {"error": f"loopback request failed: {exc}"}, sort_keys=True
                 )
-            self._send(connection, res_frame(request_id, status, body))
+            self._send_response(connection, frame, status, body)
         finally:
             self._req_slots.release()
 
     def _loopback_request(
-        self, method: str, path: str, body: dict[str, Any] | None
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+        *,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         conn = http.client.HTTPConnection(
             "127.0.0.1", self.loopback_port, timeout=LOOPBACK_TIMEOUT_S
@@ -488,7 +567,9 @@ class RelayClient:
                 headers["Authorization"] = f"Bearer {self.token}"
             conn.request(method, path, body=json.dumps(body or {}), headers=headers)
             response = conn.getresponse()
-            return response.status, response.read().decode("utf-8", errors="replace")
+            return response.status, _read_bounded_loopback_body(
+                response, max_response_bytes=max_response_bytes
+            )
         finally:
             conn.close()
 

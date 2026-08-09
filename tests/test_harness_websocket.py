@@ -730,6 +730,23 @@ def test_recv_frame_refuses_a_frame_over_the_eight_mebibyte_cap():
         server.close()
 
 
+def test_recv_frame_scoped_cap_rejects_before_payload_read():
+    """A caller-specific cap must be checked from the frame header alone."""
+    server, client = socket.socketpair()
+    try:
+        length = 4097
+        # Header only: reading the mask or payload after seeing the scoped cap
+        # blocks until timeout and fails the test for the wrong exception.
+        server.sendall(bytes([0x81, 0x80 | 127]) + length.to_bytes(8, "big"))
+        client.settimeout(0.5)
+        with pytest.raises(WebSocketClosed) as caught:
+            recv_frame(client, max_frame_bytes=4096)
+        assert "4096" in str(caught.value)
+    finally:
+        client.close()
+        server.close()
+
+
 def test_mirror_retries_then_counts_dropped_events():
     """A write failure must be retried, and a permanent one must be counted.
 

@@ -37,6 +37,7 @@ from drover.server.harness.websocket import (
     send_frame,
     send_json,
 )
+from drover.server.harness.relay_protocol import RELAY_CONTROL_FRAME_BYTES
 from drover.server.web.auth import (
     DISABLED,
     AuthSettings,
@@ -118,6 +119,102 @@ def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
     ):
         raise ValueError(f"limit must be between 1 and {_MESSAGE_PAGE_MAX}")
     return query
+
+
+_COCKPIT_QUERY_FIELDS = frozenset(
+    {
+        "days",
+        "host_id",
+        "harness",
+        "provider",
+        "model",
+        "project_key",
+        "limit",
+        "project_cursor",
+        "harness_cursor",
+        "host_cursor",
+        "model_cursor",
+    }
+)
+
+
+def _parse_cockpit_query(query: str):
+    """Parse only the bounded, documented cockpit filter surface."""
+    from drover.server.cockpit.analytics import AnalyticsFilters
+
+    params = parse_qs(query, keep_blank_values=True)
+    unknown = sorted(set(params) - _COCKPIT_QUERY_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported query field: {unknown[0]}")
+    values: dict[str, Any] = {}
+    for name, entries in params.items():
+        if len(entries) != 1:
+            raise ValueError(f"{name} must appear once")
+        value = entries[0].strip()
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        max_length = 2048 if name.endswith("_cursor") else 256
+        if len(value) > max_length:
+            raise ValueError(f"{name} is too long")
+        values[name] = value
+    for numeric in ("days", "limit"):
+        if numeric not in values:
+            continue
+        try:
+            values[numeric] = int(values[numeric])
+        except ValueError as exc:
+            raise ValueError(f"{numeric} must be an integer") from exc
+    return AnalyticsFilters(**values)
+
+
+_INSIGHT_QUERY_FIELDS = frozenset(
+    {
+        "state",
+        "severity",
+        "confidence",
+        "analyzer_class",
+        "host",
+        "harness",
+        "target_type",
+        "target_id",
+        "cursor",
+        "limit",
+    }
+)
+
+
+def _parse_insight_query(query: str):
+    from drover.server.advisory.service import InsightFilters
+
+    params = parse_qs(query, keep_blank_values=True)
+    unknown = sorted(set(params) - _INSIGHT_QUERY_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported query field: {unknown[0]}")
+    values: dict[str, Any] = {}
+    for name, entries in params.items():
+        if len(entries) != 1:
+            raise ValueError(f"{name} must appear once")
+        value = entries[0].strip()
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        if len(value) > 512:
+            raise ValueError(f"{name} is too long")
+        values[name] = value
+    if "limit" in values:
+        try:
+            values["limit"] = int(values["limit"])
+        except ValueError as exc:
+            raise ValueError("limit must be an integer") from exc
+    return InsightFilters(**values)
+
+
+def _parse_insight_route(path: str) -> tuple[str, str | None] | None:
+    parts = path.strip("/").split("/")
+    if len(parts) not in {2, 3} or parts[0] != "insights":
+        return None
+    finding_id = unquote(parts[1])
+    action = parts[2] if len(parts) == 3 else None
+    return finding_id, action
 
 
 def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
@@ -433,6 +530,39 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/observability":
             self._send(200, "application/json", self.collector.render_json())
             return
+        if path in {"/cockpit/overview", "/analytics"}:
+            try:
+                filters = _parse_cockpit_query(parsed.query)
+            except ValueError as exc:
+                self._send(
+                    400,
+                    "application/json",
+                    json.dumps({"error": str(exc)}) + "\n",
+                )
+                return
+            if path == "/cockpit/overview":
+                status, body = self.collector.render_cockpit_overview_json(filters)
+            else:
+                status, body = self.collector.render_analytics_json(filters)
+            self._send(status, "application/json", body)
+            return
+        if path == "/insights":
+            try:
+                filters = _parse_insight_query(parsed.query)
+                status, body = self.collector.render_insights_json(filters)
+            except ValueError as exc:
+                status, body = 400, json.dumps({"error": str(exc)}) + "\n"
+            self._send(status, "application/json", body)
+            return
+        if path == "/insights/content-analysis":
+            status, body = self.collector.render_content_analysis_status_json()
+            self._send(status, "application/json", body)
+            return
+        insight_route = _parse_insight_route(path)
+        if insight_route and insight_route[1] is None:
+            status, body = self.collector.render_insight_json(insight_route[0])
+            self._send(status, "application/json", body)
+            return
         if path == "/harness":
             self._send(200, "application/json", self.collector.render_harness_json())
             return
@@ -595,6 +725,49 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/auth/login":
             self._handle_login()
             return
+        if path == "/insights/content-analysis/consent":
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.consent_content_analysis(body)
+            self._send(status, "application/json", payload)
+            return
+        if path == "/insights/content-analysis/revoke":
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.revoke_content_analysis(body)
+            self._send(status, "application/json", payload)
+            return
+        insight_route = _parse_insight_route(path)
+        if insight_route and insight_route[1] in {
+            "acknowledge",
+            "dismiss",
+            "check",
+        }:
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.act_on_insight(
+                insight_route[0], insight_route[1], body
+            )
+            self._send(status, "application/json", payload)
+            return
         if path == "/harness/events":
             self._ingest_harness_events()
             return
@@ -717,6 +890,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 )
                 return
             status, payload = self.collector.continue_harness_session(session_id, body)
+            self._send(status, "application/json", payload)
+            return
+        self._send(404, "text/plain; charset=utf-8", "not found\n")
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if not self._gate(path):
+            return
+        if path == "/insights/content-excerpts":
+            status, payload = self.collector.purge_content_excerpts()
             self._send(status, "application/json", payload)
             return
         self._send(404, "text/plain; charset=utf-8", "not found\n")
@@ -1015,7 +1199,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         f"no hello frame within {RELAY_HELLO_TIMEOUT_S}s"
                     )
                 sock.settimeout(max(0.1, remaining))
-                frame = recv_json(sock)
+                frame = recv_json(sock, max_frame_bytes=RELAY_CONTROL_FRAME_BYTES)
             parsed = parse_frame(frame)
             if parsed.get("kind") != "hello":
                 raise RelayProtocolError(
@@ -1024,6 +1208,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             host_id = str(parsed.get("host_id") or "").strip()
             if not host_id:
                 raise RelayProtocolError("hello frame missing host_id")
+            raw_capabilities = parsed.get("capabilities") or []
+            if not isinstance(raw_capabilities, list) or any(
+                not isinstance(item, str) for item in raw_capabilities
+            ):
+                raise RelayProtocolError("hello capabilities must be a string list")
+            capabilities = set(raw_capabilities)
         except (OSError, WebSocketClosed, RelayProtocolError, ValueError) as exc:
             log.info("relay handshake for %s failed: %s", self.client_address, exc)
             sock.close()
@@ -1044,7 +1234,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         # no-op) while the fd itself, rewrapped below, keeps working.
         fd = sock.detach()
         relay_sock = socket.socket(fileno=fd)
-        self.collector.relay_manager.attach(host_id, relay_sock)
+        self.collector.relay_manager.attach(
+            host_id, relay_sock, capabilities=capabilities
+        )
 
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)

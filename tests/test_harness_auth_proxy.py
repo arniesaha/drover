@@ -253,8 +253,8 @@ def test_proxy_harness_auth_builds_quoted_upstream_paths(tmp_path):
     )
     calls = []
 
-    def fake_proxy(url, *, method, payload, timeout_s=15):
-        calls.append((method, url, payload))
+    def fake_proxy(url, *, method, payload, timeout_s=15, max_response_bytes=None):
+        calls.append((method, url, payload, max_response_bytes))
         return 200, json.dumps({"state": "waiting_for_user"})
 
     collector._proxy_harness_request = fake_proxy  # type: ignore[method-assign]
@@ -270,6 +270,7 @@ def test_proxy_harness_auth_builds_quoted_upstream_paths(tmp_path):
         "GET",
         "http://127.0.0.1:30400/auth/provider%2Ftest/status",
         {},
+        None,
     )
 
     collector.proxy_harness_auth("mac-mini", "provider/test", "start")

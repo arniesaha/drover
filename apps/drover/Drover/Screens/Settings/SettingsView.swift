@@ -44,6 +44,10 @@ struct SettingsView: View {
                         .textContentType(.oneTimeCode)
                 }
 
+                if let client = environment.client {
+                    ContentAnalysisSettings(client: client)
+                }
+
                 if let statusMessage {
                     statusRow(statusMessage)
                 }

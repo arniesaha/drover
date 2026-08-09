@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -20,14 +21,26 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server import metrics
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightsService
+from drover.server.advisory.types import (
+    AnalyzerClass,
+    Confidence,
+    FindingCandidate,
+    FindingEvidence,
+    Severity,
+)
+from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
     create_harness_server,
     register_daemon_host,
 )
+from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import (
@@ -266,6 +279,83 @@ def _authed_get(url: str, headers: dict[str, str] | None = None):
     return urllib.request.urlopen(request, timeout=5)
 
 
+def _authed_post(url: str, payload: object):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
+        method="POST",
+    )
+    return urllib.request.urlopen(request, timeout=5)
+
+
+def _authed_delete(url: str):
+    request = urllib.request.Request(url, headers=_AUTH_HEADERS, method="DELETE")
+    return urllib.request.urlopen(request, timeout=5)
+
+
+def _observe_insight(collector: MetricsCollector):
+    return AdvisoryRepository(collector.duckdb_path).observe(
+        FindingCandidate(
+            analyzer_id="hooks",
+            rule_id="hook.executable_missing",
+            target_type="hook",
+            target_id="mac-mini:session-start",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="SessionStart hook executable is missing",
+            impact="New sessions skip required setup.",
+            remediation=("Restore the executable.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="host:mac-mini/hooks/session-start",
+                    observed_at=datetime(2026, 8, 8, 17, tzinfo=timezone.utc),
+                    fields={"exists": False},
+                    excerpt="missing executable",
+                ),
+            ),
+            content_hash="hash-v1",
+        ),
+        run_id="analysis-run-1",
+    )
+
+
+def _observe_provider_insight(collector: MetricsCollector):
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        con.execute(
+            """
+            INSERT INTO provider_connections (
+              provider, account_label, host_id, enabled, updated_at
+            ) VALUES ('openai', 'personal', 'mac-mini', TRUE, ?)
+            """,
+            [datetime(2026, 8, 8, 17, tzinfo=timezone.utc)],
+        )
+    return AdvisoryRepository(collector.duckdb_path).observe(
+        FindingCandidate(
+            analyzer_id="deterministic.connector_freshness",
+            rule_id="connector.stale",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI connector data is stale",
+            impact="Provider capacity may be stale.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=datetime(2026, 8, 8, 17, tzinfo=timezone.utc),
+                    fields={"status": "stale"},
+                ),
+            ),
+            content_hash="old-hash",
+        ),
+        run_id="old-run",
+    )
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -280,6 +370,15 @@ def _make_collector(tmp_path) -> MetricsCollector:
         summarizer_report={},
         ttl_seconds=60,
     )
+
+
+def _swift_content_consent_fixture(name: str) -> dict:
+    fixture = (
+        Path(__file__).parents[1]
+        / "apps/drover/DroverKit/Tests/DroverKitTests/Fixtures"
+        / f"content-consent-{name}.json"
+    )
+    return json.loads(fixture.read_text(encoding="utf-8"))
 
 
 class _FailingWriter:
@@ -594,6 +693,519 @@ def test_metrics_collector_harness_json(tmp_path):
     assert '"cwd_suggestions"' in body
     assert '"path": "/home/Arnab/dev/nexus"' in body
     assert '"source": "recent session"' in body
+
+
+def test_harness_capabilities_advertise_cockpit_api(tmp_path):
+    payload = json.loads(_make_collector(tmp_path).render_harness_json())
+
+    assert payload["cockpit_api_version"] == 1
+    assert payload["cockpit_sections"] == [
+        "provider_capacity",
+        "activity",
+        "popular_projects",
+        "insights",
+    ]
+
+
+def test_cockpit_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
+    collector = _make_collector(tmp_path)
+    collector.cockpit_service = CockpitService(
+        duckdb_path=collector.duckdb_path,
+        provider_usage=None,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            urlopen(base + "/analytics", timeout=3)
+        assert exc.value.code == 401
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?days=0")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?unexpected=value")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?limit=1&limit=2")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?limit=101")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?project_cursor=not-a-valid-cursor")
+        assert exc.value.code == 400
+
+        with _authed_get(base + "/cockpit/overview?days=7") as response:
+            payload = json.loads(response.read())
+        assert payload["activity"]["status"] == "ok"
+        assert payload["provider_capacity"]["status"] == "unavailable"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_analytics_endpoint_returns_snapshot_changed_conflict(tmp_path):
+    collector = _make_collector(tmp_path)
+
+    class _ChangedCockpit:
+        def analytics(self, filters):
+            from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+
+            raise AnalyticsSnapshotChangedError()
+
+    collector.cockpit_service = _ChangedCockpit()
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?days=7")
+        assert exc.value.code == 409
+        assert json.loads(exc.value.read()) == {
+            "detail": "Activity changed; reload analytics from the first page.",
+            "error": "snapshot_changed",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_insights_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
+    collector = _make_collector(tmp_path)
+    _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            urlopen(base + "/insights", timeout=3)
+        assert exc.value.code == 401
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/insights?unexpected=value")
+        assert exc.value.code == 400
+
+        with _authed_get(base + "/insights?severity=high&limit=1") as response:
+            payload = json.loads(response.read())
+        assert payload["findings"][0]["severity"] == "high"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_content_analysis_privacy_routes_require_auth_and_return_bounded_status(
+    tmp_path,
+):
+    collector = _make_collector(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = false
+backend_policy = "local"
+external_consent = false
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+""")
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=config_path
+    )
+    _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        for method, path, payload in (
+            ("GET", "/insights/content-analysis", None),
+            ("POST", "/insights/content-analysis/consent", {"backend": "local"}),
+            ("POST", "/insights/content-analysis/revoke", {}),
+            ("DELETE", "/insights/content-excerpts", None),
+        ):
+            request = urllib.request.Request(
+                base + path,
+                data=(json.dumps(payload).encode() if payload is not None else None),
+                headers=(
+                    {"Content-Type": "application/json"} if payload is not None else {}
+                ),
+                method=method,
+            )
+            with pytest.raises(HTTPError) as exc:
+                urlopen(request, timeout=3)
+            assert exc.value.code == 401
+
+        with _authed_get(base + "/insights/content-analysis") as response:
+            status = json.loads(response.read())
+        assert status == _swift_content_consent_fixture("complete")
+        assert "content" not in json.dumps(status).lower().replace(
+            "content_analysis", ""
+        )
+
+        with _authed_post(
+            base + "/insights/content-analysis/consent", {"backend": "local"}
+        ) as response:
+            consent = json.loads(response.read())
+        assert consent["enabled"] is True
+        assert consent["external_disclosure_accepted"] is False
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(
+                base + "/insights/content-analysis/consent",
+                {"backend": "cloud", "external_disclosure_accepted": False},
+            )
+        assert exc.value.code == 400
+
+        with _authed_post(base + "/insights/content-analysis/revoke", {}) as response:
+            revoked = json.loads(response.read())
+        assert revoked["enabled"] is False
+
+        with _authed_delete(base + "/insights/content-excerpts") as response:
+            purged = json.loads(response.read())
+        assert purged == {"purged_excerpt_count": 1}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_content_status_empty_registry_matches_shared_swift_fixture(tmp_path) -> None:
+    collector = _make_collector(tmp_path)
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 200
+    assert json.loads(body) == _swift_content_consent_fixture("complete")
+
+
+def test_content_status_offline_registry_matches_shared_swift_fixture(tmp_path) -> None:
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="offline-laptop",
+        display_name="Offline Laptop",
+        kind="macos",
+        connection_kind="relay",
+        status="offline",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+    collector.consent_content_analysis(
+        {"backend": "cloud", "external_disclosure_accepted": True}
+    )
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 207
+    assert json.loads(body) == _swift_content_consent_fixture("partial")
+
+
+def test_content_status_failed_registry_matches_shared_swift_fixture(tmp_path) -> None:
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="workstation",
+        display_name="Workstation",
+        kind="macos",
+        connection_kind="relay",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    class _StatusNackRelay:
+        def is_live(self, host_id):
+            return True
+
+        def request(self, host_id, method, path, body, timeout_s=15):
+            return 409, '{"error":"epoch conflict"}'
+
+    collector.relay_manager = _StatusNackRelay()
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 503
+    assert json.loads(body) == _swift_content_consent_fixture("failed")
+
+
+def test_content_status_repair_failure_matches_shared_swift_fixture(
+    tmp_path, monkeypatch
+) -> None:
+    """Catches durable repair failure becoming a generic or successful GET."""
+
+    collector = _make_collector(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """[advisory_content]
+enabled = true
+backend_policy = "cloud"
+external_consent = true
+targets = []
+allowed_roots = []
+max_file_bytes = 131072
+max_bundle_bytes = 524288
+excerpt_max_chars = 320
+""",
+        encoding="utf-8",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=config_path
+    )
+    monkeypatch.setattr(
+        collector.advisory_service._content_consent,
+        "_persist",
+        lambda state: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 503
+    assert json.loads(body) == _swift_content_consent_fixture("repair-failed")
+
+
+def test_central_consent_and_revoke_reconcile_an_already_running_direct_daemon(
+    tmp_path,
+):
+    """Catches consent APIs succeeding while a live host keeps stale state."""
+
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    host_db = tmp_path / "host.duckdb"
+    bootstrap(parquet_dir=tmp_path / "host-parquet", duckdb_path=host_db)
+    host_state = HarnessDaemonState(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        registry=HarnessRegistry(host_db),
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        api_token="secret",
+        advisory_content=AdvisoryContentConfig(
+            enabled=True,
+            backend_policy="local",
+            external_consent=False,
+            targets=(str(target),),
+            allowed_roots=(tmp_path,),
+            max_file_bytes=1024,
+            max_bundle_bytes=2048,
+            excerpt_max_chars=320,
+        ),
+        content_consent=DurableContentConsent(tmp_path / "host-consent.json"),
+    )
+    host_server = create_harness_server(
+        listen_host="127.0.0.1", listen_port=0, state=host_state
+    )
+    host_thread = threading.Thread(target=host_server.serve_forever, daemon=True)
+    host_thread.start()
+
+    collector = _make_collector(tmp_path / "central")
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        local_url=f"http://127.0.0.1:{host_server.server_port}",
+    )
+    config_path = tmp_path / "central-config.toml"
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=config_path
+    )
+    collector.api_token = "secret"
+
+    try:
+        status, body = collector.consent_content_analysis({"backend": "local"})
+        assert status == 200
+        consent = json.loads(body)
+        assert consent["propagation"] == "complete"
+        assert host_state.content_consent.snapshot() == {
+            "enabled": True,
+            "epoch": consent["consent_epoch"],
+        }
+
+        status, body = collector.render_content_analysis_status_json()
+        reconciled = json.loads(body)
+        assert status == 200
+        assert reconciled["consent_epoch"] == consent["consent_epoch"]
+        assert reconciled["hosts"] == [{"host_id": "mac-mini", "state": "acknowledged"}]
+
+        bundle = collector.fetch_advisory_content_bundle("mac-mini", ["AGENTS.md"])
+        assert bundle["targets"][0]["target_id"] == "AGENTS.md"
+
+        status, body = collector.revoke_content_analysis({})
+        assert status == 200
+        revoked = json.loads(body)
+        assert revoked["propagation"] == "complete"
+        assert host_state.content_consent.snapshot() == {
+            "enabled": False,
+            "epoch": revoked["consent_epoch"],
+        }
+        with pytest.raises(RuntimeError, match="disabled"):
+            collector.fetch_advisory_content_bundle("mac-mini", ["AGENTS.md"])
+    finally:
+        host_state.pty.close_all()
+        host_server.shutdown()
+        host_server.server_close()
+
+
+def test_insight_detail_and_lifecycle_actions_are_validated(tmp_path):
+    collector = _make_collector(tmp_path)
+    finding = _observe_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with _authed_get(base + f"/insights/{finding.finding_id}") as response:
+            detail = json.loads(response.read())
+        assert detail["finding"]["finding_id"] == finding.finding_id
+        assert detail["actions"]["check_again"]["available"] is False
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + f"/insights/{finding.finding_id}/check", {})
+        assert exc.value.code == 409
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + f"/insights/{finding.finding_id}/dismiss", {})
+        assert exc.value.code == 400
+
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/acknowledge", {}
+        ) as response:
+            acknowledged = json.loads(response.read())
+        assert acknowledged["finding"]["state"] == "acknowledged"
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + f"/insights/{finding.finding_id}/acknowledge", {})
+        assert exc.value.code == 409
+
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/dismiss",
+            {"reason": "accepted tradeoff"},
+        ) as response:
+            dismissed = json.loads(response.read())
+        assert dismissed["finding"]["state"] == "dismissed"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_check_again_enqueues_without_configuration_mutation(tmp_path):
+    collector = _make_collector(tmp_path)
+    finding = _observe_provider_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/check", {}
+        ) as response:
+            assert response.status == 202
+            payload = json.loads(response.read())
+        assert payload["status"] == "queued"
+
+        con = duckdb.connect(str(collector.duckdb_path), read_only=True)
+        try:
+            jobs = con.execute(
+                "SELECT job_kind, subject_key FROM pipeline_jobs"
+            ).fetchall()
+        finally:
+            con.close()
+        assert jobs == [
+            (
+                "analyze_advisory_target",
+                "deterministic.connector_freshness:mac-mini",
+            )
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/insights/not-a-finding/check", {}),
+        ("/insights/00000000000000000000000000000000/dismiss", []),
+        ("/insights/00000000000000000000000000000000/acknowledge", {"extra": 1}),
+    ],
+)
+def test_insight_routes_reject_invalid_ids_and_json(tmp_path, path, payload):
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + path, payload)
+        assert exc.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_insight_api_failure_is_section_local(tmp_path):
+    class _FailedInsights:
+        def list_insights(self, filters):
+            raise RuntimeError("analyzer database unavailable")
+
+    collector = _make_collector(tmp_path)
+    collector.advisory_service = _FailedInsights()
+    collector.cockpit_service = CockpitService(
+        duckdb_path=collector.duckdb_path,
+        provider_usage=None,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/insights")
+        assert exc.value.code == 503
+        assert "analyzer database unavailable" not in exc.value.read().decode()
+
+        with _authed_get(base + "/cockpit/overview") as response:
+            assert json.loads(response.read())["activity"]["status"] == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_provider_refresh_loop_only_refreshes_online_hosts_once_per_interval():
+    refreshed = []
+
+    class _Registry:
+        def list_hosts(self, *, status=None):
+            assert status is None
+            return [type("Host", (), {"host_id": "mac-mini"})()]
+
+    class _ProviderUsage:
+        def refresh_host(self, host):
+            refreshed.append(host.host_id)
+
+    stop = threading.Event()
+    loop = ProviderRefreshLoop(
+        provider_usage=_ProviderUsage(),
+        registry=_Registry(),
+        shutdown_event=stop,
+        interval_seconds=300,
+    )
+
+    loop.run_once()
+    loop.run_once()
+
+    assert refreshed == ["mac-mini"]
 
 
 def test_harness_snapshot_serializes_session_dates_with_timezone(tmp_path):
@@ -1021,6 +1633,7 @@ def test_metrics_http_server_registers_remote_harness_host(tmp_path):
 
     host = HarnessRegistry(duckdb_path).get_host("nas")
     assert payload["host"]["host_id"] == "nas"
+    assert payload["content_consent"] == {"enabled": False, "epoch": 0}
     assert host is not None
     assert host.local_url == "http://192.168.1.70:7081"
     assert host.capabilities["harnesses"][0]["enabled"] is True
@@ -1288,6 +1901,163 @@ class _FakeRelay:
         return 200, '{"ok": true}\n'
 
 
+def _enable_collector_content(collector: MetricsCollector) -> None:
+    service = InsightsService(
+        collector.duckdb_path,
+        config_path=collector.duckdb_path.parent / "test-content-config.toml",
+    )
+    service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+    collector.advisory_service = service
+
+
+def test_content_consent_and_fetch_use_relay_with_exact_epoch_ack(tmp_path) -> None:
+    """Catches relay hosts bypassing central consent reconciliation."""
+
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="laptop",
+        display_name="Laptop",
+        kind="macos",
+        connection_kind="relay",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+    redacted_content = "bounded prompt"
+    content_hash = hashlib.sha256(redacted_content.encode()).hexdigest()
+    bundle_hash = hashlib.sha256(
+        json.dumps([["global-agents", content_hash]], separators=(",", ":")).encode()
+    ).hexdigest()
+
+    class _ConsentRelay(_FakeRelay):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
+            self.calls.append((host_id, method, path, body))
+            if path == "/advisory/content-consent":
+                return 200, json.dumps(body)
+            return 200, json.dumps(
+                {
+                    "bundle_hash": bundle_hash,
+                    "created_at": "2026-08-09T12:00:00+00:00",
+                    "targets": [
+                        {
+                            "target_id": "global-agents",
+                            "content_hash": content_hash,
+                            "redacted_content": redacted_content,
+                        }
+                    ],
+                }
+            )
+
+    relay = _ConsentRelay()
+    collector.relay_manager = relay
+
+    status, body = collector.consent_content_analysis({"backend": "local"})
+    consent = json.loads(body)
+    assert status == 200
+    assert consent["hosts"] == [{"host_id": "laptop", "state": "acknowledged"}]
+
+    collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+    assert [call[2] for call in relay.calls] == [
+        "/advisory/content-consent",
+        "/advisory/content-consent",
+        "/advisory/content-bundle",
+    ]
+
+
+def test_content_consent_reports_partial_and_revoke_fails_on_reachable_nack(
+    tmp_path,
+) -> None:
+    """Catches mutation endpoints claiming success after a reachable host NACK."""
+
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="laptop",
+        display_name="Laptop",
+        kind="macos",
+        connection_kind="relay",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    class _NackRelay(_FakeRelay):
+        def request(self, host_id, method, path, body, timeout_s=15):
+            return 409, '{"error":"epoch conflict"}'
+
+    collector.relay_manager = _NackRelay()
+
+    enabled_status, enabled_body = collector.consent_content_analysis(
+        {"backend": "local"}
+    )
+    revoked_status, revoked_body = collector.revoke_content_analysis({})
+
+    assert enabled_status == 207
+    assert json.loads(enabled_body)["propagation"] == "failed"
+    assert revoked_status == 503
+    assert json.loads(revoked_body)["propagation"] == "failed"
+
+
+def test_offline_registered_host_keeps_consent_and_revoke_partial(tmp_path) -> None:
+    """Catches known offline hosts disappearing from fleet consent results."""
+
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="offline-laptop",
+        display_name="Offline Laptop",
+        kind="macos",
+        connection_kind="relay",
+        status="offline",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    enabled_status, enabled_body = collector.consent_content_analysis(
+        {"backend": "local"}
+    )
+    revoked_status, revoked_body = collector.revoke_content_analysis({})
+
+    assert enabled_status == 207
+    assert json.loads(enabled_body)["hosts"] == [
+        {"host_id": "offline-laptop", "state": "disconnected"}
+    ]
+    assert revoked_status == 207
+    assert json.loads(revoked_body)["hosts"] == [
+        {"host_id": "offline-laptop", "state": "disconnected"}
+    ]
+
+
+def test_empty_registry_is_complete_local_only_content_consent(tmp_path) -> None:
+    """Defines no registered hosts as an intentional local-only deployment."""
+
+    collector = _make_collector(tmp_path)
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    enabled_status, enabled_body = collector.consent_content_analysis(
+        {"backend": "local"}
+    )
+    revoked_status, revoked_body = collector.revoke_content_analysis({})
+
+    assert enabled_status == 200
+    assert json.loads(enabled_body)["propagation"] == "complete"
+    assert json.loads(enabled_body)["hosts"] == []
+    assert revoked_status == 200
+    assert json.loads(revoked_body)["propagation"] == "complete"
+    assert json.loads(revoked_body)["hosts"] == []
+
+
 def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     collector = collector_with_hosts
     fake = _FakeRelay()
@@ -1296,6 +2066,270 @@ def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     status, body = collector._harness_request(host, "/sessions", method="GET")
     assert status == 200
     assert fake.calls == [("laptop", "GET", "/sessions", {})]
+
+
+def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
+    collector_with_hosts, caplog
+) -> None:
+    collector = collector_with_hosts
+    _enable_collector_content(collector)
+    redacted_content = "private prompt body"
+    content_hash = hashlib.sha256(redacted_content.encode("utf-8")).hexdigest()
+    bundle_hash = hashlib.sha256(
+        json.dumps(
+            [["global-agents", content_hash]],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    class _BundleRelay(_FakeRelay):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
+            self.calls.append((host_id, method, path, body))
+            self.timeouts.append(timeout_s)
+            self.max_response_bytes = max_response_bytes
+            if path == "/advisory/content-consent":
+                return 200, json.dumps(body)
+            return 200, json.dumps(
+                {
+                    "bundle_hash": bundle_hash,
+                    "created_at": "2026-08-08T12:00:00+00:00",
+                    "targets": [
+                        {
+                            "target_id": "global-agents",
+                            "content_hash": content_hash,
+                            "redacted_content": redacted_content,
+                        }
+                    ],
+                }
+            )
+
+    fake = _BundleRelay()
+    collector.relay_manager = fake
+
+    with caplog.at_level("INFO", logger="drover.metrics"):
+        payload = collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+
+    assert payload["bundle_hash"] == bundle_hash
+    assert fake.calls == [
+        (
+            "laptop",
+            "POST",
+            "/advisory/content-consent",
+            {"enabled": True, "epoch": 1},
+        ),
+        (
+            "laptop",
+            "POST",
+            "/advisory/content-bundle",
+            {"target_ids": ["global-agents"]},
+        ),
+    ]
+    assert fake.max_response_bytes == metrics._MAX_CONTENT_BUNDLE_RESPONSE_BYTES
+    assert "host=laptop" in caplog.text
+    assert "targets=1" in caplog.text
+    assert f"bundle_hash={bundle_hash}" in caplog.text
+    assert "private prompt body" not in caplog.text
+
+
+def test_fetch_advisory_content_version_uses_bounded_relay_hashes_only(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    _enable_collector_content(collector)
+    content_hash = "a" * 64
+    bundle_hash = hashlib.sha256(
+        json.dumps(
+            [["global-agents", content_hash]],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    class _VersionRelay(_FakeRelay):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
+            self.calls.append((host_id, method, path, body))
+            self.max_response_bytes = max_response_bytes
+            if path == "/advisory/content-consent":
+                return 200, json.dumps(body)
+            return 200, json.dumps(
+                {
+                    "bundle_hash": bundle_hash,
+                    "targets": [
+                        {"target_id": "global-agents", "content_hash": content_hash}
+                    ],
+                }
+            )
+
+    fake = _VersionRelay()
+    collector.relay_manager = fake
+
+    payload = collector.fetch_advisory_content_version("laptop", ["global-agents"])
+
+    assert payload == {
+        "bundle_hash": bundle_hash,
+        "targets": [{"target_id": "global-agents", "content_hash": content_hash}],
+    }
+    assert fake.calls[-1] == (
+        "laptop",
+        "POST",
+        "/advisory/content-version",
+        {"target_ids": ["global-agents"]},
+    )
+    assert fake.max_response_bytes == metrics._MAX_CONTENT_VERSION_RESPONSE_BYTES
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"bundle_hash": "a" * 64, "created_at": "not-a-time", "targets": []},
+        {
+            "bundle_hash": "a" * 64,
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "targets": [
+                {
+                    "target_id": "different-target",
+                    "content_hash": "b" * 64,
+                    "redacted_content": "content",
+                }
+            ],
+        },
+        {
+            "bundle_hash": "a" * 64,
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "targets": [
+                {
+                    "target_id": "global-agents",
+                    "content_hash": "b" * 64,
+                    "redacted_content": "content does not match its hash",
+                }
+            ],
+        },
+    ],
+)
+def test_fetch_advisory_content_bundle_rejects_malformed_host_response(
+    collector_with_hosts, payload
+) -> None:
+    collector = collector_with_hosts
+    _enable_collector_content(collector)
+
+    class _MalformedRelay(_FakeRelay):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
+            if path == "/advisory/content-consent":
+                return 200, json.dumps(body)
+            return 200, json.dumps(payload)
+
+    collector.relay_manager = _MalformedRelay()
+
+    with pytest.raises(ValueError, match="content bundle response"):
+        collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+
+
+def test_fetch_advisory_content_bundle_rejects_oversized_relay_response(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    _enable_collector_content(collector)
+
+    class _OversizedRelay(_FakeRelay):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
+            if path == "/advisory/content-consent":
+                return 200, json.dumps(body)
+            return 200, "x" * (4 * 1024 * 1024 + 1)
+
+    collector.relay_manager = _OversizedRelay()
+
+    with pytest.raises(ValueError, match="exceeds byte limit"):
+        collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
+
+
+@pytest.mark.parametrize(
+    "target_ids",
+    [[], ["global-agents", "global-agents"], ["../AGENTS.md"], ["global-agents", 1]],
+)
+def test_fetch_advisory_content_bundle_rejects_invalid_target_ids_before_transport(
+    collector_with_hosts, target_ids
+) -> None:
+    collector = collector_with_hosts
+    fake = _FakeRelay()
+    collector.relay_manager = fake
+
+    with pytest.raises(ValueError, match="target_ids"):
+        collector.fetch_advisory_content_bundle("laptop", target_ids)
+
+    assert fake.calls == []
+
+
+def test_proxy_harness_request_rejects_large_content_length_without_reading(
+    collector_with_hosts, monkeypatch
+) -> None:
+    collector = collector_with_hosts
+
+    class _Response:
+        status = 200
+
+        def getheader(self, name):
+            return str(4 * 1024 * 1024 + 1) if name == "Content-Length" else None
+
+        def read(self, amount=None):
+            raise AssertionError("oversized response body was read")
+
+    class _Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(metrics.http.client, "HTTPConnection", _Connection)
+
+    status, body = collector._proxy_harness_request(
+        "http://127.0.0.1/advisory/content-bundle",
+        method="POST",
+        payload={"target_ids": ["global-agents"]},
+        max_response_bytes=4 * 1024 * 1024,
+    )
+
+    assert status == 502
+    assert "exceeds byte limit" in body
 
 
 def test_harness_request_falls_back_to_direct_url(collector_with_hosts) -> None:

@@ -7,6 +7,7 @@ import base64
 import binascii
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import hashlib
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,7 +23,7 @@ import subprocess
 import threading
 import time
 from time import monotonic
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, unquote, urlparse
@@ -37,6 +38,8 @@ from drover.server.harness.auth import (
     executable_path_prefix,
     resolve_executable,
 )
+from drover.server.harness.content_consent import DurableContentConsent
+from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
@@ -59,6 +62,14 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
+
+if TYPE_CHECKING:
+    from drover.config import AdvisoryContentConfig
+    from drover.server.providers.codex import CodexUsageProbe
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
 
 # Used only to compute a human-readable "command" label for the registry row
 # when the caller didn't supply an explicit command -- the manager itself
@@ -95,6 +106,7 @@ _ATTACHMENT_EXTENSIONS = {
     "image/webp": "webp",
 }
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ADVISORY_BUNDLE_REQUEST_BYTES = 128 * 1024
 
 
 def save_turn_attachments(
@@ -1241,6 +1253,9 @@ class HarnessDaemonState:
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
+    provider_usage_probe: CodexUsageProbe | None = None
+    advisory_content: "AdvisoryContentConfig | None" = None
+    content_consent: DurableContentConsent | None = None
 
     def recovery_lock_for(self, session_id: str) -> threading.Lock:
         with self.recovery_locks_guard:
@@ -1303,6 +1318,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/capabilities":
             self._write_json(self.server.state.capabilities())
             return
+        if parsed.path == "/providers/usage":
+            self._provider_usage()
+            return
         if parsed.path == "/native-sessions":
             self._list_native_sessions(parsed.query)
             return
@@ -1342,6 +1360,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if auth_route and auth_route[2] == "cancel":
             self._auth_cancel(auth_route[0], auth_route[1] or "")
+            return
+        if parsed.path == "/advisory/content-bundle":
+            self._advisory_content_bundle()
+            return
+        if parsed.path == "/advisory/content-version":
+            self._advisory_content_version()
+            return
+        if parsed.path == "/advisory/content-consent":
+            self._advisory_content_consent()
             return
         if parsed.path == "/sessions":
             self._create_session()
@@ -1441,6 +1468,270 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         snapshot["host_id"] = self.server.state.host_id
         self._write_json(snapshot)
+
+    def _provider_usage(self) -> None:
+        observed_at = datetime.now(timezone.utc)
+        accounts: list[dict[str, Any]] = []
+        for detected in detect_provider_accounts(self.server.state.capabilities()):
+            if detected.provider == "openai":
+                probe = self.server.state.provider_usage_probe
+                if probe is None:
+                    from drover.server.providers.codex import CodexUsageProbe
+
+                    probe = CodexUsageProbe()
+                    self.server.state.provider_usage_probe = probe
+                snapshot = probe.read(host_id=self.server.state.host_id)
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+                continue
+            if detected.provider == "anthropic":
+                detected = _with_claude_plan_label(detected, self.server.state.auth)
+            accounts.append(_unavailable_provider_json(detected, observed_at))
+        self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
+
+    def _advisory_content_bundle(self) -> None:
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json(
+                {"error": "authentication required"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        config = self.server.state.advisory_content
+        live_consent = self.server.state.content_consent
+        enabled = (
+            live_consent.snapshot()["enabled"]
+            if live_consent is not None
+            else bool(config is not None and config.enabled)
+        )
+        if config is None or not enabled:
+            self._write_json(
+                {"error": "content analysis is disabled"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._write_json(
+                {"error": "invalid Content-Length"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if content_length > MAX_ADVISORY_BUNDLE_REQUEST_BYTES:
+            self._write_json(
+                {"error": "content bundle request exceeds byte limit"},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
+        body = self._read_json()
+        if body is None or set(body) != {"target_ids"}:
+            self._write_json(
+                {"error": "request must contain only target_ids"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        target_ids = body.get("target_ids")
+        if not _valid_content_target_ids(target_ids):
+            self._write_json(
+                {"error": "target_ids must be a non-empty list of unique IDs"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        from drover.server.advisory.content_targets import (
+            ContentTarget,
+            ContentTargetError,
+            build_content_bundle,
+        )
+
+        configured: dict[str, ContentTarget] = {}
+        for configured_path in config.targets:
+            target = ContentTarget(Path(configured_path))
+            if target.target_id in configured:
+                self._write_json(
+                    {"error": "configured advisory target IDs must be unique"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            configured[target.target_id] = target
+        if any(target_id not in configured for target_id in target_ids):
+            self._write_json(
+                {"error": "unknown advisory content target ID"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        bundle = None
+        payload = None
+        selected = [configured[target_id] for target_id in target_ids]
+        try:
+            bundle = build_content_bundle(
+                selected,
+                allowed_roots=config.allowed_roots,
+                host_id=self.server.state.host_id,
+                max_file_bytes=config.max_file_bytes,
+                max_bundle_bytes=config.max_bundle_bytes,
+            )
+            payload = {
+                "bundle_hash": bundle.bundle_hash,
+                "created_at": bundle.created_at.isoformat(),
+                "targets": [
+                    {
+                        "target_id": target.target_id,
+                        "content_hash": target.content_hash,
+                        "redacted_content": target.redacted_content,
+                    }
+                    for target in bundle.targets
+                ],
+            }
+            self._write_json(payload, headers={"Cache-Control": "no-store"})
+        except ContentTargetError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        finally:
+            # Content is intentionally scoped to this request. Explicitly sever
+            # the largest references as soon as serialization has completed.
+            selected.clear()
+            bundle = None
+            payload = None
+
+    def _advisory_content_version(self) -> None:
+        """Return only redacted target hashes behind the live consent epoch."""
+
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json(
+                {"error": "authentication required"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        config = self.server.state.advisory_content
+        live_consent = self.server.state.content_consent
+        snapshot = live_consent.snapshot() if live_consent is not None else None
+        if (
+            config is None
+            or snapshot is None
+            or not snapshot["enabled"]
+            or int(snapshot["epoch"]) <= 0
+        ):
+            self._write_json(
+                {"error": "content analysis is disabled"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._write_json(
+                {"error": "invalid Content-Length"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if content_length > MAX_ADVISORY_BUNDLE_REQUEST_BYTES:
+            self._write_json(
+                {"error": "content version request exceeds byte limit"},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
+        body = self._read_json()
+        if body is None or set(body) != {"target_ids"}:
+            self._write_json(
+                {"error": "request must contain only target_ids"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        target_ids = body.get("target_ids")
+        if not _valid_content_target_ids(target_ids):
+            self._write_json(
+                {"error": "target_ids must be a non-empty list of unique IDs"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        from drover.server.advisory.content_targets import (
+            ContentTarget,
+            ContentTargetError,
+            build_content_version,
+        )
+
+        configured: dict[str, ContentTarget] = {}
+        for configured_path in config.targets:
+            target = ContentTarget(Path(configured_path))
+            if target.target_id in configured:
+                self._write_json(
+                    {"error": "configured advisory target IDs must be unique"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            configured[target.target_id] = target
+        if any(target_id not in configured for target_id in target_ids):
+            self._write_json(
+                {"error": "unknown advisory content target ID"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        selected = [configured[target_id] for target_id in target_ids]
+        version = None
+        payload = None
+        try:
+            version = build_content_version(
+                selected,
+                allowed_roots=config.allowed_roots,
+                host_id=self.server.state.host_id,
+                max_file_bytes=config.max_file_bytes,
+                max_bundle_bytes=config.max_bundle_bytes,
+            )
+            payload = {
+                "bundle_hash": version.bundle_hash,
+                "targets": [
+                    {
+                        "target_id": target.target_id,
+                        "content_hash": target.content_hash,
+                    }
+                    for target in version.targets
+                ],
+            }
+            self._write_json(payload, headers={"Cache-Control": "no-store"})
+        except ContentTargetError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        finally:
+            selected.clear()
+            version = None
+            payload = None
+
+    def _advisory_content_consent(self) -> None:
+        # Unlike the daemon's ordinary endpoints, auth-off mode is never
+        # accepted for consent mutation: an empty token is fail-closed.
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json(
+                {"error": "authentication required"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        body = self._read_json()
+        if body is None or set(body) != {"enabled", "epoch"}:
+            self._write_json(
+                {"error": "request must contain only enabled and epoch"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        consent = self.server.state.content_consent
+        if consent is None:
+            self._write_json(
+                {"error": "content consent storage is unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            applied = consent.apply(enabled=body["enabled"], epoch=body["epoch"])
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        self._write_json(applied)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -2517,12 +2808,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def _write_json(
-        self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
+        self,
+        payload: dict[str, Any],
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self._write_cors_headers()
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -2655,6 +2952,91 @@ def reconcile_structured_sessions(state: HarnessDaemonState) -> None:
             continue
 
 
+def _with_claude_plan_label(
+    detected: DetectedProvider, auth: AuthFlowManager
+) -> DetectedProvider:
+    try:
+        status = auth.status("claude-code")
+    except (KeyError, RuntimeError):
+        return detected
+    plan_label = (
+        status.get("detail") if status.get("state") == "authenticated" else None
+    )
+    return replace(
+        detected,
+        plan_label=plan_label if isinstance(plan_label, str) and plan_label else None,
+    )
+
+
+def _detected_provider_json(detected: DetectedProvider) -> dict[str, Any]:
+    return {
+        "provider": detected.provider,
+        "account_label": detected.account_label,
+        "host_id": detected.host_id,
+        "harnesses": list(detected.harnesses),
+        "plan_label": detected.plan_label,
+        "usage_status": detected.usage_status,
+    }
+
+
+def _unavailable_provider_json(
+    detected: DetectedProvider, observed_at: datetime
+) -> dict[str, Any]:
+    payload = _detected_provider_json(detected)
+    fingerprint = json.dumps(
+        {
+            "provider": detected.provider,
+            "account_label": detected.account_label,
+            "host_id": detected.host_id,
+            "plan_label": detected.plan_label,
+            "status": "usage_unavailable",
+            "source": "harness-inventory",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        **payload,
+        "snapshot_id": str(uuid4()),
+        "dedup_key": hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
+        "status": "usage_unavailable",
+        "observed_at": observed_at.isoformat(),
+        "source": "harness-inventory",
+        "error_category": None,
+        "windows": [],
+    }
+
+
+def _provider_snapshot_json(
+    snapshot: ProviderAccountSnapshot, detected: DetectedProvider
+) -> dict[str, Any]:
+    return {
+        **_detected_provider_json(detected),
+        "account_label": snapshot.account_label,
+        "plan_label": snapshot.plan_label,
+        "status": snapshot.status,
+        "snapshot_id": snapshot.snapshot_id,
+        "dedup_key": snapshot.dedup_key,
+        "observed_at": snapshot.observed_at.isoformat(),
+        "source": snapshot.source,
+        "error_category": snapshot.error_category,
+        "windows": [_provider_window_json(window) for window in snapshot.windows],
+    }
+
+
+def _provider_window_json(window: ProviderUsageWindow) -> dict[str, Any]:
+    return {
+        "kind": window.kind,
+        "used_percent": window.used_percent,
+        "limit_value": window.limit_value,
+        "remaining_value": window.remaining_value,
+        "unit": window.unit,
+        "window_minutes": window.window_minutes,
+        "starts_at": window.starts_at.isoformat() if window.starts_at else None,
+        "resets_at": window.resets_at.isoformat() if window.resets_at else None,
+    }
+
+
 def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
     if len(parts) == 3 and parts[0] == "auth" and parts[2] in {"status", "start"}:
@@ -2669,6 +3051,23 @@ def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
     ):
         return parts[1], parts[3], "cancel"
     return None
+
+
+def _valid_content_target_ids(value: Any) -> bool:
+    if not isinstance(value, list) or not value or len(value) > 256:
+        return False
+    if any(
+        not isinstance(item, str)
+        or not item
+        or len(item) > 256
+        or item.strip() != item
+        or item in {".", ".."}
+        or "/" in item
+        or "\\" in item
+        for item in value
+    ):
+        return False
+    return len(set(value)) == len(value)
 
 
 def create_harness_server(
@@ -2750,8 +3149,30 @@ def _post_central_json(
         request.add_header("Authorization", f"Bearer {state.host_token}")
     try:
         with urlopen(request, timeout=5) as response:
-            return 200 <= response.status < 300
-    except (OSError, URLError):
+            if not 200 <= response.status < 300:
+                return False
+            body = response.read(64 * 1024 + 1)
+            if len(body) > 64 * 1024:
+                return False
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            remote_consent = (
+                payload.get("content_consent") if isinstance(payload, dict) else None
+            )
+            if remote_consent is not None:
+                if (
+                    not isinstance(remote_consent, dict)
+                    or set(remote_consent) != {"enabled", "epoch"}
+                    or state.content_consent is None
+                ):
+                    return False
+                state.content_consent.apply(
+                    enabled=remote_consent["enabled"], epoch=remote_consent["epoch"]
+                )
+            return True
+    except (OSError, URLError, ValueError):
         return False
 
 
@@ -2796,7 +3217,20 @@ def run_harnessd(
     central_url: str | None = None,
     host_token: str | None = None,
     relay: bool = False,
+    advisory_content: "AdvisoryContentConfig | None" = None,
+    content_consent_path: Path | None = None,
 ) -> None:
+    consent_path = content_consent_path or (
+        Path(duckdb_path).parent / ".harness-content-consent.json"
+    )
+    content_consent = DurableContentConsent(
+        consent_path,
+        initial_enabled=bool(
+            not central_url
+            and advisory_content is not None
+            and advisory_content.enabled
+        ),
+    )
     state = HarnessDaemonState(
         host_id=host_id,
         display_name=display_name,
@@ -2809,6 +3243,8 @@ def run_harnessd(
         central_url=central_url,
         host_token=host_token,
         relay=relay,
+        advisory_content=advisory_content,
+        content_consent=content_consent,
     )
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token

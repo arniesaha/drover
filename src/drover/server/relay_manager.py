@@ -27,6 +27,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from drover.server.harness.relay_protocol import (
+    FRAMED_RESPONSES_CAPABILITY,
+    RELAY_CONTROL_FRAME_BYTES,
     RelayProtocolError,
     close_frame,
     data_frame,
@@ -35,6 +37,7 @@ from drover.server.harness.relay_protocol import (
     req_frame,
 )
 from drover.server.harness.websocket import (
+    MAX_FRAME_BYTES,
     OPCODE_CLOSE,
     OPCODE_PING,
     OPCODE_PONG,
@@ -184,13 +187,21 @@ class RelayChannel:
 class _Connection:
     """One live relay websocket plus everything multiplexed over it."""
 
-    def __init__(self, manager: "RelayManager", host_id: str, sock: socket.socket):
+    def __init__(
+        self,
+        manager: "RelayManager",
+        host_id: str,
+        sock: socket.socket,
+        capabilities: frozenset[str],
+    ):
         self.manager = manager
         self.host_id = host_id
         self.sock = sock
+        self.capabilities = capabilities
         self.write_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.pending: dict[str, queue.Queue[Any]] = {}
+        self.response_limits: dict[str, int] = {}
         self.channels: dict[str, RelayChannel] = {}
         self.alive = threading.Event()
         self.alive.set()
@@ -227,26 +238,44 @@ class _Connection:
     def teardown(self, reason: str) -> None:
         self.manager._teardown(self, reason)
 
-    def register(self, key: str, waiter: queue.Queue[Any]) -> bool:
+    def register(
+        self,
+        key: str,
+        waiter: queue.Queue[Any],
+        *,
+        max_response_bytes: int | None = None,
+    ) -> bool:
         with self.state_lock:
             if self.dead.is_set():
                 return False
             self.pending[key] = waiter
+            if max_response_bytes is not None:
+                self.response_limits[key] = max_response_bytes
             return True
 
     def forget(self, key: str) -> None:
         with self.state_lock:
             self.pending.pop(key, None)
+            self.response_limits.pop(key, None)
 
     def resolve(self, key: str, result: Any) -> None:
         with self.state_lock:
             waiter = self.pending.pop(key, None)
+            self.response_limits.pop(key, None)
         if waiter is None:
             return
         try:
             waiter.put_nowait(result)
         except queue.Full:  # pragma: no cover - duplicate reply from spoke
             log.warning("duplicate relay reply for %s on %s", key, self.host_id)
+
+    def response_limit(self, key: str) -> int | None:
+        with self.state_lock:
+            return self.response_limits.get(key)
+
+    def response_contract(self, key: str) -> tuple[bool, int | None]:
+        with self.state_lock:
+            return key in self.pending, self.response_limits.get(key)
 
     def add_channel(self, channel: RelayChannel) -> bool:
         with self.state_lock:
@@ -273,7 +302,13 @@ class RelayManager:
 
     # -- lifecycle -----------------------------------------------------
 
-    def attach(self, host_id: str, sock: socket.socket) -> None:
+    def attach(
+        self,
+        host_id: str,
+        sock: socket.socket,
+        *,
+        capabilities: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
         """Take ownership of an already-upgraded server-role socket.
 
         Newest wins: a reconnecting spoke must never be blocked by its own
@@ -285,7 +320,7 @@ class RelayManager:
         # platforms reject it, and the watchdog is the real guarantee.
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        connection = _Connection(self, host_id, sock)
+        connection = _Connection(self, host_id, sock, frozenset(capabilities))
         with self._lock:
             previous = self._connections.get(host_id)
             self._connections[host_id] = connection
@@ -322,18 +357,31 @@ class RelayManager:
         path: str,
         body: dict[str, Any] | None,
         timeout_s: float = 15,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         deadline = time.monotonic() + timeout_s
         connection = self._live(host_id)
         if connection is None:
             return _error(f"relay host not connected: {host_id}")
+        framed = FRAMED_RESPONSES_CAPABILITY in connection.capabilities
+        if max_response_bytes is not None and not framed:
+            return _error("relay host lacks framed response capability")
         request_id = uuid.uuid4().hex
         waiter: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=1)
-        if not connection.register(request_id, waiter):
+        if not connection.register(
+            request_id, waiter, max_response_bytes=max_response_bytes
+        ):
             return _error(f"relay host not connected: {host_id}")
         try:
             connection.send(
-                req_frame(request_id, method, path, body),
+                req_frame(
+                    request_id,
+                    method,
+                    path,
+                    body,
+                    max_response_bytes=max_response_bytes,
+                    response_framing=(FRAMED_RESPONSES_CAPABILITY if framed else None),
+                ),
                 timeout_s=_remaining(deadline),
             )
         except _WriteTimeout as exc:
@@ -345,7 +393,13 @@ class RelayManager:
             self._teardown(connection, f"request send failed: {exc}")
             return _error(f"relay request failed: {exc}")
         try:
-            return waiter.get(timeout=_remaining(deadline))
+            result = waiter.get(timeout=_remaining(deadline))
+            if (
+                max_response_bytes is not None
+                and len(result[1].encode("utf-8")) > max_response_bytes
+            ):
+                return _error("relay response exceeds byte limit")
+            return result
         except queue.Empty:
             connection.forget(request_id)
             return _error(f"relay request to {host_id} timed out after {timeout_s}s")
@@ -445,7 +499,12 @@ class RelayManager:
 
     def _read_loop(self, connection: _Connection) -> None:
         while connection.alive.is_set():
-            frame = recv_frame(connection.sock)
+            control_cap = (
+                RELAY_CONTROL_FRAME_BYTES
+                if FRAMED_RESPONSES_CAPABILITY in connection.capabilities
+                else None
+            )
+            frame = recv_frame(connection.sock, max_frame_bytes=control_cap)
             # Every frame counts as proof of life, pongs included - see
             # SILENCE_TIMEOUT_S.
             connection.last_rx = time.monotonic()
@@ -459,7 +518,40 @@ class RelayManager:
             payload = json.loads(frame.payload.decode("utf-8"))
             if not isinstance(payload, dict):
                 continue
-            self._dispatch(connection, parse_frame(payload))
+            parsed = parse_frame(payload)
+            if parsed["kind"] == "res_start":
+                self._read_started_response(connection, parsed)
+            else:
+                self._dispatch(connection, parsed)
+
+    def _read_started_response(
+        self, connection: _Connection, frame: dict[str, Any]
+    ) -> None:
+        request_id = str(frame.get("id"))
+        status = frame.get("status")
+        body_bytes = frame.get("body_bytes")
+        pending, response_limit = connection.response_contract(request_id)
+        if not pending:
+            raise RelayProtocolError("framed response has no pending request")
+        limit = response_limit or MAX_FRAME_BYTES
+        if type(status) is not int:
+            raise RelayProtocolError("bounded response status must be an integer")
+        if type(body_bytes) is not int or body_bytes < 0:
+            raise RelayProtocolError("bounded response body_bytes is invalid")
+        if body_bytes > limit:
+            raise WebSocketClosed(
+                f"relay response of {body_bytes} bytes exceeds {limit}"
+            )
+        body_frame = recv_frame(connection.sock, max_frame_bytes=body_bytes)
+        connection.last_rx = time.monotonic()
+        if body_frame.opcode != OPCODE_TEXT:
+            raise RelayProtocolError("bounded response body must be a text frame")
+        if len(body_frame.payload) != body_bytes:
+            raise RelayProtocolError("bounded response body length does not match")
+        connection.resolve(
+            request_id,
+            (status, body_frame.payload.decode("utf-8")),
+        )
 
     def _pong(self, connection: _Connection, payload: bytes) -> None:
         """Answer a ping under the write lock, but never wait long for it.
@@ -481,10 +573,15 @@ class RelayManager:
     def _dispatch(self, connection: _Connection, frame: dict[str, Any]) -> None:
         kind = frame["kind"]
         if kind == "res":
+            request_id = str(frame.get("id"))
+            if connection.response_limit(request_id) is not None:
+                raise RelayProtocolError(
+                    "bounded request received a legacy relay response"
+                )
             status = frame.get("status")
             body = frame.get("body")
             connection.resolve(
-                str(frame.get("id")),
+                request_id,
                 (int(status) if isinstance(status, int) else 502, str(body or "")),
             )
         elif kind == "data":
@@ -541,6 +638,7 @@ class RelayManager:
             connection.alive.clear()
             pending = list(connection.pending.values())
             connection.pending.clear()
+            connection.response_limits.clear()
             channels = list(connection.channels.values())
             connection.channels.clear()
         # Drop the registry entry before waking anyone, so a caller that sees

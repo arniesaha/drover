@@ -8,6 +8,7 @@ defaults for any missing field so a brand-new install Just Works after
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 import os
 
 try:
@@ -34,6 +35,38 @@ def resolve_api_token_env() -> str:
 
 def default_token_file() -> Path:
     return config_home() / "api_token"
+
+
+@dataclass(frozen=True)
+class AdvisoryContentConfig:
+    """Explicit consent and bounds for content-sensitive advisory analysis."""
+
+    enabled: bool
+    backend_policy: str
+    external_consent: bool
+    targets: tuple[str, ...]
+    allowed_roots: tuple[Path, ...]
+    max_file_bytes: int
+    max_bundle_bytes: int
+    excerpt_max_chars: int
+
+    def __post_init__(self) -> None:
+        for field_name in ("enabled", "external_consent"):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"advisory_content.{field_name} must be a boolean")
+        if self.backend_policy not in {"local", "cloud"}:
+            raise ValueError("advisory_content.backend_policy must be local or cloud")
+        if self.backend_policy == "cloud" and not self.external_consent:
+            raise ValueError(
+                "advisory_content.external_consent must be true for cloud analysis"
+            )
+        for field_name in (
+            "max_file_bytes",
+            "max_bundle_bytes",
+            "excerpt_max_chars",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"advisory_content.{field_name} must be positive")
 
 
 @dataclass(frozen=True)
@@ -89,6 +122,14 @@ class DroverConfig:
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     harness_favorite_cwds: tuple[str, ...]
+    # Provider account freshness. Successful identical observations advance
+    # this fetch clock without duplicating immutable quota snapshots.
+    provider_freshness_threshold_seconds: float
+    # Deterministic advisory checks. Content/model analysis remains separately
+    # consented and is not enabled by these operational scheduler settings.
+    advisory_full_review_interval_seconds: float
+    advisory_poll_interval_seconds: float
+    advisory_content: AdvisoryContentConfig
 
 
 _DEFAULTS = {
@@ -150,6 +191,23 @@ _DEFAULTS = {
     "harness": {
         "favorite_cwds": [],
     },
+    "provider": {
+        "freshness_threshold_seconds": 600.0,
+    },
+    "advisory": {
+        "full_review_interval_seconds": 86400.0,
+        "poll_interval_seconds": 5.0,
+    },
+    "advisory_content": {
+        "enabled": False,
+        "backend_policy": "local",
+        "external_consent": False,
+        "targets": [],
+        "allowed_roots": [],
+        "max_file_bytes": 131072,
+        "max_bundle_bytes": 524288,
+        "excerpt_max_chars": 320,
+    },
 }
 
 
@@ -165,6 +223,17 @@ def _from_dict(d: dict) -> DroverConfig:
     e = d["embeddings"]
     r = d["redis_shadow"]
     j = d["redis_jobs"]
+    content = d["advisory_content"]
+    provider_freshness_threshold = d["provider"]["freshness_threshold_seconds"]
+    if (
+        type(provider_freshness_threshold) not in (int, float)
+        or not math.isfinite(provider_freshness_threshold)
+        or provider_freshness_threshold <= 0
+    ):
+        raise ValueError(
+            "provider.freshness_threshold_seconds must be a finite positive number"
+        )
+    provider_freshness_threshold_seconds = float(provider_freshness_threshold)
     return DroverConfig(
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
@@ -207,6 +276,21 @@ def _from_dict(d: dict) -> DroverConfig:
         auth_api_token=d["auth"]["api_token"],
         harness_favorite_cwds=tuple(
             str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
+        ),
+        provider_freshness_threshold_seconds=provider_freshness_threshold_seconds,
+        advisory_full_review_interval_seconds=float(
+            d["advisory"]["full_review_interval_seconds"]
+        ),
+        advisory_poll_interval_seconds=float(d["advisory"]["poll_interval_seconds"]),
+        advisory_content=AdvisoryContentConfig(
+            enabled=content["enabled"],
+            backend_policy=str(content["backend_policy"]),
+            external_consent=content["external_consent"],
+            targets=tuple(str(target) for target in content["targets"]),
+            allowed_roots=tuple(Path(root) for root in content["allowed_roots"]),
+            max_file_bytes=int(content["max_file_bytes"]),
+            max_bundle_bytes=int(content["max_bundle_bytes"]),
+            excerpt_max_chars=int(content["excerpt_max_chars"]),
         ),
     )
 

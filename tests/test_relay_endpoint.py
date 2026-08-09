@@ -62,7 +62,9 @@ def metrics_server(tmp_path):
         server.server_close()
 
 
-def _connect_and_hello(metrics_server, host_id: str) -> socket.socket:
+def _connect_and_hello(
+    metrics_server, host_id: str, *, capabilities: list[str] | None = None
+) -> socket.socket:
     host, port, token = metrics_server.host, metrics_server.port, metrics_server.token
     sock = socket.create_connection((host, port), timeout=5)
     client_handshake(
@@ -71,7 +73,7 @@ def _connect_and_hello(metrics_server, host_id: str) -> socket.socket:
         path="/harness/relay",
         headers={"Authorization": f"Bearer {token}"},
     )
-    client_send_json(sock, hello_frame(host_id))
+    client_send_json(sock, hello_frame(host_id, capabilities=capabilities))
     return sock
 
 
@@ -119,6 +121,51 @@ def test_relay_upgrade_registers_live_host(metrics_server):
         assert not thread.is_alive()
         assert result["status"] == 200
         assert json.loads(result["body"]) == {"sessions": []}
+    finally:
+        sock.close()
+
+
+def test_relay_upgrade_negotiates_framed_response_capability(metrics_server):
+    sock = _connect_and_hello(
+        metrics_server,
+        "framed-laptop",
+        capabilities=["framed_responses_v1"],
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if metrics_server.collector.relay_manager.is_live("framed-laptop"):
+            break
+        time.sleep(0.05)
+
+    result: dict[str, object] = {}
+
+    def issue_bounded_request() -> None:
+        result["value"] = metrics_server.collector.relay_manager.request(
+            "framed-laptop",
+            "POST",
+            "/advisory/content-bundle",
+            {"target_ids": ["global-agents"]},
+            timeout_s=5,
+            max_response_bytes=4096,
+        )
+
+    thread = threading.Thread(target=issue_bounded_request, daemon=True)
+    thread.start()
+    try:
+        frame = _spoke_recv(sock)
+        assert frame["response_framing"] == "framed_responses_v1"
+        client_send_json(
+            sock,
+            {
+                "kind": "res_start",
+                "id": frame["id"],
+                "status": 200,
+                "body_bytes": 2,
+            },
+        )
+        client_send_frame(sock, 0x1, b"{}")
+        thread.join(timeout=5)
+        assert result["value"] == (200, "{}")
     finally:
         sock.close()
 

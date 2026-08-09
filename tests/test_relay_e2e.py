@@ -29,7 +29,10 @@ from typing import Any
 
 import pytest
 
+from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
+from drover.server.advisory.service import InsightsService
+from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.daemon import (
     HarnessDaemonState,
     HarnessPreset,
@@ -153,6 +156,9 @@ def relay_env(tmp_path):
         incoming_dir=tmp_path / "hub" / "incoming",
         summarizer_report={},
     )
+    hub_collector.advisory_service = InsightsService(
+        hub_duckdb_path, config_path=tmp_path / "hub" / "config.toml"
+    )
     hub_collector.api_token = TOKEN
     hub_server = start_metrics_server(
         host="127.0.0.1",
@@ -177,6 +183,8 @@ def relay_env(tmp_path):
             description="inert stdin-echo harness for the relay e2e test",
         ),
     }
+    advisory_target = tmp_path / "harnessd" / "AGENTS.md"
+    advisory_target.write_text("Use the deployment skill.\n", encoding="utf-8")
     harnessd_state = HarnessDaemonState(
         host_id=HOST_ID,
         display_name="Laptop",
@@ -189,6 +197,19 @@ def relay_env(tmp_path):
         api_token=TOKEN,
         relay=True,
         worktrees_dir=tmp_path / "harnessd" / "worktrees",
+        advisory_content=AdvisoryContentConfig(
+            enabled=True,
+            backend_policy="local",
+            external_consent=False,
+            targets=(str(advisory_target),),
+            allowed_roots=(advisory_target.parent,),
+            max_file_bytes=1024,
+            max_bundle_bytes=2048,
+            excerpt_max_chars=320,
+        ),
+        content_consent=DurableContentConsent(
+            tmp_path / "harnessd" / "content-consent.json"
+        ),
     )
     register_daemon_host(harnessd_state)
     harnessd_server = create_harness_server(
@@ -354,3 +375,41 @@ def test_full_session_lifecycle_over_relay(relay_env, tmp_path):
             break
         time.sleep(0.5)
     assert offline, "host never flipped offline after the relay socket died"
+
+
+def test_live_content_consent_and_revoke_round_trip_over_real_relay(relay_env):
+    """Consent changes reach an already-running relay daemon without restart."""
+
+    env = relay_env
+    status, consent = _hub_post(
+        env, "/insights/content-analysis/consent", {"backend": "local"}
+    )
+    assert status == 200, consent
+    assert consent["propagation"] == "complete"
+    assert env.harnessd_state.content_consent.snapshot() == {
+        "enabled": True,
+        "epoch": consent["consent_epoch"],
+    }
+    bundle = env.hub_collector.fetch_advisory_content_bundle(HOST_ID, ["AGENTS.md"])
+    assert bundle["targets"][0]["target_id"] == "AGENTS.md"
+    version = env.hub_collector.fetch_advisory_content_version(HOST_ID, ["AGENTS.md"])
+    assert version == {
+        "bundle_hash": bundle["bundle_hash"],
+        "targets": [
+            {
+                "target_id": "AGENTS.md",
+                "content_hash": bundle["targets"][0]["content_hash"],
+            }
+        ],
+    }
+
+    status, revoked = _hub_post(env, "/insights/content-analysis/revoke", {})
+    assert status == 200, revoked
+    assert env.harnessd_state.content_consent.snapshot() == {
+        "enabled": False,
+        "epoch": revoked["consent_epoch"],
+    }
+    with pytest.raises(RuntimeError, match="disabled"):
+        env.hub_collector.fetch_advisory_content_bundle(HOST_ID, ["AGENTS.md"])
+    with pytest.raises(RuntimeError, match="disabled"):
+        env.hub_collector.fetch_advisory_content_version(HOST_ID, ["AGENTS.md"])

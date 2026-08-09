@@ -189,3 +189,81 @@ def test_loads_summarizer_launchd_overrides(tmp_path):
     cfg = load_config(cfg_file)
     assert cfg.summarizer_local_ollama_launchd_label == "com.custom.ollama"
     assert cfg.summarizer_local_ollama_launchd_plist == "/tmp/com.custom.ollama.plist"
+
+
+def test_content_analysis_defaults_to_disabled_and_local():
+    cfg = default_config().advisory_content
+
+    assert cfg.enabled is False
+    assert cfg.backend_policy == "local"
+    assert cfg.external_consent is False
+    assert cfg.targets == ()
+    assert cfg.allowed_roots == ()
+    assert cfg.max_file_bytes == 131072
+    assert cfg.max_bundle_bytes == 524288
+    assert cfg.excerpt_max_chars == 320
+
+
+def test_loads_explicit_local_content_analysis_configuration(tmp_path):
+    cfg_file = tmp_path / "content.toml"
+    cfg_file.write_text(
+        "[advisory_content]\n"
+        "enabled = true\n"
+        "backend_policy = 'local'\n"
+        "external_consent = false\n"
+        "targets = ['global-agents', 'codex-skill']\n"
+        "allowed_roots = ['/srv/prompts', '/srv/skills']\n"
+        "max_file_bytes = 4096\n"
+        "max_bundle_bytes = 8192\n"
+        "excerpt_max_chars = 160\n"
+    )
+
+    cfg = load_config(cfg_file).advisory_content
+
+    assert cfg.enabled is True
+    assert cfg.backend_policy == "local"
+    assert cfg.external_consent is False
+    assert cfg.targets == ("global-agents", "codex-skill")
+    assert cfg.allowed_roots == (Path("/srv/prompts"), Path("/srv/skills"))
+    assert cfg.max_file_bytes == 4096
+    assert cfg.max_bundle_bytes == 8192
+    assert cfg.excerpt_max_chars == 160
+
+
+def test_cloud_content_analysis_requires_separate_external_consent(tmp_path):
+    cfg_file = tmp_path / "content.toml"
+    cfg_file.write_text(
+        "[advisory_content]\n"
+        "enabled = true\n"
+        "backend_policy = 'cloud'\n"
+        "external_consent = false\n"
+    )
+
+    with pytest.raises(ValueError, match="external_consent"):
+        load_config(cfg_file)
+
+
+@pytest.mark.parametrize("field", ["enabled", "external_consent"])
+def test_content_analysis_rejects_string_booleans(tmp_path, field):
+    cfg_file = tmp_path / "content.toml"
+    cfg_file.write_text(f"[advisory_content]\n{field} = 'false'\n")
+
+    with pytest.raises(ValueError, match=field):
+        load_config(cfg_file)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("backend_policy", "'hybrid'"),
+        ("max_file_bytes", "0"),
+        ("max_bundle_bytes", "-1"),
+        ("excerpt_max_chars", "0"),
+    ],
+)
+def test_content_analysis_rejects_unsafe_configuration(tmp_path, field, value):
+    cfg_file = tmp_path / "content.toml"
+    cfg_file.write_text(f"[advisory_content]\n{field} = {value}\n")
+
+    with pytest.raises(ValueError, match=field):
+        load_config(cfg_file)

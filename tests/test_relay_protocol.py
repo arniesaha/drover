@@ -10,6 +10,7 @@ from drover.server.harness.relay_protocol import (
     opened_frame,
     parse_frame,
     req_frame,
+    res_start_frame,
     res_frame,
 )
 
@@ -26,6 +27,44 @@ def test_req_res_round_trip() -> None:
     res = res_frame("abc", 200, '{"session_id": "s1"}\n')
     assert res["status"] == 200
     assert res["body"] == '{"session_id": "s1"}\n'
+
+
+def test_req_frame_carries_optional_response_bound() -> None:
+    assert (
+        req_frame(
+            "abc",
+            "POST",
+            "/advisory/content-bundle",
+            {"target_ids": ["global-agents"]},
+            max_response_bytes=4096,
+        )["max_response_bytes"]
+        == 4096
+    )
+
+
+def test_res_start_frame_declares_request_identity_and_body_size() -> None:
+    assert parse_frame(res_start_frame("abc", 200, 4096)) == {
+        "kind": "res_start",
+        "id": "abc",
+        "status": 200,
+        "body_bytes": 4096,
+    }
+
+
+def test_hello_and_request_negotiate_framed_responses() -> None:
+    assert hello_frame("laptop", capabilities=["framed_responses_v1"])[
+        "capabilities"
+    ] == ["framed_responses_v1"]
+    assert (
+        req_frame(
+            "abc",
+            "GET",
+            "/sessions",
+            None,
+            response_framing="framed_responses_v1",
+        )["response_framing"]
+        == "framed_responses_v1"
+    )
 
 
 def test_channel_frames() -> None:
