@@ -20,6 +20,8 @@ from drover.server.advisory.types import (
 
 MODEL_ANALYZER_ID = "model.configuration"
 MAX_MODEL_FINDINGS = 50
+MAX_MODEL_RESPONSE_BYTES = 262_144
+MAX_RULE_ID_CHARS = 128
 _TOP_LEVEL_FIELDS = {"findings"}
 _FINDING_FIELDS = {
     "rule_id",
@@ -190,6 +192,10 @@ class ModelConfigurationAnalyzer:
     def _parse(self, raw: str, bundle: ContentBundle) -> list[FindingCandidate]:
         if not isinstance(raw, str):
             raise ModelFindingError("analysis response must be a JSON object")
+        if len(raw) > MAX_MODEL_RESPONSE_BYTES:
+            raise ModelFindingError("analysis response exceeds byte limit")
+        if len(raw.encode("utf-8")) > MAX_MODEL_RESPONSE_BYTES:
+            raise ModelFindingError("analysis response exceeds byte limit")
         try:
             payload = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -252,7 +258,9 @@ class ModelConfigurationAnalyzer:
         try:
             return FindingCandidate(
                 analyzer_id=self.analyzer_id,
-                rule_id=_required_string(item["rule_id"], "rule_id"),
+                rule_id=_required_bounded_string(
+                    item["rule_id"], "rule_id", MAX_RULE_ID_CHARS
+                ),
                 target_type="configuration_target",
                 target_id=f"{bundle.host_id}/{target_id}",
                 analyzer_class=AnalyzerClass.MODEL,
@@ -276,6 +284,8 @@ class ModelConfigurationAnalyzer:
                 ),
                 content_hash=target.content_hash,
             )
+        except ModelFindingError:
+            raise
         except (TypeError, ValueError) as exc:
             raise ModelFindingError(
                 "analysis finding violates bounded contract"
@@ -286,6 +296,13 @@ def _required_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ModelFindingError(f"analysis finding {field_name} is required")
     return value.strip()
+
+
+def _required_bounded_string(value: object, field_name: str, max_chars: int) -> str:
+    result = _required_string(value, field_name)
+    if len(result) > max_chars:
+        raise ModelFindingError(f"analysis finding {field_name} exceeds limit")
+    return result
 
 
 __all__ = [

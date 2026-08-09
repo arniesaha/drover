@@ -56,6 +56,87 @@ class ContentBundle:
             raise ValueError("created_at must be timezone-aware")
 
 
+def validate_content_bundle(
+    bundle: ContentBundle,
+    *,
+    host_id: str,
+    requested_ids: Sequence[str],
+) -> ContentBundle:
+    """Validate identity and hashes before an ephemeral bundle reaches a model."""
+
+    if not isinstance(bundle, ContentBundle):
+        raise ValueError("content bundle fetcher must return a validated ContentBundle")
+    if bundle.host_id != host_id:
+        raise ValueError("content bundle host does not match request")
+    returned_ids = tuple(target.target_id for target in bundle.targets)
+    if returned_ids != tuple(requested_ids):
+        raise ValueError("content bundle target IDs do not match request")
+    hash_pairs: list[tuple[str, str]] = []
+    for target in bundle.targets:
+        computed = hashlib.sha256(target.redacted_content.encode("utf-8")).hexdigest()
+        if target.content_hash != computed:
+            raise ValueError("content bundle target hash does not match content")
+        hash_pairs.append((target.target_id, target.content_hash))
+    computed_bundle_hash = hashlib.sha256(
+        json.dumps(hash_pairs, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if bundle.bundle_hash != computed_bundle_hash:
+        raise ValueError("content bundle hash does not match target hashes")
+    return bundle
+
+
+def content_bundle_from_payload(
+    payload: object,
+    *,
+    host_id: str,
+    requested_ids: Sequence[str],
+) -> ContentBundle:
+    """Strictly parse the authenticated transport payload into a bundle."""
+
+    if not isinstance(payload, dict) or set(payload) != {
+        "bundle_hash",
+        "created_at",
+        "targets",
+    }:
+        raise ValueError("content bundle response has invalid fields")
+    try:
+        created_at = datetime.fromisoformat(payload["created_at"])
+        raw_targets = payload["targets"]
+        if not isinstance(raw_targets, list):
+            raise TypeError
+        targets: list[BundledTarget] = []
+        for item in raw_targets:
+            if not isinstance(item, dict) or set(item) != {
+                "target_id",
+                "content_hash",
+                "redacted_content",
+            }:
+                raise TypeError
+            if not all(
+                isinstance(item[name], str)
+                for name in ("target_id", "content_hash", "redacted_content")
+            ):
+                raise TypeError
+            targets.append(
+                BundledTarget(
+                    target_id=item["target_id"],
+                    content_hash=item["content_hash"],
+                    redacted_content=item["redacted_content"],
+                )
+            )
+        bundle = ContentBundle(
+            host_id=host_id,
+            created_at=created_at,
+            targets=tuple(targets),
+            bundle_hash=payload["bundle_hash"],
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("content bundle response is invalid") from None
+    return validate_content_bundle(bundle, host_id=host_id, requested_ids=requested_ids)
+
+
 def build_content_bundle(
     targets: Iterable[ContentTarget],
     *,

@@ -14,13 +14,14 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import click
 import duckdb
 
 from drover.agent_aliases import canonicalize
 from drover.config import (
+    AdvisoryContentConfig,
     DroverConfig,
     default_config,
     default_config_path,
@@ -48,8 +49,11 @@ from drover.server.metrics import (
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.content_targets import content_bundle_from_payload
+from drover.server.advisory.model_analyzer import build_configured_analysis_backend
 from drover.server.advisory.worker import (
     AdvisoryWorker,
+    ContentAnalysisWorker,
     load_operational_snapshot,
     operational_analyzers,
 )
@@ -97,6 +101,36 @@ def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
     """Return whether starting summarizer-like workers can make progress."""
     return (backend_cfg.allows_anthropic and backend_cfg.has_anthropic_creds) or (
         backend_cfg.allows_local_backend and backend_cfg.has_local_backend
+    )
+
+
+def _create_content_analysis_worker(
+    *,
+    cfg: DroverConfig,
+    metrics_collector: MetricsCollector,
+    backend_config: SummarizerBackendConfig,
+    consent_reader: Callable[[], AdvisoryContentConfig],
+) -> ContentAnalysisWorker:
+    """Compose the content worker from production routing and backend policy."""
+
+    def _fetch(host_id: str, target_ids: tuple[str, ...]):
+        payload = metrics_collector.fetch_advisory_content_bundle(
+            host_id, list(target_ids)
+        )
+        return content_bundle_from_payload(
+            payload, host_id=host_id, requested_ids=target_ids
+        )
+
+    return ContentAnalysisWorker(
+        consent_reader=consent_reader,
+        bundle_fetcher=_fetch,
+        backend_factory=lambda content_cfg: build_configured_analysis_backend(
+            config=backend_config,
+            backend_policy=content_cfg.backend_policy,
+            external_consent=content_cfg.external_consent,
+        ),
+        duckdb_path=cfg.duckdb_path,
+        repository=AdvisoryRepository(cfg.duckdb_path),
     )
 
 
@@ -1355,6 +1389,7 @@ def run(
             mcp_thread = None
 
     metrics_server = None
+    metrics_collector: MetricsCollector | None = None
     provider_refresh: ProviderRefreshLoop | None = None
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
@@ -1417,6 +1452,53 @@ def run(
         except Exception:  # noqa: BLE001
             log.exception("metrics server failed to start; continuing without it")
             metrics_server = None
+
+    content_advisory_worker: ContentAnalysisWorker | None = None
+    if cfg.advisory_content.enabled:
+        try:
+            if metrics_collector is None:
+                auth = load_auth(cfg)
+                metrics_collector = MetricsCollector(
+                    duckdb_path=cfg.duckdb_path,
+                    incoming_dir=cfg.incoming_dir,
+                    summarizer_report={},
+                    job_streams=job_streams,
+                    api_token=auth.api_token if auth.enabled else "",
+                    favorite_cwds=cfg.harness_favorite_cwds,
+                )
+            content_backend_cfg = SummarizerBackendConfig.from_runtime(
+                api_model=cfg.summarizer_api_model,
+                backend_policy=cfg.summarizer_backend_policy,
+                local_model=cfg.summarizer_local_model,
+                local_ollama_url=cfg.summarizer_local_ollama_url or None,
+                gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
+                gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
+                wake_timeout_s=cfg.summarizer_wake_timeout_s,
+            )
+            config_path = (
+                Path(ctx.obj["config_path"])
+                if ctx.obj["config_path"]
+                else _DEFAULT_CONFIG_PATH
+            )
+            content_advisory_worker = _create_content_analysis_worker(
+                cfg=cfg,
+                metrics_collector=metrics_collector,
+                backend_config=content_backend_cfg,
+                consent_reader=lambda: load_config(config_path).advisory_content,
+            )
+            content_advisory_worker.start(
+                shutdown_event=stop,
+                poll_interval_seconds=cfg.advisory_poll_interval_seconds,
+            )
+            log.info(
+                "content advisory worker ready (policy=%s)",
+                cfg.advisory_content.backend_policy,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "content advisory worker failed to start; continuing without it"
+            )
+            content_advisory_worker = None
 
     summarizer: SummarizerWorker | None = None
     if not no_summarizer:
@@ -1542,6 +1624,8 @@ def run(
     try:
         stop.wait()
     finally:
+        if content_advisory_worker is not None:
+            content_advisory_worker.join(timeout=10.0)
         if advisory_worker is not None:
             advisory_worker.join(timeout=10.0)
         if briefs is not None:

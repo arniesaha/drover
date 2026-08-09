@@ -138,6 +138,20 @@ def test_model_analyzer_bounds_excerpt(bundle: ContentBundle) -> None:
         ModelConfigurationAnalyzer(backend, excerpt_max_chars=32).analyze(bundle)
 
 
+def test_model_analyzer_rejects_oversized_raw_response(bundle: ContentBundle) -> None:
+    backend = FakeBackend(" " * 262_145)
+
+    with pytest.raises(ModelFindingError, match="response exceeds"):
+        ModelConfigurationAnalyzer(backend).analyze(bundle)
+
+
+def test_model_analyzer_bounds_rule_id(bundle: ContentBundle) -> None:
+    backend = FakeBackend(_response(rule_id="r" * 129))
+
+    with pytest.raises(ModelFindingError, match="rule_id"):
+        ModelConfigurationAnalyzer(backend).analyze(bundle)
+
+
 def test_backend_failure_does_not_echo_request_or_configuration_content(
     bundle: ContentBundle,
 ) -> None:
