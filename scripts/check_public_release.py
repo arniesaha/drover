@@ -67,6 +67,10 @@ CREDENTIAL_PATTERN = re.compile(
     r"(?P<separator>\s*[:=]\s*)"
     r"(?P<value>\"[^\"\r\n]+\"|'[^'\r\n]+')"
 )
+LEGACY_POSITIONING_PATTERN = re.compile(
+    r"\bformerly\b[^\r\n]{0,80}\bNexus\b",
+    re.IGNORECASE,
+)
 
 # Only the named rule is suppressed. Other findings in an allowlisted file still fail.
 RULE_ALLOWLIST = {
@@ -124,6 +128,20 @@ def _is_release_facing(path: Path) -> bool:
     )
 
 
+def _is_public_prose_path(path: Path) -> bool:
+    parts = path.parts
+    normalized = path.as_posix()
+    if path.suffix.lower() != ".md":
+        return False
+    if "tests" in parts or "fixtures" in parts or "snapshots" in parts:
+        return False
+    if "/src/drover/prompts/" in f"/{normalized.lstrip('/')}":
+        return False
+    if path.name.lower() == "readme.md":
+        return True
+    return "docs" in parts or "skills" in parts
+
+
 def check_paths(paths: Sequence[Path]) -> list[Finding]:
     findings: list[Finding] = []
     for path in paths:
@@ -174,6 +192,26 @@ def check_paths(paths: Sequence[Path]) -> list[Finding]:
                         excerpt=_redact_credential(credential),
                     )
                 )
+
+            if _is_public_prose_path(path):
+                if "—" in line:
+                    findings.append(
+                        Finding(
+                            path=str(path),
+                            line=line_number,
+                            rule="public-em-dash",
+                            excerpt=line.strip(),
+                        )
+                    )
+                if LEGACY_POSITIONING_PATTERN.search(line):
+                    findings.append(
+                        Finding(
+                            path=str(path),
+                            line=line_number,
+                            rule="legacy-positioning-copy",
+                            excerpt=line.strip(),
+                        )
+                    )
 
             for rule in RULES:
                 if rule.name in ENVIRONMENT_RULES and not _is_release_facing(path):
