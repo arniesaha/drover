@@ -10,8 +10,9 @@ control. It is not a multi-tenant service.
 - A private Tailscale network whose members you control
 
 Tailscale Funnel and other public-internet exposure are not supported. The
-relay protocol can carry powerful session and terminal operations, and v0.1
-does not bind individual hosts to individual credentials.
+relay protocol forwards requests that create and control agent sessions and
+carries bidirectional terminal streams. Drover v0.1 does not bind individual
+hosts to individual credentials.
 
 ## Authentication
 

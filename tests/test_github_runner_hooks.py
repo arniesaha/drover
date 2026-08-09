@@ -74,14 +74,14 @@ def test_pre_job_rejects_untrusted_metadata(
 
 
 def test_pre_job_accepts_owner_workflow_dispatch(tmp_path: Path) -> None:
-    payload = push_payload() | {"ref": "main"}
+    payload = push_payload() | {"ref": "refs/heads/main"}
     env = base_env(tmp_path, payload)
     env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
     PRE_JOB.validate_job(env, payload)
 
 
 def test_pre_job_rejects_dispatch_by_another_actor(tmp_path: Path) -> None:
-    payload = push_payload() | {"ref": "main"}
+    payload = push_payload() | {"ref": "refs/heads/main"}
     env = base_env(tmp_path, payload)
     env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
     env["GITHUB_ACTOR"] = "attacker"
@@ -95,9 +95,11 @@ def test_pre_job_rejects_dispatch_by_another_actor(tmp_path: Path) -> None:
         (push_payload() | {"repository": {"full_name": "attacker/fork"}}, "push"),
         (push_payload() | {"ref": "refs/heads/feature"}, "push"),
         (
-            push_payload() | {"ref": "main", "sender": {"login": "attacker"}},
+            push_payload()
+            | {"ref": "refs/heads/main", "sender": {"login": "attacker"}},
             "workflow_dispatch",
         ),
+        (push_payload() | {"ref": "main"}, "workflow_dispatch"),
     ],
 )
 def test_pre_job_rejects_mismatched_payload(

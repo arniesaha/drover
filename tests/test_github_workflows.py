@@ -42,3 +42,44 @@ def test_trusted_workflow_has_no_pull_request_trigger() -> None:
     job_names = [job["name"] for job in workflow["jobs"].values()]
     assert len(job_names) == len(set(job_names))
     assert set(job_names) == {"Python on trusted Mac", "iOS on trusted Mac"}
+
+
+def test_trusted_python_uses_bounded_host_interpreter_venv() -> None:
+    workflow = load_workflow("trusted-mac.yml")
+    steps = workflow["jobs"]["python"]["steps"]
+    setup = next(step for step in steps if step.get("name") == "Set up Python")
+
+    assert "uses" not in setup
+    assert setup["run"] == (
+        '"$HOME/.local/bin/python3.11" -m venv "$RUNNER_TEMP/python-venv"\n'
+        'echo "$RUNNER_TEMP/python-venv/bin" >> "$GITHUB_PATH"\n'
+        '"$RUNNER_TEMP/python-venv/bin/python" --version\n'
+    )
+
+
+def test_trusted_python_runs_each_test_module_in_a_fresh_process() -> None:
+    workflow = load_workflow("trusted-mac.yml")
+    steps = workflow["jobs"]["python"]["steps"]
+    test_step = next(
+        step for step in steps if step.get("name") == "Run tests with pytest"
+    )
+
+    assert test_step["run"] == (
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "import subprocess\n"
+        "import sys\n"
+        "\n"
+        'test_files = sorted(Path("tests").rglob("test_*.py"))\n'
+        "if not test_files:\n"
+        '    raise SystemExit("no Python test modules found")\n'
+        "for test_file in test_files:\n"
+        '    print(f"::group::{test_file}", flush=True)\n'
+        "    try:\n"
+        "        subprocess.run(\n"
+        '            [sys.executable, "-m", "pytest", str(test_file)], check=True\n'
+        "        )\n"
+        "    finally:\n"
+        '        print("::endgroup::", flush=True)\n'
+        "PY\n"
+    )
