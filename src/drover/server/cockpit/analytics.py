@@ -177,7 +177,54 @@ def activity_analytics(
     *,
     cursor_codec: AnalyticsCursorCodec | None = None,
 ) -> ActivityAnalytics:
-    """Return observed metrics without reconciling them to provider quota."""
+    """Return observed metrics from one DuckDB MVCC snapshot.
+
+    When the caller already owns a transaction, that transaction defines the
+    snapshot and remains caller-owned. Otherwise this function begins and ends
+    a read transaction, rolling it back on every failure path.
+    """
+    owns_transaction = not _connection_has_active_transaction(con)
+    if owns_transaction:
+        con.execute("BEGIN TRANSACTION")
+
+    try:
+        result = _activity_analytics_in_snapshot(
+            con, filters, cursor_codec=cursor_codec
+        )
+        if owns_transaction:
+            con.execute("COMMIT")
+        return result
+    except BaseException:
+        if owns_transaction:
+            try:
+                con.execute("ROLLBACK")
+            except duckdb.TransactionException:
+                # A failed COMMIT can already have closed the transaction. The
+                # original exception remains the actionable failure.
+                pass
+        raise
+
+
+def _connection_has_active_transaction(con: duckdb.DuckDBPyConnection) -> bool:
+    """Detect a caller transaction without issuing a destructive nested BEGIN.
+
+    DuckDB aborts an existing transaction when a nested BEGIN is attempted.
+    Transaction ids advance between autocommit statements but stay fixed inside
+    an explicit transaction, so two bounded scalar reads provide a safe probe.
+    """
+    first = con.execute("SELECT current_transaction_id()").fetchone()
+    second = con.execute("SELECT current_transaction_id()").fetchone()
+    assert first is not None and second is not None
+    return first[0] == second[0]
+
+
+def _activity_analytics_in_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    *,
+    cursor_codec: AnalyticsCursorCodec | None = None,
+) -> ActivityAnalytics:
+    """Run every analytics statement inside the caller's current snapshot."""
     codec = cursor_codec or _DEFAULT_CURSOR_CODEC
     snapshot_at, cursor_snapshot = _cursor_snapshot_context(codec, filters)
     base_sql, params = _session_facts_sql(filters, snapshot_at)

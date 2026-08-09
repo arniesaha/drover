@@ -15,6 +15,10 @@ struct AnalyticsView: View {
             LazyVStack(alignment: .leading, spacing: 16) {
                 filterStrip
 
+                if let notice = store.analyticsRefreshNotice {
+                    AnalyticsRefreshBanner(message: notice)
+                }
+
                 if let error = store.analyticsError {
                     Label(error, systemImage: "exclamationmark.circle")
                         .droverText(.nested)
@@ -267,6 +271,33 @@ struct AnalyticsView: View {
     private var providerValues: [String] {
         Array(Set((store.analytics?.providerCapacity.data ?? []).map(\.provider))).sorted()
     }
+}
+
+struct AnalyticsRefreshBanner: View {
+    let message: String
+
+    var body: some View {
+        Label(message, systemImage: "arrow.clockwise.circle")
+            .droverText(.nested)
+            .foregroundStyle(DroverColor.text)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier(AnalyticsRefreshBannerPresentation.identifier)
+    }
+
+    private var presentation: AnalyticsRefreshBannerPresentation {
+        AnalyticsRefreshBannerPresentation(message: message)
+    }
+}
+
+struct AnalyticsRefreshBannerPresentation: Equatable {
+    static let identifier = "analytics-refresh-notice"
+    let message: String
+    var accessibilityLabel: String { message }
 }
 
 private struct AnalyticsFilterMenu: View {

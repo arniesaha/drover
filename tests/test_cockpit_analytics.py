@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import threading
 
 import duckdb
 import pytest
@@ -27,8 +28,10 @@ from drover.server.cockpit.analytics import (
 from drover.server.cockpit.service import CockpitService
 
 
-def _analytics_connection() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(":memory:")
+def _analytics_connection(
+    database: str = ":memory:",
+) -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(database)
     con.execute("""
         CREATE TABLE spans_enriched (
           span_id VARCHAR,
@@ -69,6 +72,10 @@ def _analytics_connection() -> duckdb.DuckDBPyConnection:
         );
         """)
     return con
+
+
+def _analytics_file_connection(path: Path) -> duckdb.DuckDBPyConnection:
+    return _analytics_connection(str(path))
 
 
 def _insert_session(
@@ -523,6 +530,123 @@ def test_analytics_rejects_cursors_from_different_snapshots():
                 ),
                 cursor_codec=codec,
             )
+    finally:
+        con.close()
+
+
+def test_initial_analytics_response_uses_one_database_snapshot(tmp_path):
+    db_path = tmp_path / "analytics.duckdb"
+    con = _analytics_file_connection(db_path)
+    for index in range(3):
+        _insert_session(
+            con,
+            session_id=f"snapshot-{index}",
+            project=f"acme/project-{index}",
+            host=f"host-{index}",
+            harness=f"harness-{index}",
+            tokens=100 - index,
+        )
+    fingerprint_read = threading.Event()
+    writer_done = threading.Event()
+
+    class _BarrierConnection:
+        def execute(self, query, parameters=None):
+            result = (
+                con.execute(query, parameters)
+                if parameters is not None
+                else con.execute(query)
+            )
+            if "fingerprint_rows" in query:
+                fingerprint_read.set()
+                assert writer_done.wait(timeout=5)
+            return result
+
+    def write_after_fingerprint():
+        assert fingerprint_read.wait(timeout=5)
+        writer = duckdb.connect(str(db_path))
+        try:
+            _insert_session(
+                writer,
+                session_id="snapshot-new",
+                project="acme/new",
+                host="aaa-host-new",
+                harness="aaa-harness-new",
+                tokens=500,
+            )
+        finally:
+            writer.close()
+            writer_done.set()
+
+    writer = threading.Thread(target=write_after_fingerprint)
+    writer.start()
+    codec = AnalyticsCursorCodec(b"test-cursor-secret")
+    try:
+        initial = activity_analytics(
+            _BarrierConnection(), AnalyticsFilters(days=7, limit=1), cursor_codec=codec
+        )
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+
+        assert initial.totals.session_count == 3
+        assert initial.projects[0].project_key == "acme/project-0"
+        assert initial.harnesses[0].key == "harness-0"
+        assert initial.hosts[0].key == "host-0"
+        assert initial.models[0].session_count == 3
+        assert initial.pagination.projects.next_cursor is not None
+        with pytest.raises(AnalyticsSnapshotChangedError, match="snapshot_changed"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(
+                    days=7,
+                    limit=1,
+                    project_cursor=initial.pagination.projects.next_cursor,
+                ),
+                cursor_codec=codec,
+            )
+    finally:
+        con.close()
+
+
+def test_analytics_failure_rolls_back_owned_transaction_and_connection_is_reusable():
+    con = _analytics_connection()
+    _insert_session(
+        con,
+        session_id="rollback-1",
+        project="acme/rollback",
+        host="mac",
+        harness="codex",
+        tokens=10,
+    )
+    try:
+        with pytest.raises(ValueError, match="invalid analytics cursor"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(project_cursor="invalid"),
+                cursor_codec=AnalyticsCursorCodec(b"test-cursor-secret"),
+            )
+
+        assert con.execute("SELECT 1").fetchone() == (1,)
+        assert activity_analytics(con, AnalyticsFilters()).totals.session_count == 1
+    finally:
+        con.close()
+
+
+def test_analytics_respects_caller_owned_transaction_without_committing_it():
+    con = _analytics_connection()
+    try:
+        con.execute("BEGIN TRANSACTION")
+        _insert_session(
+            con,
+            session_id="caller-owned",
+            project="acme/caller",
+            host="mac",
+            harness="codex",
+            tokens=10,
+        )
+        assert activity_analytics(con, AnalyticsFilters()).totals.session_count == 1
+        con.execute("ROLLBACK")
+
+        assert activity_analytics(con, AnalyticsFilters()).totals.session_count == 0
     finally:
         con.close()
 
