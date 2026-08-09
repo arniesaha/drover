@@ -145,10 +145,10 @@ public actor DroverClient {
     }
 
     public func contentAnalysisStatus() async throws -> ContentAnalysisStatus {
-        let data = try await request(
+        let result = try await contentAnalysisStateRequest(
             path: "/insights/content-analysis", method: "GET", body: nil
         )
-        return try decode(ContentAnalysisStatus.self, from: data)
+        return result.status
     }
 
     public func setContentAnalysisConsent(
@@ -159,13 +159,13 @@ public actor DroverClient {
             backend: backend,
             externalDisclosureAccepted: externalDisclosureAccepted
         ))
-        return try await contentAnalysisMutationRequest(
+        return try await contentAnalysisStateRequest(
             path: "/insights/content-analysis/consent", method: "POST", body: body
         )
     }
 
     public func revokeContentAnalysis() async throws -> ContentAnalysisConsentResult {
-        try await contentAnalysisMutationRequest(
+        try await contentAnalysisStateRequest(
             path: "/insights/content-analysis/revoke",
             method: "POST",
             body: Data("{}".utf8)
@@ -437,7 +437,7 @@ public actor DroverClient {
         return try validatedData(data, response: http)
     }
 
-    private func contentAnalysisMutationRequest(
+    private func contentAnalysisStateRequest(
         path: String, method: String, body: Data?
     ) async throws -> ContentAnalysisConsentResult {
         guard let url = URL(string: path, relativeTo: config.baseURL) else {

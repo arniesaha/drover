@@ -179,8 +179,15 @@ class InsightsService:
         self.duckdb_path = Path(duckdb_path)
         self.config_path = Path(config_path or default_config_path()).expanduser()
         self.repository = AdvisoryRepository(self.duckdb_path)
+        consent_path = self.config_path.with_name(
+            f".{self.config_path.name}.content-consent.json"
+        )
+        initial_enabled = False
+        if not consent_path.exists() and self.config_path.exists():
+            initial_enabled = load_config(self.config_path).advisory_content.enabled
         self._content_consent = DurableContentConsent(
-            self.config_path.with_name(f".{self.config_path.name}.content-consent.json")
+            consent_path,
+            initial_enabled=initial_enabled,
         )
         self._consent_propagator = consent_propagator
 
@@ -193,19 +200,27 @@ class InsightsService:
         return self._content_consent.snapshot()
 
     def content_analysis_status(self) -> dict[str, Any]:
-        """Return only consent state and a bounded pending-job count."""
+        """Return central truth plus a serialized current-epoch fleet reconcile."""
 
-        config = (
-            load_config(self.config_path).advisory_content
-            if self.config_path.exists()
-            else default_config().advisory_content
-        )
-        return {
-            "enabled": config.enabled,
-            "backend": config.backend_policy,
-            "external_disclosure_accepted": config.external_consent,
-            "pending_model_jobs": self._pending_model_job_count(),
-        }
+        # A status read may perform bounded, idempotent host consent pushes at
+        # exactly the already-durable epoch. Serialize that reconciliation with
+        # mutations so a slow GET cannot publish an older fleet result after an
+        # enable or revoke has advanced the epoch.
+        with _CONTENT_CONSENT_COORDINATOR.mutation():
+            config = (
+                load_config(self.config_path).advisory_content
+                if self.config_path.exists()
+                else default_config().advisory_content
+            )
+            consent = self._content_consent.snapshot()
+            result = {
+                "enabled": config.enabled,
+                "backend": config.backend_policy,
+                "external_disclosure_accepted": config.external_consent,
+                "pending_model_jobs": self._pending_model_job_count(),
+            }
+            self._append_propagation(result, consent)
+            return result
 
     def consent_content_analysis(
         self,

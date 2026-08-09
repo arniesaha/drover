@@ -3,9 +3,9 @@ import Testing
 @testable import DroverKit
 
 @Test(arguments: [
-    ("content-consent-complete", ContentAnalysisPropagation.complete, 7, 0),
-    ("content-consent-partial", ContentAnalysisPropagation.partial, 8, 1),
-    ("content-consent-failed", ContentAnalysisPropagation.failed, 9, 2),
+    ("content-consent-complete", ContentAnalysisPropagation.complete, 0, 0),
+    ("content-consent-partial", ContentAnalysisPropagation.partial, 1, 1),
+    ("content-consent-failed", ContentAnalysisPropagation.failed, 0, 1),
 ])
 func backendContentConsentFixturesPreserveFleetPropagation(
     fixtureName: String,
@@ -34,13 +34,15 @@ func backendContentConsentFixturesPreserveFleetPropagation(
 }
 
 @Test func unknownConsentPropagationAndHostStateFailSafe() throws {
-    let url = try #require(Bundle.module.url(
-        forResource: "content-consent-failed", withExtension: "json", subdirectory: "Fixtures"
-    ))
-    let status = try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(contentsOf: url))
+    let status = try JSONDecoder().decode(ContentAnalysisStatus.self, from: Data(#"""
+    {"enabled":false,"backend":"local","external_disclosure_accepted":false,
+     "pending_model_jobs":0,"consent_epoch":2,"propagation":"future-result",
+     "hosts":[{"host_id":"future-host","status":"new-server-state"}]}
+    """#.utf8))
 
     #expect(status.hosts.last?.state == .unknown)
-    #expect(status.affectedHosts.map(\.hostID) == ["workstation", "future-host"])
+    #expect(status.propagationOutcome == .failed)
+    #expect(status.affectedHosts.map(\.hostID) == ["future-host"])
 }
 
 @Test func analyticsDecodesPaginationAndObservedAggregateMetadata() throws {

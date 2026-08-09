@@ -1,1 +1,1 @@
-{"enabled":true,"backend":"cloud","external_disclosure_accepted":true,"pending_model_jobs":2,"consent_epoch":8,"propagation":"partial","hosts":[{"host_id":"mac-mini","state":"acknowledged"},{"host_id":"offline-laptop","state":"disconnected","error":"host is offline"}]}
+{"enabled":true,"backend":"cloud","external_disclosure_accepted":true,"pending_model_jobs":0,"consent_epoch":1,"propagation":"partial","hosts":[{"host_id":"offline-laptop","state":"disconnected"}]}

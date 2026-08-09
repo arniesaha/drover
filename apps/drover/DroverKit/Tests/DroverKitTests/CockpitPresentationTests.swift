@@ -11,7 +11,7 @@ import Testing
 
     #expect(value.isWarning)
     #expect(value.title == "Fleet propagation incomplete")
-    #expect(value.hostLines == ["offline-laptop · Disconnected · host is offline"])
+    #expect(value.hostLines == ["offline-laptop · Disconnected"])
     #expect(value.accessibilityLabel.contains("offline-laptop, Disconnected"))
 }
 
@@ -25,8 +25,7 @@ import Testing
     #expect(value.isWarning)
     #expect(value.title == "Fleet propagation failed")
     #expect(value.hostLines == [
-        "workstation · Failed · epoch conflict",
-        "future-host · Unknown status",
+        "workstation · Failed",
     ])
 }
 

@@ -574,7 +574,26 @@ struct ClientTests {
 
     #expect(result.outcome == .failed)
     #expect(!result.status.enabled)
-    #expect(result.status.cancelledModelJobs == 3)
+    #expect(result.status.cancelledModelJobs == nil)
+}
+
+@Test func contentStatusRetainsFailed503FleetTruthOnFreshNavigation() async throws {
+    let fixtureURL = try #require(Bundle.module.url(
+        forResource: "content-consent-failed", withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let fixture = try Data(contentsOf: fixtureURL)
+    MockURLProtocol.handler = { request in
+        #expect(request.httpMethod == "GET")
+        #expect(request.url?.path == "/insights/content-analysis")
+        return (503, fixture)
+    }
+
+    let status = try await client().contentAnalysisStatus()
+
+    #expect(!status.enabled)
+    #expect(status.propagationOutcome == .failed)
+    #expect(status.affectedHosts.map(\.hostID) == ["workstation"])
 }
 
 private let emptyOverviewJSON = Data(#"""

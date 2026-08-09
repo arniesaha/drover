@@ -153,16 +153,113 @@ def test_content_consent_propagates_monotonic_epoch_and_reports_partial_hosts(
     )
     revoked = service.revoke_content_analysis()
 
-    assert calls == [(True, 1), (False, 2)]
-    assert enabled["consent_epoch"] == 1
+    assert calls == [(True, 2), (False, 3)]
+    assert enabled["consent_epoch"] == 2
     assert enabled["propagation"] == "partial"
     assert enabled["hosts"] == [
         {"host_id": "mac-mini", "state": "acknowledged"},
         {"host_id": "laptop", "state": "disconnected"},
     ]
-    assert revoked["consent_epoch"] == 2
+    assert revoked["consent_epoch"] == 3
     assert revoked["propagation"] == "partial"
-    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
+    assert service.content_consent_state() == {"enabled": False, "epoch": 3}
+
+
+def test_content_status_reconciles_the_current_durable_epoch(
+    repository, content_config_path
+):
+    calls = []
+
+    def propagate(enabled, epoch):
+        calls.append((enabled, epoch))
+        return [{"host_id": "mac-mini", "state": "acknowledged"}]
+
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=propagate,
+    )
+    enabled = service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+
+    status = service.content_analysis_status()
+
+    assert calls == [(True, enabled["consent_epoch"])] * 2
+    assert status["consent_epoch"] == enabled["consent_epoch"]
+    assert status["propagation"] == "complete"
+    assert status["hosts"] == [{"host_id": "mac-mini", "state": "acknowledged"}]
+
+
+def test_content_status_bootstraps_durable_truth_from_enabled_config(
+    repository, content_config_path
+):
+    calls = []
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=lambda enabled, epoch: (
+            calls.append((enabled, epoch)) or []
+        ),
+    )
+
+    status = service.content_analysis_status()
+
+    assert status["enabled"] is True
+    assert status["consent_epoch"] == 1
+    assert calls == [(True, 1)]
+
+
+def test_status_and_mutation_serialize_so_stale_epoch_response_finishes_first(
+    repository, content_config_path
+):
+    status_entered = threading.Event()
+    release_status = threading.Event()
+    mutation_entered = threading.Event()
+    calls = []
+
+    def propagate(enabled, epoch):
+        calls.append((enabled, epoch))
+        if len(calls) == 1:
+            status_entered.set()
+            assert release_status.wait(timeout=2)
+        else:
+            mutation_entered.set()
+        return [{"host_id": "mac-mini", "state": "acknowledged"}]
+
+    service = InsightsService(
+        repository.duckdb_path,
+        config_path=content_config_path,
+        consent_propagator=propagate,
+    )
+    results = {}
+
+    status = threading.Thread(
+        target=lambda: results.setdefault("status", service.content_analysis_status())
+    )
+    status.start()
+    assert status_entered.wait(timeout=2)
+    mutation = threading.Thread(
+        target=lambda: results.setdefault(
+            "mutation",
+            service.consent_content_analysis(
+                backend="local", external_disclosure_accepted=False
+            ),
+        )
+    )
+    mutation.start()
+    assert mutation_entered.wait(timeout=0.2) is False
+    assert "mutation" not in results
+
+    release_status.set()
+    status.join(timeout=2)
+    mutation.join(timeout=2)
+
+    assert not status.is_alive()
+    assert not mutation.is_alive()
+    assert results["status"]["consent_epoch"] == 1
+    assert results["mutation"]["consent_epoch"] == 2
+    assert calls == [(True, 1), (True, 2)]
 
 
 def test_consent_mutations_serialize_without_holding_content_operation_fence(
@@ -204,7 +301,7 @@ def test_consent_mutations_serialize_without_holding_content_operation_fence(
 
     assert not enabling.is_alive()
     assert not revoking.is_alive()
-    assert service.content_consent_state() == {"enabled": False, "epoch": 2}
+    assert service.content_consent_state() == {"enabled": False, "epoch": 3}
 
 
 def test_content_consent_fsyncs_directory_after_atomic_replace(
@@ -233,6 +330,9 @@ def test_content_consent_fsyncs_directory_after_atomic_replace(
     )
 
     assert events == [
+        "file_fsync",
+        "replace",
+        "directory_fsync",
         "file_fsync",
         "replace",
         "directory_fsync",

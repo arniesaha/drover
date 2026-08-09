@@ -863,7 +863,18 @@ class MetricsCollector:
         return _insight_response(lambda: self._insights().get_insight(finding_id))
 
     def render_content_analysis_status_json(self) -> tuple[int, str]:
-        return _insight_response(lambda: self._insights().content_analysis_status())
+        try:
+            payload = self._insights().content_analysis_status()
+            propagation = payload.get("propagation")
+            if propagation == "failed":
+                status = 503
+            elif propagation in {None, "complete"}:
+                status = 200
+            else:
+                status = 207
+            return _json_response(status, payload)
+        except Exception as exc:
+            return _insight_error_response(exc)
 
     def consent_content_analysis(self, body: Mapping[str, Any]) -> tuple[int, str]:
         from drover.server.advisory.service import (

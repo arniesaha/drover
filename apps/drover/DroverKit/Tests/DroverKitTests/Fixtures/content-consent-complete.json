@@ -1,1 +1,1 @@
-{"enabled":true,"backend":"local","external_disclosure_accepted":false,"pending_model_jobs":0,"consent_epoch":7,"propagation":"complete","hosts":[{"host_id":"mac-mini","state":"acknowledged"}]}
+{"enabled":false,"backend":"local","external_disclosure_accepted":false,"pending_model_jobs":0,"consent_epoch":0,"propagation":"complete","hosts":[]}

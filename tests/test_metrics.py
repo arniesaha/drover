@@ -372,6 +372,15 @@ def _make_collector(tmp_path) -> MetricsCollector:
     )
 
 
+def _swift_content_consent_fixture(name: str) -> dict:
+    fixture = (
+        Path(__file__).parents[1]
+        / "apps/drover/DroverKit/Tests/DroverKitTests/Fixtures"
+        / f"content-consent-{name}.json"
+    )
+    return json.loads(fixture.read_text(encoding="utf-8"))
+
+
 class _FailingWriter:
     def __init__(self, error: Exception):
         self.error = error
@@ -810,12 +819,7 @@ excerpt_max_chars = 320
 
         with _authed_get(base + "/insights/content-analysis") as response:
             status = json.loads(response.read())
-        assert status == {
-            "backend": "local",
-            "enabled": False,
-            "external_disclosure_accepted": False,
-            "pending_model_jobs": 0,
-        }
+        assert status == _swift_content_consent_fixture("complete")
         assert "content" not in json.dumps(status).lower().replace(
             "content_analysis", ""
         )
@@ -844,6 +848,67 @@ excerpt_max_chars = 320
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_content_status_empty_registry_matches_shared_swift_fixture(tmp_path) -> None:
+    collector = _make_collector(tmp_path)
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 200
+    assert json.loads(body) == _swift_content_consent_fixture("complete")
+
+
+def test_content_status_offline_registry_matches_shared_swift_fixture(tmp_path) -> None:
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="offline-laptop",
+        display_name="Offline Laptop",
+        kind="macos",
+        connection_kind="relay",
+        status="offline",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+    collector.consent_content_analysis(
+        {"backend": "cloud", "external_disclosure_accepted": True}
+    )
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 207
+    assert json.loads(body) == _swift_content_consent_fixture("partial")
+
+
+def test_content_status_failed_registry_matches_shared_swift_fixture(tmp_path) -> None:
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="workstation",
+        display_name="Workstation",
+        kind="macos",
+        connection_kind="relay",
+    )
+    collector.advisory_service = InsightsService(
+        collector.duckdb_path, config_path=tmp_path / "config.toml"
+    )
+
+    class _StatusNackRelay:
+        def is_live(self, host_id):
+            return True
+
+        def request(self, host_id, method, path, body, timeout_s=15):
+            return 409, '{"error":"epoch conflict"}'
+
+    collector.relay_manager = _StatusNackRelay()
+
+    status, body = collector.render_content_analysis_status_json()
+
+    assert status == 503
+    assert json.loads(body) == _swift_content_consent_fixture("failed")
 
 
 def test_central_consent_and_revoke_reconcile_an_already_running_direct_daemon(
@@ -903,6 +968,12 @@ def test_central_consent_and_revoke_reconcile_an_already_running_direct_daemon(
             "enabled": True,
             "epoch": consent["consent_epoch"],
         }
+
+        status, body = collector.render_content_analysis_status_json()
+        reconciled = json.loads(body)
+        assert status == 200
+        assert reconciled["consent_epoch"] == consent["consent_epoch"]
+        assert reconciled["hosts"] == [{"host_id": "mac-mini", "state": "acknowledged"}]
 
         bundle = collector.fetch_advisory_content_bundle("mac-mini", ["AGENTS.md"])
         assert bundle["targets"][0]["target_id"] == "AGENTS.md"
