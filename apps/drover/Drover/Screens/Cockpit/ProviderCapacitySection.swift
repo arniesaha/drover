@@ -5,7 +5,14 @@ struct ProviderCapacitySection: View {
     let accounts: [ProviderAccount]
     let status: DataStatus
     let statusMessage: String?
+    /// Host id → display title, so a merged card can name the machines it
+    /// covers. Falls back to the raw id when the fleet snapshot is unavailable.
+    var hostTitles: [String: String] = [:]
     let onOpenAnalytics: () -> Void
+
+    private var subscriptions: [ProviderSubscriptionPresentation] {
+        ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
+    }
 
     var body: some View {
         let section = ProviderSectionPresentation(
@@ -32,8 +39,8 @@ struct ProviderCapacitySection: View {
             if !accounts.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 10) {
-                        ForEach(accounts, id: \.snapshotID) { account in
-                            ProviderAccountCard(account: account, section: section)
+                        ForEach(subscriptions) { subscription in
+                            ProviderAccountCard(subscription: subscription, section: section)
                                 .frame(width: 250)
                         }
                     }
@@ -46,16 +53,18 @@ struct ProviderCapacitySection: View {
 }
 
 private struct ProviderAccountCard: View {
-    let account: ProviderAccount
+    let subscription: ProviderSubscriptionPresentation
     let section: ProviderSectionPresentation
+
+    private var account: ProviderAccount { subscription.representative }
 
     var body: some View {
         CockpitCard {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(account.accountLabel).droverText(.h2)
-                        Text([account.provider.capitalized, account.planLabel]
+                        Text(subscription.accountLabel).droverText(.h2)
+                        Text([subscription.provider.capitalized, subscription.planLabel]
                             .compactMap { $0 }.joined(separator: " · "))
                             .droverText(.subtitle)
                     }
@@ -64,11 +73,11 @@ private struct ProviderAccountCard: View {
                         .droverText(.marker)
                 }
 
-                if account.windows.isEmpty {
+                if subscription.windows.isEmpty {
                     Text("Usage unavailable")
                         .droverText(.body)
                 } else {
-                    ForEach(Array(account.windows.enumerated()), id: \.offset) { _, window in
+                    ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in
                         let value = ProviderCapacityPresentation(
                             account: account, window: window, now: .now
                         )
@@ -85,19 +94,34 @@ private struct ProviderAccountCard: View {
                     }
                 }
 
+                // The hosts this one subscription covers, and — when a probe
+                // failed on one of them — which host and why. A single broken
+                // probe belongs on its own card, not in a banner over the
+                // whole section.
+                Text(subscription.hostsText)
+                    .droverText(.subtitle)
+                    .foregroundStyle(DroverColor.faint)
+
+                if let reason = subscription.reasonText {
+                    Label(reason, systemImage: "exclamationmark.triangle")
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.accentHi)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("provider-account-reason")
+                }
             }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
-        .accessibilityIdentifier("provider-account-\(account.snapshotID)")
+        .accessibilityIdentifier("provider-account-\(subscription.id)")
     }
 
     private var statusTitle: String {
-        section.accountStatusText(accountStatus: account.status)
+        section.accountStatusText(accountStatus: subscription.status)
     }
 
     private var accessibilityLabel: String {
-        let windows = account.windows.map {
+        let windows = subscription.windows.map {
             let value = ProviderCapacityPresentation(account: account, window: $0, now: .now)
             return [
                 $0.kind,
@@ -107,7 +131,12 @@ private struct ProviderAccountCard: View {
                 value.freshnessText,
             ].compactMap { $0 }.joined(separator: ", ")
         }.joined(separator: ". ")
-        return "\(account.provider), \(account.accountLabel), Provider reported, \(statusTitle). \(windows)"
+        return [
+            "\(subscription.provider), \(subscription.accountLabel), Provider reported, \(statusTitle)",
+            subscription.hostsText,
+            subscription.reasonText,
+            windows,
+        ].compactMap { $0 }.joined(separator: ". ")
     }
 }
 

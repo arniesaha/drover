@@ -345,3 +345,124 @@ private func decodeOverview(
 ) throws -> CockpitOverview {
     try JSONDecoder().decode(CockpitOverview.self, from: Data(#"{"cockpit_api_version":1,"provider_capacity":{"status":"\#(providerStatus)","data":\#(providerData)},"activity":{"status":"ok","data":\#(activityData)},"popular_projects":\#(projects),"insight_counts":\#(insightCounts)}"#.utf8))
 }
+
+// MARK: - Subscription grouping
+
+private func providerAccount(
+    snapshot: String,
+    provider: String,
+    label: String,
+    plan: String? = nil,
+    host: String,
+    status: String = "ok",
+    observedAt: String,
+    errorCategory: String? = nil
+) throws -> ProviderAccount {
+    let plan = plan.map { "\"plan_label\":\"\($0)\"," } ?? ""
+    let category = errorCategory.map { "\"error_category\":\"\($0)\"," } ?? ""
+    let json = """
+    {"snapshot_id":"\(snapshot)","dedup_key":"\(snapshot)-key","provider":"\(provider)",\
+    "account_label":"\(label)",\(plan)"host_id":"\(host)","status":"\(status)",\
+    "observed_at":"\(observedAt)",\(category)"source":"codex-app-server","windows":[]}
+    """
+    return try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
+}
+
+/// The reported bug: one Codex subscription signed in on three machines
+/// rendered as three identical cards, with the host nowhere on them.
+@Test func oneSubscriptionOnManyHostsCollapsesToASingleEntry() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "openai", label: "me@example.com",
+                        plan: "prolite", host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"),
+        providerAccount(snapshot: "s2", provider: "openai", label: "me@example.com",
+                        plan: "prolite", host: "nas", observedAt: "2026-08-09T17:00:00Z"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(
+        accounts, hostTitles: ["mac-mini": "Mac Mini", "nas": "NAS"]
+    )
+
+    #expect(groups.count == 1)
+    #expect(groups[0].hostIDs == ["mac-mini", "nas"])
+    #expect(groups[0].hostsText.contains("Mac Mini"))
+    #expect(groups[0].hostsText.contains("NAS"))
+    // Freshest reading wins, so the card never shows an older host's numbers.
+    #expect(groups[0].representative.snapshotID == "s1")
+}
+
+/// Different accounts with the same provider must stay apart, or a broken
+/// probe would be merged into a healthy subscription's card.
+@Test func distinctAccountsUnderOneProviderStaySeparate() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "openai", label: "me@example.com",
+                        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"),
+        providerAccount(snapshot: "s2", provider: "openai", label: "Codex",
+                        host: "work-laptop", status: "error",
+                        observedAt: "2026-08-09T18:00:00Z", errorCategory: "unavailable"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(accounts)
+
+    #expect(groups.count == 2)
+    #expect(groups.first { $0.accountLabel == "Codex" }?.status == .error)
+    #expect(groups.first { $0.accountLabel == "me@example.com" }?.status == .ok)
+}
+
+/// A probe failing on one host must not blank out numbers another host
+/// reported successfully — it becomes a note on the card naming that host.
+@Test func aFailingHostAnnotatesTheCardRatherThanReplacingIt() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "openai", label: "me@example.com",
+                        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"),
+        providerAccount(snapshot: "s2", provider: "openai", label: "me@example.com",
+                        host: "work-laptop", status: "error",
+                        observedAt: "2026-08-09T18:05:00Z", errorCategory: "unavailable"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(
+        accounts, hostTitles: ["work-laptop": "work-laptop"]
+    )
+
+    #expect(groups.count == 1)
+    // Healthy member represents the card even though it is the older reading.
+    #expect(groups[0].status == .ok)
+    #expect(groups[0].representative.snapshotID == "s1")
+    let reason = try #require(groups[0].reasonText)
+    #expect(reason.contains("Provider CLI unavailable"))
+    #expect(reason.contains("work-laptop"))
+}
+
+@Test func aHealthySubscriptionCarriesNoReason() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "google", label: "Gemini",
+                        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"),
+        providerAccount(snapshot: "s2", provider: "google", label: "Gemini",
+                        host: "nas", observedAt: "2026-08-09T17:00:00Z"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(accounts)
+
+    #expect(groups.count == 1)
+    #expect(groups[0].reasonText == nil)
+}
+
+/// Hosts disagree about the plan: the same Anthropic account reported "max"
+/// from two machines and nothing from a third, which split one subscription
+/// back into the duplicate cards grouping exists to remove.
+@Test func hostsDisagreeingAboutThePlanStillFormOneSubscription() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "anthropic", label: "Claude Code",
+                        plan: "max", host: "mac-mini", status: "usage_unavailable",
+                        observedAt: "2026-08-09T18:00:00Z"),
+        providerAccount(snapshot: "s2", provider: "anthropic", label: "Claude Code",
+                        host: "work-laptop", status: "usage_unavailable",
+                        observedAt: "2026-08-09T18:01:00Z"),
+    ]
+
+    let groups = ProviderSubscriptionGrouping.group(accounts)
+
+    #expect(groups.count == 1)
+    #expect(groups[0].hostIDs == ["mac-mini", "work-laptop"])
+    // The host that could read the plan speaks for the subscription.
+    #expect(groups[0].planLabel == "max")
+}

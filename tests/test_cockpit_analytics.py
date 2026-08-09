@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -886,3 +887,87 @@ def test_swift_contract_fixture_matches_backend_overview_shape(tmp_path):
     ).overview(AnalyticsFilters(days=7))
 
     assert actual == json.loads(fixture_path.read_text())
+
+
+def _capacity_account(host_id: str, status: str, error_category=None):
+    from drover.server.providers.types import ProviderAccountSnapshot
+
+    return ProviderAccountSnapshot(
+        snapshot_id=f"snapshot-{host_id}",
+        dedup_key=f"key-{host_id}",
+        provider="openai",
+        account_label="me@example.com",
+        plan_label="prolite",
+        host_id=host_id,
+        status=status,
+        observed_at=datetime(2026, 8, 9, 18, tzinfo=timezone.utc),
+        windows=(),
+        source="codex-app-server",
+        error_category=error_category,
+    )
+
+
+def test_one_failing_probe_does_not_mark_the_whole_section_stale():
+    """One host's probe failing is that account's problem, not the section's.
+
+    The client treats section status as authoritative over every card, so
+    folding per-account errors into it relabelled seven freshly-observed
+    accounts as "Stale" and raised a fleet-wide "provider capacity is stale"
+    banner over live data.
+    """
+    accounts = [
+        _capacity_account("mac-mini", "ok"),
+        _capacity_account("nas", "usage_unavailable"),
+        _capacity_account("work-laptop", "error", error_category="unavailable"),
+    ]
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: accounts),
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    )
+
+    capacity = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
+
+    assert capacity["status"] == "ok"
+    # The failure still travels, on the account it belongs to.
+    failed = [row for row in capacity["data"] if row["status"] == "error"]
+    assert [row["host_id"] for row in failed] == ["work-laptop"]
+    assert failed[0]["error_category"] == "unavailable"
+
+
+def test_one_host_going_dark_does_not_stale_the_whole_section():
+    """A host whose probes stop reporting is one card's problem.
+
+    NAS lost its provider CLIs and every account it reported went stale,
+    which marked the section stale and relabelled mac-mini's freshly
+    refreshed accounts "Stale" under a fleet-wide banner.
+    """
+    accounts = [
+        _capacity_account("mac-mini", "ok"),
+        _capacity_account("nas", "stale", error_category="unavailable"),
+    ]
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: accounts),
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    )
+
+    capacity = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
+
+    assert capacity["status"] == "ok"
+
+
+def test_section_is_stale_only_when_nothing_refreshed():
+    accounts = [
+        _capacity_account("mac-mini", "stale"),
+        _capacity_account("nas", "error", error_category="unavailable"),
+    ]
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: accounts),
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    )
+
+    capacity = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
+
+    assert capacity["status"] == "stale"

@@ -96,22 +96,34 @@ struct AnalyticsView: View {
                     .accessibilityIdentifier("analytics-provider-warning")
                 }
                 if !accounts.isEmpty {
-                    ForEach(accounts, id: \.snapshotID) { account in
+                    // One row per subscription, not per host — the same Codex
+                    // account signed in on three machines was three identical
+                    // rows with nothing to tell them apart.
+                    ForEach(ProviderSubscriptionGrouping.group(accounts)) { subscription in
                         CockpitCard {
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack(alignment: .firstTextBaseline) {
-                                    Text("\(account.provider.capitalized) · \(account.accountLabel)")
+                                    Text(subscription.title)
                                         .droverText(.h2)
                                     Spacer(minLength: 8)
-                                    Text(section.accountStatusText(accountStatus: account.status))
+                                    Text(section.accountStatusText(accountStatus: subscription.status))
                                         .droverText(.marker)
                                 }
-                                ForEach(Array(account.windows.enumerated()), id: \.offset) { _, window in
+                                Text(subscription.hostsText)
+                                    .droverText(.subtitle)
+                                    .foregroundStyle(DroverColor.faint)
+                                ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in
                                     let value = ProviderCapacityPresentation(
-                                        account: account, window: window, now: .now
+                                        account: subscription.representative, window: window, now: .now
                                     )
                                     Text("\(window.kind.capitalized): \(value.remainingText) · \(value.resetText)")
                                         .droverText(.nested)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                if let reason = subscription.reasonText {
+                                    Label(reason, systemImage: "exclamationmark.triangle")
+                                        .droverText(.subtitle)
+                                        .foregroundStyle(DroverColor.accentHi)
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
