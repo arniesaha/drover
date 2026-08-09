@@ -25,7 +25,7 @@ jobs:
       run: |
         "$HOME/.local/bin/python3.11" -m venv "$RUNNER_TEMP/python-venv"
         echo "$RUNNER_TEMP/python-venv/bin" >> "$GITHUB_PATH"
-        python --version
+        "$RUNNER_TEMP/python-venv/bin/python" --version
 
     - name: Install dependencies
       run: |

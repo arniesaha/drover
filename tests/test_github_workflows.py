@@ -53,5 +53,5 @@ def test_trusted_python_uses_bounded_host_interpreter_venv() -> None:
     assert setup["run"] == (
         '"$HOME/.local/bin/python3.11" -m venv "$RUNNER_TEMP/python-venv"\n'
         'echo "$RUNNER_TEMP/python-venv/bin" >> "$GITHUB_PATH"\n'
-        "python --version\n"
+        '"$RUNNER_TEMP/python-venv/bin/python" --version\n'
     )
