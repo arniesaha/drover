@@ -14,6 +14,67 @@ struct ContentAnalysisSettings: View {
 
     var body: some View {
         Section("Content analysis") {
+            // A server without the cockpit API (older harnessd) has no
+            // content-analysis endpoint. The inbox hides its cockpit sections
+            // outright in that case; Settings says so once, quietly, rather
+            // than leaving a bare transport error sitting next to a
+            // destructive control that cannot do anything.
+            if store.contentAnalysisStatus == nil, store.contentStatusError != nil {
+                Text("Content analysis is unavailable on this server.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("content-analysis-unavailable")
+            } else {
+                loadedControls
+            }
+        }
+        .task {
+            guard !didLoadStatus else { return }
+            didLoadStatus = true
+            await store.loadContentAnalysisStatus()
+            syncSelectionFromStatus()
+        }
+        .onChange(of: store.contentAnalysisStatus) { _, _ in
+            syncSelectionFromStatus()
+        }
+        .onChange(of: store.isContentConsentOperationInProgress) { wasRunning, isRunning in
+            if wasRunning, !isRunning {
+                syncSelectionFromStatus()
+            }
+        }
+        .onChange(of: showRevokeConfirmation) { wasPresented, isPresented in
+            if wasPresented, !isPresented, store.contentAnalysisStatus?.enabled == true {
+                selectionState.cancelRevocation()
+            }
+        }
+        .confirmationDialog(
+            "Stop content analysis?",
+            isPresented: $showRevokeConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Stop future analysis", role: .destructive) {
+                Task { _ = await store.revokeContentAnalysis() }
+            }
+        } message: {
+            Text(CockpitStore.revokeConfirmationMessage)
+        }
+        .confirmationDialog(
+            "Purge retained excerpts?",
+            isPresented: $showPurgeConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Purge all excerpts", role: .destructive) {
+                Task { _ = await store.purgeContentExcerpts() }
+            }
+        } message: {
+            Text(CockpitStore.purgeConfirmationMessage)
+        }
+    }
+
+    @ViewBuilder
+    private var loadedControls: some View {
+        Group {
             Picker("Analysis backend", selection: modeBinding) {
                 ForEach(ContentAnalysisMode.allCases) { mode in
                     Text(mode.title).tag(mode)
@@ -58,7 +119,9 @@ struct ContentAnalysisSettings: View {
                 .accessibilityIdentifier("content-analysis-enable")
             }
 
-            if let error = store.contentStatusError ?? store.contentConsentError {
+            if let error = store.contentStatusError {
+                operationMessage("Could not refresh status: \(error)", isError: true)
+            } else if let error = store.contentConsentError {
                 operationMessage(error, isError: true)
             } else if let status = store.contentAnalysisStatus {
                 operationMessage(statusDescription(status), isError: false)
@@ -89,47 +152,6 @@ struct ContentAnalysisSettings: View {
                 operationMessage("Purged \(count) retained excerpt\(count == 1 ? "" : "s").", isError: false)
                     .accessibilityIdentifier("content-excerpts-purge-status")
             }
-        }
-        .task {
-            guard !didLoadStatus else { return }
-            didLoadStatus = true
-            await store.loadContentAnalysisStatus()
-            syncSelectionFromStatus()
-        }
-        .onChange(of: store.contentAnalysisStatus) { _, _ in
-            syncSelectionFromStatus()
-        }
-        .onChange(of: store.isContentConsentOperationInProgress) { wasRunning, isRunning in
-            if wasRunning, !isRunning {
-                syncSelectionFromStatus()
-            }
-        }
-        .onChange(of: showRevokeConfirmation) { wasPresented, isPresented in
-            if wasPresented, !isPresented, store.contentAnalysisStatus?.enabled == true {
-                selectionState.cancelRevocation()
-            }
-        }
-        .confirmationDialog(
-            "Stop content analysis?",
-            isPresented: $showRevokeConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Stop future analysis", role: .destructive) {
-                Task { _ = await store.revokeContentAnalysis() }
-            }
-        } message: {
-            Text(CockpitStore.revokeConfirmationMessage)
-        }
-        .confirmationDialog(
-            "Purge retained excerpts?",
-            isPresented: $showPurgeConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Purge all excerpts", role: .destructive) {
-                Task { _ = await store.purgeContentExcerpts() }
-            }
-        } message: {
-            Text(CockpitStore.purgeConfirmationMessage)
         }
     }
 
