@@ -52,6 +52,8 @@ class ProviderAccountSnapshot:
     windows: tuple[ProviderUsageWindow, ...]
     source: str
     error_category: str | None = None
+    provider_observed_at: datetime | None = None
+    freshness_age_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"ok", "usage_unavailable", "stale", "error"}:
@@ -59,6 +61,7 @@ class ProviderAccountSnapshot:
         if self.observed_at is None:
             raise ValueError("observed_at must be timezone-aware")
         _require_timezone_aware(self.observed_at, "observed_at")
+        _require_timezone_aware(self.provider_observed_at, "provider_observed_at")
         windows = tuple(self.windows)
         if not all(isinstance(window, ProviderUsageWindow) for window in windows):
             raise ValueError("windows must contain ProviderUsageWindow records")

@@ -168,6 +168,7 @@ class ProviderRefreshLoop:
         self.operational_source_version = operational_source_version
         self.on_operational_change = on_operational_change
         self._last_attempt: dict[str, float] = {}
+        self._offline_hosts: set[str] = set()
         self._last_operational_version: dict[str, str] = {}
         self._thread: threading.Thread | None = None
 
@@ -182,7 +183,7 @@ class ProviderRefreshLoop:
     def run_once(self) -> None:
         now = self.clock()
         try:
-            hosts = self.registry.list_hosts(status="online")
+            hosts = self.registry.list_hosts()
         except Exception as exc:  # noqa: BLE001 - refresh cannot kill server
             log.warning("failed to list hosts for provider refresh: %s", exc)
             return
@@ -190,10 +191,30 @@ class ProviderRefreshLoop:
             host_id = str(getattr(host, "host_id", "") or "").strip()
             if not host_id:
                 continue
+            status = str(getattr(host, "status", "online") or "").lower()
+            if status != "online":
+                try:
+                    self.provider_usage.mark_host_unavailable(
+                        host_id, error_category="host_offline"
+                    )
+                except Exception as exc:  # noqa: BLE001 - status overlay is isolated
+                    log.warning(
+                        "failed to mark provider host %s unavailable: %s",
+                        host_id,
+                        exc,
+                    )
+                self._offline_hosts.add(host_id)
+                continue
             previous = self._last_attempt.get(host_id)
-            if previous is not None and now - previous < self.interval_seconds:
+            recovering = host_id in self._offline_hosts
+            if (
+                not recovering
+                and previous is not None
+                and now - previous < self.interval_seconds
+            ):
                 continue
             self._last_attempt[host_id] = now
+            self._offline_hosts.discard(host_id)
             try:
                 if self.fetch is None:
                     self.provider_usage.refresh_host(host)

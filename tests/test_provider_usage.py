@@ -1,15 +1,19 @@
 """Contracts for normalized provider account usage."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 
 import duckdb
 import pytest
 
 from drover.schema import bootstrap
+from drover.config import load_config
 from drover.server.providers.codex import CodexUsageProbe
+from drover.server.cockpit.analytics import AnalyticsFilters
+from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.providers.inventory import detect_provider_accounts
 from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import (
@@ -361,3 +365,192 @@ def test_provider_refresh_is_atomic_deduplicated_and_records_every_attempt(
     assert connection[0] is not None
     assert connection[1] is not None
     assert connection[2] is None
+
+
+def test_identical_success_advances_effective_freshness_without_new_snapshot(
+    tmp_path, provider_host
+):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    clock = [datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc)]
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: clock[0],
+        freshness_threshold_seconds=300,
+    )
+
+    service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    clock[0] += timedelta(minutes=2)
+    service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+
+    account = service.latest_accounts()
+    parts = list((parquet_dir / "provider_usage_snapshots").glob("*.parquet"))
+    with duckdb.connect(str(duckdb_path)) as con:
+        snapshot_count = con.execute(
+            "SELECT count(DISTINCT snapshot_id) FROM provider_usage_snapshots"
+        ).fetchone()[0]
+
+    assert len(account) == 1
+    assert account[0].status == "ok"
+    assert account[0].observed_at == clock[0]
+    assert account[0].provider_observed_at == datetime(
+        2026, 8, 8, 10, tzinfo=timezone.utc
+    )
+    assert account[0].freshness_age_seconds == 0
+    assert len(parts) == 1
+    assert snapshot_count == 1
+
+    overview = CockpitService(
+        duckdb_path=None,
+        provider_usage=service,
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    ).overview(AnalyticsFilters(days=7))
+    capacity = overview["provider_capacity"]
+    assert capacity["status"] == "ok"
+    assert capacity["observed_at"] == clock[0]
+    assert capacity["data"][0]["provider_observed_at"] == datetime(
+        2026, 8, 8, 10, tzinfo=timezone.utc
+    )
+
+
+def test_success_older_than_injected_threshold_is_explicitly_stale(
+    tmp_path, provider_host
+):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    clock = [datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc)]
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: clock[0],
+        freshness_threshold_seconds=300,
+    )
+    service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+
+    clock[0] += timedelta(seconds=301)
+    account = service.latest_accounts()[0]
+
+    assert account.status == "stale"
+    assert account.error_category == "freshness_expired"
+    assert account.freshness_age_seconds == 301
+
+
+def test_success_within_threshold_is_not_falsely_stale(tmp_path, provider_host):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    clock = [datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc)]
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: clock[0],
+        freshness_threshold_seconds=300,
+    )
+    service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+
+    clock[0] += timedelta(seconds=299)
+    account = service.latest_accounts()[0]
+
+    assert account.status == "ok"
+    assert account.error_category is None
+    assert account.freshness_age_seconds == 299
+
+
+def test_expired_provider_reported_window_marks_account_stale(tmp_path, provider_host):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    clock = [datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc)]
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: clock[0],
+        freshness_threshold_seconds=86_400,
+    )
+    service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+
+    clock[0] = datetime(2026, 8, 8, 15, 0, 1, tzinfo=timezone.utc)
+    account = service.latest_accounts()[0]
+
+    assert account.status == "stale"
+    assert account.error_category == "provider_window_expired"
+    assert account.windows[0].resets_at == datetime(2026, 8, 8, 15, tzinfo=timezone.utc)
+
+
+def test_offline_host_stales_immediately_and_recovery_clears_status(
+    tmp_path, provider_host
+):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc),
+        freshness_threshold_seconds=300,
+    )
+    host = SimpleNamespace(**vars(provider_host), status="online")
+
+    class _Registry:
+        def list_hosts(self):
+            return [host]
+
+    refreshes = []
+    monotonic_clock = [0.0]
+    loop = ProviderRefreshLoop(
+        provider_usage=service,
+        registry=_Registry(),
+        shutdown_event=threading.Event(),
+        interval_seconds=300,
+        clock=lambda: monotonic_clock[0],
+        fetch=lambda item: refreshes.append(item.host_id) or GOOD_PAYLOAD,
+    )
+
+    loop.run_once()
+    host.status = "offline"
+    monotonic_clock[0] = 10
+    loop.run_once()
+    offline = service.latest_accounts()[0]
+    host.status = "online"
+    monotonic_clock[0] = 20
+    loop.run_once()
+    recovered = service.latest_accounts()[0]
+
+    assert offline.status == "stale"
+    assert offline.error_category == "host_offline"
+    assert recovered.status == "ok"
+    assert recovered.error_category is None
+    assert refreshes == ["mac-mini", "mac-mini"]
+
+
+def test_provider_freshness_threshold_is_runtime_configurable(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[provider]\nfreshness_threshold_seconds = 900\n")
+
+    config = load_config(config_path)
+
+    assert config.provider_freshness_threshold_seconds == 900.0
+
+
+def test_legacy_codex_source_is_normalized_to_canonical_contract(
+    tmp_path, provider_host
+):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc),
+    )
+    legacy_payload = {
+        **GOOD_PAYLOAD,
+        "accounts": [{**GOOD_PAYLOAD["accounts"][0], "source": "codex_app_server"}],
+    }
+
+    service.refresh_host(provider_host, fetch=lambda _: legacy_payload)
+
+    assert service.latest_accounts()[0].source == "codex-app-server"

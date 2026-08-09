@@ -121,6 +121,9 @@ class DroverConfig:
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     harness_favorite_cwds: tuple[str, ...]
+    # Provider account freshness. Successful identical observations advance
+    # this fetch clock without duplicating immutable quota snapshots.
+    provider_freshness_threshold_seconds: float
     # Deterministic advisory checks. Content/model analysis remains separately
     # consented and is not enabled by these operational scheduler settings.
     advisory_full_review_interval_seconds: float
@@ -187,6 +190,9 @@ _DEFAULTS = {
     "harness": {
         "favorite_cwds": [],
     },
+    "provider": {
+        "freshness_threshold_seconds": 600.0,
+    },
     "advisory": {
         "full_review_interval_seconds": 86400.0,
         "poll_interval_seconds": 5.0,
@@ -217,6 +223,11 @@ def _from_dict(d: dict) -> DroverConfig:
     r = d["redis_shadow"]
     j = d["redis_jobs"]
     content = d["advisory_content"]
+    provider_freshness_threshold_seconds = float(
+        d["provider"]["freshness_threshold_seconds"]
+    )
+    if provider_freshness_threshold_seconds <= 0:
+        raise ValueError("provider.freshness_threshold_seconds must be positive")
     return DroverConfig(
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
@@ -260,6 +271,7 @@ def _from_dict(d: dict) -> DroverConfig:
         harness_favorite_cwds=tuple(
             str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
         ),
+        provider_freshness_threshold_seconds=provider_freshness_threshold_seconds,
         advisory_full_review_interval_seconds=float(
             d["advisory"]["full_review_interval_seconds"]
         ),

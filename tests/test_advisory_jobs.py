@@ -2202,7 +2202,7 @@ def test_provider_refresh_notifies_only_for_material_operational_change() -> Non
     now = [0.0]
 
     class _Registry:
-        def list_hosts(self, *, status: str):
+        def list_hosts(self):
             return [type("Host", (), {"host_id": "mac-mini"})()]
 
     class _ProviderUsage:

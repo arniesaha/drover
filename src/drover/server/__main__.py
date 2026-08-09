@@ -181,6 +181,11 @@ api_token = ""
 agent_id     = "{default_agent_id}"
 principal_id = "unknown"
 
+[provider]
+# Provider fetches run every five minutes. Retain provider-reported quota facts,
+# but label them stale when no successful fetch has completed within this age.
+freshness_threshold_seconds = 600
+
 [summarizer]
 # backend_policy:
 #   hybrid = prefer Anthropic, fall back to local Ollama only when cloud auth is unavailable
@@ -1442,6 +1447,7 @@ def run(
                 duckdb_path=cfg.duckdb_path,
                 parquet_dir=cfg.parquet_dir,
                 api_token=auth.api_token if auth.enabled else None,
+                freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
             )
             metrics_collector.cockpit_service = CockpitService(
                 duckdb_path=cfg.duckdb_path,

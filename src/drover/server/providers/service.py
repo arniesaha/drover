@@ -87,11 +87,17 @@ class ProviderUsageService:
         *,
         api_token: str | None = None,
         timeout_s: float = 5.0,
+        clock: Callable[[], datetime] | None = None,
+        freshness_threshold_seconds: float = 600.0,
     ) -> None:
+        if freshness_threshold_seconds <= 0:
+            raise ValueError("provider freshness threshold must be positive")
         self.duckdb_path = Path(duckdb_path)
         self.parquet_dir = Path(parquet_dir)
         self.api_token = api_token
         self.timeout_s = timeout_s
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.freshness_threshold_seconds = float(freshness_threshold_seconds)
         self.snapshot_dir = self.parquet_dir / "provider_usage_snapshots"
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -102,7 +108,7 @@ class ProviderUsageService:
         fetch: FetchProviderUsage | None = None,
     ) -> tuple[ProviderAccountSnapshot, ...]:
         """Fetch and persist one host observation without propagating failures."""
-        attempted_at = datetime.now(timezone.utc)
+        attempted_at = self.clock()
         host_id = _host_value(host, "host_id")
         if not host_id:
             raise ValueError("host_id is required")
@@ -200,6 +206,7 @@ class ProviderUsageService:
             by_account.setdefault(key, []).append(snapshot)
 
         latest: list[ProviderAccountSnapshot] = []
+        now = self.clock()
         for key, account_snapshots in by_account.items():
             base = next(
                 (
@@ -210,12 +217,45 @@ class ProviderUsageService:
                 account_snapshots[0],
             )
             connection = connections.get(key)
+            provider_observed_at = base.observed_at
+            effective_observed_at = (
+                connection.get("last_success_at")
+                if connection and connection.get("last_success_at") is not None
+                else base.observed_at
+            )
+            freshness_age_seconds = max(
+                0.0, (now - effective_observed_at).total_seconds()
+            )
+            base = replace(
+                base,
+                observed_at=effective_observed_at,
+                provider_observed_at=provider_observed_at,
+                freshness_age_seconds=freshness_age_seconds,
+            )
             if connection and _connection_failed(connection):
                 status = "stale" if base.status in _SUCCESS_STATUSES else "error"
                 base = replace(
                     base,
                     status=status,
                     error_category=connection.get("error_category"),
+                )
+            elif (
+                base.status in _SUCCESS_STATUSES
+                and freshness_age_seconds > self.freshness_threshold_seconds
+            ):
+                base = replace(
+                    base,
+                    status="stale",
+                    error_category="freshness_expired",
+                )
+            elif base.status in _SUCCESS_STATUSES and any(
+                window.resets_at is not None and window.resets_at <= now
+                for window in base.windows
+            ):
+                base = replace(
+                    base,
+                    status="stale",
+                    error_category="provider_window_expired",
                 )
             latest.append(base)
         return sorted(
@@ -226,6 +266,19 @@ class ProviderUsageService:
     def operational_source_version(self, host_id: str) -> str:
         """Hash material connector/quota state while ignoring refresh clocks."""
         return provider_operational_source_version(self.duckdb_path, host_id)
+
+    def mark_host_unavailable(
+        self, host_id: str, *, error_category: str = "host_offline"
+    ) -> None:
+        """Overlay an unavailable fleet state without mutating snapshot facts."""
+        host_id = str(host_id).strip()
+        if not host_id:
+            raise ValueError("host_id is required")
+        self._record_host_failure(
+            host_id,
+            attempted_at=self.clock(),
+            error_category=error_category,
+        )
 
     def _fetch_host(self, host: Any) -> Mapping[str, Any]:
         endpoint = (
@@ -418,7 +471,7 @@ def _snapshots_from_payload(
                     account.get("observed_at"), "observed_at", required=True
                 ),  # type: ignore[arg-type]
                 windows=windows,
-                source=str(account.get("source") or "").strip(),
+                source=_canonical_source(account.get("source")),
                 error_category=_optional_text(account.get("error_category")),
             )
         )
@@ -478,7 +531,7 @@ def _snapshots_from_rows(rows: list[dict[str, Any]]) -> list[ProviderAccountSnap
                 status=first["status"],
                 observed_at=first["observed_at"],
                 windows=windows,
-                source=first["source"],
+                source=_canonical_source(first["source"]),
                 error_category=first["error_category"],
             )
         )
@@ -526,3 +579,11 @@ def _error_category(exc: Exception) -> str:
 def _optional_text(value: Any) -> str | None:
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _canonical_source(value: Any) -> str:
+    source = str(value or "").strip()
+    return {
+        "codex_app_server": "codex-app-server",
+        "harness_inventory": "harness-inventory",
+    }.get(source, source)

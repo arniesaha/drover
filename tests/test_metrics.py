@@ -1042,7 +1042,7 @@ def test_provider_refresh_loop_only_refreshes_online_hosts_once_per_interval():
 
     class _Registry:
         def list_hosts(self, *, status=None):
-            assert status == "online"
+            assert status is None
             return [type("Host", (), {"host_id": "mac-mini"})()]
 
     class _ProviderUsage:

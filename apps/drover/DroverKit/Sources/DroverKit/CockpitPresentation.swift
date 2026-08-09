@@ -234,8 +234,8 @@ public struct ProviderCapacityPresentation: Sendable, Equatable {
 
     private static func sourceLabel(_ source: String) -> String {
         switch source {
-        case "codex_app_server": return "Provider reported"
-        case "harness_inventory": return "Harness detected"
+        case "codex-app-server", "codex_app_server": return "Provider reported"
+        case "harness-inventory", "harness_inventory": return "Harness detected"
         default: return source.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }

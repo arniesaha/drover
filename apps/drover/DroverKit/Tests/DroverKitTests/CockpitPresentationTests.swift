@@ -194,6 +194,23 @@ import Testing
     #expect(value.sourceText == "Provider reported")
 }
 
+@Test func canonicalCodexSourceNamesProviderReported() throws {
+    let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(#"""
+    {"snapshot_id":"snapshot-1","dedup_key":"codex:personal","provider":"openai",
+     "account_label":"Personal","host_id":"mac-mini","status":"ok",
+     "observed_at":"2026-08-08T18:00:00Z","source":"codex-app-server",
+     "windows":[{"kind":"primary","used_percent":20}]}
+    """#.utf8))
+
+    let value = ProviderCapacityPresentation(
+        account: account,
+        window: account.windows[0],
+        now: Date(timeIntervalSince1970: 1_786_212_100)
+    )
+
+    #expect(value.sourceText == "Provider reported")
+}
+
 @Test func disabledSelectionWaitsForConfirmedRevocationAndCancelRestoresActualBackend() {
     var state = ContentAnalysisSelectionState()
     state.synchronize(enabled: true, backend: .cloud, disclosureAccepted: true)
