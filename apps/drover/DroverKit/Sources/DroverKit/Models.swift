@@ -491,11 +491,15 @@ public struct HarnessSnapshot: Sendable, Decodable {
     public var hosts: [HostSummary]
     public var sessions: [SessionSummary]
     public var cwdSuggestions: [CwdSuggestion]
+    public var cockpitAPIVersion: Int?
+    public var cockpitSections: [String]
 
     private enum CodingKeys: String, CodingKey {
         case hosts
         case sessions
         case cwdSuggestions = "cwd_suggestions"
+        case cockpitAPIVersion = "cockpit_api_version"
+        case cockpitSections = "cockpit_sections"
     }
 
     public init(from decoder: Decoder) throws {
@@ -506,6 +510,8 @@ public struct HarnessSnapshot: Sendable, Decodable {
         sessions = lenientDecode(SessionSummary.self, from: sessionsWrapped)
         let suggestionsWrapped = (try? container.decode([LenientElement<CwdSuggestion>].self, forKey: .cwdSuggestions)) ?? []
         cwdSuggestions = lenientDecode(CwdSuggestion.self, from: suggestionsWrapped)
+        cockpitAPIVersion = try? container.decode(Int.self, forKey: .cockpitAPIVersion)
+        cockpitSections = (try? container.decode([String].self, forKey: .cockpitSections)) ?? []
     }
 
     public static func decode(from data: Data) throws -> HarnessSnapshot {

@@ -423,6 +423,146 @@ struct ClientTests {
     ])
 }
 
+@Test func cockpitOverviewUsesAuthenticatedBoundedDaysQuery() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/cockpit/overview")
+        #expect(request.url?.query == "days=7")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        return (200, emptyOverviewJSON)
+    }
+
+    _ = try await client().cockpitOverview(days: 7)
+}
+
+@Test func analyticsEncodesAllowlistedFiltersOnceInDeterministicOrder() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/analytics")
+        #expect(request.url?.query == "days=30&host_id=mac%20mini&harness=codex&provider=openai&model=gpt-5.6-sol&project_key=arniesaha%2Fdrover")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        return (200, emptyAnalyticsJSON)
+    }
+
+    _ = try await client().analytics(filters: AnalyticsFilters(
+        days: 30,
+        hostID: "mac mini",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        projectKey: "arniesaha/drover"
+    ))
+}
+
+@Test func insightsCursorAndFiltersAreEncodedExactlyOnce() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/insights")
+        #expect(request.url?.query == "state=open&severity=high&confidence=confirmed&analyzer_class=deterministic&host=mac-mini&harness=codex&target_type=hook&target_id=mac-mini%2Fcodex%2Fpre%20tool&cursor=rank%2Btime%2Fnext%3D&limit=25")
+        let cursorItems = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+            .queryItems?.filter { $0.name == "cursor" }
+        #expect(cursorItems?.count == 1)
+        #expect(cursorItems?.first?.value == "rank+time/next=")
+        return (200, Data(#"{"findings":[],"next_cursor":null}"#.utf8))
+    }
+
+    _ = try await client().insights(filters: InsightFilters(
+        state: .open,
+        severity: .high,
+        confidence: .confirmed,
+        analyzerClass: .deterministic,
+        host: "mac-mini",
+        harness: "codex",
+        targetType: "hook",
+        targetID: "mac-mini/codex/pre tool",
+        cursor: "rank+time/next=",
+        limit: 25
+    ))
+}
+
+@Test func insightLifecycleAndPrivacyRoutesUseExpectedBodies() async throws {
+    let seen = RequestLog()
+    MockURLProtocol.handler = { request in
+        let body = request.bodyStreamData()
+        let encodedPath = request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?.percentEncodedPath
+        } ?? ""
+        let bodyText = body.isEmpty ? "<none>" : (String(data: body, encoding: .utf8) ?? "<none>")
+        seen.append("\(request.httpMethod ?? "") \(encodedPath) \(bodyText)")
+        switch encodedPath {
+        case "/insights/finding%2Fone":
+            return (200, insightDetailJSON)
+        case "/insights/finding%2Fone/acknowledge", "/insights/finding%2Fone/dismiss":
+            return (200, insightMutationJSON)
+        case "/insights/finding%2Fone/check":
+            return (202, Data(#"{"status":"queued","job_id":"job-1"}"#.utf8))
+        case "/insights/content-analysis":
+            return (200, contentAnalysisStatusJSON)
+        case "/insights/content-analysis/consent":
+            return (200, contentAnalysisStatusJSON)
+        case "/insights/content-analysis/revoke":
+            return (200, Data(#"{"enabled":false,"backend":"local","external_disclosure_accepted":false,"pending_model_jobs":0,"cancelled_model_jobs":2}"#.utf8))
+        case "/insights/content-excerpts":
+            return (200, Data(#"{"purged_excerpt_count":3}"#.utf8))
+        default:
+            Issue.record("unexpected request \(request)")
+            return (404, Data())
+        }
+    }
+
+    _ = try await client().insightDetail(findingID: "finding/one")
+    _ = try await client().acknowledgeInsight(findingID: "finding/one")
+    _ = try await client().dismissInsight(findingID: "finding/one", reason: "accepted tradeoff")
+    _ = try await client().checkInsight(findingID: "finding/one")
+    _ = try await client().contentAnalysisStatus()
+    _ = try await client().setContentAnalysisConsent(backend: .cloud, externalDisclosureAccepted: true)
+    _ = try await client().revokeContentAnalysis()
+    _ = try await client().purgeContentExcerpts()
+
+    #expect(seen.values == [
+        "GET /insights/finding%2Fone <none>",
+        "POST /insights/finding%2Fone/acknowledge {}",
+        "POST /insights/finding%2Fone/dismiss {\"reason\":\"accepted tradeoff\"}",
+        "POST /insights/finding%2Fone/check {}",
+        "GET /insights/content-analysis <none>",
+        "POST /insights/content-analysis/consent {\"backend\":\"cloud\",\"external_disclosure_accepted\":true}",
+        "POST /insights/content-analysis/revoke {}",
+        "DELETE /insights/content-excerpts <none>",
+    ])
+}
+
+private let emptyOverviewJSON = Data(#"""
+{"cockpit_api_version":1,
+ "provider_capacity":{"status":"unavailable","observed_at":null,"coverage":null,"data":[]},
+ "activity":{"status":"error","observed_at":null,"coverage":null,"data":null},
+ "popular_projects":[]}
+"""#.utf8)
+
+private let emptyAnalyticsJSON = Data(#"""
+{"cockpit_api_version":1,
+ "filters":{"days":30,"host_id":"mac mini","harness":"codex","provider":"openai","model":"gpt-5.6-sol","project_key":"arniesaha/drover"},
+ "provider_capacity":{"status":"unavailable","observed_at":null,"coverage":null,"data":[]},
+ "activity":{"status":"error","observed_at":null,"coverage":null,"data":null}}
+"""#.utf8)
+
+private let insightFindingJSON = #"""
+{"finding_id":"finding-one","analyzer_id":"deterministic.hook","rule_id":"hook_validity",
+ "target_type":"hook","target_id":"mac-mini/codex/pre-tool","analyzer_class":"deterministic",
+ "severity":"high","confidence":"confirmed","title":"Hook is broken","impact":"Turns fail",
+ "remediation":["Fix the executable path"],"state":"open","dismissal_reason":null,
+ "first_seen_at":"2026-08-08T18:00:00+00:00","last_seen_at":"2026-08-08T18:01:00+00:00",
+ "resolved_at":null,"dismissed_at":null,"regressed_at":null}
+"""#
+
+private var insightDetailJSON: Data {
+    Data(#"{"finding":\#(insightFindingJSON),"evidence":[]}"#.utf8)
+}
+
+private var insightMutationJSON: Data {
+    Data(#"{"finding":\#(insightFindingJSON)}"#.utf8)
+}
+
+private let contentAnalysisStatusJSON = Data(#"""
+{"enabled":true,"backend":"cloud","external_disclosure_accepted":true,"pending_model_jobs":0}
+"""#.utf8)
+
 private final class RequestLog: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String] = []

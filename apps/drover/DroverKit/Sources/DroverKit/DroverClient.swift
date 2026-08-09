@@ -73,6 +73,109 @@ public actor DroverClient {
         return try decode(HarnessSnapshot.self, from: data)
     }
 
+    public func cockpitOverview(days: Int = 7) async throws -> CockpitOverview {
+        let url = try queryURL(path: "/cockpit/overview", items: [
+            ("days", String(days)),
+        ])
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(CockpitOverview.self, from: data)
+    }
+
+    public func analytics(filters: AnalyticsFilters = AnalyticsFilters()) async throws
+        -> AnalyticsSnapshot {
+        let url = try queryURL(path: "/analytics", items: [
+            ("days", String(filters.days)),
+            ("host_id", filters.hostID),
+            ("harness", filters.harness),
+            ("provider", filters.provider),
+            ("model", filters.model),
+            ("project_key", filters.projectKey),
+        ])
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(AnalyticsSnapshot.self, from: data)
+    }
+
+    public func insights(filters: InsightFilters = InsightFilters()) async throws
+        -> InsightPage {
+        let url = try queryURL(path: "/insights", items: [
+            ("state", filters.state?.rawValue),
+            ("severity", filters.severity?.rawValue),
+            ("confidence", filters.confidence?.rawValue),
+            ("analyzer_class", filters.analyzerClass?.rawValue),
+            ("host", filters.host),
+            ("harness", filters.harness),
+            ("target_type", filters.targetType),
+            ("target_id", filters.targetID),
+            ("cursor", filters.cursor),
+            ("limit", String(filters.limit)),
+        ])
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(InsightPage.self, from: data)
+    }
+
+    public func insightDetail(findingID: String) async throws -> InsightDetail {
+        let path = "/insights/\(encodePathComponent(findingID))"
+        let data = try await request(path: path, method: "GET", body: nil)
+        return try decode(InsightDetail.self, from: data)
+    }
+
+    public func acknowledgeInsight(findingID: String) async throws -> InsightFinding {
+        let path = "/insights/\(encodePathComponent(findingID))/acknowledge"
+        let data = try await request(path: path, method: "POST", body: Data("{}".utf8))
+        return try decode(InsightMutationResponse.self, from: data).finding
+    }
+
+    public func dismissInsight(findingID: String, reason: String) async throws
+        -> InsightFinding {
+        let path = "/insights/\(encodePathComponent(findingID))/dismiss"
+        let body = try encodeJSON(DismissInsightBody(reason: reason))
+        let data = try await request(path: path, method: "POST", body: body)
+        return try decode(InsightMutationResponse.self, from: data).finding
+    }
+
+    public func checkInsight(findingID: String) async throws -> InsightCheckResponse {
+        let path = "/insights/\(encodePathComponent(findingID))/check"
+        let data = try await request(path: path, method: "POST", body: Data("{}".utf8))
+        return try decode(InsightCheckResponse.self, from: data)
+    }
+
+    public func contentAnalysisStatus() async throws -> ContentAnalysisStatus {
+        let data = try await request(
+            path: "/insights/content-analysis", method: "GET", body: nil
+        )
+        return try decode(ContentAnalysisStatus.self, from: data)
+    }
+
+    public func setContentAnalysisConsent(
+        backend: ContentAnalysisBackend,
+        externalDisclosureAccepted: Bool = false
+    ) async throws -> ContentAnalysisStatus {
+        let body = try encodeJSON(ContentAnalysisConsentBody(
+            backend: backend,
+            externalDisclosureAccepted: externalDisclosureAccepted
+        ))
+        let data = try await request(
+            path: "/insights/content-analysis/consent", method: "POST", body: body
+        )
+        return try decode(ContentAnalysisStatus.self, from: data)
+    }
+
+    public func revokeContentAnalysis() async throws -> ContentAnalysisStatus {
+        let data = try await request(
+            path: "/insights/content-analysis/revoke",
+            method: "POST",
+            body: Data("{}".utf8)
+        )
+        return try decode(ContentAnalysisStatus.self, from: data)
+    }
+
+    public func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse {
+        let data = try await request(
+            path: "/insights/content-excerpts", method: "DELETE", body: nil
+        )
+        return try decode(PurgeContentExcerptsResponse.self, from: data)
+    }
+
     public func authStatus(hostID: String, harness: String) async throws -> HarnessAuthStatus {
         let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/status"
         let data = try await request(path: path, method: "GET", body: nil)
@@ -278,6 +381,39 @@ public actor DroverClient {
         return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
     }
 
+    private nonisolated func queryURL(
+        path: String,
+        items: [(String, String?)]
+    ) throws -> URL {
+        var components = URLComponents(
+            url: config.baseURL, resolvingAgainstBaseURL: false
+        )
+        components?.percentEncodedPath = path
+        let query = items.compactMap { name, value -> String? in
+            guard let value else { return nil }
+            return "\(encodeQueryComponent(name))=\(encodeQueryComponent(value))"
+        }.joined(separator: "&")
+        components?.percentEncodedQuery = query.isEmpty ? nil : query
+        guard let url = components?.url else {
+            throw DroverError.transport("invalid URL for path \(path)")
+        }
+        return url
+    }
+
+    private nonisolated func encodeQueryComponent(_ raw: String) -> String {
+        encodePathComponent(raw)
+    }
+
+    private nonisolated func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do {
+            return try encoder.encode(value)
+        } catch {
+            throw DroverError.decoding("failed to encode request: \(error)")
+        }
+    }
+
     /// Builds the request, sends it, and maps non-2xx responses to
     /// `DroverError`. Returns the raw response body on success.
     private func request(path: String, method: String, body: Data?,
@@ -403,5 +539,19 @@ private struct TurnResponse: Decodable {
 
     private enum CodingKeys: String, CodingKey {
         case turnID = "turn_id"
+    }
+}
+
+private struct DismissInsightBody: Encodable {
+    let reason: String
+}
+
+private struct ContentAnalysisConsentBody: Encodable {
+    let backend: ContentAnalysisBackend
+    let externalDisclosureAccepted: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case backend
+        case externalDisclosureAccepted = "external_disclosure_accepted"
     }
 }
