@@ -20,13 +20,16 @@ It does not require a Drover cloud service.
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view showing active sessions across two hosts" width="360">
-  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="360">
+  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view showing active sessions across two hosts" width="290">
+  <img src="docs/assets/screenshots/ios-fleet-light.png" alt="The same fleet view in light mode" width="290">
+  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="290">
 </p>
 
 The fleet view groups live work by host and brings approvals and questions to
-the top. The launch sheet selects a host and harness, checks authentication,
-and carries model and reasoning preferences into the new session.
+the top. One palette contract covers both themes, and the control beside the
+wordmark switches between them. The launch sheet selects a host and harness,
+checks authentication, and carries model and reasoning preferences into the
+new session.
 
 ## How it works
 
