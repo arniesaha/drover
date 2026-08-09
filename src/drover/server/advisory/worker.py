@@ -124,22 +124,25 @@ class ContentAnalysisScheduler:
         for host in self.registry.list_hosts():
             if host.host_id in self._scheduled_hosts:
                 continue
-            live = self.consent_reader()
-            if not live.enabled or _content_config_version(
-                live
-            ) != _content_config_version(config):
-                return {}
-            bundle = self.bundle_fetcher(host.host_id, target_ids)
-            enqueue_advisory_check(
-                self.duckdb_path,
-                analyzer_id=MODEL_ANALYZER_ID,
-                target_id=host.host_id,
-                source_version=(
-                    f"{bundle.bundle_hash}:scheduled:{bucket}:{material_hash}"
-                ),
-            )
-            discovered[host.host_id] = bundle
-            self._scheduled_hosts.add(host.host_id)
+            from drover.server.advisory.service import content_consent_operation
+
+            with content_consent_operation():
+                live = self.consent_reader()
+                if not live.enabled or _content_config_version(
+                    live
+                ) != _content_config_version(config):
+                    return {}
+                bundle = self.bundle_fetcher(host.host_id, target_ids)
+                enqueue_advisory_check(
+                    self.duckdb_path,
+                    analyzer_id=MODEL_ANALYZER_ID,
+                    target_id=host.host_id,
+                    source_version=(
+                        f"{bundle.bundle_hash}:scheduled:{bucket}:{material_hash}"
+                    ),
+                )
+                discovered[host.host_id] = bundle
+                self._scheduled_hosts.add(host.host_id)
         self._last_signature = signature
         return discovered
 
@@ -180,37 +183,42 @@ class ContentAnalysisWorker:
     def run_once(self) -> AdvisoryRunResult:
         """Claim and isolate one pending model-configuration job."""
 
+        from drover.server.advisory.service import content_consent_operation
+
         prefetched: dict[str, ContentBundle] = {}
         if self.scheduler is not None:
             prefetched = self.scheduler.enqueue_due()
-        config = self.consent_reader()
-        if not config.enabled:
-            prefetched.clear()
-            return AdvisoryRunResult(skipped=1)
-        if self.duckdb_path is None or self.repository is None:
-            raise ValueError("duckdb_path and repository are required for job dispatch")
-        job = self._claim_model_job()
-        if job is None:
-            return AdvisoryRunResult(skipped=1)
-        target_ids = tuple(Path(target).name for target in config.targets)
-        try:
-            host_id = job.subject_key.partition(":")[2]
-            result = self.run_model_job(
-                host_id=host_id,
-                target_ids=target_ids,
-                job=job,
-                prefetched_bundle=prefetched.get(host_id),
-            )
-            if result.status == "succeeded":
-                return AdvisoryRunResult(succeeded=1)
-            self._requeue_job(job)
-            return AdvisoryRunResult(skipped=1)
-        except Exception:  # noqa: BLE001 - isolate model/backend failures
-            self._record_content_failure(job)
-            log.warning("content advisory job failed")
-            return AdvisoryRunResult(failed=1)
-        finally:
-            prefetched.clear()
+        with content_consent_operation():
+            config = self.consent_reader()
+            if not config.enabled:
+                prefetched.clear()
+                return AdvisoryRunResult(skipped=1)
+            if self.duckdb_path is None or self.repository is None:
+                raise ValueError(
+                    "duckdb_path and repository are required for job dispatch"
+                )
+            job = self._claim_model_job()
+            if job is None:
+                return AdvisoryRunResult(skipped=1)
+            target_ids = tuple(Path(target).name for target in config.targets)
+            try:
+                host_id = job.subject_key.partition(":")[2]
+                result = self.run_model_job(
+                    host_id=host_id,
+                    target_ids=target_ids,
+                    job=job,
+                    prefetched_bundle=prefetched.get(host_id),
+                )
+                if result.status == "succeeded":
+                    return AdvisoryRunResult(succeeded=1)
+                self._requeue_job(job)
+                return AdvisoryRunResult(skipped=1)
+            except Exception:  # noqa: BLE001 - isolate model/backend failures
+                self._record_content_failure(job)
+                log.warning("content advisory job failed")
+                return AdvisoryRunResult(failed=1)
+            finally:
+                prefetched.clear()
 
     def start(
         self,
@@ -320,6 +328,24 @@ class ContentAnalysisWorker:
             con.close()
 
     def run_model_job(
+        self,
+        *,
+        host_id: str,
+        target_ids: Iterable[str],
+        job: Job | None = None,
+        prefetched_bundle: ContentBundle | None = None,
+    ) -> ContentAnalysisResult:
+        from drover.server.advisory.service import content_consent_operation
+
+        with content_consent_operation():
+            return self._run_model_job(
+                host_id=host_id,
+                target_ids=target_ids,
+                job=job,
+                prefetched_bundle=prefetched_bundle,
+            )
+
+    def _run_model_job(
         self,
         *,
         host_id: str,
@@ -460,12 +486,9 @@ class _ConsentFencedBackend:
     selected_policy: str
 
     def complete(self, system: str, user: str) -> str:
-        from drover.server.advisory.service import CONTENT_CONSENT_FENCE
+        from drover.server.advisory.service import content_consent_operation
 
-        # Revocation uses this same boundary while it atomically disables
-        # consent and cancels runnable jobs. Once the revoke response returns,
-        # no already-leased worker can cross into a backend call.
-        with CONTENT_CONSENT_FENCE:
+        with content_consent_operation():
             config = self.consent_reader()
             if (
                 not config.enabled

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import threading
 
 import duckdb
 import pytest
@@ -782,6 +783,137 @@ def test_disabled_content_worker_leaves_pending_job_without_fetch(
             ).fetchone()[0]
             == "pending"
         )
+
+
+def test_revoke_waits_for_scheduler_fetch_then_cancels_post_fetch_job(
+    db_path: Path, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "local"
+external_consent = false
+targets = ["/allowed/global-agents"]
+allowed_roots = ["/allowed"]
+max_file_bytes = 1024
+max_bundle_bytes = 4096
+excerpt_max_chars = 320
+""")
+    entered = threading.Event()
+    release = threading.Event()
+    revoked = threading.Event()
+    fetches: list[str] = []
+    bundle = _content_bundle("No issue.")
+
+    class Registry:
+        def list_hosts(self):
+            return [type("Host", (), {"host_id": "mac-mini"})()]
+
+    def fetch(host_id, _target_ids):
+        fetches.append(host_id)
+        entered.set()
+        assert release.wait(2)
+        return bundle
+
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=Registry(),
+        consent_reader=lambda: load_config(config_path).advisory_content,
+        bundle_fetcher=fetch,
+        interval_seconds=300,
+        clock=lambda: 1_000,
+    )
+    scheduling = threading.Thread(target=scheduler.enqueue_due)
+    scheduling.start()
+    assert entered.wait(2)
+
+    service = InsightsService(db_path, config_path=config_path)
+
+    def revoke() -> None:
+        service.revoke_content_analysis()
+        revoked.set()
+
+    revoker = threading.Thread(target=revoke)
+    revoker.start()
+    revoked_before_release = revoked.wait(0.2)
+    release.set()
+    scheduling.join(2)
+    revoker.join(2)
+
+    assert revoked_before_release is False
+    assert revoked.is_set()
+    assert service.pending_model_jobs() == []
+    assert fetches == ["mac-mini"]
+    assert scheduler.enqueue_due() == {}
+    assert fetches == ["mac-mini"]
+
+
+def test_revoke_waits_for_leased_worker_fetch_and_prevents_future_reads(
+    db_path: Path, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "local"
+external_consent = false
+targets = ["/allowed/global-agents"]
+allowed_roots = ["/allowed"]
+max_file_bytes = 1024
+max_bundle_bytes = 4096
+excerpt_max_chars = 320
+""")
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version="bundle-v1",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    revoked = threading.Event()
+    fetches: list[str] = []
+    bundle = _content_bundle("No issue.")
+
+    def fetch(host_id, _target_ids):
+        fetches.append(host_id)
+        entered.set()
+        assert release.wait(2)
+        return bundle
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            return '{"findings":[]}'
+
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: load_config(config_path).advisory_content,
+        bundle_fetcher=fetch,
+        backend_factory=lambda _config: Backend(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+    )
+    working = threading.Thread(target=worker.run_once)
+    working.start()
+    assert entered.wait(2)
+
+    service = InsightsService(db_path, config_path=config_path)
+
+    def revoke() -> None:
+        service.revoke_content_analysis()
+        revoked.set()
+
+    revoker = threading.Thread(target=revoke)
+    revoker.start()
+    revoked_before_release = revoked.wait(0.2)
+    release.set()
+    working.join(2)
+    revoker.join(2)
+
+    assert revoked_before_release is False
+    assert revoked.is_set()
+    assert service.pending_model_jobs() == []
+    assert fetches == ["mac-mini"]
+    assert worker.run_once().skipped == 1
+    assert fetches == ["mac-mini"]
 
 
 def test_revocation_after_lease_requeues_job_and_resumes_after_enable(

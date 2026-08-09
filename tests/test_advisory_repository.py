@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import os
+import stat
 
 import duckdb
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from drover.config import load_config
 from drover.schema import bootstrap
 from drover.server.advisory.jobs import enqueue_advisory_check
+from drover.server.advisory import service as advisory_service_module
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.service import (
     InsightFilters,
@@ -122,6 +125,34 @@ def test_content_analysis_consent_creates_missing_default_deny_config(
     assert status["enabled"] is True
     assert config_path.exists()
     assert load_config(config_path).advisory_content.enabled is True
+
+
+def test_content_consent_fsyncs_directory_after_atomic_replace(
+    repository, content_config_path, monkeypatch
+):
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def recording_fsync(fd: int) -> None:
+        events.append(
+            "directory_fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_fsync"
+        )
+        real_fsync(fd)
+
+    def recording_replace(source, target) -> None:
+        events.append("replace")
+        real_replace(source, target)
+
+    monkeypatch.setattr(advisory_service_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(advisory_service_module.os, "replace", recording_replace)
+    service = InsightsService(repository.duckdb_path, config_path=content_config_path)
+
+    service.consent_content_analysis(
+        backend="local", external_disclosure_accepted=False
+    )
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
 
 
 def test_content_analysis_revoke_cancels_model_jobs_but_keeps_findings(

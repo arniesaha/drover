@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -38,8 +39,55 @@ _SEVERITY_RANK_SQL = (
     "CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
     "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 END"
 )
-CONTENT_CONSENT_FENCE = threading.RLock()
+
+
+class _ContentConsentCoordinator:
+    """Track active content operations without locking across remote I/O."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self._condition = threading.Condition(self.lock)
+        self._active = 0
+        self._revoking = False
+
+    @contextmanager
+    def operation(self):
+        with self._condition:
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                if self._active == 0:
+                    self._condition.notify_all()
+
+    def wait_for_idle(self) -> None:
+        # The caller holds ``lock`` while persisting disabled consent. Condition
+        # waits release it so active operations can drain, while new operations
+        # can only observe the already-disabled configuration.
+        while self._active:
+            self._condition.wait()
+
+    def begin_revocation(self) -> None:
+        self._revoking = True
+
+    def finish_revocation(self) -> None:
+        self._revoking = False
+        self._condition.notify_all()
+
+    def wait_for_revocation(self) -> None:
+        while self._revoking:
+            self._condition.wait()
+
+
+_CONTENT_CONSENT_COORDINATOR = _ContentConsentCoordinator()
+CONTENT_CONSENT_FENCE = _CONTENT_CONSENT_COORDINATOR.lock
 _CONTENT_JOB_STATUSES = ("pending", "leased", "retry_wait")
+
+
+def content_consent_operation():
+    return _CONTENT_CONSENT_COORDINATOR.operation()
 
 
 class InvalidInsightRequest(ValueError):
@@ -132,6 +180,7 @@ class InsightsService:
         # Local consent never carries cloud disclosure forward implicitly.
         disclosure = backend == "cloud" and external_disclosure_accepted
         with CONTENT_CONSENT_FENCE:
+            _CONTENT_CONSENT_COORDINATOR.wait_for_revocation()
             self._persist_content_consent(
                 enabled=True,
                 backend=backend,
@@ -149,13 +198,18 @@ class InsightsService:
         """Disable model analysis before atomically cancelling runnable jobs."""
 
         with CONTENT_CONSENT_FENCE:
-            self._persist_content_consent(
-                enabled=False,
-                backend="local",
-                external_disclosure_accepted=False,
-            )
-            cancelled = self._cancel_pending_model_jobs()
-            pending = self._pending_model_job_count()
+            _CONTENT_CONSENT_COORDINATOR.begin_revocation()
+            try:
+                self._persist_content_consent(
+                    enabled=False,
+                    backend="local",
+                    external_disclosure_accepted=False,
+                )
+                _CONTENT_CONSENT_COORDINATOR.wait_for_idle()
+                cancelled = self._cancel_pending_model_jobs()
+                pending = self._pending_model_job_count()
+            finally:
+                _CONTENT_CONSENT_COORDINATOR.finish_revocation()
         return {
             "enabled": False,
             "backend": "local",
@@ -314,6 +368,14 @@ class InsightsService:
             load_config(Path(temp_name))
             os.replace(temp_name, self.config_path)
             temp_name = None
+            directory_fd = os.open(
+                self.config_path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             if temp_name is not None:
                 Path(temp_name).unlink(missing_ok=True)
@@ -602,6 +664,7 @@ def _wire_datetime(value: datetime | None) -> str | None:
 
 __all__ = [
     "CONTENT_CONSENT_FENCE",
+    "content_consent_operation",
     "InsightFilters",
     "InsightsService",
     "InvalidInsightRequest",
