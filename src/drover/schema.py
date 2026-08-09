@@ -51,6 +51,8 @@ EXPECTED_TABLES = (
     "pipeline_job_attempts",
     "pipeline_artifacts",
     "provider_connections",
+    "advisory_findings",
+    "advisory_occurrences",
     *HARNESS_TABLES,
 )
 EXPECTED_VIEWS = (
@@ -446,6 +448,47 @@ CREATE TABLE IF NOT EXISTS provider_connections (
   credential_reference         VARCHAR,
   updated_at                   TIMESTAMPTZ DEFAULT now(),
   PRIMARY KEY (provider, account_label, host_id)
+);
+"""
+
+_ADVISORY_FINDINGS_DDL = """
+CREATE TABLE IF NOT EXISTS advisory_findings (
+  finding_id              VARCHAR PRIMARY KEY,
+  fingerprint             VARCHAR NOT NULL UNIQUE,
+  analyzer_id             VARCHAR NOT NULL,
+  rule_id                 VARCHAR NOT NULL,
+  target_type             VARCHAR NOT NULL,
+  target_id               VARCHAR NOT NULL,
+  analyzer_class          VARCHAR NOT NULL,
+  severity                VARCHAR NOT NULL,
+  confidence              VARCHAR NOT NULL,
+  title                   VARCHAR NOT NULL,
+  impact                  VARCHAR NOT NULL,
+  remediation_json        VARCHAR NOT NULL,
+  state                   VARCHAR NOT NULL,
+  dismissal_reason        VARCHAR,
+  first_seen_at           TIMESTAMPTZ NOT NULL,
+  last_seen_at            TIMESTAMPTZ NOT NULL,
+  resolved_at             TIMESTAMPTZ,
+  dismissed_at            TIMESTAMPTZ,
+  regressed_at            TIMESTAMPTZ,
+  evaluated_content_hash  VARCHAR,
+  latest_run_id           VARCHAR NOT NULL
+);
+"""
+
+_ADVISORY_OCCURRENCES_DDL = """
+CREATE TABLE IF NOT EXISTS advisory_occurrences (
+  occurrence_id   VARCHAR PRIMARY KEY,
+  finding_id      VARCHAR NOT NULL,
+  run_id          VARCHAR NOT NULL,
+  outcome         VARCHAR NOT NULL,
+  observed_at     TIMESTAMPTZ NOT NULL,
+  source_ref      VARCHAR,
+  evidence_json   VARCHAR,
+  excerpt         VARCHAR,
+  evidence_hash   VARCHAR,
+  recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
@@ -1465,6 +1508,8 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_JOB_ATTEMPTS_DDL)
         con.execute(_PIPELINE_ARTIFACTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
+        con.execute(_ADVISORY_FINDINGS_DDL)
+        con.execute(_ADVISORY_OCCURRENCES_DDL)
         bootstrap_harness_tables(con)
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))

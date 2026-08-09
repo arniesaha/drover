@@ -49,6 +49,55 @@ def test_bootstrap_creates_provider_storage(tmp_lakehouse):
         con.close()
 
 
+def test_bootstrap_creates_advisory_storage(tmp_lakehouse):
+    parquet_dir, db_path = tmp_lakehouse
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
+
+    con = duckdb.connect(str(db_path))
+    try:
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        }
+        assert {"advisory_findings", "advisory_occurrences"} <= tables
+
+        finding_columns = {
+            row[0]
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'advisory_findings'"
+            ).fetchall()
+        }
+        assert {
+            "finding_id",
+            "fingerprint",
+            "analyzer_id",
+            "rule_id",
+            "target_type",
+            "target_id",
+            "analyzer_class",
+            "severity",
+            "confidence",
+            "title",
+            "impact",
+            "remediation_json",
+            "state",
+            "dismissal_reason",
+            "first_seen_at",
+            "last_seen_at",
+            "resolved_at",
+            "dismissed_at",
+            "regressed_at",
+            "evaluated_content_hash",
+            "latest_run_id",
+        } <= finding_columns
+    finally:
+        con.close()
+
+
 def test_bootstrap_creates_expected_tables(tmp_lakehouse):
     parquet_dir, db_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
