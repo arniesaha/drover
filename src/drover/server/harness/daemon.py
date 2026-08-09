@@ -1462,6 +1462,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
 
     def _advisory_content_bundle(self) -> None:
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json(
+                {"error": "authentication required"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
         config = self.server.state.advisory_content
         if config is None or not config.enabled:
             self._write_json(

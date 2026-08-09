@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import http.client
 import json
 import logging
@@ -107,6 +108,7 @@ def _validate_advisory_content_bundle(
     if not isinstance(targets, list) or len(targets) != len(requested_ids):
         raise ValueError("content bundle response has invalid targets")
     returned_ids: list[str] = []
+    hash_pairs: list[tuple[str, str]] = []
     for target in targets:
         if not isinstance(target, dict) or set(target) != {
             "target_id",
@@ -120,9 +122,24 @@ def _validate_advisory_content_bundle(
             raise ValueError("content bundle response has invalid content_hash")
         if not isinstance(target["redacted_content"], str):
             raise ValueError("content bundle response has invalid redacted content")
+        computed_content_hash = hashlib.sha256(
+            target["redacted_content"].encode("utf-8")
+        ).hexdigest()
+        if target["content_hash"] != computed_content_hash:
+            raise ValueError("content bundle response content_hash does not match")
         returned_ids.append(target["target_id"])
+        hash_pairs.append((target["target_id"], target["content_hash"]))
     if returned_ids != requested_ids:
         raise ValueError("content bundle response target IDs do not match request")
+    computed_bundle_hash = hashlib.sha256(
+        json.dumps(
+            hash_pairs,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload["bundle_hash"] != computed_bundle_hash:
+        raise ValueError("content bundle response bundle_hash does not match")
 
 
 def _is_sha256(value: Any) -> bool:
@@ -131,6 +148,27 @@ def _is_sha256(value: Any) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _read_bounded_http_body(response: Any, *, max_response_bytes: int | None) -> str:
+    if max_response_bytes is None:
+        return response.read().decode("utf-8")
+    if max_response_bytes <= 0:
+        raise ValueError("max_response_bytes must be positive")
+    content_length = response.getheader("Content-Length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError as exc:
+            raise ValueError("harness response has invalid Content-Length") from exc
+        if declared_bytes < 0:
+            raise ValueError("harness response has invalid Content-Length")
+        if declared_bytes > max_response_bytes:
+            raise ValueError("harness response exceeds byte limit")
+    body = response.read(max_response_bytes + 1)
+    if len(body) > max_response_bytes:
+        raise ValueError("harness response exceeds byte limit")
+    return body.decode("utf-8")
 
 
 def _label_value(value: object) -> str:
@@ -865,6 +903,7 @@ class MetricsCollector:
             method="POST",
             payload={"target_ids": target_ids},
             timeout_s=15.0,
+            max_response_bytes=_MAX_CONTENT_BUNDLE_RESPONSE_BYTES,
         )
         body_bytes = body.encode("utf-8")
         if len(body_bytes) > _MAX_CONTENT_BUNDLE_RESPONSE_BYTES:
@@ -1467,6 +1506,7 @@ class MetricsCollector:
         method: str,
         payload: Mapping[str, Any] | None = None,
         timeout_s: float = 15,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         """Single routing choke point for every hub->harnessd API call.
 
@@ -1478,6 +1518,15 @@ class MetricsCollector:
         endpoint.
         """
         if self.relay_manager is not None and self.relay_manager.is_live(host.host_id):
+            if max_response_bytes is not None:
+                return self.relay_manager.request(
+                    host.host_id,
+                    method,
+                    path,
+                    dict(payload or {}),
+                    timeout_s=max(timeout_s, RELAY_MIN_TIMEOUT_S),
+                    max_response_bytes=max_response_bytes,
+                )
             return self.relay_manager.request(
                 host.host_id,
                 method,
@@ -1506,6 +1555,7 @@ class MetricsCollector:
                 method=method,
                 payload=payload,
                 timeout_s=timeout_s,
+                max_response_bytes=max_response_bytes,
             )
         return _json_response(
             502, {"error": f"harness host has no reachable endpoint: {host.host_id}"}
@@ -1518,6 +1568,7 @@ class MetricsCollector:
         method: str,
         payload: Mapping[str, Any] | None = None,
         timeout_s: float = 15,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         body = json.dumps(dict(payload or {}), sort_keys=True)
         parsed = urlparse(url)
@@ -1539,7 +1590,9 @@ class MetricsCollector:
                 headers=headers,
             )
             response = conn.getresponse()
-            return response.status, response.read().decode("utf-8")
+            return response.status, _read_bounded_http_body(
+                response, max_response_bytes=max_response_bytes
+            )
         except OSError as exc:
             return _json_response(502, {"error": f"harness host request failed: {exc}"})
         except Exception as exc:  # noqa: BLE001

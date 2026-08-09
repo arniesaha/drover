@@ -526,6 +526,29 @@ def test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default(tmp_pa
         server.server_close()
 
 
+def test_harnessd_content_bundle_requires_configured_token_even_when_enabled(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_text("Use the deployment skill.\n", encoding="utf-8")
+    server, state, base_url = _start_test_server(
+        tmp_path,
+        advisory_content=_content_config(target),
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            _json_request(
+                f"{base_url}/advisory/content-bundle",
+                payload={"target_ids": ["AGENTS.md"]},
+            )
+        assert unauthorized.value.code == 401
+        assert json.loads(unauthorized.value.read())["error"] == (
+            "authentication required"
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral(
     tmp_path,
 ):

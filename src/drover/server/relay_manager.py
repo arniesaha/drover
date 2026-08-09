@@ -322,6 +322,7 @@ class RelayManager:
         path: str,
         body: dict[str, Any] | None,
         timeout_s: float = 15,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         deadline = time.monotonic() + timeout_s
         connection = self._live(host_id)
@@ -333,7 +334,13 @@ class RelayManager:
             return _error(f"relay host not connected: {host_id}")
         try:
             connection.send(
-                req_frame(request_id, method, path, body),
+                req_frame(
+                    request_id,
+                    method,
+                    path,
+                    body,
+                    max_response_bytes=max_response_bytes,
+                ),
                 timeout_s=_remaining(deadline),
             )
         except _WriteTimeout as exc:
@@ -345,7 +352,13 @@ class RelayManager:
             self._teardown(connection, f"request send failed: {exc}")
             return _error(f"relay request failed: {exc}")
         try:
-            return waiter.get(timeout=_remaining(deadline))
+            result = waiter.get(timeout=_remaining(deadline))
+            if (
+                max_response_bytes is not None
+                and len(result[1].encode("utf-8")) > max_response_bytes
+            ):
+                return _error("relay response exceeds byte limit")
+            return result
         except queue.Empty:
             connection.forget(request_id)
             return _error(f"relay request to {host_id} timed out after {timeout_s}s")

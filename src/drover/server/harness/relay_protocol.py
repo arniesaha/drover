@@ -24,15 +24,25 @@ def hello_frame(host_id: str) -> dict[str, Any]:
 
 
 def req_frame(
-    request_id: str, method: str, path: str, body: dict[str, Any] | None
+    request_id: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    *,
+    max_response_bytes: int | None = None,
 ) -> dict[str, Any]:
-    return {
+    frame = {
         "kind": "req",
         "id": request_id,
         "method": method,
         "path": path,
         "body": body,
     }
+    if max_response_bytes is not None:
+        if type(max_response_bytes) is not int or max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be a positive integer")
+        frame["max_response_bytes"] = max_response_bytes
+    return frame
 
 
 def res_frame(request_id: str, status: int, body: str) -> dict[str, Any]:

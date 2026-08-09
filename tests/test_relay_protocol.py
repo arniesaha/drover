@@ -28,6 +28,19 @@ def test_req_res_round_trip() -> None:
     assert res["body"] == '{"session_id": "s1"}\n'
 
 
+def test_req_frame_carries_optional_response_bound() -> None:
+    assert (
+        req_frame(
+            "abc",
+            "POST",
+            "/advisory/content-bundle",
+            {"target_ids": ["global-agents"]},
+            max_response_bytes=4096,
+        )["max_response_bytes"]
+        == 4096
+    )
+
+
 def test_channel_frames() -> None:
     assert open_frame("c1", "/sessions/s1/terminal")["kind"] == "open"
     assert opened_frame("c1") == {"kind": "opened", "chan": "c1"}

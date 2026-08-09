@@ -102,6 +102,29 @@ class RelayConfigError(ValueError):
     """The relay target is unusable no matter how many times we redial."""
 
 
+def _read_bounded_loopback_body(
+    response: Any, *, max_response_bytes: int | None
+) -> str:
+    if max_response_bytes is None:
+        return response.read().decode("utf-8", errors="replace")
+    if max_response_bytes <= 0:
+        raise ValueError("max_response_bytes must be positive")
+    content_length = response.getheader("Content-Length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError as exc:
+            raise ValueError("loopback response has invalid Content-Length") from exc
+        if declared_bytes < 0:
+            raise ValueError("loopback response has invalid Content-Length")
+        if declared_bytes > max_response_bytes:
+            raise ValueError("loopback response exceeds byte limit")
+    payload = response.read(max_response_bytes + 1)
+    if len(payload) > max_response_bytes:
+        raise ValueError("loopback response exceeds byte limit")
+    return payload.decode("utf-8", errors="replace")
+
+
 class _Target:
     """A validated dial target parsed out of ``central_url``."""
 
@@ -465,7 +488,20 @@ class RelayClient:
         path = str(frame.get("path") or "/")
         try:
             try:
-                status, body = self._loopback_request(method, path, frame.get("body"))
+                max_response_bytes = frame.get("max_response_bytes")
+                if max_response_bytes is None:
+                    status, body = self._loopback_request(
+                        method, path, frame.get("body")
+                    )
+                elif type(max_response_bytes) is int and max_response_bytes > 0:
+                    status, body = self._loopback_request(
+                        method,
+                        path,
+                        frame.get("body"),
+                        max_response_bytes=max_response_bytes,
+                    )
+                else:
+                    raise ValueError("invalid relay response byte limit")
             except Exception as exc:  # noqa: BLE001 - never crash the frame loop
                 log.warning("relay loopback %s %s failed: %s", method, path, exc)
                 status = 502
@@ -477,7 +513,12 @@ class RelayClient:
             self._req_slots.release()
 
     def _loopback_request(
-        self, method: str, path: str, body: dict[str, Any] | None
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+        *,
+        max_response_bytes: int | None = None,
     ) -> tuple[int, str]:
         conn = http.client.HTTPConnection(
             "127.0.0.1", self.loopback_port, timeout=LOOPBACK_TIMEOUT_S
@@ -488,7 +529,9 @@ class RelayClient:
                 headers["Authorization"] = f"Bearer {self.token}"
             conn.request(method, path, body=json.dumps(body or {}), headers=headers)
             response = conn.getresponse()
-            return response.status, response.read().decode("utf-8", errors="replace")
+            return response.status, _read_bounded_loopback_body(
+                response, max_response_bytes=max_response_bytes
+            )
         finally:
             conn.close()
 

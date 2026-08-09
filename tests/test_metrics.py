@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -1597,20 +1598,38 @@ def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
     collector_with_hosts, caplog
 ) -> None:
     collector = collector_with_hosts
+    redacted_content = "private prompt body"
+    content_hash = hashlib.sha256(redacted_content.encode("utf-8")).hexdigest()
+    bundle_hash = hashlib.sha256(
+        json.dumps(
+            [["global-agents", content_hash]],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
     class _BundleRelay(_FakeRelay):
-        def request(self, host_id, method, path, body, timeout_s=15):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
             self.calls.append((host_id, method, path, body))
             self.timeouts.append(timeout_s)
+            self.max_response_bytes = max_response_bytes
             return 200, json.dumps(
                 {
-                    "bundle_hash": "a" * 64,
+                    "bundle_hash": bundle_hash,
                     "created_at": "2026-08-08T12:00:00+00:00",
                     "targets": [
                         {
                             "target_id": "global-agents",
-                            "content_hash": "b" * 64,
-                            "redacted_content": "private prompt body",
+                            "content_hash": content_hash,
+                            "redacted_content": redacted_content,
                         }
                     ],
                 }
@@ -1622,7 +1641,7 @@ def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
     with caplog.at_level("INFO", logger="drover.metrics"):
         payload = collector.fetch_advisory_content_bundle("laptop", ["global-agents"])
 
-    assert payload["bundle_hash"] == "a" * 64
+    assert payload["bundle_hash"] == bundle_hash
     assert fake.calls == [
         (
             "laptop",
@@ -1631,9 +1650,10 @@ def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
             {"target_ids": ["global-agents"]},
         )
     ]
+    assert fake.max_response_bytes == metrics._MAX_CONTENT_BUNDLE_RESPONSE_BYTES
     assert "host=laptop" in caplog.text
     assert "targets=1" in caplog.text
-    assert f"bundle_hash={'a' * 64}" in caplog.text
+    assert f"bundle_hash={bundle_hash}" in caplog.text
     assert "private prompt body" not in caplog.text
 
 
@@ -1652,6 +1672,17 @@ def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
                 }
             ],
         },
+        {
+            "bundle_hash": "a" * 64,
+            "created_at": "2026-08-08T12:00:00+00:00",
+            "targets": [
+                {
+                    "target_id": "global-agents",
+                    "content_hash": "b" * 64,
+                    "redacted_content": "content does not match its hash",
+                }
+            ],
+        },
     ],
 )
 def test_fetch_advisory_content_bundle_rejects_malformed_host_response(
@@ -1660,7 +1691,15 @@ def test_fetch_advisory_content_bundle_rejects_malformed_host_response(
     collector = collector_with_hosts
 
     class _MalformedRelay(_FakeRelay):
-        def request(self, host_id, method, path, body, timeout_s=15):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
             return 200, json.dumps(payload)
 
     collector.relay_manager = _MalformedRelay()
@@ -1675,7 +1714,15 @@ def test_fetch_advisory_content_bundle_rejects_oversized_relay_response(
     collector = collector_with_hosts
 
     class _OversizedRelay(_FakeRelay):
-        def request(self, host_id, method, path, body, timeout_s=15):
+        def request(
+            self,
+            host_id,
+            method,
+            path,
+            body,
+            timeout_s=15,
+            max_response_bytes=None,
+        ):
             return 200, "x" * (4 * 1024 * 1024 + 1)
 
     collector.relay_manager = _OversizedRelay()
@@ -1699,6 +1746,46 @@ def test_fetch_advisory_content_bundle_rejects_invalid_target_ids_before_transpo
         collector.fetch_advisory_content_bundle("laptop", target_ids)
 
     assert fake.calls == []
+
+
+def test_proxy_harness_request_rejects_large_content_length_without_reading(
+    collector_with_hosts, monkeypatch
+) -> None:
+    collector = collector_with_hosts
+
+    class _Response:
+        status = 200
+
+        def getheader(self, name):
+            return str(4 * 1024 * 1024 + 1) if name == "Content-Length" else None
+
+        def read(self, amount=None):
+            raise AssertionError("oversized response body was read")
+
+    class _Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(metrics.http.client, "HTTPConnection", _Connection)
+
+    status, body = collector._proxy_harness_request(
+        "http://127.0.0.1/advisory/content-bundle",
+        method="POST",
+        payload={"target_ids": ["global-agents"]},
+        max_response_bytes=4 * 1024 * 1024,
+    )
+
+    assert status == 502
+    assert "exceeds byte limit" in body
 
 
 def test_harness_request_falls_back_to_direct_url(collector_with_hosts) -> None:

@@ -102,6 +102,47 @@ def test_req_frame_loopback_failure_is_502_not_crash(harnessd_server):
     hub_side.close()
 
 
+def test_loopback_response_bound_rejects_content_length_without_reading(monkeypatch):
+    client = RelayClient(
+        central_url="https://unused.example",
+        host_id="laptop",
+        token="test-token",
+        loopback_port=7081,
+    )
+
+    class _Response:
+        status = 200
+
+        def getheader(self, name):
+            return "4097" if name == "Content-Length" else None
+
+        def read(self, amount=None):
+            raise AssertionError("oversized loopback body was read")
+
+    class _Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(relay_client.http.client, "HTTPConnection", _Connection)
+
+    with pytest.raises(ValueError, match="exceeds byte limit"):
+        client._loopback_request(
+            "POST",
+            "/advisory/content-bundle",
+            {"target_ids": ["global-agents"]},
+            max_response_bytes=4096,
+        )
+
+
 def test_open_frame_against_missing_session_reports_open_error(harnessd_server):
     client = RelayClient(
         central_url="https://unused.example",
