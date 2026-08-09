@@ -46,19 +46,13 @@ from drover.server.metrics import (
     start_metrics_server,
 )
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.advisory.analyzers.connectors import (
-    ConnectorFreshnessAnalyzer,
-    ProviderResetWindowAnalyzer,
-)
-from drover.server.advisory.analyzers.hooks import HookValidityAnalyzer
-from drover.server.advisory.analyzers.routing import RoutingMismatchAnalyzer
-from drover.server.advisory.analyzers.telemetry import (
-    CacheReadEfficiencyAnalyzer,
-    TelemetryCoverageAnalyzer,
-)
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.repository import AdvisoryRepository
-from drover.server.advisory.worker import AdvisoryWorker, load_operational_snapshot
+from drover.server.advisory.worker import (
+    AdvisoryWorker,
+    load_operational_snapshot,
+    operational_analyzers,
+)
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.providers.service import ProviderUsageService
 from drover.server.observatory import pipeline_observatory_snapshot
@@ -1270,14 +1264,7 @@ def run(
 
     advisory_worker: AdvisoryWorker | None = None
     try:
-        advisory_analyzers = (
-            ConnectorFreshnessAnalyzer(),
-            ProviderResetWindowAnalyzer(),
-            TelemetryCoverageAnalyzer(),
-            CacheReadEfficiencyAnalyzer(),
-            RoutingMismatchAnalyzer(),
-            HookValidityAnalyzer(),
-        )
+        advisory_analyzers = operational_analyzers()
         advisory_scheduler = AdvisoryScheduler(
             duckdb_path=cfg.duckdb_path,
             analyzer_ids=(item.analyzer_id for item in advisory_analyzers),
@@ -1394,6 +1381,7 @@ def run(
                 registry=HarnessRegistry(cfg.duckdb_path),
                 shutdown_event=stop,
                 fetch=metrics_collector.fetch_harness_provider_usage,
+                operational_source_version=provider_usage.operational_source_version,
                 on_operational_change=lambda host_id, source_version: enqueue_operational_checks(
                     cfg.duckdb_path,
                     target_id=host_id,

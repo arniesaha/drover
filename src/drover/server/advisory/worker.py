@@ -16,6 +16,11 @@ from drover.server.advisory.analyzers import (
     AnalysisSnapshot,
     Analyzer,
     ProviderConnectionObservation,
+    ProviderResetWindow,
+)
+from drover.server.advisory.analyzers.connectors import (
+    ConnectorFreshnessAnalyzer,
+    ProviderResetWindowAnalyzer,
 )
 from drover.server.advisory.jobs import (
     ADVISORY_ARTIFACT_KIND,
@@ -50,6 +55,7 @@ class AdvisoryWorker:
         snapshot_factory: SnapshotFactory,
         worker_id: str = "advisory-worker",
         retry_delay: timedelta = timedelta(seconds=30),
+        lease_duration: timedelta = timedelta(minutes=5),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
@@ -57,6 +63,9 @@ class AdvisoryWorker:
         self.snapshot_factory = snapshot_factory
         self.worker_id = worker_id
         self.retry_delay = retry_delay
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease duration must be positive")
+        self.lease_duration = lease_duration
         self.clock = clock
         self._thread: threading.Thread | None = None
 
@@ -120,6 +129,7 @@ class AdvisoryWorker:
         try:
             ledger = Ledger(con)
             now = self.clock()
+            ledger.reclaim_stale_leases(job_kind=ADVISORY_JOB_KIND, stale_before=now)
             retry_rows = con.execute(
                 """
                 SELECT job_id, subject_key FROM pipeline_jobs
@@ -153,7 +163,11 @@ class AdvisoryWorker:
             )
             if job is None:
                 return None
-            ledger.lease_job(job.job_id, worker_id=self.worker_id)
+            ledger.lease_job(
+                job.job_id,
+                worker_id=self.worker_id,
+                lease_expires_at=now + self.lease_duration,
+            )
             return ledger.latest_job(ADVISORY_JOB_KIND, job.subject_key)
         finally:
             con.close()
@@ -172,7 +186,7 @@ class AdvisoryWorker:
             for item in self.repository.list_findings()
             if item.analyzer_id == analyzer.analyzer_id
             and _finding_in_job_scope(target_id, item.target_id)
-            and item.state != FindingState.RESOLVED
+            and item.state not in {FindingState.RESOLVED, FindingState.DISMISSED}
         }
         affected: list[str] = []
         observed_fingerprints: set[str] = set()
@@ -366,8 +380,38 @@ def load_operational_snapshot(
             """,
             params,
         ).fetchall()
+        windows = con.execute(
+            f"""
+            WITH chosen AS (
+              SELECT provider, account_label, host_id,
+                     arg_max(snapshot_id, observed_at) FILTER (
+                       WHERE status IN ('ok', 'usage_unavailable')
+                     ) AS snapshot_id
+              FROM provider_usage_snapshots
+              {where}
+              GROUP BY provider, account_label, host_id
+            )
+            SELECT p.provider, p.account_label, p.host_id, p.window_kind,
+                   p.starts_at, p.resets_at
+            FROM provider_usage_snapshots p
+            JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
+            WHERE p.window_kind IS NOT NULL
+            ORDER BY p.host_id, p.provider, p.account_label, p.window_kind
+            LIMIT {MAX_SNAPSHOT_RECORDS}
+            """,
+            params,
+        ).fetchall()
     finally:
         con.close()
+    windows_by_account: dict[tuple[str, str, str], list[ProviderResetWindow]] = {}
+    for provider, account_label, host_id, kind, starts_at, resets_at in windows:
+        windows_by_account.setdefault(
+            (str(provider), str(account_label), str(host_id)), []
+        ).append(
+            ProviderResetWindow(
+                kind=str(kind), starts_at=starts_at, resets_at=resets_at
+            )
+        )
     providers = tuple(
         ProviderConnectionObservation(
             provider=str(row[0]),
@@ -379,7 +423,9 @@ def load_operational_snapshot(
             last_attempt_at=row[4],
             last_success_at=row[5],
             error_category=str(row[6]) if row[6] else None,
-            reset_windows=(),
+            reset_windows=tuple(
+                windows_by_account.get((str(row[0]), str(row[1]), str(row[2])), ())
+            ),
             source_ref=f"provider_connections:{row[2]}/{row[0]}/{row[1]}",
         )
         for row in rows
@@ -391,9 +437,16 @@ def load_operational_snapshot(
     )
 
 
+def operational_analyzers() -> tuple[Analyzer, ...]:
+    """Return only analyzers backed by complete runtime snapshot producers."""
+
+    return (ConnectorFreshnessAnalyzer(), ProviderResetWindowAnalyzer())
+
+
 __all__ = [
     "AdvisoryRunResult",
     "AdvisoryWorker",
     "SnapshotFactory",
     "load_operational_snapshot",
+    "operational_analyzers",
 ]

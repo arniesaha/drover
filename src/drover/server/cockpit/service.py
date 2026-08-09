@@ -132,6 +132,7 @@ class ProviderRefreshLoop:
         interval_seconds: float = PROVIDER_REFRESH_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         fetch: Callable[[Any], Any] | None = None,
+        operational_source_version: Callable[[str], str] | None = None,
         on_operational_change: Callable[[str, str], None] | None = None,
     ) -> None:
         if interval_seconds < PROVIDER_REFRESH_INTERVAL_SECONDS:
@@ -142,8 +143,10 @@ class ProviderRefreshLoop:
         self.interval_seconds = interval_seconds
         self.clock = clock
         self.fetch = fetch
+        self.operational_source_version = operational_source_version
         self.on_operational_change = on_operational_change
         self._last_attempt: dict[str, float] = {}
+        self._last_operational_version: dict[str, str] = {}
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -174,12 +177,15 @@ class ProviderRefreshLoop:
                     self.provider_usage.refresh_host(host)
                 else:
                     self.provider_usage.refresh_host(host, fetch=self.fetch)
-                if self.on_operational_change is not None:
-                    version = (
-                        f"provider-refresh:{datetime.now(timezone.utc).isoformat()}"
-                    )
+                if (
+                    self.on_operational_change is not None
+                    and self.operational_source_version is not None
+                ):
+                    version = self.operational_source_version(host_id)
                     try:
-                        self.on_operational_change(host_id, version)
+                        if self._last_operational_version.get(host_id) != version:
+                            self.on_operational_change(host_id, version)
+                            self._last_operational_version[host_id] = version
                     except Exception as exc:  # noqa: BLE001 - scheduling is isolated
                         log.warning(
                             "failed to enqueue advisory checks for host %s: %s",

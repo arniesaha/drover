@@ -172,6 +172,58 @@ class ProviderUsageService:
             key=lambda item: (item.provider, item.account_label, item.host_id),
         )
 
+    def operational_source_version(self, host_id: str) -> str:
+        """Hash material connector/quota state while ignoring refresh clocks."""
+
+        host_id = str(host_id).strip()
+        if not host_id:
+            raise ValueError("host_id is required")
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            connections = con.execute(
+                """
+                SELECT provider, account_label, enabled, supports_usage,
+                       supports_limits, supports_account_discovery,
+                       supports_refresh, capabilities_json, error_category,
+                       CASE
+                         WHEN error_category IS NULL THEN FALSE
+                         WHEN last_success_at IS NULL THEN TRUE
+                         ELSE last_attempt_at IS NOT NULL
+                              AND last_attempt_at >= last_success_at
+                       END AS failed
+                FROM provider_connections
+                WHERE host_id = ?
+                ORDER BY provider, account_label
+                """,
+                [host_id],
+            ).fetchall()
+            snapshots = con.execute(
+                """
+                WITH latest AS (
+                  SELECT provider, account_label, host_id,
+                         arg_max(snapshot_id, observed_at) AS snapshot_id
+                  FROM provider_usage_snapshots
+                  WHERE host_id = ?
+                  GROUP BY provider, account_label, host_id
+                )
+                SELECT p.provider, p.account_label, p.dedup_key
+                FROM provider_usage_snapshots p
+                JOIN latest l USING (provider, account_label, host_id, snapshot_id)
+                GROUP BY p.provider, p.account_label, p.dedup_key
+                ORDER BY p.provider, p.account_label
+                """,
+                [host_id],
+            ).fetchall()
+        finally:
+            con.close()
+        material = {"connections": connections, "snapshots": snapshots}
+        digest = hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return f"provider-state:{digest}"
+
     def _fetch_host(self, host: Any) -> Mapping[str, Any]:
         endpoint = (
             _host_value(host, "local_url") or _host_value(host, "tailscale_url")

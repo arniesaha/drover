@@ -17,9 +17,6 @@ DEFAULT_FULL_REVIEW_INTERVAL_SECONDS = 24 * 60 * 60.0
 LIGHTWEIGHT_ANALYZER_IDS = (
     "deterministic.connector_freshness",
     "deterministic.provider_reset_windows",
-    "deterministic.telemetry_coverage",
-    "deterministic.cache_read_efficiency",
-    "deterministic.routing_mismatch",
 )
 
 
