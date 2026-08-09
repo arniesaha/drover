@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from time import monotonic
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, unquote, urlparse
@@ -38,9 +38,7 @@ from drover.server.harness.auth import (
     executable_path_prefix,
     resolve_executable,
 )
-from drover.server.providers.codex import CodexUsageProbe
 from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
-from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
@@ -63,6 +61,13 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
+
+if TYPE_CHECKING:
+    from drover.server.providers.codex import CodexUsageProbe
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
 
 # Used only to compute a human-readable "command" label for the registry row
 # when the caller didn't supply an explicit command -- the manager itself
@@ -1238,7 +1243,7 @@ class HarnessDaemonState:
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
-    provider_usage_probe: CodexUsageProbe = field(default_factory=CodexUsageProbe)
+    provider_usage_probe: CodexUsageProbe | None = None
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -1436,9 +1441,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         accounts: list[dict[str, Any]] = []
         for detected in detect_provider_accounts(self.server.state.capabilities()):
             if detected.provider == "openai":
-                snapshot = self.server.state.provider_usage_probe.read(
-                    host_id=self.server.state.host_id
-                )
+                probe = self.server.state.provider_usage_probe
+                if probe is None:
+                    from drover.server.providers.codex import CodexUsageProbe
+
+                    probe = CodexUsageProbe()
+                    self.server.state.provider_usage_probe = probe
+                snapshot = probe.read(host_id=self.server.state.host_id)
                 accounts.append(_provider_snapshot_json(snapshot, detected))
                 continue
             if detected.provider == "anthropic":

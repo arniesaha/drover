@@ -22,6 +22,7 @@ def test_skinny_harnessd_import_avoids_server_wide_modules():
                 "grpc",
                 "mcp",
                 "anthropic",
+                "drover.server.providers.types",
                 "drover.server.summarizer.worker",
                 "drover.server.embeddings.worker",
                 "drover.server.otlp.receiver",
