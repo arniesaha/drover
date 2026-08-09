@@ -286,6 +286,56 @@ def test_analytics_bounds_harness_sessions_by_latest_activity():
     assert result.totals.session_count == 1
 
 
+def test_harness_only_sessions_use_greatest_activity_for_filter_dimensions_and_cursor():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=30)
+    recent_a = now - timedelta(hours=2)
+    recent_b = now - timedelta(hours=1)
+    for session_id, host, ended_at in (
+        ("recent-ended-a", "host-a", recent_a),
+        ("recent-ended-b", "host-b", recent_b),
+        ("fully-old", "host-old", old),
+    ):
+        con.execute(
+            """
+            INSERT INTO harness_sessions VALUES (
+              ?, ?, 'codex', 'acme', ?, 'gpt-5', ?, ?, ?
+            )
+            """,
+            [session_id, host, session_id, old, ended_at, old],
+        )
+
+    codec = AnalyticsCursorCodec(b"test-cursor-secret")
+    try:
+        first = activity_analytics(
+            con, AnalyticsFilters(days=7, limit=1), cursor_codec=codec
+        )
+
+        assert first.totals.session_count == 2
+        assert first.harnesses[0].key == "codex"
+        assert first.harnesses[0].session_count == 2
+        assert first.hosts[0].key in {"host-a", "host-b"}
+        assert first.pagination.hosts.next_cursor is not None
+
+        con.execute(
+            "UPDATE harness_sessions SET ended_at=? WHERE session_id='recent-ended-a'",
+            [recent_a + timedelta(minutes=1)],
+        )
+        with pytest.raises(AnalyticsSnapshotChangedError, match="snapshot_changed"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(
+                    days=7,
+                    limit=1,
+                    host_cursor=first.pagination.hosts.next_cursor,
+                ),
+                cursor_codec=codec,
+            )
+    finally:
+        con.close()
+
+
 def test_analytics_freshness_uses_recent_span_end_for_old_started_session():
     con = _analytics_connection()
     old = datetime.now(timezone.utc) - timedelta(days=30)

@@ -20,6 +20,7 @@ struct ContentAnalysisSettings: View {
                 }
             }
             .pickerStyle(.segmented)
+            .disabled(store.isContentConsentOperationInProgress)
             .accessibilityIdentifier("content-analysis-mode")
 
             modeDescription
@@ -36,6 +37,7 @@ struct ContentAnalysisSettings: View {
                     isOn: $selectionState.disclosureAccepted
                 )
                     .fixedSize(horizontal: false, vertical: true)
+                    .disabled(store.isContentConsentOperationInProgress)
                     .accessibilityIdentifier("content-cloud-disclosure-acceptance")
             }
 
@@ -49,7 +51,7 @@ struct ContentAnalysisSettings: View {
                     }
                 }
                 .disabled(
-                    store.isUpdatingContentConsent
+                    store.isContentConsentOperationInProgress
                         || (selectionState.displayedMode == .cloud
                             && !selectionState.disclosureAccepted)
                 )
@@ -68,7 +70,7 @@ struct ContentAnalysisSettings: View {
                 Button("Stop future model analysis…", role: .destructive) {
                     showRevokeConfirmation = true
                 }
-                .disabled(store.isRevokingContentAnalysis)
+                .disabled(store.isContentConsentOperationInProgress)
                 .accessibilityIdentifier("content-analysis-revoke")
             }
 
@@ -96,6 +98,11 @@ struct ContentAnalysisSettings: View {
         }
         .onChange(of: store.contentAnalysisStatus) { _, _ in
             syncSelectionFromStatus()
+        }
+        .onChange(of: store.isContentConsentOperationInProgress) { wasRunning, isRunning in
+            if wasRunning, !isRunning {
+                syncSelectionFromStatus()
+            }
         }
         .onChange(of: showRevokeConfirmation) { wasPresented, isPresented in
             if wasPresented, !isPresented, store.contentAnalysisStatus?.enabled == true {
@@ -187,7 +194,7 @@ struct ContentAnalysisSettings: View {
                 Button("Retry fleet propagation") {
                     Task { _ = await store.retryContentAnalysisPropagation() }
                 }
-                .disabled(store.isUpdatingContentConsent || store.isRevokingContentAnalysis)
+                .disabled(store.isContentConsentOperationInProgress)
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier("content-analysis-propagation-retry")
             }

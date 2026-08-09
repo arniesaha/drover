@@ -404,12 +404,17 @@ def _session_facts_sql(
         session_base AS (
           SELECT s.*
           FROM sessions s, bounds
-          WHERE COALESCE(s.ended_at, s.started_at) >= bounds.cutoff
+          WHERE COALESCE(
+              GREATEST(s.ended_at, s.started_at), s.ended_at, s.started_at
+            ) >= bounds.cutoff
         ),
         harness_base AS (
           SELECT hs.*
           FROM harness_sessions hs, bounds
-          WHERE COALESCE(hs.updated_at, hs.ended_at, hs.started_at) >= bounds.cutoff
+          WHERE COALESCE(
+              GREATEST(hs.updated_at, hs.ended_at, hs.started_at),
+              hs.updated_at, hs.ended_at, hs.started_at
+            ) >= bounds.cutoff
              OR EXISTS (
                SELECT 1 FROM span_sessions ss WHERE ss.session_id = hs.session_id
              )
@@ -477,7 +482,9 @@ def _session_facts_sql(
 
           SELECT
             s.session_id, s.started_at,
-            COALESCE(s.ended_at, s.started_at) AS latest_activity_at,
+            COALESCE(
+              GREATEST(s.ended_at, s.started_at), s.ended_at, s.started_at
+            ) AS latest_activity_at,
             NULL AS host_id, NULL AS harness,
             NULL AS provider, NULL AS model, NULL AS project_key,
             NULL AS total_tokens, NULL AS cost_usd,

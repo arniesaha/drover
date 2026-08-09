@@ -47,6 +47,11 @@ public final class CockpitStore {
     private var loadingAnalyticsDimensions: [AnalyticsDimension: Int] = [:]
     private var analyticsPageErrors: [AnalyticsDimension: String] = [:]
     private var lifecycleTail: Task<Void, Never>?
+    private var contentConsentMutationTail: Task<Void, Never>?
+    private var contentConsentGeneration = 0
+    private var contentConsentOperationCount = 0
+    private var updatingContentConsentCount = 0
+    private var revokingContentAnalysisCount = 0
     private nonisolated(unsafe) var pollingTask: Task<Void, Never>?
 
     public private(set) var overview: CockpitOverview?
@@ -79,8 +84,11 @@ public final class CockpitStore {
     public private(set) var contentRevocationOutcome: ContentAnalysisMutationOutcome?
     public private(set) var contentPurgeError: String?
     public private(set) var purgedExcerptCount: Int?
-    public private(set) var isUpdatingContentConsent = false
-    public private(set) var isRevokingContentAnalysis = false
+    public var isContentConsentOperationInProgress: Bool {
+        contentConsentOperationCount > 0
+    }
+    public var isUpdatingContentConsent: Bool { updatingContentConsentCount > 0 }
+    public var isRevokingContentAnalysis: Bool { revokingContentAnalysisCount > 0 }
     public private(set) var isPurgingContentExcerpts = false
 
     public static let cloudDisclosureRequiredMessage =
@@ -217,8 +225,16 @@ public final class CockpitStore {
     }
 
     public func loadContentAnalysisStatus() async {
+        startContentConsentOperation()
+        let expectedGeneration = contentConsentGeneration
+        let precedingMutation = contentConsentMutationTail
+        defer { finishContentConsentOperation() }
+        await precedingMutation?.value
+        guard expectedGeneration == contentConsentGeneration, !Task.isCancelled else { return }
+        let generation = claimContentConsentGeneration()
         do {
             let status = try await client.contentAnalysisStatus()
+            guard generation == contentConsentGeneration, !Task.isCancelled else { return }
             contentAnalysisStatus = status
             if let outcome = status.propagationOutcome {
                 if status.enabled {
@@ -229,6 +245,7 @@ public final class CockpitStore {
             }
             contentStatusError = nil
         } catch {
+            guard generation == contentConsentGeneration, !Task.isCancelled else { return }
             guard !Self.isCancellation(error) else { return }
             contentStatusError = Self.errorMessage(error)
         }
@@ -243,42 +260,62 @@ public final class CockpitStore {
             contentConsentError = Self.cloudDisclosureRequiredMessage
             return false
         }
-        isUpdatingContentConsent = true
+        startContentConsentOperation()
+        let generation = claimContentConsentGeneration()
+        updatingContentConsentCount += 1
         contentConsentError = nil
         contentConsentOutcome = nil
-        defer { isUpdatingContentConsent = false }
-        do {
-            let result = try await client.setContentAnalysisConsent(
-                backend: backend,
-                externalDisclosureAccepted: backend == .cloud && disclosureAccepted
-            )
-            contentAnalysisStatus = result.status
-            contentConsentOutcome = result.outcome
-            contentStatusError = nil
-            return result.outcome == .complete
-        } catch {
-            guard !Self.isCancellation(error) else { return false }
-            contentConsentError = Self.errorMessage(error)
-            return false
+        defer {
+            updatingContentConsentCount -= 1
+            finishContentConsentOperation()
+        }
+        return await enqueueContentConsentMutation { [weak self] in
+            guard let self else { return false }
+            do {
+                let result = try await self.client.setContentAnalysisConsent(
+                    backend: backend,
+                    externalDisclosureAccepted: backend == .cloud && disclosureAccepted
+                )
+                guard generation == self.contentConsentGeneration else { return false }
+                self.contentAnalysisStatus = result.status
+                self.contentConsentOutcome = result.outcome
+                self.contentStatusError = nil
+                return result.outcome == .complete
+            } catch {
+                guard generation == self.contentConsentGeneration else { return false }
+                guard !Self.isCancellation(error) else { return false }
+                self.contentConsentError = Self.errorMessage(error)
+                return false
+            }
         }
     }
 
     @discardableResult
     public func revokeContentAnalysis() async -> Bool {
-        isRevokingContentAnalysis = true
+        startContentConsentOperation()
+        let generation = claimContentConsentGeneration()
+        revokingContentAnalysisCount += 1
         contentRevocationError = nil
         contentRevocationOutcome = nil
-        defer { isRevokingContentAnalysis = false }
-        do {
-            let result = try await client.revokeContentAnalysis()
-            contentAnalysisStatus = result.status
-            contentRevocationOutcome = result.outcome
-            contentStatusError = nil
-            return result.outcome == .complete
-        } catch {
-            guard !Self.isCancellation(error) else { return false }
-            contentRevocationError = Self.errorMessage(error)
-            return false
+        defer {
+            revokingContentAnalysisCount -= 1
+            finishContentConsentOperation()
+        }
+        return await enqueueContentConsentMutation { [weak self] in
+            guard let self else { return false }
+            do {
+                let result = try await self.client.revokeContentAnalysis()
+                guard generation == self.contentConsentGeneration else { return false }
+                self.contentAnalysisStatus = result.status
+                self.contentRevocationOutcome = result.outcome
+                self.contentStatusError = nil
+                return result.outcome == .complete
+            } catch {
+                guard generation == self.contentConsentGeneration else { return false }
+                guard !Self.isCancellation(error) else { return false }
+                self.contentRevocationError = Self.errorMessage(error)
+                return false
+            }
         }
     }
 
@@ -311,6 +348,31 @@ public final class CockpitStore {
             contentPurgeError = Self.errorMessage(error)
             return false
         }
+    }
+
+    private func startContentConsentOperation() {
+        contentConsentOperationCount += 1
+    }
+
+    private func claimContentConsentGeneration() -> Int {
+        contentConsentGeneration &+= 1
+        return contentConsentGeneration
+    }
+
+    private func finishContentConsentOperation() {
+        contentConsentOperationCount -= 1
+    }
+
+    private func enqueueContentConsentMutation(
+        _ mutation: @escaping @MainActor @Sendable () async -> Bool
+    ) async -> Bool {
+        let preceding = contentConsentMutationTail
+        let task = Task { @MainActor in
+            await preceding?.value
+            return await mutation()
+        }
+        contentConsentMutationTail = Task { @MainActor in _ = await task.value }
+        return await task.value
     }
 
     public func loadAnalytics(filters: AnalyticsFilters = AnalyticsFilters()) async {

@@ -541,6 +541,189 @@ struct CockpitStoreTests {
         #expect(store.contentAnalysisStatus?.affectedHosts.first?.hostID == "fleet")
     }
 
+    @Test @MainActor func delayedStatusCannotOverwriteNewerPartialEnable() async throws {
+        let disabled = try decodeContentStatus(
+            enabled: false, backend: "local", disclosureAccepted: false
+        )
+        let partial = try contentConsentFixture("content-consent-partial")
+        let client = ControlledConsentCockpitClient(
+            statusResponse: .success(disabled),
+            enableResponse: .success(.init(status: partial, outcome: .partial))
+        )
+        let store = CockpitStore(client: client)
+
+        let load = Task { await store.loadContentAnalysisStatus() }
+        await client.waitUntilRequested(.status)
+        let enable = Task {
+            await store.enableContentAnalysis(backend: .cloud, disclosureAccepted: true)
+        }
+        await client.waitUntilRequested(.enable)
+        await client.release(.enable)
+        #expect(await enable.value == false)
+        await client.release(.status)
+        await load.value
+
+        #expect(store.contentAnalysisStatus == partial)
+        #expect(store.contentConsentOutcome == .partial)
+        #expect(store.contentAnalysisStatus?.affectedHosts.map(\.hostID) == ["offline-laptop"])
+        #expect(store.contentStatusError == nil)
+    }
+
+    @Test @MainActor func enableThenRevokeIsSerializedAndEndsRevoked() async throws {
+        let enabled = try decodeContentStatus(
+            enabled: true, backend: "local", disclosureAccepted: false
+        )
+        let disabled = try decodeContentStatus(
+            enabled: false, backend: "local", disclosureAccepted: false
+        )
+        let client = ControlledConsentCockpitClient(
+            enableResponse: .success(.init(status: enabled, outcome: .complete)),
+            revokeResponse: .success(.init(status: disabled, outcome: .complete))
+        )
+        let store = CockpitStore(client: client)
+
+        let enable = Task {
+            await store.enableContentAnalysis(backend: .local, disclosureAccepted: false)
+        }
+        await client.waitUntilRequested(.enable)
+        let revoke = Task { await store.revokeContentAnalysis() }
+        for _ in 0..<100 {
+            if store.isRevokingContentAnalysis { break }
+            await Task.yield()
+        }
+
+        #expect(store.isContentConsentOperationInProgress)
+        #expect(store.isRevokingContentAnalysis)
+        #expect(await client.requests == [.enable])
+        await client.release(.enable)
+        await client.waitUntilRequested(.revoke)
+        await client.release(.revoke)
+        _ = await (enable.value, revoke.value)
+
+        #expect(await client.requests == [.enable, .revoke])
+        #expect(store.contentAnalysisStatus == disabled)
+        #expect(!store.isContentConsentOperationInProgress)
+    }
+
+    @Test @MainActor func revokeThenEnableIsSerializedAndEndsEnabled() async throws {
+        let disabled = try decodeContentStatus(
+            enabled: false, backend: "local", disclosureAccepted: false
+        )
+        let enabled = try decodeContentStatus(
+            enabled: true, backend: "local", disclosureAccepted: false
+        )
+        let client = ControlledConsentCockpitClient(
+            enableResponse: .success(.init(status: enabled, outcome: .complete)),
+            revokeResponse: .success(.init(status: disabled, outcome: .complete))
+        )
+        let store = CockpitStore(client: client)
+
+        let revoke = Task { await store.revokeContentAnalysis() }
+        await client.waitUntilRequested(.revoke)
+        let enable = Task {
+            await store.enableContentAnalysis(backend: .local, disclosureAccepted: false)
+        }
+        for _ in 0..<100 {
+            if store.isUpdatingContentConsent { break }
+            await Task.yield()
+        }
+
+        #expect(store.isUpdatingContentConsent)
+        #expect(await client.requests == [.revoke])
+        await client.release(.revoke)
+        await client.waitUntilRequested(.enable)
+        await client.release(.enable)
+        _ = await (revoke.value, enable.value)
+
+        #expect(await client.requests == [.revoke, .enable])
+        #expect(store.contentAnalysisStatus == enabled)
+    }
+
+    @Test @MainActor func staleStatusErrorCannotOverwriteNewerEnable() async throws {
+        let enabled = try decodeContentStatus(
+            enabled: true, backend: "local", disclosureAccepted: false
+        )
+        let client = ControlledConsentCockpitClient(
+            statusResponse: .failure(.unavailable("stale status failed")),
+            enableResponse: .success(.init(status: enabled, outcome: .complete))
+        )
+        let store = CockpitStore(client: client)
+
+        let load = Task { await store.loadContentAnalysisStatus() }
+        await client.waitUntilRequested(.status)
+        let enable = Task {
+            await store.enableContentAnalysis(backend: .local, disclosureAccepted: false)
+        }
+        await client.waitUntilRequested(.enable)
+        await client.release(.enable)
+        _ = await enable.value
+        await client.release(.status)
+        await load.value
+
+        #expect(store.contentAnalysisStatus == enabled)
+        #expect(store.contentStatusError == nil)
+    }
+
+    @Test @MainActor func statusInvokedDuringEnableWaitsAndThenWinsWithLatestFleetState() async throws {
+        let enabled = try decodeContentStatus(
+            enabled: true, backend: "local", disclosureAccepted: false
+        )
+        let partial = try contentConsentFixture("content-consent-partial")
+        let client = ControlledConsentCockpitClient(
+            statusResponse: .success(partial),
+            enableResponse: .success(.init(status: enabled, outcome: .complete))
+        )
+        let store = CockpitStore(client: client)
+
+        let enable = Task {
+            await store.enableContentAnalysis(backend: .local, disclosureAccepted: false)
+        }
+        await client.waitUntilRequested(.enable)
+        let load = Task { await store.loadContentAnalysisStatus() }
+        for _ in 0..<100 {
+            if await client.requests.contains(.status) { break }
+            await Task.yield()
+        }
+        await client.release(.enable)
+        await client.waitUntilRequested(.status)
+        await client.release(.status)
+        _ = await (enable.value, load.value)
+
+        #expect(await client.requests == [.enable, .status])
+        #expect(await client.maximumConcurrentConsentRequests == 1)
+        #expect(store.contentAnalysisStatus == partial)
+        #expect(store.contentConsentOutcome == .partial)
+    }
+
+    @Test @MainActor func cancelledNoncooperativeStatusCannotOverwriteNewerEnable() async throws {
+        let disabled = try decodeContentStatus(
+            enabled: false, backend: "local", disclosureAccepted: false
+        )
+        let enabled = try decodeContentStatus(
+            enabled: true, backend: "local", disclosureAccepted: false
+        )
+        let client = ControlledConsentCockpitClient(
+            statusResponse: .success(disabled),
+            enableResponse: .success(.init(status: enabled, outcome: .complete))
+        )
+        let store = CockpitStore(client: client)
+
+        let load = Task { await store.loadContentAnalysisStatus() }
+        await client.waitUntilRequested(.status)
+        load.cancel()
+        let enable = Task {
+            await store.enableContentAnalysis(backend: .local, disclosureAccepted: false)
+        }
+        await client.waitUntilRequested(.enable)
+        await client.release(.enable)
+        _ = await enable.value
+        await client.release(.status)
+        await load.value
+
+        #expect(store.contentAnalysisStatus == enabled)
+        #expect(store.contentStatusError == nil)
+    }
+
     @Test @MainActor func failedRevokeKeepsCentralDisabledTruthAndCanRetryConsentOnly() async throws {
         let status = try contentConsentFixture("content-consent-failed")
         let client = CockpitClientStub(
@@ -825,6 +1008,111 @@ private actor CockpitClientStub: CockpitClient {
             PurgeContentExcerptsResponse.self,
             from: Data("{\"purged_excerpt_count\":\(purgedExcerptCount)}".utf8)
         )
+    }
+}
+
+private enum ControlledConsentRequest: Hashable, Sendable {
+    case status, enable, revoke
+}
+
+private actor ControlledConsentCockpitClient: CockpitClient {
+    private let statusResponse: Result<ContentAnalysisStatus, DroverError>
+    private let enableResponse: Result<ContentAnalysisConsentResult, DroverError>
+    private let revokeResponse: Result<ContentAnalysisConsentResult, DroverError>
+    private var requestWaiters: [
+        ControlledConsentRequest: [CheckedContinuation<Void, Never>]
+    ] = [:]
+    private var releaseWaiters: [
+        ControlledConsentRequest: CheckedContinuation<Void, Never>
+    ] = [:]
+    private(set) var requests: [ControlledConsentRequest] = []
+    private(set) var maximumConcurrentConsentRequests = 0
+    private var concurrentConsentRequests = 0
+
+    init(
+        statusResponse: Result<ContentAnalysisStatus, DroverError> = .failure(
+            .unavailable("status not configured")
+        ),
+        enableResponse: Result<ContentAnalysisConsentResult, DroverError> = .failure(
+            .unavailable("enable not configured")
+        ),
+        revokeResponse: Result<ContentAnalysisConsentResult, DroverError> = .failure(
+            .unavailable("revoke not configured")
+        )
+    ) {
+        self.statusResponse = statusResponse
+        self.enableResponse = enableResponse
+        self.revokeResponse = revokeResponse
+    }
+
+    func waitUntilRequested(_ request: ControlledConsentRequest) async {
+        guard !requests.contains(request) else { return }
+        await withCheckedContinuation { continuation in
+            requestWaiters[request, default: []].append(continuation)
+        }
+    }
+
+    func release(_ request: ControlledConsentRequest) {
+        releaseWaiters.removeValue(forKey: request)?.resume()
+    }
+
+    private func awaitRelease(_ request: ControlledConsentRequest) async {
+        requests.append(request)
+        concurrentConsentRequests += 1
+        maximumConcurrentConsentRequests = max(
+            maximumConcurrentConsentRequests, concurrentConsentRequests
+        )
+        defer { concurrentConsentRequests -= 1 }
+        requestWaiters.removeValue(forKey: request)?.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseWaiters[request] = continuation
+        }
+    }
+
+    func contentAnalysisStatus() async throws -> ContentAnalysisStatus {
+        await awaitRelease(.status)
+        return try statusResponse.get()
+    }
+
+    func setContentAnalysisConsent(
+        backend: ContentAnalysisBackend,
+        externalDisclosureAccepted: Bool
+    ) async throws -> ContentAnalysisConsentResult {
+        await awaitRelease(.enable)
+        return try enableResponse.get()
+    }
+
+    func revokeContentAnalysis() async throws -> ContentAnalysisConsentResult {
+        await awaitRelease(.revoke)
+        return try revokeResponse.get()
+    }
+
+    func cockpitOverview(days: Int) async throws -> CockpitOverview {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func analytics(filters: AnalyticsFilters) async throws -> AnalyticsSnapshot {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func insights(filters: InsightFilters) async throws -> InsightPage {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func acknowledgeInsight(findingID: String) async throws -> InsightFinding {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func dismissInsight(findingID: String, reason: String) async throws -> InsightFinding {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func checkInsight(findingID: String) async throws -> InsightCheckResponse {
+        throw DroverError.unavailable("not configured")
+    }
+
+    func purgeContentExcerpts() async throws -> PurgeContentExcerptsResponse {
+        throw DroverError.unavailable("not configured")
     }
 }
 
