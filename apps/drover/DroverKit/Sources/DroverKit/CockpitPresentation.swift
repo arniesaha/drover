@@ -78,8 +78,7 @@ public enum HomeSection: Sendable, Equatable {
         if !overview.popularProjects.isEmpty {
             sections.append(.popularProjects)
         }
-        if let counts = overview.insightCounts,
-           counts.critical + counts.high + counts.medium + counts.low > 0 {
+        if overview.insightCounts != nil {
             sections.append(.insights)
         }
         sections.append(.sessions)

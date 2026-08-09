@@ -19,7 +19,7 @@ struct InsightDetailView: View {
                     impactSection(detail.finding)
                     evidenceSection(detail.evidence)
                     remediationSection(detail.finding)
-                    actionSection(detail.finding)
+                    actionSection(detail)
                 } else if let loadError {
                     ContentUnavailableView(
                         "Insight unavailable", systemImage: "exclamationmark.triangle",
@@ -111,8 +111,9 @@ struct InsightDetailView: View {
         }
     }
 
-    private func actionSection(_ finding: InsightFinding) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func actionSection(_ detail: InsightDetail) -> some View {
+        let finding = detail.finding
+        return VStack(alignment: .leading, spacing: 10) {
             if let message = actionMessage ?? store.lifecycleError {
                 Text(message)
                     .droverText(.nested)
@@ -126,8 +127,15 @@ struct InsightDetailView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!detail.actions.checkAgain.available)
             .accessibilityHint("Reruns analysis only; it does not change configuration")
             .accessibilityIdentifier("insight-check-again")
+
+            if !detail.actions.checkAgain.available {
+                Text(detail.actions.checkAgain.reason ?? "Scoped reanalysis is unavailable.")
+                    .droverText(.nested)
+                    .foregroundStyle(DroverColor.muted)
+            }
 
             HStack {
                 Button("Acknowledge") {

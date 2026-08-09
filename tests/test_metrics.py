@@ -692,6 +692,7 @@ def test_harness_capabilities_advertise_cockpit_api(tmp_path):
         "provider_capacity",
         "activity",
         "popular_projects",
+        "insights",
     ]
 
 
@@ -842,6 +843,11 @@ def test_insight_detail_and_lifecycle_actions_are_validated(tmp_path):
         with _authed_get(base + f"/insights/{finding.finding_id}") as response:
             detail = json.loads(response.read())
         assert detail["finding"]["finding_id"] == finding.finding_id
+        assert detail["actions"]["check_again"]["available"] is False
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_post(base + f"/insights/{finding.finding_id}/check", {})
+        assert exc.value.code == 409
 
         with pytest.raises(HTTPError) as exc:
             _authed_post(base + f"/insights/{finding.finding_id}/dismiss", {})

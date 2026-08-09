@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from drover.config import default_config, default_config_path, load_config
 from drover.server.advisory.jobs import (
     ADVISORY_JOB_KIND,
+    ADVISORY_RECEIPT_KIND,
     LIGHTWEIGHT_ANALYZER_IDS,
     enqueue_advisory_check,
 )
@@ -501,6 +502,7 @@ class InsightsService:
                 }
                 for row in rows
             ],
+            "actions": {"check_again": self._check_action(finding)},
         }
 
     def acknowledge(self, finding_id: str) -> dict[str, Any]:
@@ -526,15 +528,40 @@ class InsightsService:
     def check_again(self, finding_id: str) -> dict[str, Any]:
         finding_id = validate_finding_id(finding_id)
         finding = self.repository.get_finding(finding_id)
-        target_id, source_version = self._check_scope(finding)
-        job = enqueue_advisory_check(
+        if finding.analyzer_id == MODEL_ANALYZER_ID:
+            with content_consent_operation() as generation:
+                target_id, source_version = self._check_scope(finding)
+                with validate_content_consent_generation(generation) as current:
+                    if not current or not self._content_config().enabled:
+                        raise InvalidInsightTransition(
+                            "Enable content analysis before checking again."
+                        )
+                    job = self._enqueue_check(finding, target_id, source_version)
+        else:
+            target_id, source_version = self._check_scope(finding)
+            job = self._enqueue_check(finding, target_id, source_version)
+        return {"status": "queued", "job_id": job.job_id}
+
+    def _enqueue_check(self, finding: Finding, target_id: str, source_version: str):
+        return enqueue_advisory_check(
             self.duckdb_path,
             analyzer_id=finding.analyzer_id,
             target_id=target_id,
             source_version=source_version,
             force=True,
         )
-        return {"status": "queued", "job_id": job.job_id}
+
+    def _check_action(self, finding: Finding) -> dict[str, Any]:
+        try:
+            self._check_scope(finding)
+        except InvalidInsightTransition as exc:
+            return {"available": False, "reason": str(exc)}
+        except Exception:
+            return {
+                "available": False,
+                "reason": "Check Again is temporarily unavailable.",
+            }
+        return {"available": True, "reason": None}
 
     def _check_scope(self, finding: Finding) -> tuple[str, str]:
         if (
@@ -554,9 +581,64 @@ class InsightsService:
             return host_id, provider_operational_source_version(
                 self.duckdb_path, host_id
             )
+        if (
+            finding.target_type == "configuration_target"
+            and finding.analyzer_id == MODEL_ANALYZER_ID
+        ):
+            config = self._content_config()
+            if not config.enabled:
+                raise InvalidInsightTransition(
+                    "Enable content analysis before checking again."
+                )
+            host_id, separator, target_id = finding.target_id.partition("/")
+            configured_targets = {Path(item).name for item in config.targets}
+            if (
+                not separator
+                or not host_id
+                or not target_id
+                or target_id not in configured_targets
+            ):
+                raise InvalidInsightTransition(
+                    "Model finding has no currently configured analysis scope."
+                )
+            source_version = self._latest_source_version(MODEL_ANALYZER_ID, host_id)
+            if source_version is None:
+                raise InvalidInsightTransition(
+                    "Run content analysis before checking again."
+                )
+            return host_id, source_version
         raise InvalidInsightTransition(
             "scoped reanalysis is unavailable for this finding analyzer"
         )
+
+    def _content_config(self):
+        return (
+            load_config(self.config_path).advisory_content
+            if self.config_path.exists()
+            else default_config().advisory_content
+        )
+
+    def _latest_source_version(self, analyzer_id: str, target_id: str) -> str | None:
+        subject_key = f"{analyzer_id}:{target_id}"
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            row = con.execute(
+                """
+                SELECT source_version
+                FROM pipeline_receipts
+                WHERE source_kind = ? AND source_key = ?
+                ORDER BY first_seen_at DESC, receipt_id DESC
+                LIMIT 1
+                """,
+                [ADVISORY_RECEIPT_KIND, subject_key],
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            return None
+        return row[0]
 
 
 def validate_finding_id(value: str) -> str:

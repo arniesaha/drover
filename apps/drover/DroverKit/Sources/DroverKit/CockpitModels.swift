@@ -559,16 +559,45 @@ public struct InsightEvidence: Decodable, Sendable, Equatable {
     }
 }
 
+public struct InsightActionAvailability: Decodable, Sendable, Equatable {
+    public let available: Bool
+    public let reason: String?
+
+    public init(available: Bool, reason: String? = nil) {
+        self.available = available
+        self.reason = reason
+    }
+}
+
+public struct InsightActions: Decodable, Sendable, Equatable {
+    public let checkAgain: InsightActionAvailability
+
+    private enum CodingKeys: String, CodingKey {
+        case checkAgain = "check_again"
+    }
+
+    public init(checkAgain: InsightActionAvailability) {
+        self.checkAgain = checkAgain
+    }
+
+    static let unavailable = InsightActions(
+        checkAgain: InsightActionAvailability(available: false)
+    )
+}
+
 public struct InsightDetail: Decodable, Sendable, Equatable {
     public let finding: InsightFinding
     public let evidence: [InsightEvidence]
+    public let actions: InsightActions
 
-    private enum CodingKeys: String, CodingKey { case finding, evidence }
+    private enum CodingKeys: String, CodingKey { case finding, evidence, actions }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         finding = try container.decode(InsightFinding.self, forKey: .finding)
         evidence = try container.decodeIfPresent([InsightEvidence].self, forKey: .evidence) ?? []
+        actions = try container.decodeIfPresent(InsightActions.self, forKey: .actions)
+            ?? .unavailable
     }
 }
 

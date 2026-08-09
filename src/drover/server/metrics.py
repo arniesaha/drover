@@ -1393,15 +1393,13 @@ class MetricsCollector:
         include_hosts: bool = True,
         include_sessions: bool = True,
     ) -> dict[str, Any]:
+        from drover.server.cockpit.service import COCKPIT_SECTIONS
+
         source = Path(self.duckdb_path)
         if not source.exists():
             return {
                 "cockpit_api_version": 1,
-                "cockpit_sections": [
-                    "provider_capacity",
-                    "activity",
-                    "popular_projects",
-                ],
+                "cockpit_sections": list(COCKPIT_SECTIONS),
                 "hosts": [],
                 "sessions": [],
                 "error": f"DuckDB file does not exist: {source}",
@@ -1422,11 +1420,7 @@ class MetricsCollector:
             )
             return {
                 "cockpit_api_version": 1,
-                "cockpit_sections": [
-                    "provider_capacity",
-                    "activity",
-                    "popular_projects",
-                ],
+                "cockpit_sections": list(COCKPIT_SECTIONS),
                 "hosts": [
                     _harness_host_dict(host, self.relay_manager) for host in hosts
                 ],

@@ -16,7 +16,7 @@ import Testing
     ])
 }
 
-@Test func emptyHealthyHomeSectionsStayCompact() throws {
+@Test func zeroInsightCountsKeepInsightsNavigationReachable() throws {
     let overview = try decodeOverview(
         providerStatus: "ok",
         providerData: "[]",
@@ -25,7 +25,7 @@ import Testing
         insightCounts: #"{"critical":0,"high":0,"medium":0,"low":0}"#
     )
 
-    #expect(HomeSection.visible(for: overview) == [.attention, .sessions])
+    #expect(HomeSection.visible(for: overview) == [.attention, .insights, .sessions])
 }
 
 @Test func unavailableProviderSectionRemainsVisibleWithoutAccounts() throws {

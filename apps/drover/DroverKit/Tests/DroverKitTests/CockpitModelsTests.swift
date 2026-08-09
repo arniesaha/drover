@@ -168,11 +168,74 @@ import Testing
     let old = try HarnessSnapshot.decode(from: Data(#"{"hosts":[],"sessions":[]}"#.utf8))
     let current = try HarnessSnapshot.decode(from: Data(#"""
     {"hosts":[],"sessions":[],"cockpit_api_version":1,
-     "cockpit_sections":["provider_capacity","activity","popular_projects"]}
+     "cockpit_sections":["provider_capacity","activity","popular_projects","insights"]}
     """#.utf8))
 
     #expect(old.cockpitAPIVersion == nil)
     #expect(old.cockpitSections == [])
     #expect(current.cockpitAPIVersion == 1)
-    #expect(current.cockpitSections == ["provider_capacity", "activity", "popular_projects"])
+    #expect(current.cockpitSections == ["provider_capacity", "activity", "popular_projects", "insights"])
+}
+
+@Test func backendCockpitOverviewFixtureDecodesInsightCounts() throws {
+    let fixtureURL = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("Fixtures/cockpit-overview-with-insights.json")
+
+    let overview = try JSONDecoder().decode(
+        CockpitOverview.self,
+        from: Data(contentsOf: fixtureURL)
+    )
+
+    #expect(overview.insightCounts?.critical == 0)
+    #expect(overview.insightCounts?.high == 0)
+    #expect(overview.insightCounts?.medium == 0)
+    #expect(overview.insightCounts?.low == 0)
+}
+
+@Test func insightDetailDecodesTruthfulCheckAgainAvailability() throws {
+    let fixture = Data(#"""
+    {
+      "finding": {
+        "finding_id":"finding-one","analyzer_id":"deterministic.hook_validity",
+        "rule_id":"hook.missing","target_type":"hook",
+        "target_id":"mac-mini/codex/pre-tool","analyzer_class":"deterministic",
+        "severity":"high","confidence":"confirmed","title":"Hook is missing",
+        "impact":"The hook cannot run.","remediation":["Restore it."],"state":"open",
+        "first_seen_at":"2026-08-08T18:00:00Z","last_seen_at":"2026-08-08T18:01:00Z"
+      },
+      "evidence": [],
+      "actions": {
+        "check_again": {
+          "available": false,
+          "reason": "Scoped reanalysis is not available for this analyzer."
+        }
+      }
+    }
+    """#.utf8)
+
+    let detail = try JSONDecoder().decode(InsightDetail.self, from: fixture)
+
+    #expect(detail.actions.checkAgain.available == false)
+    #expect(detail.actions.checkAgain.reason == "Scoped reanalysis is not available for this analyzer.")
+}
+
+@Test func legacyInsightDetailDoesNotInventCheckAgainAvailability() throws {
+    let fixture = Data(#"""
+    {
+      "finding": {
+        "finding_id":"finding-one","analyzer_id":"deterministic.hook_validity",
+        "rule_id":"hook.missing","target_type":"hook",
+        "target_id":"mac-mini/codex/pre-tool","analyzer_class":"deterministic",
+        "severity":"high","confidence":"confirmed","title":"Hook is missing",
+        "impact":"The hook cannot run.","remediation":["Restore it."],"state":"open",
+        "first_seen_at":"2026-08-08T18:00:00Z","last_seen_at":"2026-08-08T18:01:00Z"
+      },
+      "evidence": []
+    }
+    """#.utf8)
+
+    let detail = try JSONDecoder().decode(InsightDetail.self, from: fixture)
+
+    #expect(detail.actions.checkAgain.available == false)
 }

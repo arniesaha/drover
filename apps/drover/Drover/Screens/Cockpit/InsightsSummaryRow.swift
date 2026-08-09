@@ -2,7 +2,7 @@ import DroverKit
 import SwiftUI
 
 struct InsightsSummaryRow: View {
-    let counts: InsightCounts
+    let counts: InsightCounts?
     let onOpenInsights: () -> Void
 
     var body: some View {
@@ -28,6 +28,7 @@ struct InsightsSummaryRow: View {
     }
 
     private var summary: String {
+        guard let counts else { return "Counts temporarily unavailable" }
         let severe = counts.critical + counts.high
         let total = severe + counts.medium + counts.low
         return severe > 0 ? "\(severe) high priority · \(total) open" : "\(total) open"

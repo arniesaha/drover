@@ -20,6 +20,7 @@ COCKPIT_SECTIONS = (
     "provider_capacity",
     "activity",
     "popular_projects",
+    "insights",
 )
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
 
@@ -33,10 +34,16 @@ class CockpitService:
         duckdb_path: str | Path | None,
         provider_usage: Any | None,
         connect: Callable[[], Any] | None = None,
+        advisory_repository: Any | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
         self._connect = connect
+        if advisory_repository is None and self.duckdb_path is not None:
+            from drover.server.advisory.repository import AdvisoryRepository
+
+            advisory_repository = AdvisoryRepository(self.duckdb_path)
+        self.advisory_repository = advisory_repository
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
         provider_capacity = self._provider_capacity(filters)
@@ -53,6 +60,7 @@ class CockpitService:
             "provider_capacity": provider_capacity,
             "activity": activity,
             "popular_projects": projects,
+            "insight_counts": self._insight_counts(),
         }
 
     def analytics(self, filters: AnalyticsFilters) -> dict[str, Any]:
@@ -118,6 +126,20 @@ class CockpitService:
         finally:
             if owns_connection and con is not None:
                 con.close()
+
+    def _insight_counts(self) -> dict[str, int] | None:
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        if self.advisory_repository is None:
+            return counts
+        try:
+            for finding in self.advisory_repository.list_findings():
+                if finding.state.value not in {"open", "regressed"}:
+                    continue
+                counts[finding.severity.value] += 1
+            return counts
+        except Exception as exc:  # noqa: BLE001 - isolate response sections
+            log.warning("failed to render insight counts: %s", exc)
+            return None
 
 
 class ProviderRefreshLoop:

@@ -89,9 +89,10 @@ struct SessionsView: View {
                             )
                         }
 
-                        if let counts = cockpitStore.insightCounts,
-                           counts.critical + counts.high + counts.medium + counts.low > 0 {
-                            InsightsSummaryRow(counts: counts) { showInsights = true }
+                        if cockpitStore.isInsightsAvailable {
+                            InsightsSummaryRow(counts: cockpitStore.insightCounts) {
+                                showInsights = true
+                            }
                         }
                     }
 

@@ -4,6 +4,18 @@ import Testing
 
 @Suite(.serialized)
 struct CockpitStoreTests {
+    @Test @MainActor func insightsAvailabilityFollowsAdvertisedCapability() throws {
+        let store = CockpitStore(client: CockpitClientStub())
+
+        store.updateCapability(from: try capableSnapshot())
+        #expect(store.isInsightsAvailable)
+
+        store.updateCapability(from: try HarnessSnapshot.decode(from: Data(
+            #"{"hosts":[],"sessions":[],"cockpit_api_version":1,"cockpit_sections":["activity"]}"#.utf8
+        )))
+        #expect(!store.isInsightsAvailable)
+    }
+
     @Test @MainActor func refreshUsesIndependentSectionStateAndRetainsLastGoodValues() async throws {
         let client = CockpitClientStub(overviews: [
             try decodeOverview(providerStatus: "ok", activitySessions: 10),
@@ -511,7 +523,7 @@ private actor ControlledRefreshCockpitClient: CockpitClient {
 
 private func capableSnapshot() throws -> HarnessSnapshot {
     try HarnessSnapshot.decode(from: Data(
-        #"{"hosts":[],"sessions":[],"cockpit_api_version":1}"#.utf8
+        #"{"hosts":[],"sessions":[],"cockpit_api_version":1,"cockpit_sections":["provider_capacity","activity","popular_projects","insights"]}"#.utf8
     ))
 }
 

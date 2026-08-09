@@ -9,7 +9,8 @@ let package = Package(
         .target(name: "DroverKit"),
         .testTarget(
             name: "DroverKitTests",
-            dependencies: ["DroverKit"]
+            dependencies: ["DroverKit"],
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

@@ -28,6 +28,7 @@ extension DroverClient: CockpitClient {}
 public final class CockpitStore {
     private let client: any CockpitClient
     private var cockpitAPIVersion: Int?
+    private var cockpitSections: Set<String> = []
     private var insightFilters = InsightFilters()
     private var stateOverrides: [String: InsightState] = [:]
     private var refreshGeneration = 0
@@ -85,8 +86,13 @@ public final class CockpitStore {
         (cockpitAPIVersion ?? 0) >= 1
     }
 
+    public var isInsightsAvailable: Bool {
+        isCockpitAvailable && cockpitSections.contains("insights")
+    }
+
     public func updateCapability(from snapshot: HarnessSnapshot?) {
         cockpitAPIVersion = snapshot?.cockpitAPIVersion
+        cockpitSections = Set(snapshot?.cockpitSections ?? [])
         if !isCockpitAvailable {
             stopForegroundPolling()
             providerError = nil

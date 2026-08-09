@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.types import (
+    AnalyzerClass,
+    Confidence,
+    FindingCandidate,
+    FindingEvidence,
+    Severity,
+)
 from drover.server.cockpit.analytics import AnalyticsFilters, activity_analytics
 from drover.server.cockpit.service import CockpitService
 
@@ -301,3 +310,85 @@ def test_cockpit_analytics_isolates_activity_failure():
     assert payload["provider_capacity"]["status"] == "unavailable"
     assert payload["activity"]["status"] == "error"
     assert payload["activity"]["data"] is None
+
+
+def test_cockpit_overview_counts_actionable_insights_by_severity(tmp_path):
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    repository = AdvisoryRepository(db_path)
+    now = datetime.now(timezone.utc)
+    for index, severity in enumerate((Severity.CRITICAL, Severity.HIGH, Severity.LOW)):
+        repository.observe(
+            FindingCandidate(
+                analyzer_id="deterministic.connector_freshness",
+                rule_id=f"connector.rule.{index}",
+                target_type="provider_connector",
+                target_id=f"mac-mini/openai/account-{index}",
+                analyzer_class=AnalyzerClass.DETERMINISTIC,
+                severity=severity,
+                confidence=Confidence.CONFIRMED,
+                title=f"Finding {index}",
+                impact="Capacity may be stale.",
+                remediation=("Refresh the connector.",),
+                evidence=(
+                    FindingEvidence(
+                        source_ref=f"provider:{index}",
+                        observed_at=now,
+                        fields={"index": index},
+                    ),
+                ),
+                content_hash=f"hash-{index}",
+            ),
+            run_id="run-1",
+        )
+
+    payload = CockpitService(
+        duckdb_path=db_path,
+        provider_usage=None,
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity offline")),
+        advisory_repository=repository,
+    ).overview(AnalyticsFilters(days=7))
+
+    assert payload["insight_counts"] == {
+        "critical": 1,
+        "high": 1,
+        "medium": 0,
+        "low": 1,
+    }
+    assert payload["activity"]["status"] == "error"
+
+
+def test_cockpit_overview_isolates_insight_count_failure(
+    low_coverage_analytics_db,
+):
+    class _FailedRepository:
+        def list_findings(self):
+            raise RuntimeError("advisory database unavailable")
+
+    payload = CockpitService(
+        duckdb_path=None,
+        provider_usage=None,
+        connect=lambda: low_coverage_analytics_db,
+        advisory_repository=_FailedRepository(),
+    ).overview(AnalyticsFilters(days=7))
+
+    assert payload["insight_counts"] is None
+    assert payload["activity"]["status"] == "ok"
+
+
+def test_swift_contract_fixture_matches_backend_overview_shape(tmp_path):
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    fixture_path = (
+        Path(__file__).parents[1]
+        / "apps/drover/DroverKit/Tests/DroverKitTests/Fixtures"
+        / "cockpit-overview-with-insights.json"
+    )
+
+    actual = CockpitService(
+        duckdb_path=db_path,
+        provider_usage=None,
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity offline")),
+    ).overview(AnalyticsFilters(days=7))
+
+    assert actual == json.loads(fixture_path.read_text())

@@ -23,7 +23,10 @@ from drover.server.advisory.jobs import (
     enqueue_operational_checks,
 )
 from drover.server.advisory.repository import AdvisoryRepository
-from drover.server.advisory.service import InsightsService
+from drover.server.advisory.service import (
+    InsightsService,
+    InvalidInsightTransition,
+)
 from drover.server.advisory.types import (
     AnalyzerClass,
     Confidence,
@@ -1527,3 +1530,171 @@ def test_check_again_scopes_provider_finding_to_host_and_executes_current_facts(
     assert source_version != "old-content-hash"
     assert status == "succeeded"
     assert any(item.rule_id == "connector.error" for item in repository.list_findings())
+
+
+def test_provider_insight_detail_advertises_scoped_check_again(db_path: Path) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.provider_reset_windows",
+            rule_id="provider.reset.passed",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Reset window passed",
+            impact="Capacity may need refreshing.",
+            remediation=("Refresh the connector.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider:mac-mini/openai/personal",
+                    observed_at=NOW,
+                    fields={"status": "stale"},
+                ),
+            ),
+            content_hash="provider-old",
+        ),
+        run_id="run-old",
+    )
+
+    detail = InsightsService(db_path).get_insight(finding.finding_id)
+
+    assert detail["actions"]["check_again"] == {"available": True, "reason": None}
+
+
+def test_model_check_again_replays_latest_material_version_behind_consent(
+    db_path: Path, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("""[advisory_content]
+enabled = true
+backend_policy = "local"
+external_consent = false
+targets = ["/allowed/global-agents"]
+allowed_roots = ["/allowed"]
+max_file_bytes = 1024
+max_bundle_bytes = 4096
+excerpt_max_chars = 320
+""")
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="model.configuration",
+            rule_id="prompt.repetition",
+            target_type="configuration_target",
+            target_id="mac-mini/global-agents",
+            analyzer_class=AnalyzerClass.MODEL,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.LIKELY,
+            title="Repeated instruction",
+            impact="Repeated text consumes context.",
+            remediation=("Keep one copy.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="content:mac-mini/global-agents#old",
+                    observed_at=NOW,
+                    fields={"bundle_hash": "old"},
+                    excerpt="Repeated instruction",
+                ),
+            ),
+            content_hash="old-target-hash",
+        ),
+        run_id="run-old",
+    )
+    existing = enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version="bundle-current",
+    )
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).lease_job(existing.job_id, worker_id="content-worker")
+        Ledger(con).succeed_job(existing.job_id)
+
+    service = InsightsService(db_path, config_path=config_path)
+    detail = service.get_insight(finding.finding_id)
+    queued = service.check_again(finding.finding_id)
+
+    assert detail["actions"]["check_again"] == {"available": True, "reason": None}
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        subject_key, source_version = con.execute(
+            """
+            SELECT j.subject_key, r.source_version
+            FROM pipeline_jobs j
+            JOIN pipeline_receipts r ON r.receipt_id = j.caused_by_receipt_id
+            WHERE j.job_id = ?
+            """,
+            [queued["job_id"]],
+        ).fetchone()
+    assert subject_key == "model.configuration:mac-mini"
+    assert source_version == "bundle-current"
+
+
+def test_check_again_is_truthfully_unavailable_without_runtime_or_consent(
+    db_path: Path, tmp_path: Path
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    unsupported = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.hook_validity",
+            rule_id="hook.missing",
+            target_type="hook",
+            target_id="mac-mini/codex/pre-tool",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="Hook is missing",
+            impact="The hook cannot run.",
+            remediation=("Restore the hook.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="hook:mac-mini/codex/pre-tool",
+                    observed_at=NOW,
+                    fields={"exists": False},
+                ),
+            ),
+            content_hash="hook-old",
+        ),
+        run_id="run-old",
+    )
+    model = repository.observe(
+        FindingCandidate(
+            analyzer_id="model.configuration",
+            rule_id="prompt.repetition",
+            target_type="configuration_target",
+            target_id="mac-mini/global-agents",
+            analyzer_class=AnalyzerClass.MODEL,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.LIKELY,
+            title="Repeated instruction",
+            impact="Repeated text consumes context.",
+            remediation=("Keep one copy.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="content:mac-mini/global-agents#old",
+                    observed_at=NOW,
+                    fields={"bundle_hash": "old"},
+                    excerpt="Repeated instruction",
+                ),
+            ),
+            content_hash="old-target-hash",
+        ),
+        run_id="run-old",
+    )
+    service = InsightsService(db_path, config_path=tmp_path / "missing.toml")
+
+    assert (
+        service.get_insight(unsupported.finding_id)["actions"]["check_again"][
+            "available"
+        ]
+        is False
+    )
+    assert service.get_insight(model.finding_id)["actions"]["check_again"] == {
+        "available": False,
+        "reason": "Enable content analysis before checking again.",
+    }
+    with pytest.raises(InvalidInsightTransition, match="unavailable"):
+        service.check_again(unsupported.finding_id)
+    with pytest.raises(InvalidInsightTransition, match="Enable content analysis"):
+        service.check_again(model.finding_id)
