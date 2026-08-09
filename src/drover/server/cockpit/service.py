@@ -132,6 +132,7 @@ class ProviderRefreshLoop:
         interval_seconds: float = PROVIDER_REFRESH_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         fetch: Callable[[Any], Any] | None = None,
+        on_operational_change: Callable[[str, str], None] | None = None,
     ) -> None:
         if interval_seconds < PROVIDER_REFRESH_INTERVAL_SECONDS:
             raise ValueError("provider refresh interval must be at least 300 seconds")
@@ -141,6 +142,7 @@ class ProviderRefreshLoop:
         self.interval_seconds = interval_seconds
         self.clock = clock
         self.fetch = fetch
+        self.on_operational_change = on_operational_change
         self._last_attempt: dict[str, float] = {}
         self._thread: threading.Thread | None = None
 
@@ -172,6 +174,18 @@ class ProviderRefreshLoop:
                     self.provider_usage.refresh_host(host)
                 else:
                     self.provider_usage.refresh_host(host, fetch=self.fetch)
+                if self.on_operational_change is not None:
+                    version = (
+                        f"provider-refresh:{datetime.now(timezone.utc).isoformat()}"
+                    )
+                    try:
+                        self.on_operational_change(host_id, version)
+                    except Exception as exc:  # noqa: BLE001 - scheduling is isolated
+                        log.warning(
+                            "failed to enqueue advisory checks for host %s: %s",
+                            host_id,
+                            exc,
+                        )
             except Exception as exc:  # noqa: BLE001 - defensive connector isolation
                 log.warning("provider refresh failed for host %s: %s", host_id, exc)
 

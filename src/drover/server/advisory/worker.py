@@ -1,0 +1,399 @@
+"""Isolated advisory analyzer execution over the durable pipeline ledger."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import logging
+from pathlib import Path
+import threading
+from typing import Callable, Iterable
+
+from drover.server.advisory.analyzers import (
+    MAX_SNAPSHOT_RECORDS,
+    AnalysisSnapshot,
+    Analyzer,
+    ProviderConnectionObservation,
+)
+from drover.server.advisory.jobs import (
+    ADVISORY_ARTIFACT_KIND,
+    ADVISORY_JOB_KIND,
+    AdvisoryScheduler,
+    enqueue_advisory_check,
+)
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.types import FindingState
+from drover.server.db import open_duckdb_connection
+from drover.server.ledger import ArtifactSpec, Job, Ledger
+
+log = logging.getLogger("drover.advisory")
+SnapshotFactory = Callable[[str, str, str], AnalysisSnapshot]
+
+
+@dataclass(frozen=True)
+class AdvisoryRunResult:
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+
+class AdvisoryWorker:
+    """Lease and run at most one durable job for each supplied analyzer."""
+
+    def __init__(
+        self,
+        *,
+        duckdb_path: str | Path,
+        repository: AdvisoryRepository,
+        snapshot_factory: SnapshotFactory,
+        worker_id: str = "advisory-worker",
+        retry_delay: timedelta = timedelta(seconds=30),
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
+        self.duckdb_path = Path(duckdb_path)
+        self.repository = repository
+        self.snapshot_factory = snapshot_factory
+        self.worker_id = worker_id
+        self.retry_delay = retry_delay
+        self.clock = clock
+        self._thread: threading.Thread | None = None
+
+    def run_once(self, analyzers: Iterable[Analyzer]) -> AdvisoryRunResult:
+        succeeded = failed = skipped = 0
+        for analyzer in analyzers:
+            job = self._claim_for_analyzer(analyzer.analyzer_id)
+            if job is None:
+                skipped += 1
+                continue
+            try:
+                self._execute(analyzer, job)
+                succeeded += 1
+            except Exception as exc:  # noqa: BLE001 - isolate analyzer failures
+                failed += 1
+                self._record_failure(job, exc)
+                log.warning(
+                    "advisory analyzer %s failed for %s: %s",
+                    analyzer.analyzer_id,
+                    job.subject_key,
+                    exc,
+                )
+        return AdvisoryRunResult(succeeded=succeeded, failed=failed, skipped=skipped)
+
+    def start(
+        self,
+        *,
+        analyzers: Iterable[Analyzer],
+        scheduler: AdvisoryScheduler,
+        shutdown_event: threading.Event,
+        poll_interval_seconds: float = 5.0,
+    ) -> None:
+        """Start one bounded daemon loop that exits through ``shutdown_event``."""
+
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll interval must be positive")
+        if self._thread is not None and self._thread.is_alive():
+            return
+        analyzer_set = tuple(analyzers)
+
+        def _run() -> None:
+            while not shutdown_event.is_set():
+                try:
+                    scheduler.enqueue_due_full_review()
+                    self.run_once(analyzer_set)
+                except Exception:  # noqa: BLE001 - keep server alive when degraded
+                    log.exception("advisory worker loop failed; continuing")
+                shutdown_event.wait(poll_interval_seconds)
+
+        self._thread = threading.Thread(
+            target=_run, name="drover-advisory", daemon=True
+        )
+        self._thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def _claim_for_analyzer(self, analyzer_id: str) -> Job | None:
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            ledger = Ledger(con)
+            now = self.clock()
+            retry_rows = con.execute(
+                """
+                SELECT job_id, subject_key FROM pipeline_jobs
+                WHERE job_kind = ? AND status = 'retry_wait'
+                  AND (next_run_at IS NULL OR next_run_at <= ?)
+                ORDER BY priority DESC, created_at, job_id
+                """,
+                [ADVISORY_JOB_KIND, now],
+            ).fetchall()
+            for job_id, subject_key in retry_rows:
+                if str(subject_key).partition(":")[0] == analyzer_id:
+                    ledger.requeue_job(str(job_id))
+
+            rows = con.execute(
+                """
+                SELECT job_id, job_kind, subject_key, status, attempt_count,
+                       max_attempts, latest_attempt_id, latest_artifact_id
+                FROM pipeline_jobs
+                WHERE job_kind = ? AND status = 'pending'
+                ORDER BY priority DESC, created_at, job_id
+                """,
+                [ADVISORY_JOB_KIND],
+            ).fetchall()
+            job = next(
+                (
+                    Job(*row)
+                    for row in rows
+                    if str(row[2]).partition(":")[0] == analyzer_id
+                ),
+                None,
+            )
+            if job is None:
+                return None
+            ledger.lease_job(job.job_id, worker_id=self.worker_id)
+            return ledger.latest_job(ADVISORY_JOB_KIND, job.subject_key)
+        finally:
+            con.close()
+
+    def _execute(self, analyzer: Analyzer, job: Job) -> None:
+        target_id = job.subject_key.partition(":")[2]
+        source_version = self._source_version(job.job_id)
+        snapshot = self.snapshot_factory(
+            analyzer.analyzer_id, target_id, source_version
+        )
+        if snapshot.source_version != source_version:
+            raise ValueError("snapshot source version does not match the durable job")
+
+        existing = {
+            item.finding_id: item
+            for item in self.repository.list_findings()
+            if item.analyzer_id == analyzer.analyzer_id
+            and _finding_in_job_scope(target_id, item.target_id)
+            and item.state != FindingState.RESOLVED
+        }
+        affected: list[str] = []
+        observed_fingerprints: set[str] = set()
+        for candidate in analyzer.analyze(snapshot):
+            if candidate.analyzer_id != analyzer.analyzer_id:
+                raise ValueError(
+                    "analyzer emitted a candidate with another analyzer_id"
+                )
+            finding = self.repository.observe(
+                candidate, run_id=job.latest_attempt_id or job.job_id
+            )
+            affected.append(finding.finding_id)
+            observed_fingerprints.add(finding.fingerprint)
+        for finding in existing.values():
+            if (
+                finding.fingerprint not in observed_fingerprints
+                and _snapshot_covers_finding(
+                    snapshot, finding.target_type, finding.target_id
+                )
+            ):
+                passing = self.repository.mark_passing(
+                    finding.finding_id, run_id=job.latest_attempt_id or job.job_id
+                )
+                affected.append(passing.finding_id)
+
+        finding_ids = tuple(dict.fromkeys(affected))
+        payload = json.dumps(finding_ids, separators=(",", ":"))
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            con.execute("BEGIN TRANSACTION")
+            ledger = Ledger(con)
+            ledger.succeed_job(
+                job.job_id,
+                artifact=ArtifactSpec(
+                    artifact_kind=ADVISORY_ARTIFACT_KIND,
+                    subject_key=job.subject_key,
+                    storage_uri=f"duckdb://advisory_findings/{job.subject_key}",
+                    content_hash=hashlib.sha256(payload.encode()).hexdigest(),
+                    version_token=source_version,
+                    metadata={"finding_ids": finding_ids},
+                ),
+                metrics={"finding_count": len(finding_ids)},
+            )
+            receipt = con.execute(
+                """
+                SELECT r.receipt_id, r.status
+                FROM pipeline_jobs j
+                JOIN pipeline_receipts r ON r.receipt_id = j.caused_by_receipt_id
+                WHERE j.job_id = ?
+                """,
+                [job.job_id],
+            ).fetchone()
+            if receipt is not None and receipt[1] == "observed":
+                ledger.mark_receipt(str(receipt[0]), "applied")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+        self._enqueue_newer_source(job, source_version)
+
+    def _record_failure(self, job: Job, exc: Exception) -> None:
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            ledger = Ledger(con)
+            current = ledger.latest_job(ADVISORY_JOB_KIND, job.subject_key)
+            if current is None or current.status != "leased":
+                return
+            if current.attempt_count >= current.max_attempts:
+                ledger.fail_job(
+                    current.job_id,
+                    error_category="analyzer_error",
+                    error_message=str(exc),
+                )
+                ledger.dead_letter_job(current.job_id)
+            else:
+                ledger.retry_job(
+                    current.job_id,
+                    error_category="analyzer_error",
+                    error_message=str(exc),
+                    next_run_at=self.clock() + self.retry_delay,
+                )
+        finally:
+            con.close()
+
+    def _source_version(self, job_id: str) -> str:
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            row = con.execute(
+                """
+                SELECT r.source_version
+                FROM pipeline_jobs j
+                JOIN pipeline_receipts r ON r.receipt_id = j.caused_by_receipt_id
+                WHERE j.job_id = ?
+                """,
+                [job_id],
+            ).fetchone()
+        finally:
+            con.close()
+        if row is None or not row[0]:
+            raise RuntimeError("advisory job has no source-version receipt")
+        return str(row[0])
+
+    def _enqueue_newer_source(self, job: Job, processed_version: str) -> None:
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            row = con.execute(
+                """
+                SELECT source_version FROM pipeline_receipts
+                WHERE source_kind = 'advisory_target_snapshot' AND source_key = ?
+                ORDER BY first_seen_at DESC, receipt_id DESC LIMIT 1
+                """,
+                [job.subject_key],
+            ).fetchone()
+        finally:
+            con.close()
+        if row is not None and row[0] and str(row[0]) != processed_version:
+            analyzer_id, _, target_id = job.subject_key.partition(":")
+            enqueue_advisory_check(
+                self.duckdb_path,
+                analyzer_id=analyzer_id,
+                target_id=target_id,
+                source_version=str(row[0]),
+                force=True,
+            )
+
+
+def _snapshot_covers_finding(
+    snapshot: AnalysisSnapshot, target_type: str, target_id: str
+) -> bool:
+    """Require concrete passing evidence before resolving a prior finding."""
+
+    if target_type == "provider_connector":
+        return any(
+            f"{item.host_id}/{item.provider}/{item.account_label}" == target_id
+            for item in snapshot.provider_connections
+        )
+    if target_type == "telemetry_source":
+        return any(item.target_id == target_id for item in snapshot.telemetry)
+    if target_type == "routing_policy":
+        return any(item.target_id == target_id for item in snapshot.routing)
+    if target_type == "hook":
+        return any(
+            f"{item.host_id}/{item.harness_id}/{item.hook_id}" == target_id
+            for item in snapshot.hooks
+        )
+    return False
+
+
+def _finding_in_job_scope(job_target_id: str, finding_target_id: str) -> bool:
+    return (
+        job_target_id == "fleet"
+        or finding_target_id == job_target_id
+        or finding_target_id.startswith(f"{job_target_id}/")
+    )
+
+
+def load_operational_snapshot(
+    duckdb_path: str | Path,
+    _analyzer_id: str,
+    target_id: str,
+    source_version: str,
+) -> AnalysisSnapshot:
+    """Build a bounded, credential-free snapshot from durable connector state.
+
+    Other fact families remain empty until their bounded query producers have
+    evidence. The worker therefore cannot treat them as passing evidence.
+    """
+
+    analyzed_at = datetime.now(timezone.utc)
+    con = open_duckdb_connection(Path(duckdb_path), read_only=True, role="diagnostic")
+    try:
+        params: list[object] = []
+        where = ""
+        if target_id != "fleet":
+            where = "WHERE host_id = ?"
+            params.append(target_id)
+        rows = con.execute(
+            f"""
+            SELECT provider, account_label, host_id, enabled, last_attempt_at,
+                   last_success_at, error_category, updated_at
+            FROM provider_connections
+            {where}
+            ORDER BY host_id, provider, account_label
+            LIMIT {MAX_SNAPSHOT_RECORDS}
+            """,
+            params,
+        ).fetchall()
+    finally:
+        con.close()
+    providers = tuple(
+        ProviderConnectionObservation(
+            provider=str(row[0]),
+            account_label=str(row[1]),
+            host_id=str(row[2]),
+            enabled=bool(row[3]),
+            status="error" if row[6] else "ok",
+            observed_at=row[7] or row[4] or row[5] or analyzed_at,
+            last_attempt_at=row[4],
+            last_success_at=row[5],
+            error_category=str(row[6]) if row[6] else None,
+            reset_windows=(),
+            source_ref=f"provider_connections:{row[2]}/{row[0]}/{row[1]}",
+        )
+        for row in rows
+    )
+    return AnalysisSnapshot(
+        source_version=source_version,
+        analyzed_at=analyzed_at,
+        provider_connections=providers,
+    )
+
+
+__all__ = [
+    "AdvisoryRunResult",
+    "AdvisoryWorker",
+    "SnapshotFactory",
+    "load_operational_snapshot",
+]

@@ -46,6 +46,19 @@ from drover.server.metrics import (
     start_metrics_server,
 )
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.advisory.analyzers.connectors import (
+    ConnectorFreshnessAnalyzer,
+    ProviderResetWindowAnalyzer,
+)
+from drover.server.advisory.analyzers.hooks import HookValidityAnalyzer
+from drover.server.advisory.analyzers.routing import RoutingMismatchAnalyzer
+from drover.server.advisory.analyzers.telemetry import (
+    CacheReadEfficiencyAnalyzer,
+    TelemetryCoverageAnalyzer,
+)
+from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.worker import AdvisoryWorker, load_operational_snapshot
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.providers.service import ProviderUsageService
 from drover.server.observatory import pipeline_observatory_snapshot
@@ -143,6 +156,11 @@ api_key         = ""   # or set DROVER_EMBEDDINGS_API_KEY in the service env
 api_model       = "text-embedding-3-small"
 mac_ollama_url  = ""   # e.g. "http://127.0.0.1:11435" for Mac-local Ollama
 local_model     = "nomic-embed-text"
+
+[advisory]
+# Local deterministic checks only. Advisory actions never mutate configuration.
+full_review_interval_seconds = 86400
+poll_interval_seconds = 5
 
 [redis_jobs]
 # Optional production coordination for derived workers. Off by default; when
@@ -1250,6 +1268,42 @@ def run(
     )
     watcher.start()
 
+    advisory_worker: AdvisoryWorker | None = None
+    try:
+        advisory_analyzers = (
+            ConnectorFreshnessAnalyzer(),
+            ProviderResetWindowAnalyzer(),
+            TelemetryCoverageAnalyzer(),
+            CacheReadEfficiencyAnalyzer(),
+            RoutingMismatchAnalyzer(),
+            HookValidityAnalyzer(),
+        )
+        advisory_scheduler = AdvisoryScheduler(
+            duckdb_path=cfg.duckdb_path,
+            analyzer_ids=(item.analyzer_id for item in advisory_analyzers),
+            full_review_interval_seconds=cfg.advisory_full_review_interval_seconds,
+        )
+        advisory_worker = AdvisoryWorker(
+            duckdb_path=cfg.duckdb_path,
+            repository=AdvisoryRepository(cfg.duckdb_path),
+            snapshot_factory=lambda analyzer_id, target_id, source_version: load_operational_snapshot(
+                cfg.duckdb_path, analyzer_id, target_id, source_version
+            ),
+        )
+        advisory_worker.start(
+            analyzers=advisory_analyzers,
+            scheduler=advisory_scheduler,
+            shutdown_event=stop,
+            poll_interval_seconds=cfg.advisory_poll_interval_seconds,
+        )
+        log.info(
+            "advisory worker ready (full_review_interval=%.0fs)",
+            cfg.advisory_full_review_interval_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("advisory worker failed to start; continuing without it")
+        advisory_worker = None
+
     receiver: OTLPReceiver | None = None
     if not no_otlp:
         try:
@@ -1340,6 +1394,11 @@ def run(
                 registry=HarnessRegistry(cfg.duckdb_path),
                 shutdown_event=stop,
                 fetch=metrics_collector.fetch_harness_provider_usage,
+                on_operational_change=lambda host_id, source_version: enqueue_operational_checks(
+                    cfg.duckdb_path,
+                    target_id=host_id,
+                    source_version=source_version,
+                ),
             )
             provider_refresh.start()
             log.info(
@@ -1482,6 +1541,8 @@ def run(
     try:
         stop.wait()
     finally:
+        if advisory_worker is not None:
+            advisory_worker.join(timeout=10.0)
         if briefs is not None:
             briefs.stop()
         if embeddings is not None:

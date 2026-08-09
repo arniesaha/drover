@@ -89,6 +89,10 @@ class DroverConfig:
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     harness_favorite_cwds: tuple[str, ...]
+    # Deterministic advisory checks. Content/model analysis remains separately
+    # consented and is not enabled by these operational scheduler settings.
+    advisory_full_review_interval_seconds: float
+    advisory_poll_interval_seconds: float
 
 
 _DEFAULTS = {
@@ -150,6 +154,10 @@ _DEFAULTS = {
     "harness": {
         "favorite_cwds": [],
     },
+    "advisory": {
+        "full_review_interval_seconds": 86400.0,
+        "poll_interval_seconds": 5.0,
+    },
 }
 
 
@@ -208,6 +216,10 @@ def _from_dict(d: dict) -> DroverConfig:
         harness_favorite_cwds=tuple(
             str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
         ),
+        advisory_full_review_interval_seconds=float(
+            d["advisory"]["full_review_interval_seconds"]
+        ),
+        advisory_poll_interval_seconds=float(d["advisory"]["poll_interval_seconds"]),
     )
 
 
