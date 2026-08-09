@@ -124,35 +124,124 @@ struct AnalyticsView: View {
         if let activity = snapshot.activity.data {
             VStack(alignment: .leading, spacing: 10) {
                 CockpitSectionHeading(title: "Observed usage", source: "Drover observed", action: nil)
+                let metadata = ObservedAggregatePresentation(
+                    metadata: activity.metadata,
+                    fallbackCoverage: activity.coverage
+                )
+                Text("\(metadata.freshnessText) · \(metadata.coverageText)")
+                    .droverText(.subtitle)
+                    .fixedSize(horizontal: false, vertical: true)
                 CockpitCard {
-                    HStack(alignment: .top, spacing: 16) {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 88), alignment: .leading)],
+                        alignment: .leading,
+                        spacing: 12
+                    ) {
                         analyticsMetric(format(activity.totals.sessionCount), "Sessions")
                         analyticsMetric(format(activity.totals.totalTokens), "Tokens")
                         analyticsMetric(currency(activity.totals.costUSD), "API cost")
                     }
                 }
 
-                if !activity.projects.isEmpty {
-                    Text("Projects").droverText(.h3)
-                    ForEach(activity.projects, id: \.projectKey) { value in
-                        CockpitCard {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(value.projectKey).droverText(.h2)
-                                Text("\(format(value.totalTokens)) tokens · \(value.sessionCount) sessions")
-                                    .droverText(.body)
-                                Text("Harnesses: \(value.harnesses.joined(separator: ", "))")
-                                    .droverText(.nested)
-                                Text("Hosts: \(value.hosts.joined(separator: ", "))")
-                                    .droverText(.nested)
-                                Text(tokenCoverage(activity))
-                                    .droverText(.subtitle)
-                            }
+                distributionHeading("Projects", dimension: .projects)
+                ForEach(store.analyticsProjects, id: \.projectKey) { value in
+                    CockpitCard {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(value.projectKey).droverText(.h2)
+                            Text("\(format(value.totalTokens)) tokens · \(value.sessionCount) sessions")
+                                .droverText(.body)
+                            Text("Harnesses: \(contributors(value.harnesses))")
+                                .droverText(.nested)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("Hosts: \(contributors(value.hosts))")
+                                .droverText(.nested)
+                                .fixedSize(horizontal: false, vertical: true)
+                            aggregateCaption(value.metadata, activity: activity)
                         }
                     }
                 }
+                paginationControls(.projects)
+
+                dimensionSection(
+                    title: "Harnesses", dimension: .harnesses,
+                    values: store.analyticsHarnesses, activity: activity
+                )
+                dimensionSection(
+                    title: "Hosts", dimension: .hosts,
+                    values: store.analyticsHosts, activity: activity
+                )
+                dimensionSection(
+                    title: "Models", dimension: .models,
+                    values: store.analyticsModels, activity: activity
+                )
             }
             .accessibilityIdentifier("analytics-drover-observed")
         }
+    }
+
+    @ViewBuilder
+    private func dimensionSection(
+        title: String,
+        dimension: AnalyticsDimension,
+        values: [ActivityBreakdown],
+        activity: ActivitySummary
+    ) -> some View {
+        distributionHeading(title, dimension: dimension)
+        ForEach(values, id: \.key) { value in
+            CockpitCard {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(value.key).droverText(.h2)
+                    Text("\(format(value.totalTokens)) tokens · \(value.sessionCount) sessions")
+                        .droverText(.body)
+                    aggregateCaption(value.metadata, activity: activity)
+                }
+            }
+        }
+        paginationControls(dimension)
+    }
+
+    private func distributionHeading(
+        _ title: String, dimension: AnalyticsDimension
+    ) -> some View {
+        Text(title)
+            .droverText(.h3)
+            .accessibilityIdentifier("analytics-distribution-\(dimension.rawValue)")
+    }
+
+    @ViewBuilder
+    private func paginationControls(_ dimension: AnalyticsDimension) -> some View {
+        if let error = store.analyticsPaginationError(for: dimension) {
+            Text(error).droverText(.subtitle).foregroundStyle(DroverColor.accentHi)
+        }
+        if store.nextAnalyticsCursor(for: dimension) != nil {
+            Button {
+                Task { await store.loadMoreAnalytics(dimension) }
+            } label: {
+                if store.isLoadingAnalytics(dimension) {
+                    ProgressView()
+                } else {
+                    Text("Load more")
+                }
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("analytics-load-more-\(dimension.rawValue)")
+        }
+    }
+
+    private func aggregateCaption(
+        _ rowMetadata: ObservedAggregateMetadata?, activity: ActivitySummary
+    ) -> some View {
+        let value = ObservedAggregatePresentation(
+            metadata: rowMetadata ?? activity.metadata,
+            fallbackCoverage: activity.coverage
+        )
+        return Text("\(value.sourceText) · \(value.freshnessText) · \(value.coverageText)")
+            .droverText(.subtitle)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func contributors(_ values: [String]) -> String {
+        values.isEmpty ? "Unavailable" : values.joined(separator: ", ")
     }
 
     private func analyticsMetric(_ value: String, _ label: String) -> some View {
@@ -163,11 +252,6 @@ struct AnalyticsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func tokenCoverage(_ activity: ActivitySummary) -> String {
-        activity.coverage.tokenPercent.map { "\(formatPercent($0))% token coverage" }
-            ?? "Token coverage unavailable"
-    }
-
     private func reload() async {
         await store.loadAnalytics(filters: AnalyticsFilters(
             days: days, hostID: host, harness: harness, provider: provider,
@@ -176,10 +260,10 @@ struct AnalyticsView: View {
     }
 
     private var activity: ActivitySummary? { store.analytics?.activity.data }
-    private var hostValues: [String] { activity?.hosts.map(\.key).sorted() ?? [] }
-    private var harnessValues: [String] { activity?.harnesses.map(\.key).sorted() ?? [] }
-    private var modelValues: [String] { activity?.models.map(\.key).sorted() ?? [] }
-    private var projectValues: [String] { activity?.projects.map(\.projectKey).sorted() ?? [] }
+    private var hostValues: [String] { store.analyticsHosts.map(\.key).sorted() }
+    private var harnessValues: [String] { store.analyticsHarnesses.map(\.key).sorted() }
+    private var modelValues: [String] { store.analyticsModels.map(\.key).sorted() }
+    private var projectValues: [String] { store.analyticsProjects.map(\.projectKey).sorted() }
     private var providerValues: [String] {
         Array(Set((store.analytics?.providerCapacity.data ?? []).map(\.provider))).sorted()
     }

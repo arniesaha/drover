@@ -1,5 +1,51 @@
 import Foundation
 
+public enum AnalyticsDistributionSection: String, CaseIterable, Sendable {
+    case projects, harnesses, hosts, models
+
+    public var title: String { rawValue.capitalized }
+}
+
+public struct ObservedAggregatePresentation: Sendable, Equatable {
+    public let sourceText: String
+    public let freshnessText: String
+    public let coverageText: String
+
+    public init(
+        metadata: ObservedAggregateMetadata?,
+        fallbackCoverage: Coverage,
+        now: Date = .now
+    ) {
+        sourceText = metadata?.source == "drover_observed"
+            ? "Drover observed" : "Observed source unavailable"
+        let coverage = metadata?.coverage ?? fallbackCoverage
+        coverageText = coverage.tokenPercent.map {
+            "\(Self.number($0))% token coverage"
+        } ?? "Token coverage unavailable"
+        guard let observedAt = metadata?.observedAt else {
+            freshnessText = "Observation time unavailable"
+            return
+        }
+        let seconds = max(0, now.timeIntervalSince(observedAt))
+        let age: String
+        if seconds < 60 {
+            age = "Updated now"
+        } else if seconds < 3_600 {
+            age = "Updated \(Int(seconds / 60))m ago"
+        } else if seconds < 86_400 {
+            age = "Updated \(Int(seconds / 3_600))h ago"
+        } else {
+            age = "Updated \(Int(seconds / 86_400))d ago"
+        }
+        let state = metadata?.freshness.rawValue.capitalized ?? "Unknown"
+        freshnessText = "\(age) · \(state)"
+    }
+
+    private static func number(_ value: Double) -> String {
+        value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
+    }
+}
+
 public enum ContentAnalysisMode: String, CaseIterable, Identifiable, Sendable, Equatable {
     case disabled
     case local

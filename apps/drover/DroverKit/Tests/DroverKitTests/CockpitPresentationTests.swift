@@ -211,6 +211,28 @@ import Testing
     #expect(value.sourceText == "Provider reported")
 }
 
+@Test func analyticsPresentationNamesAllDistributionsAndObservedFreshness() throws {
+    let activity = try JSONDecoder().decode(ActivitySummary.self, from: Data(#"""
+    {"totals":{"session_count":4,"total_tokens":40,"cost_usd":0,
+      "cache_read_tokens":0,"cache_write_tokens":0,"total_latency_ms":40},
+     "projects":[],"harnesses":[],"hosts":[],"models":[],
+     "project_metric":"tokens","coverage":{"token_percent":75},
+     "metadata":{"source":"drover_observed","observed_at":"1970-01-01T00:16:40Z",
+      "freshness":"stale","coverage":{"token_percent":75}}}
+    """#.utf8))
+
+    #expect(AnalyticsDistributionSection.allCases.map(\.title) == [
+        "Projects", "Harnesses", "Hosts", "Models",
+    ])
+    let value = ObservedAggregatePresentation(
+        metadata: activity.metadata, fallbackCoverage: activity.coverage,
+        now: Date(timeIntervalSince1970: 8_200)
+    )
+    #expect(value.sourceText == "Drover observed")
+    #expect(value.freshnessText == "Updated 2h ago · Stale")
+    #expect(value.coverageText == "75% token coverage")
+}
+
 @Test func disabledSelectionWaitsForConfirmedRevocationAndCancelRestoresActualBackend() {
     var state = ContentAnalysisSelectionState()
     state.synchronize(enabled: true, backend: .cloud, disclosureAccepted: true)

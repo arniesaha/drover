@@ -155,6 +155,7 @@ public struct ActivityTotals: Decodable, Sendable, Equatable {
     public let cacheWriteTokens: Int
     public let totalLatencyMS: Double
     public let averageLatencyMS: Double?
+    public let metadata: ObservedAggregateMetadata?
 
     private enum CodingKeys: String, CodingKey {
         case sessionCount = "session_count"
@@ -164,6 +165,7 @@ public struct ActivityTotals: Decodable, Sendable, Equatable {
         case cacheWriteTokens = "cache_write_tokens"
         case totalLatencyMS = "total_latency_ms"
         case averageLatencyMS = "average_latency_ms"
+        case metadata
     }
 }
 
@@ -176,6 +178,7 @@ public struct ActivityBreakdown: Decodable, Sendable, Equatable {
     public let cacheWriteTokens: Int
     public let totalLatencyMS: Double
     public let averageLatencyMS: Double?
+    public let metadata: ObservedAggregateMetadata?
 
     private enum CodingKeys: String, CodingKey {
         case key
@@ -186,6 +189,7 @@ public struct ActivityBreakdown: Decodable, Sendable, Equatable {
         case cacheWriteTokens = "cache_write_tokens"
         case totalLatencyMS = "total_latency_ms"
         case averageLatencyMS = "average_latency_ms"
+        case metadata
     }
 }
 
@@ -200,6 +204,7 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
     public let averageLatencyMS: Double?
     public let harnesses: [String]
     public let hosts: [String]
+    public let metadata: ObservedAggregateMetadata?
 
     private enum CodingKeys: String, CodingKey {
         case projectKey = "project_key"
@@ -210,7 +215,7 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
         case cacheWriteTokens = "cache_write_tokens"
         case totalLatencyMS = "total_latency_ms"
         case averageLatencyMS = "average_latency_ms"
-        case harnesses, hosts
+        case harnesses, hosts, metadata
     }
 
     public init(from decoder: Decoder) throws {
@@ -225,7 +230,60 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
         averageLatencyMS = try container.decodeIfPresent(Double.self, forKey: .averageLatencyMS)
         harnesses = try container.decodeIfPresent([String].self, forKey: .harnesses) ?? []
         hosts = try container.decodeIfPresent([String].self, forKey: .hosts) ?? []
+        metadata = try container.decodeIfPresent(ObservedAggregateMetadata.self, forKey: .metadata)
     }
+}
+
+public enum AggregateFreshness: String, Decodable, Sendable, Equatable {
+    case fresh, stale, unavailable
+}
+
+public struct ObservedAggregateMetadata: Decodable, Sendable, Equatable {
+    public let source: String
+    public let observedAt: Date?
+    public let freshness: AggregateFreshness
+    public let coverage: Coverage
+
+    private enum CodingKeys: String, CodingKey {
+        case source, freshness, coverage
+        case observedAt = "observed_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        source = try container.decodeRequiredIdentity(forKey: .source)
+        observedAt = try container.decodeOptionalWireDate(forKey: .observedAt)
+        freshness = try container.decode(AggregateFreshness.self, forKey: .freshness)
+        coverage = try container.decode(Coverage.self, forKey: .coverage)
+    }
+}
+
+public struct AnalyticsPageMetadata: Decodable, Sendable, Equatable {
+    public let limit: Int
+    public let nextCursor: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case limit
+        case nextCursor = "next_cursor"
+    }
+
+    fileprivate static let empty = AnalyticsPageMetadata(limit: 25, nextCursor: nil)
+
+    fileprivate init(limit: Int, nextCursor: String?) {
+        self.limit = limit
+        self.nextCursor = nextCursor
+    }
+}
+
+public struct AnalyticsPagination: Decodable, Sendable, Equatable {
+    public let projects: AnalyticsPageMetadata
+    public let harnesses: AnalyticsPageMetadata
+    public let hosts: AnalyticsPageMetadata
+    public let models: AnalyticsPageMetadata
+
+    fileprivate static let empty = AnalyticsPagination(
+        projects: .empty, harnesses: .empty, hosts: .empty, models: .empty
+    )
 }
 
 public enum PopularProjectMetric: String, Decodable, Sendable, Equatable {
@@ -281,9 +339,11 @@ public struct ActivitySummary: Decodable, Sendable, Equatable {
     public let models: [ActivityBreakdown]
     public let projectMetric: PopularProjectMetric
     public let coverage: Coverage
+    public let metadata: ObservedAggregateMetadata?
+    public let pagination: AnalyticsPagination
 
     private enum CodingKeys: String, CodingKey {
-        case totals, projects, harnesses, hosts, models, coverage
+        case totals, projects, harnesses, hosts, models, coverage, metadata, pagination
         case projectMetric = "project_metric"
     }
 
@@ -296,6 +356,8 @@ public struct ActivitySummary: Decodable, Sendable, Equatable {
         models = try container.decodeIfPresent([ActivityBreakdown].self, forKey: .models) ?? []
         projectMetric = try container.decode(PopularProjectMetric.self, forKey: .projectMetric)
         coverage = try container.decode(Coverage.self, forKey: .coverage)
+        metadata = try container.decodeIfPresent(ObservedAggregateMetadata.self, forKey: .metadata)
+        pagination = try container.decodeIfPresent(AnalyticsPagination.self, forKey: .pagination) ?? .empty
     }
 }
 
@@ -344,16 +406,28 @@ public struct AnalyticsFilters: Sendable, Equatable {
     public var provider: String?
     public var model: String?
     public var projectKey: String?
+    public var limit: Int
+    public var projectCursor: String?
+    public var harnessCursor: String?
+    public var hostCursor: String?
+    public var modelCursor: String?
 
     public init(days: Int = 7, hostID: String? = nil, harness: String? = nil,
                 provider: String? = nil, model: String? = nil,
-                projectKey: String? = nil) {
+                projectKey: String? = nil, limit: Int = 25,
+                projectCursor: String? = nil, harnessCursor: String? = nil,
+                hostCursor: String? = nil, modelCursor: String? = nil) {
         self.days = days
         self.hostID = hostID
         self.harness = harness
         self.provider = provider
         self.model = model
         self.projectKey = projectKey
+        self.limit = limit
+        self.projectCursor = projectCursor
+        self.harnessCursor = harnessCursor
+        self.hostCursor = hostCursor
+        self.modelCursor = modelCursor
     }
 }
 
@@ -364,12 +438,14 @@ public struct AppliedAnalyticsFilters: Decodable, Sendable, Equatable {
     public let provider: String?
     public let model: String?
     public let projectKey: String?
+    public let limit: Int?
 
     private enum CodingKeys: String, CodingKey {
         case days
         case hostID = "host_id"
         case harness, provider, model
         case projectKey = "project_key"
+        case limit
     }
 }
 

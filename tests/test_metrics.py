@@ -721,6 +721,18 @@ def test_cockpit_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
             _authed_get(base + "/analytics?unexpected=value")
         assert exc.value.code == 400
 
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?limit=1&limit=2")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?limit=101")
+        assert exc.value.code == 400
+
+        with pytest.raises(HTTPError) as exc:
+            _authed_get(base + "/analytics?project_cursor=not-a-valid-cursor")
+        assert exc.value.code == 400
+
         with _authed_get(base + "/cockpit/overview?days=7") as response:
             payload = json.loads(response.read())
         assert payload["activity"]["status"] == "ok"

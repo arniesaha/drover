@@ -22,6 +22,10 @@ public protocol CockpitClient: Sendable {
 
 extension DroverClient: CockpitClient {}
 
+public enum AnalyticsDimension: String, Sendable, Hashable, CaseIterable {
+    case projects, harnesses, hosts, models
+}
+
 /// Observable cockpit state with independent last-known-good sections.
 @MainActor
 @Observable
@@ -32,6 +36,11 @@ public final class CockpitStore {
     private var insightFilters = InsightFilters()
     private var stateOverrides: [String: InsightState] = [:]
     private var refreshGeneration = 0
+    private var analyticsGeneration = 0
+    private var analyticsFilters = AnalyticsFilters()
+    private var analyticsCursors: [AnalyticsDimension: String] = [:]
+    private var loadingAnalyticsDimensions: [AnalyticsDimension: Int] = [:]
+    private var analyticsPageErrors: [AnalyticsDimension: String] = [:]
     private var lifecycleTail: Task<Void, Never>?
     private nonisolated(unsafe) var pollingTask: Task<Void, Never>?
 
@@ -45,6 +54,10 @@ public final class CockpitStore {
 
     public private(set) var analytics: AnalyticsSnapshot?
     public private(set) var analyticsError: String?
+    public private(set) var analyticsProjects: [ProjectActivity] = []
+    public private(set) var analyticsHarnesses: [ActivityBreakdown] = []
+    public private(set) var analyticsHosts: [ActivityBreakdown] = []
+    public private(set) var analyticsModels: [ActivityBreakdown] = []
     public private(set) var insights: [InsightSummary] = []
     public private(set) var nextInsightsCursor: String?
     public private(set) var insightsError: String?
@@ -257,13 +270,110 @@ public final class CockpitStore {
 
     public func loadAnalytics(filters: AnalyticsFilters = AnalyticsFilters()) async {
         guard isCockpitAvailable else { return }
+        analyticsGeneration &+= 1
+        let generation = analyticsGeneration
+        var firstPage = filters
+        firstPage.projectCursor = nil
+        firstPage.harnessCursor = nil
+        firstPage.hostCursor = nil
+        firstPage.modelCursor = nil
+        analyticsFilters = firstPage
+        analyticsCursors = [:]
+        analyticsPageErrors = [:]
+        loadingAnalyticsDimensions = [:]
         do {
-            analytics = try await client.analytics(filters: filters)
+            let fresh = try await client.analytics(filters: firstPage)
+            guard generation == analyticsGeneration else { return }
+            analytics = fresh
+            if let data = fresh.activity.data {
+                analyticsProjects = data.projects
+                analyticsHarnesses = data.harnesses
+                analyticsHosts = data.hosts
+                analyticsModels = data.models
+                setAnalyticsCursors(data.pagination)
+            }
             analyticsError = nil
         } catch {
+            guard generation == analyticsGeneration else { return }
             guard !Self.isCancellation(error) else { return }
             analyticsError = Self.errorMessage(error)
         }
+    }
+
+    public func loadMoreAnalytics(_ dimension: AnalyticsDimension) async {
+        guard isCockpitAvailable,
+              loadingAnalyticsDimensions[dimension] == nil,
+              let cursor = analyticsCursors[dimension] else { return }
+        let generation = analyticsGeneration
+        loadingAnalyticsDimensions[dimension] = generation
+        analyticsPageErrors[dimension] = nil
+        defer {
+            if loadingAnalyticsDimensions[dimension] == generation {
+                loadingAnalyticsDimensions[dimension] = nil
+            }
+        }
+        var filters = analyticsFilters
+        filters.projectCursor = dimension == .projects ? cursor : nil
+        filters.harnessCursor = dimension == .harnesses ? cursor : nil
+        filters.hostCursor = dimension == .hosts ? cursor : nil
+        filters.modelCursor = dimension == .models ? cursor : nil
+        do {
+            let page = try await client.analytics(filters: filters)
+            guard generation == analyticsGeneration, let data = page.activity.data else {
+                return
+            }
+            switch dimension {
+            case .projects:
+                let existing = Set(analyticsProjects.map(\.projectKey))
+                analyticsProjects.append(contentsOf: data.projects.filter {
+                    !existing.contains($0.projectKey)
+                })
+                setCursor(data.pagination.projects.nextCursor, for: dimension)
+            case .harnesses:
+                analyticsHarnesses = deduplicating(analyticsHarnesses, appending: data.harnesses)
+                setCursor(data.pagination.harnesses.nextCursor, for: dimension)
+            case .hosts:
+                analyticsHosts = deduplicating(analyticsHosts, appending: data.hosts)
+                setCursor(data.pagination.hosts.nextCursor, for: dimension)
+            case .models:
+                analyticsModels = deduplicating(analyticsModels, appending: data.models)
+                setCursor(data.pagination.models.nextCursor, for: dimension)
+            }
+            analyticsPageErrors[dimension] = nil
+        } catch {
+            guard generation == analyticsGeneration, !Self.isCancellation(error) else { return }
+            analyticsPageErrors[dimension] = Self.errorMessage(error)
+        }
+    }
+
+    public func nextAnalyticsCursor(for dimension: AnalyticsDimension) -> String? {
+        analyticsCursors[dimension]
+    }
+
+    public func analyticsPaginationError(for dimension: AnalyticsDimension) -> String? {
+        analyticsPageErrors[dimension]
+    }
+
+    public func isLoadingAnalytics(_ dimension: AnalyticsDimension) -> Bool {
+        loadingAnalyticsDimensions[dimension] != nil
+    }
+
+    private func setAnalyticsCursors(_ pagination: AnalyticsPagination) {
+        setCursor(pagination.projects.nextCursor, for: .projects)
+        setCursor(pagination.harnesses.nextCursor, for: .harnesses)
+        setCursor(pagination.hosts.nextCursor, for: .hosts)
+        setCursor(pagination.models.nextCursor, for: .models)
+    }
+
+    private func setCursor(_ cursor: String?, for dimension: AnalyticsDimension) {
+        analyticsCursors[dimension] = cursor
+    }
+
+    private func deduplicating(
+        _ existing: [ActivityBreakdown], appending page: [ActivityBreakdown]
+    ) -> [ActivityBreakdown] {
+        let keys = Set(existing.map(\.key))
+        return existing + page.filter { !keys.contains($0.key) }
     }
 
     public func loadInsights(filters: InsightFilters = InsightFilters()) async {

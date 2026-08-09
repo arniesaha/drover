@@ -841,7 +841,10 @@ class MetricsCollector:
     def render_analytics_json(self, filters: Any) -> tuple[int, str]:
         if self.cockpit_service is None:
             return _json_response(503, {"error": "cockpit service unavailable"})
-        return _json_response(200, self.cockpit_service.analytics(filters))
+        try:
+            return _json_response(200, self.cockpit_service.analytics(filters))
+        except ValueError as exc:
+            return _json_response(400, {"error": str(exc)})
 
     def _insights(self) -> "InsightsService":
         if self.advisory_service is None:

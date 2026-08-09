@@ -2,6 +2,34 @@ import Foundation
 import Testing
 @testable import DroverKit
 
+@Test func analyticsDecodesPaginationAndObservedAggregateMetadata() throws {
+    let snapshot = try JSONDecoder().decode(AnalyticsSnapshot.self, from: Data(#"""
+    {"cockpit_api_version":1,"filters":{"days":7,"limit":2},
+     "provider_capacity":{"status":"unavailable","data":[]},
+     "activity":{"status":"ok","observed_at":"2026-08-08T18:00:00Z",
+      "coverage":{"token_percent":80},"data":{
+       "totals":{"session_count":2,"total_tokens":20,"cost_usd":0,
+        "cache_read_tokens":0,"cache_write_tokens":0,"total_latency_ms":20,
+        "average_latency_ms":10,"metadata":{"source":"drover_observed",
+         "observed_at":"2026-08-08T18:00:00Z","freshness":"fresh",
+         "coverage":{"token_percent":80}}},
+       "projects":[],"harnesses":[],"hosts":[],"models":[],
+       "project_metric":"tokens","coverage":{"token_percent":80},
+       "metadata":{"source":"drover_observed","observed_at":"2026-08-08T18:00:00Z",
+        "freshness":"fresh","coverage":{"token_percent":80}},
+       "pagination":{"projects":{"limit":2,"next_cursor":"next-project"},
+        "harnesses":{"limit":2,"next_cursor":null},
+        "hosts":{"limit":2,"next_cursor":"next-host"},
+        "models":{"limit":2,"next_cursor":null}}}}}
+    """#.utf8))
+
+    #expect(snapshot.activity.data?.metadata?.source == "drover_observed")
+    #expect(snapshot.activity.data?.metadata?.freshness == .fresh)
+    #expect(snapshot.activity.data?.totals.metadata?.coverage.tokenPercent == 80)
+    #expect(snapshot.activity.data?.pagination.projects.nextCursor == "next-project")
+    #expect(snapshot.activity.data?.pagination.hosts.nextCursor == "next-host")
+}
+
 @Test func overviewDecodesPartialProviderFailureWithoutDroppingActivity() throws {
     let fixture = Data(#"""
     {

@@ -18,7 +18,11 @@ from drover.server.advisory.types import (
     FindingEvidence,
     Severity,
 )
-from drover.server.cockpit.analytics import AnalyticsFilters, activity_analytics
+from drover.server.cockpit.analytics import (
+    AnalyticsCursorCodec,
+    AnalyticsFilters,
+    activity_analytics,
+)
 from drover.server.cockpit.service import CockpitService
 
 
@@ -73,6 +77,7 @@ def _insert_session(
     host: str,
     harness: str,
     tokens: int | None,
+    model: str = "model-a",
     cost: float | None = None,
     cache_read: int | None = None,
 ) -> None:
@@ -82,7 +87,7 @@ def _insert_session(
         """
         INSERT INTO harness_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [session_id, host, harness, owner, name, "model-a", now, now, now],
+        [session_id, host, harness, owner, name, model, now, now, now],
     )
     con.execute(
         "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
@@ -101,7 +106,7 @@ def _insert_session(
             100.0 if tokens is not None else None,
             harness,
             "anthropic",
-            "model-a",
+            model,
             None,
             owner,
             name,
@@ -277,6 +282,125 @@ def test_analytics_rejects_unbounded_day_ranges(days):
         AnalyticsFilters(days=days)
 
 
+def test_analytics_pages_each_dimension_deterministically_without_overlap():
+    con = _analytics_connection()
+    try:
+        for index in range(5):
+            _insert_session(
+                con,
+                session_id=f"session-{index}",
+                project=f"acme/project-{index}",
+                host=f"host-{index}",
+                harness=f"harness-{index}",
+                tokens=100 - index,
+                model=f"model-{index}",
+            )
+        codec = AnalyticsCursorCodec(b"test-cursor-secret")
+        first = activity_analytics(
+            con, AnalyticsFilters(days=7, limit=2), cursor_codec=codec
+        )
+        second = activity_analytics(
+            con,
+            AnalyticsFilters(
+                days=7,
+                limit=2,
+                project_cursor=first.pagination.projects.next_cursor,
+                harness_cursor=first.pagination.harnesses.next_cursor,
+                host_cursor=first.pagination.hosts.next_cursor,
+                model_cursor=first.pagination.models.next_cursor,
+            ),
+            cursor_codec=codec,
+        )
+    finally:
+        con.close()
+
+    assert [item.project_key for item in first.projects] == [
+        "acme/project-0",
+        "acme/project-1",
+    ]
+    assert not (
+        {item.project_key for item in first.projects}
+        & {item.project_key for item in second.projects}
+    )
+    assert first.pagination.projects.limit == 2
+    assert first.pagination.projects.next_cursor
+    assert not (
+        {item.key for item in first.hosts} & {item.key for item in second.hosts}
+    )
+    assert not (
+        {item.key for item in first.harnesses} & {item.key for item in second.harnesses}
+    )
+    assert not (
+        {item.key for item in first.models} & {item.key for item in second.models}
+    )
+
+
+def test_analytics_cursor_is_bound_to_dimension_filters_and_sort():
+    con = _analytics_connection()
+    try:
+        for index in range(3):
+            _insert_session(
+                con,
+                session_id=f"bound-{index}",
+                project=f"acme/project-{index}",
+                host=f"host-{index}",
+                harness="codex",
+                tokens=10,
+            )
+        codec = AnalyticsCursorCodec(b"test-cursor-secret")
+        first = activity_analytics(
+            con, AnalyticsFilters(days=7, limit=1), cursor_codec=codec
+        )
+        cursor = first.pagination.projects.next_cursor
+
+        with pytest.raises(ValueError, match="cursor does not match"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(days=30, limit=1, project_cursor=cursor),
+                cursor_codec=codec,
+            )
+        with pytest.raises(ValueError, match="cursor does not match"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(days=7, limit=1, host_cursor=cursor),
+                cursor_codec=codec,
+            )
+        with pytest.raises(ValueError, match="invalid analytics cursor"):
+            activity_analytics(
+                con,
+                AnalyticsFilters(days=7, limit=1, project_cursor=cursor + "tampered"),
+                cursor_codec=codec,
+            )
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("limit", [0, 101, True])
+def test_analytics_rejects_unbounded_page_limits(limit):
+    with pytest.raises(ValueError, match="limit"):
+        AnalyticsFilters(limit=limit)
+
+
+def test_observed_aggregates_name_source_freshness_and_coverage(
+    low_coverage_analytics_db,
+):
+    result = activity_analytics(
+        low_coverage_analytics_db,
+        AnalyticsFilters(days=7),
+        cursor_codec=AnalyticsCursorCodec(b"test-cursor-secret"),
+    )
+
+    assert result.metadata.source == "drover_observed"
+    assert result.metadata.observed_at is not None
+    assert result.metadata.freshness in {"fresh", "stale"}
+    assert result.totals.metadata.coverage.token_percent == pytest.approx(100 / 3)
+    assert result.projects[0].metadata.source == "drover_observed"
+    assert result.harnesses[0].metadata.observed_at == result.metadata.observed_at
+    harnesses = {item.key: item for item in result.harnesses}
+    assert harnesses["claude-code"].metadata.coverage.token_percent == 100.0
+    assert harnesses["openclaw"].metadata.coverage.token_percent == 0.0
+
+
 class _FailingProviderService:
     def latest_accounts(self):
         raise RuntimeError("provider offline")
@@ -294,6 +418,10 @@ def test_cockpit_overview_isolates_provider_failure(low_coverage_analytics_db):
     assert payload["provider_capacity"]["status"] == "error"
     assert payload["provider_capacity"]["data"] == []
     assert payload["activity"]["status"] == "ok"
+    assert (
+        payload["activity"]["observed_at"]
+        == payload["activity"]["data"]["metadata"]["observed_at"]
+    )
     assert payload["popular_projects"][0]["metric"] == "sessions"
     assert payload["popular_projects"][0]["project_key"] == "acme/alpha"
 

@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime
 import logging
 from pathlib import Path
+import secrets
 import threading
 import time
 from typing import Any, Callable
 
-from drover.server.cockpit.analytics import AnalyticsFilters, activity_analytics
+from drover.server.cockpit.analytics import (
+    AnalyticsCursorCodec,
+    AnalyticsFilters,
+    activity_analytics,
+)
 from drover.server.db import open_duckdb_connection
 
 log = logging.getLogger("drover.cockpit")
@@ -35,6 +40,7 @@ class CockpitService:
         provider_usage: Any | None,
         connect: Callable[[], Any] | None = None,
         advisory_repository: Any | None = None,
+        cursor_secret: bytes | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
@@ -44,6 +50,9 @@ class CockpitService:
 
             advisory_repository = AdvisoryRepository(self.duckdb_path)
         self.advisory_repository = advisory_repository
+        self._cursor_codec = AnalyticsCursorCodec(
+            cursor_secret or secrets.token_bytes(32)
+        )
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
         provider_capacity = self._provider_capacity(filters)
@@ -112,14 +121,16 @@ class CockpitService:
                 )
             else:
                 raise RuntimeError("activity store is unavailable")
-            result = activity_analytics(con, filters)
+            result = activity_analytics(con, filters, cursor_codec=self._cursor_codec)
             data = asdict(result)
             return _section(
                 "ok",
                 data=data,
-                observed_at=datetime.now(timezone.utc),
+                observed_at=result.metadata.observed_at,
                 coverage=asdict(result.coverage),
             )
+        except ValueError:
+            raise
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render observed activity: %s", exc)
             return _section("error", data=None, coverage=None)

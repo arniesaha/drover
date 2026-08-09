@@ -452,6 +452,17 @@ struct ClientTests {
     ))
 }
 
+@Test func analyticsEncodesIndependentDimensionCursorsAndBoundedLimit() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.query == "days=7&limit=50&project_cursor=project%2Bnext%3D&host_cursor=host%2Fnext")
+        return (200, emptyAnalyticsJSON)
+    }
+
+    _ = try await client().analytics(filters: AnalyticsFilters(
+        limit: 50, projectCursor: "project+next=", hostCursor: "host/next"
+    ))
+}
+
 @Test func insightsCursorAndFiltersAreEncodedExactlyOnce() async throws {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/insights")

@@ -122,7 +122,19 @@ def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
 
 
 _COCKPIT_QUERY_FIELDS = frozenset(
-    {"days", "host_id", "harness", "provider", "model", "project_key"}
+    {
+        "days",
+        "host_id",
+        "harness",
+        "provider",
+        "model",
+        "project_key",
+        "limit",
+        "project_cursor",
+        "harness_cursor",
+        "host_cursor",
+        "model_cursor",
+    }
 )
 
 
@@ -141,14 +153,17 @@ def _parse_cockpit_query(query: str):
         value = entries[0].strip()
         if not value:
             raise ValueError(f"{name} must not be empty")
-        if len(value) > 256:
+        max_length = 2048 if name.endswith("_cursor") else 256
+        if len(value) > max_length:
             raise ValueError(f"{name} is too long")
         values[name] = value
-    if "days" in values:
+    for numeric in ("days", "limit"):
+        if numeric not in values:
+            continue
         try:
-            values["days"] = int(values["days"])
+            values[numeric] = int(values[numeric])
         except ValueError as exc:
-            raise ValueError("days must be an integer") from exc
+            raise ValueError(f"{numeric} must be an integer") from exc
     return AnalyticsFilters(**values)
 
 

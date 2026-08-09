@@ -135,6 +135,116 @@ struct CockpitStoreTests {
         #expect(store.insights.map(\.findingID) == ["one"])
     }
 
+    @Test @MainActor func analyticsDimensionsPageIndependentlyAndDedupeRows() async throws {
+        let client = CockpitClientStub(analyticsPages: [
+            try decodeAnalyticsPage(projects: ["one", "two"], hosts: ["mac"],
+                                    projectCursor: "projects-2", hostCursor: "hosts-2"),
+            try decodeAnalyticsPage(projects: ["two", "three"], hosts: [],
+                                    projectCursor: nil, hostCursor: nil),
+            try decodeAnalyticsPage(projects: [], hosts: ["mac", "nas"],
+                                    projectCursor: nil, hostCursor: nil),
+        ])
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 30, limit: 2))
+        await store.loadMoreAnalytics(.projects)
+        await store.loadMoreAnalytics(.hosts)
+
+        #expect(store.analyticsProjects.map(\.projectKey) == ["one", "two", "three"])
+        #expect(store.analyticsHosts.map(\.key) == ["mac", "nas"])
+        #expect(store.nextAnalyticsCursor(for: .projects) == nil)
+        #expect(store.nextAnalyticsCursor(for: .hosts) == nil)
+        let filters = await client.requestedAnalyticsFilters
+        #expect(filters.map(\.days) == [30, 30, 30])
+        #expect(filters[1].projectCursor == "projects-2")
+        #expect(filters[1].hostCursor == nil)
+        #expect(filters[2].hostCursor == "hosts-2")
+        #expect(filters[2].projectCursor == nil)
+    }
+
+    @Test @MainActor func analyticsPageFailureIsIsolatedAndRetainsItsCursor() async throws {
+        let client = CockpitClientStub(
+            analyticsPages: [
+                try decodeAnalyticsPage(projects: ["one"], hosts: ["mac"],
+                                        projectCursor: "projects-2", hostCursor: "hosts-2"),
+                try decodeAnalyticsPage(projects: ["two"], hosts: [],
+                                        projectCursor: nil, hostCursor: nil),
+            ],
+            failingAnalyticsCursors: ["hosts-2"]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        await store.loadAnalytics()
+        await store.loadMoreAnalytics(.hosts)
+        await store.loadMoreAnalytics(.projects)
+
+        #expect(store.analyticsPaginationError(for: .hosts) == "analytics page failed")
+        #expect(store.analyticsPaginationError(for: .projects) == nil)
+        #expect(store.nextAnalyticsCursor(for: .hosts) == "hosts-2")
+        #expect(store.analyticsHosts.map(\.key) == ["mac"])
+        #expect(store.analyticsProjects.map(\.projectKey) == ["one", "two"])
+    }
+
+    @Test @MainActor func newerAnalyticsFilterGenerationIgnoresOlderResponse() async throws {
+        let client = CockpitClientStub(
+            analyticsByDays: [
+                7: try decodeAnalyticsPage(projects: ["old"], hosts: [],
+                                           projectCursor: nil, hostCursor: nil),
+                30: try decodeAnalyticsPage(projects: ["new"], hosts: [],
+                                            projectCursor: nil, hostCursor: nil),
+            ],
+            analyticsDelays: [7: .milliseconds(80)]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        let old = Task { await store.loadAnalytics(filters: AnalyticsFilters(days: 7)) }
+        try await Task.sleep(for: .milliseconds(10))
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 30))
+        await old.value
+
+        #expect(store.analyticsProjects.map(\.projectKey) == ["new"])
+    }
+
+    @Test @MainActor func stalePageCompletionDoesNotClearNewGenerationLoadingState() async throws {
+        let oldInitial = try decodeAnalyticsPage(
+            projects: ["old"], hosts: [], projectCursor: "old-page", hostCursor: nil
+        )
+        let newInitial = try decodeAnalyticsPage(
+            projects: ["new"], hosts: [], projectCursor: "new-page", hostCursor: nil
+        )
+        let client = CockpitClientStub(
+            analyticsPages: [oldInitial, newInitial],
+            analyticsByCursor: [
+                "old-page": try decodeAnalyticsPage(
+                    projects: ["old-more"], hosts: [], projectCursor: nil, hostCursor: nil
+                ),
+                "new-page": try decodeAnalyticsPage(
+                    projects: ["new-more"], hosts: [], projectCursor: nil, hostCursor: nil
+                ),
+            ],
+            analyticsCursorDelays: [
+                "old-page": .milliseconds(80), "new-page": .milliseconds(500),
+            ]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 7))
+
+        let oldPage = Task { await store.loadMoreAnalytics(.projects) }
+        try await Task.sleep(for: .milliseconds(10))
+        await store.loadAnalytics(filters: AnalyticsFilters(days: 30))
+        let newPage = Task { await store.loadMoreAnalytics(.projects) }
+        try await Task.sleep(for: .milliseconds(20))
+        await oldPage.value
+
+        #expect(store.isLoadingAnalytics(.projects))
+        await newPage.value
+        #expect(store.analyticsProjects.map(\.projectKey) == ["new", "new-more"])
+    }
+
     @Test @MainActor func insightCursorAppendsWithoutReplacingExistingRows() async throws {
         let client = CockpitClientStub(insightPages: [
             try decodeInsightPage(ids: ["one", "two"], nextCursor: "page-2"),
@@ -321,7 +431,7 @@ private struct RequestedContentConsent: Sendable, Equatable {
 
 private actor CockpitClientStub: CockpitClient {
     private var overviews: [CockpitOverview]
-    private let analyticsValue: AnalyticsSnapshot?
+    private var analyticsValues: [AnalyticsSnapshot]
     private var pages: [InsightPage]
     private let acknowledgedFinding: InsightFinding?
     private let lifecycleError: DroverError?
@@ -330,9 +440,15 @@ private actor CockpitClientStub: CockpitClient {
     private let contentError: DroverError?
     private let purgedExcerptCount: Int
     private var refreshError: DroverError?
+    private let failingAnalyticsCursors: Set<String>
+    private let analyticsByDays: [Int: AnalyticsSnapshot]
+    private let analyticsDelays: [Int: Duration]
+    private let analyticsByCursor: [String: AnalyticsSnapshot]
+    private let analyticsCursorDelays: [String: Duration]
 
     private(set) var overviewRequestCount = 0
     private(set) var analyticsRequestCount = 0
+    private(set) var requestedAnalyticsFilters: [AnalyticsFilters] = []
     private(set) var insightsRequestCount = 0
     private(set) var requestedCursors: [String?] = []
     private(set) var dismissRequestCount = 0
@@ -346,6 +462,12 @@ private actor CockpitClientStub: CockpitClient {
     init(
         overviews: [CockpitOverview] = [],
         analytics: AnalyticsSnapshot? = nil,
+        analyticsPages: [AnalyticsSnapshot] = [],
+        failingAnalyticsCursors: Set<String> = [],
+        analyticsByDays: [Int: AnalyticsSnapshot] = [:],
+        analyticsDelays: [Int: Duration] = [:],
+        analyticsByCursor: [String: AnalyticsSnapshot] = [:],
+        analyticsCursorDelays: [String: Duration] = [:],
         insightPages: [InsightPage] = [],
         acknowledgedFinding: InsightFinding? = nil,
         lifecycleError: DroverError? = nil,
@@ -355,7 +477,12 @@ private actor CockpitClientStub: CockpitClient {
         purgedExcerptCount: Int = 0
     ) {
         self.overviews = overviews
-        self.analyticsValue = analytics
+        self.analyticsValues = analyticsPages.isEmpty ? analytics.map { [$0] } ?? [] : analyticsPages
+        self.failingAnalyticsCursors = failingAnalyticsCursors
+        self.analyticsByDays = analyticsByDays
+        self.analyticsDelays = analyticsDelays
+        self.analyticsByCursor = analyticsByCursor
+        self.analyticsCursorDelays = analyticsCursorDelays
         self.pages = insightPages
         self.acknowledgedFinding = acknowledgedFinding
         self.lifecycleError = lifecycleError
@@ -376,8 +503,20 @@ private actor CockpitClientStub: CockpitClient {
 
     func analytics(filters: AnalyticsFilters) async throws -> AnalyticsSnapshot {
         analyticsRequestCount += 1
-        guard let analyticsValue else { throw DroverError.unavailable("no analytics") }
-        return analyticsValue
+        requestedAnalyticsFilters.append(filters)
+        if let delay = analyticsDelays[filters.days] { try await Task.sleep(for: delay) }
+        let cursor = filters.projectCursor ?? filters.harnessCursor
+            ?? filters.hostCursor ?? filters.modelCursor
+        if let cursor, let delay = analyticsCursorDelays[cursor] {
+            try await Task.sleep(for: delay)
+        }
+        if let cursor, failingAnalyticsCursors.contains(cursor) {
+            throw DroverError.unavailable("analytics page failed")
+        }
+        if let cursor, let value = analyticsByCursor[cursor] { return value }
+        if let value = analyticsByDays[filters.days] { return value }
+        guard !analyticsValues.isEmpty else { throw DroverError.unavailable("no analytics") }
+        return analyticsValues.removeFirst()
     }
 
     func insights(filters: InsightFilters) async throws -> InsightPage {
@@ -554,6 +693,30 @@ private func decodeAnalytics() throws -> AnalyticsSnapshot {
      "provider_capacity":{"status":"ok","data":[]},
      "activity":{"status":"ok","coverage":{"token_percent":90},
        "data":\(activityJSON(sessions: 22))}}
+    """.utf8))
+}
+
+private func decodeAnalyticsPage(
+    projects: [String], hosts: [String], projectCursor: String?, hostCursor: String?
+) throws -> AnalyticsSnapshot {
+    let projectRows = projects.map {
+        "{\"project_key\":\"\($0)\",\"session_count\":1,\"total_tokens\":10,\"cost_usd\":0,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"total_latency_ms\":1,\"harnesses\":[\"codex\"],\"hosts\":[\"mac\"]}"
+    }.joined(separator: ",")
+    let hostRows = hosts.map {
+        "{\"key\":\"\($0)\",\"session_count\":1,\"total_tokens\":10,\"cost_usd\":0,\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"total_latency_ms\":1}"
+    }.joined(separator: ",")
+    let projectNext = projectCursor.map { "\"\($0)\"" } ?? "null"
+    let hostNext = hostCursor.map { "\"\($0)\"" } ?? "null"
+    return try JSONDecoder().decode(AnalyticsSnapshot.self, from: Data("""
+    {"cockpit_api_version":1,"filters":{"days":30,"limit":2},
+     "provider_capacity":{"status":"unavailable","data":[]},
+     "activity":{"status":"ok","coverage":{"token_percent":100},"data":{
+      "totals":{"session_count":1,"total_tokens":10,"cost_usd":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_latency_ms":1},
+      "projects":[\(projectRows)],"harnesses":[],"hosts":[\(hostRows)],"models":[],
+      "project_metric":"tokens","coverage":{"token_percent":100},
+      "pagination":{"projects":{"limit":2,"next_cursor":\(projectNext)},
+       "harnesses":{"limit":2,"next_cursor":null},"hosts":{"limit":2,"next_cursor":\(hostNext)},
+       "models":{"limit":2,"next_cursor":null}}}}}
     """.utf8))
 }
 

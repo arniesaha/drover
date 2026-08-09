@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
+import secrets
 from typing import Any, Literal
 
 import duckdb
 
 _MAX_DAYS = 365
 _MAX_BREAKDOWNS = 100
+_DEFAULT_BREAKDOWNS = 25
 _TOKEN_COVERAGE_THRESHOLD = 80.0
+_FRESHNESS_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -20,12 +28,21 @@ class AnalyticsFilters:
     provider: str | None = None
     model: str | None = None
     project_key: str | None = None
+    limit: int = _DEFAULT_BREAKDOWNS
+    project_cursor: str | None = None
+    harness_cursor: str | None = None
+    host_cursor: str | None = None
+    model_cursor: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.days, bool) or not isinstance(self.days, int):
             raise ValueError("days must be an integer")
         if not 1 <= self.days <= _MAX_DAYS:
             raise ValueError(f"days must be within [1, {_MAX_DAYS}]")
+        if isinstance(self.limit, bool) or not isinstance(self.limit, int):
+            raise ValueError("limit must be an integer")
+        if not 1 <= self.limit <= _MAX_BREAKDOWNS:
+            raise ValueError(f"limit must be within [1, {_MAX_BREAKDOWNS}]")
 
 
 @dataclass(frozen=True)
@@ -37,6 +54,7 @@ class ActivityTotals:
     cache_write_tokens: int
     total_latency_ms: float
     average_latency_ms: float | None
+    metadata: AggregateMetadata
 
 
 @dataclass(frozen=True)
@@ -49,6 +67,28 @@ class Coverage:
 
 
 @dataclass(frozen=True)
+class AggregateMetadata:
+    source: Literal["drover_observed"]
+    observed_at: datetime | None
+    freshness: Literal["fresh", "stale", "unavailable"]
+    coverage: Coverage
+
+
+@dataclass(frozen=True)
+class PageMetadata:
+    limit: int
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class AnalyticsPagination:
+    projects: PageMetadata
+    harnesses: PageMetadata
+    hosts: PageMetadata
+    models: PageMetadata
+
+
+@dataclass(frozen=True)
 class ActivityBreakdown:
     key: str
     session_count: int
@@ -58,6 +98,7 @@ class ActivityBreakdown:
     cache_write_tokens: int
     total_latency_ms: float
     average_latency_ms: float | None
+    metadata: AggregateMetadata
 
 
 @dataclass(frozen=True)
@@ -72,6 +113,7 @@ class ProjectActivity:
     average_latency_ms: float | None
     harnesses: tuple[str, ...]
     hosts: tuple[str, ...]
+    metadata: AggregateMetadata
 
 
 @dataclass(frozen=True)
@@ -83,13 +125,52 @@ class ActivityAnalytics:
     models: tuple[ActivityBreakdown, ...]
     project_metric: Literal["tokens", "sessions"]
     coverage: Coverage
+    metadata: AggregateMetadata
+    pagination: AnalyticsPagination
+
+
+class AnalyticsCursorCodec:
+    """Opaque HMAC-authenticated keyset cursor bound to a query surface."""
+
+    def __init__(self, secret: bytes) -> None:
+        if len(secret) < 16:
+            raise ValueError("analytics cursor secret must be at least 16 bytes")
+        self._secret = secret
+
+    def encode(self, payload: dict[str, Any]) -> str:
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        signature = hmac.new(self._secret, body, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(body + signature).decode().rstrip("=")
+
+    def decode(self, cursor: str) -> dict[str, Any]:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            raw = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+            body, signature = raw[:-32], raw[-32:]
+            if len(body) == 0 or not hmac.compare_digest(
+                signature, hmac.new(self._secret, body, hashlib.sha256).digest()
+            ):
+                raise ValueError
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid analytics cursor") from exc
+
+
+_DEFAULT_CURSOR_CODEC = AnalyticsCursorCodec(secrets.token_bytes(32))
 
 
 def activity_analytics(
-    con: duckdb.DuckDBPyConnection, filters: AnalyticsFilters
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    *,
+    cursor_codec: AnalyticsCursorCodec | None = None,
 ) -> ActivityAnalytics:
     """Return observed metrics without reconciling them to provider quota."""
     base_sql, params = _session_facts_sql(filters)
+    codec = cursor_codec or _DEFAULT_CURSOR_CODEC
     aggregate = con.execute(
         base_sql + """
         SELECT
@@ -104,7 +185,8 @@ def activity_analytics(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_tokens) AS token_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cost) AS cost_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
-          count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions
+          count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
+          max(started_at) AS observed_at
         FROM filtered_sessions
         """,
         params,
@@ -119,6 +201,7 @@ def activity_analytics(
         cache_percent=_percent(int(aggregate[10] or 0), attributable_sessions),
         latency_percent=_percent(int(aggregate[11] or 0), attributable_sessions),
     )
+    metadata = _aggregate_metadata(coverage, aggregate[12])
     project_metric: Literal["tokens", "sessions"] = (
         "tokens" if coverage.token_percent >= _TOKEN_COVERAGE_THRESHOLD else "sessions"
     )
@@ -130,16 +213,35 @@ def activity_analytics(
         cache_write_tokens=int(aggregate[4] or 0),
         total_latency_ms=float(aggregate[5] or 0),
         average_latency_ms=(float(aggregate[6]) if aggregate[6] is not None else None),
+        metadata=metadata,
     )
-    projects = _project_breakdowns(con, base_sql, params, project_metric)
+    projects, projects_page = _project_breakdowns(
+        con, base_sql, params, filters, project_metric, codec
+    )
+    harnesses, harnesses_page = _dimension_breakdowns(
+        con, base_sql, params, filters, "harness", codec
+    )
+    hosts, hosts_page = _dimension_breakdowns(
+        con, base_sql, params, filters, "host_id", codec
+    )
+    models, models_page = _dimension_breakdowns(
+        con, base_sql, params, filters, "model", codec
+    )
     return ActivityAnalytics(
         totals=totals,
         projects=projects,
-        harnesses=_dimension_breakdowns(con, base_sql, params, "harness"),
-        hosts=_dimension_breakdowns(con, base_sql, params, "host_id"),
-        models=_dimension_breakdowns(con, base_sql, params, "model"),
+        harnesses=harnesses,
+        hosts=hosts,
+        models=models,
         project_metric=project_metric,
         coverage=coverage,
+        metadata=metadata,
+        pagination=AnalyticsPagination(
+            projects=projects_page,
+            harnesses=harnesses_page,
+            hosts=hosts_page,
+            models=models_page,
+        ),
     )
 
 
@@ -282,9 +384,21 @@ def _project_breakdowns(
     con: duckdb.DuckDBPyConnection,
     base_sql: str,
     params: list[Any],
+    filters: AnalyticsFilters,
     metric: Literal["tokens", "sessions"],
-) -> tuple[ProjectActivity, ...]:
+    codec: AnalyticsCursorCodec,
+) -> tuple[tuple[ProjectActivity, ...], PageMetadata]:
     order_column = "total_tokens" if metric == "tokens" else "session_count"
+    cursor = _cursor_position(
+        codec, filters.project_cursor, "projects", filters, metric
+    )
+    having = ""
+    query_params = list(params)
+    if cursor is not None:
+        having = (
+            f"HAVING ({order_column} < ? OR ({order_column} = ? AND project_key > ?))"
+        )
+        query_params.extend([cursor[0], cursor[0], cursor[1]])
     rows = con.execute(
         base_sql + f"""
         SELECT
@@ -297,16 +411,24 @@ def _project_breakdowns(
           COALESCE(sum(total_latency_ms), 0) AS total_latency_ms,
           avg(total_latency_ms) FILTER (WHERE has_latency) AS average_latency_ms,
           list(DISTINCT harness ORDER BY harness) FILTER (WHERE harness IS NOT NULL),
-          list(DISTINCT host_id ORDER BY host_id) FILTER (WHERE host_id IS NOT NULL)
+          list(DISTINCT host_id ORDER BY host_id) FILTER (WHERE host_id IS NOT NULL),
+          count(*) FILTER (WHERE has_tokens) AS token_sessions,
+          count(*) FILTER (WHERE has_cost) AS cost_sessions,
+          count(*) FILTER (WHERE has_cache) AS cache_sessions,
+          count(*) FILTER (WHERE has_latency) AS latency_sessions,
+          max(started_at) AS observed_at
         FROM filtered_sessions
         WHERE project_key IS NOT NULL
         GROUP BY project_key
+        {having}
         ORDER BY {order_column} DESC, project_key
-        LIMIT {_MAX_BREAKDOWNS}
+        LIMIT ?
         """,
-        params,
+        [*query_params, filters.limit + 1],
     ).fetchall()
-    return tuple(
+    has_more = len(rows) > filters.limit
+    page_rows = rows[: filters.limit]
+    items = tuple(
         ProjectActivity(
             project_key=str(row[0]),
             session_count=int(row[1]),
@@ -318,17 +440,49 @@ def _project_breakdowns(
             average_latency_ms=float(row[7]) if row[7] is not None else None,
             harnesses=tuple(row[8] or ()),
             hosts=tuple(row[9] or ()),
+            metadata=_aggregate_metadata(
+                Coverage(
+                    attributable_session_percent=100.0,
+                    token_percent=_percent(int(row[10]), int(row[1])),
+                    cost_percent=_percent(int(row[11]), int(row[1])),
+                    cache_percent=_percent(int(row[12]), int(row[1])),
+                    latency_percent=_percent(int(row[13]), int(row[1])),
+                ),
+                row[14],
+            ),
         )
-        for row in rows
+        for row in page_rows
     )
+    next_cursor = None
+    if has_more:
+        row = page_rows[-1]
+        next_cursor = _encode_cursor(
+            codec,
+            "projects",
+            filters,
+            metric,
+            int(row[2]) if metric == "tokens" else int(row[1]),
+            str(row[0]),
+        )
+    return items, PageMetadata(limit=filters.limit, next_cursor=next_cursor)
 
 
 def _dimension_breakdowns(
     con: duckdb.DuckDBPyConnection,
     base_sql: str,
     params: list[Any],
+    filters: AnalyticsFilters,
     column: Literal["harness", "host_id", "model"],
-) -> tuple[ActivityBreakdown, ...]:
+    codec: AnalyticsCursorCodec,
+) -> tuple[tuple[ActivityBreakdown, ...], PageMetadata]:
+    dimension = {"harness": "harnesses", "host_id": "hosts", "model": "models"}[column]
+    cursor_value = getattr(filters, f"{column.removesuffix('_id')}_cursor")
+    cursor = _cursor_position(codec, cursor_value, dimension, filters, "sessions")
+    having = ""
+    query_params = list(params)
+    if cursor is not None:
+        having = "HAVING (session_count < ? OR (session_count = ? AND key > ?))"
+        query_params.extend([cursor[0], cursor[0], cursor[1]])
     rows = con.execute(
         base_sql + f"""
         SELECT
@@ -339,16 +493,25 @@ def _dimension_breakdowns(
           COALESCE(sum(cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(sum(cache_write_tokens), 0) AS cache_write_tokens,
           COALESCE(sum(total_latency_ms), 0) AS total_latency_ms,
-          avg(total_latency_ms) FILTER (WHERE has_latency) AS average_latency_ms
+          avg(total_latency_ms) FILTER (WHERE has_latency) AS average_latency_ms,
+          count(*) FILTER (WHERE project_key IS NOT NULL) AS attributable_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND has_tokens) AS token_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND has_cost) AS cost_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
+          max(started_at) AS observed_at
         FROM filtered_sessions
         WHERE {column} IS NOT NULL
         GROUP BY {column}
+        {having}
         ORDER BY session_count DESC, key
-        LIMIT {_MAX_BREAKDOWNS}
+        LIMIT ?
         """,
-        params,
+        [*query_params, filters.limit + 1],
     ).fetchall()
-    return tuple(
+    has_more = len(rows) > filters.limit
+    page_rows = rows[: filters.limit]
+    items = tuple(
         ActivityBreakdown(
             key=str(row[0]),
             session_count=int(row[1]),
@@ -358,9 +521,105 @@ def _dimension_breakdowns(
             cache_write_tokens=int(row[5]),
             total_latency_ms=float(row[6]),
             average_latency_ms=float(row[7]) if row[7] is not None else None,
+            metadata=_aggregate_metadata(
+                Coverage(
+                    attributable_session_percent=_percent(int(row[8]), int(row[1])),
+                    token_percent=_percent(int(row[9]), int(row[8])),
+                    cost_percent=_percent(int(row[10]), int(row[8])),
+                    cache_percent=_percent(int(row[11]), int(row[8])),
+                    latency_percent=_percent(int(row[12]), int(row[8])),
+                ),
+                row[13],
+            ),
         )
-        for row in rows
+        for row in page_rows
     )
+    next_cursor = None
+    if has_more:
+        row = page_rows[-1]
+        next_cursor = _encode_cursor(
+            codec, dimension, filters, "sessions", int(row[1]), str(row[0])
+        )
+    return items, PageMetadata(limit=filters.limit, next_cursor=next_cursor)
+
+
+def _filter_fingerprint(filters: AnalyticsFilters) -> str:
+    values = {
+        "days": filters.days,
+        "host_id": filters.host_id,
+        "harness": filters.harness,
+        "provider": filters.provider,
+        "model": filters.model,
+        "project_key": filters.project_key,
+    }
+    body = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
+
+
+def _aggregate_metadata(
+    coverage: Coverage, observed_at: datetime | None
+) -> AggregateMetadata:
+    if observed_at is not None and observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    freshness: Literal["fresh", "stale", "unavailable"] = "unavailable"
+    if observed_at is not None:
+        age = (datetime.now(timezone.utc) - observed_at).total_seconds()
+        freshness = "fresh" if age <= _FRESHNESS_SECONDS else "stale"
+    return AggregateMetadata(
+        source="drover_observed",
+        observed_at=observed_at,
+        freshness=freshness,
+        coverage=coverage,
+    )
+
+
+def _encode_cursor(
+    codec: AnalyticsCursorCodec,
+    dimension: str,
+    filters: AnalyticsFilters,
+    sort: str,
+    value: int,
+    key: str,
+) -> str:
+    return codec.encode(
+        {
+            "v": 1,
+            "dimension": dimension,
+            "filters": _filter_fingerprint(filters),
+            "sort": sort,
+            "value": value,
+            "key": key,
+        }
+    )
+
+
+def _cursor_position(
+    codec: AnalyticsCursorCodec,
+    cursor: str | None,
+    dimension: str,
+    filters: AnalyticsFilters,
+    sort: str,
+) -> tuple[int, str] | None:
+    if cursor is None:
+        return None
+    payload = codec.decode(cursor)
+    expected = {
+        "v": 1,
+        "dimension": dimension,
+        "filters": _filter_fingerprint(filters),
+        "sort": sort,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise ValueError("analytics cursor does not match dimension, filters, or sort")
+    value = payload.get("value")
+    key = payload.get("key")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not isinstance(key, str)
+    ):
+        raise ValueError("invalid analytics cursor")
+    return value, key
 
 
 def _percent(numerator: int, denominator: int) -> float:

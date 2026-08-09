@@ -90,6 +90,11 @@ public actor DroverClient {
             ("provider", filters.provider),
             ("model", filters.model),
             ("project_key", filters.projectKey),
+            ("limit", filters.limit == 25 ? nil : String(filters.limit)),
+            ("project_cursor", filters.projectCursor),
+            ("harness_cursor", filters.harnessCursor),
+            ("host_cursor", filters.hostCursor),
+            ("model_cursor", filters.modelCursor),
         ])
         let data = try await request(url: url, method: "GET", body: nil)
         return try decode(AnalyticsSnapshot.self, from: data)
