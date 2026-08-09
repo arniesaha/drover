@@ -32,6 +32,7 @@ from drover.server.advisory.types import (
 )
 from drover.server.advisory.worker import (
     AdvisoryWorker,
+    ContentAnalysisScheduler,
     ContentAnalysisWorker,
     load_operational_snapshot,
     operational_analyzers,
@@ -41,6 +42,7 @@ from drover.server.cockpit.service import ProviderRefreshLoop
 from drover.server.ledger import Ledger
 from drover.server.providers.service import ProviderUsageService
 from drover.server.__main__ import _create_content_analysis_worker
+from drover.server.harness.registry import HarnessRegistry
 
 NOW = datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc)
 
@@ -782,6 +784,48 @@ def test_disabled_content_worker_leaves_pending_job_without_fetch(
         )
 
 
+def test_revocation_after_lease_requeues_job_and_resumes_after_enable(
+    db_path: Path,
+) -> None:
+    current = [_content_config()]
+    bundle = _content_bundle("No issue.")
+    job = enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version=bundle.bundle_hash,
+    )
+
+    def fetch(_host, _targets):
+        current[0] = _content_config(enabled=False)
+        return bundle
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            return '{"findings":[]}'
+
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: current[0],
+        bundle_fetcher=fetch,
+        backend_factory=lambda _config: Backend(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+    )
+
+    assert worker.run_once().skipped == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert (
+            con.execute(
+                "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+            ).fetchone()[0]
+            == "pending"
+        )
+
+    current[0] = _content_config()
+    worker.bundle_fetcher = lambda _host, _targets: bundle
+    assert worker.run_once().succeeded == 1
+
+
 def test_server_factory_wires_collector_backend_and_durable_content_job(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -789,17 +833,21 @@ def test_server_factory_wires_collector_backend_and_durable_content_job(
     config = replace(
         default_config(),
         duckdb_path=db_path,
-        advisory_content=_content_config(),
+        advisory_content=_content_config(enabled=False),
     )
-    enqueue_advisory_check(
-        db_path,
-        analyzer_id="model.configuration",
-        target_id="mac-mini",
-        source_version=bundle.bundle_hash,
+    current = [config.advisory_content]
+    HarnessRegistry(db_path).register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="mac",
+        local_url="http://127.0.0.1:7081",
+        status="online",
     )
+    fetches: list[str] = []
 
     class Collector:
         def fetch_advisory_content_bundle(self, host_id, target_ids):
+            fetches.append(host_id)
             assert host_id == "mac-mini"
             assert target_ids == ["global-agents"]
             return {
@@ -827,10 +875,102 @@ def test_server_factory_wires_collector_backend_and_durable_content_job(
         cfg=config,
         metrics_collector=Collector(),
         backend_config=object(),
-        consent_reader=lambda: config.advisory_content,
+        consent_reader=lambda: current[0],
     )
 
+    assert worker.run_once().skipped == 1
+    assert fetches == []
+    current[0] = _content_config()
     assert worker.run_once().succeeded == 1
+    assert fetches == ["mac-mini"]
+    assert worker.run_once().skipped == 1
+    assert fetches == ["mac-mini"]
+
+
+def test_content_scheduler_coalesces_startup_and_enqueues_periodic_versions(
+    db_path: Path,
+) -> None:
+    HarnessRegistry(db_path).register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="mac",
+        local_url="http://127.0.0.1:7081",
+        status="online",
+    )
+    now = [0.0]
+    fetches: list[str] = []
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=db_path,
+        registry=HarnessRegistry(db_path),
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=lambda host_id, _targets: (
+            fetches.append(host_id),
+            _content_bundle("No issue."),
+        )[1],
+        interval_seconds=3600,
+        clock=lambda: now[0],
+    )
+
+    assert set(scheduler.enqueue_due()) == {"mac-mini"}
+    assert scheduler.enqueue_due() == {}
+    now[0] = 3600
+    assert set(scheduler.enqueue_due()) == {"mac-mini"}
+    assert fetches == ["mac-mini", "mac-mini"]
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM pipeline_receipts WHERE source_key = ?",
+                ["model.configuration:mac-mini"],
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_content_job_rolls_back_findings_when_ledger_completion_fails(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = "Always inspect the repository. Always inspect the repository."
+    bundle = _content_bundle(content)
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="model.configuration",
+        target_id="mac-mini",
+        source_version=bundle.bundle_hash,
+    )
+
+    class Backend:
+        def complete(self, _system: str, _user: str) -> str:
+            return json.dumps(
+                {
+                    "findings": [
+                        {
+                            "rule_id": "prompt.repetition",
+                            "target_id": "global-agents",
+                            "severity": "medium",
+                            "confidence": "likely",
+                            "title": "Repeated instruction",
+                            "impact": "Repeated text consumes context.",
+                            "evidence_excerpt": "Always inspect the repository.",
+                            "remediation": ["Keep one copy of the instruction."],
+                        }
+                    ]
+                }
+            )
+
+    def fail_completion(self, *args, **kwargs):
+        raise RuntimeError("injected artifact failure")
+
+    monkeypatch.setattr(Ledger, "succeed_job", fail_completion)
+    worker = ContentAnalysisWorker(
+        consent_reader=lambda: _content_config(),
+        bundle_fetcher=lambda _host, _targets: bundle,
+        backend_factory=lambda _config: Backend(),
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+    )
+
+    assert worker.run_once().failed == 1
+    assert AdvisoryRepository(db_path).list_findings() == []
 
 
 def test_periodic_scheduler_uses_one_deterministic_version_per_interval(

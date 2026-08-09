@@ -66,6 +66,27 @@ class AdvisoryRepository:
         self.duckdb_path = Path(duckdb_path)
 
     def observe(self, candidate: FindingCandidate, *, run_id: str) -> Finding:
+        con = open_duckdb_connection(self.duckdb_path, role="worker")
+        try:
+            con.execute("BEGIN TRANSACTION")
+            finding_id = self.observe_in_transaction(con, candidate, run_id=run_id)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+        return self.get_finding(finding_id)
+
+    def observe_in_transaction(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        candidate: FindingCandidate,
+        *,
+        run_id: str,
+    ) -> str:
+        """Observe one candidate using the caller's existing transaction."""
+
         if not run_id.strip():
             raise ValueError("run_id is required")
         normalized = tuple(_normalize_evidence(item) for item in candidate.evidence)
@@ -81,109 +102,98 @@ class AdvisoryRepository:
             normalized=normalized,
         )
         observed_at = max(item[0].observed_at for item in normalized)
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            row = con.execute(
-                "SELECT finding_id, state, severity, evaluated_content_hash "
-                "FROM advisory_findings WHERE fingerprint = ?",
-                [fingerprint],
-            ).fetchone()
-            if row is None:
-                finding_id = uuid4().hex
-                state = FindingState.OPEN
-                con.execute(
-                    """
-                    INSERT INTO advisory_findings (
-                      finding_id, fingerprint, analyzer_id, rule_id, target_type,
-                      target_id, analyzer_class, severity, confidence, title,
-                      impact, remediation_json, state, first_seen_at, last_seen_at,
-                      evaluated_content_hash, latest_run_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        finding_id,
-                        fingerprint,
-                        candidate.analyzer_id,
-                        candidate.rule_id,
-                        candidate.target_type,
-                        candidate.target_id,
-                        candidate.analyzer_class.value,
-                        candidate.severity.value,
-                        candidate.confidence.value,
-                        title,
-                        impact,
-                        json.dumps(remediation),
-                        state.value,
-                        observed_at,
-                        observed_at,
-                        candidate.content_hash,
-                        run_id,
-                    ],
-                )
-            else:
-                finding_id = str(row[0])
-                old_state = FindingState(row[1])
-                state = self._next_observed_state(
-                    con,
-                    finding_id=finding_id,
-                    old_state=old_state,
-                    old_severity=Severity(row[2]),
-                    new_severity=candidate.severity,
-                    old_content_hash=row[3],
-                    new_content_hash=candidate.content_hash,
-                    material_hash=material_hash,
-                )
-                regressed_at = (
-                    observed_at if old_state == FindingState.RESOLVED else None
-                )
-                clear_dismissal = (
-                    old_state == FindingState.DISMISSED and state == FindingState.OPEN
-                )
-                con.execute(
-                    """
-                    UPDATE advisory_findings SET
-                      analyzer_class = ?, severity = ?, confidence = ?, title = ?,
-                      impact = ?, remediation_json = ?, state = ?,
-                      dismissal_reason = CASE WHEN ? THEN NULL ELSE dismissal_reason END,
-                      dismissed_at = CASE WHEN ? THEN NULL ELSE dismissed_at END,
-                      resolved_at = CASE WHEN ? THEN NULL ELSE resolved_at END,
-                      regressed_at = COALESCE(?, regressed_at),
-                      last_seen_at = ?, evaluated_content_hash = ?, latest_run_id = ?
-                    WHERE finding_id = ?
-                    """,
-                    [
-                        candidate.analyzer_class.value,
-                        candidate.severity.value,
-                        candidate.confidence.value,
-                        title,
-                        impact,
-                        json.dumps(remediation),
-                        state.value,
-                        clear_dismissal,
-                        clear_dismissal,
-                        old_state == FindingState.RESOLVED,
-                        regressed_at,
-                        observed_at,
-                        candidate.content_hash,
-                        run_id,
-                        finding_id,
-                    ],
-                )
-            self._insert_occurrences(
+        row = con.execute(
+            "SELECT finding_id, state, severity, evaluated_content_hash "
+            "FROM advisory_findings WHERE fingerprint = ?",
+            [fingerprint],
+        ).fetchone()
+        if row is None:
+            finding_id = uuid4().hex
+            state = FindingState.OPEN
+            con.execute(
+                """
+                INSERT INTO advisory_findings (
+                  finding_id, fingerprint, analyzer_id, rule_id, target_type,
+                  target_id, analyzer_class, severity, confidence, title,
+                  impact, remediation_json, state, first_seen_at, last_seen_at,
+                  evaluated_content_hash, latest_run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    finding_id,
+                    fingerprint,
+                    candidate.analyzer_id,
+                    candidate.rule_id,
+                    candidate.target_type,
+                    candidate.target_id,
+                    candidate.analyzer_class.value,
+                    candidate.severity.value,
+                    candidate.confidence.value,
+                    title,
+                    impact,
+                    json.dumps(remediation),
+                    state.value,
+                    observed_at,
+                    observed_at,
+                    candidate.content_hash,
+                    run_id,
+                ],
+            )
+        else:
+            finding_id = str(row[0])
+            old_state = FindingState(row[1])
+            state = self._next_observed_state(
                 con,
                 finding_id=finding_id,
-                run_id=run_id,
-                normalized=normalized,
+                old_state=old_state,
+                old_severity=Severity(row[2]),
+                new_severity=candidate.severity,
+                old_content_hash=row[3],
+                new_content_hash=candidate.content_hash,
                 material_hash=material_hash,
             )
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
-        return self.get_finding(finding_id)
+            regressed_at = observed_at if old_state == FindingState.RESOLVED else None
+            clear_dismissal = (
+                old_state == FindingState.DISMISSED and state == FindingState.OPEN
+            )
+            con.execute(
+                """
+                UPDATE advisory_findings SET
+                  analyzer_class = ?, severity = ?, confidence = ?, title = ?,
+                  impact = ?, remediation_json = ?, state = ?,
+                  dismissal_reason = CASE WHEN ? THEN NULL ELSE dismissal_reason END,
+                  dismissed_at = CASE WHEN ? THEN NULL ELSE dismissed_at END,
+                  resolved_at = CASE WHEN ? THEN NULL ELSE resolved_at END,
+                  regressed_at = COALESCE(?, regressed_at),
+                  last_seen_at = ?, evaluated_content_hash = ?, latest_run_id = ?
+                WHERE finding_id = ?
+                """,
+                [
+                    candidate.analyzer_class.value,
+                    candidate.severity.value,
+                    candidate.confidence.value,
+                    title,
+                    impact,
+                    json.dumps(remediation),
+                    state.value,
+                    clear_dismissal,
+                    clear_dismissal,
+                    old_state == FindingState.RESOLVED,
+                    regressed_at,
+                    observed_at,
+                    candidate.content_hash,
+                    run_id,
+                    finding_id,
+                ],
+            )
+        self._insert_occurrences(
+            con,
+            finding_id=finding_id,
+            run_id=run_id,
+            normalized=normalized,
+            material_hash=material_hash,
+        )
+        return finding_id
 
     def mark_passing(self, finding_id: str, *, run_id: str) -> Finding:
         now = datetime.now(timezone.utc)

@@ -53,6 +53,7 @@ from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
 from drover.server.advisory.worker import (
     AdvisoryWorker,
+    ContentAnalysisScheduler,
     ContentAnalysisWorker,
     load_operational_snapshot,
     operational_analyzers,
@@ -121,6 +122,13 @@ def _create_content_analysis_worker(
             payload, host_id=host_id, requested_ids=target_ids
         )
 
+    scheduler = ContentAnalysisScheduler(
+        duckdb_path=cfg.duckdb_path,
+        registry=HarnessRegistry(cfg.duckdb_path),
+        consent_reader=consent_reader,
+        bundle_fetcher=_fetch,
+        interval_seconds=cfg.advisory_full_review_interval_seconds,
+    )
     return ContentAnalysisWorker(
         consent_reader=consent_reader,
         bundle_fetcher=_fetch,
@@ -131,6 +139,7 @@ def _create_content_analysis_worker(
         ),
         duckdb_path=cfg.duckdb_path,
         repository=AdvisoryRepository(cfg.duckdb_path),
+        scheduler=scheduler,
     )
 
 
@@ -1454,51 +1463,48 @@ def run(
             metrics_server = None
 
     content_advisory_worker: ContentAnalysisWorker | None = None
-    if cfg.advisory_content.enabled:
-        try:
-            if metrics_collector is None:
-                auth = load_auth(cfg)
-                metrics_collector = MetricsCollector(
-                    duckdb_path=cfg.duckdb_path,
-                    incoming_dir=cfg.incoming_dir,
-                    summarizer_report={},
-                    job_streams=job_streams,
-                    api_token=auth.api_token if auth.enabled else "",
-                    favorite_cwds=cfg.harness_favorite_cwds,
-                )
-            content_backend_cfg = SummarizerBackendConfig.from_runtime(
-                api_model=cfg.summarizer_api_model,
-                backend_policy=cfg.summarizer_backend_policy,
-                local_model=cfg.summarizer_local_model,
-                local_ollama_url=cfg.summarizer_local_ollama_url or None,
-                gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
-                gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
-                wake_timeout_s=cfg.summarizer_wake_timeout_s,
+    try:
+        if metrics_collector is None:
+            auth = load_auth(cfg)
+            metrics_collector = MetricsCollector(
+                duckdb_path=cfg.duckdb_path,
+                incoming_dir=cfg.incoming_dir,
+                summarizer_report={},
+                job_streams=job_streams,
+                api_token=auth.api_token if auth.enabled else "",
+                favorite_cwds=cfg.harness_favorite_cwds,
             )
-            config_path = (
-                Path(ctx.obj["config_path"])
-                if ctx.obj["config_path"]
-                else _DEFAULT_CONFIG_PATH
-            )
-            content_advisory_worker = _create_content_analysis_worker(
-                cfg=cfg,
-                metrics_collector=metrics_collector,
-                backend_config=content_backend_cfg,
-                consent_reader=lambda: load_config(config_path).advisory_content,
-            )
-            content_advisory_worker.start(
-                shutdown_event=stop,
-                poll_interval_seconds=cfg.advisory_poll_interval_seconds,
-            )
-            log.info(
-                "content advisory worker ready (policy=%s)",
-                cfg.advisory_content.backend_policy,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "content advisory worker failed to start; continuing without it"
-            )
-            content_advisory_worker = None
+        content_backend_cfg = SummarizerBackendConfig.from_runtime(
+            api_model=cfg.summarizer_api_model,
+            backend_policy=cfg.summarizer_backend_policy,
+            local_model=cfg.summarizer_local_model,
+            local_ollama_url=cfg.summarizer_local_ollama_url or None,
+            gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
+            gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
+            wake_timeout_s=cfg.summarizer_wake_timeout_s,
+        )
+        config_path = (
+            Path(ctx.obj["config_path"])
+            if ctx.obj["config_path"]
+            else _DEFAULT_CONFIG_PATH
+        )
+        content_advisory_worker = _create_content_analysis_worker(
+            cfg=cfg,
+            metrics_collector=metrics_collector,
+            backend_config=content_backend_cfg,
+            consent_reader=lambda: load_config(config_path).advisory_content,
+        )
+        content_advisory_worker.start(
+            shutdown_event=stop,
+            poll_interval_seconds=cfg.advisory_poll_interval_seconds,
+        )
+        log.info(
+            "content advisory worker ready (policy=%s)",
+            cfg.advisory_content.backend_policy,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("content advisory worker failed to start; continuing without it")
+        content_advisory_worker = None
 
     summarizer: SummarizerWorker | None = None
     if not no_summarizer:

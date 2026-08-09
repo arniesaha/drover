@@ -9,6 +9,7 @@ import json
 import logging
 from pathlib import Path
 import threading
+import time
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from drover.config import AdvisoryContentConfig
@@ -69,6 +70,80 @@ class ContentBundleFetcher(Protocol):
     def __call__(self, host_id: str, target_ids: tuple[str, ...]) -> ContentBundle: ...
 
 
+class ContentAnalysisScheduler:
+    """Discover consented bundle versions and enqueue coalesced model jobs."""
+
+    def __init__(
+        self,
+        *,
+        duckdb_path: str | Path,
+        registry,
+        consent_reader: Callable[[], AdvisoryContentConfig],
+        bundle_fetcher: ContentBundleFetcher,
+        interval_seconds: float,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("content review interval must be positive")
+        self.duckdb_path = Path(duckdb_path)
+        self.registry = registry
+        self.consent_reader = consent_reader
+        self.bundle_fetcher = bundle_fetcher
+        self.interval_seconds = interval_seconds
+        self.clock = clock
+        self._last_signature: tuple[int, str] | None = None
+        self._scheduled_hosts: set[str] = set()
+
+    def enqueue_due(self) -> dict[str, ContentBundle]:
+        config = self.consent_reader()
+        if not config.enabled:
+            return {}
+        target_ids = tuple(Path(target).name for target in config.targets)
+        if not target_ids:
+            return {}
+        material = json.dumps(
+            {
+                "backend_policy": config.backend_policy,
+                "external_consent": config.external_consent,
+                "targets": target_ids,
+                "allowed_roots": tuple(str(root) for root in config.allowed_roots),
+                "max_file_bytes": config.max_file_bytes,
+                "max_bundle_bytes": config.max_bundle_bytes,
+                "excerpt_max_chars": config.excerpt_max_chars,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        material_hash = hashlib.sha256(material.encode()).hexdigest()
+        bucket = int(self.clock() // self.interval_seconds)
+        signature = (bucket, material_hash)
+        if signature != self._last_signature:
+            self._scheduled_hosts.clear()
+
+        discovered: dict[str, ContentBundle] = {}
+        for host in self.registry.list_hosts():
+            if host.host_id in self._scheduled_hosts:
+                continue
+            live = self.consent_reader()
+            if not live.enabled or _content_config_version(
+                live
+            ) != _content_config_version(config):
+                return {}
+            bundle = self.bundle_fetcher(host.host_id, target_ids)
+            enqueue_advisory_check(
+                self.duckdb_path,
+                analyzer_id=MODEL_ANALYZER_ID,
+                target_id=host.host_id,
+                source_version=(
+                    f"{bundle.bundle_hash}:scheduled:{bucket}:{material_hash}"
+                ),
+            )
+            discovered[host.host_id] = bundle
+            self._scheduled_hosts.add(host.host_id)
+        self._last_signature = signature
+        return discovered
+
+
 class ContentAnalysisWorker:
     """Run one ephemeral model analysis behind two live consent fences."""
 
@@ -85,6 +160,7 @@ class ContentAnalysisWorker:
         retry_delay: timedelta = timedelta(seconds=30),
         lease_duration: timedelta = timedelta(minutes=5),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        scheduler: ContentAnalysisScheduler | None = None,
     ) -> None:
         self.consent_reader = consent_reader
         self.bundle_fetcher = bundle_fetcher
@@ -98,13 +174,18 @@ class ContentAnalysisWorker:
             raise ValueError("lease duration must be positive")
         self.lease_duration = lease_duration
         self.clock = clock
+        self.scheduler = scheduler
         self._thread: threading.Thread | None = None
 
     def run_once(self) -> AdvisoryRunResult:
         """Claim and isolate one pending model-configuration job."""
 
+        prefetched: dict[str, ContentBundle] = {}
+        if self.scheduler is not None:
+            prefetched = self.scheduler.enqueue_due()
         config = self.consent_reader()
         if not config.enabled:
+            prefetched.clear()
             return AdvisoryRunResult(skipped=1)
         if self.duckdb_path is None or self.repository is None:
             raise ValueError("duckdb_path and repository are required for job dispatch")
@@ -113,19 +194,23 @@ class ContentAnalysisWorker:
             return AdvisoryRunResult(skipped=1)
         target_ids = tuple(Path(target).name for target in config.targets)
         try:
+            host_id = job.subject_key.partition(":")[2]
             result = self.run_model_job(
-                host_id=job.subject_key.partition(":")[2],
+                host_id=host_id,
                 target_ids=target_ids,
                 job=job,
+                prefetched_bundle=prefetched.get(host_id),
             )
             if result.status == "succeeded":
                 return AdvisoryRunResult(succeeded=1)
-            self._cancel_job(job)
+            self._requeue_job(job)
             return AdvisoryRunResult(skipped=1)
         except Exception:  # noqa: BLE001 - isolate model/backend failures
             self._record_content_failure(job)
             log.warning("content advisory job failed")
             return AdvisoryRunResult(failed=1)
+        finally:
+            prefetched.clear()
 
     def start(
         self,
@@ -197,11 +282,15 @@ class ContentAnalysisWorker:
         finally:
             con.close()
 
-    def _cancel_job(self, job: Job) -> None:
+    def _requeue_job(self, job: Job) -> None:
         assert self.duckdb_path is not None
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
-            Ledger(con).cancel_job(job.job_id)
+            Ledger(con).reclaim_lease(
+                job.job_id,
+                error_category="consent_revoked",
+                error_message="content analysis consent changed during attempt",
+            )
         finally:
             con.close()
 
@@ -231,7 +320,12 @@ class ContentAnalysisWorker:
             con.close()
 
     def run_model_job(
-        self, *, host_id: str, target_ids: Iterable[str], job: Job | None = None
+        self,
+        *,
+        host_id: str,
+        target_ids: Iterable[str],
+        job: Job | None = None,
+        prefetched_bundle: ContentBundle | None = None,
     ) -> ContentAnalysisResult:
         requested = tuple(target_ids)
         if not requested:
@@ -251,10 +345,13 @@ class ContentAnalysisWorker:
             config = self.consent_reader()
             if not config.enabled:
                 return ContentAnalysisResult(status="revoked", artifact={})
-            try:
-                fetched = self.bundle_fetcher(host_id, requested)
-            except Exception:
-                raise ModelFindingError("content bundle fetch failed") from None
+            if prefetched_bundle is None:
+                try:
+                    fetched = self.bundle_fetcher(host_id, requested)
+                except Exception:
+                    raise ModelFindingError("content bundle fetch failed") from None
+            else:
+                fetched = prefetched_bundle
             bundle = validate_content_bundle(
                 fetched, host_id=host_id, requested_ids=requested
             )
@@ -282,25 +379,18 @@ class ContentAnalysisWorker:
             except AnalysisConsentRevoked:
                 return ContentAnalysisResult(status="revoked", artifact={})
 
-            sink = self.finding_sink
-            if sink is None and self.repository is not None:
-                run_id = (
-                    job.latest_attempt_id
-                    if job is not None and job.latest_attempt_id
-                    else (job.job_id if job is not None else bundle.bundle_hash)
-                )
-                sink = lambda candidate: self.repository.observe(
-                    candidate, run_id=run_id
-                ).finding_id
-            sink = sink or _candidate_reference
-            finding_ids = [sink(candidate) for candidate in candidates]
-            artifact = {
+            artifact_base = {
                 "bundle_hash": bundle.bundle_hash,
                 "target_hashes": [target.content_hash for target in bundle.targets],
-                "finding_ids": finding_ids,
             }
             if job is not None:
-                self._record_success(job, artifact)
+                artifact = self._record_success(job, candidates, artifact_base)
+            else:
+                sink = self.finding_sink or _candidate_reference
+                artifact = {
+                    **artifact_base,
+                    "finding_ids": [sink(candidate) for candidate in candidates],
+                }
             return ContentAnalysisResult(status="succeeded", artifact=artifact)
         finally:
             # Sever all direct references to redacted content before returning.
@@ -310,13 +400,26 @@ class ContentAnalysisWorker:
             fetched = None
             bundle = None
 
-    def _record_success(self, job: Job, artifact: Mapping[str, Any]) -> None:
-        if self.duckdb_path is None:
-            raise ValueError("duckdb_path is required to record a content job")
-        serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
+    def _record_success(
+        self,
+        job: Job,
+        candidates: list[FindingCandidate],
+        artifact_base: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if self.duckdb_path is None or self.repository is None:
+            raise ValueError(
+                "duckdb_path and repository are required to record a content job"
+            )
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
             con.execute("BEGIN TRANSACTION")
+            run_id = job.latest_attempt_id or job.job_id
+            finding_ids = [
+                self.repository.observe_in_transaction(con, candidate, run_id=run_id)
+                for candidate in candidates
+            ]
+            artifact = {**artifact_base, "finding_ids": finding_ids}
+            serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
             ledger = Ledger(con)
             ledger.succeed_job(
                 job.job_id,
@@ -342,6 +445,7 @@ class ContentAnalysisWorker:
             if receipt is not None and receipt[1] == "observed":
                 ledger.mark_receipt(str(receipt[0]), "applied")
             con.execute("COMMIT")
+            return artifact
         except Exception:
             con.execute("ROLLBACK")
             raise
@@ -368,6 +472,19 @@ class _ConsentFencedBackend:
 
 def _candidate_reference(candidate: FindingCandidate) -> str:
     return f"{candidate.analyzer_id}:{candidate.rule_id}:{candidate.target_id}"
+
+
+def _content_config_version(config: AdvisoryContentConfig) -> tuple[object, ...]:
+    return (
+        config.enabled,
+        config.backend_policy,
+        config.external_consent,
+        config.targets,
+        config.allowed_roots,
+        config.max_file_bytes,
+        config.max_bundle_bytes,
+        config.excerpt_max_chars,
+    )
 
 
 class AdvisoryWorker:
@@ -792,6 +909,7 @@ __all__ = [
     "AdvisoryRunResult",
     "AdvisoryWorker",
     "ContentAnalysisResult",
+    "ContentAnalysisScheduler",
     "ContentAnalysisWorker",
     "SnapshotFactory",
     "load_operational_snapshot",
