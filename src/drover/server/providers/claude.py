@@ -79,6 +79,15 @@ class ClaudeUsageProbe:
                 plan_label=None,
                 error_category=exc.category,
             )
+        except (TypeError, ValueError, OverflowError, OSError):
+            return _snapshot(
+                host_id=host_id,
+                status="error",
+                observed_at=observed_at,
+                windows=(),
+                plan_label=None,
+                error_category="protocol_error",
+            )
         if not windows:
             return _snapshot(
                 host_id=host_id,

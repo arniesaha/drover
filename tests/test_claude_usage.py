@@ -95,3 +95,49 @@ def test_the_access_token_never_appears_in_the_snapshot(tmp_path):
             "error": snapshot.error_category,
         }
     )
+
+
+def test_out_of_range_utilization_returns_error_snapshot(tmp_path):
+    body = json.dumps(
+        {
+            "five_hour": {"utilization": 150, "resets_at": "2026-08-09T20:00:00Z"},
+        }
+    ).encode()
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda url, headers, timeout: (200, body),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "protocol_error"
+    assert snapshot.windows == ()
+
+
+def test_nan_utilization_returns_error_snapshot(tmp_path):
+    # json.loads accepts NaN as valid JSON
+    body = b'{"five_hour": {"utilization": NaN, "resets_at": "2026-08-09T20:00:00Z"}}'
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda url, headers, timeout: (200, body),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "protocol_error"
+    assert snapshot.windows == ()
+
+
+def test_absurd_expires_at_returns_error_snapshot(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path, expires_at_ms=10**20),
+        opener=lambda url, headers, timeout: (200, USAGE_BODY),
+    )
+
+    snapshot = probe.read(host_id="mac-mini")
+
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "protocol_error"
+    assert snapshot.windows == ()
