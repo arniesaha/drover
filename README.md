@@ -6,7 +6,7 @@
 
 > Drive your coding-agent fleet from your pocket.
 
-## What Drover Is
+## What Drover is
 
 Drover is a local-first cockpit and context store for a personal fleet of CLI
 coding agents. It connects Claude Code, Codex, Gemini, OpenClaw, and compatible
@@ -28,7 +28,7 @@ The fleet view groups live work by host and brings approvals and questions to
 the top. The launch sheet selects a host and harness, checks authentication,
 and carries model and reasoning preferences into the new session.
 
-## How It Works
+## How it works
 
 ![Drover command and context planes](docs/drover-architecture.png)
 
@@ -72,7 +72,7 @@ that token when configuring the iOS app or calling the harness API.
 Continue with [Getting Started](docs/getting-started.md) for verification,
 private Tailscale setup, and optional context ingestion.
 
-## Context Store
+## Context store
 
 Raw agent events and OpenTelemetry spans are durable facts. Drover stores them
 as partitioned Parquet, exposes normalized DuckDB views, and keeps mutable
@@ -83,7 +83,7 @@ The model and its compatibility boundary are documented in
 [Context Store](docs/context-store.md). Historical telemetry may retain
 `nexus.*` attributes; new public APIs, commands, and MCP tools use Drover.
 
-## Supported Networking And Security
+## Supported networking and security
 
 - Supported: localhost, a trusted private LAN, and a private Tailscale network.
 - Not supported for v0.1: Tailscale Funnel or any public-internet exposure.
@@ -94,7 +94,7 @@ The model and its compatibility boundary are documented in
 Read [Security](docs/security.md) before exposing a listener beyond localhost,
 and [Multi-Host](docs/multi-host.md) before adding another machine.
 
-## Build The iOS App
+## Build the iOS app
 
 The iOS app ships from source. It requires Xcode 16+, iOS 18+, and XcodeGen.
 
@@ -120,7 +120,7 @@ device signing, and server configuration.
 - [GitHub Actions Runner](docs/github-actions-runner.md)
 - [Agent Skills](skills/README.md)
 
-## Status And Limitations
+## Status and limitations
 
 Drover v0.1 is source-distributed software for technical users operating a
 trusted personal fleet. The Python server and native iOS client are functional,
