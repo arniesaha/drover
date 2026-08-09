@@ -22,10 +22,10 @@ jobs:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-        cache: pip
+      run: |
+        "$HOME/.local/bin/python3.11" -m venv "$RUNNER_TEMP/python-venv"
+        echo "$RUNNER_TEMP/python-venv/bin" >> "$GITHUB_PATH"
+        python --version
 
     - name: Install dependencies
       run: |
