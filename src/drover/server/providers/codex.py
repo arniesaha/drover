@@ -32,10 +32,13 @@ class CodexUsageProbe:
 
     def __init__(
         self,
-        command: Sequence[str] = ("codex", "app-server", "--stdio"),
+        command: Sequence[str] | None = None,
         timeout_s: float = 5.0,
     ):
-        self.command = tuple(command)
+        # No default command: the caller resolves the CLI through the user's
+        # login shell. Spawning a bare "codex" would search this process's PATH,
+        # which under launchd omits the prefix the CLI is installed in.
+        self.command = tuple(command) if command else None
         self.timeout_s = timeout_s
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
@@ -46,6 +49,8 @@ class CodexUsageProbe:
         lines: Queue[str | None] = Queue()
         stderr_parts: list[str] = []
         try:
+            if self.command is None:
+                raise _ProbeFailure("cli_not_found")
             if self.timeout_s <= 0:
                 raise _ProbeFailure("timeout")
             deadline = monotonic() + self.timeout_s
@@ -59,6 +64,10 @@ class CodexUsageProbe:
                     encoding="utf-8",
                     errors="replace",
                 )
+            except FileNotFoundError:
+                # Distinct from "unavailable", which is also the host-level
+                # catch-all: the CLI is simply not where we were told it is.
+                raise _ProbeFailure("cli_not_found") from None
             except OSError:
                 raise _ProbeFailure("unavailable") from None
 

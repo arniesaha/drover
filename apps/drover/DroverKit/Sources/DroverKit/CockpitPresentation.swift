@@ -560,6 +560,9 @@ public enum ProviderSubscriptionGrouping {
     private static func explain(_ category: String) -> String? {
         switch category {
         case "unavailable", "host_offline": return "Couldn't reach"
+        // Not a reachability or sign-in problem: the daemon resolved no path to
+        // the CLI, so the probe never ran.
+        case "cli_not_found": return "CLI not found on"
         case "timeout": return "Timed out reaching"
         case "process_error": return "Usage probe failed on"
         case "empty_inventory": return "No accounts detected on"
