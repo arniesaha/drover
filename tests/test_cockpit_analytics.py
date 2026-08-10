@@ -1050,3 +1050,66 @@ def test_a_healthy_activity_section_is_untouched_by_the_budget():
     # what matters is that the budget never fired.
     assert "interrupted" not in recorded
     assert payload["cockpit_api_version"] == 1
+
+
+def test_an_abandoned_activity_query_blocks_the_next_attempt(monkeypatch):
+    """The regression this prevents: the caller closed the DuckDB connection in
+    a finally while the abandoned worker was still using it, and every 30s poll
+    stacked another multi-minute query on the same database. The pile-up wedged
+    every endpoint on the server, not just this section.
+    """
+    from drover.server.cockpit import service as service_module
+
+    monkeypatch.setattr(service_module, "ACTIVITY_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(service_module, "_INTERRUPT_GRACE_SECONDS", 0.1)
+
+    release = threading.Event()
+    closed = threading.Event()
+    opened = []
+
+    class _Connection:
+        def interrupt(self):
+            pass
+
+        def close(self):
+            closed.set()
+
+    def _connect():
+        opened.append(1)
+        return _Connection()
+
+    def _hangs(con, filters, *, cursor_codec=None):
+        release.wait(10)
+        return None
+
+    monkeypatch.setattr(service_module, "activity_analytics", _hangs)
+    svc = service_module.CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: []),
+        connect=_connect,
+    )
+
+    first = svc.overview(AnalyticsFilters(days=7))
+    assert first["activity"]["status"] == "error"
+    # The worker is still running, so a second attempt must not start one.
+    second = svc.overview(AnalyticsFilters(days=7))
+    assert second["activity"]["status"] == "error"
+    assert (
+        len(opened) == 1
+    ), f"a second query was started while the first ran ({len(opened)})"
+    # The connection is closed by the worker that opened it, never by the caller.
+    assert not closed.is_set()
+
+    # The caller supplied the connection factory, so the connection is
+    # caller-owned and the worker must NOT close it -- only a connection it
+    # opened itself.
+    assert not closed.is_set()
+
+    # Once the abandoned worker finishes, the slot frees and the next attempt
+    # starts a fresh query rather than being blocked forever.
+    release.set()
+    deadline = time.monotonic() + 5
+    while len(opened) < 2 and time.monotonic() < deadline:
+        svc.overview(AnalyticsFilters(days=7))
+        time.sleep(0.05)
+    assert len(opened) == 2, "the slot never freed after the worker finished"
