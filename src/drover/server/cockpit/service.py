@@ -63,6 +63,10 @@ class CockpitService:
         self._cursor_codec = AnalyticsCursorCodec(
             cursor_secret or secrets.token_bytes(32)
         )
+        # One activity query at a time. Released by the worker, not the caller,
+        # so a query abandoned at its budget still blocks the next attempt until
+        # it has actually finished and closed its connection.
+        self._activity_slot = threading.BoundedSemaphore(1)
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
         provider_capacity = self._provider_capacity(filters)
@@ -132,22 +136,18 @@ class CockpitService:
             return _section("error", data=[], coverage=None)
 
     def _activity(self, filters: AnalyticsFilters) -> dict[str, Any]:
-        con = None
-        owns_connection = self._connect is None
+        if not self._activity_slot.acquire(blocking=False):
+            # A previous attempt is still unwinding. Starting another would
+            # stack a second multi-minute query on the same database: the 30s
+            # client poll did exactly that, and the pile-up blocked every other
+            # endpoint on the server, not just this section.
+            log.warning("activity query still in flight; skipping this attempt")
+            return _section("error", data=None, coverage=None)
         try:
-            if self._connect is not None:
-                con = self._connect()
-            elif self.duckdb_path is not None:
-                con = open_duckdb_connection(
-                    self.duckdb_path, read_only=True, role="diagnostic"
-                )
-            else:
-                raise RuntimeError("activity store is unavailable")
-            result = self._activity_within_budget(con, filters)
-            data = asdict(result)
+            result = self._activity_within_budget(filters)
             return _section(
                 "ok",
-                data=data,
+                data=asdict(result),
                 observed_at=result.metadata.observed_at,
                 coverage=asdict(result.coverage),
             )
@@ -156,13 +156,8 @@ class CockpitService:
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render observed activity: %s", exc)
             return _section("error", data=None, coverage=None)
-        finally:
-            if owns_connection and con is not None:
-                con.close()
 
-    def _activity_within_budget(
-        self, con: Any, filters: AnalyticsFilters
-    ) -> ActivityAnalytics:
+    def _activity_within_budget(self, filters: AnalyticsFilters) -> ActivityAnalytics:
         """Run the activity query, but never for longer than its budget.
 
         The overview is assembled from several sections and returned as one
@@ -171,16 +166,31 @@ class CockpitService:
         lost, taking provider capacity and insight counts -- which had both
         succeeded -- down with it.
 
-        A budget alone would only stop us waiting: the query would keep running
-        and keep holding memory. `interrupt()` is what actually stops it, so a
-        section that cannot answer in time costs a thread for its budget and
-        nothing after that.
+        The worker owns its connection from open to close. An earlier cut had
+        the caller close it in a `finally` while the abandoned worker was still
+        using it, which wedged the whole HTTP server rather than just this
+        section. Whoever opens it closes it, and only after it is done with it.
+
+        `interrupt()` is what actually stops the query; a budget alone would
+        stop us waiting while it kept running and kept holding memory.
         """
         outcome: dict[str, Any] = {}
         done = threading.Event()
+        released = threading.Event()
 
         def run() -> None:
+            con = None
+            owns_connection = self._connect is None
             try:
+                if self._connect is not None:
+                    con = self._connect()
+                elif self.duckdb_path is not None:
+                    con = open_duckdb_connection(
+                        self.duckdb_path, read_only=True, role="diagnostic"
+                    )
+                else:
+                    raise RuntimeError("activity store is unavailable")
+                outcome["connection"] = con
                 outcome["result"] = activity_analytics(
                     con, filters, cursor_codec=self._cursor_codec
                 )
@@ -188,20 +198,30 @@ class CockpitService:
                 outcome["error"] = exc
             finally:
                 done.set()
+                if owns_connection and con is not None:
+                    try:
+                        con.close()
+                    except Exception:  # noqa: BLE001 - closing is best effort
+                        pass
+                released.set()
+                self._activity_slot.release()
 
         worker = threading.Thread(target=run, name="cockpit-activity", daemon=True)
         worker.start()
         if not done.wait(ACTIVITY_BUDGET_SECONDS):
-            try:
-                con.interrupt()
-            except Exception:  # noqa: BLE001 - interrupt is best effort
-                pass
-            # Give the interrupt a moment to unwind the query thread so the
-            # connection is not closed underneath it.
-            done.wait(_INTERRUPT_GRACE_SECONDS)
+            con = outcome.get("connection")
+            if con is not None:
+                try:
+                    con.interrupt()
+                except Exception:  # noqa: BLE001 - interrupt is best effort
+                    pass
+            # Do not wait for the worker to finish unwinding -- the point of the
+            # budget is to answer now. The slot stays held until it does, which
+            # is what stops the next poll stacking another query on top.
             raise TimeoutError(
                 f"activity query exceeded {ACTIVITY_BUDGET_SECONDS:g}s budget"
             )
+        released.wait(_INTERRUPT_GRACE_SECONDS)
         if "error" in outcome:
             raise outcome["error"]
         return outcome["result"]
