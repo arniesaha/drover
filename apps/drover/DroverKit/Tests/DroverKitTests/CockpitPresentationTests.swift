@@ -356,14 +356,15 @@ private func providerAccount(
     host: String,
     status: String = "ok",
     observedAt: String,
-    errorCategory: String? = nil
+    errorCategory: String? = nil,
+    windows: String = "[]"
 ) throws -> ProviderAccount {
     let plan = plan.map { "\"plan_label\":\"\($0)\"," } ?? ""
     let category = errorCategory.map { "\"error_category\":\"\($0)\"," } ?? ""
     let json = """
     {"snapshot_id":"\(snapshot)","dedup_key":"\(snapshot)-key","provider":"\(provider)",\
     "account_label":"\(label)",\(plan)"host_id":"\(host)","status":"\(status)",\
-    "observed_at":"\(observedAt)",\(category)"source":"codex-app-server","windows":[]}
+    "observed_at":"\(observedAt)",\(category)"source":"codex-app-server","windows":\(windows)}
     """
     return try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
 }
@@ -508,4 +509,143 @@ private func providerAccount(
     #expect(groups[0].status == .ok)
     #expect(value.usedText.contains("34.5"))
     #expect(value.remainingText.contains("65.5"))
+}
+
+// MARK: - Headline window
+
+private let fourAnthropicWindows = """
+[{"kind":"extra_usage","used_percent":3.6},\
+{"kind":"five_hour","used_percent":4,"resets_at":"2026-08-09T20:00:00Z"},\
+{"kind":"nimbus_quill","used_percent":0},\
+{"kind":"seven_day","used_percent":26,"resets_at":"2026-08-10T08:00:00Z"}]
+"""
+
+/// The card shows one window, and it has to be the one that will stop you
+/// first. Anthropic reports four; picking a fixed one would hide a five-hour
+/// window at 99% behind a seven-day window at 3%.
+@Test func theTightestWindowLeadsTheCard() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "anthropic", label: "me@example.com", plan: "max",
+        host: "work-laptop", observedAt: "2026-08-09T18:00:00Z",
+        windows: fourAnthropicWindows
+    )
+
+    let groups = ProviderSubscriptionGrouping.group([account], now: account.observedAt)
+
+    let headline = groups[0].headline
+    #expect(headline.windowTitle == "Seven day")
+    #expect(headline.usedText == "26% used")
+    #expect(headline.detailText == "74% remaining · Resets in 14h")
+    #expect(headline.fraction == 0.26)
+    #expect(headline.isCritical == false)
+}
+
+/// Gemini and every failed probe must render the same shell as everyone else,
+/// or the strip goes back to cards of four different heights.
+@Test func aSubscriptionWithNoWindowsStillPresentsAHeadline() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "google", label: "Antigravity",
+        host: "nas", status: "usage_unavailable", observedAt: "2026-08-09T18:00:00Z"
+    )
+
+    let headline = ProviderSubscriptionGrouping
+        .group([account], now: account.observedAt)[0].headline
+
+    #expect(headline.windowTitle == "Usage")
+    #expect(headline.usedText == "Usage unavailable")
+    #expect(headline.detailText == nil)
+    #expect(headline.fraction == nil)
+    #expect(headline.isCritical == false)
+}
+
+/// A card's bar must never disagree with its own text, so the fraction walks
+/// the same limit/remaining ladder the wording does.
+@Test func aUnitBasedWindowDerivesItsFractionFromTheLimit() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "openai", label: "me@example.com",
+        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"[{"kind":"primary","limit_value":1000,"remaining_value":250,"unit":"credits"}]"#
+    )
+
+    let headline = ProviderSubscriptionGrouping
+        .group([account], now: account.observedAt)[0].headline
+
+    #expect(headline.fraction == 0.75)
+    #expect(headline.usedText == "750 credits used")
+    #expect(headline.detailText == "250 credits remaining · Reset unavailable")
+}
+
+/// A provider reporting a zero limit would divide by zero into an infinite bar.
+@Test func aZeroLimitWindowHasNoFractionRatherThanAnInfinity() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "openai", label: "me@example.com",
+        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"[{"kind":"primary","limit_value":0,"remaining_value":0,"unit":"credits"}]"#
+    )
+
+    let headline = ProviderSubscriptionGrouping
+        .group([account], now: account.observedAt)[0].headline
+
+    #expect(headline.fraction == nil)
+}
+
+@Test func criticalBeginsAtExactlyEightyFivePercent() throws {
+    func headline(usedPercent: String) throws -> ProviderHeadline {
+        let account = try providerAccount(
+            snapshot: "s1", provider: "openai", label: "me@example.com",
+            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+            windows: #"[{"kind":"primary","used_percent":\#(usedPercent)}]"#
+        )
+        return ProviderSubscriptionGrouping.group([account], now: account.observedAt)[0].headline
+    }
+
+    #expect(try headline(usedPercent: "85").isCritical == true)
+    #expect(try headline(usedPercent: "84.9").isCritical == false)
+}
+
+/// Two windows at the same fraction must not swap places between refreshes.
+@Test func equalFractionsTieBreakOnWindowKind() throws {
+    func headline(_ windows: String) throws -> ProviderHeadline {
+        let account = try providerAccount(
+            snapshot: "s1", provider: "anthropic", label: "me@example.com",
+            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z", windows: windows
+        )
+        return ProviderSubscriptionGrouping.group([account], now: account.observedAt)[0].headline
+    }
+
+    let forward = #"[{"kind":"alpha","used_percent":50},{"kind":"beta","used_percent":50}]"#
+    let reversed = #"[{"kind":"beta","used_percent":50},{"kind":"alpha","used_percent":50}]"#
+
+    #expect(try headline(forward).windowTitle == "Alpha")
+    #expect(try headline(reversed).windowTitle == "Alpha")
+}
+
+/// A window nobody can put a number on tells you nothing about how full the
+/// account is, so it must never outrank one that can.
+@Test func aWindowWithoutAFractionRanksBehindOneThatHasIt() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "anthropic", label: "me@example.com",
+        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"[{"kind":"alpha"},{"kind":"beta","used_percent":2}]"#
+    )
+
+    let headline = ProviderSubscriptionGrouping
+        .group([account], now: account.observedAt)[0].headline
+
+    #expect(headline.windowTitle == "Beta")
+}
+
+/// Freshness hangs off the subscription, not off a window — an unavailable
+/// card has no window and must still say when it was last read.
+@Test func freshnessSurvivesASubscriptionWithNoWindows() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "google", label: "Antigravity",
+        host: "nas", status: "usage_unavailable", observedAt: "2026-08-09T18:00:00Z"
+    )
+
+    let groups = ProviderSubscriptionGrouping.group(
+        [account], now: account.observedAt.addingTimeInterval(120)
+    )
+
+    #expect(groups[0].freshnessText == "Updated 2m ago")
 }

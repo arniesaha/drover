@@ -315,7 +315,7 @@ public struct ProviderCapacityPresentation: Sendable, Equatable {
         return "\(hours / 24)d"
     }
 
-    private static func freshness(observedAt: Date, now: Date) -> String {
+    static func freshness(observedAt: Date, now: Date) -> String {
         let seconds = max(0, now.timeIntervalSince(observedAt))
         if seconds < 60 { return "Updated just now" }
         if seconds < 3_600 { return "Updated \(Int(seconds / 60))m ago" }
@@ -334,6 +334,99 @@ public struct ProviderCapacityPresentation: Sendable, Equatable {
     private static func nonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// A quota window's kind, in prose. `seven_day` reads as "Seven day" — one
+/// capital, because `.capitalized` turns it into a title ("Seven Day") and
+/// leaves an untouched underscore behind when the caller forgets to strip it.
+public enum ProviderWindowTitle {
+    public static func display(_ kind: String) -> String {
+        let spaced = kind.replacingOccurrences(of: "_", with: " ")
+        guard let first = spaced.first else { return spaced }
+        return first.uppercased() + spaced.dropFirst()
+    }
+}
+
+/// The one quota window a capacity card shows, plus the fraction its bar fills.
+///
+/// Providers report wildly different window counts — Anthropic four, OpenAI
+/// one, an unsupported or failed probe none — and rendering all of them made
+/// the card strip a row of four different heights. So the card shows the window
+/// that will stop you first and the rest move to the analytics screen.
+///
+/// Always present, even when there is no window at all, so the view has exactly
+/// one rendering path and the unavailable card is the same shape as every
+/// other card rather than a second layout.
+public struct ProviderHeadline: Sendable, Equatable {
+    /// "Seven day", or "Usage" when the subscription reported no window.
+    public let windowTitle: String
+    /// "26% used", "750 credits used", or "Usage unavailable".
+    public let usedText: String
+    /// "74% remaining · Resets in 14h". Nil when there is no window.
+    public let detailText: String?
+    /// Used, 0...1. Nil when no fraction can be derived, which the bar draws
+    /// as an empty track rather than as zero — "unknown" and "none used" are
+    /// opposite readings and must not share a rendering.
+    public let fraction: Double?
+    /// At or past the point where an account is about to stop being useful.
+    public let isCritical: Bool
+
+    /// Tide has one accent and no per-state palette, so severity is carried by
+    /// weight rather than hue (see `DroverColor`). This is the threshold that
+    /// switches that weight on.
+    public static let criticalFraction = 0.85
+
+    public init(account: ProviderAccount, window: ProviderWindow?, now: Date) {
+        guard let window else {
+            windowTitle = "Usage"
+            usedText = "Usage unavailable"
+            detailText = nil
+            fraction = nil
+            isCritical = false
+            return
+        }
+
+        // Wording comes from the presentation that already ships, so a card's
+        // bar can never disagree with the text printed beside it.
+        let value = ProviderCapacityPresentation(account: account, window: window, now: now)
+        windowTitle = ProviderWindowTitle.display(window.kind)
+        usedText = value.usedText
+        detailText = "\(value.remainingText) · \(value.resetText)"
+
+        let used = Self.usedFraction(window)
+        fraction = used
+        isCritical = (used ?? 0) >= Self.criticalFraction
+    }
+
+    /// Walks the same ladder `ProviderCapacityPresentation` uses to choose its
+    /// wording, in the same order, for the same reason.
+    static func usedFraction(_ window: ProviderWindow) -> Double? {
+        // `limit > 0` is not defensive noise: a provider reporting a zero limit
+        // would divide into an infinite bar.
+        if let limit = window.limitValue, limit > 0,
+           let remaining = window.remainingValue,
+           let unit = window.unit,
+           !unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return min(1, max(0, (limit - remaining) / limit))
+        }
+        if let percent = window.usedPercent {
+            return min(1, max(0, percent / 100))
+        }
+        return nil
+    }
+
+    /// The window closest to exhaustion. A window nobody can put a number on
+    /// says nothing about how full the account is, so it ranks behind every
+    /// window that can; ties break on `kind` so the card does not reshuffle
+    /// between refreshes.
+    static func leadingWindow(_ windows: [ProviderWindow]) -> ProviderWindow? {
+        windows.sorted { lhs, rhs in
+            let left = usedFraction(lhs) ?? -1
+            let right = usedFraction(rhs) ?? -1
+            if left != right { return left > right }
+            return lhs.kind < rhs.kind
+        }.first
     }
 }
 
@@ -464,6 +557,11 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
     /// The freshest reading across hosts; the card's numbers come from it.
     public let representative: ProviderAccount
     public let windows: [ProviderWindow]
+    /// The single window the card renders, chosen for tightness.
+    public let headline: ProviderHeadline
+    /// "Updated 1m ago". Lives here rather than on a window's presentation
+    /// because a subscription with no windows must still say when it was read.
+    public let freshnessText: String
     public let status: ProviderAccountStatus
     /// Why this subscription is degraded, naming the host it failed on, so a
     /// single broken probe reads as one card's problem rather than a banner
@@ -482,7 +580,8 @@ public enum ProviderSubscriptionGrouping {
     /// to the freshest member overall.
     public static func group(
         _ accounts: [ProviderAccount],
-        hostTitles: [String: String] = [:]
+        hostTitles: [String: String] = [:],
+        now: Date = Date()
     ) -> [ProviderSubscriptionPresentation] {
         var order: [String] = []
         var buckets: [String: [ProviderAccount]] = [:]
@@ -518,6 +617,14 @@ public enum ProviderSubscriptionGrouping {
                 hostsText: ListFormatter.localizedString(byJoining: titles),
                 representative: representative,
                 windows: representative.windows,
+                headline: ProviderHeadline(
+                    account: representative,
+                    window: ProviderHeadline.leadingWindow(representative.windows),
+                    now: now
+                ),
+                freshnessText: ProviderCapacityPresentation.freshness(
+                    observedAt: representative.observedAt, now: now
+                ),
                 status: representative.status,
                 reasonText: reason(members: members, hostTitles: hostTitles)
             )
