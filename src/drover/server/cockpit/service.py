@@ -31,9 +31,13 @@ COCKPIT_SECTIONS = (
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
 # The iOS client abandons a cockpit request at 15s (DroverClient's default
 # timeoutInterval). The overview is one response, so the activity section has to
-# leave room for the others and for transport; 6s does, with margin.
-ACTIVITY_BUDGET_SECONDS = 6.0
-_INTERRUPT_GRACE_SECONDS = 2.0
+# leave room for the other sections, for a cold cache, and for a phone's
+# transport. Measured on the live fleet, a 6s budget still produced a 12.4s cold
+# overview -- inside the limit, but with too little margin to survive a slow
+# network. A query that cannot answer in 6s cannot answer in 3s either, so the
+# shorter budget costs nothing real and buys back the headroom.
+ACTIVITY_BUDGET_SECONDS = 3.0
+_INTERRUPT_GRACE_SECONDS = 1.0
 
 
 class CockpitService:
