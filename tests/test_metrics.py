@@ -4339,25 +4339,46 @@ def test_render_harness_json_refreshes_after_ttl(tmp_path, monkeypatch):
     assert calls["n"] == 2
 
 
-def test_quality_and_observatory_snapshots_do_not_copy_the_database(
+def test_quality_and_observatory_snapshots_read_an_isolated_copy(
     tmp_path, monkeypatch
 ):
-    """Same defect as harness_snapshot, lower request frequency."""
+    """The slow snapshots must NOT touch the live database.
+
+    quality_snapshot takes ~20s on a real store (measured 19.4s at 686MB).
+    Run against the live file it shares one DuckDB instance with the harness
+    registry, saturates the scheduler, spills to temp storage, and starves
+    every other DB-backed endpoint -- /harness timed out for minutes at a
+    time while /healthz stayed instant. The copy is isolation, not caching:
+    a separate file is a separate DuckDB instance, which is the whole point.
+
+    This asserts the paths handed to the snapshot functions are NOT the live
+    database. An earlier version of this test asserted the opposite and is
+    what let the regression through.
+    """
     collector = _make_collector(tmp_path)
+    live = Path(collector.duckdb_path).resolve()
+    seen: list[Path] = []
 
-    copies: list = []
-    real_copy = shutil.copy2
+    def fake_quality(*, duckdb_path, **kwargs):
+        seen.append(Path(duckdb_path).resolve())
+        return {"runtime_audit": {}}
 
-    def spy(*args, **kwargs):
-        copies.append(args)
-        return real_copy(*args, **kwargs)
+    def fake_observatory(*, duckdb_path, **kwargs):
+        seen.append(Path(duckdb_path).resolve())
+        return {}
 
-    monkeypatch.setattr(shutil, "copy2", spy)
+    monkeypatch.setattr(metrics, "quality_snapshot", fake_quality)
+    monkeypatch.setattr(
+        metrics, "pipeline_observatory_snapshot", fake_observatory
+    )
 
     quality = collector._quality_snapshot()
     collector._observatory_snapshot(quality)
 
-    assert copies == []
+    assert len(seen) == 2, "both snapshots should have run"
+    for path in seen:
+        assert path != live, f"slow snapshot read the live DB at {path}"
+        assert path.name == live.name, "copy should keep the database filename"
 
 
 def test_harness_snapshot_works_while_this_process_holds_the_db(tmp_path):

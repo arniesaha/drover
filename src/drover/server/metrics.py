@@ -8,6 +8,8 @@ import hashlib
 import http.client
 import json
 import logging
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1952,13 +1954,29 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
             )
-        # Live read, same reasoning as harness_snapshot: copying the whole
-        # database to answer a read is unaffordable once it is large.
-        return quality_snapshot(
-            duckdb_path=source,
-            incoming_dir=self.incoming_dir,
-            deep=False,
-        )
+        # Deliberately a COPY, unlike harness_snapshot's live read.
+        #
+        # This is isolation, not caching. quality_snapshot is a heavy
+        # analytical scan -- 19.4s measured against a 686MB store, and it
+        # spills ~175MB to duckdb_temp_storage. Pointed at the live file it
+        # shares one DuckDB instance with the harness registry: it saturates
+        # the task scheduler and starves every other DB-backed endpoint, so
+        # /harness timed out for minutes while /healthz stayed instant.
+        # A separate file is a separate instance, which is the entire point.
+        #
+        # Do NOT "optimize" this into a live read to save the copy. That was
+        # tried (927e446, 2026-08-04) and is exactly what caused the outage.
+        # The copy costs ~0.6s behind a 60s TTL; the live read cost the fleet.
+        # The real cure is making quality_snapshot fast -- spans_enriched is
+        # the known offender -- and until then this stays.
+        with tempfile.TemporaryDirectory(prefix="drover-metrics-") as tmp:
+            snapshot = Path(tmp) / source.name
+            shutil.copy2(source, snapshot)
+            return quality_snapshot(
+                duckdb_path=snapshot,
+                incoming_dir=self.incoming_dir,
+                deep=False,
+            )
 
     def _observatory_snapshot(self, quality: dict) -> dict:
         audit = quality.get("runtime_audit", {})
@@ -1966,12 +1984,18 @@ class MetricsCollector:
         if not source.exists():
             return {}
         try:
-            return pipeline_observatory_snapshot(
-                duckdb_path=source,
-                runtime_audit=audit,
-                max_artifacts=10,
-                max_projects=10,
-            )
+            # Copy for the same isolation reason as _quality_snapshot above.
+            # This one is fast on its own (0.23s measured), but it runs in the
+            # same refresh and must not add live-instance contention either.
+            with tempfile.TemporaryDirectory(prefix="drover-observatory-") as tmp:
+                snapshot = Path(tmp) / source.name
+                shutil.copy2(source, snapshot)
+                return pipeline_observatory_snapshot(
+                    duckdb_path=snapshot,
+                    runtime_audit=audit,
+                    max_artifacts=10,
+                    max_projects=10,
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render observatory drilldown: %s", exc)
             return {"error": str(exc)}
