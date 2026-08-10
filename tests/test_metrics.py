@@ -4339,9 +4339,7 @@ def test_render_harness_json_refreshes_after_ttl(tmp_path, monkeypatch):
     assert calls["n"] == 2
 
 
-def test_quality_and_observatory_snapshots_read_an_isolated_copy(
-    tmp_path, monkeypatch
-):
+def test_quality_and_observatory_snapshots_read_an_isolated_copy(tmp_path, monkeypatch):
     """The slow snapshots must NOT touch the live database.
 
     quality_snapshot takes ~20s on a real store (measured 19.4s at 686MB).
@@ -4368,9 +4366,7 @@ def test_quality_and_observatory_snapshots_read_an_isolated_copy(
         return {}
 
     monkeypatch.setattr(metrics, "quality_snapshot", fake_quality)
-    monkeypatch.setattr(
-        metrics, "pipeline_observatory_snapshot", fake_observatory
-    )
+    monkeypatch.setattr(metrics, "pipeline_observatory_snapshot", fake_observatory)
 
     quality = collector._quality_snapshot()
     collector._observatory_snapshot(quality)
