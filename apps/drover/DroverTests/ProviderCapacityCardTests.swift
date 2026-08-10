@@ -63,7 +63,7 @@ struct ProviderCapacityCardTests {
      "source":"codex-app-server","windows":[]}
     """
 
-    private func height(_ json: String) throws -> CGFloat {
+    private func height(_ json: String, proposing proposal: CGFloat? = nil) throws -> CGFloat {
         let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
         let subscription = try #require(
             ProviderSubscriptionGrouping.group(
@@ -79,12 +79,15 @@ struct ProviderCapacityCardTests {
         let host = UIHostingController(rootView: card.frame(width: Self.cardWidth).droverTint())
         host.view.frame = CGRect(x: 0, y: 0, width: Self.cardWidth, height: Self.offeredHeight)
         host.view.layoutIfNeeded()
-        // A compressed proposal, not the offered height: the card ends in a
+        // Compressed by default, not the offered height: the card ends in a
         // `Spacer` so it will happily accept whatever it is given, and asking
         // for 900pt gets 900pt back from every card alike — a green that
         // measures the proposal rather than the card.
         return host.sizeThatFits(
-            in: CGSize(width: Self.cardWidth, height: UIView.layoutFittingCompressedSize.height)
+            in: CGSize(
+                width: Self.cardWidth,
+                height: proposal ?? UIView.layoutFittingCompressedSize.height
+            )
         ).height
     }
 
@@ -93,12 +96,26 @@ struct ProviderCapacityCardTests {
     /// The whole point. Four windows, one window and no windows all render the
     /// same card, so a field sits at the same height in every card in the strip.
     @Test func everyHealthyProviderRendersTheSameHeightCard() throws {
-        let heights = try [Self.anthropic, Self.openai, Self.google].map(height)
+        let heights = try [Self.anthropic, Self.openai, Self.google].map { try height($0) }
 
         #expect(heights[0] == heights[1],
                 "four-window \(heights[0])pt vs one-window \(heights[1])pt")
         #expect(heights[1] == heights[2],
                 "one-window \(heights[1])pt vs no-window \(heights[2])pt")
+    }
+
+    /// The other half of the promise. Equal *natural* heights only square the
+    /// strip up while nothing carries an extra line; a failed probe's reason
+    /// line breaks that, and the row then has to grow its shorter cards to
+    /// match. That only works because a card accepts more height than its
+    /// content needs — the property the trailing `Spacer` provides, and the
+    /// one a future edit is most likely to remove without noticing.
+    @Test func aCardGrowsToFillTheHeightItIsOffered() throws {
+        let natural = try height(Self.google)
+        let stretched = try height(Self.google, proposing: 400)
+
+        #expect(natural < 400, "the card was already taller than the offer")
+        #expect(stretched == 400, "card stopped at \(stretched)pt of an offered 400pt")
     }
 
     /// A failed probe earns exactly one extra line to say why, and no more —

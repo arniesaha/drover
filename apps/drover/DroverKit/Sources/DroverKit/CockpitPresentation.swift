@@ -402,12 +402,18 @@ public struct ProviderHeadline: Sendable, Equatable {
     /// Walks the same ladder `ProviderCapacityPresentation` uses to choose its
     /// wording, in the same order, for the same reason.
     static func usedFraction(_ window: ProviderWindow) -> Double? {
-        // `limit > 0` is not defensive noise: a provider reporting a zero limit
-        // would divide into an infinite bar.
-        if let limit = window.limitValue, limit > 0,
+        // Which rung applies is decided by the same field test the wording
+        // uses — presence, not usability. A window carrying both a zero limit
+        // and a percentage must not let the bar drop through to the percentage
+        // while the text stays on the limit: that drew a nearly-full critical
+        // bar beside the words "0 credits used".
+        if let limit = window.limitValue,
            let remaining = window.remainingValue,
            let unit = window.unit,
            !unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // A provider reporting a zero limit would otherwise divide into an
+            // infinite bar. No reading is the honest answer here.
+            guard limit > 0 else { return nil }
             return min(1, max(0, (limit - remaining) / limit))
         }
         if let percent = window.usedPercent {
