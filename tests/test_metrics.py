@@ -3866,12 +3866,12 @@ def test_sync_created_harness_session_preserves_mode(tmp_path):
     collector = _make_collector(tmp_path)
     collector._sync_created_harness_session(
         "mac-mini",
-        {"harness": "gemini", "mode": "structured", "prompt": "x"},
+        {"harness": "agy", "mode": "structured", "prompt": "x"},
         json.dumps(
             {
                 "session_id": "harness-sync-mode",
                 "mode": "structured",
-                "harness": "gemini",
+                "harness": "agy",
                 "status": "running",
             }
         ),
@@ -3945,13 +3945,13 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
         display_name="Mac Mini",
         kind="macos",
         local_url=f"http://127.0.0.1:{harness_port}",
-        capabilities={"harnesses": [{"name": "gemini", "enabled": True}]},
+        capabilities={"harnesses": [{"name": "agy", "enabled": True}]},
     )
     registry.create_session(
         session_id="harness-running",
         host_id="mac-mini",
-        harness="gemini",
-        command="gemini",
+        harness="agy",
+        command="agy",
         mode="structured",
         status="running",
     )
@@ -3973,7 +3973,7 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
             data=json.dumps(
                 {
                     "text": "second turn",
-                    "model": "gemini-2.5-pro",
+                    "model": "gemini-3.6-flash-high",
                     "thinking_effort": "high",
                 }
             ).encode("utf-8"),
@@ -4010,7 +4010,7 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
     assert "/sessions/harness-running/turns" in forwarded
     assert forwarded["/sessions/harness-running/turns"]["body"] == {
         "text": "second turn",
-        "model": "gemini-2.5-pro",
+        "model": "gemini-3.6-flash-high",
         "thinking_effort": "high",
     }
     assert forwarded["/sessions/harness-running/turns"]["authorization"] == (
@@ -4018,7 +4018,7 @@ def test_proxy_forwards_session_turn_to_harnessd(tmp_path):
     )
     session = HarnessRegistry(duckdb_path).get_session("harness-running")
     assert session is not None
-    assert session.model == "gemini-2.5-pro"
+    assert session.model == "gemini-3.6-flash-high"
     assert session.thinking_effort == "high"
     assert "/sessions/harness-running/permission" in forwarded
     assert forwarded["/sessions/harness-running/permission"]["body"] == {

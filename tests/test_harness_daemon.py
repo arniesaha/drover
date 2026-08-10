@@ -1491,14 +1491,22 @@ def test_build_launch_command_adds_provider_native_resume_args():
         native_resume={"session_id": "codex-session-1"},
     ) == ["/bin/zsh", "-lc", "exec /opt/homebrew/bin/codex resume codex-session-1"]
     assert build_launch_command(
-        gemini,
-        harness="gemini",
-        native_resume={"session_id": "gemini-session-1"},
+        agy,
+        harness="agy",
+        native_resume={"session_id": "agy-conversation-1"},
     ) == [
         "/bin/zsh",
         "-lc",
-        "exec /opt/homebrew/bin/gemini --resume gemini-session-1",
+        "exec /opt/homebrew/bin/agy --conversation agy-conversation-1",
     ]
+    # agy has no "latest" form: `--continue` resumes the newest conversation
+    # in the current directory, which is a different promise from the one
+    # claude/codex make here, so it is deliberately not wired up.
+    assert build_launch_command(
+        agy,
+        harness="agy",
+        native_resume={"latest": True},
+    ) == ["/bin/zsh", "-lc", "exec /opt/homebrew/bin/agy"]
 
 
 def test_build_launch_command_preserves_plain_command_without_resume():
@@ -1733,71 +1741,6 @@ def test_reads_codex_jsonl_native_transcript(tmp_path):
     assert "metrics.py" in transcript["messages"][3]["text"]
 
 
-def test_reads_gemini_json_native_transcript(tmp_path):
-    project_dir = tmp_path / ".gemini/tmp/nexus"
-    chats_dir = project_dir / "chats"
-    chats_dir.mkdir(parents=True)
-    (project_dir / ".project_root").write_text("/home/Arnab/dev/nexus\n")
-    session = chats_dir / "session-2026-06-23T01-00-abcd1234.json"
-    session.write_text(
-        json.dumps(
-            {
-                "sessionId": "gemini-session-1",
-                "lastUpdated": "2026-06-23T01:03:00Z",
-                "messages": [
-                    {
-                        "id": "user-1",
-                        "timestamp": "2026-06-23T01:00:00Z",
-                        "type": "user",
-                        "content": [{"text": "Explain this repo."}],
-                    },
-                    {
-                        "id": "assistant-1",
-                        "timestamp": "2026-06-23T01:00:01Z",
-                        "type": "gemini",
-                        "content": "I will read the README.",
-                        "toolCalls": [
-                            {
-                                "id": "tool-1",
-                                "name": "read_file",
-                                "args": {"file_path": "README.md"},
-                                "result": [
-                                    {
-                                        "functionResponse": {
-                                            "response": {
-                                                "output": "# Nexus\n\nLocal context store."
-                                            }
-                                        }
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                ],
-            }
-        )
-    )
-
-    transcript = native_transcript_for_session(
-        home=tmp_path,
-        harness="gemini",
-        cwd="/home/Arnab/dev/nexus",
-    )
-
-    assert transcript["source"] == "gemini chat"
-    assert transcript["session_id"] == "gemini-session-1"
-    assert [item["role"] for item in transcript["messages"]] == [
-        "user",
-        "assistant",
-        "tool_use",
-        "tool_result",
-    ]
-    assert transcript["messages"][0]["text"] == "Explain this repo."
-    assert transcript["messages"][2]["title"] == "Tool: read_file"
-    assert '"file_path": "README.md"' in transcript["messages"][2]["text"]
-    assert "Local context store." in transcript["messages"][3]["text"]
-
-
 def test_discovers_codex_native_resume_sessions(tmp_path):
     session_dir = tmp_path / ".codex/sessions/2026/06/23"
     session_dir.mkdir(parents=True)
@@ -1831,36 +1774,6 @@ def test_discovers_codex_native_resume_sessions(tmp_path):
     assert candidates[0]["session_id"] == session_id
     assert candidates[0]["native_resume"]["session_id"] == session_id
     assert candidates[0]["cwd"] == "/Users/arnabmac/jenny/nexus"
-    assert candidates[0]["path_hint"] == str(session)
-
-
-def test_discovers_gemini_native_resume_sessions(tmp_path):
-    project_dir = tmp_path / ".gemini/tmp/nexus"
-    chats_dir = project_dir / "chats"
-    chats_dir.mkdir(parents=True)
-    (project_dir / ".project_root").write_text("/home/Arnab/dev/nexus\n")
-    session = chats_dir / "session-2026-06-23T01-00-abcd1234.json"
-    session.write_text(
-        json.dumps(
-            {
-                "sessionId": "gemini-session-1",
-                "lastUpdated": "2026-06-23T01:01:00Z",
-                "kind": "main",
-            }
-        )
-    )
-
-    candidates = discover_native_resume_sessions(
-        home=tmp_path,
-        harness="gemini",
-        cwd="/home/Arnab/dev/nexus",
-    )
-
-    assert len(candidates) == 1
-    assert candidates[0]["harness"] == "gemini"
-    assert candidates[0]["session_id"] == "gemini-session-1"
-    assert candidates[0]["native_resume"]["session_id"] == "gemini-session-1"
-    assert candidates[0]["cwd"] == "/home/Arnab/dev/nexus"
     assert candidates[0]["path_hint"] == str(session)
 
 
@@ -2289,7 +2202,7 @@ def test_harnessd_terminate_waits_for_recovery_and_wins(tmp_path):
 @pytest.mark.parametrize(
     ("harness", "native_session_id", "cwd_exists"),
     [
-        ("gemini", "provider-session-1", True),
+        ("agy", "provider-session-1", True),
         ("codex", "", True),
         ("codex", "provider-session-1", False),
     ],
@@ -2853,11 +2766,11 @@ def test_structured_command_preferences_map_to_cli_flags():
         thinking_effort="high",
     ) == ["codex"]
     assert harness_daemon.apply_structured_preferences(
-        ["gemini"],
-        harness="gemini",
-        model="gemini-2.5-pro",
+        ["agy"],
+        harness="agy",
+        model="gemini-3.6-flash-high",
         thinking_effort="high",
-    ) == ["gemini"]
+    ) == ["agy"]
 
 
 def _structured_session_awaiting_input(tmp_path, base_url, state):
@@ -3044,7 +2957,7 @@ def test_structured_unknown_harness_rejected(tmp_path):
 
 
 def test_structured_permission_without_approval_channel_returns_400(tmp_path):
-    # codex/gemini drivers always raise RuntimeError from answer_permission
+    # codex/agy drivers always raise RuntimeError from answer_permission
     # (no wire-level approval channel) -- the daemon must surface that as a
     # 400, not a 500, and must not record a phantom approval_response event.
     server, state, base_url = _start_test_server(tmp_path)
@@ -3145,7 +3058,7 @@ def test_structured_terminate_closes_driver_and_marks_terminated(tmp_path):
         server.server_close()
 
 
-# -- per-session worktrees for approval-less harnesses (codex/gemini) --------
+# -- per-session worktrees for approval-less harnesses (codex/agy) --------
 
 
 def _init_git_repo(root) -> None:

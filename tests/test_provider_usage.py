@@ -348,8 +348,8 @@ def test_codex_probe_does_not_block_on_noisy_stderr(fake_codex_app_server):
     assert snapshot.plan_label == "plus"
 
 
-def test_detected_gemini_is_honest_when_quota_contract_is_unavailable():
-    accounts = detect_provider_accounts({"harnesses": [{"id": "gemini"}]})
+def test_detected_agy_is_honest_when_quota_contract_is_unavailable():
+    accounts = detect_provider_accounts({"harnesses": [{"id": "agy"}]})
 
     assert accounts[0].provider == "google"
     assert accounts[0].usage_status == "usage_unavailable"
@@ -374,7 +374,7 @@ def test_inventory_omits_disabled_harnesses_and_keeps_supported_codex():
 
 def test_claude_inventories_as_supported():
     detected = detect_provider_accounts(
-        {"host_id": "mac-mini", "harnesses": ["claude-code", "gemini"]}
+        {"host_id": "mac-mini", "harnesses": ["claude-code", "agy"]}
     )
     by_provider = {d.provider: d for d in detected}
 

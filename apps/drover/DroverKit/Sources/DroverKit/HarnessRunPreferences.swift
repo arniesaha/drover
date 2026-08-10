@@ -18,7 +18,10 @@ public enum HarnessRunPreferences {
         case "codex":
             return ["gpt-5.6-sol", "gpt-5.5"]
         case "agy":
-            return ["gemini-3.6-flash", "gemini-3.5-pro"]
+            // agy rejects a bare family name -- every ID it accepts carries
+            // the reasoning tier as a suffix. Taken from `agy models` on the
+            // Mac mini, 2026-08-09 (agy 1.1.11).
+            return ["gemini-3.6-flash-high", "gemini-3.1-pro-high", "claude-sonnet-4-6"]
         default:
             return []
         }

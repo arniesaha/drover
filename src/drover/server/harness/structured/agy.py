@@ -232,7 +232,8 @@ class AgyDriver:
 
         event = obj.get("event")
         if event == "init":
-            conv_id = obj.get("conversation_id") or obj.get("init", {}).get("conversation_id")
+            init = obj.get("init") or {}
+            conv_id = obj.get("conversation_id") or init.get("conversation_id")
             if conv_id:
                 self.native_session_id = str(conv_id)
             return [
@@ -254,8 +255,12 @@ class AgyDriver:
                     delta_buffer.append(str(text_delta))
                 return []
             if step_type == "tool":
-                tool_name = update.get("tool_name") or update.get("tool_info", {}).get("name")
+                # `or {}` rather than a `{}` default: a present-but-null
+                # `tool_info` would otherwise raise here, and this runs on the
+                # turn thread where an escaping exception kills the pump
+                # without ever emitting a turn-complete.
                 tool_info = update.get("tool_info") or {}
+                tool_name = update.get("tool_name") or tool_info.get("name")
                 state = update.get("state")
                 output = tool_info.get("output")
                 messages = []
@@ -337,4 +342,6 @@ class AgyDriver:
         self, request_id: str, decision: str, note: str | None = None
     ) -> None:
         del request_id, decision, note
-        raise RuntimeError("agy driver has no interactive approvals (auto-approve mode)")
+        raise RuntimeError(
+            "agy driver has no interactive approvals (auto-approve mode)"
+        )

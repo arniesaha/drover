@@ -35,7 +35,7 @@ def default_command(binary: str | None = None) -> list[str]:
         # control_request channel, any gated tool call fails outright
         # ("requested permissions ... but you haven't granted it"), so the
         # only workable posture until approval surfacing (Part B) lands is
-        # full bypass, matching codex danger-full-access / gemini yolo.
+        # full bypass, matching codex danger-full-access / agy skip-permissions.
         "--permission-mode",
         "bypassPermissions",
     ]
@@ -236,7 +236,7 @@ class ClaudeDriver(ProcessDriver):
         del turn_id, model, thinking_effort
         content: list[dict] = [{"type": "text", "text": text}]
         # Attachments also appear as [Attached image: <path>] lines in the
-        # text (that's the only channel codex/gemini have); the base64 block
+        # text (that's the only channel codex/agy have); the base64 block
         # here lets Claude see the image without a Read tool call.
         for image in images or []:
             content.append(

@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from drover.server.harness.structured.agy import AgyDriver, default_command, resume_command
+from drover.server.harness.structured.agy import (
+    AgyDriver,
+    default_command,
+    resume_command,
+)
 from drover.server.providers.agy import AgyUsageProbe
 
 FAKE_AGY = (
@@ -23,13 +27,15 @@ FAKE_AGY = (
 SLOW_AGY = (
     "import json,sys,time; args=sys.argv[1:]; "
     'idx=args.index("--print"); prompt=args[idx+1]; '
-    'time.sleep(1.0); '
+    "time.sleep(1.0); "
     'print(json.dumps({"event": "result", "result": {"status": "SUCCESS"}}))'
 )
 
 
 def _driver(sink: list, native_id: str | None = None) -> AgyDriver:
-    return AgyDriver([sys.executable, "-c", FAKE_AGY], None, sink.append, native_session_id=native_id)
+    return AgyDriver(
+        [sys.executable, "-c", FAKE_AGY], None, sink.append, native_session_id=native_id
+    )
 
 
 def _wait_for(got: list, predicate, timeout: float = 10.0) -> None:
@@ -92,13 +98,23 @@ def test_turn_roundtrip_emits_output_then_complete():
 
 
 def test_argv_includes_required_flags():
-    driver = AgyDriver(["agy"], cwd=None, emit=lambda m: None, native_session_id="conv-456")
-    argv = driver._argv_for("hello", model="gemini-3.6-flash")
+    driver = AgyDriver(
+        ["agy"], cwd=None, emit=lambda m: None, native_session_id="conv-456"
+    )
+    argv = driver._argv_for("hello", model="gemini-3.6-flash-high")
     assert "--dangerously-skip-permissions" in argv
-    assert "--output-format" in argv and argv[argv.index("--output-format") + 1] == "stream-json"
+    assert (
+        "--output-format" in argv
+        and argv[argv.index("--output-format") + 1] == "stream-json"
+    )
     assert "--print" in argv and argv[argv.index("--print") + 1] == "hello"
-    assert "--model" in argv and argv[argv.index("--model") + 1] == "gemini-3.6-flash"
-    assert "--conversation" in argv and argv[argv.index("--conversation") + 1] == "conv-456"
+    assert (
+        "--model" in argv and argv[argv.index("--model") + 1] == "gemini-3.6-flash-high"
+    )
+    assert (
+        "--conversation" in argv
+        and argv[argv.index("--conversation") + 1] == "conv-456"
+    )
 
 
 def test_parse_stream_line_tool():
@@ -121,18 +137,85 @@ def test_parse_stream_line_tool():
     assert messages[0].payload["tool"] == "run_command"
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"event": "step_update", "step_update": {"step_type": "tool", '
+        '"state": "ACTIVE", "tool_info": null}}',
+        '{"event": "init", "init": null}',
+        '{"event": "step_update", "step_update": null}',
+    ],
+)
+def test_parse_stream_line_survives_null_sub_objects(line):
+    """A null sub-object must not kill the turn thread.
+
+    ``parse_stream_line`` runs on the pump thread, where an escaping
+    exception ends the turn with no completion event at all -- the session
+    just hangs.
+    """
+    driver = _driver([])
+
+    driver.parse_stream_line(line, [], "t1")
+
+
 def test_answer_permission_raises():
     driver = _driver([])
     with pytest.raises(RuntimeError, match="no interactive approvals"):
         driver.answer_permission("req-1", "allow")
 
 
+def test_interrupt_terminates_an_in_flight_turn():
+    got: list = []
+    driver = AgyDriver([sys.executable, "-c", SLOW_AGY], None, got.append)
+    driver.send_turn("hello", turn_id="t1")
+    _wait_for(got, lambda _g: driver._turn_process is not None, timeout=5.0)
+    driver.interrupt()
+    _wait_for(got, lambda g: any(m.type == "error" for m in g))
+    driver.close()
+    assert driver.is_alive() is False
+
+
 # -- provider probe ----------------------------------------------------------
+#
+# Every credential source is injected. Reading the real ``~/.gemini`` would
+# make these pass or fail on whether this machine happens to be signed into
+# agy, which is how a "hermetic" suite starts passing for the wrong reason.
 
 
-def test_provider_probe_read():
-    probe = AgyUsageProbe()
-    snapshot = probe.read(host_id="test-host")
+def test_provider_probe_reports_the_signed_in_account(tmp_path: Path):
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com", "old": []}))
+
+    snapshot = AgyUsageProbe(accounts_path=accounts).read(host_id="test-host")
+
     assert snapshot.provider == "google"
     assert snapshot.host_id == "test-host"
-    assert snapshot.status in ("ok", "usage_unavailable")
+    assert snapshot.account_label == "someone@example.com"
+
+
+def test_provider_probe_says_capacity_is_unavailable_rather_than_ok(tmp_path: Path):
+    """No quota source exists yet, so the card must not claim to be healthy."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+
+    snapshot = AgyUsageProbe(accounts_path=accounts).read()
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "quota_api_unreachable"
+    assert snapshot.windows == ()
+
+
+def test_provider_probe_falls_back_to_a_generic_label(tmp_path: Path):
+    snapshot = AgyUsageProbe(accounts_path=tmp_path / "missing.json").read()
+
+    assert snapshot.account_label == "Antigravity"
+    assert snapshot.status == "usage_unavailable"
+
+
+def test_provider_probe_never_raises_on_a_broken_accounts_file(tmp_path: Path):
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text("{ not json")
+
+    snapshot = AgyUsageProbe(accounts_path=accounts).read()
+
+    assert snapshot.account_label == "Antigravity"

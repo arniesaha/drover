@@ -273,19 +273,36 @@ def _parse_codex_status(output: str, returncode: int) -> HarnessAuthStatus:
     return HarnessAuthStatus("codex", "unknown", detail=output or None)
 
 
-def _parse_agy_status(output: str, returncode: int) -> HarnessAuthStatus:
+def _parse_agy_status(
+    output: str, returncode: int, *, home: Path | None = None
+) -> HarnessAuthStatus:
+    """Read sign-in from agy's own state, not from ``agy --version``.
+
+    The probe command is ``--version``, which exits 0 whenever the binary is
+    installed -- signed in or not -- so its return code says nothing about
+    authentication. agy keeps its credentials in ``~/.gemini``: an account
+    address in ``google_accounts.json`` and the OAuth blob beside it. A
+    missing address is reported as ``unknown`` rather than
+    ``unauthenticated``, because agy may store identity somewhere this has
+    not seen.
+    """
+    root = home or Path.home()
+    if returncode != 0:
+        return HarnessAuthStatus("agy", "unavailable", detail=output or None)
     account_label = None
-    accounts_file = Path.home() / ".gemini/google_accounts.json"
-    if accounts_file.exists():
-        try:
-            raw = json.loads(accounts_file.read_text())
-            if isinstance(raw, dict) and isinstance(raw.get("active"), str):
-                account_label = raw["active"].strip() or None
-        except Exception:
-            pass
-    if returncode == 0:
-        return HarnessAuthStatus("agy", "authenticated", label=account_label, detail="Antigravity CLI")
-    return HarnessAuthStatus("agy", "unauthenticated", detail=output or None)
+    try:
+        raw = json.loads((root / ".gemini/google_accounts.json").read_text())
+        if isinstance(raw, dict) and isinstance(raw.get("active"), str):
+            account_label = raw["active"].strip() or None
+    except (OSError, ValueError):
+        account_label = None
+    if account_label:
+        return HarnessAuthStatus(
+            "agy", "authenticated", label=account_label, detail="Antigravity CLI"
+        )
+    if (root / ".gemini/oauth_creds.json").exists():
+        return HarnessAuthStatus("agy", "authenticated", detail="Antigravity CLI")
+    return HarnessAuthStatus("agy", "unknown", detail=output or None)
 
 
 def default_login_shell() -> str:
