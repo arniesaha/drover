@@ -36,9 +36,9 @@ let snapshotJSON = Data("""
   "capabilities": {"display_name": "Mac Mini", "harnesses": [
     {"name": "shell", "enabled": true},
     {"name": "claude-code", "enabled": true},
-    {"name": "gemini", "enabled": true}]}}],
+    {"name": "agy", "enabled": true}]}}],
  "sessions": [
-  {"session_id": "harness-1", "host_id": "mac-mini", "harness": "gemini",
+  {"session_id": "harness-1", "host_id": "mac-mini", "harness": "agy",
    "mode": "structured", "status": "running", "awaiting": "approval",
    "cwd": "/Users/arnabmac/jenny/nexus",
    "last_activity": "2026-07-07T01:23:45.678901+00:00"},
@@ -62,7 +62,7 @@ let multiHostSnapshotJSON = Data("""
    "capabilities": {"display_name": "Mac Mini", "harnesses": [
      {"name": "shell", "enabled": true},
      {"name": "claude-code", "enabled": true},
-     {"name": "gemini", "enabled": true}]}},
+     {"name": "agy", "enabled": true}]}},
   {"host_id": "nas", "status": "online",
    "capabilities": {"display_name": "NAS", "harnesses": [
      {"name": "shell", "enabled": true},
@@ -70,7 +70,7 @@ let multiHostSnapshotJSON = Data("""
   {"host_id": "studio", "status": "online",
    "capabilities": {"display_name": "Studio", "harnesses": [
      {"name": "claude-code", "enabled": true},
-     {"name": "gemini", "enabled": true}]}}],
+     {"name": "agy", "enabled": true}]}}],
  "sessions": [],
  "cwd_suggestions": []}
 """.utf8)

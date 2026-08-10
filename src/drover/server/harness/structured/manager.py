@@ -7,7 +7,7 @@ per-session ``seq`` counter into the registry, tracks the derived
 "verify-then-record" ordering: the driver call happens first, and the
 corresponding ``user_input``/``approval_response`` message is only recorded
 after it succeeds, so a rejected call (e.g. "turn already in flight", or
-Codex/Gemini's unconditional approval-channel ``RuntimeError``) never
+Codex/Agy's unconditional approval-channel ``RuntimeError``) never
 leaves a phantom event in the registry.
 """
 
@@ -20,13 +20,13 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.structured import claude, codex, gemini
+from drover.server.harness.structured import agy, claude, codex
 from drover.server.harness.structured.driver import StructuredMessage
 
 # Each factory is a small builder, not a bare class -- ClaudeDriver needs a
 # sanitized child environment (claude.child_env() strips ambient CLAUDE*
 # vars so a nested harnessd doesn't leak its own session env into the
-# spawned CLI); Codex/Gemini's constructors take no env kwarg at all.
+# spawned CLI); Codex/Agy's constructors take no env kwarg at all.
 _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
     "claude-code": (
         lambda command, cwd, emit, native_session_id: claude.ClaudeDriver(
@@ -43,11 +43,14 @@ _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
         ),
         codex.default_command,
     ),
-    "gemini": (
-        lambda command, cwd, emit, _native_session_id: gemini.GeminiDriver(
-            command, cwd, emit
+    "agy": (
+        lambda command, cwd, emit, native_session_id: agy.AgyDriver(
+            agy.resume_command(command, native_session_id),
+            cwd,
+            emit,
+            native_session_id=native_session_id,
         ),
-        gemini.default_command,
+        agy.default_command,
     ),
 }
 
@@ -199,7 +202,7 @@ class StructuredSessionManager:
             on_message(session_id, event_payload)
             # Only a genuine process-level exit finalizes the session.
             # ProcessDriver.on_exit() leaves turn_id=None on its "process
-            # exited" status message, but Codex/Gemini's per-turn respawn
+            # exited" status message, but Codex/Agy's per-turn respawn
             # drivers emit an "exited" status with turn_id SET after every
             # single turn -- gating on turn_id is None keeps those from
             # prematurely finalizing (and vanishing from listings) after
@@ -250,7 +253,7 @@ class StructuredSessionManager:
                     raise RuntimeError("turn already in flight")
                 entry.turn_active = True
         turn_id = f"turn-{uuid4()}"
-        # Dispatch first: Codex/Gemini raise RuntimeError here ("turn
+        # Dispatch first: Codex/Agy raise RuntimeError here ("turn
         # already in flight" / "driver is closed") when a turn can't be
         # accepted, and we must not record a user_input event for a turn
         # that was never actually sent.
@@ -290,7 +293,7 @@ class StructuredSessionManager:
         self, session_id: str, request_id: str, decision: str, note: str | None
     ) -> None:
         entry = self._require_entry(session_id)
-        # Dispatch first: Codex/Gemini always raise RuntimeError here (no
+        # Dispatch first: Codex/Agy always raise RuntimeError here (no
         # wire-level approval channel), and we must not record a phantom
         # approval_response event for a driver that rejected it.
         entry.driver.answer_permission(request_id, decision, note)

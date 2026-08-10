@@ -53,7 +53,7 @@ struct NotifierTests {
 @Test func firstCheckNotifiesEachNeedsYouSessionAndSetsBadge() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotData([
         (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
-        (id: "sess-input", harness: "gemini", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
+        (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
         (id: "sess-working", harness: "shell", status: "running", awaiting: nil, cwd: "/tmp"),
     ])) }
 
@@ -67,7 +67,7 @@ struct NotifierTests {
         $0.id == "sess-approval" && $0.title == "claude-code needs you" && $0.body == "project — approval required"
     })
     #expect(notifications.contains {
-        $0.id == "sess-input" && $0.title == "gemini needs you" && $0.body == "other — your turn"
+        $0.id == "sess-input" && $0.title == "agy needs you" && $0.body == "other — your turn"
     })
 
     let badges = await spy.badgeCounts
@@ -125,7 +125,7 @@ struct NotifierTests {
         return (500, Data())
     }
     let snapshot = try HarnessSnapshot.decode(from: snapshotData([
-        (id: "sess-input", harness: "gemini", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
+        (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
     ]))
     let spy = SpyNotifier()
     let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())

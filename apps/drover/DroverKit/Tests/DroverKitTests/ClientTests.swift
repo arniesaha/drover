@@ -73,12 +73,12 @@ struct ClientTests {
         #expect(request.url?.path == "/harness/hosts/mac-mini/sessions")
         #expect(request.httpMethod == "POST")
         #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
-        #expect(body["harness"] as? String == "gemini")
+        #expect(body["harness"] as? String == "agy")
         #expect(body["mode"] as? String == "structured")
         #expect(body["prompt"] as? String == "do it")
         return (201, Data(#"{"session_id": "harness-xyz", "mode": "structured"}"#.utf8))
     }
-    let id = try await client().createSession(hostID: "mac-mini", harness: "gemini",
+    let id = try await client().createSession(hostID: "mac-mini", harness: "agy",
                                               mode: "structured", prompt: "do it", cwd: nil)
     #expect(id == "harness-xyz")
 }

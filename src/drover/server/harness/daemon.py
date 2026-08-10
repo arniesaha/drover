@@ -45,9 +45,9 @@ from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
+from drover.server.harness.structured import agy as _structured_agy
 from drover.server.harness.structured import claude as _structured_claude
 from drover.server.harness.structured import codex as _structured_codex
-from drover.server.harness.structured import gemini as _structured_gemini
 from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.structured.pusher import EventPusher
 from drover.server.harness.worktree import (
@@ -77,16 +77,16 @@ if TYPE_CHECKING:
 _STRUCTURED_DEFAULT_COMMANDS: dict[str, Callable[[], list[str]]] = {
     "claude-code": _structured_claude.default_command,
     "codex": _structured_codex.default_command,
-    "gemini": _structured_gemini.default_command,
+    "agy": _structured_agy.default_command,
 }
 
 # Harnesses whose structured drivers run full-auto with no wire-level
-# approval channel (codex: --sandbox danger-full-access; gemini:
-# --approval-mode yolo). These get a per-session git worktree so a broad
+# approval channel (codex: --sandbox danger-full-access; agy:
+# --dangerously-skip-permissions). These get a per-session git worktree so a broad
 # `git add -A` inside the session can never sweep unrelated in-flight
 # changes from the user's main checkout. Claude keeps its interactive
 # approval flow and runs in place.
-_WORKTREE_HARNESSES = frozenset({"codex", "gemini"})
+_WORKTREE_HARNESSES = frozenset({"codex", "agy"})
 
 log = logging.getLogger("drover.harnessd")
 
@@ -180,7 +180,7 @@ class HarnessPreset:
     # the seed — otherwise the seed answers the gate and is discarded. The
     # markers are plural because claude-code has reworded the gate across
     # versions; every wording seen in the wild must stay matched. Empty means
-    # the harness has no gate (shell, codex, gemini).
+    # the harness has no gate (shell, codex, agy).
     startup_gate_markers: tuple[str, ...] = ()
     startup_gate_answer: str = "1\n"
     # Absolute path to the resolved CLI. `command` wraps it in a login shell so
@@ -226,11 +226,11 @@ DEFAULT_PRESETS = {
         enabled=False,
         description="Codex CLI",
     ),
-    "gemini": HarnessPreset(
-        name="gemini",
-        command=("gemini",),
+    "agy": HarnessPreset(
+        name="agy",
+        command=("agy",),
         enabled=False,
-        description="Gemini CLI",
+        description="Antigravity CLI (agy)",
     ),
     "openclaw": HarnessPreset(
         name="openclaw",
@@ -336,11 +336,13 @@ def _native_resume_args(harness: str, native_resume: Any) -> list[str]:
             return ["resume", "--last"]
         if mode == "resume":
             return ["resume"]
-    if harness == "gemini":
+    if harness == "agy":
+        # agy resumes by conversation ID only -- there is no bare "latest"
+        # form, and `--continue` picks the most recent conversation in the
+        # *current* directory, which is not the same promise the other
+        # harnesses make here.
         if session_id:
-            return ["--resume", session_id]
-        if latest or mode in {"resume", "latest"}:
-            return ["--resume"]
+            return ["--conversation", session_id]
     if harness == "openclaw":
         if session_id:
             return ["resume", session_id]
@@ -381,14 +383,17 @@ def discover_native_resume_sessions(
 ) -> list[dict[str, Any]]:
     """Return safe, metadata-only native resume candidates from local CLIs."""
     root = home or Path.home()
-    requested = {harness} if harness else {"claude-code", "codex", "gemini"}
+    # agy is absent on purpose: it keeps conversations in its own store under
+    # ``~/.gemini/antigravity-cli/conversations`` in a format nothing here
+    # reads yet. Drover's own per-session ``--conversation`` continuation is
+    # unaffected -- this list only feeds the "resume a session the CLI
+    # started outside Drover" picker.
+    requested = {harness} if harness else {"claude-code", "codex"}
     candidates: list[dict[str, Any]] = []
     if "claude-code" in requested:
         candidates.extend(_discover_claude_sessions(root))
     if "codex" in requested:
         candidates.extend(_discover_codex_sessions(root))
-    if "gemini" in requested:
-        candidates.extend(_discover_gemini_sessions(root))
     if cwd:
         wanted = str(Path(cwd).expanduser())
         exact = [item for item in candidates if item.get("cwd") == wanted]
@@ -442,20 +447,6 @@ def native_transcript_for_session(
                 "reason": "no Codex JSONL transcript found for this workspace",
             }
         return _read_codex_transcript(path, limit=limit)
-    if harness == "gemini":
-        root = home or Path.home()
-        path = _gemini_transcript_path(
-            root,
-            cwd=cwd,
-            native_session_id=native_session_id,
-        )
-        if path is None:
-            return {
-                "source": "gemini chat",
-                "messages": [],
-                "reason": "no Gemini chat transcript found for this workspace",
-            }
-        return _read_gemini_transcript(path, limit=limit)
     return {
         "source": None,
         "messages": [],
@@ -496,19 +487,6 @@ def _codex_transcript_path(
 ) -> Path | None:
     return _candidate_path(
         _discover_codex_sessions(home),
-        cwd=cwd,
-        native_session_id=native_session_id,
-    )
-
-
-def _gemini_transcript_path(
-    home: Path,
-    *,
-    cwd: str | None,
-    native_session_id: str | None,
-) -> Path | None:
-    return _candidate_path(
-        _discover_gemini_sessions(home),
         cwd=cwd,
         native_session_id=native_session_id,
     )
@@ -556,35 +534,6 @@ def _discover_codex_sessions(home: Path) -> list[dict[str, Any]]:
                 path=path,
                 updated_at_ts=path.stat().st_mtime,
                 source="codex jsonl",
-            )
-        )
-    return sessions
-
-
-def _discover_gemini_sessions(home: Path) -> list[dict[str, Any]]:
-    sessions = []
-    for path in (home / ".gemini/tmp").glob("*/chats/session-*"):
-        if not path.is_file():
-            continue
-        metadata = _gemini_metadata(path)
-        session_id = _optional_text(metadata.get("sessionId"))
-        if not session_id:
-            continue
-        project_root = path.parents[1] / ".project_root"
-        cwd = None
-        if project_root.exists():
-            cwd = _optional_text(project_root.read_text(errors="replace"))
-        updated_at_ts = (
-            _timestamp_to_epoch(metadata.get("lastUpdated")) or path.stat().st_mtime
-        )
-        sessions.append(
-            _candidate(
-                harness="gemini",
-                session_id=session_id,
-                cwd=cwd,
-                path=path,
-                updated_at_ts=updated_at_ts,
-                source="gemini chat",
             )
         )
     return sessions
@@ -711,32 +660,6 @@ def _read_codex_transcript(path: Path, *, limit: int = 80) -> dict[str, Any]:
             if updated_at_ts
             else None
         ),
-        "messages": messages[-safe_limit:],
-    }
-
-
-def _read_gemini_transcript(path: Path, *, limit: int = 80) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text(errors="replace"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {
-            "source": "gemini chat",
-            "session_id": path.stem,
-            "path_hint": _path_hint(path),
-            "messages": [],
-            "reason": str(exc),
-        }
-    session_id = _optional_text(payload.get("sessionId")) or path.stem
-    messages: list[dict[str, Any]] = []
-    for item in payload.get("messages") or []:
-        if isinstance(item, dict):
-            messages.extend(_gemini_transcript_messages(item, session_id=session_id))
-    safe_limit = max(1, min(int(limit or 80), 200))
-    return {
-        "source": "gemini chat",
-        "session_id": session_id,
-        "path_hint": _path_hint(path),
-        "updated_at": _optional_text(payload.get("lastUpdated")),
         "messages": messages[-safe_limit:],
     }
 
@@ -877,66 +800,6 @@ def _codex_transcript_messages(
     return []
 
 
-def _gemini_transcript_messages(
-    item: Mapping[str, Any], *, session_id: str | None
-) -> list[dict[str, Any]]:
-    message_type = _optional_text(item.get("type"))
-    timestamp = _optional_text(item.get("timestamp"))
-    uuid = _optional_text(item.get("id"))
-    if message_type == "user":
-        text = _content_text(item.get("content"))
-        if not text:
-            return []
-        return [
-            _native_transcript_message(
-                role="user",
-                text=text,
-                timestamp=timestamp,
-                uuid=uuid,
-                session_id=session_id,
-            )
-        ]
-    if message_type != "gemini":
-        return []
-    records: list[dict[str, Any]] = []
-    if text := _clip_transcript_text(item.get("content")):
-        records.append(
-            _native_transcript_message(
-                role="assistant",
-                text=text,
-                timestamp=timestamp,
-                uuid=uuid,
-                session_id=session_id,
-            )
-        )
-    for tool in item.get("toolCalls") or []:
-        if not isinstance(tool, dict):
-            continue
-        name = _optional_text(tool.get("name")) or "tool"
-        records.append(
-            _native_transcript_message(
-                role="tool_use",
-                text=_format_gemini_tool_use(tool),
-                timestamp=_optional_text(tool.get("timestamp")) or timestamp,
-                uuid=_optional_text(tool.get("id")) or uuid,
-                session_id=session_id,
-                title=f"Tool: {name}",
-            )
-        )
-        if result := _format_gemini_tool_result(tool):
-            records.append(
-                _native_transcript_message(
-                    role="tool_result",
-                    text=result,
-                    timestamp=_optional_text(tool.get("timestamp")) or timestamp,
-                    uuid=_optional_text(tool.get("id")) or uuid,
-                    session_id=session_id,
-                    title="Tool result",
-                )
-            )
-    return [record for record in records if record.get("text")]
-
-
 def _native_transcript_message(
     *,
     role: str,
@@ -988,39 +851,6 @@ def _format_codex_function_call(payload: Mapping[str, Any]) -> str:
             return f"```sh\n{command}\n```"
         return "```json\n" + json.dumps(parsed, indent=2, sort_keys=True) + "\n```"
     return text
-
-
-def _format_gemini_tool_use(tool: Mapping[str, Any]) -> str:
-    args = tool.get("args")
-    if isinstance(args, dict):
-        description = _optional_text(tool.get("description"))
-        body = "```json\n" + json.dumps(args, indent=2, sort_keys=True) + "\n```"
-        return f"{description}\n\n{body}" if description else body
-    return _clip_transcript_text(args) or (_optional_text(tool.get("name")) or "tool")
-
-
-def _format_gemini_tool_result(tool: Mapping[str, Any]) -> str:
-    result = tool.get("result")
-    if isinstance(result, list):
-        texts: list[str] = []
-        for item in result:
-            if isinstance(item, dict):
-                response = (
-                    item.get("functionResponse")
-                    if isinstance(item.get("functionResponse"), dict)
-                    else {}
-                )
-                payload = (
-                    response.get("response")
-                    if isinstance(response.get("response"), dict)
-                    else {}
-                )
-                if output := _optional_text(payload.get("output")):
-                    texts.append(output)
-                    continue
-            texts.append(str(item))
-        return _clip_transcript_text("\n\n".join(texts))
-    return _clip_transcript_text(result)
 
 
 def _format_claude_tool_result(part: Mapping[str, Any]) -> str:
@@ -1099,18 +929,6 @@ def _jsonl_metadata(path: Path, *, max_lines: int = 250) -> dict[str, Any]:
                     break
     except OSError:
         return metadata
-    return metadata
-
-
-def _gemini_metadata(path: Path) -> dict[str, Any]:
-    if path.suffix == ".jsonl":
-        return _jsonl_metadata(path, max_lines=5)
-    try:
-        item = json.loads(path.read_text(errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    metadata: dict[str, Any] = {}
-    _collect_metadata(item, metadata)
     return metadata
 
 
@@ -1495,6 +1313,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     probe = ClaudeUsageProbe()
                     self.server.state.claude_usage_probe = probe
                 snapshot = probe.read(host_id=self.server.state.host_id)
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+                continue
+            if detected.provider == "google":
+                from drover.server.providers.agy import AgyUsageProbe
+
+                snapshot = AgyUsageProbe().read(host_id=self.server.state.host_id)
                 accounts.append(_provider_snapshot_json(snapshot, detected))
                 continue
             accounts.append(_unavailable_provider_json(detected, observed_at))
@@ -3348,8 +3172,8 @@ def _harness_name_for_command(command: tuple[str, ...]) -> str:
         return "claude-code"
     if "codex" in command_text:
         return "codex"
-    if "gemini" in command_text:
-        return "gemini"
+    if "agy" in command_text or "antigravity" in command_text:
+        return "agy"
     if "openclaw" in command_text:
         return "openclaw"
     return "shell"

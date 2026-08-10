@@ -236,7 +236,7 @@
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
     }[c]));
-    const HARNESS_PREFERENCE = ["claude-code", "codex", "gemini", "openclaw", "shell"];
+    const HARNESS_PREFERENCE = ["claude-code", "codex", "agy", "openclaw", "shell"];
 
     function endpoint(host) {
       return host && (host.tailscale_url || host.local_url) || "";

@@ -19,18 +19,18 @@ class DetectedProvider:
 _PROVIDER_HARNESSES = (
     ("codex", "openai", "Codex", "supported"),
     ("claude-code", "anthropic", "Claude Code", "supported"),
-    ("gemini", "google", "Gemini", "usage_unavailable"),
+    ("agy", "google", "Antigravity", "usage_unavailable"),
 )
 
 
 def detect_provider_accounts(capabilities: Mapping[str, Any]) -> list[DetectedProvider]:
     """Return only enabled, locally available provider harnesses.
 
-    Gemini is an inventory-only record. Its CLI exposes no usage subcommand
-    and no quota endpoint: quota reaches it only as metadata on a 429, and the
-    quota shown in its footer is computed live per response and never
-    persisted. There is nothing to poll. Codex and Claude Code both have a
-    real source and report windows.
+    Antigravity is an account-only record for now. Its ``FetchQuotaStatus``
+    API is not served on any reachable REST route, and nothing local caches
+    the answer, so its probe reports the signed-in account and leaves
+    capacity unavailable (see ``providers/agy.py``). Codex and Claude Code
+    both have a real source and report windows.
     """
     host_id = str(capabilities.get("host_id") or "local").strip() or "local"
     available = _available_harnesses(capabilities.get("harnesses"))

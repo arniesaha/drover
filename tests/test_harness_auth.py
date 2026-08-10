@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 
@@ -249,7 +250,7 @@ def test_command_adapter_redacts_status_output_and_replaces_invalid_bytes(tmp_pa
 def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name in ("claude", "codex", "gemini"):
+    for name in ("claude", "codex", "agy"):
         path = bindir / name
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)
@@ -257,7 +258,7 @@ def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_pat
 
     adapters = default_auth_adapters()
 
-    assert sorted(adapters) == ["claude-code", "codex", "gemini"]
+    assert sorted(adapters) == ["agy", "claude-code", "codex"]
 
 
 def test_default_auth_adapters_use_login_shell_command_and_nvm_path(
@@ -294,23 +295,57 @@ def test_default_auth_adapters_use_login_shell_command_and_nvm_path(
     ]
 
 
-def test_gemini_auth_is_non_authoritative_but_startable(monkeypatch, tmp_path):
-    gemini = tmp_path / "gemini"
-    gemini.write_text("#!/bin/sh\nexit 0\n")
-    gemini.chmod(0o755)
-    monkeypatch.setenv("GEMINI_API_KEY", "test-secret")
+def _agy_adapter(monkeypatch, tmp_path):
+    """An agy adapter whose binary and home directory are both injected.
+
+    ``Path.home()`` has to be redirected: agy's sign-in state lives in
+    ``~/.gemini``, and reading the real one would make these assertions
+    depend on whether this machine happens to be signed into agy.
+    """
+    agy = tmp_path / "agy"
+    agy.write_text("#!/bin/sh\nexit 0\n")
+    agy.chmod(0o755)
     monkeypatch.setattr(
         "drover.server.harness.auth.resolve_executable",
-        lambda binary, *, login_shell: str(gemini) if binary == "gemini" else None,
+        lambda binary, *, login_shell: str(agy) if binary == "agy" else None,
     )
+    home = tmp_path / "home"
+    (home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: home)
+    return default_auth_adapters()["agy"], agy, home
 
-    adapter = default_auth_adapters()["gemini"]
+
+def test_agy_auth_status_reports_the_signed_in_account(monkeypatch, tmp_path):
+    adapter, agy, home = _agy_adapter(monkeypatch, tmp_path)
+    (home / ".gemini/google_accounts.json").write_text(
+        json.dumps({"active": "someone@example.com", "old": []})
+    )
 
     status = adapter.status()
 
-    assert status.state == "unknown"
-    assert status.detail == "GEMINI_API_KEY set"
-    assert adapter.command()[-1].endswith(f"exec {gemini}")
+    assert status.state == "authenticated"
+    assert status.label == "someone@example.com"
+    assert status.detail == "Antigravity CLI"
+    assert adapter.command()[-1].endswith(f"exec {agy}")
+
+
+def test_agy_auth_status_is_unknown_without_sign_in_state(monkeypatch, tmp_path):
+    """``agy --version`` exits 0 whether or not anyone is signed in."""
+    adapter, _agy, _home = _agy_adapter(monkeypatch, tmp_path)
+
+    assert adapter.status().state == "unknown"
+
+
+def test_agy_auth_status_accepts_oauth_blob_without_an_account_file(
+    monkeypatch, tmp_path
+):
+    adapter, _agy, home = _agy_adapter(monkeypatch, tmp_path)
+    (home / ".gemini/oauth_creds.json").write_text("{}")
+
+    status = adapter.status()
+
+    assert status.state == "authenticated"
+    assert status.label is None
 
 
 def test_manager_starts_and_polls_successful_flow(tmp_path):

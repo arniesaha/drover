@@ -230,7 +230,7 @@ def test_append_events_in_order(tmp_path):
         host_id="gpu-pc",
         display_name="GPU PC",
         kind="linux",
-        capabilities={"harnesses": ["shell", "gemini"]},
+        capabilities={"harnesses": ["shell", "agy"]},
     )
     registry.create_session(
         session_id="harness-session-2",

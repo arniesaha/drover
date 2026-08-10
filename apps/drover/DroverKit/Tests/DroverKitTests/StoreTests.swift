@@ -134,7 +134,7 @@ struct StoreTests {
         (200, Data(#"{"session_id": "harness-9", "mode": "structured"}"#.utf8))
     }
     let store = SessionStore(client: client())
-    let continued = await store.continueSession("harness-1", targetHarness: "gemini")
+    let continued = await store.continueSession("harness-1", targetHarness: "agy")
     #expect(continued?.isStructured == true)
 }
 
@@ -146,9 +146,9 @@ struct StoreTests {
         return (200, Data(#"{"session_id": "harness-9"}"#.utf8))
     }
     let store = SessionStore(client: client())
-    let continued = await store.continueSession("harness-1", targetHarness: "gemini")
+    let continued = await store.continueSession("harness-1", targetHarness: "agy")
     #expect(continued?.sessionID == "harness-9")
-    #expect(sentTarget == "gemini")
+    #expect(sentTarget == "agy")
 }
 
 @Test @MainActor func continueSessionSurfacesServerExplanation() async throws {

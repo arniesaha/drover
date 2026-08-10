@@ -25,9 +25,9 @@ struct LaunchModelTests {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot)
 
-    // Fixture host declares ["shell", "claude-code", "gemini"] in that
+    // Fixture host declares ["shell", "claude-code", "agy"] in that
     // order — structured-capable ones should surface first.
-    #expect(model.availableHarnesses == ["claude-code", "gemini", "shell"])
+    #expect(model.availableHarnesses == ["claude-code", "agy", "shell"])
 }
 
 @Test @MainActor func shellHarnessIsNotStructured() async throws {
@@ -42,7 +42,7 @@ struct LaunchModelTests {
     let model = LaunchModel(client: client(), snapshot: snapshot)
 
     #expect(model.supportsInteractiveAuth == true)
-    model.harness = "gemini"
+    model.harness = "agy"
     #expect(model.supportsInteractiveAuth == true)
     model.harness = "shell"
     #expect(model.supportsInteractiveAuth == false)
@@ -73,25 +73,25 @@ struct LaunchModelTests {
 @Test @MainActor func switchingHostPreservesStillValidHarness() async throws {
     let snapshot = try HarnessSnapshot.decode(from: multiHostSnapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot)
-    model.harness = "gemini" // deliberate non-default pick on mac-mini
+    model.harness = "agy" // deliberate non-default pick on mac-mini
 
-    // "studio" offers gemini too — the user's pick must stay put, not get
+    // "studio" offers agy too — the user's pick must stay put, not get
     // clobbered back to studio's default ("claude-code").
     model.hostID = "studio"
-    #expect(model.harness == "gemini")
+    #expect(model.harness == "agy")
 }
 
-@Test @MainActor func launchPostsStructuredModeWithPromptForGemini() async throws {
+@Test @MainActor func launchPostsStructuredModeWithPromptForAgy() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot)
-    model.harness = "gemini"
+    model.harness = "agy"
     model.prompt = "explain the repo layout"
 
     MockURLProtocol.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(request.url?.path == "/harness/hosts/mac-mini/sessions")
-        #expect(body["harness"] as? String == "gemini")
+        #expect(body["harness"] as? String == "agy")
         #expect(body["mode"] as? String == "structured")
         #expect(body["prompt"] as? String == "explain the repo layout")
         return (201, Data(#"{"session_id": "harness-xyz"}"#.utf8))

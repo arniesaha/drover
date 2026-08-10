@@ -9,7 +9,7 @@
 ## What Drover is
 
 Drover is a local-first cockpit and context store for a personal fleet of CLI
-coding agents. It connects Claude Code, Codex, Gemini, OpenClaw, and compatible
+coding agents. It connects Claude Code, Codex, Antigravity (agy), OpenClaw, and compatible
 harnesses running on machines you control. A native iOS client lets you inspect
 sessions, answer prompts, send turns, hand work off, and attach to a terminal.
 

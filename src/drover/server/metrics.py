@@ -56,7 +56,7 @@ _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
-# gemini). A nexus handoff to one of these launches mode="structured" and
+# agy). A nexus handoff to one of these launches mode="structured" and
 # delivers the handoff text as the first turn -- strictly more reliable than
 # typing it into a cold PTY (no startup-gate race).
 _STRUCTURED_HANDOFF_HARNESSES = frozenset(_STRUCTURED_DEFAULT_COMMANDS)

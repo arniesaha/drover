@@ -236,8 +236,8 @@ def test_analytics_counts_harness_sessions_without_spans():
     con.execute(
         """
         INSERT INTO harness_sessions VALUES (
-          'local-only', 'mac-mini', 'gemini', 'acme', 'offline',
-          'gemini-2.5', ?, NULL, ?
+          'local-only', 'mac-mini', 'agy', 'acme', 'offline',
+          'gemini-3.6-flash', ?, NULL, ?
         )
         """,
         [now, now],

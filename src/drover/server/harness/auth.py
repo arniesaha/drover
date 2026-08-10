@@ -231,8 +231,8 @@ class CommandAuthAdapter:
             return _parse_claude_status(output, result.returncode)
         if self.harness == "codex":
             return _parse_codex_status(output, result.returncode)
-        if self.harness == "gemini":
-            return _parse_gemini_status(output, result.returncode)
+        if self.harness == "agy":
+            return _parse_agy_status(output, result.returncode)
         return HarnessAuthStatus(self.harness, "unknown", detail=output or None)
 
     def command(self) -> list[str]:
@@ -273,14 +273,36 @@ def _parse_codex_status(output: str, returncode: int) -> HarnessAuthStatus:
     return HarnessAuthStatus("codex", "unknown", detail=output or None)
 
 
-def _parse_gemini_status(output: str, returncode: int) -> HarnessAuthStatus:
-    if os.environ.get("GEMINI_API_KEY"):
-        return HarnessAuthStatus("gemini", "unknown", detail="GEMINI_API_KEY set")
-    settings = Path.home() / ".gemini/settings.json"
-    accounts = Path.home() / ".gemini/google_accounts.json"
-    if settings.exists() or accounts.exists():
-        return HarnessAuthStatus("gemini", "unknown", detail="Gemini config present")
-    return HarnessAuthStatus("gemini", "unknown", detail=output or None)
+def _parse_agy_status(
+    output: str, returncode: int, *, home: Path | None = None
+) -> HarnessAuthStatus:
+    """Read sign-in from agy's own state, not from ``agy --version``.
+
+    The probe command is ``--version``, which exits 0 whenever the binary is
+    installed -- signed in or not -- so its return code says nothing about
+    authentication. agy keeps its credentials in ``~/.gemini``: an account
+    address in ``google_accounts.json`` and the OAuth blob beside it. A
+    missing address is reported as ``unknown`` rather than
+    ``unauthenticated``, because agy may store identity somewhere this has
+    not seen.
+    """
+    root = home or Path.home()
+    if returncode != 0:
+        return HarnessAuthStatus("agy", "unavailable", detail=output or None)
+    account_label = None
+    try:
+        raw = json.loads((root / ".gemini/google_accounts.json").read_text())
+        if isinstance(raw, dict) and isinstance(raw.get("active"), str):
+            account_label = raw["active"].strip() or None
+    except (OSError, ValueError):
+        account_label = None
+    if account_label:
+        return HarnessAuthStatus(
+            "agy", "authenticated", label=account_label, detail="Antigravity CLI"
+        )
+    if (root / ".gemini/oauth_creds.json").exists():
+        return HarnessAuthStatus("agy", "authenticated", detail="Antigravity CLI")
+    return HarnessAuthStatus("agy", "unknown", detail=output or None)
 
 
 def default_login_shell() -> str:
@@ -416,12 +438,12 @@ def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthA
             _command_with_args(codex, "login", "status"),
             _command_with_args(codex, "login", "--device-auth"),
         )
-    gemini = _resolve_login_command("gemini", shell=shell)
-    if gemini is not None:
-        adapters["gemini"] = CommandAuthAdapter(
-            "gemini",
-            _command_with_args(gemini, "--version"),
-            list(gemini),
+    agy = _resolve_login_command("agy", shell=shell)
+    if agy is not None:
+        adapters["agy"] = CommandAuthAdapter(
+            "agy",
+            _command_with_args(agy, "--version"),
+            list(agy),
         )
     return adapters
 

@@ -154,7 +154,7 @@ import Testing
     #expect(value.valueText == "12 sessions")
     #expect(value.metricText == "Ranked by sessions")
     #expect(value.coverageText == "42% token coverage")
-    #expect(value.contributorsText == "codex, gemini · mac-mini, nas")
+    #expect(value.contributorsText == "codex, agy · mac-mini, nas")
 }
 
 @Test func tokenRankedProjectNamesTokenMetric() throws {
@@ -307,7 +307,7 @@ private func decodePopularProject(metric: String) throws -> PopularProject {
     {"project_key":"arniesaha/drover","session_count":12,"total_tokens":1234,
      "cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,
      "total_latency_ms":500,"average_latency_ms":41.7,
-     "harnesses":["codex","gemini"],"hosts":["mac-mini","nas"],
+     "harnesses":["codex","agy"],"hosts":["mac-mini","nas"],
      "metric":"\(metric)"}
     """.utf8))
 }
@@ -453,9 +453,9 @@ private func providerAccount(
 
 @Test func aHealthySubscriptionCarriesNoReason() throws {
     let accounts = try [
-        providerAccount(snapshot: "s1", provider: "google", label: "Gemini",
+        providerAccount(snapshot: "s1", provider: "google", label: "Antigravity",
                         host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"),
-        providerAccount(snapshot: "s2", provider: "google", label: "Gemini",
+        providerAccount(snapshot: "s2", provider: "google", label: "Antigravity",
                         host: "nas", observedAt: "2026-08-09T17:00:00Z"),
     ]
 
