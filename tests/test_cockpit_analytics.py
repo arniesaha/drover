@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 import duckdb
@@ -971,3 +972,81 @@ def test_section_is_stale_only_when_nothing_refreshed():
     capacity = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
 
     assert capacity["status"] == "stale"
+
+
+def test_a_slow_activity_section_cannot_blank_the_whole_overview(monkeypatch):
+    """The reported bug: activity ran 10-21s against the iOS client's 15s
+    timeout, so the entire overview was lost -- including provider capacity and
+    insight counts, which had both succeeded. The card read "Counts temporarily
+    unavailable" while the server held the counts.
+    """
+    from drover.server.cockpit import service as service_module
+
+    monkeypatch.setattr(service_module, "ACTIVITY_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(service_module, "_INTERRUPT_GRACE_SECONDS", 0.2)
+
+    interrupted = threading.Event()
+
+    class _SlowConnection:
+        def interrupt(self):
+            interrupted.set()
+
+        def close(self):
+            pass
+
+    def _never_finishes(con, filters, *, cursor_codec=None):
+        # Stops when the connection is interrupted, as DuckDB's own query does.
+        interrupted.wait(10)
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(service_module, "activity_analytics", _never_finishes)
+
+    svc = service_module.CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(
+            latest_accounts=lambda: [_capacity_account("mac-mini", "ok")]
+        ),
+        connect=lambda: _SlowConnection(),
+    )
+
+    started = time.monotonic()
+    payload = svc.overview(AnalyticsFilters(days=7))
+    elapsed = time.monotonic() - started
+
+    # The slow section degrades on its own...
+    assert payload["activity"]["status"] == "error"
+    assert (
+        interrupted.is_set()
+    ), "the runaway query must be interrupted, not just abandoned"
+    # ...while everything else still answers.
+    assert payload["provider_capacity"]["status"] == "ok"
+    assert payload["insight_counts"] == {
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+    }
+    assert elapsed < 5, f"overview took {elapsed:.1f}s; the budget should cap it"
+
+
+def test_a_healthy_activity_section_is_untouched_by_the_budget():
+    recorded = {}
+
+    class _Connection:
+        def interrupt(self):
+            recorded["interrupted"] = True
+
+        def close(self):
+            pass
+
+    svc = CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: []),
+        connect=lambda: _Connection(),
+    )
+    payload = svc.overview(AnalyticsFilters(days=7))
+
+    # No real analytics store here, so activity reports error rather than ok --
+    # what matters is that the budget never fired.
+    assert "interrupted" not in recorded
+    assert payload["cockpit_api_version"] == 1
