@@ -444,11 +444,13 @@ private enum ProviderNumberFormatting {
 /// on the card. So identity here is the subscription (provider + account +
 /// plan), and the hosts become an attribute of it.
 ///
-/// Merging is by label, which is a true identity for providers that report an
-/// account (`arnabsahacanada@gmail.com`) and a generic name for those that do
-/// not (`Claude Code`). Collapsing the generic ones assumes a single operator's
-/// account signed in on each host — the deployment Drover is built for. It is
-/// the same assumption the fleet already makes everywhere else.
+/// Merging is by label, so the label has to be a real identity. This once
+/// assumed that a generic name like `Claude Code` meant one operator's account
+/// signed in everywhere, and merged on that basis. It was wrong on the fleet it
+/// was written for: a personal subscription on two hosts and a work
+/// subscription on a third collapsed into one card that showed personal
+/// consumption against a work machine. Probes now report the account they are
+/// actually signed into, so this code can take the label at its word.
 public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiable {
     public let id: String
     public let title: String

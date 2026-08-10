@@ -66,7 +66,13 @@ class ClaudeUsageProbe:
         timeout_s: float = 5.0,
         base_url: str | None = None,
         keychain_reader: Callable[[], str | None] | None = None,
+        account_path: str | Path | None = None,
     ):
+        self.account_path = (
+            Path(account_path)
+            if account_path is not None
+            else Path.home() / ".claude.json"
+        )
         self.credentials_path = (
             Path(credentials_path)
             if credentials_path is not None
@@ -81,6 +87,7 @@ class ClaudeUsageProbe:
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = datetime.now(timezone.utc)
+        account_label = self._account_label()
         try:
             token, plan_label = self._credentials()
             payload = self._fetch(token)
@@ -88,6 +95,7 @@ class ClaudeUsageProbe:
         except _ProbeFailure as exc:
             return _snapshot(
                 host_id=host_id,
+                account_label=account_label,
                 status=exc.status,
                 observed_at=observed_at,
                 windows=(),
@@ -97,6 +105,7 @@ class ClaudeUsageProbe:
         except (TypeError, ValueError, OverflowError, OSError):
             return _snapshot(
                 host_id=host_id,
+                account_label=account_label,
                 status="error",
                 observed_at=observed_at,
                 windows=(),
@@ -106,6 +115,7 @@ class ClaudeUsageProbe:
         if not windows:
             return _snapshot(
                 host_id=host_id,
+                account_label=account_label,
                 status="usage_unavailable",
                 observed_at=observed_at,
                 windows=(),
@@ -114,12 +124,40 @@ class ClaudeUsageProbe:
             )
         return _snapshot(
             host_id=host_id,
+            account_label=account_label,
             status="ok",
             observed_at=observed_at,
             windows=windows,
             plan_label=plan_label,
             error_category=None,
         )
+
+    def _account_label(self) -> str:
+        """Name the subscription this host is signed into.
+
+        Anthropic's usage endpoint says nothing about *which* account it
+        answered for, and the fleet runs more than one: a personal
+        subscription on some hosts and a work subscription on others. Reported
+        under one generic name they merge into a single card, which attributes
+        one account's consumption to the other's machines. The signed-in
+        identity is in the CLI's own config, so it is read per host and used
+        the way the Codex probe uses its account email.
+
+        Falls back rather than failing: an unreadable or unfamiliar config
+        gives the generic name, which is no worse than before this existed.
+        """
+        try:
+            raw = json.loads(self.account_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return _ACCOUNT_LABEL
+        account = raw.get("oauthAccount") if isinstance(raw, Mapping) else None
+        if not isinstance(account, Mapping):
+            return _ACCOUNT_LABEL
+        for key in ("emailAddress", "organizationName", "accountUuid"):
+            value = account.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return _ACCOUNT_LABEL
 
     def _credentials(self) -> tuple[str, str | None]:
         saw_expired = False
@@ -331,6 +369,7 @@ def _timestamp(value: Any) -> datetime | None:
 def _snapshot(
     *,
     host_id: str,
+    account_label: str,
     status: str,
     observed_at: datetime,
     windows: tuple[ProviderUsageWindow, ...],
@@ -339,7 +378,7 @@ def _snapshot(
 ) -> ProviderAccountSnapshot:
     fingerprint = {
         "provider": "anthropic",
-        "account_label": _ACCOUNT_LABEL,
+        "account_label": account_label,
         "plan_label": plan_label,
         "host_id": host_id,
         "status": status,
@@ -362,7 +401,7 @@ def _snapshot(
         snapshot_id=str(uuid4()),
         dedup_key=dedup_key,
         provider="anthropic",
-        account_label=_ACCOUNT_LABEL,
+        account_label=account_label,
         plan_label=plan_label,
         host_id=host_id,
         status=status,  # type: ignore[arg-type]

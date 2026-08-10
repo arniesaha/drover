@@ -569,3 +569,96 @@ def test_missing_file_with_empty_keychain_still_reports_not_authenticated(tmp_pa
 
     assert snapshot.status == "usage_unavailable"
     assert snapshot.error_category == "not_authenticated"
+
+
+def _account(tmp_path, email=None, org=None, uuid=None, *, name=".claude.json"):
+    payload = {}
+    if email or org or uuid:
+        oauth = {}
+        if email:
+            oauth["emailAddress"] = email
+        if org:
+            oauth["organizationName"] = org
+        if uuid:
+            oauth["accountUuid"] = uuid
+        payload["oauthAccount"] = oauth
+    path = tmp_path / name
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_two_hosts_on_different_accounts_report_different_labels(tmp_path):
+    """The reported bug: a personal subscription on two hosts and a work
+    subscription on a third all reported the generic label "Claude Code", so
+    the cards merged into one and attributed one account's usage to the other's
+    machines. Codex avoids this by reporting its account email; so does this.
+    """
+    personal_dir = tmp_path / "personal"
+    work_dir = tmp_path / "work"
+    personal_dir.mkdir()
+    work_dir.mkdir()
+
+    personal = ClaudeUsageProbe(
+        credentials_path=_credentials(personal_dir),
+        account_path=_account(personal_dir, email="me@personal.example"),
+        opener=lambda url, headers, timeout: (200, USAGE_BODY),
+        keychain_reader=lambda: None,
+    ).read(host_id="mac-mini")
+    work = ClaudeUsageProbe(
+        credentials_path=_credentials(work_dir),
+        account_path=_account(work_dir, email="me@work.example"),
+        opener=lambda url, headers, timeout: (200, USAGE_BODY),
+        keychain_reader=lambda: None,
+    ).read(host_id="work-laptop")
+
+    assert personal.account_label == "me@personal.example"
+    assert work.account_label == "me@work.example"
+    # Distinct identities must also produce distinct dedup keys, or the central
+    # store would collapse them again on the way in.
+    assert personal.dedup_key != work.dedup_key
+
+
+def test_the_label_falls_back_through_org_then_uuid(tmp_path):
+    for kwargs, expected in (
+        ({"org": "Acme Org"}, "Acme Org"),
+        ({"uuid": "02f73c29-aaaa"}, "02f73c29-aaaa"),
+    ):
+        d = tmp_path / f"case-{expected[:6]}"
+        d.mkdir()
+        snapshot = ClaudeUsageProbe(
+            credentials_path=_credentials(d),
+            account_path=_account(d, **kwargs),
+            opener=lambda url, headers, timeout: (200, USAGE_BODY),
+            keychain_reader=lambda: None,
+        ).read(host_id="nas")
+        assert snapshot.account_label == expected
+
+
+def test_an_unreadable_account_config_keeps_the_generic_label(tmp_path):
+    """A host whose config is missing or malformed is no worse off than before
+    this existed -- it must not fail the whole probe."""
+    for account_path in (
+        tmp_path / "absent.json",
+        _account(tmp_path, name="empty.json"),
+    ):
+        snapshot = ClaudeUsageProbe(
+            credentials_path=_credentials(tmp_path),
+            account_path=account_path,
+            opener=lambda url, headers, timeout: (200, USAGE_BODY),
+            keychain_reader=lambda: None,
+        ).read(host_id="mac-mini")
+        assert snapshot.account_label == "Claude Code"
+        assert snapshot.status == "ok"
+
+
+def test_the_label_is_reported_even_when_the_probe_fails(tmp_path):
+    """A degraded card must still say which subscription it is degraded for."""
+    snapshot = ClaudeUsageProbe(
+        credentials_path=tmp_path / "absent.json",
+        account_path=_account(tmp_path, email="me@work.example"),
+        opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
+    ).read(host_id="work-laptop")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.account_label == "me@work.example"
