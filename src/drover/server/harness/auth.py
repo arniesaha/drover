@@ -231,8 +231,8 @@ class CommandAuthAdapter:
             return _parse_claude_status(output, result.returncode)
         if self.harness == "codex":
             return _parse_codex_status(output, result.returncode)
-        if self.harness == "gemini":
-            return _parse_gemini_status(output, result.returncode)
+        if self.harness == "agy":
+            return _parse_agy_status(output, result.returncode)
         return HarnessAuthStatus(self.harness, "unknown", detail=output or None)
 
     def command(self) -> list[str]:
@@ -273,14 +273,19 @@ def _parse_codex_status(output: str, returncode: int) -> HarnessAuthStatus:
     return HarnessAuthStatus("codex", "unknown", detail=output or None)
 
 
-def _parse_gemini_status(output: str, returncode: int) -> HarnessAuthStatus:
-    if os.environ.get("GEMINI_API_KEY"):
-        return HarnessAuthStatus("gemini", "unknown", detail="GEMINI_API_KEY set")
-    settings = Path.home() / ".gemini/settings.json"
-    accounts = Path.home() / ".gemini/google_accounts.json"
-    if settings.exists() or accounts.exists():
-        return HarnessAuthStatus("gemini", "unknown", detail="Gemini config present")
-    return HarnessAuthStatus("gemini", "unknown", detail=output or None)
+def _parse_agy_status(output: str, returncode: int) -> HarnessAuthStatus:
+    account_label = None
+    accounts_file = Path.home() / ".gemini/google_accounts.json"
+    if accounts_file.exists():
+        try:
+            raw = json.loads(accounts_file.read_text())
+            if isinstance(raw, dict) and isinstance(raw.get("active"), str):
+                account_label = raw["active"].strip() or None
+        except Exception:
+            pass
+    if returncode == 0:
+        return HarnessAuthStatus("agy", "authenticated", label=account_label, detail="Antigravity CLI")
+    return HarnessAuthStatus("agy", "unauthenticated", detail=output or None)
 
 
 def default_login_shell() -> str:
@@ -416,12 +421,12 @@ def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthA
             _command_with_args(codex, "login", "status"),
             _command_with_args(codex, "login", "--device-auth"),
         )
-    gemini = _resolve_login_command("gemini", shell=shell)
-    if gemini is not None:
-        adapters["gemini"] = CommandAuthAdapter(
-            "gemini",
-            _command_with_args(gemini, "--version"),
-            list(gemini),
+    agy = _resolve_login_command("agy", shell=shell)
+    if agy is not None:
+        adapters["agy"] = CommandAuthAdapter(
+            "agy",
+            _command_with_args(agy, "--version"),
+            list(agy),
         )
     return adapters
 

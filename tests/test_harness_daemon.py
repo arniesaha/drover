@@ -515,7 +515,7 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
     state.presets = {
         "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
-        "gemini": replace(DEFAULT_PRESETS["gemini"], enabled=True),
+        "agy": replace(DEFAULT_PRESETS["agy"], enabled=True),
     }
     state.claude_usage_probe = ClaudeUsageProbe(
         credentials_path=tmp_path / "missing-credentials.json",
@@ -1163,10 +1163,10 @@ def test_harnessd_auth_status_unknown_harness_returns_404(tmp_path):
 
 def test_harnessd_auth_status_unavailable_returns_404(tmp_path):
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
-    state.auth = AuthFlowManager({"gemini": StaticAuthAdapter("gemini")})
+    state.auth = AuthFlowManager({"agy": StaticAuthAdapter("agy")})
     try:
         req = urllib.request.Request(
-            f"{base_url}/auth/gemini/status",
+            f"{base_url}/auth/agy/status",
             headers={"Authorization": "Bearer secret"},
         )
         with pytest.raises(urllib.error.HTTPError) as exc_info:
@@ -1179,7 +1179,7 @@ def test_harnessd_auth_status_unavailable_returns_404(tmp_path):
 
     assert exc_info.value.code == 404
     assert body["host_id"] == "test-host"
-    assert body["harness"] == "gemini"
+    assert body["harness"] == "agy"
     assert body["state"] == "unavailable"
 
 
@@ -1236,10 +1236,10 @@ def test_harnessd_auth_flow_unknown_id_returns_404(tmp_path):
 
 def test_harnessd_auth_start_unsupported_returns_400(tmp_path):
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
-    state.auth = AuthFlowManager({"gemini": StaticAuthAdapter("gemini")})
+    state.auth = AuthFlowManager({"agy": StaticAuthAdapter("agy")})
     try:
         req = urllib.request.Request(
-            f"{base_url}/auth/gemini/start",
+            f"{base_url}/auth/agy/start",
             data=b"{}",
             method="POST",
             headers={
@@ -1304,7 +1304,7 @@ def test_resolve_harness_presets_enables_available_login_shell_clis(
         {
             "shell": DEFAULT_PRESETS["shell"],
             "codex": DEFAULT_PRESETS["codex"],
-            "gemini": DEFAULT_PRESETS["gemini"],
+            "agy": DEFAULT_PRESETS["agy"],
         },
         shell="/bin/zsh",
     )
@@ -1316,8 +1316,8 @@ def test_resolve_harness_presets_enables_available_login_shell_clis(
         "-lc",
         "exec /opt/homebrew/bin/codex",
     )
-    assert presets["gemini"].enabled is False
-    assert "not found" in presets["gemini"].description
+    assert presets["agy"].enabled is False
+    assert "not found" in presets["agy"].description
 
 
 def test_resolve_harness_presets_records_resolved_executable(monkeypatch, tmp_path):
@@ -1339,7 +1339,7 @@ def test_resolve_harness_presets_records_resolved_executable(monkeypatch, tmp_pa
         {
             "shell": DEFAULT_PRESETS["shell"],
             "codex": DEFAULT_PRESETS["codex"],
-            "gemini": DEFAULT_PRESETS["gemini"],
+            "agy": DEFAULT_PRESETS["agy"],
         },
         shell="/bin/zsh",
     )
@@ -1348,7 +1348,7 @@ def test_resolve_harness_presets_records_resolved_executable(monkeypatch, tmp_pa
     # to be carried separately for probes that spawn the CLI directly.
     assert presets["codex"].executable == "/opt/homebrew/bin/codex"
     assert presets["shell"].executable is None
-    assert presets["gemini"].executable is None
+    assert presets["agy"].executable is None
 
 
 def test_resolve_harness_presets_clears_the_executable_when_the_cli_disappears(
@@ -1459,11 +1459,11 @@ def test_build_launch_command_adds_provider_native_resume_args():
         enabled=True,
         description="Codex",
     )
-    gemini = HarnessPreset(
-        name="gemini",
-        command=("/bin/zsh", "-lc", "exec /opt/homebrew/bin/gemini"),
+    agy = HarnessPreset(
+        name="agy",
+        command=("/bin/zsh", "-lc", "exec /opt/homebrew/bin/agy"),
         enabled=True,
-        description="Gemini",
+        description="Antigravity",
     )
 
     assert build_launch_command(

@@ -6,7 +6,7 @@ import Testing
     let snap = try HarnessSnapshot.decode(from: snapshotJSON)
     #expect(snap.hosts.count == 1)
     #expect(snap.hosts[0].displayName == "Mac Mini")
-    #expect(snap.hosts[0].harnesses.contains("gemini"))
+    #expect(snap.hosts[0].harnesses.contains("agy"))
     #expect(snap.sessions.count == 2)  // bogus element skipped, not fatal
     #expect(snap.sessions[0].attention == .needsApproval)
     #expect(snap.sessions[0].isStructured)
@@ -105,7 +105,7 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
 @Test(arguments: [
     ("claude-code", "Claude", "brain"),
     ("codex", "Codex", "chevron.left.forwardslash.chevron.right"),
-    ("gemini", "Gemini", "sparkles"),
+    ("agy", "Antigravity", "sparkles"),
     ("shell", "Shell", "terminal"),
     ("custom-harness", "custom-harness", "terminal"),
 ])
@@ -321,7 +321,7 @@ func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbol
 
 @Test func harnessAuthFlowDecodesUnknownStateLeniently() throws {
     let data = Data("""
-    {"host_id":"mac-mini","harness":"gemini","flow_id":"auth-flow-1",
+    {"host_id":"mac-mini","harness":"agy","flow_id":"auth-flow-1",
      "state":"provider_weird","login_url":"https://example.test",
      "user_code":"ABCD-EFGH","message":"Open browser"}
     """.utf8)

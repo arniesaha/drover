@@ -45,9 +45,9 @@ from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
+from drover.server.harness.structured import agy as _structured_agy
 from drover.server.harness.structured import claude as _structured_claude
 from drover.server.harness.structured import codex as _structured_codex
-from drover.server.harness.structured import gemini as _structured_gemini
 from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.structured.pusher import EventPusher
 from drover.server.harness.worktree import (
@@ -77,16 +77,16 @@ if TYPE_CHECKING:
 _STRUCTURED_DEFAULT_COMMANDS: dict[str, Callable[[], list[str]]] = {
     "claude-code": _structured_claude.default_command,
     "codex": _structured_codex.default_command,
-    "gemini": _structured_gemini.default_command,
+    "agy": _structured_agy.default_command,
 }
 
 # Harnesses whose structured drivers run full-auto with no wire-level
-# approval channel (codex: --sandbox danger-full-access; gemini:
-# --approval-mode yolo). These get a per-session git worktree so a broad
+# approval channel (codex: --sandbox danger-full-access; agy:
+# --dangerously-skip-permissions). These get a per-session git worktree so a broad
 # `git add -A` inside the session can never sweep unrelated in-flight
 # changes from the user's main checkout. Claude keeps its interactive
 # approval flow and runs in place.
-_WORKTREE_HARNESSES = frozenset({"codex", "gemini"})
+_WORKTREE_HARNESSES = frozenset({"codex", "agy"})
 
 log = logging.getLogger("drover.harnessd")
 
@@ -226,11 +226,11 @@ DEFAULT_PRESETS = {
         enabled=False,
         description="Codex CLI",
     ),
-    "gemini": HarnessPreset(
-        name="gemini",
-        command=("gemini",),
+    "agy": HarnessPreset(
+        name="agy",
+        command=("agy",),
         enabled=False,
-        description="Gemini CLI",
+        description="Antigravity CLI (agy)",
     ),
     "openclaw": HarnessPreset(
         name="openclaw",
@@ -1495,6 +1495,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     probe = ClaudeUsageProbe()
                     self.server.state.claude_usage_probe = probe
                 snapshot = probe.read(host_id=self.server.state.host_id)
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+                continue
+            if detected.provider == "google":
+                from drover.server.providers.agy import AgyUsageProbe
+
+                snapshot = AgyUsageProbe().read(host_id=self.server.state.host_id)
                 accounts.append(_provider_snapshot_json(snapshot, detected))
                 continue
             accounts.append(_unavailable_provider_json(detected, observed_at))
@@ -3348,8 +3354,8 @@ def _harness_name_for_command(command: tuple[str, ...]) -> str:
         return "claude-code"
     if "codex" in command_text:
         return "codex"
-    if "gemini" in command_text:
-        return "gemini"
+    if "agy" in command_text or "antigravity" in command_text:
+        return "agy"
     if "openclaw" in command_text:
         return "openclaw"
     return "shell"

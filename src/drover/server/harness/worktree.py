@@ -1,7 +1,7 @@
 """Per-session git worktrees for approval-less structured harnesses.
 
-Codex and Gemini structured sessions run headless with no wire-level
-approval channel (see ``structured/codex.py`` and ``structured/gemini.py``),
+Codex and Agy structured sessions run headless with no wire-level
+approval channel (see ``structured/codex.py`` and ``structured/agy.py``),
 so the daemon gives them full-auto execution -- which is only safe when a
 session cannot touch the user's main checkout. Each such session gets its
 own worktree on a ``drover/<session-id>`` branch: a broad ``git add -A``

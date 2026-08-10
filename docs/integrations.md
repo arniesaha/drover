@@ -6,7 +6,7 @@ formats can evolve without becoming the public storage contract.
 ## Agent CLIs
 
 The collector recognizes local session records from Claude Code, Codex,
-Gemini, OpenClaw, Hermes, and compatible tools. Parsers preserve source-native
+Antigravity (agy), OpenClaw, Hermes, and compatible tools. Parsers preserve source-native
 identifiers and raw metadata while producing normalized agent events.
 
 Repository identity is taken from source metadata or the local Git checkout.

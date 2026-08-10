@@ -19,7 +19,7 @@ class DetectedProvider:
 _PROVIDER_HARNESSES = (
     ("codex", "openai", "Codex", "supported"),
     ("claude-code", "anthropic", "Claude Code", "supported"),
-    ("gemini", "google", "Gemini", "usage_unavailable"),
+    ("agy", "google", "Antigravity", "supported"),
 )
 
 

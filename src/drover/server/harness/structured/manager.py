@@ -20,13 +20,13 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.structured import claude, codex, gemini
+from drover.server.harness.structured import agy, claude, codex
 from drover.server.harness.structured.driver import StructuredMessage
 
 # Each factory is a small builder, not a bare class -- ClaudeDriver needs a
 # sanitized child environment (claude.child_env() strips ambient CLAUDE*
 # vars so a nested harnessd doesn't leak its own session env into the
-# spawned CLI); Codex/Gemini's constructors take no env kwarg at all.
+# spawned CLI); Codex/Agy's constructors take no env kwarg at all.
 _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
     "claude-code": (
         lambda command, cwd, emit, native_session_id: claude.ClaudeDriver(
@@ -43,11 +43,14 @@ _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
         ),
         codex.default_command,
     ),
-    "gemini": (
-        lambda command, cwd, emit, _native_session_id: gemini.GeminiDriver(
-            command, cwd, emit
+    "agy": (
+        lambda command, cwd, emit, native_session_id: agy.AgyDriver(
+            agy.resume_command(command, native_session_id),
+            cwd,
+            emit,
+            native_session_id=native_session_id,
         ),
-        gemini.default_command,
+        agy.default_command,
     ),
 }
 

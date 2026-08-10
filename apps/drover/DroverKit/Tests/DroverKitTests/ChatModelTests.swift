@@ -149,7 +149,7 @@ struct ChatModelTests {
     let model = ChatModel(client: client(), sessionID: "harness-1", harness: "codex")
     #expect(model.harnessPresentation.name == "Codex")
     await model.loadHandoffTargets()
-    #expect(model.harnessPresentation.name == "Gemini")
+    #expect(model.harnessPresentation.name == "Antigravity")
     #expect(model.harnessPresentation.symbolName == "sparkles")
 }
 
@@ -158,7 +158,7 @@ struct ChatModelTests {
     let model = ChatModel(client: client(), sessionID: "harness-1")
     #expect(model.handoffHarnesses.isEmpty)
     await model.loadHandoffTargets()
-    #expect(model.handoffHarnesses == ["shell", "claude-code", "gemini"])
+    #expect(model.handoffHarnesses == ["shell", "claude-code", "agy"])
 }
 
 @Test @MainActor func loadHandoffTargetsSeedsRunPreferencesFromSession() async throws {

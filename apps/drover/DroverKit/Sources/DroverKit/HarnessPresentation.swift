@@ -14,8 +14,8 @@ public struct HarnessPresentation: Sendable, Equatable {
         case "codex":
             name = "Codex"
             symbolName = "chevron.left.forwardslash.chevron.right"
-        case "gemini":
-            name = "Gemini"
+        case "agy":
+            name = "Antigravity"
             symbolName = "sparkles"
         case "shell":
             name = "Shell"

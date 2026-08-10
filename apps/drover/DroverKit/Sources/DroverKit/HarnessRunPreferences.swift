@@ -17,8 +17,8 @@ public enum HarnessRunPreferences {
             return ["sonnet", "opus", "fable"]
         case "codex":
             return ["gpt-5.6-sol", "gpt-5.5"]
-        case "gemini":
-            return ["gemini-2.5-pro", "gemini-2.5-flash"]
+        case "agy":
+            return ["gemini-3.6-flash", "gemini-3.5-pro"]
         default:
             return []
         }

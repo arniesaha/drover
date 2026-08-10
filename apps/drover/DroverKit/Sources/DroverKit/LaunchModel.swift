@@ -13,7 +13,7 @@ public final class LaunchModel {
 
     /// Harness names the server can run in a structured (turn-based) mode;
     /// anything else (currently just "shell") only supports a raw PTY.
-    static let structuredCapableHarnesses: Set<String> = ["claude-code", "codex", "gemini"]
+    static let structuredCapableHarnesses: Set<String> = ["claude-code", "codex", "agy"]
 
     public var hostID: String {
         didSet {
