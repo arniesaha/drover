@@ -41,16 +41,12 @@ struct ProviderCapacitySection: View {
                     HStack(alignment: .top, spacing: 10) {
                         ForEach(subscriptions) { subscription in
                             // Every card in the strip is the same card. The row
-                            // sizes itself to the tallest and the rest fill it,
-                            // which beats a hardcoded height: a two-line
-                            // account label or a Dynamic Type bump moves the
-                            // tallest card and everyone else follows it.
-                            ProviderAccountCard(
-                                subscription: subscription,
-                                section: section,
-                                fillsHeight: true
-                            )
-                            .frame(width: 250)
+                            // sizes itself to the tallest and the rest grow to
+                            // match, which beats a hardcoded height: a
+                            // two-line account label or a Dynamic Type bump
+                            // moves the tallest card and everyone else follows.
+                            ProviderAccountCard(subscription: subscription, section: section)
+                                .frame(width: 250)
                         }
                     }
                 }
@@ -64,21 +60,22 @@ struct ProviderCapacitySection: View {
 struct ProviderAccountCard: View {
     let subscription: ProviderSubscriptionPresentation
     let section: ProviderSectionPresentation
-    /// Set by the strip so every card matches the tallest one. Off by default,
-    /// which is what lets the layout tests measure a card's own content.
-    var fillsHeight = false
 
     private var account: ProviderAccount { subscription.representative }
 
     private var headline: ProviderHeadline { subscription.headline }
 
     var body: some View {
-        CockpitCard(fillsHeight: fillsHeight) {
+        CockpitCard {
             VStack(alignment: .leading, spacing: 10) {
                 identity
                 capacity
-                // Pins the footer to the bottom edge once the row has
-                // stretched this card to its neighbours' height.
+                // Does two jobs, and the second is easy to miss: it pins the
+                // footer to the bottom edge, and it makes the card accept more
+                // height than its content needs. That second one is what
+                // squares the strip up — the row sizes to the tallest card and
+                // every other card's background grows to match. Delete it and
+                // the cards go ragged again, not just bottom-aligned.
                 Spacer(minLength: 0)
                 footer
             }
@@ -152,8 +149,7 @@ struct ProviderAccountCard: View {
         VStack(alignment: .leading, spacing: 4) {
             if let reason = subscription.reasonText {
                 Label(reason, systemImage: "exclamationmark.triangle")
-                    .droverText(.subtitle)
-                    .foregroundStyle(DroverColor.accentHi)
+                    .droverText(.subtitle, accented: true)
                     .lineLimit(1)
                     .accessibilityIdentifier("provider-account-reason")
             }
@@ -212,19 +208,11 @@ struct CockpitSectionHeading: View {
 }
 
 struct CockpitCard<Content: View>: View {
-    /// Grow to whatever height is offered rather than to the content's own.
-    /// Has to happen inside the card, ahead of the background, or the card
-    /// paints itself at its natural height inside a taller frame.
-    var fillsHeight = false
     @ViewBuilder let content: Content
 
     var body: some View {
         content
-            .frame(
-                maxWidth: .infinity,
-                maxHeight: fillsHeight ? .infinity : nil,
-                alignment: .leading
-            )
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
             .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
