@@ -130,6 +130,12 @@ class AgyDriver:
         command = list(self.command)
         if "--dangerously-skip-permissions" not in command:
             command.append("--dangerously-skip-permissions")
+        # agy ignores the process cwd -- it resolves its workspace from
+        # --add-dir/--project and otherwise falls back to
+        # ~/.gemini/antigravity-cli/scratch, so Popen(cwd=...) alone leaves
+        # the session pointed at the scratch dir.
+        if self.cwd and "--add-dir" not in command:
+            command.extend(["--add-dir", self.cwd])
         if model and "--model" not in command:
             command.extend(["--model", model])
         if self.native_session_id and "--conversation" not in command:
