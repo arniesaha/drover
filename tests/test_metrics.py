@@ -1605,6 +1605,11 @@ def test_metrics_http_server_registers_remote_harness_host(tmp_path):
         incoming_dir=tmp_path / "incoming",
         summarizer_report={},
         ttl_seconds=60,
+        # Without this the collector falls back to the real ~/.drover config,
+        # and the asserted consent epoch below is read off whatever the live
+        # server on this machine has advanced it to. That passes on a clean
+        # CI box and fails forever on any host that actually runs Drover.
+        config_path=tmp_path / "config.toml",
     )
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH

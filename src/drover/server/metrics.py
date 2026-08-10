@@ -788,6 +788,11 @@ class MetricsCollector:
     harness_ttl_seconds: float = 2.0
     cockpit_service: "CockpitService | None" = None
     advisory_service: "InsightsService | None" = None
+    # Where InsightsService reads config and, beside it, the durable
+    # content-consent state. None means the real user config path, which is
+    # right in production and untestable everywhere else: without an override
+    # a test reads the running server's own consent epoch off the machine.
+    config_path: Path | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -862,7 +867,9 @@ class MetricsCollector:
         if self.advisory_service is None:
             from drover.server.advisory.service import InsightsService
 
-            self.advisory_service = InsightsService(self.duckdb_path)
+            self.advisory_service = InsightsService(
+                self.duckdb_path, config_path=self.config_path
+            )
         self.advisory_service.set_content_consent_propagator(
             self._propagate_content_consent
         )
