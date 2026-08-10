@@ -117,6 +117,31 @@ def test_argv_includes_required_flags():
     )
 
 
+def test_argv_scopes_workspace_to_cwd():
+    # agy does not take its workspace from the process cwd -- without an
+    # explicit --add-dir it runs in ~/.gemini/antigravity-cli/scratch no
+    # matter what we hand Popen. Every turn is a fresh process, so the flag
+    # has to be on every argv, not just the first.
+    driver = AgyDriver(["agy"], cwd="/Volumes/M2 1/drover", emit=lambda m: None)
+    argv = driver._argv_for("hello")
+    assert "--add-dir" in argv
+    assert argv[argv.index("--add-dir") + 1] == "/Volumes/M2 1/drover"
+
+
+def test_argv_omits_add_dir_without_cwd():
+    driver = AgyDriver(["agy"], cwd=None, emit=lambda m: None)
+    assert "--add-dir" not in driver._argv_for("hello")
+
+
+def test_argv_does_not_duplicate_caller_supplied_add_dir():
+    driver = AgyDriver(
+        ["agy", "--add-dir", "/srv/repo"], cwd="/tmp/other", emit=lambda m: None
+    )
+    argv = driver._argv_for("hello")
+    assert argv.count("--add-dir") == 1
+    assert argv[argv.index("--add-dir") + 1] == "/srv/repo"
+
+
 def test_parse_stream_line_tool():
     got: list = []
     driver = _driver(got)
