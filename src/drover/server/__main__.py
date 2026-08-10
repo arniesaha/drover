@@ -60,6 +60,7 @@ from drover.server.advisory.worker import (
     operational_snapshot_source_version,
     operational_analyzers,
 )
+from drover.server.cockpit.analytics import AnalyticsFilters
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.providers.service import ProviderUsageService
 from drover.server.observatory import pipeline_observatory_snapshot
@@ -105,6 +106,23 @@ def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
     return (backend_cfg.allows_anthropic and backend_cfg.has_anthropic_creds) or (
         backend_cfg.allows_local_backend and backend_cfg.has_local_backend
     )
+
+
+def _warm_cockpit(service: "CockpitService") -> None:
+    """Prime the cockpit's DuckDB handles in the background at startup.
+
+    Cold, the first overview spends its time opening the database and reading
+    parquet view metadata rather than answering. Doing that here means the cost
+    lands before any client asks, not on the client that asks first.
+    """
+
+    def run() -> None:
+        try:
+            service.overview(AnalyticsFilters(days=7))
+        except Exception:  # noqa: BLE001 - warming is best effort
+            log.debug("cockpit warm-up failed; the first request pays instead")
+
+    threading.Thread(target=run, name="cockpit-warmup", daemon=True).start()
 
 
 def _create_content_analysis_worker(
@@ -1454,6 +1472,12 @@ def run(
                 duckdb_path=cfg.duckdb_path,
                 provider_usage=provider_usage,
             )
+            # The first cockpit request after a restart pays to open DuckDB and
+            # read the parquet views' metadata: measured at 15.6s cold against
+            # 3.9-5.3s warm, and the iOS client abandons the whole response at
+            # 15s. Whoever asks first should not be the one paying that, so the
+            # server pays it itself, off the request path.
+            _warm_cockpit(metrics_collector.cockpit_service)
             metrics_server = start_metrics_server(
                 host=metrics_host,
                 port=cfg.metrics_http_port,
