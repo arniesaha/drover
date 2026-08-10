@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable
 
 from drover.server.cockpit.analytics import (
+    ActivityAnalytics,
     AnalyticsCursorCodec,
     AnalyticsFilters,
     activity_analytics,
@@ -28,6 +29,11 @@ COCKPIT_SECTIONS = (
     "insights",
 )
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
+# The iOS client abandons a cockpit request at 15s (DroverClient's default
+# timeoutInterval). The overview is one response, so the activity section has to
+# leave room for the others and for transport; 6s does, with margin.
+ACTIVITY_BUDGET_SECONDS = 6.0
+_INTERRUPT_GRACE_SECONDS = 2.0
 
 
 class CockpitService:
@@ -95,16 +101,13 @@ class CockpitService:
                 (account.observed_at for account in accounts), default=None
             )
             # Section status describes the *section*: whether what we are
-            # showing is current. A single account failing to report does not
-            # make the other seven stale, and the client treats section status
-            # as authoritative over every card — so folding per-account errors
-            # in here relabels healthy, freshly-observed accounts as "Stale".
-            # Account-level failures travel on the account and render on their
-            # own card.
-            # ...which means one host going dark cannot make it stale either.
-            # The section is stale only when nothing in it is current: if any
-            # account was refreshed successfully, what we are showing is live
-            # and the hosts that failed say so on their own cards.
+            # showing is current. The client treats it as authoritative over
+            # every card, so folding per-account failures in here relabels
+            # healthy, freshly-observed accounts as "Stale" -- one erroring
+            # account did exactly that to seven good ones, and one host going
+            # dark did it again. The section is stale only when nothing in it
+            # is current. Account-level failures travel on the account and
+            # render on their own card.
             status = (
                 "ok"
                 if not accounts
@@ -136,7 +139,7 @@ class CockpitService:
                 )
             else:
                 raise RuntimeError("activity store is unavailable")
-            result = activity_analytics(con, filters, cursor_codec=self._cursor_codec)
+            result = self._activity_within_budget(con, filters)
             data = asdict(result)
             return _section(
                 "ok",
@@ -152,6 +155,52 @@ class CockpitService:
         finally:
             if owns_connection and con is not None:
                 con.close()
+
+    def _activity_within_budget(
+        self, con: Any, filters: AnalyticsFilters
+    ) -> ActivityAnalytics:
+        """Run the activity query, but never for longer than its budget.
+
+        The overview is assembled from several sections and returned as one
+        response, so the slowest section sets the client's wait. The iOS client
+        gives up at 15 seconds; when this query ran long the whole response was
+        lost, taking provider capacity and insight counts -- which had both
+        succeeded -- down with it.
+
+        A budget alone would only stop us waiting: the query would keep running
+        and keep holding memory. `interrupt()` is what actually stops it, so a
+        section that cannot answer in time costs a thread for its budget and
+        nothing after that.
+        """
+        outcome: dict[str, Any] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                outcome["result"] = activity_analytics(
+                    con, filters, cursor_codec=self._cursor_codec
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run, name="cockpit-activity", daemon=True)
+        worker.start()
+        if not done.wait(ACTIVITY_BUDGET_SECONDS):
+            try:
+                con.interrupt()
+            except Exception:  # noqa: BLE001 - interrupt is best effort
+                pass
+            # Give the interrupt a moment to unwind the query thread so the
+            # connection is not closed underneath it.
+            done.wait(_INTERRUPT_GRACE_SECONDS)
+            raise TimeoutError(
+                f"activity query exceeded {ACTIVITY_BUDGET_SECONDS:g}s budget"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
 
     def _insight_counts(self) -> dict[str, int] | None:
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
