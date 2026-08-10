@@ -134,6 +134,9 @@ class AgyUsageProbe:
         active = raw.get("active")
         if isinstance(active, str) and active.strip():
             return active.strip()
+        old = raw.get("old")
+        if isinstance(old, list) and old and isinstance(old[0], str) and old[0].strip():
+            return old[0].strip()
         return _ACCOUNT_LABEL
 
 
