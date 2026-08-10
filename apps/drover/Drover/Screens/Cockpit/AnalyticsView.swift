@@ -21,8 +21,7 @@ struct AnalyticsView: View {
 
                 if let error = store.analyticsError {
                     Label(error, systemImage: "exclamationmark.circle")
-                        .droverText(.nested)
-                        .foregroundStyle(DroverColor.accentHi)
+                        .droverText(.nested, accented: true)
                 }
 
                 if let snapshot = store.analytics {
@@ -111,7 +110,6 @@ struct AnalyticsView: View {
                                 }
                                 Text(subscription.hostsText)
                                     .droverText(.subtitle)
-                                    .foregroundStyle(DroverColor.faint)
                                 // Every window, with a bar each. The cockpit
                                 // card shows only the tightest one so the
                                 // strip can hold its shape; this is where the
@@ -123,8 +121,7 @@ struct AnalyticsView: View {
                                 }
                                 if let reason = subscription.reasonText {
                                     Label(reason, systemImage: "exclamationmark.triangle")
-                                        .droverText(.subtitle)
-                                        .foregroundStyle(DroverColor.accentHi)
+                                        .droverText(.subtitle, accented: true)
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
@@ -228,7 +225,7 @@ struct AnalyticsView: View {
     @ViewBuilder
     private func paginationControls(_ dimension: AnalyticsDimension) -> some View {
         if let error = store.analyticsPaginationError(for: dimension) {
-            Text(error).droverText(.subtitle).foregroundStyle(DroverColor.accentHi)
+            Text(error).droverText(.subtitle, accented: true)
         }
         if store.nextAnalyticsCursor(for: dimension) != nil {
             Button {
@@ -325,7 +322,6 @@ struct AnalyticsRefreshBanner: View {
     var body: some View {
         Label(message, systemImage: "arrow.clockwise.circle")
             .droverText(.nested)
-            .foregroundStyle(DroverColor.text)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)

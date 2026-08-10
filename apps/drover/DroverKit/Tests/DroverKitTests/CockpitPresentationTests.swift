@@ -589,6 +589,27 @@ private let fourAnthropicWindows = """
     #expect(headline.fraction == nil)
 }
 
+/// The bar and the text beside it have to describe the same window. A window
+/// carrying both a zero limit and a percentage used to split them: the wording
+/// took the limit rung and said "0 credits used" while the fraction fell
+/// through to the percentage and drew a nearly-full critical bar.
+@Test func aZeroLimitWindowDoesNotFallThroughToAPercentageTheTextIgnores() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "openai", label: "me@example.com",
+        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"""
+        [{"kind":"primary","limit_value":0,"remaining_value":0,"unit":"credits","used_percent":90}]
+        """#
+    )
+
+    let headline = ProviderSubscriptionGrouping
+        .group([account], now: account.observedAt)[0].headline
+
+    #expect(headline.usedText == "0 credits used")
+    #expect(headline.fraction == nil)
+    #expect(headline.isCritical == false)
+}
+
 @Test func criticalBeginsAtExactlyEightyFivePercent() throws {
     func headline(usedPercent: String) throws -> ProviderHeadline {
         let account = try providerAccount(
