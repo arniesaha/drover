@@ -112,13 +112,14 @@ struct AnalyticsView: View {
                                 Text(subscription.hostsText)
                                     .droverText(.subtitle)
                                     .foregroundStyle(DroverColor.faint)
+                                // Every window, with a bar each. The cockpit
+                                // card shows only the tightest one so the
+                                // strip can hold its shape; this is where the
+                                // rest are meant to be found.
                                 ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in
-                                    let value = ProviderCapacityPresentation(
-                                        account: subscription.representative, window: window, now: .now
+                                    ProviderWindowRow(
+                                        account: subscription.representative, window: window
                                     )
-                                    Text("\(window.kind.capitalized): \(value.remainingText) · \(value.resetText)")
-                                        .droverText(.nested)
-                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                                 if let reason = subscription.reasonText {
                                     Label(reason, systemImage: "exclamationmark.triangle")
@@ -282,6 +283,39 @@ struct AnalyticsView: View {
     private var projectValues: [String] { store.analyticsProjects.map(\.projectKey).sorted() }
     private var providerValues: [String] {
         Array(Set((store.analytics?.providerCapacity.data ?? []).map(\.provider))).sorted()
+    }
+}
+
+/// One quota window, with its bar. The cockpit strip shows only the window
+/// closest to exhaustion so its cards can hold a common height; this screen is
+/// where the other windows have to be legible, so each gets the same treatment
+/// the headline gets on the card.
+private struct ProviderWindowRow: View {
+    let account: ProviderAccount
+    let window: ProviderWindow
+
+    var body: some View {
+        let value = ProviderHeadline(account: account, window: window, now: .now)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(value.windowTitle).droverText(.h3)
+                Spacer(minLength: 0)
+                Text(value.usedText)
+                    .droverText(.subtitle, accented: value.isCritical)
+            }
+            CapacityBar(fraction: value.fraction, isCritical: value.isCritical)
+            if let detail = value.detailText {
+                Text(detail)
+                    .droverText(.subtitle)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.top, 3)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            [value.windowTitle, value.usedText, value.detailText]
+                .compactMap { $0 }.joined(separator: ", ")
+        )
     }
 }
 

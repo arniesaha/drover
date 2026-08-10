@@ -33,52 +33,59 @@ enum DroverTextStyle {
 extension View {
     /// Applies one ramp role — font, tracking, case and colour together, so a
     /// call site never picks a colour and a size separately and drifts.
-    func droverText(_ style: DroverTextStyle) -> some View {
-        modifier(DroverTextModifier(style: style))
+    ///
+    /// `accented` raises the role to `accentHi`, for the handful of places
+    /// that carry a signal rather than prose — a quota nearly spent, a state
+    /// worth looking at. It is a parameter rather than a `.foregroundStyle`
+    /// layered on afterwards because the style nearest the `Text` is the one
+    /// SwiftUI draws, so layering silently does nothing.
+    func droverText(_ style: DroverTextStyle, accented: Bool = false) -> some View {
+        modifier(DroverTextModifier(style: style, accented: accented))
     }
 }
 
 private struct DroverTextModifier: ViewModifier {
     let style: DroverTextStyle
+    var accented = false
 
     func body(content: Content) -> some View {
+        content
+            .font(font)
+            .tracking(tracking)
+            .textCase(style == .h3 ? .uppercase : nil)
+            // One `foregroundStyle`, chosen — not a default with an override
+            // layered on top, which SwiftUI resolves the other way round.
+            .foregroundStyle(accented ? DroverColor.accentHi : foreground)
+    }
+
+    private var font: Font {
         switch style {
-        case .h1:
-            content
-                .font(.system(.title3, design: .default, weight: .medium))
-                .tracking(-0.38)
-                .foregroundStyle(DroverColor.text)
-        case .h2:
-            content
-                .font(.system(.callout, design: .default, weight: .medium))
-                .tracking(-0.19)
-                .foregroundStyle(DroverColor.text)
-        case .h3:
-            content
-                .font(.system(.caption2, design: .default, weight: .medium))
-                .tracking(1.4)
-                .textCase(.uppercase)
-                .foregroundStyle(DroverColor.muted)
-        case .body:
-            content
-                .font(.system(.subheadline, design: .default))
-                .foregroundStyle(DroverColor.text)
-        case .nested:
-            content
-                .font(.system(.footnote, design: .default))
-                .foregroundStyle(DroverColor.muted)
-        case .subtitle:
-            content
-                .font(.system(.caption, design: .default))
-                .foregroundStyle(DroverColor.muted)
-        case .mono:
-            content
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(DroverColor.faint)
-        case .marker:
-            content
-                .font(.system(.caption, design: .monospaced).monospacedDigit())
-                .foregroundStyle(DroverColor.accentHi)
+        case .h1: .system(.title3, design: .default, weight: .medium)
+        case .h2: .system(.callout, design: .default, weight: .medium)
+        case .h3: .system(.caption2, design: .default, weight: .medium)
+        case .body: .system(.subheadline, design: .default)
+        case .nested: .system(.footnote, design: .default)
+        case .subtitle: .system(.caption, design: .default)
+        case .mono: .system(.caption, design: .monospaced)
+        case .marker: .system(.caption, design: .monospaced).monospacedDigit()
+        }
+    }
+
+    private var tracking: CGFloat {
+        switch style {
+        case .h1: -0.38
+        case .h2: -0.19
+        case .h3: 1.4
+        default: 0
+        }
+    }
+
+    private var foreground: PaletteToken {
+        switch style {
+        case .h1, .h2, .body: DroverColor.text
+        case .h3, .nested, .subtitle: DroverColor.muted
+        case .mono: DroverColor.faint
+        case .marker: DroverColor.accentHi
         }
     }
 }
