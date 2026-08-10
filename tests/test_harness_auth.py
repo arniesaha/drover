@@ -372,7 +372,6 @@ def test_agy_auth_status_falls_back_to_old_account_list(monkeypatch, tmp_path):
     assert status.label == "someone@example.com"
 
 
-
 def test_manager_starts_and_polls_successful_flow(tmp_path):
     script = tmp_path / "login.py"
     script.write_text(

@@ -308,10 +308,9 @@ def _parse_agy_status(
         return HarnessAuthStatus(
             "agy", "authenticated", label=account_label, detail="Antigravity CLI"
         )
-    if (
-        (root / ".gemini/oauth_creds.json").exists()
-        or (root / ".gemini/antigravity-cli/antigravity-oauth-token").exists()
-    ):
+    if (root / ".gemini/oauth_creds.json").exists() or (
+        root / ".gemini/antigravity-cli/antigravity-oauth-token"
+    ).exists():
         return HarnessAuthStatus("agy", "authenticated", detail="Antigravity CLI")
     return HarnessAuthStatus("agy", "unknown", detail=output or None)
 

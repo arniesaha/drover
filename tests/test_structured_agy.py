@@ -253,4 +253,3 @@ def test_provider_probe_falls_back_to_old_accounts_when_active_is_null(tmp_path:
     snapshot = AgyUsageProbe(accounts_path=accounts).read()
 
     assert snapshot.account_label == "someone@example.com"
-
