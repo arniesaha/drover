@@ -179,3 +179,61 @@ def test_stream_worker_acks_stale_source_sequence_without_generating(
     )
     assert backend.calls == 0
     assert stream.pending() == []
+
+
+def test_new_worker_recovers_an_expired_running_claim(tmp_path: Path) -> None:
+    """A process crash cannot leave a live-recap generation running forever."""
+    db, con = recap_db(tmp_path, session_id="s1")
+    enqueue_live_recap(con, "s1", 8)
+    con.execute("""UPDATE live_recap_jobs
+           SET status='running', attempts=1,
+               updated_at=now() - INTERVAL '6 minutes'
+           WHERE session_id='s1'""")
+    con.close()
+
+    assert (
+        LiveRecapWorker(
+            duckdb_path=db, backend=StubBackend({"recap": "Recovered recap."})
+        ).drain_once()
+        == 1
+    )
+    assert recap_row(db, "s1")[:2] == ("Recovered recap.", 8)
+    with duckdb.connect(str(db)) as con:
+        assert con.execute(
+            "SELECT status, attempts FROM live_recap_jobs WHERE session_id='s1'"
+        ).fetchone() == ("done", 2)
+
+
+def test_stream_retry_acknowledges_delivery_and_retries_from_durable_due_time(
+    tmp_path: Path,
+) -> None:
+    """A retry wait does not consume Redis redelivery budget before it is due."""
+    from drover.server.jobs import JobStream
+
+    db, con = recap_db(tmp_path, session_id="s1")
+    enqueue_live_recap(con, "s1", 8)
+    con.close()
+    stream = JobStream("live-recap", max_deliveries=1)
+    failing = LiveRecapWorker(
+        duckdb_path=db, backend=FailingBackend("offline"), job_stream=stream
+    )
+
+    assert failing.drain_once() == 1
+    assert stream.pending() == []
+    assert stream.dead_letters() == []
+    with duckdb.connect(str(db)) as con:
+        con.execute("""UPDATE live_recap_jobs
+               SET next_run_at=now() - INTERVAL '1 second'
+               WHERE session_id='s1'""")
+
+    assert (
+        LiveRecapWorker(
+            duckdb_path=db,
+            backend=StubBackend({"recap": "Retried from durable queue."}),
+            job_stream=stream,
+        ).drain_once()
+        == 1
+    )
+    assert recap_row(db, "s1")[:2] == ("Retried from durable queue.", 8)
+    assert job_status(db, "s1") == "done"
+    assert stream.dead_letters() == []

@@ -34,6 +34,7 @@ _CONTENT_EVENT_TYPES = (
 )
 _RETRY_BASE_SECONDS = 60
 _RETRY_MAX_SECONDS = 3600
+_RUNNING_LEASE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -94,11 +95,11 @@ class LiveRecapWorker:
     def drain_once(self) -> int:
         """Process one recap generation, returning one when a delivery was handled."""
         self._flush_publications()
-        claim = (
-            self._claim_stream_job()
-            if self.job_stream is not None
-            else self._claim_due_job()
-        )
+        claim = self._claim_stream_job() if self.job_stream is not None else None
+        if claim is None:
+            # Redis coordinates immediate work, but DuckDB owns retry timing.
+            # An acknowledged failed delivery is retried from the durable row.
+            claim = self._claim_due_job()
         if claim is None:
             return 0
         if claim.handled_only:
@@ -152,12 +153,17 @@ class LiveRecapWorker:
     def _claim_due_job(self) -> _Claim | None:
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
-            row = con.execute("""SELECT session_id, desired_source_seq
+            row = con.execute(
+                """SELECT session_id, desired_source_seq
                    FROM live_recap_jobs
                    WHERE status='pending'
                       OR (status='retry_wait' AND next_run_at <= now())
+                      OR (status='running'
+                          AND updated_at <= now() - ? * INTERVAL '1 second')
                    ORDER BY enqueued_at ASC
-                   LIMIT 1""").fetchone()
+                   LIMIT 1""",
+                [_RUNNING_LEASE_SECONDS],
+            ).fetchone()
             if row is None:
                 return None
             session_id, source_seq = str(row[0]), int(row[1])
@@ -167,9 +173,11 @@ class LiveRecapWorker:
                        updated_at=now(), next_run_at=NULL
                    WHERE session_id=? AND desired_source_seq=?
                      AND (status='pending'
-                       OR (status='retry_wait' AND next_run_at <= now()))
+                       OR (status='retry_wait' AND next_run_at <= now())
+                       OR (status='running'
+                           AND updated_at <= now() - ? * INTERVAL '1 second'))
                    RETURNING attempts""",
-                [session_id, source_seq],
+                [session_id, source_seq, _RUNNING_LEASE_SECONDS],
             ).fetchone()
             if claimed is None:
                 return None
@@ -225,9 +233,10 @@ class LiveRecapWorker:
                        updated_at=now(), next_run_at=NULL
                    WHERE session_id=? AND desired_source_seq=?
                      AND (status='pending'
-                       OR (status='retry_wait' AND next_run_at <= now()))
+                       OR (status='retry_wait' AND next_run_at <= now())
+                       OR (status='running' AND ? > 1))
                    RETURNING attempts""",
-                [session_id, desired_seq],
+                [session_id, desired_seq, delivery.delivery_count],
             ).fetchone()
             if claimed is None:
                 return None
@@ -309,7 +318,7 @@ class LiveRecapWorker:
         )
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
-            updated = con.execute(
+            con.execute(
                 """UPDATE live_recap_jobs
                    SET status='retry_wait', last_error=?,
                        next_run_at=now() + ? * INTERVAL '1 second', updated_at=now()
@@ -320,7 +329,6 @@ class LiveRecapWorker:
         finally:
             con.close()
         if claim.delivery is not None:
-            if updated is None:
-                self.job_stream.ack(claim.delivery.id)  # type: ignore[union-attr]
-            else:
-                self.job_stream.fail(claim.delivery.id, error)  # type: ignore[union-attr]
+            # The durable retry row is authoritative. ACK this delivery so
+            # exponential waits cannot consume the stream redelivery budget.
+            self.job_stream.ack(claim.delivery.id)  # type: ignore[union-attr]
