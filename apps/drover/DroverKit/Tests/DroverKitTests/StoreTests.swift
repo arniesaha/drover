@@ -56,6 +56,76 @@ struct StoreTests {
     ]).map(\.id) == ["new-running", "older-input", "oldest-approval"])
 }
 
+/// The inbox list is one run, newest first, with nothing in between. The screen
+/// used to assemble this itself out of two buckets with four analytics sections
+/// between them (#80), which read as a sort bug — a session touched minutes ago
+/// rendered below one last touched two days ago, with three sections in the gap.
+/// Pinning capacity closed the gap; ordering by recency closed the rest.
+@Test @MainActor func inboxSessionsAreOneContiguousRunNewestFirst() async throws {
+    let waitingTwoDaysAgo = SessionSummary(
+        id: "old-input", hostID: "mac-mini", harness: "claude-code", mode: "structured",
+        status: "running", awaiting: "input", cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 100)
+    )
+    let approvalYesterday = SessionSummary(
+        id: "approval", hostID: "mac-mini", harness: "claude-code", mode: "structured",
+        status: "running", awaiting: "approval", cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 200)
+    )
+    let runningMinutesAgo = SessionSummary(
+        id: "new-running", hostID: "mac-mini", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 900)
+    )
+    let runningEarlier = SessionSummary(
+        id: "old-running", hostID: "nas", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 300)
+    )
+    let finished = SessionSummary(
+        id: "done", hostID: "nas", harness: "codex", mode: "structured",
+        status: "completed", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 800)
+    )
+
+    let inbox = SessionStore.inboxSessions(from: [
+        runningEarlier, finished, waitingTwoDaysAgo, runningMinutesAgo, approvalYesterday,
+    ])
+
+    // Newest first, regardless of bucket. The two-day-old question sorts
+    // below live work rather than above it. Finished is not here: it has its
+    // own collapsed section under the list.
+    #expect(inbox.map(\.id) == ["new-running", "old-running", "approval", "old-input"])
+}
+
+/// The ordering itself, stated as the invariant rather than as one example:
+/// activity never increases as you go down the list, whatever the buckets do.
+/// Interleaving is now expected — that is the point of ordering by recency.
+@Test @MainActor func inboxSessionsAreOrderedByRecencyAcrossBuckets() async throws {
+    let sessions = (0..<12).map { index in
+        SessionSummary(
+            id: "s\(index)", hostID: "mac-mini", harness: "codex", mode: "structured",
+            status: "running",
+            awaiting: [nil, "input", "approval"][index % 3],
+            cwd: nil,
+            lastActivity: Date(timeIntervalSince1970: TimeInterval(index * 60))
+        )
+    }
+
+    let inbox = SessionStore.inboxSessions(from: sessions)
+    let activity = inbox.compactMap(\.activityDate)
+
+    #expect(inbox.count == sessions.count)
+    #expect(activity == activity.sorted(by: >),
+            "inbox is not newest-first: \(inbox.map(\.id))")
+    // And the buckets really are allowed to mix now, so this corpus proves
+    // the ordering is doing work rather than accidentally agreeing with a
+    // bucket-first result.
+    let needsYouFlags = inbox.map { $0.attention == .needsApproval || $0.attention == .needsInput }
+    #expect(needsYouFlags != needsYouFlags.sorted(by: { $0 && !$1 }),
+            "expected interleaving with recency ordering")
+}
+
 @Test @MainActor func refreshFailureKeepsSnapshotSetsError() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
