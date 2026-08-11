@@ -141,4 +141,13 @@ import Testing
         ], harness: "codex")
         #expect(gauge?.text == "ctx 93.6K")
     }
+
+    @Test func extremeCodexUsageBoundsPercentageWithoutTrapping() {
+        let gauge = ContextGauge(messages: [
+            codexCompletion(
+                seq: 1, input: 1_000_000_000_000_000_000, cached: 0, window: 1
+            ),
+        ], harness: "codex")
+        #expect(gauge?.text == "ctx 1000000000000M / 1 · 9223372036854775807%")
+    }
 }

@@ -12,7 +12,8 @@ public struct ContextGauge: Sendable, Equatable {
 
     public var text: String {
         guard let window, window > 0 else { return "ctx \(TokenCount.format(usedTokens))" }
-        let percent = Int((Double(usedTokens) / Double(window) * 100).rounded())
+        let rawPercent = (Double(usedTokens) / Double(window) * 100).rounded()
+        let percent = rawPercent >= Double(Int.max) ? Int.max : Int(rawPercent)
         return "ctx \(TokenCount.format(usedTokens)) / \(TokenCount.format(window)) · \(percent)%"
     }
 
