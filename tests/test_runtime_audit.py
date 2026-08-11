@@ -1720,3 +1720,56 @@ def test_cli_runtime_audit_accepts_db_and_incoming_dir(tmp_path: Path) -> None:
     assert "diagnostic_db :" in res.output
     assert "diagnostic_db : none" not in res.output
     assert "agent-a/stuck.jsonl" in res.output
+
+
+def _record_open_roles(monkeypatch) -> list[str]:
+    from drover.server import doctor as doctor_module
+
+    roles: list[str] = []
+    real_open = doctor_module.open_duckdb_connection
+
+    def _recording_open(*args, **kwargs):
+        roles.append(str(kwargs.get("role", "worker")))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(doctor_module, "open_duckdb_connection", _recording_open)
+    return roles
+
+
+def test_runtime_audit_defaults_to_the_single_threaded_diagnostic_role(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Callers that may be pointed at the live database keep threads=1.
+
+    ``runtime_audit`` is reachable from the CLI and from in-process
+    diagnostics that read the live file. ``threads`` is a DuckDB instance
+    setting, so raising it there raises it for every other connection to the
+    live instance -- the 2026-08-04 outage (#91).
+    """
+    db, incoming = _seed_runtime_db(tmp_path)
+    roles = _record_open_roles(monkeypatch)
+
+    runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24, deep=False)
+
+    assert roles == ["diagnostic"]
+
+
+def test_runtime_audit_can_run_under_the_isolated_copy_role(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Callers reading a private copy may ask for the parallel role.
+
+    Regression guard for #78: without this the /metrics snapshot stays pinned
+    to one thread even though it owns its own DuckDB instance.
+    """
+    db, incoming = _seed_runtime_db(tmp_path)
+    roles = _record_open_roles(monkeypatch)
+
+    report = runtime_audit(
+        duckdb_path=db, incoming_dir=incoming, hours=24, deep=False, role="snapshot"
+    )
+
+    assert roles == ["snapshot"]
+    # Same answers, just more threads.
+    assert report["table_counts"]["agent_events"] == 10
+    assert report["session_consistency"]["event_sessions"] == 9

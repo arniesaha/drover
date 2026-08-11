@@ -278,8 +278,13 @@ def pipeline_observatory_snapshot(
     runtime_audit: dict[str, Any] | None = None,
     max_artifacts: int = 10,
     max_projects: int = 10,
+    role: str = "diagnostic",
 ) -> dict[str, Any]:
-    """Return artifact and project drilldown for the Drover pipeline."""
+    """Return artifact and project drilldown for the Drover pipeline.
+
+    ``role`` is the DuckDB connection profile; pass ``role="snapshot"`` only
+    when ``duckdb_path`` is a private copy (see ``drover.server.db``).
+    """
 
     if not Path(duckdb_path).exists():
         return {
@@ -294,7 +299,7 @@ def pipeline_observatory_snapshot(
             "agent_adoption": adoption_snapshot(runtime_audit or {}),
         }
 
-    con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")
+    con = open_duckdb_connection(duckdb_path, read_only=True, role=role)
     try:
         summaries = _summary_artifacts(con, limit=max_artifacts)
         briefs = _brief_artifacts(con, limit=max_artifacts)

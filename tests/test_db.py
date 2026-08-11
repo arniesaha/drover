@@ -2,7 +2,107 @@ from __future__ import annotations
 
 import duckdb
 
-from drover.server.db import open_duckdb_connection
+from drover.server.db import (
+    ROLE_DEFAULTS,
+    open_duckdb_connection,
+    snapshot_thread_default,
+)
+
+
+def test_snapshot_thread_default_scales_with_cores_but_always_leaves_one():
+    """The snapshot role gets parallelism, never the whole machine.
+
+    threads is a DuckDB *instance* setting, so a role that can be pointed at
+    the live database must stay at 1 (issue #91). This role is only ever used
+    against a private copy, which is its own instance -- but the copy still
+    shares CPU with the live server, so it never takes the last core.
+    """
+    assert snapshot_thread_default(1) == 1
+    assert snapshot_thread_default(2) == 1
+    assert snapshot_thread_default(4) == 3
+    # Measured on the 2.32M-row store: 4 threads and 8 threads are within
+    # noise of each other (6.6s vs 6.3s), so 4 is the knee, not a budget.
+    assert snapshot_thread_default(10) == 4
+    assert snapshot_thread_default(64) == 4
+
+
+def test_diagnostic_role_stays_single_threaded():
+    """Regression guard for the 2026-08-04 outage (#91, PR #76, PR #93).
+
+    ``diagnostic`` still governs readers pointed at the *live* database, where
+    raising threads raises the shared instance's thread count for every other
+    connection. Faster snapshots come from the separate ``snapshot`` role, not
+    from loosening this one.
+    """
+    assert ROLE_DEFAULTS["diagnostic"]["threads"] == "1"
+
+
+def test_open_duckdb_connection_supports_snapshot_profile(tmp_path):
+    db = tmp_path / "copy.duckdb"
+    con = open_duckdb_connection(db, role="snapshot")
+    try:
+        threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
+    finally:
+        con.close()
+    assert threads == int(ROLE_DEFAULTS["snapshot"]["threads"])
+    assert threads >= 1
+
+
+def test_threads_is_instance_wide_so_a_shared_file_leaks_it(tmp_path, monkeypatch):
+    """The reason ``snapshot`` may only ever read a private copy.
+
+    ``threads`` is a DuckDB *instance* setting, not a connection one. Two
+    connections to the same file share an instance, so raising it on one
+    raises it on the other -- which is how a diagnostic scan came to starve
+    the live harness registry on 2026-08-04 (#91). This pins the mechanism.
+    """
+    monkeypatch.setenv("DROVER_DUCKDB_SNAPSHOT_THREADS", "4")
+    shared = tmp_path / "live.duckdb"
+
+    live = open_duckdb_connection(shared, role="worker")
+    try:
+        assert live.execute("SELECT current_setting('threads')").fetchone() == (2,)
+        greedy = open_duckdb_connection(shared, role="snapshot")
+        try:
+            assert live.execute("SELECT current_setting('threads')").fetchone() == (4,)
+        finally:
+            greedy.close()
+    finally:
+        live.close()
+
+
+def test_a_snapshot_of_a_copy_cannot_change_the_live_instance(tmp_path, monkeypatch):
+    """...and the reason the copy makes the extra threads safe.
+
+    A separate file is a separate DuckDB instance with its own scheduler, so
+    the snapshot role's thread count cannot reach the live one.
+    """
+    monkeypatch.setenv("DROVER_DUCKDB_SNAPSHOT_THREADS", "4")
+
+    live = open_duckdb_connection(tmp_path / "live.duckdb", role="worker")
+    try:
+        copy = open_duckdb_connection(tmp_path / "copy.duckdb", role="snapshot")
+        try:
+            assert copy.execute("SELECT current_setting('threads')").fetchone() == (4,)
+            assert live.execute("SELECT current_setting('threads')").fetchone() == (2,)
+        finally:
+            copy.close()
+    finally:
+        live.close()
+
+
+def test_snapshot_role_ignores_the_diagnostic_thread_override(tmp_path, monkeypatch):
+    """Scoping is the point: throttling live diagnostics must not throttle the
+    isolated copy readers, and vice versa."""
+    monkeypatch.setenv("DROVER_DUCKDB_DIAGNOSTIC_THREADS", "1")
+    monkeypatch.setenv("DROVER_DUCKDB_WORKER_THREADS", "1")
+    monkeypatch.setenv("DROVER_DUCKDB_SNAPSHOT_THREADS", "3")
+
+    con = open_duckdb_connection(tmp_path / "copy.duckdb", role="snapshot")
+    try:
+        assert con.execute("SELECT current_setting('threads')").fetchone() == (3,)
+    finally:
+        con.close()
 
 
 def test_open_duckdb_connection_applies_settings_without_config_conflict(tmp_path):
