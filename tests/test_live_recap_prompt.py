@@ -90,3 +90,15 @@ def test_normalize_recap_preserves_plain_text_underscores() -> None:
     recap = normalize_live_recap("Update recap_prompt.py before release")
 
     assert recap == "Update recap_prompt.py before release"
+
+
+def test_normalize_recap_keeps_only_the_first_sentence() -> None:
+    recap = normalize_live_recap("First sentence. Second sentence.")
+
+    assert recap == "First sentence."
+
+
+def test_normalize_recap_rejects_an_overlong_single_token() -> None:
+    recap = normalize_live_recap("x" * 161)
+
+    assert recap == ""

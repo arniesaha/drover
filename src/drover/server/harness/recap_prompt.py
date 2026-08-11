@@ -17,6 +17,7 @@ _CONTENT_EVENT_TYPES = {
 _MAX_EVENTS = 30
 _MAX_EVENT_CHARS = 500
 _MARKDOWN_RE = re.compile(r"(?:`{1,3}|\*{1,3}|^#{1,6}\s*)", re.MULTILINE)
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -57,9 +58,12 @@ def normalize_live_recap(value: Any, *, max_chars: int = 160) -> str:
         return ""
 
     text = _WHITESPACE_RE.sub(" ", _MARKDOWN_RE.sub("", value)).strip()
+    sentence_end = _SENTENCE_END_RE.search(text)
+    if sentence_end is not None:
+        text = text[: sentence_end.end()]
     if len(text) <= max_chars:
         return text
 
     bounded = text[:max_chars]
     boundary = bounded.rfind(" ")
-    return (bounded[:boundary] if boundary > 0 else bounded).rstrip()
+    return bounded[:boundary].rstrip() if boundary > 0 else ""
