@@ -79,8 +79,8 @@ public struct SessionCardPresentation: Sendable, Equatable {
             case .working: .watch
             case .done, .errored: .resume
             }
-            if let preview = Self.firstLine(of: session.preview) {
-                title = preview
+            if let titleText = Self.firstLine(of: session.recap) ?? Self.firstLine(of: session.preview) {
+                title = titleText
                 isTitlePlaceholder = false
                 subtitleParts.append(state)
             } else {
