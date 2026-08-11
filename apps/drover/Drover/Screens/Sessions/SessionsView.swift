@@ -124,7 +124,20 @@ struct SessionsView: View {
                             .buttonStyle(.bordered)
                         }
                     } else {
-                        ProgressView("Connecting…")
+                        // The spinner alone cannot distinguish a hub that is
+                        // unreachable from a first load repeatedly torn down
+                        // before it lands — which is exactly why a recurring
+                        // stuck "Connecting…" could not be diagnosed from the
+                        // phone (#85). After the second failure it says which.
+                        VStack(spacing: 8) {
+                            ProgressView("Connecting…")
+                            if let detail = store.connectingDetail {
+                                Text(detail)
+                                    .droverText(.subtitle)
+                                    .multilineTextAlignment(.center)
+                                    .accessibilityIdentifier("connecting-detail")
+                            }
+                        }
                     }
                 }
             }
