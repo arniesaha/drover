@@ -2,16 +2,12 @@ import Foundation
 
 /// How full the model's context window is *right now*.
 ///
-/// The obvious sources are both wrong, and both were tried in production:
-/// `result.modelUsage` accumulates over the session (10 turns of ~900K cache
-/// reads rendered as "9.1M / 1M"), and `result.usage` accumulates over one
-/// request's internal turns (7.47M at num_turns=100). Only an individual
-/// assistant message's `usage` describes a single API call's prompt, which
-/// is what "context used" means -- and it is the only one that falls when
-/// the session compacts.
+/// Claude reports one API call's prompt usage on each assistant message.
+/// Codex reports cumulative input on turn completions, so its current prompt
+/// pressure is the delta between consecutive completion totals.
 public struct ContextGauge: Sendable, Equatable {
     public let usedTokens: Int
-    /// Nil until the first `result` payload arrives with a window.
+    /// Nil when the newest provider-specific usage payload has no window.
     public let window: Int?
 
     public var text: String {
@@ -21,24 +17,26 @@ public struct ContextGauge: Sendable, Equatable {
     }
 
     public init?(messages: [HarnessMessage], harness: String? = nil) {
-        guard let used = Self.latestPromptTokens(messages, harness: harness) else { return nil }
-        usedTokens = used
-        window = Self.latestWindow(messages)
+        let normalizedHarness = harness?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedHarness == "codex" {
+            guard let context = Self.latestCodexContext(messages) else { return nil }
+            usedTokens = context.usedTokens
+            window = context.window
+        } else {
+            guard let used = Self.latestClaudePromptTokens(messages) else { return nil }
+            usedTokens = used
+            window = Self.latestClaudeWindow(messages)
+        }
     }
 
     /// Newest-first: one assistant message's `usage` is one API call.
     /// A `result` payload is explicitly skipped -- its `usage` sibling is a
     /// per-request total, not a per-call one.
-    private static func latestPromptTokens(_ messages: [HarnessMessage], harness: String?) -> Int? {
-        let normalizedHarness = harness?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let window = Self.latestWindow(messages)
+    private static func latestClaudePromptTokens(_ messages: [HarnessMessage]) -> Int? {
         for message in messages.reversed() {
             guard message.type == .assistantOutput,
                   message.payload["result"] == nil,
                   let usage = message.payload["usage"]?.objectValue else { continue }
-            if normalizedHarness == "codex" && window == nil {
-                return nil
-            }
             let input = usage["input_tokens"]?.numberValue ?? 0
             let cacheRead = usage["cache_read_input_tokens"]?.numberValue ?? 0
             let cacheCreation = usage["cache_creation_input_tokens"]?.numberValue ?? 0
@@ -48,8 +46,38 @@ public struct ContextGauge: Sendable, Equatable {
         return nil
     }
 
+    /// Codex completion usage is cumulative. The newest minus the preceding
+    /// valid sample is the latest prompt; a first or reset sample stands alone.
+    private static func latestCodexContext(
+        _ messages: [HarnessMessage]
+    ) -> (usedTokens: Int, window: Int?)? {
+        var samples: [(input: Int, window: Int?)] = []
+        for message in messages.reversed() {
+            guard message.type == .status,
+                  message.payload["turn_complete"]?.boolValue == true,
+                  let usage = message.payload["usage"]?.objectValue,
+                  let input = positiveInt(usage["input_tokens"]?.numberValue) else { continue }
+            let window = positiveInt(message.payload["model_context_window"]?.numberValue)
+            samples.append((input, window))
+            if samples.count == 2 { break }
+        }
+
+        guard let latest = samples.first else { return nil }
+        guard samples.count == 2 else { return (latest.input, latest.window) }
+        let previous = samples[1].input
+        let used = latest.input >= previous ? latest.input - previous : latest.input
+        return (used, latest.window)
+    }
+
+    private static func positiveInt(_ number: Double?) -> Int? {
+        guard let number, number.isFinite else { return nil }
+        let rounded = number.rounded()
+        guard rounded > 0, rounded < Double(Int.max) else { return nil }
+        return Int(rounded)
+    }
+
     /// `modelUsage` remains the one reliable source for the window itself.
-    private static func latestWindow(_ messages: [HarnessMessage]) -> Int? {
+    private static func latestClaudeWindow(_ messages: [HarnessMessage]) -> Int? {
         for message in messages.reversed() {
             guard let result = message.payload["result"]?.objectValue,
                   let modelUsage = result["modelUsage"]?.objectValue else { continue }
