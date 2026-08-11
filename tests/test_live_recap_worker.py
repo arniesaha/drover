@@ -237,3 +237,32 @@ def test_stream_retry_acknowledges_delivery_and_retries_from_durable_due_time(
     assert recap_row(db, "s1")[:2] == ("Retried from durable queue.", 8)
     assert job_status(db, "s1") == "done"
     assert stream.dead_letters() == []
+
+
+def test_stream_redelivery_does_not_steal_an_unexpired_running_claim(
+    tmp_path: Path,
+) -> None:
+    """A live worker retains its generation until the durable lease expires."""
+    from drover.server.jobs import JobStream
+
+    db, con = recap_db(tmp_path, session_id="s1")
+    enqueue_live_recap(con, "s1", 8)
+    con.execute("""UPDATE live_recap_jobs
+           SET status='running', attempts=1, stream_publish_needed=FALSE,
+               updated_at=now()
+           WHERE session_id='s1'""")
+    con.close()
+    stream = JobStream("live-recap", visibility_timeout_ms=0)
+    stream.add({"session_id": "s1", "source_seq": 8})
+    assert stream.read_group("original", count=1)
+    backend = StubBackend({"recap": "A second worker must not run."})
+
+    assert (
+        LiveRecapWorker(duckdb_path=db, backend=backend, job_stream=stream).drain_once()
+        == 0
+    )
+    assert backend.calls == 0
+    with duckdb.connect(str(db)) as con:
+        assert con.execute(
+            "SELECT status, attempts FROM live_recap_jobs WHERE session_id='s1'"
+        ).fetchone() == ("running", 1)

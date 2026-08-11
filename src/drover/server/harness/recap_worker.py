@@ -234,9 +234,10 @@ class LiveRecapWorker:
                    WHERE session_id=? AND desired_source_seq=?
                      AND (status='pending'
                        OR (status='retry_wait' AND next_run_at <= now())
-                       OR (status='running' AND ? > 1))
+                       OR (status='running'
+                           AND updated_at <= now() - ? * INTERVAL '1 second'))
                    RETURNING attempts""",
-                [session_id, desired_seq, delivery.delivery_count],
+                [session_id, desired_seq, _RUNNING_LEASE_SECONDS],
             ).fetchone()
             if claimed is None:
                 return None
@@ -275,7 +276,8 @@ class LiveRecapWorker:
                    SELECT ?, ?, ?, ?, now()
                    WHERE EXISTS (
                      SELECT 1 FROM live_recap_jobs
-                      WHERE session_id=? AND desired_source_seq=? AND status='running'
+                      WHERE session_id=? AND desired_source_seq=?
+                        AND status='running' AND attempts=?
                    )
                    RETURNING session_id""",
                 [
@@ -285,6 +287,7 @@ class LiveRecapWorker:
                     model,
                     claim.session_id,
                     claim.source_seq,
+                    claim.attempts,
                 ],
             ).fetchone()
             if persisted is None:
@@ -293,9 +296,10 @@ class LiveRecapWorker:
             finalized = con.execute(
                 """UPDATE live_recap_jobs
                    SET status='done', last_error=NULL, next_run_at=NULL, updated_at=now()
-                   WHERE session_id=? AND desired_source_seq=? AND status='running'
+                   WHERE session_id=? AND desired_source_seq=?
+                     AND status='running' AND attempts=?
                    RETURNING session_id""",
-                [claim.session_id, claim.source_seq],
+                [claim.session_id, claim.source_seq, claim.attempts],
             ).fetchone()
             if finalized is None:
                 con.execute("ROLLBACK")
@@ -322,9 +326,16 @@ class LiveRecapWorker:
                 """UPDATE live_recap_jobs
                    SET status='retry_wait', last_error=?,
                        next_run_at=now() + ? * INTERVAL '1 second', updated_at=now()
-                   WHERE session_id=? AND desired_source_seq=? AND status='running'
+                   WHERE session_id=? AND desired_source_seq=?
+                     AND status='running' AND attempts=?
                    RETURNING session_id""",
-                [error[:1000], delay_s, claim.session_id, claim.source_seq],
+                [
+                    error[:1000],
+                    delay_s,
+                    claim.session_id,
+                    claim.source_seq,
+                    claim.attempts,
+                ],
             ).fetchone()
         finally:
             con.close()
