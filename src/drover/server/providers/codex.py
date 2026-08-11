@@ -223,10 +223,11 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
     response at all -- taking the Claude and Google cards down with a Codex
     problem (the rule ``providers/claude.py`` already follows, drover#65).
 
-    Two ways that happened: a child that outlives ``SIGKILL`` (wedged in
-    uninterruptible sleep) makes the second ``wait`` raise ``TimeoutExpired``,
-    and closing stdin against a dead child raises ``BrokenPipeError``. An
-    abandoned process is worth less than the response, so both are swallowed.
+    Two ways it can fire, neither yet observed in the wild: a child that
+    outlives ``SIGKILL`` (wedged in uninterruptible sleep) makes the second
+    ``wait`` raise ``TimeoutExpired``, and closing stdin against a dead child
+    raises ``BrokenPipeError``. An abandoned process is worth less than the
+    response, so both are swallowed.
     """
     try:
         if process.poll() is None:
