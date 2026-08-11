@@ -67,38 +67,142 @@ def canonical_agent_events_cte(
 """.strip()
 
 
-def _has_column(con: duckdb.DuckDBPyConnection, relation: str, column: str) -> bool:
+def _relation_columns(con: duckdb.DuckDBPyConnection, relation: str) -> set[str] | None:
+    """Return ``relation``'s column names, or ``None`` if it is unreadable.
+
+    Catalog metadata first: ``agent_events`` is a view over a multi-thousand
+    file parquet glob, so binding it costs about a second even for a zero-row
+    probe. The direct probe stays as the fallback for relations the catalog
+    does not describe, and is what distinguishes "missing" from "no such
+    column" (see #78).
+    """
     try:
-        row = con.execute(
+        rows = con.execute(
             """
-            SELECT count(*)
+            SELECT column_name
             FROM information_schema.columns
-            WHERE table_name = ? AND column_name = ?
+            WHERE table_name = ?
             """,
-            [relation, column],
-        ).fetchone()
-        return bool(row and row[0])
+            [relation],
+        ).fetchall()
     except duckdb.Error:
-        try:
-            desc = con.execute(f"SELECT * FROM {relation} LIMIT 0").description or []
-        except duckdb.Error:
-            return False
-        return column in {str(col[0]) for col in desc}
+        rows = []
+    if rows:
+        return {str(row[0]) for row in rows}
+    try:
+        desc = con.execute(f"SELECT * FROM {relation} LIMIT 0").description or []
+    except duckdb.Error:
+        return None
+    return {str(col[0]) for col in desc}
 
 
-def _duplicate_metrics(con: duckdb.DuckDBPyConnection, column: str) -> tuple[int, int]:
-    row = con.execute(f"""
-        SELECT count(*) AS duplicate_values,
-               COALESCE(sum(rows - 1), 0) AS duplicate_rows
-        FROM (
-            SELECT {column}, count(*) AS rows
-            FROM agent_events
-            WHERE {column} IS NOT NULL
-            GROUP BY {column}
-            HAVING count(*) > 1
+def _identity_metrics_sql(
+    *, has_id: bool, has_dedup_key: bool, example_limit: int
+) -> str:
+    """Build the single-pass duplicate-identity query.
+
+    Every statement against ``agent_events`` reads the whole historical parquet
+    tree, so this deliberately answers all of the identity metrics from one
+    statement instead of one statement per metric. The CTEs are ``MATERIALIZED``
+    so that the several scalar subqueries reading them do not re-run the
+    aggregation.
+
+    When both columns are present the counts are rolled up from one
+    ``(id, dedup_key)`` grouping rather than grouping ``agent_events`` twice.
+    That also turns the per-id ``count(DISTINCT dedup_key)`` into a distinct
+    count over an already-deduplicated relation, which was the single most
+    expensive aggregate in the audit (see #78).
+    """
+    ctes: list[str] = []
+    selects: list[str] = []
+    paired = has_id and has_dedup_key
+    if paired:
+        ctes.append("""
+            identity_pairs AS MATERIALIZED (
+              SELECT id, dedup_key, count(*) AS rows
+              FROM agent_events
+              WHERE id IS NOT NULL OR dedup_key IS NOT NULL
+              GROUP BY id, dedup_key
+            )""")
+    if has_id:
+        if paired:
+            ctes.append("""
+            duplicate_ids AS MATERIALIZED (
+              SELECT id, sum(rows) AS rows, count(DISTINCT dedup_key) AS dedup_keys
+              FROM identity_pairs
+              WHERE id IS NOT NULL
+              GROUP BY id
+              HAVING sum(rows) > 1
+            )""")
+        else:
+            ctes.append("""
+            duplicate_ids AS MATERIALIZED (
+              SELECT id, count(*) AS rows, 0 AS dedup_keys
+              FROM agent_events
+              WHERE id IS NOT NULL
+              GROUP BY id
+              HAVING count(*) > 1
+            )""")
+        selects.extend(
+            [
+                "(SELECT count(*) FROM duplicate_ids) AS duplicate_id_values",
+                "(SELECT COALESCE(sum(rows - 1), 0) FROM duplicate_ids)"
+                " AS duplicate_id_rows",
+                f"""(
+              SELECT list(
+                {{'id': id, 'rows': rows, 'dedup_keys': dedup_keys}}
+                ORDER BY rows DESC, id
+              )
+              FROM (
+                SELECT * FROM duplicate_ids ORDER BY rows DESC, id LIMIT {example_limit}
+              )
+            ) AS duplicate_id_examples""",
+            ]
         )
-        """).fetchone()
-    return (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+    else:
+        selects.extend(
+            [
+                "0 AS duplicate_id_values",
+                "0 AS duplicate_id_rows",
+                "NULL AS duplicate_id_examples",
+            ]
+        )
+    if has_dedup_key:
+        if paired:
+            ctes.append("""
+            duplicate_dedup_keys AS MATERIALIZED (
+              SELECT dedup_key, sum(rows) AS rows
+              FROM identity_pairs
+              WHERE dedup_key IS NOT NULL
+              GROUP BY dedup_key
+              HAVING sum(rows) > 1
+            )""")
+        else:
+            ctes.append("""
+            duplicate_dedup_keys AS MATERIALIZED (
+              SELECT dedup_key, count(*) AS rows
+              FROM agent_events
+              WHERE dedup_key IS NOT NULL
+              GROUP BY dedup_key
+              HAVING count(*) > 1
+            )""")
+        selects.extend(
+            [
+                "(SELECT count(*) FROM duplicate_dedup_keys)"
+                " AS duplicate_dedup_key_values",
+                "(SELECT COALESCE(sum(rows - 1), 0) FROM duplicate_dedup_keys)"
+                " AS duplicate_dedup_key_rows",
+            ]
+        )
+    else:
+        selects.extend(
+            [
+                "0 AS duplicate_dedup_key_values",
+                "0 AS duplicate_dedup_key_rows",
+            ]
+        )
+    with_clause = "WITH " + ",".join(ctes) if ctes else ""
+    return f"{with_clause}\nSELECT {', '.join(selects)}"
 
 
 def audit_agent_event_identity(
@@ -124,53 +228,48 @@ def audit_agent_event_identity(
         "duplicate_id_examples": [],
     }
 
+    columns = _relation_columns(con, "agent_events")
+    if columns is None:
+        report["status"] = "missing"
+        report["error"] = "agent_events relation is not readable"
+        return report
+
+    has_id = "id" in columns
+    has_dedup_key = "dedup_key" in columns
     try:
-        con.execute("SELECT 1 FROM agent_events LIMIT 0")
+        row = con.execute(
+            _identity_metrics_sql(
+                has_id=has_id,
+                has_dedup_key=has_dedup_key,
+                example_limit=max(0, int(example_limit)),
+            )
+        ).fetchone()
     except duckdb.Error as e:
         report["status"] = "missing"
         report["error"] = str(e)
         return report
 
-    if _has_column(con, "agent_events", "id"):
-        values, rows = _duplicate_metrics(con, "id")
-        report["duplicate_id_values"] = values
-        report["duplicate_id_rows"] = rows
-        examples = con.execute(
-            (
-                """
-            SELECT id, count(*) AS rows, count(DISTINCT dedup_key) AS dedup_keys
-            FROM agent_events
-            WHERE id IS NOT NULL
-            GROUP BY id
-            HAVING count(*) > 1
-            ORDER BY rows DESC, id
-            LIMIT ?
-            """
-                if _has_column(con, "agent_events", "dedup_key")
-                else """
-            SELECT id, count(*) AS rows, 0 AS dedup_keys
-            FROM agent_events
-            WHERE id IS NOT NULL
-            GROUP BY id
-            HAVING count(*) > 1
-            ORDER BY rows DESC, id
-            LIMIT ?
-            """
-            ),
-            [example_limit],
-        ).fetchall()
+    if row is None:
+        row = (0, 0, None, 0, 0)
+
+    if has_id:
+        report["duplicate_id_values"] = int(row[0] or 0)
+        report["duplicate_id_rows"] = int(row[1] or 0)
         report["duplicate_id_examples"] = [
-            {"id": str(event_id), "rows": int(n), "dedup_keys": int(dedup_keys)}
-            for event_id, n, dedup_keys in examples
+            {
+                "id": str(example["id"]),
+                "rows": int(example["rows"]),
+                "dedup_keys": int(example["dedup_keys"]),
+            }
+            for example in (row[2] or [])
         ]
     else:
         report["status"] = "missing_id_column"
 
-    if _has_column(con, "agent_events", "dedup_key"):
-        values, rows = _duplicate_metrics(con, "dedup_key")
-        report["duplicate_dedup_key_values"] = values
-        report["duplicate_dedup_key_rows"] = rows
-        if values:
+    if has_dedup_key:
+        report["duplicate_dedup_key_values"] = int(row[3] or 0)
+        report["duplicate_dedup_key_rows"] = int(row[4] or 0)
+        if report["duplicate_dedup_key_values"]:
             report["status"] = "duplicate_dedup_key"
     else:
         report["status"] = "missing_dedup_key_column"

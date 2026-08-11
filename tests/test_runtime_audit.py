@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from click.testing import CliRunner
 
+from drover.event_identity import audit_agent_event_identity
 from drover.schema import bootstrap
 from drover.server.__main__ import main
 from drover.server.doctor import format_runtime_audit, runtime_audit
@@ -1511,6 +1512,152 @@ def test_runtime_audit_flags_embedding_queue_with_no_vectors(tmp_path: Path) -> 
     )
     assert "embedding status: offline_or_unconfigured" in text
     assert "start drover-server run without --no-embeddings" in text
+
+
+class _RecordingConnection:
+    """Delegating DuckDB connection proxy that records executed SQL."""
+
+    def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+        self._inner = inner
+        self.statements: list[str] = []
+
+    def execute(self, sql, *args, **kwargs):
+        self.statements.append(str(sql))
+        return self._inner.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _full_history_agent_event_scans(statements: list[str]) -> list[str]:
+    """Return statements that scan ``agent_events`` with no partition bound.
+
+    ``date >=`` is the only predicate that lets DuckDB prune the hive
+    partitions under ``agent_events/``. A statement naming ``agent_events``
+    without one reads the entire historical parquet tree.
+    """
+    scans = []
+    for statement in statements:
+        collapsed = " ".join(statement.split()).lower()
+        if "agent_events" not in collapsed:
+            continue
+        if "date >=" in collapsed:
+            continue
+        scans.append(collapsed)
+    return scans
+
+
+def test_metrics_hot_path_does_not_repeat_full_history_agent_event_scans(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Guard the /metrics hot path against re-scanning all of agent_events.
+
+    ``quality_snapshot(deep=False)`` drives the Prometheus endpoint every
+    refresh. Each unbounded ``agent_events`` statement reads the whole parquet
+    tree, so the cost of this audit is set by how many such statements it
+    issues, not by how much work each one does. Regression guard for #78.
+    """
+    from drover.server import doctor as doctor_module
+
+    db, incoming = _seed_runtime_db(tmp_path)
+    recorded: list[_RecordingConnection] = []
+    real_open = doctor_module.open_duckdb_connection
+
+    def _recording_open(*args, **kwargs):
+        connection = _RecordingConnection(real_open(*args, **kwargs))
+        recorded.append(connection)
+        return connection
+
+    monkeypatch.setattr(doctor_module, "open_duckdb_connection", _recording_open)
+
+    report = runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24, deep=False)
+
+    statements = [
+        statement for connection in recorded for statement in connection.statements
+    ]
+    scans = _full_history_agent_event_scans(statements)
+
+    # One row count, one session-consistency pass, one event-identity pass.
+    assert len(scans) <= 3, (
+        f"{len(scans)} unbounded agent_events scans in the /metrics hot path:\n"
+        + "\n".join(f"  - {scan[:120]}" for scan in scans)
+    )
+    # The audit must still report what it reported before the consolidation.
+    assert report["table_counts"]["agent_events"] == 10
+    assert report["session_consistency"]["event_sessions"] == 9
+    assert report["agent_event_identity"]["status"] == "ok"
+
+
+def test_agent_event_identity_without_dedup_key_column() -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE agent_events (id VARCHAR)")
+        con.execute("INSERT INTO agent_events VALUES ('dup'), ('dup'), ('solo')")
+
+        report = audit_agent_event_identity(con)
+    finally:
+        con.close()
+
+    assert report["status"] == "missing_dedup_key_column"
+    assert report["duplicate_id_values"] == 1
+    assert report["duplicate_id_rows"] == 1
+    assert report["duplicate_dedup_key_values"] == 0
+    assert report["duplicate_id_examples"] == [
+        {"id": "dup", "rows": 2, "dedup_keys": 0}
+    ]
+
+
+def test_agent_event_identity_without_id_column() -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE agent_events (dedup_key VARCHAR)")
+        con.execute("INSERT INTO agent_events VALUES ('k'), ('k'), ('other')")
+
+        report = audit_agent_event_identity(con)
+    finally:
+        con.close()
+
+    assert report["status"] == "duplicate_dedup_key"
+    assert report["duplicate_dedup_key_values"] == 1
+    assert report["duplicate_dedup_key_rows"] == 1
+    assert report["duplicate_id_values"] == 0
+    assert report["duplicate_id_examples"] == []
+
+
+def test_agent_event_identity_reports_missing_relation() -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        report = audit_agent_event_identity(con)
+    finally:
+        con.close()
+
+    assert report["status"] == "missing"
+    assert report["duplicate_id_values"] == 0
+    assert report["duplicate_dedup_key_values"] == 0
+
+
+def test_agent_event_identity_counts_rows_with_null_ids() -> None:
+    """A NULL ``id`` must not hide its row from the dedup_key rollup."""
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE agent_events (id VARCHAR, dedup_key VARCHAR)")
+        con.execute("""
+            INSERT INTO agent_events VALUES
+              (NULL, 'shared'),
+              ('a', 'shared'),
+              ('a', 'other'),
+              ('a', NULL)
+            """)
+
+        report = audit_agent_event_identity(con)
+    finally:
+        con.close()
+
+    assert report["duplicate_dedup_key_values"] == 1
+    assert report["duplicate_dedup_key_rows"] == 1
+    assert report["duplicate_id_values"] == 1
+    assert report["duplicate_id_rows"] == 2
+    assert report["duplicate_id_examples"] == [{"id": "a", "rows": 3, "dedup_keys": 2}]
 
 
 def test_runtime_audit_handles_missing_tables_and_incoming_dir(tmp_path: Path) -> None:

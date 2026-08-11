@@ -46,6 +46,89 @@ def _safe_scalar(
     return int(row[0]) if row and row[0] is not None else 0
 
 
+_SESSION_SET_SQL = """
+WITH event_sessions AS MATERIALIZED (
+  SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL
+), summary_sessions AS MATERIALIZED (
+  SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
+)
+SELECT
+  (SELECT count(*) FROM event_sessions) AS event_sessions,
+  (
+    SELECT count(*)
+    FROM event_sessions e
+    LEFT JOIN summary_sessions s USING (session_id)
+    WHERE s.session_id IS NULL
+  ) AS event_sessions_without_summary,
+  (
+    SELECT count(*)
+    FROM summary_sessions s
+    LEFT JOIN event_sessions e USING (session_id)
+    WHERE e.session_id IS NULL
+  ) AS summaries_without_events
+"""
+
+_EVENT_SESSIONS_SQL = (
+    "SELECT count(DISTINCT session_id) FROM agent_events WHERE session_id IS NOT NULL"
+)
+
+_EVENT_SESSIONS_WITHOUT_SUMMARY_SQL = """
+SELECT count(*)
+FROM (SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL) e
+LEFT JOIN (
+  SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
+) ss USING (session_id)
+WHERE ss.session_id IS NULL
+"""
+
+_SUMMARIES_WITHOUT_EVENTS_SQL = """
+SELECT count(*)
+FROM (
+  SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
+) ss
+LEFT JOIN (
+  SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL
+) e USING (session_id)
+WHERE e.session_id IS NULL
+"""
+
+
+def _session_set_metrics(
+    con: duckdb.DuckDBPyConnection, *, warnings: list[str]
+) -> tuple[int | None, int | None, int | None]:
+    """Return the three session-set metrics from a single ``agent_events`` scan.
+
+    These metrics all derive from the same two DISTINCT session-id sets. Asking
+    for them separately meant three full scans of the ``agent_events`` parquet
+    tree per audit, which is a large share of the /metrics cost (see #78). The
+    per-metric fallback is kept so one unreadable relation still degrades to
+    partial results rather than losing all three.
+    """
+    try:
+        row = con.execute(_SESSION_SET_SQL).fetchone()
+    except duckdb.Error:
+        return (
+            _safe_scalar(
+                con, _EVENT_SESSIONS_SQL, warnings=warnings, label="event_sessions"
+            ),
+            _safe_scalar(
+                con,
+                _EVENT_SESSIONS_WITHOUT_SUMMARY_SQL,
+                warnings=warnings,
+                label="event_sessions_without_summary",
+            ),
+            _safe_scalar(
+                con,
+                _SUMMARIES_WITHOUT_EVENTS_SQL,
+                warnings=warnings,
+                label="summaries_without_events",
+            ),
+        )
+    if row is None:
+        return (0, 0, 0)
+    return tuple(int(value) if value is not None else 0 for value in row[:3])  # type: ignore[return-value]
+
+
 def _relation_type(con: duckdb.DuckDBPyConnection, name: str) -> str | None:
     row = con.execute(
         """
@@ -134,12 +217,12 @@ def audit_session_consistency(
         warnings.append("sessions relation is missing; expected a DuckDB VIEW")
         return report
 
-    report["event_sessions"] = _safe_scalar(
-        con,
-        "SELECT count(DISTINCT session_id) FROM agent_events WHERE session_id IS NOT NULL",
-        warnings=warnings,
-        label="event_sessions",
-    )
+    (
+        event_sessions,
+        event_sessions_without_summary,
+        summaries_without_events,
+    ) = _session_set_metrics(con, warnings=warnings)
+    report["event_sessions"] = event_sessions
     if include_expensive_checks:
         report["sessions_rows"] = _safe_scalar(
             con,
@@ -201,30 +284,8 @@ def audit_session_consistency(
                 "sessions relation has no event_count column; cannot verify counts"
             )
 
-    report["event_sessions_without_summary"] = _safe_scalar(
-        con,
-        """
-        SELECT count(*)
-        FROM (SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL) e
-        LEFT JOIN (SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL) ss
-          USING (session_id)
-        WHERE ss.session_id IS NULL
-        """,
-        warnings=warnings,
-        label="event_sessions_without_summary",
-    )
-    report["summaries_without_events"] = _safe_scalar(
-        con,
-        """
-        SELECT count(*)
-        FROM (SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL) ss
-        LEFT JOIN (SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL) e
-          USING (session_id)
-        WHERE e.session_id IS NULL
-        """,
-        warnings=warnings,
-        label="summaries_without_events",
-    )
+    report["event_sessions_without_summary"] = event_sessions_without_summary
+    report["summaries_without_events"] = summaries_without_events
 
     drift_fields = (
         _ZERO_DRIFT_FIELDS
