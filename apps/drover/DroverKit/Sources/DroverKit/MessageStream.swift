@@ -86,11 +86,22 @@ public actor MessageStream {
         case snapshotChanged
     }
 
-    private static let historyPageSize = 200
+    /// One REST request's worth of history. Deliberately small: it is the
+    /// unit of work that a flaky link has to carry in one piece, and the unit
+    /// of progress that survives a failure.
+    public static let defaultPageSize = 50
+
+    /// How much history a cold open assembles before attaching the socket.
+    /// Unchanged from when it was fetched as a single page — only the number
+    /// of requests it takes to gather changed.
+    public static let defaultColdWindowSize = 200
+
     private let client: DroverClient
     private let sessionID: String
     private let connector: WebSocketConnecting
     private let reconnectBaseDelay: Duration
+    private let pageSize: Int
+    private let coldWindowSize: Int
 
     private var lastSeq = 0
     private var coldHistoryComplete = false
@@ -100,16 +111,28 @@ public actor MessageStream {
     private var coldSnapshotMaxSeq = 0
     private var pumpTask: Task<Void, Never>?
 
+    /// Partially assembled cold window, retained across reconnect attempts.
+    /// `coldWindow` is contiguous and ascending; `coldWindowMaxSeq` is the
+    /// snapshot bound captured by the first page and the cursor the socket
+    /// will attach at. Nil means no page of the window has landed yet.
+    private var coldWindow: [HarnessMessage] = []
+    private var coldWindowMaxSeq: Int?
+    private var coldWindowHasOlder = false
+
     public init(
         client: DroverClient,
         sessionID: String,
         connector: WebSocketConnecting = URLSessionWebSocketConnector(),
-        reconnectBaseDelay: Duration = .seconds(1)
+        reconnectBaseDelay: Duration = .seconds(1),
+        pageSize: Int = MessageStream.defaultPageSize,
+        coldWindowSize: Int = MessageStream.defaultColdWindowSize
     ) {
         self.client = client
         self.sessionID = sessionID
         self.connector = connector
         self.reconnectBaseDelay = reconnectBaseDelay
+        self.pageSize = max(1, pageSize)
+        self.coldWindowSize = max(1, coldWindowSize)
     }
 
     /// Single-consumer: each `MessageStream` supports one `events()` stream
@@ -150,7 +173,7 @@ public actor MessageStream {
 
         let page = try await client.messagePage(
             sessionID: sessionID,
-            request: .older(beforeSeq: beforeSeq, limit: Self.historyPageSize)
+            request: .older(beforeSeq: beforeSeq, limit: pageSize)
         )
         try Task.checkCancellation()
         try validate(page: page)
@@ -249,47 +272,116 @@ public actor MessageStream {
         return try await forwardCatchUp(continuation: continuation)
     }
 
-    /// A cold open publishes only the newest bounded page, then attaches the
-    /// live socket immediately. Older pages remain behind an explicit request
-    /// so opening a session never shifts the viewport with automatic prepends.
+    /// A cold open publishes only the newest bounded window, then attaches the
+    /// live socket immediately. Older history beyond that window stays behind
+    /// an explicit request so opening a session never shifts the viewport with
+    /// automatic prepends.
+    ///
+    /// The window is assembled from `pageSize` chunks rather than one large
+    /// page, and each landed chunk is *retained* on the actor. A dropped
+    /// request therefore costs one chunk, not the whole window: the reconnect
+    /// loop re-enters here and continues from the retained cursor. Restarting
+    /// from zero every time was issue #79 — on a link that could not carry the
+    /// whole page in one piece, the session never attached at all.
+    ///
+    /// A logically inconsistent page is different from a dropped one: it can
+    /// never be resumed past, so it discards the retained window and the retry
+    /// re-establishes the snapshot from scratch.
     private func coldCatchUp(
         continuation: AsyncStream<StreamEvent>.Continuation
     ) async throws -> Int {
-        let newest = try await client.messagePage(
-            sessionID: sessionID,
-            request: .newest(limit: Self.historyPageSize)
-        )
-        try Task.checkCancellation()
-        try validate(page: newest)
-
-        let fixedMaxSeq = newest.maxSeq
-        guard fixedMaxSeq >= 0, !newest.hasNewer else {
-            throw CatchUpError.snapshotChanged
+        do {
+            return try await assembleColdWindow(continuation: continuation)
+        } catch let error as CatchUpError {
+            discardColdWindow()
+            throw error
         }
-        if newest.messages.isEmpty {
-            guard fixedMaxSeq == 0, !newest.hasOlder else {
+    }
+
+    private func assembleColdWindow(
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) async throws -> Int {
+        if coldWindowMaxSeq == nil {
+            let newest = try await client.messagePage(
+                sessionID: sessionID, request: .newest(limit: pageSize)
+            )
+            try Task.checkCancellation()
+            try validate(page: newest)
+
+            let fixedMaxSeq = newest.maxSeq
+            guard fixedMaxSeq >= 0, !newest.hasNewer else {
                 throw CatchUpError.snapshotChanged
             }
-            coldHistoryComplete = true
-            return fixedMaxSeq
-        }
-        guard newest.messages.last?.seq == fixedMaxSeq else {
-            throw CatchUpError.snapshotChanged
+            if newest.messages.isEmpty {
+                guard fixedMaxSeq == 0, !newest.hasOlder else {
+                    throw CatchUpError.snapshotChanged
+                }
+                coldHistoryComplete = true
+                return fixedMaxSeq
+            }
+            guard newest.messages.last?.seq == fixedMaxSeq else {
+                throw CatchUpError.snapshotChanged
+            }
+            coldWindowMaxSeq = fixedMaxSeq
+            coldWindow = newest.messages
+            coldWindowHasOlder = newest.hasOlder
         }
 
-        let newestVisible = newest.messages.filter { $0.seq > 0 }
-        guard newest.hasOlder || fixedMaxSeq == 0 || newestVisible.first?.seq == 1 else {
+        // Extend oldest-ward one chunk at a time. Every successful page is
+        // committed to `coldWindow` before the next request is issued, so a
+        // failure anywhere in here leaves real progress behind.
+        while let fixedMaxSeq = coldWindowMaxSeq,
+              coldWindowHasOlder,
+              coldWindow.count < coldWindowSize,
+              let beforeSeq = coldWindow.first?.seq {
+            let page = try await client.messagePage(
+                sessionID: sessionID,
+                request: .older(
+                    beforeSeq: beforeSeq,
+                    limit: min(pageSize, coldWindowSize - coldWindow.count)
+                )
+            )
+            try Task.checkCancellation()
+            try validate(page: page)
+            // The snapshot may have grown underneath us — that is fine, the
+            // socket attaches at the bound captured above and replays the
+            // rest. It must never have shrunk, and the page must abut what we
+            // already hold.
+            guard page.maxSeq >= fixedMaxSeq,
+                  !page.messages.isEmpty,
+                  page.messages.last?.seq == beforeSeq - 1,
+                  page.hasNewer else {
+                throw CatchUpError.sequenceGap
+            }
+            coldWindow = page.messages + coldWindow
+            coldWindowHasOlder = page.hasOlder
+        }
+
+        guard let fixedMaxSeq = coldWindowMaxSeq else {
+            throw CatchUpError.snapshotChanged
+        }
+        let visible = coldWindow.filter { $0.seq > 0 }
+        guard coldWindowHasOlder || fixedMaxSeq == 0 || visible.first?.seq == 1 else {
             throw CatchUpError.sequenceGap
         }
-        olderBeforeSeq = newest.messages.first?.seq
-        hasOlderHistory = newest.hasOlder
+        olderBeforeSeq = coldWindow.first?.seq
+        hasOlderHistory = coldWindowHasOlder
         coldSnapshotMaxSeq = fixedMaxSeq
         lastSeq = fixedMaxSeq
         coldHistoryComplete = true
-        if !newestVisible.isEmpty {
-            continuation.yield(.history(newestVisible, decodeIssues: newest.decodeIssues))
+        // One batch for the whole window: assembling it in chunks must not
+        // become visible as a series of prepends.
+        if !visible.isEmpty {
+            continuation.yield(.history(visible, decodeIssues: []))
         }
+        discardColdWindow()
         return fixedMaxSeq
+    }
+
+    private func discardColdWindow() {
+        coldWindow = []
+        coldWindowMaxSeq = nil
+        coldWindowHasOlder = false
     }
 
     /// Reconnects retain the forward, fixed-bound path: only events newer
@@ -306,7 +398,7 @@ public actor MessageStream {
                 request: .newer(
                     afterSeq: cursor,
                     throughSeq: fixedMaxSeq,
-                    limit: Self.historyPageSize
+                    limit: pageSize
                 )
             )
             try Task.checkCancellation()
