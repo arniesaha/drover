@@ -107,4 +107,35 @@ struct InboxStatusHeaderLayoutTests {
         #expect(without < withCapacity)
         #expect(without <= 120, "bare header is \(without)pt")
     }
+
+    /// The collapse itself, measured rather than asserted.
+    ///
+    /// Collapsed is the default because the strip is charged to every frame the
+    /// inbox draws. This pins the saving so a future change to the summary line
+    /// cannot quietly grow it back into a second slab.
+    @Test func collapsingTheCapacityStripGivesTheListItsHeightBack() throws {
+        let key = "inbox.providerCapacityExpanded"
+        let previous = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+
+        UserDefaults.standard.set(true, forKey: key)
+        let expanded = try height(accounts: accounts([Self.anthropic, Self.openai]))
+
+        UserDefaults.standard.set(false, forKey: key)
+        let collapsed = try height(accounts: accounts([Self.anthropic, Self.openai]))
+
+        #expect(collapsed < expanded,
+                "collapsed \(collapsed)pt vs expanded \(expanded)pt")
+        // The cards are the bulk of the strip; collapsing has to give back most
+        // of it, not shave a few points off.
+        #expect(collapsed <= expanded * 0.6,
+                "collapse only saved \(expanded - collapsed)pt of \(expanded)pt")
+        // And the default the user actually gets is the small one.
+        UserDefaults.standard.removeObject(forKey: key)
+        let byDefault = try height(accounts: accounts([Self.anthropic, Self.openai]))
+        #expect(byDefault == collapsed, "default is not collapsed: \(byDefault)pt")
+    }
 }
