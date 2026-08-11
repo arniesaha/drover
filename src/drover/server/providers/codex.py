@@ -214,6 +214,20 @@ def _stderr_reader(stream, captured: list[str]) -> threading.Thread:
 
 
 def _stop_process(process: subprocess.Popen[str]) -> None:
+    """Stop the child, and never raise while doing it.
+
+    This runs inside ``read()``'s ``finally``, where an exception escapes the
+    method itself rather than being caught by its own ``except`` clauses.
+    ``_provider_usage`` calls the probe with no ``try`` and ``harnessd``'s
+    ``do_GET`` has no wrapper, so anything escaping here means no HTTP
+    response at all -- taking the Claude and Google cards down with a Codex
+    problem (the rule ``providers/claude.py`` already follows, drover#65).
+
+    Two ways that happened: a child that outlives ``SIGKILL`` (wedged in
+    uninterruptible sleep) makes the second ``wait`` raise ``TimeoutExpired``,
+    and closing stdin against a dead child raises ``BrokenPipeError``. An
+    abandoned process is worth less than the response, so both are swallowed.
+    """
     try:
         if process.poll() is None:
             process.terminate()
@@ -221,10 +235,18 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
             process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
+            try:
+                process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                log.debug("codex app-server survived SIGKILL; abandoning it")
+    except OSError:
+        log.debug("codex app-server could not be stopped", exc_info=True)
     finally:
         if process.stdin is not None:
-            process.stdin.close()
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
 
 
 def _snapshot_from_responses(
@@ -289,6 +311,12 @@ def _usage_window(kind: str, value: Any) -> ProviderUsageWindow | None:
 def _error_snapshot(
     host_id: str, observed_at: datetime, error_category: str
 ) -> ProviderAccountSnapshot:
+    # Logged here rather than at each raise site so no path can fail silently.
+    # A card that flips to "error" and recovers on the next refresh otherwise
+    # leaves nothing behind, and the category is the whole diagnosis: it
+    # separates a slow CLI (timeout) from a broken one (process_error) from a
+    # changed wire format (protocol_error).
+    log.warning("codex usage probe failed on %s: %s", host_id, error_category)
     return _snapshot(
         account_label="Codex",
         plan_label=None,
