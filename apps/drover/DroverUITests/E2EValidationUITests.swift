@@ -127,6 +127,16 @@ final class E2EValidationUITests: XCTestCase {
         let horseradish = app.staticTexts["HORSERADISH"]
         XCTAssertTrue(horseradish.waitForExistence(timeout: 240),
                       "the starting prompt should produce the exact reply bubble")
+
+        let title = app.staticTexts["chat-recap-title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 30),
+                      "chat should expose its recap as the navigation title")
+        XCTAssertEqual(title.label, "Improving previews; verifying the chat header.")
+        let metadata = app.staticTexts["chat-header-metadata"]
+        XCTAssertTrue(metadata.waitForExistence(timeout: 30),
+                      "chat should expose harness and context metadata")
+        XCTAssertTrue(metadata.label.contains("Codex"))
+        XCTAssertTrue(metadata.label.contains("ctx"))
         shoot(app, "05-chat-first-reply")
 
         // ── 4. A follow-up turn through the composer ──────────────────────

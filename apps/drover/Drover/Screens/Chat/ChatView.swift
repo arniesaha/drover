@@ -23,9 +23,21 @@ struct ChatView: View {
     /// race: a tall new row unpinned before the coalesced scroll fired).
     @State private var scrollPhase: ScrollPhase = .idle
 
-    init(client: DroverClient, sessionID: String, harness: String? = nil) {
+    init(
+        client: DroverClient,
+        sessionID: String,
+        harness: String? = nil,
+        recap: String? = nil,
+        recapSourceSeq: Int? = nil
+    ) {
         self.client = client
-        _model = State(initialValue: ChatModel(client: client, sessionID: sessionID, harness: harness))
+        _model = State(initialValue: ChatModel(
+            client: client,
+            sessionID: sessionID,
+            harness: harness,
+            recap: recap,
+            recapSourceSeq: recapSourceSeq
+        ))
     }
 
     var body: some View {
@@ -90,7 +102,7 @@ struct ChatView: View {
         }
         .task {
             model.start()
-            await model.loadHandoffTargets()
+            await model.loadSessionMetadata()
         }
         .onDisappear { model.stop() }
         // A handoff (`/continue`) creates a structured session for
@@ -309,18 +321,16 @@ struct ChatView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .principal) {
-            VStack(spacing: 0) {
-                Label(model.harnessPresentation.name,
-                      systemImage: model.harnessPresentation.symbolName)
-                    .labelStyle(.titleAndIcon)
+            VStack(spacing: 1) {
+                Text(model.headerTitle)
                     .font(.headline)
-                    .accessibilityIdentifier("chat-harness-title")
-                if let gauge = model.contextGauge {
-                    Text(gauge.text)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("chat-context-gauge")
-                }
+                    .lineLimit(1)
+                    .accessibilityIdentifier("chat-recap-title")
+                Text(model.headerMetadata)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .accessibilityIdentifier("chat-header-metadata")
             }
         }
 
