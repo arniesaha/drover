@@ -1,7 +1,7 @@
 """drover-server CLI."""
 
 from __future__ import annotations
-from contextlib import contextmanager
+
 import json
 import logging
 import os
@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -27,11 +28,29 @@ from drover.config import (
     default_config_path,
     load_config,
 )
-from drover.task_id import compute_task_id
-from drover.schema import bootstrap, EXPECTED_TABLES
+from drover.schema import EXPECTED_TABLES, bootstrap
+from drover.server import ledger_shadow
+from drover.server.advisory.content_targets import content_bundle_from_payload
+from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
+from drover.server.advisory.model_analyzer import build_configured_analysis_backend
+from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.service import InsightsService
+from drover.server.advisory.worker import (
+    AdvisoryWorker,
+    ContentAnalysisScheduler,
+    ContentAnalysisWorker,
+    load_operational_snapshot,
+    operational_analyzers,
+    operational_snapshot_source_version,
+)
+from drover.server.briefs.worker import (
+    BriefWorker,
+    enqueue_brief,
+    enqueue_briefs_for_active_projects,
+)
+from drover.server.cockpit.analytics import AnalyticsFilters
+from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.compact import compact_table
-from drover.server.decisions import derive_decisions
-from drover.server.db import open_duckdb_connection
 from drover.server.context_catalog import (
     diff_bundle,
     format_diff,
@@ -39,62 +58,46 @@ from drover.server.context_catalog import (
     import_bundle,
     load_bundle,
 )
+from drover.server.db import open_duckdb_connection
+from drover.server.decisions import derive_decisions
 from drover.server.doctor import audit_lakehouse, format_runtime_audit, runtime_audit
-from drover.server.mcp import tools as mcp_tools
-from drover.server.metrics import (
-    MetricsCollector,
-    sequence_health_report,
-    start_metrics_server,
-)
-from drover.server.harness.registry import HarnessRegistry
-from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
-from drover.server.advisory.repository import AdvisoryRepository
-from drover.server.advisory.service import InsightsService
-from drover.server.advisory.content_targets import content_bundle_from_payload
-from drover.server.advisory.model_analyzer import build_configured_analysis_backend
-from drover.server.advisory.worker import (
-    AdvisoryWorker,
-    ContentAnalysisScheduler,
-    ContentAnalysisWorker,
-    load_operational_snapshot,
-    operational_snapshot_source_version,
-    operational_analyzers,
-)
-from drover.server.cockpit.analytics import AnalyticsFilters
-from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
-from drover.server.providers.service import ProviderUsageService
-from drover.server.observatory import pipeline_observatory_snapshot
-from drover.server.web.auth import load_auth
-from drover.server.quality import format_prometheus, quality_snapshot
-from drover.session_audit import audit_session_consistency_db, format_session_audit
-from drover.server.rollup import rollup_tasks
-from drover.server.mcp.server import build_mcp_server
-from drover.server.otlp.receiver import OTLPReceiver
-from drover.server.briefs.worker import (
-    BriefWorker,
-    enqueue_brief,
-    enqueue_briefs_for_active_projects,
-)
+from drover.server.embeddings.client import EmbeddingBackendConfig
 from drover.server.embeddings.worker import (
     EmbedWorker,
     enqueue_missing_span_embeds,
     reset_stale_session_embed_jobs,
     reset_stale_span_embed_jobs,
 )
-from drover.server.embeddings.client import EmbeddingBackendConfig
-from drover.server import ledger_shadow
+from drover.server.harness.recap_worker import LiveRecapWorker
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.jobs import RedisJobStream, RedisJobStreamConfig
+from drover.server.mcp import tools as mcp_tools
+from drover.server.mcp.server import build_mcp_server
+from drover.server.metrics import (
+    MetricsCollector,
+    sequence_health_report,
+    start_metrics_server,
+)
+from drover.server.observatory import pipeline_observatory_snapshot
+from drover.server.otlp.receiver import OTLPReceiver
+from drover.server.providers.service import ProviderUsageService
+from drover.server.quality import format_prometheus, quality_snapshot
+from drover.server.rollup import rollup_tasks
+from drover.server.session_graph import format_ascii, format_dot, session_graph_payload
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.summarizer.diagnostics import summarize_backend_auth
-from drover.server.session_graph import format_ascii, format_dot, session_graph_payload
 from drover.server.summarizer.retry import retry_errored_jobs
 from drover.server.summarizer.worker import SummarizerWorker
 from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
+from drover.server.web.auth import load_auth
+from drover.session_audit import audit_session_consistency_db, format_session_audit
+from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.server")
 
 _REDIS_JOB_STREAM_SUFFIXES = {
     "summarize": "summarize_session",
+    "live_recap": "summarize_live_session",
     "brief": "regenerate_project_brief",
     "embed_session": "embed_session",
     "embed_span": "embed_span",
@@ -312,6 +315,7 @@ def _seed_redis_job_streams(
         return {}
     table_map = {
         "summarize": ("summarize_jobs", "session_id", "session_id"),
+        "live_recap": ("live_recap_jobs", "session_id", "session_id"),
         "brief": ("brief_jobs", "project_key", "project_key"),
         "embed_session": ("embed_jobs", "session_id", "session_id"),
         "embed_span": ("span_embed_jobs", "span_id", "span_id"),
@@ -325,6 +329,8 @@ def _seed_redis_job_streams(
                 selected = f"{column}, source_session_id, source_version"
             elif key in ("summarize", "embed_session"):
                 selected = f"{column}, source_version"
+            elif key == "live_recap":
+                selected = f"{column}, desired_source_seq"
             else:
                 selected = column
             rows = con.execute(
@@ -339,6 +345,8 @@ def _seed_redis_job_streams(
                     payload["source_version"] = str(row[2])
                 elif key in ("summarize", "embed_session") and row[1] is not None:
                     payload["source_version"] = str(row[1])
+                elif key == "live_recap":
+                    payload["source_seq"] = str(row[1])
                 stream.add(payload)
             counts[key] = len(rows)
     finally:
@@ -1556,6 +1564,7 @@ def run(
         content_advisory_worker = None
 
     summarizer: SummarizerWorker | None = None
+    live_recap: LiveRecapWorker | None = None
     if not no_summarizer:
         try:
             backend_cfg = SummarizerBackendConfig.from_runtime(
@@ -1590,6 +1599,19 @@ def run(
                     "yes" if backend_cfg.has_anthropic_creds else "no",
                     "yes" if backend_cfg.has_local_backend else "no",
                 )
+                try:
+                    live_recap = LiveRecapWorker(
+                        duckdb_path=cfg.duckdb_path,
+                        backend_config=backend_cfg,
+                        job_stream=job_streams.get("live_recap"),
+                    )
+                    live_recap.start()
+                    log.info("live recap worker ready")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "live recap worker failed to start; continuing without it"
+                    )
+                    live_recap = None
         except Exception:  # noqa: BLE001
             log.exception("summarizer failed to start; continuing without it")
             summarizer = None
@@ -1689,6 +1711,8 @@ def run(
             embeddings.stop()
         if summarizer is not None:
             summarizer.stop()
+        if live_recap is not None:
+            live_recap.stop()
         if metrics_server is not None:
             metrics_server.shutdown()
         if receiver is not None:

@@ -1,25 +1,30 @@
 """Tests for src/drover/server/__main__.py CLI."""
 
-from pathlib import Path
 import json
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 from click.testing import CliRunner
 
-from drover.server.harness import cli as harness_cli
+from drover.config import default_config
 from drover.schema import bootstrap
 from drover.server import __main__ as server_main
 from drover.server.__main__ import (
     _bootstrap_harnessd_schema,
+    _build_redis_job_streams,
+    _seed_redis_job_streams,
     _summarizer_backend_available,
     main,
 )
+from drover.server.harness import cli as harness_cli
+from drover.server.harness.recap_jobs import enqueue_live_recap
 from drover.server.ledger import ArtifactSpec, Ledger
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig
@@ -61,6 +66,24 @@ def _make_config(tmp_path: Path) -> Path:
         principal_id = "test"
     """))
     return cfg
+
+
+def seeded_server_db(tmp_path: Path) -> Path:
+    """Create the bootstrapped server database used by Redis seeding tests."""
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    return db
+
+
+class RecordingJobStream:
+    """Capture the payloads mirrored into a startup job stream."""
+
+    def __init__(self) -> None:
+        self.items: list[dict[str, str]] = []
+
+    def add(self, fields: dict[str, str]) -> str:
+        self.items.append(fields)
+        return f"{len(self.items)}-0"
 
 
 def _write_spans(parquet_dir: Path, rows: list[dict]) -> None:
@@ -230,6 +253,139 @@ def test_summarizer_backend_available_requires_api_or_local_backend(
     assert not _summarizer_backend_available(
         SummarizerBackendConfig(backend_policy="local", api_key="sk-test")
     )
+
+
+def test_build_redis_job_streams_includes_live_recap(monkeypatch) -> None:
+    """A Redis-enabled server gives live recaps their own consumer stream."""
+    captured_suffixes: list[str] = []
+
+    def fake_from_url(_url, config):
+        captured_suffixes.append(config.stream.rsplit(":", maxsplit=1)[-1])
+        return RecordingJobStream()
+
+    monkeypatch.setattr(
+        server_main.RedisJobStream, "from_url", staticmethod(fake_from_url)
+    )
+    cfg = replace(default_config(), redis_jobs_enabled=True)
+
+    streams = _build_redis_job_streams(cfg)
+
+    assert "live_recap" in streams
+    assert "summarize_live_session" in captured_suffixes
+
+
+def test_seed_redis_streams_publishes_live_recap_source_seq(tmp_path):
+    db = seeded_server_db(tmp_path)
+    with duckdb.connect(str(db)) as con:
+        enqueue_live_recap(con, "s1", 12)
+    stream = RecordingJobStream()
+    counts = _seed_redis_job_streams(duckdb_path=db, streams={"live_recap": stream})
+    assert counts == {"live_recap": 1}
+    assert stream.items == [{"session_id": "s1", "source_seq": "12"}]
+
+
+def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
+    tmp_path, monkeypatch
+) -> None:
+    """The foreground server owns recap worker lifecycle beside summarization."""
+    events: list[tuple[str, str]] = []
+    worker_configs: dict[str, object] = {}
+
+    class ImmediateStopEvent:
+        def set(self) -> None:
+            events.append(("event", "set"))
+
+        def wait(self, _timeout=None) -> bool:
+            return True
+
+    class RecordingWatcher:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append(("watcher", "start"))
+
+        def stop(self) -> None:
+            events.append(("watcher", "stop"))
+
+    class RecordingAdvisoryWorker:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self, **_kwargs) -> None:
+            events.append(("advisory", "start"))
+
+        def join(self, **_kwargs) -> None:
+            events.append(("advisory", "join"))
+
+    class RecordingContentWorker:
+        def start(self, **_kwargs) -> None:
+            events.append(("content", "start"))
+
+        def join(self, **_kwargs) -> None:
+            events.append(("content", "join"))
+
+    class RecordingSummarizerWorker:
+        backend_config = None
+
+        def __init__(self, **kwargs) -> None:
+            self.backend_config = kwargs["backend_config"]
+            worker_configs["summarizer"] = self.backend_config
+            events.append(("summarizer", "constructed"))
+
+        def start(self) -> None:
+            events.append(("summarizer", "start"))
+
+        def stop(self) -> None:
+            events.append(("summarizer", "stop"))
+
+    class RecordingLiveRecapWorker:
+        backend_config = None
+
+        def __init__(self, **kwargs) -> None:
+            self.backend_config = kwargs["backend_config"]
+            worker_configs["live_recap"] = self.backend_config
+            events.append(("live_recap", "constructed"))
+
+        def start(self) -> None:
+            events.append(("live_recap", "start"))
+
+        def stop(self) -> None:
+            events.append(("live_recap", "stop"))
+
+    monkeypatch.setattr(server_main.threading, "Event", ImmediateStopEvent)
+    monkeypatch.setattr(server_main, "IncomingWatcher", RecordingWatcher)
+    monkeypatch.setattr(server_main, "operational_analyzers", lambda: ())
+    monkeypatch.setattr(server_main, "AdvisoryWorker", RecordingAdvisoryWorker)
+    monkeypatch.setattr(
+        server_main,
+        "_create_content_analysis_worker",
+        lambda **_kwargs: RecordingContentWorker(),
+    )
+    monkeypatch.setattr(server_main, "SummarizerWorker", RecordingSummarizerWorker)
+    monkeypatch.setattr(server_main, "LiveRecapWorker", RecordingLiveRecapWorker)
+    monkeypatch.setattr(server_main, "_summarizer_backend_available", lambda _cfg: True)
+    monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--config",
+            str(_make_config(tmp_path)),
+            "run",
+            "--no-otlp",
+            "--no-mcp",
+            "--no-metrics",
+            "--no-embeddings",
+            "--no-briefs",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ("live_recap", "constructed") in events
+    assert ("live_recap", "start") in events
+    assert ("live_recap", "stop") in events
+    assert worker_configs["live_recap"] is worker_configs["summarizer"]
 
 
 def test_cli_init_writes_default_config(tmp_path):
