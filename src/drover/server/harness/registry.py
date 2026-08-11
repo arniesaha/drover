@@ -21,7 +21,11 @@ from drover.server.harness.models import (
     HarnessHost,
     HarnessSession,
 )
-from drover.server.harness.recap_jobs import enqueue_live_recap
+from drover.server.harness.recap_jobs import (
+    LiveRecap,
+    enqueue_live_recap,
+    latest_live_recaps,
+)
 
 # DuckDB's Python client is not safe against two threads in one process
 # calling duckdb.connect() on the same database file at nearly the same
@@ -684,6 +688,14 @@ class HarnessRegistry:
             if preview:
                 previews[session_id] = preview
         return previews
+
+    def latest_live_recaps(self, session_ids: list[str]) -> dict[str, LiveRecap]:
+        """Return the durable recap projection for the requested sessions."""
+        session_ids = [session_id for session_id in session_ids if session_id]
+        if not session_ids:
+            return {}
+        with self._connect() as con:
+            return latest_live_recaps(con, session_ids)
 
     @staticmethod
     def _session_event_preview(row: dict[str, Any]) -> str:

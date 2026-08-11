@@ -372,6 +372,39 @@ def _make_collector(tmp_path) -> MetricsCollector:
     )
 
 
+def collector_with_session(
+    tmp_path,
+    *,
+    preview: str,
+    recap: tuple[str, int] | None = None,
+    event_type: str = "user_input",
+) -> MetricsCollector:
+    """Create one fleet session with a prompt and optional recap projection."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.create_session(
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/Volumes/M2 1/drover",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type=event_type,
+        content_preview=preview,
+    )
+    if recap is not None:
+        with registry._connect() as con:
+            con.execute(
+                """INSERT INTO live_session_recaps
+                   (session_id, recap_text, source_seq, generator_model, generated_at)
+                   VALUES (?, ?, ?, 'test-recap-model', now())""",
+                [session.session_id, recap[0], recap[1]],
+            )
+    return collector
+
+
 def _swift_content_consent_fixture(name: str) -> dict:
     fixture = (
         Path(__file__).parents[1]
@@ -1284,6 +1317,46 @@ def test_harness_snapshot_includes_latest_user_or_assistant_preview(tmp_path):
     payload = json.loads(collector.render_harness_json())
 
     assert payload["sessions"][0]["preview"] == "Refactor session screen cards"
+
+
+def test_harness_snapshot_includes_live_recap_and_preview_fallback(tmp_path):
+    collector = collector_with_session(
+        tmp_path,
+        preview="Improve the chat list",
+        recap=("Improving chat titles; wiring recap refresh.", 12),
+    )
+
+    payload = collector.harness_snapshot()
+
+    session = payload["sessions"][0]
+    assert session["preview"] == "Improve the chat list"
+    assert session["recap"] == "Improving chat titles; wiring recap refresh."
+    assert session["recap_source_seq"] == 12
+
+
+def test_harness_snapshot_missing_recap_emits_null_fields(tmp_path):
+    collector = collector_with_session(tmp_path, preview="Improve the chat list")
+
+    session = collector.harness_snapshot()["sessions"][0]
+
+    assert session["preview"] == "Improve the chat list"
+    assert session["recap"] is None
+    assert session["recap_source_seq"] is None
+
+
+def test_harness_snapshot_recap_preserves_terminal_preview(tmp_path):
+    collector = collector_with_session(
+        tmp_path,
+        preview="git status --short",
+        recap=("Checking the working tree before the snapshot change.", 9),
+        event_type="terminal.input",
+    )
+
+    session = collector.harness_snapshot()["sessions"][0]
+
+    assert session["preview"] == "git status --short"
+    assert session["recap"] == "Checking the working tree before the snapshot change."
+    assert session["recap_source_seq"] == 9
 
 
 def test_metrics_collector_marks_stale_harness_hosts(tmp_path):
