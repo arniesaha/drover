@@ -180,6 +180,21 @@ public final class SessionStore {
     /// cancellations that are otherwise invisible. Nil once one succeeds.
     public private(set) var lastRefreshOutcome: String?
 
+    /// When the snapshot currently being rendered actually landed.
+    ///
+    /// Only a *success* moves this. Keeping the cached snapshot through a
+    /// failure is deliberate (see `refresh()`); restamping it on failure would
+    /// make the cache look freshly fetched, which is the same lie the ticking
+    /// card timestamps were telling (#81).
+    public private(set) var lastSuccessfulRefresh: Date?
+
+    /// How far behind the rendered snapshot is, for the views drawn from it.
+    /// `now` is a parameter so a card's staleness can be tested without
+    /// waiting for a clock.
+    public func freshness(now: Date = Date()) -> SnapshotFreshness {
+        SnapshotFreshness(lastUpdate: lastSuccessfulRefresh, isReachable: isReachable, now: now)
+    }
+
     /// The line the "Connecting…" screen shows once it has been sitting there
     /// long enough to owe an explanation.
     ///
@@ -204,6 +219,7 @@ public final class SessionStore {
             hasLoadedOnce = true
             refreshAttempts = 0
             lastRefreshOutcome = nil
+            lastSuccessfulRefresh = Date()
         } catch {
             // A cancelled request means *we* tore it down (a superseded poll,
             // a dismissed screen) — the hub never said anything. Treating it
