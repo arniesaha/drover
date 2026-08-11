@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import time
@@ -211,27 +212,318 @@ def test_provider_probe_reports_the_signed_in_account(tmp_path: Path):
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text(json.dumps({"active": "someone@example.com", "old": []}))
 
-    snapshot = AgyUsageProbe(accounts_path=accounts).read(host_id="test-host")
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts, state_dir=tmp_path, keychain_reader=lambda: None
+    ).read(host_id="test-host")
 
     assert snapshot.provider == "google"
     assert snapshot.host_id == "test-host"
     assert snapshot.account_label == "someone@example.com"
 
 
-def test_provider_probe_says_capacity_is_unavailable_rather_than_ok(tmp_path: Path):
-    """No quota source exists yet, so the card must not claim to be healthy."""
+def test_provider_probe_says_capacity_is_unavailable_without_a_credential(
+    tmp_path: Path,
+):
+    """No token anywhere means no capacity -- the card must not claim health."""
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text(json.dumps({"active": "someone@example.com"}))
 
-    snapshot = AgyUsageProbe(accounts_path=accounts).read()
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts, state_dir=tmp_path, keychain_reader=lambda: None
+    ).read()
 
     assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "quota_api_unreachable"
+    assert snapshot.error_category == "not_authenticated"
     assert snapshot.windows == ()
 
 
+# -- quota fetch -------------------------------------------------------------
+
+# Verbatim shape of a real 200 from
+# ``v1internal:retrieveUserQuotaSummary`` (Mac mini, 2026-08-10), trimmed to
+# the fields the probe reads.
+QUOTA_SUMMARY = {
+    "groups": [
+        {
+            "displayName": "Gemini Models",
+            "buckets": [
+                {
+                    "bucketId": "gemini-weekly",
+                    "window": "weekly",
+                    "resetTime": "2026-08-16T20:02:26Z",
+                    "remainingFraction": 0.9080874,
+                },
+                {
+                    "bucketId": "gemini-5h",
+                    "window": "5h",
+                    "resetTime": "2026-08-11T03:15:27Z",
+                    "remainingFraction": 0.9022169,
+                },
+            ],
+        },
+        {
+            "displayName": "Claude and GPT models",
+            "buckets": [
+                {
+                    "bucketId": "3p-weekly",
+                    "window": "weekly",
+                    "resetTime": "2026-08-18T02:15:30Z",
+                    "remainingFraction": 1,
+                },
+            ],
+        },
+    ],
+}
+
+
+def _cred(access: str = "tok-1", expiry: str = "2099-01-01T00:00:00Z") -> str:
+    return json.dumps(
+        {
+            "auth_method": "consumer",
+            "token": {
+                "access_token": access,
+                "refresh_token": "refresh-1",
+                "token_type": "Bearer",
+                "expiry": expiry,
+            },
+        }
+    )
+
+
+def _opener(calls: list, payload=QUOTA_SUMMARY, status: int = 200):
+    def open_(url: str, headers: dict, body: bytes, timeout: float):
+        calls.append({"url": url, "headers": headers, "body": body})
+        return status, json.dumps(payload).encode()
+
+    return open_
+
+
+def test_probe_maps_the_quota_summary_into_windows(tmp_path: Path):
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+    calls: list = []
+
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts,
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener(calls),
+    ).read()
+
+    assert snapshot.status == "ok"
+    assert snapshot.error_category is None
+    kinds = {w.kind: w for w in snapshot.windows}
+    assert set(kinds) == {"five_hour", "seven_day", "seven_day_claude_gpt"}
+    # remaining_fraction is what the API reports; the card wants used.
+    assert kinds["seven_day"].used_percent == pytest.approx(9.19126, abs=1e-4)
+    assert kinds["five_hour"].used_percent == pytest.approx(9.77831, abs=1e-4)
+    assert kinds["seven_day_claude_gpt"].used_percent == pytest.approx(0.0)
+    assert kinds["five_hour"].window_minutes == 300
+    assert kinds["seven_day"].window_minutes == 10080
+    assert kinds["seven_day"].resets_at is not None
+    assert kinds["seven_day"].resets_at.year == 2026
+
+
+def test_probe_sends_an_antigravity_user_agent(tmp_path: Path):
+    """The gate that made this look unfetchable.
+
+    Without an "antigravity" User-Agent the endpoint answers 403
+    PERMISSION_DENIED even with a valid token, which reads as "not
+    permitted" rather than "wrong header". A regression here would silently
+    blank the card, so it is asserted rather than left to the live fleet.
+    """
+    calls: list = []
+
+    AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener(calls),
+    ).read()
+
+    assert calls, "probe made no request"
+    agent = calls[-1]["headers"]["User-Agent"]
+    assert "antigravity" in agent.lower()
+
+
+def test_probe_reads_the_token_file_when_there_is_no_keychain(tmp_path: Path):
+    """Linux hosts (the NAS) have no Keychain; go-keyring falls back to a file."""
+    token_file = tmp_path / "antigravity-cli" / "antigravity-oauth-token"
+    token_file.parent.mkdir(parents=True)
+    token_file.write_text(_cred(access="from-file"))
+    calls: list = []
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: None,
+        opener=_opener(calls),
+    ).read()
+
+    assert snapshot.status == "ok"
+    assert calls[-1]["headers"]["Authorization"] == "Bearer from-file"
+
+
+def test_probe_decodes_the_go_keyring_base64_wrapper(tmp_path: Path):
+    blob = (
+        "go-keyring-base64:"
+        + base64.b64encode(_cred(access="from-keychain").encode()).decode()
+    )
+    calls: list = []
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: blob,
+        opener=_opener(calls),
+    ).read()
+
+    assert snapshot.status == "ok"
+    assert calls[-1]["headers"]["Authorization"] == "Bearer from-keychain"
+
+
+def test_probe_refreshes_an_expired_token_without_writing_it_back(tmp_path: Path):
+    """agy only refreshes while it runs, so an idle host's token is stale.
+
+    The refreshed token is used in memory only -- writing back into agy's own
+    credential store would risk corrupting the state of a live CLI.
+    """
+    token_file = tmp_path / "antigravity-cli" / "antigravity-oauth-token"
+    token_file.parent.mkdir(parents=True)
+    stale = _cred(access="expired", expiry="2020-01-01T00:00:00Z")
+    token_file.write_text(stale)
+    calls: list = []
+
+    def open_(url: str, headers: dict, body: bytes, timeout: float):
+        calls.append({"url": url, "headers": headers, "body": body})
+        if "oauth2" in url:
+            return (
+                200,
+                json.dumps({"access_token": "fresh", "expires_in": 3599}).encode(),
+            )
+        return 200, json.dumps(QUOTA_SUMMARY).encode()
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: None,
+        opener=open_,
+        oauth_clients=lambda: (("id-1", "secret-1"),),
+    ).read()
+
+    assert snapshot.status == "ok"
+    assert "oauth2" in calls[0]["url"], "expired token was not refreshed"
+    assert calls[-1]["headers"]["Authorization"] == "Bearer fresh"
+    assert token_file.read_text() == stale, "probe rewrote agy's credential store"
+
+
+def test_probe_tries_each_oauth_client_pairing(tmp_path: Path):
+    """The binary yields ids and secrets with no clue which pairs with which."""
+    calls: list = []
+
+    def open_(url: str, headers: dict, body: bytes, timeout: float):
+        calls.append(body)
+        if "oauth2" in url:
+            if b"secret-good" not in body:
+                return 401, b'{"error": "invalid_client"}'
+            return 200, json.dumps({"access_token": "fresh"}).encode()
+        return 200, json.dumps(QUOTA_SUMMARY).encode()
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(expiry="2020-01-01T00:00:00Z"),
+        opener=open_,
+        oauth_clients=lambda: (("id-1", "secret-bad"), ("id-1", "secret-good")),
+    ).read()
+
+    assert snapshot.status == "ok"
+
+
+def test_probe_reports_expired_when_no_oauth_client_can_be_found(tmp_path: Path):
+    """No agy binary to read the client out of -- say so, do not crash."""
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(expiry="2020-01-01T00:00:00Z"),
+        opener=lambda *a: (200, b"{}"),
+        oauth_clients=lambda: (),
+    ).read()
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "token_expired"
+
+
+def test_probe_reports_unavailable_when_the_quota_call_is_rejected(tmp_path: Path):
+    def open_(url: str, headers: dict, body: bytes, timeout: float):
+        return 403, b'{"error": {"code": 403}}'
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=open_,
+    ).read()
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.windows == ()
+
+
+def test_probe_never_raises_when_the_transport_explodes(tmp_path: Path):
+    """read() must never raise: harnessd's do_GET has no try wrapper."""
+
+    def open_(url: str, headers: dict, body: bytes, timeout: float):
+        raise OSError("connection reset")
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=open_,
+    ).read()
+
+    assert snapshot.status in ("usage_unavailable", "error")
+    assert snapshot.windows == ()
+
+
+def test_probe_ignores_disabled_buckets(tmp_path: Path):
+    payload = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-5h",
+                        "window": "5h",
+                        "remainingFraction": 0.5,
+                        "disabled": True,
+                    },
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "remainingFraction": 0.5,
+                    },
+                ],
+            }
+        ]
+    }
+
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener([], payload=payload),
+    ).read()
+
+    assert [w.kind for w in snapshot.windows] == ["seven_day"]
+
+
 def test_provider_probe_falls_back_to_a_generic_label(tmp_path: Path):
-    snapshot = AgyUsageProbe(accounts_path=tmp_path / "missing.json").read()
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: None,
+    ).read()
 
     assert snapshot.account_label == "Antigravity"
     assert snapshot.status == "usage_unavailable"
@@ -241,7 +533,9 @@ def test_provider_probe_never_raises_on_a_broken_accounts_file(tmp_path: Path):
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text("{ not json")
 
-    snapshot = AgyUsageProbe(accounts_path=accounts).read()
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts, state_dir=tmp_path, keychain_reader=lambda: None
+    ).read()
 
     assert snapshot.account_label == "Antigravity"
 
@@ -250,6 +544,8 @@ def test_provider_probe_falls_back_to_old_accounts_when_active_is_null(tmp_path:
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text(json.dumps({"active": None, "old": ["someone@example.com"]}))
 
-    snapshot = AgyUsageProbe(accounts_path=accounts).read()
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts, state_dir=tmp_path, keychain_reader=lambda: None
+    ).read()
 
     assert snapshot.account_label == "someone@example.com"
