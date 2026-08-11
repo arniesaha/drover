@@ -338,7 +338,7 @@ def test_full_session_lifecycle_over_relay(relay_env, tmp_path):
     # harnessd's) must have mirrored a terminal.output event for this
     # session -- proof the event path works end-to-end over relay, not just
     # the raw output stream.
-    mirror_deadline = time.monotonic() + 10
+    mirror_deadline = time.monotonic() + 30
     mirrored_output = None
     while time.monotonic() < mirror_deadline and mirrored_output is None:
         events = HarnessRegistry(env.hub_duckdb_path).list_events(session_id)
@@ -350,7 +350,16 @@ def test_full_session_lifecycle_over_relay(relay_env, tmp_path):
                 break
         if mirrored_output is None:
             time.sleep(0.1)
-    assert mirrored_output is not None, "hub never mirrored a terminal.output event"
+    if mirrored_output is None:
+        # Attributable, not mysterious (issue #90): say what the hub DID
+        # mirror. "Only terminal.input landed" means the trailing
+        # terminal.output event frame was discarded at detach; a completely
+        # empty list means the relay event path never worked at all.
+        landed = HarnessRegistry(env.hub_duckdb_path).list_events(session_id)
+        raise AssertionError(
+            "hub never mirrored a terminal.output event; hub registry holds "
+            f"{len(landed)} event(s): {[e.event_type for e in landed]}"
+        )
 
     # 5. Terminate through the hub.
     status, terminated = _hub_post(env, f"/harness/sessions/{session_id}/terminate", {})

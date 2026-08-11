@@ -418,17 +418,30 @@ def test_concurrent_emits_from_two_threads_do_not_corrupt_registry_state(
     at the same time, DuckDB raises a write-write TransactionException.
     entry.lock must serialize the whole side-effect sequence, not just the
     in-memory awaiting/seq bookkeeping.
+
+    Read the registry only once BOTH emitters have actually finished. A bare
+    ``join(timeout=...)`` returns silently when the thread is still running,
+    so counting rows straight after it reported whatever had landed so far --
+    on a loaded runner that was `assert 49 == 50`, indistinguishable from the
+    dropped-event bug this test guards (issue #90). The emitters do ~100
+    serialized DuckDB connect windows between them, which is ~1.3s here and
+    several times that on a contended CI runner; the ceiling below is a
+    deadlock guard, not a timing budget, and blowing it now fails loudly as
+    "threads never finished" rather than as a phantom lost event.
     """
+    from drover.server.harness import daemon as daemon_mod
+
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path
     )
+    daemon_mod.reset_dropped_event_count()
 
     barrier = threading.Barrier(2)
     errors: list[Exception] = []
 
     def emit_many(prefix: str) -> None:
         try:
-            barrier.wait(timeout=5)
+            barrier.wait(timeout=30)
             for index in range(25):
                 driver.emit(
                     StructuredMessage(
@@ -447,9 +460,14 @@ def test_concurrent_emits_from_two_threads_do_not_corrupt_registry_state(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=10)
+        thread.join(timeout=120)
+    unfinished = [thread for thread in threads if thread.is_alive()]
+    assert not unfinished, f"{len(unfinished)} emitter thread(s) never finished"
 
     assert errors == []
+    # Attributable: emit() swallows registry failures by design, so without
+    # this a genuine drop would surface only as a short row count.
+    assert daemon_mod.dropped_event_count() == 0, "emit() dropped a registry write"
     events = registry.list_events("sess-1")
     seqs = sorted(event.seq for event in events if event.seq is not None)
     # No dropped/duplicated seq values despite concurrent emitters.
