@@ -32,6 +32,12 @@ public final class ChatModel {
     /// which is what produced nine duplicate turns from one message.
     public private(set) var isSending = false
     public private(set) var harnessPresentation: HarnessPresentation
+    /// The server-generated recap when available, otherwise the session's
+    /// stable preview. It is intentionally independent of the message stream:
+    /// snapshot refreshes must never manufacture transcript events or reuse
+    /// their sequence numbers.
+    public private(set) var recap: String?
+    public private(set) var recapSourceSeq: Int?
     /// Bumped once per `messages` mutation. Every derived value below reads
     /// this — and only this — so SwiftUI's dependency is "the transcript
     /// changed" rather than "something on the model changed". A scroll-phase
@@ -88,6 +94,20 @@ public final class ChatModel {
         items.last?.id
     }
 
+    /// Prefer the current server summary for an open chat, but retain the
+    /// harness title until neither a recap nor its preview fallback exists.
+    public var headerTitle: String {
+        recap ?? harnessPresentation.name
+    }
+
+    /// The title is the work summary; this keeps provenance and live context
+    /// pressure visible without duplicating the summary text.
+    public var headerMetadata: String {
+        [harnessPresentation.name, contextGauge?.text]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
     /// Live context pressure for the header gauge; nil when the harness
     /// reports no per-call usage.
     public var contextGauge: ContextGauge? {
@@ -131,11 +151,22 @@ public final class ChatModel {
     /// Monotonic token identifying the current pump: a finishing pump only
     /// clears `pumpTask` if it hasn't been superseded by a newer `start()`.
     private var pumpGeneration = 0
+    /// Bounded snapshot poll started after a terminal stream status. Kept
+    /// separate from the stream task so snapshot timing cannot affect turn
+    /// delivery, queueing, or message sequence handling.
+    private nonisolated(unsafe) var recapRefreshTask: Task<Void, Never>?
+    private var recapRefreshGeneration = 0
+    private let recapPollInterval: Duration
+    private let recapPollAttempts: Int
 
     public convenience init(
         client: DroverClient,
         sessionID: String,
         harness: String? = nil,
+        recap: String? = nil,
+        recapSourceSeq: Int? = nil,
+        recapPollInterval: Duration = .seconds(1),
+        recapPollAttempts: Int = 30,
         streamFactory: ((DroverClient, String) -> MessageStream)? = nil
     ) {
         self.init(
@@ -143,6 +174,10 @@ public final class ChatModel {
             sessionID: sessionID,
             harness: harness,
             initialMessages: [],
+            recap: recap,
+            recapSourceSeq: recapSourceSeq,
+            recapPollInterval: recapPollInterval,
+            recapPollAttempts: recapPollAttempts,
             streamFactory: streamFactory
         )
     }
@@ -155,12 +190,20 @@ public final class ChatModel {
         sessionID: String,
         harness: String? = nil,
         initialMessages: [HarnessMessage],
+        recap: String? = nil,
+        recapSourceSeq: Int? = nil,
+        recapPollInterval: Duration = .seconds(1),
+        recapPollAttempts: Int = 30,
         streamFactory: ((DroverClient, String) -> MessageStream)? = nil
     ) {
         self.client = client
         self.sessionID = sessionID
         self.messages = initialMessages
         self.harnessPresentation = HarnessPresentation(harness ?? "")
+        self.recap = recap
+        self.recapSourceSeq = recapSourceSeq
+        self.recapPollInterval = recapPollInterval
+        self.recapPollAttempts = recapPollAttempts
         let factory = streamFactory ?? { c, s in MessageStream(client: c, sessionID: s) }
         self.stream = factory(client, sessionID)
         rebuildApprovals()
@@ -171,6 +214,7 @@ public final class ChatModel {
         // ChatView's subtree on navigation pop) must not leak a
         // still-streaming socket even if `stop()` wasn't called explicitly.
         pumpTask?.cancel()
+        recapRefreshTask?.cancel()
     }
 
     // MARK: - Streaming
@@ -219,6 +263,9 @@ public final class ChatModel {
         // events() pump and wedge the stream.)
         pumpTask?.cancel()
         pumpTask = nil
+        recapRefreshTask?.cancel()
+        recapRefreshTask = nil
+        recapRefreshGeneration &+= 1
     }
 
     @discardableResult
@@ -251,6 +298,7 @@ public final class ChatModel {
             messages.append(message)
             messagesVersion &+= 1
             noteApproval(message)
+            refreshRecapAfterTurnComplete(message)
             dispatchQueuedTurnIfComplete(message)
         case .history(let messages, _):
             mergeHistory(messages)
@@ -413,6 +461,58 @@ public final class ChatModel {
         Task { await sendQueued(text, images: images) }
     }
 
+    /// Starts a new bounded poll after a real-time completion. The server
+    /// writes recaps asynchronously, so a snapshot may temporarily retain an
+    /// older source sequence. We never turn those snapshots into stream
+    /// messages: doing so would collide with the server's event ordering.
+    private func refreshRecapAfterTurnComplete(_ message: HarnessMessage) {
+        guard message.type == .status,
+              message.payload["turn_complete"]?.boolValue == true
+        else { return }
+
+        recapRefreshTask?.cancel()
+        recapRefreshTask = nil
+        recapRefreshGeneration &+= 1
+        let generation = recapRefreshGeneration
+        let targetSequence = message.seq
+        let attempts = recapPollAttempts
+        let interval = recapPollInterval
+
+        guard attempts > 0,
+              (recapSourceSeq ?? -1) < targetSequence
+        else { return }
+
+        let client = client
+        let sessionID = sessionID
+        recapRefreshTask = Task { [weak self, client, sessionID] in
+            defer {
+                if let self, self.recapRefreshGeneration == generation {
+                    self.recapRefreshTask = nil
+                }
+            }
+            for attempt in 0..<attempts {
+                guard !Task.isCancelled,
+                      let metadata = await Self.fetchSessionMetadata(
+                        client: client, sessionID: sessionID
+                      ),
+                      !Task.isCancelled,
+                      let self,
+                      self.recapRefreshGeneration == generation
+                else { return }
+                self.applySessionMetadata(metadata.snapshot, session: metadata.session)
+                if (self.recapSourceSeq ?? -1) >= targetSequence { return }
+                guard attempt + 1 < attempts else { return }
+                do {
+                    try await Task.sleep(for: interval)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
     private func sendQueued(_ text: String, images: [TurnAttachment]) async {
         let preferences = turnPreferences
         do {
@@ -484,18 +584,49 @@ public final class ChatModel {
     }
 
     /// Enabled harnesses on this session's host, for the handoff target
-    /// picker. Loaded on demand by `loadHandoffTargets()`; empty until then
+    /// picker. Loaded on demand by `loadSessionMetadata()`; empty until then
     /// (the UI falls back to the plain same-harness handoff).
     public private(set) var handoffHarnesses: [String] = []
 
-    /// Resolves this session's host from the snapshot and publishes its
-    /// enabled harness list. Failures (or an unknown session) leave the
-    /// list as-is — the picker just doesn't gain per-harness options.
-    public func loadHandoffTargets() async {
+    /// Applies all snapshot-backed state for this open session. A missing
+    /// generated recap may seed the display from preview only when the chat
+    /// has no good text yet, so a pending or failed recap generation cannot
+    /// erase a summary that was already visible.
+    public func loadSessionMetadata() async {
+        guard let metadata = await Self.fetchSessionMetadata(client: client, sessionID: sessionID)
+        else { return }
+        applySessionMetadata(metadata.snapshot, session: metadata.session)
+    }
+
+    /// Fetching is intentionally side-effect free so a recap-refresh task can
+    /// discard a late snapshot after cancellation or supersession, before it
+    /// changes any observable chat state.
+    private nonisolated static func fetchSessionMetadata(
+        client: DroverClient, sessionID: String
+    ) async -> (snapshot: HarnessSnapshot, session: SessionSummary)? {
         guard let snapshot = try? await client.snapshot(),
               let session = snapshot.sessions.first(where: { $0.id == sessionID })
-        else { return }
+        else { return nil }
+        return (snapshot, session)
+    }
+
+    private func applySessionMetadata(_ snapshot: HarnessSnapshot, session: SessionSummary) {
         harnessPresentation = HarnessPresentation(session.harness)
+        if let generatedRecap = session.recap, !generatedRecap.isEmpty {
+            let isOlderThanCurrent = {
+                guard let incoming = session.recapSourceSeq,
+                      let current = recapSourceSeq
+                else { return recapSourceSeq != nil && session.recapSourceSeq == nil }
+                return incoming < current
+            }()
+            if !isOlderThanCurrent {
+                recap = generatedRecap
+                recapSourceSeq = session.recapSourceSeq
+            }
+        } else if recap == nil, let preview = session.preview, !preview.isEmpty {
+            recap = preview
+            recapSourceSeq = nil
+        }
         if selectedModel.isEmpty, let model = session.model, !model.isEmpty {
             selectedModel = model
         }
@@ -507,6 +638,12 @@ public final class ChatModel {
         }
         guard let host = snapshot.hosts.first(where: { $0.id == session.hostID }) else { return }
         handoffHarnesses = host.harnesses
+    }
+
+    /// Compatibility entry point for existing callers. Metadata loading grew
+    /// beyond the handoff picker, but remains the same single snapshot read.
+    public func loadHandoffTargets() async {
+        await loadSessionMetadata()
     }
 
     public func interrupt() async {
