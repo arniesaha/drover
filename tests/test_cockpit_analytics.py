@@ -1062,6 +1062,12 @@ def test_an_abandoned_activity_query_blocks_the_next_attempt(monkeypatch):
 
     monkeypatch.setattr(service_module, "ACTIVITY_BUDGET_SECONDS", 0.2)
     monkeypatch.setattr(service_module, "_INTERRUPT_GRACE_SECONDS", 0.1)
+    # This test's subject is the slot: does an abandoned worker keep the next
+    # attempt out, and does it let go when it finishes? The post-miss cooldown
+    # is a separate policy with its own test, and leaving it on here would
+    # suppress the retry this test uses to observe the slot freeing.
+    monkeypatch.setattr(service_module, "ACTIVITY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(service_module, "ACTIVITY_CACHE_TTL_SECONDS", 0.0)
 
     release = threading.Event()
     closed = threading.Event()
@@ -1113,3 +1119,80 @@ def test_an_abandoned_activity_query_blocks_the_next_attempt(monkeypatch):
         svc.overview(AnalyticsFilters(days=7))
         time.sleep(0.05)
     assert len(opened) == 2, "the slot never freed after the worker finished"
+
+
+def test_activity_result_is_cached_so_many_clients_cost_one_query(
+    monkeypatch, low_coverage_analytics_db
+):
+    """Every poll used to run the scan again.
+
+    The slot only stops *concurrent* queries; back-to-back ones still saturate
+    the DuckDB instance, and each one starves every harness listing endpoint
+    behind it (#91). Several clients polling every 30s produced a near
+    continuous 3s scan.
+    """
+    from drover.server.cockpit import service as service_module
+
+    calls = {"n": 0}
+    real = service_module.activity_analytics
+
+    def _counting(con, filters, *, cursor_codec=None):
+        calls["n"] += 1
+        return real(con, filters, cursor_codec=cursor_codec)
+
+    monkeypatch.setattr(service_module, "activity_analytics", _counting)
+
+    svc = service_module.CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: []),
+        connect=lambda: low_coverage_analytics_db,
+    )
+
+    first = svc.overview(AnalyticsFilters(days=7))
+    second = svc.overview(AnalyticsFilters(days=7))
+
+    assert first["activity"]["status"] == "ok"
+    assert second["activity"]["status"] == "ok"
+    assert calls["n"] == 1, f"ran the scan {calls['n']} times for two polls"
+    assert second["activity"]["data"] == first["activity"]["data"]
+
+
+def test_a_query_that_blew_its_budget_is_not_retried_immediately(monkeypatch):
+    """A budget that gives up but retries at once is worse than one that backs off.
+
+    Until the underlying scan is fast (#78), retrying every poll keeps the
+    database saturated permanently. After a miss the section reports error and
+    stays quiet for a cooldown.
+    """
+    from drover.server.cockpit import service as service_module
+
+    monkeypatch.setattr(service_module, "ACTIVITY_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(service_module, "_INTERRUPT_GRACE_SECONDS", 0.2)
+
+    interrupted = threading.Event()
+    calls = {"n": 0}
+
+    def _never_finishes(con, filters, *, cursor_codec=None):
+        calls["n"] += 1
+        interrupted.wait(10)
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(service_module, "activity_analytics", _never_finishes)
+
+    svc = service_module.CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: []),
+        connect=lambda: SimpleNamespace(
+            interrupt=lambda: interrupted.set(), close=lambda: None
+        ),
+    )
+
+    first = svc.overview(AnalyticsFilters(days=7))
+    second = svc.overview(AnalyticsFilters(days=7))
+
+    assert first["activity"]["status"] == "error"
+    assert second["activity"]["status"] == "error"
+    assert calls["n"] == 1, (
+        f"scan was started {calls['n']} times; a blown budget must back off "
+        "before trying again"
+    )

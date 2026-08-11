@@ -38,6 +38,16 @@ PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
 # shorter budget costs nothing real and buys back the headroom.
 ACTIVITY_BUDGET_SECONDS = 3.0
 _INTERRUPT_GRACE_SECONDS = 1.0
+# Repeat callers are answered from the last result rather than re-running the
+# scan. The iOS client polls the overview every 30s, so with several clients
+# connected this is the difference between a scan every few seconds and one
+# per interval. Shorter than the client poll so a single client still sees
+# fresh numbers on every poll.
+ACTIVITY_CACHE_TTL_SECONDS = 20.0
+# How long to leave the database alone after a query could not finish inside
+# its budget. Until the underlying scan is cheap (#78), retrying every poll
+# keeps the instance saturated permanently.
+ACTIVITY_BACKOFF_SECONDS = 60.0
 
 
 class CockpitService:
@@ -67,6 +77,19 @@ class CockpitService:
         # so a query abandoned at its budget still blocks the next attempt until
         # it has actually finished and closed its connection.
         self._activity_slot = threading.BoundedSemaphore(1)
+        # The slot stops *concurrent* queries; it does nothing about
+        # back-to-back ones. Several clients polling every 30s produced a
+        # near-continuous scan, and each scan saturates the shared DuckDB
+        # instance hard enough to starve every harness listing endpoint behind
+        # it -- the server looked alive while /harness timed out (#91).
+        #
+        # So: answer repeat callers from the last result, and after a query
+        # that could not finish in its budget, stay quiet for a while instead
+        # of trying again on the very next poll. A budget that gives up and
+        # immediately retries is worse than no budget at all.
+        self._activity_lock = threading.Lock()
+        self._activity_cache: tuple[Any, dict[str, Any], float] | None = None
+        self._activity_quiet_until = 0.0
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
         provider_capacity = self._provider_capacity(filters)
@@ -136,6 +159,22 @@ class CockpitService:
             return _section("error", data=[], coverage=None)
 
     def _activity(self, filters: AnalyticsFilters) -> dict[str, Any]:
+        cache_key = asdict(filters)
+        now = time.monotonic()
+        with self._activity_lock:
+            cached = self._activity_cache
+            if (
+                cached is not None
+                and cached[0] == cache_key
+                and now - cached[2] < ACTIVITY_CACHE_TTL_SECONDS
+            ):
+                return cached[1]
+            if now < self._activity_quiet_until:
+                # Still cooling off from a query that blew its budget. Running
+                # it again would just re-saturate the database for another
+                # budget's worth of everyone else's latency.
+                return _section("error", data=None, coverage=None)
+
         if not self._activity_slot.acquire(blocking=False):
             # A previous attempt is still unwinding. Starting another would
             # stack a second multi-minute query on the same database: the 30s
@@ -145,16 +184,22 @@ class CockpitService:
             return _section("error", data=None, coverage=None)
         try:
             result = self._activity_within_budget(filters)
-            return _section(
+            section = _section(
                 "ok",
                 data=asdict(result),
                 observed_at=result.metadata.observed_at,
                 coverage=asdict(result.coverage),
             )
+            with self._activity_lock:
+                self._activity_cache = (cache_key, section, time.monotonic())
+                self._activity_quiet_until = 0.0
+            return section
         except ValueError:
             raise
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render observed activity: %s", exc)
+            with self._activity_lock:
+                self._activity_quiet_until = time.monotonic() + ACTIVITY_BACKOFF_SECONDS
             return _section("error", data=None, coverage=None)
 
     def _activity_within_budget(self, filters: AnalyticsFilters) -> ActivityAnalytics:
