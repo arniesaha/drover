@@ -79,6 +79,28 @@ public final class SessionStore {
             .sorted(by: Self.byActivityDescending)
     }
 
+    /// The inbox list, as one uninterrupted run ordered by recency: whatever
+    /// moved most recently is at the top, whether it is waiting on you or
+    /// still working. Attention only breaks ties between sessions with the
+    /// same (or no) activity date — see `activeOrdering`.
+    ///
+    /// The screen used to build this itself, as two `ForEach`es with four
+    /// analytics sections between them, needs-you above and working below.
+    /// That read as a sort bug: a session touched 27 minutes ago rendered
+    /// three sections below one last touched two days ago (#80).
+    ///
+    /// Pinning capacity fixed the split; ordering by recency was the second
+    /// half of the decision. Bucket-first was defensible while the analytics
+    /// sections separated the two groups — once the list is contiguous, a
+    /// two-day-old question sitting above live work is just stale-first.
+    public var inboxSessions: [SessionSummary] {
+        Self.inboxSessions(from: snapshot?.sessions ?? [])
+    }
+
+    public nonisolated static func inboxSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
+        activeSessions(from: sessions)
+    }
+
     public var finished: [SessionSummary] {
         (snapshot?.sessions ?? [])
             .filter { $0.attention == .done || $0.attention == .errored }
@@ -239,7 +261,7 @@ public final class SessionStore {
 
     // MARK: - Private helpers
 
-    private static func needsYouOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+    private nonisolated static func needsYouOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
         if lhs.attention != rhs.attention {
             return lhs.attention == .needsApproval
         }
