@@ -681,15 +681,25 @@ def quality_snapshot(
     now: datetime | None = None,
     required_agent_ids: Iterable[str] | None = None,
     deep: bool = True,
+    role: str = "diagnostic",
 ) -> dict:
     """Return a structured Drover data-quality snapshot.
 
     The snapshot is derived from ``runtime_audit`` so the CLI, automation, and
     Grafana metrics all use the same read-only lakehouse health signals.
+
+    ``role`` is the DuckDB connection profile, defaulting to the
+    single-threaded ``diagnostic`` one because this is reachable from the CLI
+    against the live database. Pass ``role="snapshot"`` only when
+    ``duckdb_path`` is a private copy (see ``drover.server.db``).
     """
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     audit = runtime_audit(
-        duckdb_path=duckdb_path, incoming_dir=incoming_dir, hours=hours, deep=deep
+        duckdb_path=duckdb_path,
+        incoming_dir=incoming_dir,
+        hours=hours,
+        deep=deep,
+        role=role,
     )
     categories = {
         "freshness": _freshness_category(

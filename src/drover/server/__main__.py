@@ -125,6 +125,25 @@ def _warm_cockpit(service: "CockpitService") -> None:
     threading.Thread(target=run, name="cockpit-warmup", daemon=True).start()
 
 
+def _warm_metrics(collector: MetricsCollector) -> None:
+    """Build the first /metrics render in the background at startup.
+
+    Same bargain as ``_warm_cockpit``, for the other cold path: the first
+    scrape after a restart copies the database and globs a parquet tree this
+    DuckDB instance has never seen, measured at 35.6s against 7-15s warm
+    (#78). Once this lands, scrapes are served from cache and refreshed
+    behind the request.
+    """
+
+    def run() -> None:
+        try:
+            collector.warm()
+        except Exception:  # noqa: BLE001 - warming is best effort
+            log.debug("metrics warm-up failed; the first scrape pays instead")
+
+    threading.Thread(target=run, name="metrics-warmup", daemon=True).start()
+
+
 def _create_content_analysis_worker(
     *,
     cfg: DroverConfig,
@@ -1484,6 +1503,7 @@ def run(
                 collector=metrics_collector,
                 auth=auth,
             )
+            _warm_metrics(metrics_collector)
             provider_refresh = ProviderRefreshLoop(
                 provider_usage=provider_usage,
                 registry=HarnessRegistry(cfg.duckdb_path),
