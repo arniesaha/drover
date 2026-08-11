@@ -461,3 +461,109 @@ def test_event_mirror_close_does_not_leak_a_parked_worker_thread():
 
     mirror._thread.join(timeout=5)
     assert not mirror._thread.is_alive(), "worker thread parked forever after close()"
+
+
+class _StubChannel:
+    """A relay channel with a fixed backlog, then nothing (recv -> None)."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.closed = False
+        self.recv_calls = 0
+
+    def recv(self, timeout_s: float):
+        del timeout_s
+        self.recv_calls += 1
+        if not self._messages:
+            return None
+        return self._messages.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _RecordingMirror:
+    def __init__(self):
+        self.offered = []
+
+    def offer(self, record) -> None:
+        self.offered.append(record)
+
+
+def _event_message(event_id: str, event_type: str):
+    return {
+        "type": "event",
+        "event": {
+            "event_id": event_id,
+            "event_type": event_type,
+            "payload": {"text": "hello-relay"},
+        },
+    }
+
+
+def test_closing_terminal_channel_rescues_its_undrained_events():
+    """Issue #90: a detach used to discard events already on the channel.
+
+    harnessd sends a PTY read's raw ``output`` frame before the
+    ``terminal.output`` event frame that records it, so the event frame is
+    the most likely thing in flight when the app side goes away. The
+    forwarding loop returns the moment ``stop`` is set, and closing the
+    channel then dropped whatever it had not read -- silently, with nothing
+    counting it. This is the CI flake in ``test_relay_e2e`` ("hub never
+    mirrored a terminal.output event"): under load the event never arrived
+    at all, not late.
+    """
+    channel = _StubChannel(
+        [
+            {"type": "output", "data": "hello-relay\n"},
+            _event_message("e-out", "terminal.output"),
+        ]
+    )
+    mirror = _RecordingMirror()
+
+    rescued = app_module._drain_channel_into_mirror(channel, "s1", mirror)
+
+    assert rescued == 1
+    assert [record["event_type"] for record in mirror.offered] == ["terminal.output"]
+    assert mirror.offered[0]["event_id"] == "e-out"
+
+
+def test_channel_drain_stops_on_an_empty_channel_without_spinning():
+    """The common path: nothing buffered, so teardown pays one poll."""
+    channel = _StubChannel([])
+    mirror = _RecordingMirror()
+
+    assert app_module._drain_channel_into_mirror(channel, "s1", mirror) == 0
+    assert channel.recv_calls == 1
+    assert mirror.offered == []
+
+
+def test_channel_drain_is_bounded_against_a_peer_that_keeps_talking():
+    """Teardown runs on a request-handler thread; a chatty peer must not own
+    it. The count bound has to hold even when recv never returns None."""
+
+    class _EndlessChannel:
+        def __init__(self):
+            self.n = 0
+
+        def recv(self, timeout_s: float):
+            del timeout_s
+            self.n += 1
+            return _event_message(f"e-{self.n}", "terminal.output")
+
+    mirror = _RecordingMirror()
+    rescued = app_module._drain_channel_into_mirror(_EndlessChannel(), "s1", mirror)
+
+    assert rescued == app_module.MIRROR_DRAIN_MAX
+
+
+def test_channel_drain_never_raises_out_of_teardown():
+    """A channel that errors on recv must not break the finally block."""
+
+    class _AngryChannel:
+        def recv(self, timeout_s: float):
+            del timeout_s
+            raise OSError("channel is gone")
+
+    mirror = _RecordingMirror()
+    assert app_module._drain_channel_into_mirror(_AngryChannel(), "s1", mirror) == 0
