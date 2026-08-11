@@ -11,6 +11,7 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from click.testing import CliRunner
 
 from drover.config import default_config
@@ -284,8 +285,13 @@ def test_seed_redis_streams_publishes_live_recap_source_seq(tmp_path):
     assert stream.items == [{"session_id": "s1", "source_seq": "12"}]
 
 
+@pytest.mark.parametrize(
+    "summarizer_start_error",
+    [False, True],
+    ids=["summarizer-starts", "summarizer-start-fails"],
+)
 def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, summarizer_start_error
 ) -> None:
     """The foreground server owns recap worker lifecycle beside summarization."""
     events: list[tuple[str, str]] = []
@@ -335,6 +341,8 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
 
         def start(self) -> None:
             events.append(("summarizer", "start"))
+            if summarizer_start_error:
+                raise RuntimeError("summarizer startup failed")
 
         def stop(self) -> None:
             events.append(("summarizer", "stop"))

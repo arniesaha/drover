@@ -1576,6 +1576,11 @@ def run(
                 gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
                 wake_timeout_s=cfg.summarizer_wake_timeout_s,
             )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "summarizer backend configuration failed; continuing without it"
+            )
+        else:
             if not _summarizer_backend_available(backend_cfg):
                 log.warning(
                     "summarizer not started: no Anthropic creds "
@@ -1583,22 +1588,26 @@ def run(
                     "and no [summarizer] local_ollama_url or gpu_*_url configured — jobs will remain queued"
                 )
             else:
-                summarizer = SummarizerWorker(
-                    duckdb_path=cfg.duckdb_path,
-                    backend_config=backend_cfg,
-                    job_kind="incremental",
-                    batch_size=cfg.summarizer_batch_size,
-                    job_stream=job_streams.get("summarize"),
-                    brief_job_stream=job_streams.get("brief"),
-                    embed_job_stream=job_streams.get("embed_session"),
-                )
-                summarizer.start()
-                log.info(
-                    "summarizer ready (policy=%s, api=%s, local=%s)",
-                    backend_cfg.backend_policy,
-                    "yes" if backend_cfg.has_anthropic_creds else "no",
-                    "yes" if backend_cfg.has_local_backend else "no",
-                )
+                try:
+                    summarizer = SummarizerWorker(
+                        duckdb_path=cfg.duckdb_path,
+                        backend_config=backend_cfg,
+                        job_kind="incremental",
+                        batch_size=cfg.summarizer_batch_size,
+                        job_stream=job_streams.get("summarize"),
+                        brief_job_stream=job_streams.get("brief"),
+                        embed_job_stream=job_streams.get("embed_session"),
+                    )
+                    summarizer.start()
+                    log.info(
+                        "summarizer ready (policy=%s, api=%s, local=%s)",
+                        backend_cfg.backend_policy,
+                        "yes" if backend_cfg.has_anthropic_creds else "no",
+                        "yes" if backend_cfg.has_local_backend else "no",
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("summarizer failed to start; continuing without it")
+                    summarizer = None
                 try:
                     live_recap = LiveRecapWorker(
                         duckdb_path=cfg.duckdb_path,
@@ -1612,9 +1621,6 @@ def run(
                         "live recap worker failed to start; continuing without it"
                     )
                     live_recap = None
-        except Exception:  # noqa: BLE001
-            log.exception("summarizer failed to start; continuing without it")
-            summarizer = None
 
     embeddings: EmbedWorker | None = None
     if not no_embeddings:
