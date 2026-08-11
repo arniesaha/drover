@@ -207,7 +207,11 @@ final class E2EValidationUITests: XCTestCase {
             throw XCTSkip("DROVER_SMOKE_TOKEN not set — seeded recap E2E skipped")
         }
         guard let sessionID = env["DROVER_SMOKE_RECAP_SESSION_ID"], !sessionID.isEmpty else {
-            throw XCTSkip("DROVER_SMOKE_RECAP_SESSION_ID not set — seeded recap E2E skipped")
+            XCTFail(
+                "DROVER_SMOKE_RECAP_SESSION_ID is required when live E2E is enabled; "
+                    + "seed a Codex recap session before running this suite"
+            )
+            return
         }
         let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
         let expectedRecap = "Improving previews; verifying the chat header."
