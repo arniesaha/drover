@@ -66,7 +66,7 @@ This is a dedicated live-recap projection. It does not repurpose closed-session 
 
 The fleet snapshot adds an optional `recap` field to each structured session. Its existing `preview` remains available as the initial-request fallback and for backward compatibility.
 
-After persisting a recap, the worker appends a `status` event with subtype `session_recap`, containing the recap and its source sequence. Open chats receive that event through the existing session stream, update their title, and exclude that subtype from transcript folding. Fleet polling obtains the identical stored recap from the snapshot. Older clients ignore the additive snapshot field and safely fold the recognized status event with other status updates.
+Fleet polling obtains the stored recap and source sequence from the snapshot. When an open chat receives `turn_complete`, it starts a bounded one-second metadata poll and stops when the snapshot's recap source sequence reaches that turn's sequence or after 30 seconds. It keeps the previous recap throughout the poll. This avoids inserting server-generated records into the host-owned message sequence while still updating the title without requiring navigation. Older clients ignore the additive snapshot fields.
 
 ## Codex Context Usage
 
@@ -124,7 +124,7 @@ When only the used count is known:
 - Stale worker output cannot replace a newer requested recap.
 - Failed or malformed generation retains the last successful recap.
 - Fleet snapshots expose recap text while preserving the existing preview fallback.
-- A successful generation emits a `status/session_recap` stream event with the same text and source sequence.
+- A successful generation advances the snapshot's recap and source sequence atomically.
 - Terminal sessions do not enqueue live recaps.
 - The Codex driver resolves effective context windows from model metadata and degrades cleanly when metadata is absent.
 
@@ -133,6 +133,7 @@ When only the used count is known:
 - Session models decode snapshots with and without `recap`.
 - Structured cards prefer `recap`, then fall back to the existing preview.
 - Chat state updates its title when a newer recap arrives.
+- Chat metadata polling stops when the recap reaches the completed turn, after 30 seconds, or when the view stops.
 - Codex context usage is the delta between consecutive cumulative input totals.
 - Codex cached input is not double-counted.
 - First-sample and reset cases use the latest cumulative input value.
