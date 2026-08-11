@@ -225,6 +225,16 @@ struct SessionsView: View {
         store.inboxSessions
     }
 
+    /// How far behind the snapshot every card below is drawn from.
+    ///
+    /// Recomputed on each render, which is what keeps the age honest: a failed
+    /// poll still mutates `refreshAttempts` and `lastRefreshOutcome`, so an
+    /// unreachable hub re-renders this screen every five seconds and the cards'
+    /// ages climb even though no snapshot lands.
+    private var freshness: SnapshotFreshness {
+        store.freshness()
+    }
+
     private var providerSectionStatus: DataStatus {
         let responseStatus = cockpitStore.overview?.providerCapacity.status ?? .ok
         if cockpitStore.providerError != nil, responseStatus == .ok {
@@ -332,7 +342,11 @@ struct SessionsView: View {
                 TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
             }
         } label: {
-            SessionRow(session: session, hostTitle: hostTitle(for: session))
+            SessionRow(
+                session: session,
+                hostTitle: hostTitle(for: session),
+                freshness: freshness
+            )
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(session.id)
