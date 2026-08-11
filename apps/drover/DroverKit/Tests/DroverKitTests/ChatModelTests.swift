@@ -179,6 +179,53 @@ struct ChatModelTests {
     #expect(snapshots.snapshotRequestCount == 2)
 }
 
+@Test @MainActor func recapPollRetriesAfterFailedSnapshot() async {
+    let requests = RequestCounter()
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        requests.bump()
+        if requests.value == 1 {
+            return (500, Data(#"{"error": "temporary failure"}"#.utf8))
+        }
+        return (200, sessionJSON(recap: "Recovered", source: 12))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+
+    await eventually { model.recap == "Recovered" }
+    #expect(model.recapSourceSeq == 12)
+    #expect(requests.value == 2)
+}
+
+@Test @MainActor func recapPollKeepsCurrentTextUntilTargetSourceArrives() async {
+    let requests = RequestCounter()
+    let target = DelayedSnapshotResponse(sessionJSON(recap: "Target", source: 12))
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        requests.bump()
+        if requests.value == 1 {
+            return (200, sessionJSON(recap: "Intermediate", source: 10))
+        }
+        return (200, target.waitForRelease())
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+    await eventually { target.hasStarted }
+
+    #expect(model.recap == "Old")
+    #expect(model.recapSourceSeq == 8)
+
+    target.finish()
+    await eventually { model.recap == "Target" }
+    #expect(model.recapSourceSeq == 12)
+}
+
 @Test @MainActor func recapPollStopsAfterConfiguredAttemptsAndKeepsLastGoodText() async {
     let snapshots = snapshotClient(repeating: sessionJSON(recap: "Old", source: 8))
     let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",

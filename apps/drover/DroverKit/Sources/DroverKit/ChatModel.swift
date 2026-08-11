@@ -491,16 +491,24 @@ public final class ChatModel {
                 }
             }
             for attempt in 0..<attempts {
+                guard !Task.isCancelled else { return }
+                let metadata = await Self.fetchSessionMetadata(client: client, sessionID: sessionID)
                 guard !Task.isCancelled,
-                      let metadata = await Self.fetchSessionMetadata(
-                        client: client, sessionID: sessionID
-                      ),
-                      !Task.isCancelled,
                       let self,
                       self.recapRefreshGeneration == generation
                 else { return }
-                self.applySessionMetadata(metadata.snapshot, session: metadata.session)
-                if (self.recapSourceSeq ?? -1) >= targetSequence { return }
+
+                // A recap writer can lag the stream by several snapshots.
+                // Keep the currently displayed successful recap until this
+                // completion's source sequence is present; failed, missing,
+                // and intermediate snapshots all consume one bounded attempt.
+                if let metadata,
+                   let recap = metadata.session.recap, !recap.isEmpty,
+                   let sourceSequence = metadata.session.recapSourceSeq,
+                   sourceSequence >= targetSequence {
+                    self.applySessionMetadata(metadata.snapshot, session: metadata.session)
+                    return
+                }
                 guard attempt + 1 < attempts else { return }
                 do {
                     try await Task.sleep(for: interval)
