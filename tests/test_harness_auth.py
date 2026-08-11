@@ -348,6 +348,30 @@ def test_agy_auth_status_accepts_oauth_blob_without_an_account_file(
     assert status.label is None
 
 
+def test_agy_auth_status_accepts_antigravity_oauth_token_file(monkeypatch, tmp_path):
+    adapter, _agy, home = _agy_adapter(monkeypatch, tmp_path)
+    cli_dir = home / ".gemini/antigravity-cli"
+    cli_dir.mkdir(parents=True)
+    (cli_dir / "antigravity-oauth-token").write_text("{}")
+
+    status = adapter.status()
+
+    assert status.state == "authenticated"
+    assert status.label is None
+
+
+def test_agy_auth_status_falls_back_to_old_account_list(monkeypatch, tmp_path):
+    adapter, _agy, home = _agy_adapter(monkeypatch, tmp_path)
+    (home / ".gemini/google_accounts.json").write_text(
+        json.dumps({"active": None, "old": ["someone@example.com"]})
+    )
+
+    status = adapter.status()
+
+    assert status.state == "authenticated"
+    assert status.label == "someone@example.com"
+
+
 def test_manager_starts_and_polls_successful_flow(tmp_path):
     script = tmp_path / "login.py"
     script.write_text(

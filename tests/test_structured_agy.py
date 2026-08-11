@@ -244,3 +244,12 @@ def test_provider_probe_never_raises_on_a_broken_accounts_file(tmp_path: Path):
     snapshot = AgyUsageProbe(accounts_path=accounts).read()
 
     assert snapshot.account_label == "Antigravity"
+
+
+def test_provider_probe_falls_back_to_old_accounts_when_active_is_null(tmp_path: Path):
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": None, "old": ["someone@example.com"]}))
+
+    snapshot = AgyUsageProbe(accounts_path=accounts).read()
+
+    assert snapshot.account_label == "someone@example.com"

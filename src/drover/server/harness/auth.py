@@ -292,15 +292,25 @@ def _parse_agy_status(
     account_label = None
     try:
         raw = json.loads((root / ".gemini/google_accounts.json").read_text())
-        if isinstance(raw, dict) and isinstance(raw.get("active"), str):
-            account_label = raw["active"].strip() or None
+        if isinstance(raw, dict):
+            if isinstance(raw.get("active"), str) and raw["active"].strip():
+                account_label = raw["active"].strip()
+            elif (
+                isinstance(raw.get("old"), list)
+                and raw["old"]
+                and isinstance(raw["old"][0], str)
+                and raw["old"][0].strip()
+            ):
+                account_label = raw["old"][0].strip()
     except (OSError, ValueError):
         account_label = None
     if account_label:
         return HarnessAuthStatus(
             "agy", "authenticated", label=account_label, detail="Antigravity CLI"
         )
-    if (root / ".gemini/oauth_creds.json").exists():
+    if (root / ".gemini/oauth_creds.json").exists() or (
+        root / ".gemini/antigravity-cli/antigravity-oauth-token"
+    ).exists():
         return HarnessAuthStatus("agy", "authenticated", detail="Antigravity CLI")
     return HarnessAuthStatus("agy", "unknown", detail=output or None)
 
