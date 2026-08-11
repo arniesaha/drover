@@ -128,15 +128,6 @@ final class E2EValidationUITests: XCTestCase {
         XCTAssertTrue(horseradish.waitForExistence(timeout: 240),
                       "the starting prompt should produce the exact reply bubble")
 
-        let title = app.staticTexts["chat-recap-title"]
-        XCTAssertTrue(title.waitForExistence(timeout: 30),
-                      "chat should expose its recap as the navigation title")
-        XCTAssertEqual(title.label, "Improving previews; verifying the chat header.")
-        let metadata = app.staticTexts["chat-header-metadata"]
-        XCTAssertTrue(metadata.waitForExistence(timeout: 30),
-                      "chat should expose harness and context metadata")
-        XCTAssertTrue(metadata.label.contains("Codex"))
-        XCTAssertTrue(metadata.label.contains("ctx"))
         shoot(app, "05-chat-first-reply")
 
         // ── 4. A follow-up turn through the composer ──────────────────────
@@ -202,6 +193,51 @@ final class E2EValidationUITests: XCTestCase {
 
         // Hold briefly so external screenshots can catch the final state.
         Thread.sleep(forTimeInterval: 3)
+    }
+
+    /// Header-specific fixture: `DROVER_SMOKE_RECAP_SESSION_ID` must name a
+    /// Codex structured session whose snapshot row already carries the recap
+    /// below and whose event stream includes a Codex turn-completion payload
+    /// with context usage. Keeping that fixture separate from the mutating
+    /// launch/resume smoke test makes the recap and provider deterministic.
+    @MainActor
+    func testSeededCodexRecapHeader() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
+            throw XCTSkip("DROVER_SMOKE_TOKEN not set — seeded recap E2E skipped")
+        }
+        guard let sessionID = env["DROVER_SMOKE_RECAP_SESSION_ID"], !sessionID.isEmpty else {
+            throw XCTSkip("DROVER_SMOKE_RECAP_SESSION_ID not set — seeded recap E2E skipped")
+        }
+        let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
+        let expectedRecap = "Improving previews; verifying the chat header."
+
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_BASE_URL"] = serverURL
+        app.launchEnvironment["DROVER_TOKEN"] = token
+        app.launch()
+
+        let row = app.buttons[sessionID]
+        XCTAssertTrue(row.waitForExistence(timeout: 30),
+                      "seeded Codex recap session should be listed")
+        row.tap()
+
+        let title = app.staticTexts.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@",
+            "chat-recap-title", expectedRecap
+        )).firstMatch
+        XCTAssertTrue(title.waitForExistence(timeout: 30),
+                      "chat should render the seeded recap title")
+        XCTAssertEqual(title.label, expectedRecap)
+
+        let metadata = app.staticTexts.matching(NSPredicate(
+            format: "identifier == %@ AND label CONTAINS[c] %@ AND label CONTAINS[c] %@",
+            "chat-header-metadata", "Codex", "ctx"
+        )).firstMatch
+        XCTAssertTrue(metadata.waitForExistence(timeout: 30),
+                      "chat should render Codex context metadata")
+        XCTAssertTrue(metadata.label.contains("Codex"))
+        XCTAssertTrue(metadata.label.contains("ctx"))
     }
 
     /// Diagnostic reproduction against an explicitly selected long session.
