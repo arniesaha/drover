@@ -10,15 +10,30 @@ import DroverKit
 /// session wants you, a hollow ring while it works, and a faint ring once it
 /// has finished. That is deliberate — a pale fill disappears on a light
 /// ground, which is why there is one accent here and no traffic-light palette.
+///
+/// Staleness is carried the same way. When the hub is unreachable the inbox
+/// keeps rendering the last-known snapshot — right, and it stays — but a card
+/// drawn from it used to look identical to a live one, down to a relative
+/// timestamp that kept counting up against *now* while the data underneath it
+/// was frozen (#81). A stale card breaks its dot to a dashed ring, freezes
+/// that timestamp against the snapshot, and trades its verb for the snapshot's
+/// own age. Same statement the provider capacity strip has always made.
 struct SessionRow: View {
     let session: SessionSummary
     let hostTitle: String
+    /// How far behind the snapshot this card was drawn from is. The default is
+    /// "never stale", so previews and any caller without a store are unchanged.
+    var freshness: SnapshotFreshness = .live
 
     var body: some View {
-        let card = SessionCardPresentation(session: session, hostTitle: hostTitle)
+        let card = SessionCardPresentation(
+            session: session,
+            hostTitle: hostTitle,
+            freshness: freshness
+        )
 
         HStack(alignment: .top, spacing: 11) {
-            StateDot(attention: session.attention)
+            StateDot(attention: session.attention, isStale: card.isStale)
                 .padding(.top, 5)
 
             VStack(alignment: .leading, spacing: 5) {
@@ -36,7 +51,17 @@ struct SessionRow: View {
 
                     Spacer(minLength: 8)
 
-                    if let activityDate = session.activityDate {
+                    // A stale card's timestamp is a static string measured
+                    // against the snapshot, not a live formatter measured
+                    // against now. The ticking version is the whole deception:
+                    // `lastActivity` is frozen inside the snapshot while the
+                    // formatter recomputes every render, so a card nobody has
+                    // refreshed in ten minutes still counts up like live data.
+                    if let frozen = card.frozenActivityText {
+                        Text(frozen)
+                            .lineLimit(1)
+                            .fixedSize()
+                    } else if let activityDate = session.activityDate {
                         Text(activityDate, format: .relative(presentation: .numeric))
                             .lineLimit(1)
                             .fixedSize()
@@ -70,20 +95,34 @@ struct SessionRow: View {
 
                     Spacer(minLength: 8)
 
-                    // Outlined, never filled — the system guide is explicit
-                    // that a primary action is an accent outline.
-                    Text(card.action.rawValue)
-                        .font(.system(.caption, design: .default, weight: .medium))
-                        .foregroundStyle(isWaiting ? DroverColor.accentHi : DroverColor.muted)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .overlay {
-                            Capsule().strokeBorder(
-                                isWaiting ? AnyShapeStyle(DroverColor.accent) : AnyShapeStyle(DroverColor.line),
-                                lineWidth: 1
-                            )
-                        }
-                        .fixedSize()
+                    if let action = card.action {
+                        // Outlined, never filled — the system guide is explicit
+                        // that a primary action is an accent outline.
+                        Text(action.rawValue)
+                            .font(.system(.caption, design: .default, weight: .medium))
+                            .foregroundStyle(isWaiting ? DroverColor.accentHi : DroverColor.muted)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .overlay {
+                                Capsule().strokeBorder(
+                                    isWaiting ? AnyShapeStyle(DroverColor.accent) : AnyShapeStyle(DroverColor.line),
+                                    lineWidth: 1
+                                )
+                            }
+                            .fixedSize()
+                    } else if let note = card.staleNote {
+                        // Deliberately not a capsule: the outline is what says
+                        // "this is a thing you do", and there is nothing here
+                        // to do. It occupies the same slot at the same padding
+                        // so the card's height does not move when a link drops.
+                        Text(note)
+                            .font(.system(.caption, design: .default, weight: .medium))
+                            .foregroundStyle(DroverColor.faint)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .fixedSize()
+                            .accessibilityIdentifier("session-stale-note")
+                    }
                 }
                 .padding(.top, 1)
             }
@@ -99,8 +138,24 @@ struct SessionRow: View {
                 .strokeBorder(DroverColor.line, lineWidth: 1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(card.title). \(card.subtitle)")
-        .accessibilityHint("\(card.action.rawValue) this session")
+        .accessibilityLabel(accessibilityLabel(for: card))
+        .accessibilityHint(accessibilityHint(for: card))
+    }
+
+    /// A dashed ring is invisible to VoiceOver, so staleness is said out loud
+    /// — before the state phrase it is qualifying, not after it.
+    private func accessibilityLabel(for card: SessionCardPresentation) -> String {
+        guard let note = card.staleNote else {
+            return "\(card.title). \(card.subtitle)"
+        }
+        return "\(note). \(card.title). \(card.subtitle)"
+    }
+
+    private func accessibilityHint(for card: SessionCardPresentation) -> String {
+        guard let action = card.action else {
+            return "Showing last reported state. Open to load live state."
+        }
+        return "\(action.rawValue) this session"
     }
 
     private var isWaiting: Bool {
@@ -109,20 +164,34 @@ struct SessionRow: View {
 }
 
 /// Session and host state as *form*: filled = wants you, hollow ring =
-/// working, faint ring = finished.
+/// working, faint ring = finished — and a broken ring when the state itself is
+/// last-known rather than current.
 struct StateDot: View {
     let attention: AttentionState
+    /// Overrides the state form entirely rather than tinting it. A stale card's
+    /// `attention` is the field we cannot vouch for, so drawing it as a
+    /// confident filled disc would be asserting the very thing in doubt.
+    var isStale: Bool = false
     var diameter: CGFloat = 7
 
     var body: some View {
         Group {
-            switch attention {
-            case .needsApproval, .needsInput:
-                Circle().fill(DroverColor.accent)
-            case .working:
-                Circle().strokeBorder(DroverColor.accentHi, lineWidth: 1.5)
-            case .done, .errored:
-                Circle().strokeBorder(DroverColor.line, lineWidth: 1)
+            if isStale {
+                // A broken ring, at the working ring's weight: 7pt of dashed
+                // hairline reads as nothing at all.
+                Circle().strokeBorder(
+                    DroverColor.muted,
+                    style: StrokeStyle(lineWidth: 1.5, dash: [2, 2])
+                )
+            } else {
+                switch attention {
+                case .needsApproval, .needsInput:
+                    Circle().fill(DroverColor.accent)
+                case .working:
+                    Circle().strokeBorder(DroverColor.accentHi, lineWidth: 1.5)
+                case .done, .errored:
+                    Circle().strokeBorder(DroverColor.line, lineWidth: 1)
+                }
             }
         }
         .frame(width: diameter, height: diameter)
