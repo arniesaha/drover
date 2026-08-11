@@ -56,6 +56,69 @@ struct StoreTests {
     ]).map(\.id) == ["new-running", "older-input", "oldest-approval"])
 }
 
+/// The inbox list is one run: everything that wants a human, then everything
+/// running, and nothing in between. The screen used to assemble this itself out
+/// of two buckets with four analytics sections between them (#80), which read
+/// as a sort bug — a session touched minutes ago rendered below one last
+/// touched two days ago, with three sections in the gap.
+@Test @MainActor func inboxSessionsAreOneContiguousRunNeedsYouFirst() async throws {
+    let waitingTwoDaysAgo = SessionSummary(
+        id: "old-input", hostID: "mac-mini", harness: "claude-code", mode: "structured",
+        status: "running", awaiting: "input", cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 100)
+    )
+    let approvalYesterday = SessionSummary(
+        id: "approval", hostID: "mac-mini", harness: "claude-code", mode: "structured",
+        status: "running", awaiting: "approval", cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 200)
+    )
+    let runningMinutesAgo = SessionSummary(
+        id: "new-running", hostID: "mac-mini", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 900)
+    )
+    let runningEarlier = SessionSummary(
+        id: "old-running", hostID: "nas", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 300)
+    )
+    let finished = SessionSummary(
+        id: "done", hostID: "nas", harness: "codex", mode: "structured",
+        status: "completed", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 800)
+    )
+
+    let inbox = SessionStore.inboxSessions(from: [
+        runningEarlier, finished, waitingTwoDaysAgo, runningMinutesAgo, approvalYesterday,
+    ])
+
+    // Approval, then question, then running newest-first. Finished is not here:
+    // it has its own collapsed section under the list.
+    #expect(inbox.map(\.id) == ["approval", "old-input", "new-running", "old-running"])
+}
+
+/// The contiguity itself, stated as the invariant rather than as one example:
+/// once a running session appears, no needs-you session may follow it. Any
+/// future re-bucketing has to keep the two groups whole.
+@Test @MainActor func inboxSessionsNeverInterleaveTheBuckets() async throws {
+    let sessions = (0..<12).map { index in
+        SessionSummary(
+            id: "s\(index)", hostID: "mac-mini", harness: "codex", mode: "structured",
+            status: "running",
+            awaiting: [nil, "input", "approval"][index % 3],
+            cwd: nil,
+            lastActivity: Date(timeIntervalSince1970: TimeInterval(index * 60))
+        )
+    }
+
+    let inbox = SessionStore.inboxSessions(from: sessions)
+    let needsYou = inbox.map { $0.attention == .needsApproval || $0.attention == .needsInput }
+
+    #expect(inbox.count == sessions.count)
+    #expect(needsYou == needsYou.sorted(by: { $0 && !$1 }),
+            "needs-you and working sessions interleave: \(inbox.map(\.id))")
+}
+
 @Test @MainActor func refreshFailureKeepsSnapshotSetsError() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())

@@ -79,6 +79,29 @@ public final class SessionStore {
             .sorted(by: Self.byActivityDescending)
     }
 
+    /// The inbox list, as one uninterrupted run: everything that wants a human
+    /// first (approvals before questions, newest first), then everything still
+    /// running (newest first).
+    ///
+    /// The screen used to build this itself, as two `ForEach`es with four
+    /// analytics sections between them — which read as a sort bug, because a
+    /// session touched 27 minutes ago rendered three sections below one last
+    /// touched two days ago. The buckets are still real and still in this
+    /// order; they are simply no longer allowed to be split apart (see #80).
+    public var inboxSessions: [SessionSummary] {
+        Self.inboxSessions(from: snapshot?.sessions ?? [])
+    }
+
+    public nonisolated static func inboxSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
+        let needsYou = sessions
+            .filter { $0.attention == .needsApproval || $0.attention == .needsInput }
+            .sorted(by: needsYouOrdering)
+        let working = sessions
+            .filter { $0.attention == .working }
+            .sorted(by: byActivityDescending)
+        return needsYou + working
+    }
+
     public var finished: [SessionSummary] {
         (snapshot?.sessions ?? [])
             .filter { $0.attention == .done || $0.attention == .errored }
@@ -239,7 +262,7 @@ public final class SessionStore {
 
     // MARK: - Private helpers
 
-    private static func needsYouOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+    private nonisolated static func needsYouOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
         if lhs.attention != rhs.attention {
             return lhs.attention == .needsApproval
         }
