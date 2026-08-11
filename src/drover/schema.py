@@ -35,6 +35,8 @@ EXPECTED_TABLES = (
     "tasks",
     "session_summaries",
     "summarize_jobs",
+    "live_session_recaps",
+    "live_recap_jobs",
     "project_briefs",
     "brief_jobs",
     "session_embeddings",
@@ -128,6 +130,30 @@ _SUMMARIZE_JOBS_COLUMNS = {
     "dead_lettered_at": "TIMESTAMP",
     "stream_publish_needed": "BOOLEAN DEFAULT FALSE",
 }
+
+_LIVE_SESSION_RECAPS_DDL = """
+CREATE TABLE IF NOT EXISTS live_session_recaps (
+  session_id       VARCHAR PRIMARY KEY,
+  recap_text       VARCHAR NOT NULL,
+  source_seq       INTEGER NOT NULL,
+  generator_model  VARCHAR,
+  generated_at     TIMESTAMP NOT NULL DEFAULT now()
+);
+"""
+
+_LIVE_RECAP_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS live_recap_jobs (
+  session_id            VARCHAR PRIMARY KEY,
+  desired_source_seq    INTEGER NOT NULL,
+  status                VARCHAR NOT NULL,
+  attempts              INTEGER NOT NULL DEFAULT 0,
+  last_error            VARCHAR,
+  enqueued_at           TIMESTAMP NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMP NOT NULL DEFAULT now(),
+  next_run_at           TIMESTAMP,
+  stream_publish_needed BOOLEAN NOT NULL DEFAULT FALSE
+);
+"""
 
 # Project-level rollup keyed by `<repo_owner>/<repo_name>`. One row per
 # project; regenerated from session_summaries when activity warrants.
@@ -1415,6 +1441,8 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
+        con.execute(_LIVE_SESSION_RECAPS_DDL)
+        con.execute(_LIVE_RECAP_JOBS_DDL)
         con.execute(_PROJECT_BRIEFS_DDL)
         con.execute(_BRIEF_JOBS_DDL)
         _ensure_table_columns(con, "brief_jobs", _BRIEF_JOBS_COLUMNS)
