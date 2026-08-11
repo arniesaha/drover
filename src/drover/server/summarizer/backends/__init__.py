@@ -112,6 +112,7 @@ def select_backend(
         ACTIVE_BRIEF_REQUIRED_KEYS,
         BRIEF_OPTIONAL_KEYS,
         BRIEF_REQUIRED_KEYS,
+        LIVE_RECAP_REQUIRED_KEYS,
     )
 
     api_ready = config.allows_anthropic and config.has_anthropic_creds
@@ -123,6 +124,9 @@ def select_backend(
     elif job_kind == "active_brief":
         required_keys = ACTIVE_BRIEF_REQUIRED_KEYS
         optional_keys = ACTIVE_BRIEF_OPTIONAL_KEYS
+    elif job_kind == "live_recap":
+        required_keys = LIVE_RECAP_REQUIRED_KEYS
+        optional_keys = ()
     else:
         required_keys = None
         optional_keys = None

@@ -305,6 +305,36 @@ def test_select_backend_backfill_prefers_api() -> None:
     assert b.model == cfg.api_model
 
 
+def test_select_backend_live_recap_requires_recap_key() -> None:
+    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=None)
+
+    backend = select_backend(job_kind="live_recap", config=cfg)
+
+    assert backend.name == "anthropic"
+    assert backend.required_keys == ("recap",)
+    assert backend.optional_keys == ()
+
+
+def test_select_backend_live_recap_local_requires_string_recap() -> None:
+    cfg = SummarizerBackendConfig(
+        backend_policy="local",
+        api_key=None,
+        gpu_rig=_rig(),
+    )
+    envelope = {"response": json.dumps({"recap": 1})}
+
+    with (
+        patch("drover.server.wol.requests.get", return_value=_FakeResp()),
+        patch(
+            "drover.server.summarizer.backends.ollama.requests.post",
+            return_value=_FakeResp(payload=envelope),
+        ),
+    ):
+        backend = select_backend(job_kind="live_recap", config=cfg)
+        with pytest.raises(BackendError, match="recap must be a string"):
+            backend.summarize("prompt")
+
+
 def test_select_backend_falls_back_to_api_when_no_rig() -> None:
     cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=None)
     b = select_backend(job_kind="incremental", config=cfg)

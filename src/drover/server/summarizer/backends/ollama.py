@@ -22,6 +22,7 @@ from typing import Optional
 import requests
 
 from drover.server.summarizer.backends.types import BackendError, BackendReadinessError
+from drover.server.summarizer.client import LIVE_RECAP_REQUIRED_KEYS
 from drover.server.wol import GpuRig, GpuWakeError, ensure_gpu_awake, wait_for_ollama
 
 log = logging.getLogger("drover.summarizer.backends.ollama")
@@ -112,8 +113,12 @@ class OllamaBackend:
             )
             or DEFAULT_OLLAMA_KEEP_ALIVE
         )
-        self.required_keys = required_keys or _REQUIRED_KEYS
-        self.optional_keys = optional_keys or _OPTIONAL_KEYS
+        self.required_keys = (
+            required_keys if required_keys is not None else _REQUIRED_KEYS
+        )
+        self.optional_keys = (
+            optional_keys if optional_keys is not None else _OPTIONAL_KEYS
+        )
         self._awoken = False  # tracks whether we've wake-checked in this process
 
     def ensure_ready(self) -> None:
@@ -223,6 +228,10 @@ class OllamaBackend:
         missing = [k for k in self.required_keys if k not in parsed]
         if missing:
             raise BackendError(f"ollama: response missing required keys: {missing}")
+        if self.required_keys == LIVE_RECAP_REQUIRED_KEYS and not isinstance(
+            parsed["recap"], str
+        ):
+            raise BackendError("ollama: response recap must be a string")
 
         out: dict = {k: parsed[k] for k in self.required_keys}
         for k in self.optional_keys:
