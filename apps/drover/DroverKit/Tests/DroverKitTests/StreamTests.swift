@@ -40,7 +40,7 @@ struct StreamTests {
 @Test func historyThenLiveDedupedAndOrdered() async throws {
     // REST returns history seq 1-2; WS replays 2 (dup) then delivers 3.
     MockURLProtocol.handler = { request in
-        #expect(request.url!.query == "limit=200")
+        #expect(request.url!.query == "limit=50")
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
          "max_seq": 2}
@@ -211,9 +211,11 @@ struct StreamTests {
     let connector = FakeConnector([
         .frames([wireMessage(seq: 6, text: "six")], thenError: false)
     ])
+    // A two-message cold window, so the first page fills it and the older
+    // pages the handler can still serve stay behind the explicit request.
     let stream = MessageStream(
         client: client(), sessionID: "s1", connector: connector,
-        reconnectBaseDelay: .milliseconds(10)
+        reconnectBaseDelay: .milliseconds(10), coldWindowSize: 2
     )
 
     var batches: [[Int]] = []
@@ -236,8 +238,165 @@ struct StreamTests {
     // The live stream still starts at the snapshot cursor captured at max_seq.
     #expect(batches == [[4, 5]])
     #expect(live == [6])
-    #expect(queries == ["limit=200"])
+    #expect(queries == ["limit=50"])
     #expect(connector.requests.first?.url?.query == "after_seq=5")
+}
+
+@Test func coldCatchUpResumesFromPartialProgressAfterATransientFailure() async throws {
+    // Issue #79: the newest chunk lands, then the link drops on the chunk
+    // below it. The retry must continue from the retained cursor instead of
+    // re-fetching the whole cold window from zero — otherwise a link that
+    // cannot carry the window in one go never converges and the session sits
+    // on "Reconnecting…" forever.
+    nonisolated(unsafe) var queries: [String] = []
+    nonisolated(unsafe) var olderAttempts = 0
+    MockURLProtocol.handler = { request in
+        let query = request.url?.query ?? ""
+        queries.append(query)
+        if query == "limit=50" {
+            return (200, Data("""
+            {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
+            """.utf8))
+        }
+        olderAttempts += 1
+        if olderAttempts == 1 {
+            return (500, Data(#"{"error": "transient"}"#.utf8))
+        }
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
+         "page_min_seq": 1, "page_max_seq": 3, "max_seq": 5,
+         "has_older": false, "has_newer": true}
+        """.utf8))
+    }
+    let connector = FakeConnector([
+        .frames([wireMessage(seq: 6, text: "six")], thenError: false)
+    ])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var batches: [[Int]] = []
+    var live: [Int] = []
+    var drops = 0
+    for await event in await stream.events() {
+        switch event {
+        case let .history(messages, _): batches.append(messages.map(\.seq))
+        case let .message(message): live.append(message.seq)
+        case .connection(false): drops += 1
+        case .connection(true), .unauthorized: break
+        }
+        // One drop is the scripted failure; more means the stream is
+        // restarting the cold window instead of resuming it.
+        if live == [6] || drops > 1 { break }
+    }
+
+    // Exactly one snapshot-establishing request: the failed chunk is retried
+    // on its own, and the window is still published as a single batch.
+    #expect(queries == ["limit=50", "before_seq=4&limit=50", "before_seq=4&limit=50"])
+    #expect(batches == [[1, 2, 3, 4, 5]])
+    #expect(connector.requests.first?.url?.query == "after_seq=5")
+}
+
+@Test func coldCatchUpDiscardsARetainedWindowWhenAPageIsInconsistent() async throws {
+    // Retaining progress must not wedge the stream on a page the snapshot
+    // can never satisfy: a dropped request is resumable, a *malformed* one is
+    // not, so the window is thrown away and the snapshot re-established.
+    nonisolated(unsafe) var queries: [String] = []
+    nonisolated(unsafe) var olderAttempts = 0
+    MockURLProtocol.handler = { request in
+        let query = request.url?.query ?? ""
+        queries.append(query)
+        if query == "limit=50" {
+            return (200, Data("""
+            {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
+             "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
+             "has_older": true, "has_newer": false}
+            """.utf8))
+        }
+        olderAttempts += 1
+        if olderAttempts == 1 {
+            // Does not abut seq 4 — a gap, not a transient failure.
+            return (200, Data("""
+            {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
+             "page_min_seq": 1, "page_max_seq": 2, "max_seq": 5,
+             "has_older": false, "has_newer": true}
+            """.utf8))
+        }
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
+         "page_min_seq": 1, "page_max_seq": 3, "max_seq": 5,
+         "has_older": false, "has_newer": true}
+        """.utf8))
+    }
+    let connector = FakeConnector([.frames([], thenError: false)])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var batches: [[Int]] = []
+    var drops = 0
+    for await event in await stream.events() {
+        switch event {
+        case let .history(messages, _): batches.append(messages.map(\.seq))
+        case .connection(false): drops += 1
+        case .message, .connection(true), .unauthorized: break
+        }
+        if !batches.isEmpty || drops > 1 { break }
+    }
+
+    #expect(batches == [[1, 2, 3, 4, 5]])
+    #expect(queries == [
+        "limit=50", "before_seq=4&limit=50", "limit=50", "before_seq=4&limit=50",
+    ])
+}
+
+@Test func coldCatchUpAssemblesItsWindowInBoundedChunks() async throws {
+    // The cold window is unchanged at 200 messages, but no single request may
+    // carry more than one page of it.
+    nonisolated(unsafe) var queries: [String] = []
+    MockURLProtocol.handler = { request in
+        queries.append(request.url?.query ?? "")
+        let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+            .queryItems ?? []
+        func value(_ name: String) -> Int? {
+            Int(items.first { $0.name == name }?.value ?? "")
+        }
+        let upper = (value("before_seq") ?? 261) - 1
+        let lower = max(1, upper - (value("limit") ?? 0) + 1)
+        let body = (lower...upper)
+            .map { wireMessage(seq: $0, text: "m\($0)") }
+            .joined(separator: ", ")
+        return (200, Data("""
+        {"messages": [\(body)],
+         "page_min_seq": \(lower), "page_max_seq": \(upper), "max_seq": 260,
+         "has_older": \(lower > 1), "has_newer": \(upper < 260)}
+        """.utf8))
+    }
+    let connector = FakeConnector([.frames([], thenError: false)])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var batches: [[Int]] = []
+    for await event in await stream.events() {
+        if case let .history(messages, _) = event { batches.append(messages.map(\.seq)) }
+        if event == .connection(true) || event == .connection(false) { break }
+    }
+
+    #expect(queries == [
+        "limit=50",
+        "before_seq=211&limit=50",
+        "before_seq=161&limit=50",
+        "before_seq=111&limit=50",
+    ])
+    #expect(batches == [Array(61...260)])
+    #expect(await stream.olderHistoryAvailable())
+    #expect(connector.requests.first?.url?.query == "after_seq=260")
 }
 
 @Test func olderHistoryLoadsOnePageOnlyWhenRequested() async throws {
@@ -245,7 +404,7 @@ struct StreamTests {
     MockURLProtocol.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
-        if query == "limit=200" {
+        if query == "limit=50" {
             return (200, Data("""
             {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
              "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
@@ -261,7 +420,7 @@ struct StreamTests {
     let connector = FakeConnector([.frames([], thenError: false)])
     let stream = MessageStream(
         client: client(), sessionID: "s1", connector: connector,
-        reconnectBaseDelay: .milliseconds(10)
+        reconnectBaseDelay: .milliseconds(10), coldWindowSize: 2
     )
 
     var iterator = await stream.events().makeAsyncIterator()
@@ -269,11 +428,11 @@ struct StreamTests {
         if event == .connection(true) { break }
     }
 
-    #expect(queries == ["limit=200"])
+    #expect(queries == ["limit=50"])
     let older = try await stream.loadOlderHistory()
     #expect(older?.messages.map(\.seq) == [1, 2, 3])
     #expect(older?.hasOlder == false)
-    #expect(queries == ["limit=200", "before_seq=4&limit=200"])
+    #expect(queries == ["limit=50", "before_seq=4&limit=50"])
     #expect(try await stream.loadOlderHistory() == nil)
     #expect(queries.count == 2)
 }
@@ -298,7 +457,7 @@ struct StreamTests {
         if event == .connection(false) { break }
     }
 
-    #expect(queries.first == "limit=200")
+    #expect(queries.first == "limit=50")
     #expect(connector.requests.isEmpty)
 }
 
@@ -308,7 +467,7 @@ struct StreamTests {
     MockURLProtocol.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
-        if query == "limit=200" {
+        if query == "limit=50" {
             return (200, Data("""
             {"messages": [\(wireMessage(seq: 4, text: "four")), \(wireMessage(seq: 5, text: "five"))],
              "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
@@ -328,7 +487,7 @@ struct StreamTests {
     let connector = FakeConnector([.frames([], thenError: false)])
     let stream = MessageStream(
         client: client(), sessionID: "s1", connector: connector,
-        reconnectBaseDelay: .milliseconds(10)
+        reconnectBaseDelay: .milliseconds(10), coldWindowSize: 2
     )
 
     let events = await stream.events()
@@ -352,8 +511,8 @@ struct StreamTests {
     await stream.stop()
 
     #expect(retry?.messages.map(\.seq) == [1, 2, 3])
-    #expect(queries.first == "limit=200")
-    #expect(queries.filter { $0 == "before_seq=4&limit=200" }.count == 2)
+    #expect(queries.first == "limit=50")
+    #expect(queries.filter { $0 == "before_seq=4&limit=50" }.count == 2)
 }
 
 @Test func catchUpGapRetriesFromLastContiguousSequenceWithoutWebSocket() async throws {
@@ -376,7 +535,7 @@ struct StreamTests {
         if event == .connection(false) { break }
     }
 
-    #expect(queries.first == "limit=200")
+    #expect(queries.first == "limit=50")
     #expect(connector.requests.isEmpty)
 }
 
@@ -403,7 +562,7 @@ struct StreamTests {
         if event == .connection(false) { break }
     }
 
-    #expect(queries.first == "limit=200")
+    #expect(queries.first == "limit=50")
     #expect(connector.requests.isEmpty)
 }
 
@@ -453,7 +612,7 @@ struct StreamTests {
     }
 
     #expect(delivered.isEmpty)
-    #expect(queries.first == "limit=200")
+    #expect(queries.first == "limit=50")
 }
 
 }

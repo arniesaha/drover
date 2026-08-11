@@ -561,13 +561,13 @@ struct ChatModelTests {
 @Test @MainActor func olderHistoryIsLoadedOnlyAfterExplicitRequest() async throws {
     MockURLProtocol.handler = { request in
         switch request.url?.query {
-        case "limit=200":
+        case "limit=50":
             return (200, Data("""
             {"messages": [\(chatWireMessage(seq: 4, text: "four")), \(chatWireMessage(seq: 5, text: "five"))],
              "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
              "has_older": true, "has_newer": false}
             """.utf8))
-        case "before_seq=4&limit=200":
+        case "before_seq=4&limit=50":
             return (200, Data("""
             {"messages": [\(chatWireMessage(seq: 1, text: "one")), \(chatWireMessage(seq: 2, text: "two")), \(chatWireMessage(seq: 3, text: "three"))],
              "page_min_seq": 1, "page_max_seq": 3, "max_seq": 5,
@@ -580,7 +580,10 @@ struct ChatModelTests {
     }
     let connector = FakeConnector([.frames([], thenError: false)])
     let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
-        MessageStream(client: client, sessionID: sessionID, connector: connector)
+        // Two-message cold window: the older page stays behind the explicit
+        // request rather than being pulled in while assembling the window.
+        MessageStream(client: client, sessionID: sessionID, connector: connector,
+                      coldWindowSize: 2)
     })
 
     model.start()
@@ -598,7 +601,7 @@ struct ChatModelTests {
 
 @Test @MainActor func failedOlderHistoryLoadReportsNoPrepend() async throws {
     MockURLProtocol.handler = { request in
-        if request.url?.query == "limit=200" {
+        if request.url?.query == "limit=50" {
             return (200, Data("""
             {"messages": [\(chatWireMessage(seq: 4, text: "four")), \(chatWireMessage(seq: 5, text: "five"))],
              "page_min_seq": 4, "page_max_seq": 5, "max_seq": 5,
@@ -609,7 +612,10 @@ struct ChatModelTests {
     }
     let connector = FakeConnector([.frames([], thenError: false)])
     let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
-        MessageStream(client: client, sessionID: sessionID, connector: connector)
+        // Two-message cold window: the older page stays behind the explicit
+        // request rather than being pulled in while assembling the window.
+        MessageStream(client: client, sessionID: sessionID, connector: connector,
+                      coldWindowSize: 2)
     })
 
     model.start()

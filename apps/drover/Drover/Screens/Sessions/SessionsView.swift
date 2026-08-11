@@ -2,9 +2,16 @@ import SwiftUI
 import DroverKit
 
 /// The fleet inbox: a wordmark row carrying the two app-level controls, a
-/// count that says how much wants you, a host strip that says where the herd
-/// is, then one list of live sessions ordered by activity, over a pinned
-/// "New Session" footer.
+/// pinned status header (the count that says how much wants you, the host
+/// strip that says where the herd is, and the provider capacity strip), then
+/// one list of live sessions, over a pinned "New Session" footer.
+///
+/// Only the list scrolls. The header above it and the action bar below it stay
+/// put, so capacity is always in the first viewport instead of being scrolled
+/// past — and, more importantly, the list is one uninterrupted run. It used to
+/// be two runs with four analytics sections wedged between them, which read as
+/// a sort bug (#80); the analytics that are not capacity now sit *below* the
+/// list, where they can no longer split it.
 ///
 /// Conversation and terminal sessions share that list — `SessionRow` gives
 /// each species its own form, and the card's verb ("Answer", "Attach") carries
@@ -45,58 +52,18 @@ struct SessionsView: View {
         VStack(spacing: 0) {
             chromeRow
 
+            if store.hasLoadedOnce {
+                InboxStatusHeader(
+                    summary: summary,
+                    hostGroups: store.hostGroups,
+                    onRetry: { Task { await store.refresh() } }
+                ) {
+                    providerCapacity
+                }
+            }
+
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if store.hasLoadedOnce {
-                        FleetHeader(
-                            summary: summary,
-                            hostGroups: store.hostGroups,
-                            onRetry: { Task { await store.refresh() } }
-                        )
-                        .padding(.bottom, 4)
-
-                        // The work that needs a human stays above every
-                        // analytics section. Remaining live sessions keep
-                        // their established inbox position below Insights.
-                        ForEach(attentionSessions) { session in
-                            row(for: session)
-                        }
-                    }
-
-                    if cockpitStore.isCockpitAvailable {
-                        if !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
-                            ProviderCapacitySection(
-                                accounts: cockpitStore.providerAccounts,
-                                status: providerSectionStatus,
-                                statusMessage: cockpitStore.providerError,
-                                hostTitles: hostTitles,
-                                onOpenAnalytics: { showAnalytics = true }
-                            )
-                        }
-
-                        if let activity = cockpitStore.activity {
-                            ActivitySummarySection(
-                                activity: activity,
-                                statusMessage: cockpitStore.activityError,
-                                onOpenAnalytics: { showAnalytics = true }
-                            )
-                        }
-
-                        if !cockpitStore.popularProjects.isEmpty {
-                            PopularProjectsSection(
-                                projects: cockpitStore.popularProjects,
-                                tokenCoveragePercent: cockpitStore.activity?.coverage.tokenPercent,
-                                onOpenAnalytics: { showAnalytics = true }
-                            )
-                        }
-
-                        if cockpitStore.isInsightsAvailable {
-                            InsightsSummaryRow(counts: cockpitStore.insightCounts) {
-                                showInsights = true
-                            }
-                        }
-                    }
-
                     // Action errors (e.g. a failed continueSession) land here.
                     // They are distinct from an unreachable hub: connected, but
                     // the last thing you asked for didn't happen. Refresh
@@ -106,20 +73,31 @@ struct SessionsView: View {
                         actionFailedRow(lastError)
                     }
 
-                    if activeSessions.isEmpty, store.hasLoadedOnce {
+                    // One list, in one run. Work that needs a human is still
+                    // first and running sessions still follow it, but nothing
+                    // is allowed between them any more: the analytics that used
+                    // to sit in the middle are below the list now (#80).
+                    if inboxSessions.isEmpty, store.hasLoadedOnce {
                         ContentUnavailableView("Nothing running",
                                                systemImage: "rectangle.stack.badge.plus",
                                                description: Text("Start a new session when you're ready."))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 40)
                     } else {
-                        ForEach(remainingActiveSessions) { session in
+                        ForEach(inboxSessions) { session in
                             row(for: session)
                         }
                     }
 
                     if !store.finished.isEmpty {
                         finishedSection
+                    }
+
+                    if cockpitStore.isCockpitAvailable {
+                        VStack(alignment: .leading, spacing: 10) {
+                            analyticsSections
+                        }
+                        .padding(.top, 6)
                     }
                 }
                 .padding(.horizontal, 14)
@@ -227,17 +205,11 @@ struct SessionsView: View {
         )
     }
 
-    private var activeSessions: [SessionSummary] {
-        store.activeSessions
-    }
-
-    private var attentionSessions: [SessionSummary] {
-        store.needsYou
-    }
-
-    private var remainingActiveSessions: [SessionSummary] {
-        let attentionIDs = Set(attentionSessions.map(\.id))
-        return activeSessions.filter { !attentionIDs.contains($0.id) }
+    /// The whole live list, in one piece: needs-you first, then working, each
+    /// newest-first. The store owns the order (`SessionStore.inboxSessions`) so
+    /// it can be tested without a view.
+    private var inboxSessions: [SessionSummary] {
+        store.inboxSessions
     }
 
     private var providerSectionStatus: DataStatus {
@@ -255,6 +227,49 @@ struct SessionsView: View {
             onToggleTheme: { appearance.toggle(displaying: colorScheme) },
             onOpenSettings: onOpenSettings
         )
+    }
+
+    /// The pinned capacity strip. Empty (and so zero-height inside the pinned
+    /// header) whenever the hub has no cockpit, or nothing to report about it.
+    @ViewBuilder
+    private var providerCapacity: some View {
+        if cockpitStore.isCockpitAvailable,
+           !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
+            ProviderCapacitySection(
+                accounts: cockpitStore.providerAccounts,
+                status: providerSectionStatus,
+                statusMessage: cockpitStore.providerError,
+                hostTitles: hostTitles,
+                onOpenAnalytics: { showAnalytics = true }
+            )
+        }
+    }
+
+    /// Everything that is *about* the fleet rather than *in* it. Below the
+    /// list, where it can no longer split it.
+    @ViewBuilder
+    private var analyticsSections: some View {
+        if let activity = cockpitStore.activity {
+            ActivitySummarySection(
+                activity: activity,
+                statusMessage: cockpitStore.activityError,
+                onOpenAnalytics: { showAnalytics = true }
+            )
+        }
+
+        if !cockpitStore.popularProjects.isEmpty {
+            PopularProjectsSection(
+                projects: cockpitStore.popularProjects,
+                tokenCoveragePercent: cockpitStore.activity?.coverage.tokenPercent,
+                onOpenAnalytics: { showAnalytics = true }
+            )
+        }
+
+        if cockpitStore.isInsightsAvailable {
+            InsightsSummaryRow(counts: cockpitStore.insightCounts) {
+                showInsights = true
+            }
+        }
     }
 
     private func actionFailedRow(_ message: String) -> some View {
