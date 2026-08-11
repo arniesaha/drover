@@ -79,27 +79,26 @@ public final class SessionStore {
             .sorted(by: Self.byActivityDescending)
     }
 
-    /// The inbox list, as one uninterrupted run: everything that wants a human
-    /// first (approvals before questions, newest first), then everything still
-    /// running (newest first).
+    /// The inbox list, as one uninterrupted run ordered by recency: whatever
+    /// moved most recently is at the top, whether it is waiting on you or
+    /// still working. Attention only breaks ties between sessions with the
+    /// same (or no) activity date — see `activeOrdering`.
     ///
     /// The screen used to build this itself, as two `ForEach`es with four
-    /// analytics sections between them — which read as a sort bug, because a
-    /// session touched 27 minutes ago rendered three sections below one last
-    /// touched two days ago. The buckets are still real and still in this
-    /// order; they are simply no longer allowed to be split apart (see #80).
+    /// analytics sections between them, needs-you above and working below.
+    /// That read as a sort bug: a session touched 27 minutes ago rendered
+    /// three sections below one last touched two days ago (#80).
+    ///
+    /// Pinning capacity fixed the split; ordering by recency was the second
+    /// half of the decision. Bucket-first was defensible while the analytics
+    /// sections separated the two groups — once the list is contiguous, a
+    /// two-day-old question sitting above live work is just stale-first.
     public var inboxSessions: [SessionSummary] {
         Self.inboxSessions(from: snapshot?.sessions ?? [])
     }
 
     public nonisolated static func inboxSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
-        let needsYou = sessions
-            .filter { $0.attention == .needsApproval || $0.attention == .needsInput }
-            .sorted(by: needsYouOrdering)
-        let working = sessions
-            .filter { $0.attention == .working }
-            .sorted(by: byActivityDescending)
-        return needsYou + working
+        activeSessions(from: sessions)
     }
 
     public var finished: [SessionSummary] {
