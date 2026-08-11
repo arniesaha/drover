@@ -135,6 +135,16 @@ import Testing
         #expect(gauge?.usedTokens == 40_000)
     }
 
+    @Test func codexUsesExactZeroAfterCounterReset() {
+        let gauge = ContextGauge(messages: [
+            codexCompletion(seq: 1, input: 300_000, cached: 250_000, window: 258_400),
+            codexCompletion(seq: 2, input: 0, cached: 0, window: 258_400),
+        ], harness: "codex")
+        #expect(gauge?.usedTokens == 0)
+        #expect(gauge?.window == 258_400)
+        #expect(gauge?.text == "ctx 0 / 258.4K · 0%")
+    }
+
     @Test func codexWithoutWindowShowsAbsoluteUsage() {
         let gauge = ContextGauge(messages: [
             codexCompletion(seq: 1, input: 93_590, cached: 90_000, window: nil),

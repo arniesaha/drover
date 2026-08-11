@@ -35,7 +35,17 @@ struct DroverApp: App {
 
     var body: some Scene {
         WindowGroup {
+#if DEBUG
+            if ProcessInfo.processInfo.environment[
+                "DROVER_UI_TEST_CHAT_HEADER_FIXTURE"
+            ] == "1" {
+                ChatHeaderFixtureRoot()
+            } else {
+                RootView(environment: environment, notifier: notifier)
+            }
+#else
             RootView(environment: environment, notifier: notifier)
+#endif
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
@@ -44,6 +54,40 @@ struct DroverApp: App {
         }
     }
 }
+
+#if DEBUG
+private struct ChatHeaderFixtureRoot: View {
+    private let title = ProcessInfo.processInfo.environment[
+        "DROVER_UI_TEST_CHAT_HEADER_TITLE"
+    ] ?? "Chat recap fixture"
+    private let metadata = ProcessInfo.processInfo.environment[
+        "DROVER_UI_TEST_CHAT_HEADER_METADATA"
+    ] ?? "Codex · ctx 0"
+
+    var body: some View {
+        NavigationStack {
+            Color.clear
+                .navigationTitle("Chat")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        ChatHeaderContent(title: title, metadata: metadata)
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Button("Fixture action") {}
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                        .accessibilityLabel("Session actions")
+                        .accessibilityIdentifier("chat-menu")
+                    }
+                }
+        }
+        .dynamicTypeSize(.accessibility5)
+    }
+}
+#endif
 
 /// Composition root: no client configured → onboarding `SettingsView`;
 /// otherwise a `NavigationStack` over `SessionsView`, whose own header row

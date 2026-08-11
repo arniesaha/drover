@@ -3456,6 +3456,115 @@ def _ingest_events(port: int, events: list[dict]) -> None:
     assert status == 200
 
 
+def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(tmp_path):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(
+        host_id="nas",
+        harness="codex",
+        command="codex",
+        session_id="harness-recap-wire",
+        status="running",
+        mode="structured",
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    event = {
+        "event_id": "harness-event-recap-wire-12",
+        "session_id": "harness-recap-wire",
+        "seq": 12,
+        "type": "status",
+        "role": "system",
+        "text": "turn complete",
+        "payload": {"turn_complete": True, "awaiting": "input"},
+        "turn_id": "turn-1",
+        "ts": "2026-07-06T00:00:12+00:00",
+    }
+    try:
+        port = server.server_address[1]
+        status, body = _json_request(
+            f"http://127.0.0.1:{port}/harness/events",
+            payload={"events": [event]},
+        )
+        assert status == 200
+        assert body == {"ingested": 1}
+    finally:
+        server.shutdown()
+
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        assert con.execute(
+            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
+            ["harness-recap-wire"],
+        ).fetchone() == (12,)
+
+
+def test_split_db_completion_before_session_create_is_reconciled_once(tmp_path):
+    """An EventPusher completion may beat the central create-response sync."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    event = {
+        "event_id": "harness-event-race-23",
+        "session_id": "harness-race",
+        "seq": 23,
+        "type": "status",
+        "role": "system",
+        "text": "turn complete",
+        "payload": {"turn_complete": True, "awaiting": "input"},
+        "turn_id": "turn-race",
+        "ts": "2026-07-06T00:00:23+00:00",
+    }
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        status, body = _json_request(
+            f"http://127.0.0.1:{port}/harness/events",
+            payload={"events": [event]},
+        )
+        assert status == 200
+        assert body == {"ingested": 1}
+        with duckdb.connect(str(collector.duckdb_path)) as con:
+            assert con.execute(
+                "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
+                ["harness-race"],
+            ).fetchone() == (0,)
+
+        response_body = json.dumps(
+            {
+                "session_id": "harness-race",
+                "harness": "codex",
+                "command": ["codex"],
+                "status": "running",
+                "mode": "structured",
+            }
+        )
+        collector._sync_created_harness_session(
+            "nas", {"harness": "codex", "mode": "structured"}, response_body
+        )
+
+        status, body = _json_request(
+            f"http://127.0.0.1:{port}/harness/events",
+            payload={"events": [event]},
+        )
+        assert status == 200
+        assert body == {"ingested": 0}
+        collector._sync_created_harness_session(
+            "nas", {"harness": "codex", "mode": "structured"}, response_body
+        )
+    finally:
+        server.shutdown()
+
+    assert registry.get_session("harness-race") is not None
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        assert con.execute(
+            "SELECT desired_source_seq, count(*) FROM live_recap_jobs "
+            "WHERE session_id = ? GROUP BY desired_source_seq",
+            ["harness-race"],
+        ).fetchone() == (23, 1)
+
+
 def _event(seq: int, text: str) -> dict:
     return {
         "event_id": f"harness-event-m{seq}",

@@ -631,7 +631,7 @@ def test_terminal_and_noncompletion_events_do_not_enqueue_live_recap(tmp_path):
 
 
 def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
-    """Discarding the host sequence prevents the worker from recapping a turn."""
+    """The mirrored wire envelope must enqueue at the preserved host sequence."""
     registry, duckdb_path = _structured_registry(tmp_path)
 
     inserted = registry.append_events_if_new(
@@ -640,7 +640,13 @@ def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
                 "event_id": "e12",
                 "session_id": "s1",
                 "event_type": "status",
-                "payload": {"turn_complete": True},
+                "payload": {
+                    "event_id": "e12",
+                    "session_id": "s1",
+                    "seq": 12,
+                    "type": "status",
+                    "payload": {"turn_complete": True},
+                },
                 "seq": 12,
             }
         ]
@@ -649,6 +655,38 @@ def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
     assert inserted == 1
     assert registry.get_event("e12").seq == 12
     assert _recap_job(duckdb_path, "s1") == (12,)
+
+
+def test_session_materialization_rolls_back_when_orphan_recap_enqueue_fails(
+    tmp_path, monkeypatch
+):
+    """Session creation and orphan-completion recovery are one transaction."""
+    registry, duckdb_path = _registry(tmp_path)
+    registry.append_event(
+        event_id="e12",
+        session_id="s1",
+        event_type="status",
+        payload={"type": "status", "payload": {"turn_complete": True}},
+        seq=12,
+    )
+
+    def unavailable(*_args):
+        raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable)
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        registry.create_session(
+            session_id="s1",
+            host_id="laptop",
+            harness="codex",
+            command="codex",
+            mode="structured",
+        )
+
+    assert registry.get_session("s1") is None
+    assert registry.get_event("e12") is not None
+    assert _recap_job(duckdb_path, "s1") is None
 
 
 def test_append_events_if_new_writes_a_batch_in_one_window(tmp_path):

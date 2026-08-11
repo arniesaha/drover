@@ -57,6 +57,14 @@ def _looks_like_traceback(value: str) -> bool:
     )
 
 
+def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
+    """Accept both legacy flat payloads and StructuredMessage wire envelopes."""
+    if payload.get("turn_complete") is True:
+        return True
+    inner = payload.get("payload")
+    return isinstance(inner, dict) and inner.get("turn_complete") is True
+
+
 def _enqueue_recap_if_completion(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -69,7 +77,7 @@ def _enqueue_recap_if_completion(
     if (
         event_type != "status"
         or not payload
-        or payload.get("turn_complete") is not True
+        or not _is_turn_completion_payload(payload)
         or not isinstance(seq, int)
         or isinstance(seq, bool)
     ):
@@ -84,6 +92,34 @@ def _enqueue_recap_if_completion(
     if mode != "structured" and not (mode is None and harness != "shell"):
         return
     enqueue_live_recap(con, session_id, seq)
+
+
+def _enqueue_latest_stored_completion(
+    con: duckdb.DuckDBPyConnection, session_id: str
+) -> None:
+    """Recover the newest completion that arrived before session metadata."""
+    rows = con.execute(
+        """SELECT payload_json, seq
+             FROM harness_events
+            WHERE session_id = ? AND event_type = 'status' AND seq IS NOT NULL
+            ORDER BY seq DESC, created_at DESC""",
+        [session_id],
+    ).fetchall()
+    for payload_json, seq in rows:
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or not _is_turn_completion_payload(payload):
+            continue
+        _enqueue_recap_if_completion(
+            con,
+            session_id=session_id,
+            event_type="status",
+            payload=payload,
+            seq=seq,
+        )
+        return
 
 
 def _rows(
@@ -214,38 +250,45 @@ class HarnessRegistry:
         started_at = started_at or now
         session_id = session_id or f"harness-{uuid4()}"
         with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO harness_sessions (
-                  session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
-                  command, status, started_at, updated_at, native_session_id,
-                  native_resume_label, source_session_id, handoff_mode, mode,
-                  permission_mode, model, thinking_effort
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(
+                    """
+                    INSERT INTO harness_sessions (
+                      session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
+                      command, status, started_at, updated_at, native_session_id,
+                      native_resume_label, source_session_id, handoff_mode, mode,
+                      permission_mode, model, thinking_effort
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        session_id,
+                        host_id,
+                        harness,
+                        repo_owner,
+                        repo_name,
+                        branch,
+                        cwd,
+                        command,
+                        status,
+                        started_at,
+                        now,
+                        native_session_id,
+                        native_resume_label,
+                        source_session_id,
+                        handoff_mode,
+                        mode,
+                        permission_mode,
+                        model,
+                        thinking_effort,
+                    ],
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    session_id,
-                    host_id,
-                    harness,
-                    repo_owner,
-                    repo_name,
-                    branch,
-                    cwd,
-                    command,
-                    status,
-                    started_at,
-                    now,
-                    native_session_id,
-                    native_resume_label,
-                    source_session_id,
-                    handoff_mode,
-                    mode,
-                    permission_mode,
-                    model,
-                    thinking_effort,
-                ],
-            )
+                _enqueue_latest_stored_completion(con, session_id)
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         session = self.get_session(session_id)
         if session is None:
             raise RuntimeError(f"failed to create harness session {session_id!r}")

@@ -57,7 +57,7 @@ public struct ContextGauge: Sendable, Equatable {
             guard message.type == .status,
                   message.payload["turn_complete"]?.boolValue == true,
                   let usage = message.payload["usage"]?.objectValue,
-                  let input = positiveInt(usage["input_tokens"]?.numberValue) else { continue }
+                  let input = nonnegativeInt(usage["input_tokens"]?.numberValue) else { continue }
             let window = positiveInt(message.payload["model_context_window"]?.numberValue)
             samples.append((input, window))
             if samples.count == 2 { break }
@@ -71,9 +71,14 @@ public struct ContextGauge: Sendable, Equatable {
     }
 
     private static func positiveInt(_ number: Double?) -> Int? {
+        guard let value = nonnegativeInt(number), value > 0 else { return nil }
+        return value
+    }
+
+    private static func nonnegativeInt(_ number: Double?) -> Int? {
         guard let number, number.isFinite else { return nil }
         let rounded = number.rounded()
-        guard rounded > 0, rounded < Double(Int.max) else { return nil }
+        guard rounded >= 0, rounded < Double(Int.max) else { return nil }
         return Int(rounded)
     }
 

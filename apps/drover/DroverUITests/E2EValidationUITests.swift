@@ -35,6 +35,38 @@ final class E2EValidationUITests: XCTestCase {
     }
 
     @MainActor
+    func testDeterministicChatHeaderLayoutAtAccessibilitySize() {
+        let expectedTitle = "Improving live session recaps across every narrow chat header"
+        let expectedMetadata = "Codex · ctx 93.6K / 258.4K · 36%"
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_HEADER_FIXTURE"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_HEADER_TITLE"] = expectedTitle
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_HEADER_METADATA"] = expectedMetadata
+        app.launch()
+
+        let title = app.staticTexts["chat-recap-title"]
+        let metadata = app.staticTexts["chat-header-metadata"]
+        let menu = app.buttons["chat-menu"]
+        let navigationBar = app.navigationBars.firstMatch
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        XCTAssertTrue(metadata.waitForExistence(timeout: 10))
+        XCTAssertTrue(menu.exists)
+        XCTAssertTrue(navigationBar.exists)
+        XCTAssertEqual(title.label, expectedTitle)
+        XCTAssertEqual(metadata.label, expectedMetadata)
+
+        // The full accessibility labels remain available while both visible
+        // frames stay on one line, ordered, and inside the compact nav bar.
+        XCTAssertLessThanOrEqual(title.frame.height, 40)
+        XCTAssertLessThanOrEqual(metadata.frame.height, 30)
+        XCTAssertLessThanOrEqual(title.frame.maxY, metadata.frame.minY + 1)
+        XCTAssertGreaterThanOrEqual(title.frame.minX, navigationBar.frame.minX)
+        XCTAssertLessThanOrEqual(title.frame.maxX, navigationBar.frame.maxX)
+        XCTAssertLessThanOrEqual(title.frame.maxX, menu.frame.minX)
+        XCTAssertLessThanOrEqual(metadata.frame.maxY, navigationBar.frame.maxY + 1)
+    }
+
+    @MainActor
     func testLoginLaunchChatResumeTerminate() throws {
         let env = ProcessInfo.processInfo.environment
         guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
