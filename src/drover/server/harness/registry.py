@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,14 +13,15 @@ from uuid import uuid4
 import duckdb
 
 from drover.server.db import duckdb_connect_lock
+from drover.server.harness.auth import redact_auth_text
+from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import (
     HarnessEvent,
     HarnessEventPage,
     HarnessHost,
     HarnessSession,
 )
-from drover.server.harness.auth import redact_auth_text
-from drover.server.harness.events import normalize_harness_event
+from drover.server.harness.recap_jobs import enqueue_live_recap
 
 # DuckDB's Python client is not safe against two threads in one process
 # calling duckdb.connect() on the same database file at nearly the same
@@ -50,6 +51,35 @@ def _looks_like_traceback(value: str) -> bool:
         or lowered.startswith("stack trace")
         or "\n  file " in lowered
     )
+
+
+def _enqueue_recap_if_completion(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any] | None,
+    seq: int | None,
+) -> None:
+    """Queue a recap only for a completed turn from a structured session."""
+    if (
+        event_type != "status"
+        or not payload
+        or payload.get("turn_complete") is not True
+        or not isinstance(seq, int)
+        or isinstance(seq, bool)
+    ):
+        return
+    session = con.execute(
+        "SELECT mode, harness FROM harness_sessions WHERE session_id = ?",
+        [session_id],
+    ).fetchone()
+    if session is None:
+        return
+    mode, harness = session
+    if mode != "structured" and not (mode is None and harness != "shell"):
+        return
+    enqueue_live_recap(con, session_id, seq)
 
 
 def _rows(
@@ -381,26 +411,39 @@ class HarnessRegistry:
             content_preview=content_preview,
         )
         with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO harness_events (
-                  event_id, session_id, event_type, normalized_type,
-                  normalized_source, content_preview, payload_json, created_at, seq
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(
+                    """
+                    INSERT INTO harness_events (
+                      event_id, session_id, event_type, normalized_type,
+                      normalized_source, content_preview, payload_json, created_at, seq
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        event_id,
+                        session_id,
+                        event_type,
+                        normalized["normalized_type"],
+                        normalized["normalized_source"],
+                        normalized["content_preview"],
+                        _json_dumps(payload),
+                        created_at,
+                        seq,
+                    ],
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    event_id,
-                    session_id,
-                    event_type,
-                    normalized["normalized_type"],
-                    normalized["normalized_source"],
-                    normalized["content_preview"],
-                    _json_dumps(payload),
-                    created_at,
-                    seq,
-                ],
-            )
+                _enqueue_recap_if_completion(
+                    con,
+                    session_id=session_id,
+                    event_type=event_type,
+                    payload=payload,
+                    seq=seq,
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         event = self.get_event(event_id)
         if event is None:
             raise RuntimeError(f"failed to append harness event {event_id!r}")
@@ -439,6 +482,7 @@ class HarnessRegistry:
                 ).fetchall()
             }
             params = []
+            inserted_records: list[tuple[dict[str, Any], int | None]] = []
             for event_id, record in unique.items():
                 if event_id in existing:
                     continue
@@ -450,6 +494,9 @@ class HarnessRegistry:
                     normalized_source=record.get("normalized_source"),
                     content_preview=record.get("content_preview"),
                 )
+                seq = record.get("seq")
+                if not isinstance(seq, int) or isinstance(seq, bool):
+                    seq = None
                 params.append(
                     [
                         event_id,
@@ -460,21 +507,36 @@ class HarnessRegistry:
                         normalized["content_preview"],
                         _json_dumps(record.get("payload")),
                         record.get("created_at") or _now(),
-                        None,
+                        seq,
                     ]
                 )
+                inserted_records.append((record, seq))
             if not params:
                 return 0
-            con.executemany(
-                """
-                INSERT INTO harness_events (
-                  event_id, session_id, event_type, normalized_type,
-                  normalized_source, content_preview, payload_json, created_at, seq
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.executemany(
+                    """
+                    INSERT INTO harness_events (
+                      event_id, session_id, event_type, normalized_type,
+                      normalized_source, content_preview, payload_json, created_at, seq
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    params,
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                params,
-            )
+                for record, seq in inserted_records:
+                    _enqueue_recap_if_completion(
+                        con,
+                        session_id=record["session_id"],
+                        event_type=record["event_type"],
+                        payload=record.get("payload"),
+                        seq=seq,
+                    )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return len(params)
 
     def max_event_seq(self, session_id: str) -> int:

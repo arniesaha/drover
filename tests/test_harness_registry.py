@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import duckdb
+import pytest
 
+import drover.server.harness.registry as registry_module
 from drover.schema import bootstrap
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import migrate_legacy_harness_event_sequences
@@ -548,6 +550,105 @@ def _record(event_id, **overrides):
     }
     record.update(overrides)
     return record
+
+
+def _structured_registry(tmp_path, *, harness="codex"):
+    registry, duckdb_path = _registry(tmp_path)
+    registry.create_session(
+        session_id="s1",
+        host_id="laptop",
+        harness=harness,
+        command=harness,
+        mode="structured",
+    )
+    return registry, duckdb_path
+
+
+def _recap_job(duckdb_path, session_id):
+    with duckdb.connect(str(duckdb_path)) as con:
+        return con.execute(
+            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
+            [session_id],
+        ).fetchone()
+
+
+def test_structured_turn_complete_enqueues_live_recap(tmp_path):
+    """A missing structured-completion enqueue would leave live recaps stale."""
+    registry, duckdb_path = _structured_registry(tmp_path)
+
+    registry.append_event(
+        session_id="s1",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=12,
+    )
+
+    assert _recap_job(duckdb_path, "s1") == (12,)
+
+
+def test_structured_completion_insert_rolls_back_when_enqueue_fails(
+    tmp_path, monkeypatch
+):
+    """A queue failure must not persist an unqueued completion event."""
+    registry, duckdb_path = _structured_registry(tmp_path)
+
+    def unavailable(*_args):
+        raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable)
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        registry.append_event(
+            session_id="s1",
+            event_type="status",
+            payload={"turn_complete": True},
+            seq=12,
+        )
+
+    assert registry.list_events("s1") == []
+    assert _recap_job(duckdb_path, "s1") is None
+
+
+def test_terminal_and_noncompletion_events_do_not_enqueue_live_recap(tmp_path):
+    """Terminal activity and partial structured output are not recap boundaries."""
+    terminal, terminal_db = _session_for_events(tmp_path / "terminal")
+    terminal.append_event(
+        session_id="s1",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=12,
+    )
+    structured, structured_db = _structured_registry(tmp_path / "structured")
+    structured.append_event(
+        session_id="s1",
+        event_type="assistant_output",
+        payload={"text": "Still working."},
+        seq=12,
+    )
+
+    assert _recap_job(terminal_db, "s1") is None
+    assert _recap_job(structured_db, "s1") is None
+
+
+def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
+    """Discarding the host sequence prevents the worker from recapping a turn."""
+    registry, duckdb_path = _structured_registry(tmp_path)
+
+    inserted = registry.append_events_if_new(
+        [
+            {
+                "event_id": "e12",
+                "session_id": "s1",
+                "event_type": "status",
+                "payload": {"turn_complete": True},
+                "seq": 12,
+            }
+        ]
+    )
+
+    assert inserted == 1
+    assert registry.get_event("e12").seq == 12
+    assert _recap_job(duckdb_path, "s1") == (12,)
 
 
 def test_append_events_if_new_writes_a_batch_in_one_window(tmp_path):
