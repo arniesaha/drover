@@ -670,3 +670,67 @@ private let fourAnthropicWindows = """
 
     #expect(groups[0].freshnessText == "Updated 2m ago")
 }
+
+// MARK: - Collapsed capacity summary
+
+/// The strip is pinned above the inbox, so it costs the list every point it
+/// takes (#80). Collapsed, it has to answer "what have I got left" in one
+/// line — which means the *tightest* budget, not an average and not the first
+/// account, because the one about to run out is the one that changes plans.
+@Test func capacitySummaryReportsTheTightestRemainingBudget() throws {
+    let accounts = try [
+        providerAccount(
+            snapshot: "s1", provider: "anthropic", label: "roomy@example.com",
+            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+            windows: #"[{"kind":"seven_day","used_percent":6}]"#
+        ),
+        providerAccount(
+            snapshot: "s2", provider: "anthropic", label: "tight@example.com",
+            host: "nas", observedAt: "2026-08-09T18:00:00Z",
+            windows: #"[{"kind":"five_hour","used_percent":55}]"#
+        ),
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts, hostTitles: [:])
+
+    let summary = ProviderCapacitySummary(subscriptions: groups)
+
+    #expect(summary.accountsText == "2 accounts")
+    #expect(summary.tightestText == "lowest 45% left")
+    #expect(summary.text == "2 accounts · lowest 45% left")
+    #expect(!summary.isCritical)
+}
+
+@Test func capacitySummarySingularAndCriticalReadings() throws {
+    let accounts = try [
+        providerAccount(
+            snapshot: "s1", provider: "anthropic", label: "one@example.com",
+            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
+            windows: #"[{"kind":"five_hour","used_percent":92}]"#
+        )
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts, hostTitles: [:])
+
+    let summary = ProviderCapacitySummary(subscriptions: groups)
+
+    #expect(summary.accountsText == "1 account")
+    #expect(summary.tightestText == "lowest 8% left")
+    #expect(summary.isCritical)
+}
+
+/// No window reported is not the same as nothing left — the summary must not
+/// invent a number, or a probe that failed reads as an exhausted budget.
+@Test func capacitySummaryOmitsTheBudgetWhenNoWindowIsKnown() throws {
+    let accounts = try [
+        providerAccount(
+            snapshot: "s1", provider: "anthropic", label: "unknown@example.com",
+            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"
+        )
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts, hostTitles: [:])
+
+    let summary = ProviderCapacitySummary(subscriptions: groups)
+
+    #expect(summary.tightestText == nil)
+    #expect(summary.text == "1 account")
+    #expect(!summary.isCritical)
+}

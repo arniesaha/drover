@@ -686,3 +686,41 @@ public enum ProviderSubscriptionGrouping {
         }
     }
 }
+
+/// The one line the capacity strip shows while collapsed.
+///
+/// The strip is pinned above the inbox, so every point it occupies is a point
+/// the session list does not get (#80). Collapsed it still has to answer the
+/// question the strip exists for — "what have I got left to spend" — which is
+/// the *tightest* budget across subscriptions, not an average and not the
+/// first account: the one about to run out is the one that changes what you do
+/// next.
+public struct ProviderCapacitySummary: Sendable, Equatable {
+    /// "2 accounts", "1 account".
+    public let accountsText: String
+    /// "lowest 45% left", or nil when no subscription reported a window.
+    /// Absent rather than zero on purpose: a probe that reported nothing is
+    /// not a budget that is spent, and the two must not read alike.
+    public let tightestText: String?
+    /// The tightest reading is at or past `ProviderHeadline.criticalFraction`.
+    public let isCritical: Bool
+
+    public var text: String {
+        [accountsText, tightestText].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    public init(subscriptions: [ProviderSubscriptionPresentation]) {
+        let count = subscriptions.count
+        accountsText = count == 1 ? "1 account" : "\(count) accounts"
+
+        let fractions = subscriptions.compactMap { $0.headline.fraction }
+        guard let tightest = fractions.max() else {
+            tightestText = nil
+            isCritical = false
+            return
+        }
+        let remaining = max(0, min(100, Int((((1 - tightest) * 100)).rounded())))
+        tightestText = "lowest \(remaining)% left"
+        isCritical = tightest >= ProviderHeadline.criticalFraction
+    }
+}

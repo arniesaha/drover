@@ -10,6 +10,15 @@ struct ProviderCapacitySection: View {
     var hostTitles: [String: String] = [:]
     let onOpenAnalytics: () -> Void
 
+    /// Collapsed by default, and remembered across launches.
+    ///
+    /// The strip is pinned above the inbox (#80), so its height is taken from
+    /// the session list on every screen, forever. Expanded it ran to roughly a
+    /// quarter of the viewport — worth it while you are deciding where to send
+    /// work, dead weight the rest of the time. Collapsed it keeps the one line
+    /// that answers "what have I got left"; the cards are one tap away.
+    @AppStorage("inbox.providerCapacityExpanded") private var isExpanded = false
+
     private var subscriptions: [ProviderSubscriptionPresentation] {
         ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
     }
@@ -24,9 +33,17 @@ struct ProviderCapacitySection: View {
             CockpitSectionHeading(
                 title: "Provider capacity",
                 source: "Provider reported",
-                action: accounts.isEmpty ? nil : onOpenAnalytics
+                action: accounts.isEmpty ? nil : onOpenAnalytics,
+                disclosure: accounts.isEmpty
+                    ? nil
+                    : .init(isExpanded: isExpanded) {
+                        withAnimation(.snappy(duration: 0.2)) { isExpanded.toggle() }
+                    }
             )
 
+            // A failed probe is not something to hide behind a chevron: it
+            // explains numbers that are missing or stale, so it shows in both
+            // states.
             if let warning = section.warningText {
                 CockpitCard {
                     Label(warning, systemImage: "gauge.with.dots.needle.33percent")
@@ -37,23 +54,40 @@ struct ProviderCapacitySection: View {
             }
 
             if !accounts.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 10) {
-                        ForEach(subscriptions) { subscription in
-                            // Every card in the strip is the same card. The row
-                            // sizes itself to the tallest and the rest grow to
-                            // match, which beats a hardcoded height: a
-                            // two-line account label or a Dynamic Type bump
-                            // moves the tallest card and everyone else follows.
-                            ProviderAccountCard(subscription: subscription, section: section)
-                                .frame(width: 250)
+                if isExpanded {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(alignment: .top, spacing: 10) {
+                            ForEach(subscriptions) { subscription in
+                                // Every card in the strip is the same card. The row
+                                // sizes itself to the tallest and the rest grow to
+                                // match, which beats a hardcoded height: a
+                                // two-line account label or a Dynamic Type bump
+                                // moves the tallest card and everyone else follows.
+                                ProviderAccountCard(subscription: subscription, section: section)
+                                    .frame(width: 250)
+                            }
                         }
                     }
+                    .scrollClipDisabled()
+                } else {
+                    collapsedSummary
                 }
-                .scrollClipDisabled()
             }
         }
         .accessibilityIdentifier("provider-capacity-section")
+    }
+
+    private var collapsedSummary: some View {
+        let summary = ProviderCapacitySummary(subscriptions: subscriptions)
+        return Text(summary.text)
+            .droverText(.subtitle, accented: summary.isCritical)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.snappy(duration: 0.2)) { isExpanded = true }
+            }
+            .accessibilityIdentifier("provider-capacity-summary")
     }
 }
 
@@ -186,9 +220,18 @@ struct ProviderAccountCard: View {
 }
 
 struct CockpitSectionHeading: View {
+    /// An optional expand/collapse affordance. Optional because every other
+    /// cockpit section using this heading has nothing to collapse — passing
+    /// nil keeps their headings byte-identical to before.
+    struct Disclosure {
+        let isExpanded: Bool
+        let toggle: () -> Void
+    }
+
     let title: String
     let source: String?
     let action: (() -> Void)?
+    var disclosure: Disclosure? = nil
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -202,6 +245,24 @@ struct CockpitSectionHeading: View {
                     .font(.system(.caption, design: .default, weight: .medium))
                     .foregroundStyle(DroverColor.accentHi)
                     .buttonStyle(.plain)
+            }
+            if let disclosure {
+                Button(action: disclosure.toggle) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(.caption, design: .default, weight: .semibold))
+                        .rotationEffect(.degrees(disclosure.isExpanded ? 180 : 0))
+                        .foregroundStyle(DroverColor.accentHi)
+                        // The chevron alone is well under the 44pt minimum, so
+                        // the tap target is padded out rather than left at the
+                        // glyph's size.
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(disclosure.isExpanded
+                    ? "Collapse provider capacity"
+                    : "Expand provider capacity")
+                .accessibilityIdentifier("provider-capacity-disclosure")
             }
         }
     }
