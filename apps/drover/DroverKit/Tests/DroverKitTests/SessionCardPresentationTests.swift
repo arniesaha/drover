@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import DroverKit
 
@@ -142,7 +143,8 @@ import Testing
             status: status, awaiting: nil, cwd: nil, lastActivity: nil
         )
         let action = SessionCardPresentation(session: session, hostTitle: "h").action
-        #expect([.attach, .reopen].contains(action), "\(status) produced \(action)")
+        #expect(action == .attach || action == .reopen,
+                "\(status) produced \(String(describing: action))")
     }
 }
 
@@ -164,6 +166,112 @@ import Testing
     #expect(species(mode: "pty", harness: "shell") == .terminal)
     #expect(species(mode: nil, harness: "claude-code") == .conversation)
     #expect(species(mode: nil, harness: "shell") == .terminal)
+}
+
+// MARK: - Stale cards (#81)
+
+/// The reported card. `awaiting: "input"` was true when the snapshot landed;
+/// by the time it was read the session was back to work — and the card still
+/// offered **Answer**, whose only effect would have been to push a turn into a
+/// session mid-work. A verb is derived from `attention`, and `attention` is
+/// exactly the field a stale snapshot cannot vouch for, so a stale card offers
+/// no verb at all.
+@Test func aStaleCardOffersNoVerbToActOn() {
+    let session = SessionSummary(
+        id: "openclaw", hostID: "nas", harness: "claude-code", mode: "structured",
+        status: "running", awaiting: "input", cwd: "/home/arnab/src/openclaw",
+        lastActivity: Date(timeIntervalSince1970: 1_754_913_600),
+        preview: "Yeah go ahead"
+    )
+
+    let live = SessionCardPresentation(session: session, hostTitle: "NAS")
+    let stale = SessionCardPresentation(
+        session: session,
+        hostTitle: "NAS",
+        freshness: SnapshotFreshness(
+            lastUpdate: Date(timeIntervalSince1970: 1_754_913_600),
+            isReachable: false,
+            now: Date(timeIntervalSince1970: 1_754_913_600 + 247)
+        )
+    )
+
+    #expect(live.action == .answer)
+    #expect(live.isStale == false)
+
+    #expect(stale.isStale)
+    #expect(stale.action == nil, "a stale card must not offer a verb derived from state we can't vouch for")
+    #expect(stale.staleNote != nil)
+    // The card still says what it last heard — it just stops pretending that
+    // is current.
+    #expect(stale.title == "Yeah go ahead")
+    #expect(stale.subtitle == "Claude · NAS · asked a question")
+}
+
+/// Approve/deny and Watch go the same way as Answer: every verb on the card is
+/// derived from `attention`.
+@Test func everyVerbIsSuppressedWhileStaleNotJustAnswer() {
+    let stale = SnapshotFreshness(lastUpdate: nil, isReachable: false, now: Date())
+
+    for (awaiting, status, mode) in [
+        ("approval", "running", "structured"),
+        (nil, "running", "structured"),
+        (nil, "running", "pty"),
+        (nil, "completed", "structured"),
+    ] as [(String?, String, String)] {
+        let session = SessionSummary(
+            id: "s", hostID: "h", harness: "codex", mode: mode,
+            status: status, awaiting: awaiting, cwd: "/src/drover", lastActivity: nil
+        )
+        let card = SessionCardPresentation(session: session, hostTitle: "h", freshness: stale)
+        #expect(card.action == nil, "\(mode)/\(status)/\(awaiting ?? "nil") still offered \(String(describing: card.action))")
+    }
+}
+
+/// The specific deception (#81): `lastActivity` is frozen inside the stale
+/// snapshot while the relative formatter recomputes against *now*, so a frozen
+/// card counts up — "27 minutes ago", "28 minutes ago" — and reads as live.
+/// A stale card measures activity against the snapshot it came from, so the
+/// number stops moving, and the snapshot's own age is what is shown instead.
+@Test func aStaleCardFreezesActivityAgainstTheSnapshotNotNow() throws {
+    let snapshotTaken = Date(timeIntervalSince1970: 1_754_913_600)
+    let session = SessionSummary(
+        id: "openclaw", hostID: "nas", harness: "claude-code", mode: "structured",
+        status: "running", awaiting: "input", cwd: "/home/arnab/src/openclaw",
+        lastActivity: snapshotTaken.addingTimeInterval(-27 * 60),
+        preview: "Yeah go ahead"
+    )
+
+    // Ten minutes after the last successful refresh, the card must still say
+    // 27 minutes — not 37.
+    let card = SessionCardPresentation(
+        session: session,
+        hostTitle: "NAS",
+        freshness: SnapshotFreshness(
+            lastUpdate: snapshotTaken, isReachable: false,
+            now: snapshotTaken.addingTimeInterval(600)
+        )
+    )
+
+    let frozen = try #require(card.frozenActivityText)
+    #expect(frozen.contains("27m"), "activity was measured against now, not the snapshot: \(frozen)")
+    let note = try #require(card.staleNote)
+    #expect(note.contains("10m"), "the note must carry the snapshot's own age: \(note)")
+}
+
+/// A live card keeps rendering its timestamp with the ticking relative
+/// formatter — the frozen string is a stale-only affordance.
+@Test func aLiveCardDoesNotFreezeItsTimestamp() {
+    let session = SessionSummary(
+        id: "s", hostID: "h", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: nil,
+        lastActivity: Date(timeIntervalSince1970: 1_754_913_600)
+    )
+
+    let card = SessionCardPresentation(session: session, hostTitle: "h")
+
+    #expect(card.frozenActivityText == nil)
+    #expect(card.staleNote == nil)
+    #expect(card.action == .watch)
 }
 
 @Test func sessionWithoutCwdStillProducesACard() {

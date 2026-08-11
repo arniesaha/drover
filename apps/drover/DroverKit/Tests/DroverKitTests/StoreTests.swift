@@ -256,6 +256,47 @@ struct StoreTests {
     #expect(store.snapshot != nil)   // last-known state kept, list never blanks
 }
 
+/// The snapshot's own age, which is the thing the cards were missing (#81).
+///
+/// Keeping the cached snapshot through a failed refresh is deliberate and
+/// stays; what could not be asked before is *when* that snapshot was true.
+/// A failed refresh must not move the timestamp — a clock that ticks on
+/// failure is exactly the deception the cards were committing.
+@Test @MainActor func aFailedRefreshDoesNotMoveTheSnapshotsTimestamp() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    let landed = try #require(store.lastSuccessfulRefresh)
+    #expect(store.freshness(now: landed.addingTimeInterval(1)).isStale == false)
+
+    MockURLProtocol.handler = { _ in (500, Data()) }
+    await store.refresh()
+
+    #expect(store.snapshot != nil, "the cached snapshot must survive — that behaviour stays")
+    #expect(store.lastSuccessfulRefresh == landed, "a failure must not restamp the snapshot")
+    let freshness = store.freshness(now: landed.addingTimeInterval(247))
+    #expect(freshness.isStale)
+    #expect(freshness.staleNote?.contains("4m") == true)
+}
+
+/// A cancelled refresh is not a failure and not a success: it leaves the
+/// timestamp where it was, so the snapshot simply keeps ageing.
+@Test @MainActor func aCancelledRefreshLeavesTheTimestampAlone() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    let landed = try #require(store.lastSuccessfulRefresh)
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    await store.refresh()
+
+    #expect(store.lastSuccessfulRefresh == landed)
+    #expect(store.isReachable, "a cancellation is still not an unreachable hub")
+    // Reachable, but nothing has landed in ten minutes — the cards say so.
+    #expect(store.freshness(now: landed.addingTimeInterval(600)).isStale)
+}
+
 @Test @MainActor func fleetSnapshotProducesHostGroups() async throws {
     MockURLProtocol.handler = { _ in (200, fleetSnapshotJSON) }
     let store = SessionStore(client: client())
