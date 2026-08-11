@@ -1,7 +1,9 @@
 """Contracts for normalized provider account usage."""
 
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
+import subprocess
 import sys
 import threading
 from types import SimpleNamespace
@@ -346,6 +348,82 @@ def test_codex_probe_does_not_block_on_noisy_stderr(fake_codex_app_server):
 
     assert snapshot.status == "ok"
     assert snapshot.plan_label == "plus"
+
+
+def test_codex_probe_kill_path_never_raises():
+    """``_stop_process`` swallows a SIGKILL that does not take.
+
+    Cleanup runs in ``read()``'s ``finally``, where an exception escapes the
+    method rather than being caught by its own ``except`` clauses.
+    ``_provider_usage`` calls the probe with no ``try`` and ``harnessd``'s
+    ``do_GET`` has no wrapper, so anything escaping here means no HTTP
+    response at all -- the Claude and Google cards go down with a Codex
+    problem (drover#65).
+    """
+    from drover.server.providers.codex import _stop_process
+
+    class _Stuck:
+        stdin = None
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout or 0)
+
+    _stop_process(_Stuck())
+
+
+def test_codex_probe_close_failure_never_raises():
+    """Closing stdin on a dead child raises BrokenPipeError; cleanup eats it."""
+    from drover.server.providers.codex import _stop_process
+
+    class _BrokenStdin:
+        def close(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    class _Dead:
+        stdin = _BrokenStdin()
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    _stop_process(_Dead())
+
+
+def test_codex_probe_failure_is_logged_with_its_category(caplog, tmp_path):
+    """A transient failure must leave a trace naming the category.
+
+    Without this a card flips to ``error`` and recovers with nothing recorded,
+    so there is nothing to diagnose afterwards.
+    """
+    with caplog.at_level(logging.WARNING, logger="drover.server.providers.codex"):
+        snapshot = CodexUsageProbe(
+            command=(
+                str(tmp_path / "definitely-not-installed"),
+                "app-server",
+                "--stdio",
+            )
+        ).read(host_id="mac-mini")
+
+    assert snapshot.error_category == "cli_not_found"
+    assert any("cli_not_found" in record.message for record in caplog.records)
 
 
 def test_detected_agy_is_honest_when_quota_contract_is_unavailable():
