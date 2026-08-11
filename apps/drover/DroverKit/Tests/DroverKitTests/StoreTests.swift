@@ -264,6 +264,89 @@ struct StoreTests {
     #expect(store.hostGroups[0].sessions.map(\.id) == ["mac-input", "mac-running"])
 }
 
+@Test @MainActor func repeatedStartPollingStillClearsTheConnectingGate() async throws {
+    // The reported bug (#85): the app sat on "Connecting…" while the server
+    // answered in 70ms. startPolling() tore down the in-flight refresh, whose
+    // cancellation returns early *without* setting hasLoadedOnce — and it is
+    // called from both `.task` and the scenePhase change, so a foreground
+    // event during the first load could leave the gate shut. A slow server
+    // (see #91) widened that window from milliseconds to tens of seconds.
+    MockURLProtocol.handler = { _ in
+        Thread.sleep(forTimeInterval: 0.15)  // a server that is not instant
+        return (200, snapshotJSON)
+    }
+    defer { MockURLProtocol.handler = nil }
+
+    let store = SessionStore(client: client())
+    // Churn faster than a request can complete, as scene-phase changes do.
+    for _ in 0..<6 {
+        store.startPolling(every: 5)
+        try? await Task.sleep(for: .milliseconds(40))
+    }
+
+    // Give the surviving loop room to finish one request.
+    let deadline = Date().addingTimeInterval(3)
+    while !store.hasLoadedOnce, Date() < deadline {
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+    store.stopPolling()
+
+    #expect(store.hasLoadedOnce,
+            "restarting the poll loop must not leave the app stuck on Connecting")
+}
+
+/// A stuck "Connecting…" has to say why (#85).
+///
+/// A cancelled refresh returns early and records nothing, so an app wedged
+/// before its first successful load looks identical to one that cannot reach
+/// the hub at all — which is exactly why the recurring report could not be
+/// diagnosed from the phone.
+@Test @MainActor func connectingDetailNamesTheCancellationsNobodyCanSee() async throws {
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    let store = SessionStore(client: client())
+
+    await store.refresh()
+    await store.refresh()
+
+    #expect(!store.hasLoadedOnce)
+    #expect(store.refreshAttempts == 2)
+    let detail = try #require(store.connectingDetail)
+    #expect(detail.contains("2 attempts"))
+    #expect(detail.localizedCaseInsensitiveContains("cancel"),
+            "cancellations must be nameable, not silent: \(detail)")
+}
+
+@Test @MainActor func connectingDetailReportsAnUnreachableHubDifferently() async throws {
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    defer { MockURLProtocol.transportError = nil }
+    let store = SessionStore(client: client())
+
+    await store.refresh()
+    await store.refresh()
+
+    let detail = try #require(store.connectingDetail)
+    #expect(detail.contains("Can't reach the hub"))
+}
+
+@Test @MainActor func connectingDetailStaysQuietOnTheFirstAttemptAndAfterSuccess() async throws {
+    MockURLProtocol.transportError = URLError(.cancelled)
+    let store = SessionStore(client: client())
+
+    await store.refresh()
+    // One blip is normal; the screen should not start explaining itself.
+    #expect(store.connectingDetail == nil)
+
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    defer { MockURLProtocol.handler = nil }
+    await store.refresh()
+
+    #expect(store.hasLoadedOnce)
+    #expect(store.connectingDetail == nil)
+    #expect(store.lastRefreshOutcome == nil)
+}
+
 }
 
 }  // extension MockNetworkTests
