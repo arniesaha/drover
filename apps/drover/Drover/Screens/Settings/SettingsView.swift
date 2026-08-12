@@ -26,6 +26,28 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
+                // Scanning is the intended route; the two fields below are the
+                // recovery path for when a camera is unavailable.
+                NavigationLink {
+                    PairingView(environment: environment)
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .font(.system(size: 15, weight: .medium))
+                        Text("Scan pairing code").droverText(.h3)
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(DroverColor.accentHi)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+                    }
+                }
+                .accessibilityIdentifier("settings-scan-pairing")
+
                 field(label: "Server", hint: "Where drover-server is listening.") {
                     TextField("http://host:7080", text: $urlString)
                         .textInputAutocapitalization(.never)
