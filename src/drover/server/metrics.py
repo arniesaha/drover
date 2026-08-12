@@ -8,7 +8,6 @@ import hashlib
 import http.client
 import json
 import logging
-import shutil
 import tempfile
 import threading
 import time
@@ -27,6 +26,7 @@ from drover.server.harness.schema import (
     migrate_legacy_harness_event_sequences,
 )
 from drover.server.db import (
+    copy_duckdb_store,
     control_plane_connection,
     control_plane_path,
     open_duckdb_connection,
@@ -2097,7 +2097,7 @@ class MetricsCollector:
         # threads=1 vs 6.6-8.1s here (#78).
         with tempfile.TemporaryDirectory(prefix="drover-metrics-") as tmp:
             snapshot = Path(tmp) / source.name
-            shutil.copy2(source, snapshot)
+            copy_duckdb_store(source, snapshot)
             return quality_snapshot(
                 duckdb_path=snapshot,
                 incoming_dir=self.incoming_dir,
@@ -2116,7 +2116,7 @@ class MetricsCollector:
             # same refresh and must not add live-instance contention either.
             with tempfile.TemporaryDirectory(prefix="drover-observatory-") as tmp:
                 snapshot = Path(tmp) / source.name
-                shutil.copy2(source, snapshot)
+                copy_duckdb_store(source, snapshot)
                 return pipeline_observatory_snapshot(
                     duckdb_path=snapshot,
                     runtime_audit=audit,
