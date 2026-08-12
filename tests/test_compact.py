@@ -115,9 +115,12 @@ def test_compact_partition_whose_files_have_different_columns(tmp_path: Path) ->
     table = pq.ParquetFile(next(partition.glob("*.parquet"))).read()
     assert "stop_reason" in table.schema.names
     # The rows that predate the column read back as NULL rather than vanishing.
-    assert sorted(
-        v or "" for v in table.column("stop_reason").to_pylist()
-    ) == ["", "", "end_turn", "max_tokens"]
+    assert sorted(v or "" for v in table.column("stop_reason").to_pylist()) == [
+        "",
+        "",
+        "end_turn",
+        "max_tokens",
+    ]
     assert sorted(table.column("id").to_pylist()) == ["a", "a", "b", "b"]
 
 
