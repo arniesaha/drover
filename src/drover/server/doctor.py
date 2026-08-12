@@ -22,7 +22,11 @@ from drover.attribution import (
     GENERAL_WORKSPACE_ACTIVITY_TYPE,
     configured_general_workspace_roots,
 )
-from drover.event_identity import audit_agent_event_identity, canonical_agent_events_cte
+from drover.event_identity import (
+    audit_agent_event_identity,
+    canonical_agent_events_cte,
+    scan_agent_events_once,
+)
 from drover.server.summarizer.retry import classify_summarize_error
 from drover.session_audit import audit_session_consistency
 
@@ -1357,8 +1361,18 @@ def runtime_audit(
 
     try:
         recent_days = max(2, int(ceil(hours / 24)) + 2)
+        # One pass over the whole agent_events history, shared by the row
+        # count, the session-set metrics and the duplicate-identity metrics.
+        # Each of those used to scan the parquet tree on its own -- 1.61s,
+        # 2.37s and 2.71s of an 11.4s audit at 6,876 files (#78) -- for three
+        # columns between them. `None` means the pass was unavailable and
+        # every consumer reads agent_events directly, as it did before.
+        scan = scan_agent_events_once(con)
         for name in RUNTIME_KEY_RELATIONS:
             if name == "spans":
+                continue
+            if name == "agent_events" and scan is not None:
+                report["table_counts"][name] = scan.total_rows
                 continue
             report["table_counts"][name] = _relation_count(con, name)
         if _relation_exists(con, "spans"):
@@ -1513,7 +1527,10 @@ def runtime_audit(
             )
         if report["table_counts"].get("agent_events") is not None:
             report["session_consistency"] = audit_session_consistency(
-                con, duckdb_path=duckdb_path, include_expensive_checks=deep
+                con,
+                duckdb_path=duckdb_path,
+                include_expensive_checks=deep,
+                scan=scan,
             )
             session_status = report["session_consistency"].get("status")
             if session_status not in {"ok", "missing"}:
@@ -1525,7 +1542,7 @@ def runtime_audit(
                     report["warnings"].append(warning)
 
         if report["table_counts"].get("agent_events") is not None:
-            report["agent_event_identity"] = audit_agent_event_identity(con)
+            report["agent_event_identity"] = audit_agent_event_identity(con, scan=scan)
             identity = report["agent_event_identity"]
             if identity.get("duplicate_dedup_key_values", 0):
                 report["warnings"].append(
