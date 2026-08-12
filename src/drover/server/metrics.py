@@ -39,6 +39,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("drover.metrics")
 
+#: Ceiling on how many archived sessions a caller may ask a fleet render for.
+#: Above this the payload stops being a fleet view and starts being a history
+#: export, which belongs on a paged endpoint rather than the 5s poll.
+MAX_ARCHIVED_SESSION_LIMIT = 100
+
+#: Distinguishes "caller did not specify" from an explicit ``None`` (meaning
+#: no cap at all), so the collector default can apply only to the former.
+_UNSET_ARCHIVED_LIMIT: Any = object()
+
 _HARNESS_STALE_AFTER_SECONDS = 45
 
 # Floor on any hub->harnessd budget that rides a relay connection.
@@ -803,6 +812,11 @@ class MetricsCollector:
     # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel
     # live, but N polling clients should still share one render.
     harness_ttl_seconds: float = 2.0
+    # Newest finished sessions kept in a fleet render. Unbounded, this grew
+    # with every session ever run -- 115 of 120 were terminated when the cap
+    # was added, at 117KB per poll per client. Live sessions are never capped.
+    # Callers may ask for more, up to MAX_ARCHIVED_SESSION_LIMIT.
+    archived_session_limit: int = 20
     # How long past ttl_seconds an expired render may still be served while
     # its replacement is built in the background. Serving stale forever would
     # freeze the numbers whenever refreshes keep failing, and frozen metrics
@@ -841,10 +855,15 @@ class MetricsCollector:
         *,
         include_hosts: bool = True,
         include_sessions: bool = True,
+        archived_limit: int | None = _UNSET_ARCHIVED_LIMIT,
     ) -> str:
         # Only the default full render is cached; partial renders are rare
         # and caching them would need a per-variant key for no real gain.
-        full = include_hosts and include_sessions
+        # A caller asking for a non-default archived cap counts as partial for
+        # the same reason -- serving it the cached default would silently hand
+        # back 20 sessions to someone who asked for 100.
+        default_cap = archived_limit is _UNSET_ARCHIVED_LIMIT
+        full = include_hosts and include_sessions and default_cap
         now = time.monotonic()
         if full and self._harness_cached_json is not None:
             if now < self._harness_cached_until:
@@ -852,6 +871,7 @@ class MetricsCollector:
         snapshot = self.harness_snapshot(
             include_hosts=include_hosts,
             include_sessions=include_sessions,
+            archived_limit=archived_limit,
         )
         rendered = json.dumps(snapshot, sort_keys=True, default=str) + "\n"
         if full:
@@ -1601,6 +1621,7 @@ class MetricsCollector:
         *,
         include_hosts: bool = True,
         include_sessions: bool = True,
+        archived_limit: int | None = _UNSET_ARCHIVED_LIMIT,
     ) -> dict[str, Any]:
         from drover.server.cockpit.service import COCKPIT_SECTIONS
 
@@ -1621,9 +1642,15 @@ class MetricsCollector:
             # registry's connect lock cost microseconds. Live reads beside
             # live writers are the supported path -- see
             # open_duckdb_connection's docstring.
+            if archived_limit is _UNSET_ARCHIVED_LIMIT:
+                archived_limit = self.archived_session_limit
             registry = HarnessRegistry(source)
             hosts = registry.list_hosts() if include_hosts else []
-            sessions = registry.list_sessions() if include_sessions else []
+            sessions = (
+                registry.list_sessions(archived_limit=archived_limit)
+                if include_sessions
+                else []
+            )
             previews = registry.latest_session_previews(
                 [session.session_id for session in sessions]
             )

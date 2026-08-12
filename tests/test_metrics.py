@@ -4829,3 +4829,69 @@ def test_harness_snapshot_works_while_this_process_holds_the_db(tmp_path):
 
     assert "error" not in snapshot, snapshot.get("error")
     assert len(snapshot["sessions"]) == 1
+
+
+def _seed_sessions(duckdb_path, *, archived: int, live: int) -> None:
+    """Register a host and a mix of finished and live sessions."""
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(host_id="h1", display_name="H1", kind="macos")
+    for i in range(archived + live):
+        s = registry.create_session(host_id="h1", harness="claude-code", command="x")
+        status = "terminated" if i < archived else "running"
+        registry.update_session_status(s.session_id, status)
+
+
+def test_fleet_render_caps_archived_sessions_by_default(tmp_path):
+    """115 of 120 sessions were terminated and every one shipped on each poll."""
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    _seed_sessions(duckdb_path, archived=40, live=2)
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+    sessions = json.loads(collector.render_harness_json())["sessions"]
+    statuses = [s["status"] for s in sessions]
+
+    assert statuses.count("terminated") == collector.archived_session_limit == 20
+    assert statuses.count("running") == 2, "a live session was capped away"
+
+
+def test_a_larger_archived_request_is_not_served_the_cached_default(tmp_path):
+    """The fleet render is cached for 2s; the cap must be part of that identity.
+
+    Without this the first default poll populates the cache and a client
+    asking for 100 gets handed 20 back, which looks like the cap ignoring it.
+    """
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    _seed_sessions(duckdb_path, archived=40, live=1)
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+    default = json.loads(collector.render_harness_json())["sessions"]
+    larger = json.loads(collector.render_harness_json(archived_limit=40))["sessions"]
+
+    assert len([s for s in default if s["status"] == "terminated"]) == 20
+    assert len([s for s in larger if s["status"] == "terminated"]) == 40
+
+
+def test_archived_query_param_is_clamped_not_rejected(tmp_path):
+    """A stray query string must not fail a whole fleet render on the poll path."""
+    from drover.server.metrics import MAX_ARCHIVED_SESSION_LIMIT
+    from drover.server.web.app import _archived_limit_kwargs
+
+    assert _archived_limit_kwargs({}) == {}
+    assert _archived_limit_kwargs({"archived": ["oops"]}) == {}
+    assert _archived_limit_kwargs({"archived": ["5"]}) == {"archived_limit": 5}
+    assert _archived_limit_kwargs({"archived": ["-3"]}) == {"archived_limit": 0}
+    assert _archived_limit_kwargs({"archived": ["9999"]}) == {
+        "archived_limit": MAX_ARCHIVED_SESSION_LIMIT
+    }

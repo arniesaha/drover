@@ -104,6 +104,29 @@ def _parse_optional_nonnegative_int(
     return value
 
 
+def _archived_limit_kwargs(params: dict[str, list[str]]) -> dict[str, int]:
+    """Read ``?archived=N`` for a fleet render, or nothing if absent.
+
+    Returning an empty dict rather than a default keeps "caller said nothing"
+    distinct from "caller asked for the same number the default happens to
+    be" -- only the former may be served from the shared render cache.
+
+    A malformed or out-of-range value is clamped rather than rejected: this
+    sits on the 5s poll path, and failing a whole fleet render over a stray
+    query string would turn a cosmetic mistake into an outage.
+    """
+    from drover.server.metrics import MAX_ARCHIVED_SESSION_LIMIT
+
+    raw = params.get("archived")
+    if not raw:
+        return {}
+    try:
+        value = int(raw[0])
+    except (TypeError, ValueError):
+        return {}
+    return {"archived_limit": max(0, min(value, MAX_ARCHIVED_SESSION_LIMIT))}
+
+
 def _parse_message_page_query(params: dict[str, list[str]]) -> MessagePageQuery:
     query = MessagePageQuery(
         after_seq=_parse_optional_nonnegative_int(params, "after_seq"),
@@ -620,7 +643,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(status, "application/json", body)
             return
         if path == "/harness":
-            self._send(200, "application/json", self.collector.render_harness_json())
+            self._send(
+                200,
+                "application/json",
+                self.collector.render_harness_json(
+                    **_archived_limit_kwargs(parse_qs(parsed.query))
+                ),
+            )
             return
         if path == "/harness/hosts":
             self._send(

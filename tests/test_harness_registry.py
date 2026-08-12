@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 import pytest
@@ -946,3 +946,74 @@ def test_migration_is_idempotent(tmp_path):
     assert second.migrated_events == 0
     assert second.mixed_sessions == ()
     assert rows == [("event-1", 1)]
+
+
+def _session(reg, host_id, *, status, minutes_ago):
+    """Create a session and force its status and recency."""
+    s = reg.create_session(host_id=host_id, harness="claude-code", command="x")
+    when = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc) - timedelta(
+        minutes=minutes_ago
+    )
+    with duckdb.connect(str(reg.duckdb_path)) as con:
+        con.execute(
+            "UPDATE harness_sessions SET status = ?, updated_at = ? WHERE session_id = ?",
+            [status, when, s.session_id],
+        )
+    return s.session_id
+
+
+def test_list_sessions_caps_archived_but_never_hides_a_live_one(tmp_path):
+    """The fleet payload grew without bound: 115 of 120 sessions were terminated.
+
+    Capping archived sessions keeps the poll payload small, but a live session
+    must never be dropped to make room -- being unable to see a running
+    session is a far worse failure than a long list.
+    """
+    reg, _ = _registry(tmp_path)
+    reg.register_host(host_id="h1", display_name="H1", kind="macos")
+
+    archived = [
+        _session(reg, "h1", status="terminated", minutes_ago=i) for i in range(10)
+    ]
+    live = [
+        _session(reg, "h1", status="running", minutes_ago=500),
+        _session(reg, "h1", status="created", minutes_ago=600),
+    ]
+
+    got = reg.list_sessions(archived_limit=3)
+    ids = [s.session_id for s in got]
+
+    # Every live session survives, however stale it looks.
+    for sid in live:
+        assert sid in ids, "a live session was dropped by the archived cap"
+
+    kept_archived = [sid for sid in ids if sid in archived]
+    assert len(kept_archived) == 3
+    # The three most recently updated archived sessions, not an arbitrary three.
+    assert kept_archived == archived[:3]
+
+
+def test_list_sessions_without_a_limit_returns_everything(tmp_path):
+    reg, _ = _registry(tmp_path)
+    reg.register_host(host_id="h1", display_name="H1", kind="macos")
+    for i in range(5):
+        _session(reg, "h1", status="terminated", minutes_ago=i)
+
+    assert len(reg.list_sessions()) == 5
+    assert len(reg.list_sessions(archived_limit=None)) == 5
+
+
+def test_list_sessions_treats_an_unknown_status_as_live(tmp_path):
+    """An unrecognised status must not be capped away.
+
+    Statuses are written in several places; if a new one appears, hiding it
+    silently would make a real session invisible. Unknown means live here.
+    """
+    reg, _ = _registry(tmp_path)
+    reg.register_host(host_id="h1", display_name="H1", kind="macos")
+    for i in range(4):
+        _session(reg, "h1", status="terminated", minutes_ago=i)
+    odd = _session(reg, "h1", status="quiesced", minutes_ago=999)
+
+    ids = [s.session_id for s in reg.list_sessions(archived_limit=1)]
+    assert odd in ids
