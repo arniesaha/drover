@@ -3576,6 +3576,11 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
                 "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
                 ["harness-race"],
             ).fetchone() == (0,)
+            assert con.execute(
+                "SELECT recap_reconcile_needed FROM harness_sessions "
+                "WHERE session_id = ?",
+                ["harness-race"],
+            ).fetchone() == (True,)
 
         # drain_once is the production worker loop's scheduled retry boundary.
         # No backend is needed to prove queue recovery: generation moves the
@@ -3585,11 +3590,35 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         server.shutdown()
 
     with duckdb.connect(str(collector.duckdb_path)) as con:
+        marker_after_recovery = con.execute(
+            "SELECT recap_reconcile_needed FROM harness_sessions "
+            "WHERE session_id = ?",
+            ["harness-race"],
+        ).fetchone()
         assert con.execute(
             "SELECT desired_source_seq, status, count(*) FROM live_recap_jobs "
             "WHERE session_id = ? GROUP BY desired_source_seq, status",
             ["harness-race"],
         ).fetchone() == (23, "retry_wait", 1)
+        # Remove ordinary due-job work from the second poll. If reconciliation
+        # cleanup were missing, the still-marked session would recreate this
+        # row from the stored completion and drain_once would handle it again.
+        con.execute(
+            "DELETE FROM live_recap_jobs WHERE session_id = ?", ["harness-race"]
+        )
+
+    assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 0
+    assert marker_after_recovery == (False,)
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        assert con.execute(
+            "SELECT recap_reconcile_needed FROM harness_sessions "
+            "WHERE session_id = ?",
+            ["harness-race"],
+        ).fetchone() == (False,)
+        assert con.execute(
+            "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
+            ["harness-race"],
+        ).fetchone() == (0,)
 
 
 def _event(seq: int, text: str) -> dict:

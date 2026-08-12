@@ -10,7 +10,10 @@ import pytest
 import drover.server.harness.registry as registry_module
 from drover.schema import bootstrap
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.schema import migrate_legacy_harness_event_sequences
+from drover.server.harness.schema import (
+    bootstrap_harness_tables,
+    migrate_legacy_harness_event_sequences,
+)
 
 
 def _registry(tmp_path):
@@ -36,6 +39,36 @@ def test_bootstrap_creates_harness_tables(tmp_path):
         "harness_sessions",
         "harness_events",
     }.issubset(tables)
+
+
+def test_bootstrap_adds_recap_reconcile_marker_to_existing_sessions(tmp_path):
+    """Removing the additive marker migration breaks existing Drover databases."""
+    duckdb_path = tmp_path / "pre-marker.duckdb"
+    with duckdb.connect(str(duckdb_path)) as con:
+        bootstrap_harness_tables(con)
+        columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('harness_sessions')").fetchall()
+        }
+        if "recap_reconcile_needed" in columns:
+            con.execute(
+                "ALTER TABLE harness_sessions DROP COLUMN recap_reconcile_needed"
+            )
+        con.execute("""INSERT INTO harness_sessions
+                 (session_id, host_id, harness, command, status)
+               VALUES ('existing-session', 'nas', 'codex', 'codex', 'running')""")
+
+        bootstrap_harness_tables(con)
+
+        columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('harness_sessions')").fetchall()
+        }
+        assert "recap_reconcile_needed" in columns
+        assert con.execute(
+            "SELECT recap_reconcile_needed FROM harness_sessions "
+            "WHERE session_id = 'existing-session'"
+        ).fetchone() == (False,)
 
 
 def test_register_host_upserts_capabilities_and_heartbeat(tmp_path):
