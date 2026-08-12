@@ -29,6 +29,17 @@ from drover.server.harness.recap_jobs import (
 
 _SESSION_PREVIEW_CANDIDATE_LIMIT = 5
 
+#: Statuses that mean a session is finished and may therefore be capped out of
+#: a listing. Deliberately an allowlist rather than "not running": statuses are
+#: written from several places, and a new one appearing must not make a real
+#: session silently invisible. Anything unrecognised counts as live.
+ARCHIVED_SESSION_STATUSES: tuple[str, ...] = (
+    "completed",
+    "terminated",
+    "errored",
+    "failed",
+)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -346,7 +357,18 @@ class HarnessRegistry:
         *,
         host_id: str | None = None,
         status: str | None = None,
+        archived_limit: int | None = None,
     ) -> list[HarnessSession]:
+        """List sessions, optionally keeping only the newest archived ones.
+
+        Every fleet poll returned every session that had ever run -- 115 of
+        120 were `terminated` when this was added, and the list only grows.
+        ``archived_limit`` bounds the finished ones while leaving live
+        sessions untouched: not being able to see a running session is a far
+        worse failure than a long list, so the cap only ever applies to
+        statuses known to be terminal, and anything unrecognised counts as
+        live.
+        """
         filters = []
         params: list[Any] = []
         if host_id is not None:
@@ -355,10 +377,32 @@ class HarnessRegistry:
         if status is not None:
             filters.append("status = ?")
             params.append(status)
-        query = "SELECT * FROM harness_sessions"
-        if filters:
-            query += " WHERE " + " AND ".join(filters)
-        query += " ORDER BY updated_at DESC, session_id"
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+        order = " ORDER BY updated_at DESC, session_id"
+
+        if archived_limit is None:
+            query = f"SELECT * FROM harness_sessions{where}{order}"
+        else:
+            # Rank archived rows among themselves so the cap cannot consume
+            # the budget a live session would have occupied.
+            placeholders = ", ".join("?" for _ in ARCHIVED_SESSION_STATUSES)
+            query = f"""
+                SELECT * FROM (
+                  SELECT *,
+                         CASE WHEN status IN ({placeholders})
+                              THEN row_number() OVER (
+                                     PARTITION BY status IN ({placeholders})
+                                     ORDER BY updated_at DESC, session_id
+                                   )
+                         END AS _archived_rank
+                    FROM harness_sessions{where}
+                )
+                 WHERE _archived_rank IS NULL OR _archived_rank <= ?
+                {order}
+            """
+            statuses = list(ARCHIVED_SESSION_STATUSES)
+            params = statuses + statuses + params + [max(0, int(archived_limit))]
+
         with self._connect() as con:
             return [HarnessSession.from_row(row) for row in _rows(con, query, params)]
 
