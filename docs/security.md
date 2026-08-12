@@ -16,19 +16,52 @@ hosts to individual credentials.
 
 ## Authentication
 
-The central HTTP API uses one shared bearer token. Resolution order is:
+Each paired device and each harness host holds its own bearer credential,
+issued by redeeming a pairing code. The server stores only
+`sha256("drover-cred-v1\0" + token)` and never the token, so `credentials.json`
+cannot be replayed if it leaks, and revoking one device leaves every other
+credential working.
+
+Pairing codes are held in the running server's memory and never written to
+disk, so restarting the server invalidates every outstanding code. A code is
+single use, expires after ten minutes for a device and fifteen for a host, and
+carries its own scope, so a device code cannot be redeemed into a host
+credential.
+
+`POST /auth/pair` is the only unauthenticated write in the API, because a
+device being paired has no credential yet. It answers identically for unknown,
+already used, and expired codes, and refuses a source after five failed
+attempts in a minute.
+
+Treat any credential as equivalent to interactive access to every registered
+harness host. Revoke rather than rotate when a single device is lost:
+
+```bash
+drover-server credentials list
+drover-server credentials revoke <credential-id>
+```
+
+### Legacy shared token
+
+The original single shared bearer token is still accepted while
+`[auth] legacy_token_enabled` is true, which is the default so that upgrading
+does not lock out an existing host or phone. Turn it off once every device and
+host has been paired. Resolution order is:
 
 1. `DROVER_API_TOKEN`
 2. `[auth].api_token` in `~/.drover/config.toml`
 3. Auto-generated `~/.drover/api_token`
 
-The generated token file uses mode `0600`. Treat the token as equivalent to
-interactive access to every registered harness host:
+The generated token file uses mode `0600`, as does `~/.drover/credentials.json`.
+Treat any token as equivalent to interactive access to every registered harness
+host:
 
 - Do not commit it or paste it into issue bodies, logs, screenshots, or shell
   commands that will be shared.
-- Store it in the iOS Keychain through the app's settings flow.
-- Rotate it if any participating machine or account becomes untrusted.
+- Prefer scanning a pairing code over copying a token; the app stores what it
+  receives in the iOS Keychain.
+- Rotate the shared token, or revoke the affected credential, if any
+  participating machine or account becomes untrusted.
 - Keep authentication enabled outside isolated local development.
 
 ## Trust Model

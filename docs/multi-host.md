@@ -69,13 +69,25 @@ Tailscale Funnel. A relay host should not set `--local-url` or
 
 ## Authentication
 
-The central server and every host currently share one bearer token. The daemon
-resolves it from `--host-token`, `DROVER_API_TOKEN`, or
-`~/.drover/api_token`. Prefer the environment or token file so it does not
-appear in shell history.
+Each paired device and each host holds its own credential. The central server
+stores only a SHA-256 verifier of the token and never the token itself, so a
+lost phone is revoked on its own without disturbing anything else:
 
-Because v0.1 does not bind a credential to a specific `host-id`, every host
-belongs to the same trust domain. Do not enroll a machine you do not fully
+```bash
+uv run drover-server credentials list
+uv run drover-server credentials revoke <credential-id>
+```
+
+Revocation takes effect on the next request.
+
+The original shared cluster token still works while
+`[auth] legacy_token_enabled` is true, which is the default. The daemon
+resolves it from `--host-token`, `DROVER_API_TOKEN`, or `~/.drover/api_token`.
+Prefer the environment or token file so it does not appear in shell history.
+Turn the setting off once every device and host holds its own credential.
+
+Because v0.1 does not bind a credential to a specific `host-id`, a host
+credential can act as any host. Do not enroll a machine you do not fully
 control. See [Security](security.md).
 
 ## Validation
