@@ -2339,25 +2339,33 @@ def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(
 ) -> None:
     now = [0.0]
     version = ["stable"]
+    version_calls: list[tuple[str, str]] = []
+
+    def source_version(analyzer_id: str, target_id: str) -> str:
+        version_calls.append((analyzer_id, target_id))
+        return f"facts:{analyzer_id}:{target_id}:{version[0]}"
+
     scheduler = AdvisoryScheduler(
         duckdb_path=db_path,
         analyzer_ids=("deterministic.telemetry_coverage",),
         full_review_interval_seconds=60,
         clock=lambda: now[0],
-        source_version_factory=lambda analyzer_id, target_id: (
-            f"facts:{analyzer_id}:{target_id}:{version[0]}"
-        ),
+        source_version_factory=source_version,
     )
 
     first = scheduler.enqueue_due_full_review()[0]
     assert scheduler.enqueue_due_full_review() == []
     version[0] = "stale-threshold-crossed"
-    changed_in_same_bucket = scheduler.enqueue_due_full_review()
+    assert scheduler.enqueue_due_full_review() == []
+    assert version_calls == [("deterministic.telemetry_coverage", "fleet")]
     now[0] = 60.0
-    unchanged_next_bucket = scheduler.enqueue_due_full_review()
+    changed_next_bucket = scheduler.enqueue_due_full_review()
 
-    assert changed_in_same_bucket[0].job_id == first.job_id
-    assert unchanged_next_bucket == []
+    assert changed_next_bucket[0].job_id == first.job_id
+    assert version_calls == [
+        ("deterministic.telemetry_coverage", "fleet"),
+        ("deterministic.telemetry_coverage", "fleet"),
+    ]
     with duckdb.connect(str(db_path), read_only=True) as con:
         assert (
             con.execute(
@@ -2366,6 +2374,33 @@ def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(
             ).fetchone()[0]
             == 2
         )
+
+
+def test_failed_material_version_pass_retries_in_the_same_interval(
+    db_path: Path,
+) -> None:
+    calls = 0
+
+    def source_version(analyzer_id: str, target_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary snapshot failure")
+        return f"facts:{analyzer_id}:{target_id}:stable"
+
+    scheduler = AdvisoryScheduler(
+        duckdb_path=db_path,
+        analyzer_ids=("deterministic.telemetry_coverage",),
+        full_review_interval_seconds=60,
+        clock=lambda: 0.0,
+        source_version_factory=source_version,
+    )
+
+    with pytest.raises(RuntimeError, match="temporary snapshot failure"):
+        scheduler.enqueue_due_full_review()
+
+    assert len(scheduler.enqueue_due_full_review()) == 1
+    assert calls == 2
 
 
 def test_runtime_snapshot_includes_latest_provider_reset_windows(

@@ -586,14 +586,8 @@ def _snapshot_signature(source: Path) -> tuple[int, int, int, int]:
     )
 
 
-def _copy_store(source: Path, destination: Path) -> None:
-    """Copy the store *and its WAL*, which is where recent rows actually are.
-
-    Measured on DuckDB 1.5.2: with a connection held open, an insert lives
-    entirely in ``<db>.wal``, and a copy of the database file alone yields a
-    database in which the table does not exist. Copying the pair and attaching
-    it ``READ_ONLY`` replays the log and returns the rows.
-    """
+def copy_duckdb_store(source: Path, destination: Path) -> None:
+    """Copy a DuckDB store and its WAL when one exists."""
     shutil.copy2(source, destination)
     wal = _write_ahead_log(source)
     if wal.exists():
@@ -628,7 +622,7 @@ def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
         fresh = Path(directory.name) / (
             f"{source.stem}-{next(_SNAPSHOT_SEQUENCE)}{source.suffix}"
         )
-        _copy_store(source, fresh)
+        copy_duckdb_store(source, fresh)
         return _CachedSnapshot(
             path=fresh, signature=_snapshot_signature(source), busy=True
         )

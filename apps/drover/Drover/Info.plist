@@ -27,6 +27,8 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Drover uses the camera to scan the pairing QR code shown by drover-server. The camera is not used for anything else.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Drover connects to your Drover server on your local network to manage agent sessions.</string>
 	<key>UIBackgroundModes</key>

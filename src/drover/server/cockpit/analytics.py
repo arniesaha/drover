@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -227,12 +228,48 @@ def _activity_analytics_in_snapshot(
     """Run every analytics statement inside the caller's current snapshot."""
     codec = cursor_codec or _DEFAULT_CURSOR_CODEC
     snapshot_at, cursor_snapshot = _cursor_snapshot_context(codec, filters)
+    with _materialized_session_facts(con, filters, snapshot_at) as facts:
+        return _activity_analytics_from_facts(
+            con, filters, codec, snapshot_at, cursor_snapshot, facts
+        )
+
+
+@contextmanager
+def _materialized_session_facts(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    snapshot_at: datetime,
+):
+    """Yield one connection-scoped copy of the normalized request facts."""
+    relation = f"analytics_session_facts_{secrets.token_hex(8)}"
     base_sql, params = _session_facts_sql(filters, snapshot_at)
-    snapshot_version = _snapshot_fingerprint(con, base_sql, params, snapshot_at)
+    con.execute(
+        f"CREATE TEMP TABLE {relation} AS {base_sql} SELECT * FROM filtered_sessions",
+        params,
+    )
+    try:
+        yield relation
+    finally:
+        try:
+            con.execute(f"DROP TABLE IF EXISTS {relation}")
+        except Exception:
+            # Preserve the query failure that caused cleanup to run. A failed
+            # transaction removes the request-scoped table when it rolls back.
+            pass
+
+
+def _activity_analytics_from_facts(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    codec: AnalyticsCursorCodec,
+    snapshot_at: datetime,
+    cursor_snapshot: str | None,
+    facts: str,
+) -> ActivityAnalytics:
+    snapshot_version = _snapshot_fingerprint(con, facts, snapshot_at)
     if cursor_snapshot is not None and cursor_snapshot != snapshot_version:
         raise AnalyticsSnapshotChangedError()
-    aggregate = con.execute(
-        base_sql + """
+    aggregate = con.execute(f"""
         SELECT
           count(*) AS session_count,
           COALESCE(sum(total_tokens), 0) AS total_tokens,
@@ -247,10 +284,8 @@ def _activity_analytics_in_snapshot(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
           max(latest_activity_at) AS observed_at
-        FROM filtered_sessions
-        """,
-        params,
-    ).fetchone()
+        FROM {facts}
+        """).fetchone()
     assert aggregate is not None
     session_count = int(aggregate[0] or 0)
     attributable_sessions = int(aggregate[7] or 0)
@@ -277,8 +312,7 @@ def _activity_analytics_in_snapshot(
     )
     projects, projects_page = _project_breakdowns(
         con,
-        base_sql,
-        params,
+        facts,
         filters,
         project_metric,
         codec,
@@ -287,8 +321,7 @@ def _activity_analytics_in_snapshot(
     )
     harnesses, harnesses_page = _dimension_breakdowns(
         con,
-        base_sql,
-        params,
+        facts,
         filters,
         "harness",
         codec,
@@ -297,8 +330,7 @@ def _activity_analytics_in_snapshot(
     )
     hosts, hosts_page = _dimension_breakdowns(
         con,
-        base_sql,
-        params,
+        facts,
         filters,
         "host_id",
         codec,
@@ -307,8 +339,7 @@ def _activity_analytics_in_snapshot(
     )
     models, models_page = _dimension_breakdowns(
         con,
-        base_sql,
-        params,
+        facts,
         filters,
         "model",
         codec,
@@ -509,8 +540,7 @@ def _session_facts_sql(
 
 def _project_breakdowns(
     con: duckdb.DuckDBPyConnection,
-    base_sql: str,
-    params: list[Any],
+    facts: str,
     filters: AnalyticsFilters,
     metric: Literal["tokens", "sessions"],
     codec: AnalyticsCursorCodec,
@@ -528,14 +558,14 @@ def _project_breakdowns(
         snapshot_version,
     )
     having = ""
-    query_params = list(params)
+    query_params: list[Any] = []
     if cursor is not None:
         having = (
             f"HAVING ({order_column} < ? OR ({order_column} = ? AND project_key > ?))"
         )
         query_params.extend([cursor[0], cursor[0], cursor[1]])
     rows = con.execute(
-        base_sql + f"""
+        f"""
         SELECT
           project_key,
           count(*) AS session_count,
@@ -552,7 +582,7 @@ def _project_breakdowns(
           count(*) FILTER (WHERE has_cache) AS cache_sessions,
           count(*) FILTER (WHERE has_latency) AS latency_sessions,
           max(latest_activity_at) AS observed_at
-        FROM filtered_sessions
+        FROM {facts}
         WHERE project_key IS NOT NULL
         GROUP BY project_key
         {having}
@@ -606,8 +636,7 @@ def _project_breakdowns(
 
 def _dimension_breakdowns(
     con: duckdb.DuckDBPyConnection,
-    base_sql: str,
-    params: list[Any],
+    facts: str,
     filters: AnalyticsFilters,
     column: Literal["harness", "host_id", "model"],
     codec: AnalyticsCursorCodec,
@@ -626,12 +655,12 @@ def _dimension_breakdowns(
         snapshot_version,
     )
     having = ""
-    query_params = list(params)
+    query_params: list[Any] = []
     if cursor is not None:
         having = "HAVING (session_count < ? OR (session_count = ? AND key > ?))"
         query_params.extend([cursor[0], cursor[0], cursor[1]])
     rows = con.execute(
-        base_sql + f"""
+        f"""
         SELECT
           {column} AS key,
           count(*) AS session_count,
@@ -647,7 +676,7 @@ def _dimension_breakdowns(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
           max(latest_activity_at) AS observed_at
-        FROM filtered_sessions
+        FROM {facts}
         WHERE {column} IS NOT NULL
         GROUP BY {column}
         {having}
@@ -754,14 +783,12 @@ def _cursor_snapshot_context(
 
 def _snapshot_fingerprint(
     con: duckdb.DuckDBPyConnection,
-    base_sql: str,
-    params: list[Any],
+    facts: str,
     snapshot_at: datetime,
 ) -> str:
     """Bounded multiset fingerprint of every normalized fact used by analytics."""
-    row = con.execute(
-        base_sql + """
-        , fingerprint_rows AS (
+    row = con.execute(f"""
+        WITH fingerprint_rows AS (
           SELECT to_json(struct_pack(
             session_id := session_id,
             started_at := started_at,
@@ -781,7 +808,7 @@ def _snapshot_fingerprint(
             has_cache := has_cache,
             has_latency := has_latency
           )) AS body
-          FROM filtered_sessions
+          FROM {facts}
         )
         SELECT
           count(*),
@@ -790,9 +817,7 @@ def _snapshot_fingerprint(
           COALESCE(bit_xor(hash('drover-analytics-snapshot-v1', body)), 0),
           COALESCE(sum(hash('drover-analytics-snapshot-v1', body)), 0)
         FROM fingerprint_rows
-        """,
-        params,
-    ).fetchone()
+        """).fetchone()
     assert row is not None
     body = json.dumps(
         [

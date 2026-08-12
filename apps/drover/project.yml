@@ -43,6 +43,12 @@ targets:
         NSLocalNetworkUsageDescription: >-
           Drover connects to your Drover server on your local network to
           manage agent sessions.
+        # Required before any camera access. Unlike the Local Network key,
+        # a missing usage description is not a silent block: iOS terminates
+        # the app the moment AVCaptureSession touches the camera.
+        NSCameraUsageDescription: >-
+          Drover uses the camera to scan the pairing QR code shown by
+          drover-server. The camera is not used for anything else.
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
     # No entitlements: the time-sensitive notifications capability

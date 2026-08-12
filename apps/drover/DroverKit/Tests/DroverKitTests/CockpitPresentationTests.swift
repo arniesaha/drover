@@ -91,6 +91,33 @@ import Testing
     #expect(value.warningText == "Last successful refresh was two hours ago. Showing last reported values.")
 }
 
+@Test func unavailableObservedUsageNamesMissingAPICost() throws {
+    let section = try decodeActivitySection(status: "error", data: "null")
+
+    let value = ObservedUsageSectionPresentation(section: section)
+
+    #expect(value.warningText == "Observed usage, including API cost, is temporarily unavailable. Pull to refresh and try again.")
+    #expect(value.accessibilityLabel == value.warningText)
+    #expect(ObservedUsageSectionPresentation.identifier == "analytics-observed-unavailable")
+}
+
+@Test func unknownObservedUsageNeverInventsZeroCost() throws {
+    let section = try decodeActivitySection(status: "future-status", data: "null")
+
+    let value = ObservedUsageSectionPresentation(section: section)
+
+    #expect(value.warningText != nil)
+}
+
+@Test func healthyObservedUsageDoesNotShowUnavailableWarning() throws {
+    let section = try decodeActivitySection(status: "ok", data: populatedActivity)
+
+    let value = ObservedUsageSectionPresentation(section: section)
+
+    #expect(value.warningText == nil)
+    #expect(value.accessibilityLabel == nil)
+}
+
 @Test func unavailableProviderWithoutRetainedValuesDoesNotClaimToShowThem() throws {
     let value = ProviderSectionPresentation(
         status: .unavailable, hasRetainedValues: false
@@ -335,6 +362,15 @@ private func presentationConsentFixture(_ name: String) throws -> ContentAnalysi
 private let populatedActivity = #"{"totals":{"session_count":12,"total_tokens":1234,"cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,"total_latency_ms":500},"projects":[],"harnesses":[],"hosts":[],"models":[],"project_metric":"tokens","coverage":{"token_percent":86.4}}"#
 
 private let populatedProjects = #"[{"project_key":"arniesaha/drover","session_count":12,"total_tokens":1234,"cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,"total_latency_ms":500,"harnesses":["codex"],"hosts":["mac-mini"],"metric":"tokens"}]"#
+
+private func decodeActivitySection(
+    status: String, data: String
+) throws -> SectionEnvelope<ActivitySummary> {
+    try JSONDecoder().decode(
+        SectionEnvelope<ActivitySummary>.self,
+        from: Data(#"{"status":"\#(status)","data":\#(data)}"#.utf8)
+    )
+}
 
 private func decodeOverview(
     providerStatus: String,

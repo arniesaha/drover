@@ -24,6 +24,9 @@ dependencies = [
     "anthropic>=0.40",
     "requests",
     "PyYAML>=6.0",
+    # Pure Python with no transitive dependencies, which matters for an
+    # install path that has to work everywhere. Renders the pairing QR.
+    "segno>=1.6",
 ]
 
 [project.scripts]

@@ -462,14 +462,19 @@ def test_send_does_not_swallow_other_final_write_errors():
         _MetricsHandler._send(handler, 200, "application/json", "{}")
 
 
-def test_send_does_not_swallow_disconnect_before_final_write():
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError("headers"), ConnectionResetError("headers")]
+)
+def test_send_treats_expected_header_disconnect_as_access_outcome(caplog, error):
     handler = _send_handler(
         writer=_FailingWriter(AssertionError("write must not run")),
-        end_headers=lambda: (_ for _ in ()).throw(BrokenPipeError("headers")),
+        end_headers=lambda: (_ for _ in ()).throw(error),
     )
 
-    with pytest.raises(BrokenPipeError, match="headers"):
+    with caplog.at_level(logging.INFO, logger="drover.metrics"):
         _MetricsHandler._send(handler, 200, "application/json", "{}")
+
+    assert "client disconnected while sending 2 bytes" in caplog.text
 
 
 def _json_request(url: str, *, payload: dict | None = None):
@@ -4639,6 +4644,57 @@ def test_quality_and_observatory_snapshots_read_an_isolated_copy(tmp_path, monke
     for path in seen:
         assert path != live, f"slow snapshot read the live DB at {path}"
         assert path.name == live.name, "copy should keep the database filename"
+
+
+def test_quality_snapshot_includes_committed_rows_still_in_the_wal(
+    tmp_path, monkeypatch
+):
+    collector = _make_collector(tmp_path)
+    writer = duckdb.connect(str(collector.duckdb_path))
+    try:
+        writer.execute("CREATE TABLE wal_probe (value VARCHAR)")
+        writer.execute("INSERT INTO wal_probe VALUES ('committed')")
+        assert Path(str(collector.duckdb_path) + ".wal").exists()
+
+        def read_copy(*, duckdb_path, **kwargs):
+            con = duckdb.connect(str(duckdb_path))
+            try:
+                value = con.execute("SELECT value FROM wal_probe").fetchone()[0]
+            finally:
+                con.close()
+            return {"runtime_audit": {}, "wal_probe": value}
+
+        monkeypatch.setattr(metrics, "quality_snapshot", read_copy)
+
+        assert collector._quality_snapshot()["wal_probe"] == "committed"
+    finally:
+        writer.close()
+
+
+def test_observatory_snapshot_includes_committed_rows_still_in_the_wal(
+    tmp_path, monkeypatch
+):
+    collector = _make_collector(tmp_path)
+    writer = duckdb.connect(str(collector.duckdb_path))
+    try:
+        writer.execute("CREATE TABLE wal_probe (value VARCHAR)")
+        writer.execute("INSERT INTO wal_probe VALUES ('committed')")
+        assert Path(str(collector.duckdb_path) + ".wal").exists()
+
+        def read_copy(*, duckdb_path, **kwargs):
+            con = duckdb.connect(str(duckdb_path))
+            try:
+                value = con.execute("SELECT value FROM wal_probe").fetchone()[0]
+            finally:
+                con.close()
+            return {"wal_probe": value}
+
+        monkeypatch.setattr(metrics, "pipeline_observatory_snapshot", read_copy)
+
+        result = collector._observatory_snapshot({"runtime_audit": {}})
+        assert result["wal_probe"] == "committed"
+    finally:
+        writer.close()
 
 
 def test_copy_backed_snapshots_use_the_parallel_snapshot_role(tmp_path, monkeypatch):
