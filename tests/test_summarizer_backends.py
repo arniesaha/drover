@@ -38,6 +38,27 @@ def _isolate_oauth_sources(monkeypatch, tmp_path):
     monkeypatch.delenv("NEXUS_SUMMARIZER_OLLAMA_KEEP_ALIVE", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _pin_claude_code_availability(monkeypatch):
+    """Decide whether claude-code exists rather than inheriting the machine.
+
+    ``SummarizerBackendConfig.has_harness_backend`` calls ``resolve_binary()``,
+    so selector tests silently depended on whether the developer happened to
+    have the CLI installed: the suite passed on a Mac that has it and failed
+    on CI, which never will -- nine tests, none of them about installation.
+    Availability is an *input* to these tests, so it is set here.
+
+    Same reasoning as ``_isolate_oauth_sources`` above. Tests that want the
+    CLI absent already say so with an explicit
+    ``patch("...claude.resolve_binary", return_value=None)``, which overrides
+    this.
+    """
+    monkeypatch.setattr(
+        "drover.server.harness.structured.claude.resolve_binary",
+        lambda: "/fake/bin/claude",
+    )
+
+
 # --- AnthropicBackend ---------------------------------------------------------
 
 
