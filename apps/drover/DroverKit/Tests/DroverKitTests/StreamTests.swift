@@ -354,6 +354,144 @@ struct StreamTests {
     ])
 }
 
+@Test func coldCatchUpRendersAroundAPermanentGapAfterBoundedRetries() async throws {
+    // Issue #99: the hub's copy of the stream is permanently missing events
+    // harnessd recorded. Contiguity is the right invariant while the hole
+    // might still be filled, but it is the wrong answer to one that never
+    // will be — the window is discarded, the loop re-establishes, and it
+    // fails identically forever, so a single lost event costs the ENTIRE
+    // session's history and surfaces no error. Once the gap has outlived its
+    // retries, render what is there and mark the hole.
+    nonisolated(unsafe) var attempts = 0
+    MockURLProtocol.handler = { _ in
+        attempts += 1
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")),
+                      \(wireMessage(seq: 5, text: "five"))],
+         "page_min_seq": 1, "page_max_seq": 5, "max_seq": 5,
+         "has_older": false, "has_newer": false}
+        """.utf8))
+    }
+    let connector = FakeConnector([
+        .frames([wireMessage(seq: 6, text: "six")], thenError: false)
+    ])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var batch: [HarnessMessage] = []
+    var live: [Int] = []
+    var drops = 0
+    for await event in await stream.events() {
+        switch event {
+        case let .history(messages, _): batch = messages
+        case let .message(message): live.append(message.seq)
+        case .connection(false): drops += 1
+        case .connection(true), .unauthorized: break
+        }
+        // Wait for the live frame, not just the batch: the socket is attached
+        // *after* the window is published, so leaving at `.history` would race
+        // the connect the assertions below are about. Without the fix no
+        // history is ever published, so the drop ceiling ends the loop.
+        if live == [6] || drops > MessageStream.gapRetryLimit + 2 { break }
+    }
+
+    // The hole (3 and 4) becomes one marker row carrying its own sequence.
+    #expect(batch.map(\.seq) == [1, 2, 3, 5])
+    #expect(batch.map(\.type) == [.assistantOutput, .assistantOutput,
+                                  .transcriptGap, .assistantOutput])
+    #expect(batch.map(\.text) == ["one", "two",
+                                  "2 messages are missing from this transcript",
+                                  "five"])
+    // Degrading is a last resort, not the first response: the contiguous
+    // retries all ran first.
+    #expect(drops == MessageStream.gapRetryLimit)
+    #expect(attempts == MessageStream.gapRetryLimit + 1)
+    // Attached at the marked window's bound, and live delivery carries on
+    // across the hole rather than stalling on it.
+    #expect(connector.requests.first?.url?.query == "after_seq=5")
+    #expect(live == [6])
+}
+
+@Test func coldCatchUpDoesNotDegradeOnAGapThatHeals() async throws {
+    // A gap the hub is merely late on must not leave a marker in the
+    // transcript: the retries exist precisely so a transient hole heals.
+    nonisolated(unsafe) var attempts = 0
+    MockURLProtocol.handler = { _ in
+        attempts += 1
+        if attempts == 1 {
+            return (200, Data("""
+            {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 3, text: "three"))],
+             "page_min_seq": 1, "page_max_seq": 3, "max_seq": 3,
+             "has_older": false, "has_newer": false}
+            """.utf8))
+        }
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")),
+                      \(wireMessage(seq: 3, text: "three"))],
+         "page_min_seq": 1, "page_max_seq": 3, "max_seq": 3,
+         "has_older": false, "has_newer": false}
+        """.utf8))
+    }
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: FakeConnector([.frames([], thenError: false)]),
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var batch: [HarnessMessage] = []
+    for await event in await stream.events() {
+        if case let .history(messages, _) = event { batch = messages; break }
+    }
+
+    #expect(batch.map(\.seq) == [1, 2, 3])
+    #expect(!batch.contains(where: { $0.type == .transcriptGap }))
+    #expect(attempts == 2)
+}
+
+@Test func forwardCatchUpRendersAroundAPermanentGapAfterBoundedRetries() async throws {
+    // The same treatment on the reconnect path: a live socket frame that
+    // jumps the sequence sends the stream back through REST, and if REST
+    // cannot produce the missing event either, the session must keep
+    // updating rather than freeze on the last thing it managed to render.
+    nonisolated(unsafe) var attempts = 0
+    MockURLProtocol.handler = { _ in
+        attempts += 1
+        if attempts == 1 {
+            return (200, Data(#"{"messages": [], "max_seq": 0, "has_older": false, "has_newer": false}"#.utf8))
+        }
+        return (200, Data("""
+        {"messages": [\(wireMessage(seq: 2, text: "two"))],
+         "page_min_seq": 2, "page_max_seq": 2, "max_seq": 2,
+         "has_older": true, "has_newer": false}
+        """.utf8))
+    }
+    let connector = FakeConnector([
+        .frames([wireMessage(seq: 2, text: "two")], thenError: true)
+    ])
+    let stream = MessageStream(
+        client: client(), sessionID: "s1", connector: connector,
+        reconnectBaseDelay: .milliseconds(10)
+    )
+
+    var batch: [HarnessMessage] = []
+    var drops = 0
+    for await event in await stream.events() {
+        switch event {
+        case let .history(messages, _) where !messages.isEmpty: batch = messages
+        case .connection(false): drops += 1
+        case .history, .message, .connection(true), .unauthorized: break
+        }
+        if !batch.isEmpty || drops > MessageStream.gapRetryLimit + 2 { break }
+    }
+
+    #expect(batch.map(\.seq) == [1, 2])
+    #expect(batch.map(\.type) == [.transcriptGap, .assistantOutput])
+    #expect(batch.map(\.text) == ["1 message is missing from this transcript",
+                                  "two"])
+}
+
 @Test func coldCatchUpAssemblesItsWindowInBoundedChunks() async throws {
     // The cold window is unchanged at 200 messages, but no single request may
     // carry more than one page of it.

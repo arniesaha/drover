@@ -4282,6 +4282,21 @@ def test_prometheus_exports_dropped_harness_events(tmp_path):
     assert "drover_harness_dropped_events_total 4" in text
 
 
+def test_prometheus_exports_undelivered_harness_events(tmp_path):
+    """Loss in transit to the hub (#99) is a different loss from a failed
+    local write, and the dropped-events counter never saw it."""
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_undelivered_event_count()
+    daemon_mod.record_undelivered_events(7)
+
+    collector = _make_collector(tmp_path)
+    text = collector.render_prometheus()
+
+    assert "drover_harness_undelivered_events_total 7" in text
+    daemon_mod.reset_undelivered_event_count()
+
+
 def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
     """The hub DB is ~483MB; copying it per poll was a 16% disk duty cycle."""
     collector = _make_collector(tmp_path)

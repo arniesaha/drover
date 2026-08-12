@@ -96,6 +96,14 @@ public actor MessageStream {
     /// of requests it takes to gather changed.
     public static let defaultColdWindowSize = 200
 
+    /// Consecutive catch-up attempts a sequence gap gets to heal before it is
+    /// treated as permanent. A gap the hub is merely late on closes within a
+    /// couple of seconds; one where the events never reached the hub at all
+    /// (#99) never closes, and retrying it forever renders nothing and says
+    /// nothing. Small on purpose: this is the delay before a wedged session
+    /// shows its history, and the reconnect backoff already spaces the tries.
+    static let gapRetryLimit = 3
+
     private let client: DroverClient
     private let sessionID: String
     private let connector: WebSocketConnecting
@@ -118,6 +126,12 @@ public actor MessageStream {
     private var coldWindow: [HarnessMessage] = []
     private var coldWindowMaxSeq: Int?
     private var coldWindowHasOlder = false
+
+    /// Consecutive catch-up attempts that failed on a sequence gap. Reset by
+    /// any catch-up that completes, so tolerance is only ever earned by a hole
+    /// that is still there after `gapRetryLimit` tries.
+    private var gapAttempts = 0
+    private var toleratingGaps: Bool { gapAttempts >= Self.gapRetryLimit }
 
     public init(
         client: DroverClient,
@@ -263,13 +277,24 @@ public actor MessageStream {
         continuation.finish()
     }
 
+    /// Counts consecutive gap failures around the real catch-up, so that a
+    /// hole which survives `gapRetryLimit` attempts stops being retried and
+    /// starts being *marked*. Every other failure — a dropped request, a
+    /// malformed page, a moving snapshot — leaves the count alone: those are
+    /// not evidence that anything is permanently missing.
     private func catchUp(
         continuation: AsyncStream<StreamEvent>.Continuation
     ) async throws -> Int {
-        if !coldHistoryComplete {
-            return try await coldCatchUp(continuation: continuation)
+        do {
+            let bound = coldHistoryComplete
+                ? try await forwardCatchUp(continuation: continuation)
+                : try await coldCatchUp(continuation: continuation)
+            gapAttempts = 0
+            return bound
+        } catch CatchUpError.sequenceGap {
+            gapAttempts += 1
+            throw CatchUpError.sequenceGap
         }
-        return try await forwardCatchUp(continuation: continuation)
     }
 
     /// A cold open publishes only the newest bounded window, then attaches the
@@ -349,7 +374,7 @@ public actor MessageStream {
             // already hold.
             guard page.maxSeq >= fixedMaxSeq,
                   !page.messages.isEmpty,
-                  page.messages.last?.seq == beforeSeq - 1,
+                  joins(page, below: beforeSeq),
                   page.hasNewer else {
                 throw CatchUpError.sequenceGap
             }
@@ -361,7 +386,8 @@ public actor MessageStream {
             throw CatchUpError.snapshotChanged
         }
         let visible = coldWindow.filter { $0.seq > 0 }
-        guard coldWindowHasOlder || fixedMaxSeq == 0 || visible.first?.seq == 1 else {
+        guard coldWindowHasOlder || fixedMaxSeq == 0 || visible.first?.seq == 1
+                || toleratingGaps else {
             throw CatchUpError.sequenceGap
         }
         olderBeforeSeq = coldWindow.first?.seq
@@ -370,9 +396,14 @@ public actor MessageStream {
         lastSeq = fixedMaxSeq
         coldHistoryComplete = true
         // One batch for the whole window: assembling it in chunks must not
-        // become visible as a series of prepends.
+        // become visible as a series of prepends. A window with nothing older
+        // behind it claims to start at the session's first event, so a first
+        // sequence above 1 is itself a hole.
         if !visible.isEmpty {
-            continuation.yield(.history(visible, decodeIssues: []))
+            continuation.yield(.history(
+                marked(visible, leadingFrom: coldWindowHasOlder ? nil : 1),
+                decodeIssues: []
+            ))
         }
         discardColdWindow()
         return fixedMaxSeq
@@ -420,16 +451,17 @@ public actor MessageStream {
             let fresh = page.messages.filter { $0.seq > cursor }
             var expectedSeq = cursor + 1
             for message in fresh {
-                guard message.seq == expectedSeq else {
+                guard message.seq == expectedSeq || toleratingGaps else {
                     throw CatchUpError.sequenceGap
                 }
-                expectedSeq += 1
+                expectedSeq = message.seq + 1
             }
 
             if !fresh.isEmpty {
+                let batch = marked(fresh, leadingFrom: cursor + 1)
                 cursor = fresh.last!.seq
                 lastSeq = cursor
-                continuation.yield(.history(fresh, decodeIssues: page.decodeIssues))
+                continuation.yield(.history(batch, decodeIssues: page.decodeIssues))
             }
 
             guard let bound = fixedMaxSeq else {
@@ -456,10 +488,45 @@ public actor MessageStream {
             throw CatchUpError.snapshotChanged
         }
         for (previous, next) in zip(page.messages, page.messages.dropFirst()) {
-            guard next.seq == previous.seq + 1 else {
+            guard next.seq == previous.seq + 1 || toleratingGaps else {
                 throw CatchUpError.sequenceGap
             }
         }
+    }
+
+    /// An older page must sit immediately below the cursor. Under gap
+    /// tolerance it only has to sit *below* it — the hole in between gets
+    /// marked instead of retried.
+    private func joins(_ page: MessagePage, below cursor: Int) -> Bool {
+        guard let last = page.messages.last?.seq else { return false }
+        return toleratingGaps ? last < cursor : last == cursor - 1
+    }
+
+    /// Splices `transcript.gap` markers into an ascending run of messages —
+    /// the client-side twin of the marker the hub writes for a lost durable
+    /// write. A no-op on a contiguous run, which is every healthy path: only
+    /// a run the stream has already given up on healing has holes in it.
+    /// `lowerBound`, when given, is the sequence the run is claiming to start
+    /// at, so a run that starts above it is itself missing a leading piece.
+    private func marked(
+        _ messages: [HarnessMessage], leadingFrom lowerBound: Int?
+    ) -> [HarnessMessage] {
+        guard let first = messages.first else { return messages }
+        var result: [HarnessMessage] = []
+        result.reserveCapacity(messages.count + 1)
+        if let lowerBound, first.seq > lowerBound {
+            result.append(.transcriptGap(from: lowerBound, through: first.seq - 1))
+        }
+        result.append(first)
+        for (previous, next) in zip(messages, messages.dropFirst()) {
+            if next.seq > previous.seq + 1 {
+                result.append(
+                    .transcriptGap(from: previous.seq + 1, through: next.seq - 1)
+                )
+            }
+            result.append(next)
+        }
+        return result
     }
 
     /// Duplicate replay at or below `lastSeq` is harmless. A jump above the

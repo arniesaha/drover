@@ -31,6 +31,8 @@ struct MessageBubble: View {
             approvalResponseCaption
         case .status:
             statusCaption
+        case .transcriptGap:
+            gapCaption
         case .error:
             errorCard
         case .raw, .unknown:
@@ -132,6 +134,20 @@ struct MessageBubble: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+            Spacer()
+        }
+    }
+
+    /// A hole in the transcript, stated rather than hidden. Deliberately not
+    /// an error card: nothing is wrong with the session, some of its history
+    /// just did not survive the trip to the hub.
+    private var gapCaption: some View {
+        HStack {
+            Spacer()
+            Label(message.text, systemImage: "ellipsis.rectangle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("transcript-gap")
             Spacer()
         }
     }

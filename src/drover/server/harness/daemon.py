@@ -99,6 +99,14 @@ _dropped_events_total = 0
 _dropped_events_lock = threading.Lock()
 
 
+# A different loss, on the other side of the wire: events this host recorded
+# fine but could never hand to the hub. #99 lost ten of them mid-stream with
+# _dropped_events_total sitting at 0, because nothing counted the push path at
+# all -- the hub's write path never saw those events, so its counter could not.
+_undelivered_events_total = 0
+_undelivered_events_lock = threading.Lock()
+
+
 _ATTACHMENT_EXTENSIONS = {
     "image/jpeg": "jpg",
     "image/png": "png",
@@ -165,6 +173,23 @@ def reset_dropped_event_count() -> None:
     global _dropped_events_total
     with _dropped_events_lock:
         _dropped_events_total = 0
+
+
+def record_undelivered_events(count: int = 1) -> None:
+    global _undelivered_events_total
+    with _undelivered_events_lock:
+        _undelivered_events_total += count
+
+
+def undelivered_event_count() -> int:
+    with _undelivered_events_lock:
+        return _undelivered_events_total
+
+
+def reset_undelivered_event_count() -> None:
+    global _undelivered_events_total
+    with _undelivered_events_lock:
+        _undelivered_events_total = 0
 
 
 @dataclass(frozen=True)

@@ -2,10 +2,13 @@
 
 ``EventPusher`` batches events emitted by the structured session manager
 (``on_message`` in ``manager.py``) and POSTs them to central's
-``/harness/events`` ingest route. Delivery is best-effort and at-least-once:
-a batch that fails to deliver is retried a bounded number of times and then
-dropped (central is the idempotent side, keyed by ``event_id``). Never log
-event text or the bearer token -- only counts.
+``/harness/events`` ingest route. Delivery is at-least-once: a batch that
+fails is retried, and a batch that outlives its retry attempts is *kept* and
+re-offered on the next cycle rather than discarded (central is the idempotent
+side, keyed by ``event_id``). Only two things lose an event -- a queue that
+overflows and a shutdown central never comes back from -- and both bump
+``record_undelivered_events``. Never log event text or the bearer token --
+only counts.
 """
 
 from __future__ import annotations
@@ -25,6 +28,17 @@ _POST_TIMEOUT_SECONDS = 10.0
 # stop() must outlast one in-flight HTTP attempt (10 s) so the worker can
 # hand back an undelivered batch instead of being orphaned mid-retry.
 _STOP_JOIN_SECONDS = 12.0
+# Final flush attempts. More than one because a worker that outlived the join
+# can hand a batch back after the first sweep has already read the queue.
+_SHUTDOWN_ATTEMPTS = 2
+
+
+def _record_undelivered(count: int) -> None:
+    # Imported here, not at module scope: daemon imports this module, so a
+    # top-level import would be circular (same reason as manager.py's).
+    from drover.server.harness.daemon import record_undelivered_events
+
+    record_undelivered_events(count)
 
 
 class EventPusher:
@@ -47,9 +61,10 @@ class EventPusher:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        # Undelivered batch handed back by the worker when stop() interrupts
-        # its retry cycle; stop()'s final flush picks it up.
-        self._pending_batch: list[dict[str, Any]] | None = None
+        # Events a delivery attempt could not place. Kept here (not thrown
+        # away) and prepended to the next drain, so a central that is down
+        # longer than one cycle's attempts costs latency, not history.
+        self._unsent: list[dict[str, Any]] = []
 
     def start(self) -> None:
         if self._thread is not None:
@@ -81,23 +96,31 @@ class EventPusher:
             self._wake.set()
 
     def stop(self) -> None:
-        """Stop the worker, then give undelivered events one last attempt.
+        """Stop the worker, then give undelivered events a last few attempts.
 
         The worker's retry backoff waits on the stop event, so it wakes
-        immediately, hands back any in-flight batch via _pending_batch, and
-        exits. Whatever remains (handed-back batch + queue remnants) gets one
-        final synchronous delivery attempt; on failure it is dropped with a
-        counts-only stderr line -- nothing disappears silently.
+        immediately, retains any in-flight batch, and exits. Whatever remains
+        (retained batch + queue remnants) is drained and re-posted; the drain
+        repeats because a worker that outlived the join can retain a batch
+        after the first sweep has already read the queue. Only what is still
+        unsent when the attempts run out is lost, and it is counted as well as
+        logged -- nothing disappears silently.
         """
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=_STOP_JOIN_SECONDS)
-        remaining = (self._pending_batch or []) + self._drain()
-        self._pending_batch = None
-        if remaining and not self._post(remaining):
+        for _ in range(_SHUTDOWN_ATTEMPTS):
+            remaining = self._drain()
+            if not remaining:
+                break
+            if not self._post(remaining):
+                self._retain(remaining)
+        lost = self._drain()
+        if lost:
+            _record_undelivered(len(lost))
             print(
-                f"drover event pusher: dropping {len(remaining)} undelivered "
+                f"drover event pusher: dropping {len(lost)} undelivered "
                 "events at shutdown",
                 file=sys.stderr,
             )
@@ -117,11 +140,38 @@ class EventPusher:
                 batch.append(self._queue.get_nowait())
             except Empty:
                 break
-        if batch:
-            with self._queue_lock:
+        with self._queue_lock:
+            if batch:
                 self._queue_len = max(0, self._queue_len - len(batch))
                 self._overflowing = False
-        return batch
+            retained, self._unsent = self._unsent, []
+        # Retained first: seq order across the batch is preserved, which is
+        # what the hub replays a transcript in.
+        return retained + batch
+
+    def _retain(self, batch: list[dict[str, Any]]) -> None:
+        """Keep an undelivered batch for the next drain instead of losing it.
+
+        Re-offering is safe: central is idempotent on ``event_id``, so a
+        record it already stored costs a skipped insert, never a duplicate.
+        Bounded by the same ``_MAX_QUEUE`` cap as the inbound queue, since an
+        outage that outlasts the cap must not grow the process without limit
+        -- the oldest go, and those are counted, because that is the one live
+        case where an event genuinely cannot be delivered.
+        """
+        with self._queue_lock:
+            self._unsent.extend(batch)
+            overflow = len(self._unsent) + self._queue_len - _MAX_QUEUE
+            lost = min(max(0, overflow), len(self._unsent))
+            if lost:
+                del self._unsent[:lost]
+        if lost:
+            _record_undelivered(lost)
+            print(
+                f"drover event pusher: dropping {lost} undelivered events; "
+                f"retry buffer full ({_MAX_QUEUE})",
+                file=sys.stderr,
+            )
 
     def _deliver_with_retries(self, batch: list[dict[str, Any]]) -> None:
         for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -130,18 +180,18 @@ class EventPusher:
             if self._stop.is_set():
                 # Shutdown in progress: hand the batch to stop()'s final
                 # flush instead of burning the remaining attempts here.
-                self._pending_batch = batch
+                self._retain(batch)
                 return
             if attempt < _MAX_ATTEMPTS:
                 # Interruptible backoff: stop() wakes this immediately.
                 if self._stop.wait(_RETRY_BACKOFF_SECONDS):
-                    self._pending_batch = batch
+                    self._retain(batch)
                     return
-        print(
-            f"drover event pusher: dropping {len(batch)} events after "
-            f"{_MAX_ATTEMPTS} failed delivery attempts",
-            file=sys.stderr,
-        )
+        # Exhausting the attempts is not the end of the road. Dropping here is
+        # what lost ten mid-stream events in #99: an outage a few seconds
+        # longer than one cycle punched a permanent hole in the hub's copy,
+        # uncounted. Keep the batch and re-offer it next cycle instead.
+        self._retain(batch)
 
     def _post(self, batch: list[dict[str, Any]]) -> bool:
         """POST one batch; True only for a 2xx response.
