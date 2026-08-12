@@ -94,6 +94,7 @@ from drover.server.summarizer.retry import retry_errored_jobs
 from drover.server.summarizer.worker import SummarizerWorker
 from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
 from drover.server.web.auth import load_auth
+from drover.server.web.pairing import PairingCodes
 from drover.session_audit import audit_session_consistency_db, format_session_audit
 from drover.task_id import compute_task_id
 
@@ -1515,11 +1516,16 @@ def run(
             # 15s. Whoever asks first should not be the one paying that, so the
             # server pays it itself, off the request path.
             _warm_cockpit(metrics_collector.cockpit_service)
+            # Pairing codes live only in this process's memory, which is why
+            # `drover-server pair` reaches the hub over loopback rather than
+            # minting in-process. A restart invalidates outstanding codes.
+            pairing = PairingCodes()
             metrics_server = start_metrics_server(
                 host=metrics_host,
                 port=cfg.metrics_http_port,
                 collector=metrics_collector,
                 auth=auth,
+                pairing=pairing,
             )
             _warm_metrics(metrics_collector)
             provider_refresh = ProviderRefreshLoop(
