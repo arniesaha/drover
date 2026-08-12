@@ -133,12 +133,19 @@ def build_configured_analysis_backend(
         raise ValueError("external consent is required for cloud analysis")
     if backend_policy not in {"local", "cloud"}:
         raise ValueError("analysis backend policy must be local or cloud")
-    from drover.server.summarizer.backends import select_backend
+    from drover.server.summarizer.backends import local_analysis_backend, select_backend
 
-    transport = select_backend(
-        job_kind="advisory_content",
-        config=replace(config, backend_policy=backend_policy),
-    )
+    if backend_policy == "local":
+        # Deliberately not select_backend: the summarizer's "local" policy is
+        # retired and now means the claude-code CLI, which sends the bundle to
+        # Anthropic. "local" here is a disclosure to the user about where
+        # their content goes, so it must keep resolving to an on-box model.
+        transport = local_analysis_backend(config)
+    else:
+        transport = select_backend(
+            job_kind="advisory_content",
+            config=replace(config, backend_policy="cloud"),
+        )
     return ConfiguredAnalysisBackend(transport)
 
 

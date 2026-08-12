@@ -426,14 +426,14 @@ def _append_operational_health_metrics(
 def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> None:
     policy = str(report.get("backend_policy") or "unknown")
     allows_anthropic = policy in {"hybrid", "cloud"}
-    allows_local = policy in {"hybrid", "local"}
+    allows_harness = policy in {"harness", "hybrid"}
     lines.extend(
         [
             "# HELP drover_summarizer_policy Current summarizer backend policy.",
             "# TYPE drover_summarizer_policy gauge",
         ]
     )
-    for candidate in ("hybrid", "cloud", "local", "unknown"):
+    for candidate in ("harness", "hybrid", "cloud", "unknown"):
         lines.append(
             _metric(
                 "drover_summarizer_policy",
@@ -452,8 +452,8 @@ def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> N
             ),
             _metric(
                 "drover_summarizer_backend_ready",
-                bool(report.get("local_ready")),
-                backend="local",
+                bool(report.get("harness_ready")),
+                backend="claude-code",
             ),
             "# HELP drover_summarizer_backend_allowed Whether policy allows each summarizer backend.",
             "# TYPE drover_summarizer_backend_allowed gauge",
@@ -464,8 +464,8 @@ def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> N
             ),
             _metric(
                 "drover_summarizer_backend_allowed",
-                allows_local,
-                backend="local",
+                allows_harness,
+                backend="claude-code",
             ),
         ]
     )

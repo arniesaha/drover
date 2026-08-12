@@ -11,11 +11,11 @@ Each pending job:
   5. Fence persistence against the claimed source version.
   6. Atomically write session_summaries and mark status='done'.
 On failure: increment the generation's failure count, then schedule retry_wait
-or dead-letter exactly the fifth failure.
+or dead-letter exactly the fifth failure. A dead letter also spends one of the
+session's ``SUMMARY_MAX_DEAD_LETTERS`` generations; success clears that streak.
 
-Backend selection prefers Anthropic whenever credentials are functional and
-falls back to the local Ollama GPU rig only when Anthropic is unavailable.
-See ``backends.select_backend``.
+Backend selection prefers the claude-code CLI unless Anthropic credentials are
+configured under a cloud/hybrid policy. See ``backends.select_backend``.
 """
 
 from __future__ import annotations
@@ -754,7 +754,7 @@ class SummarizerWorker:
                 finalized = con.execute(
                     """UPDATE summarize_jobs
                           SET status='done', last_error=NULL, next_run_at=NULL,
-                              updated_at=now()
+                              dead_letter_streak=0, updated_at=now()
                         WHERE session_id=? AND status='running'
                           AND source_version IS NOT DISTINCT FROM ?
                         RETURNING session_id""",

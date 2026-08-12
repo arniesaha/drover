@@ -12,6 +12,13 @@ import duckdb
 from drover.event_identity import canonical_agent_events_cte
 
 SUMMARY_MAX_ATTEMPTS = 5
+# Attempts are scoped to one source generation, and a live session mints a new
+# generation on every event — so the per-generation cap alone bounded nothing.
+# One live session was observed at 410 attempts. This bounds the *session*: a
+# summary that dead-lettered this many generations in a row stops being
+# re-enqueued until it succeeds again, so a permanently failing job can no
+# longer spend an unbounded number of backend invocations.
+SUMMARY_MAX_DEAD_LETTERS = 3
 
 
 def _duckdb_timestamp(value: datetime) -> datetime:
@@ -49,7 +56,16 @@ def source_version_for_session(con: duckdb.DuckDBPyConnection, session_id: str) 
 def enqueue_summary_generation(
     con: duckdb.DuckDBPyConnection, session_id: str, source_version: str
 ) -> bool:
-    """Open a runnable generation only when the immutable source changed."""
+    """Open a runnable generation only when the immutable source changed.
+
+    A genuinely new ``source_version`` describes different events, so it earns
+    a fresh attempt budget — the previous generation's failure says nothing
+    about whether this one can be summarized. An identical version that already
+    dead-lettered earns nothing: it would replay the same input for the same
+    answer. What a new generation cannot do is erase the record: ``last_error``
+    and ``dead_letter_streak`` carry across, and once the streak reaches
+    ``SUMMARY_MAX_DEAD_LETTERS`` no further generation opens at all.
+    """
     try:
         con.execute("BEGIN TRANSACTION")
         legacy = con.execute(
@@ -69,21 +85,26 @@ def enqueue_summary_generation(
             """INSERT INTO summarize_jobs
                  (session_id, status, attempts, source_version, max_attempts,
                   last_error, next_run_at, dead_lettered_at, updated_at,
-                  stream_publish_needed)
-                 VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now(), TRUE)
+                  stream_publish_needed, dead_letter_streak)
+                 VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now(), TRUE, 0)
                  ON CONFLICT (session_id) DO UPDATE SET
                    source_version = excluded.source_version,
                    status = 'pending',
                    attempts = 0,
                    max_attempts = excluded.max_attempts,
-                   last_error = NULL,
                    next_run_at = NULL,
                    dead_lettered_at = NULL,
                    updated_at = now(),
                    stream_publish_needed = TRUE
                  WHERE summarize_jobs.source_version IS DISTINCT FROM excluded.source_version
+                   AND COALESCE(summarize_jobs.dead_letter_streak, 0) < ?
                  RETURNING session_id""",
-            [session_id, source_version, SUMMARY_MAX_ATTEMPTS],
+            [
+                session_id,
+                source_version,
+                SUMMARY_MAX_ATTEMPTS,
+                SUMMARY_MAX_DEAD_LETTERS,
+            ],
         ).fetchone()
         if row is not None:
             con.execute(
@@ -190,6 +211,10 @@ def finish_summary_failure(
                   dead_lettered_at = CASE
                     WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
                     THEN ? ELSE NULL END,
+                  dead_letter_streak = CASE
+                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
+                    THEN COALESCE(dead_letter_streak, 0) + 1
+                    ELSE COALESCE(dead_letter_streak, 0) END,
                   updated_at = ?
             WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?
             RETURNING status, next_run_at""",
@@ -201,6 +226,7 @@ def finish_summary_failure(
             jitter_fraction,
             SUMMARY_MAX_ATTEMPTS,
             stored_now,
+            SUMMARY_MAX_ATTEMPTS,
             stored_now,
             session_id,
             source_version,

@@ -130,7 +130,26 @@ def call_claude_summary(
         text = getattr(block, "text", None)
         if text:
             text_parts.append(text)
-    raw = _strip_fence("".join(text_parts))
+    return parse_summary_response(
+        "".join(text_parts),
+        required_keys=required_keys,
+        optional_keys=optional_keys,
+    )
+
+
+def parse_summary_response(
+    text: str,
+    *,
+    required_keys: tuple = _REQUIRED_KEYS,
+    optional_keys: tuple = _OPTIONAL_KEYS,
+) -> dict:
+    """Turn one model's raw text into the validated summary dict.
+
+    Shared by every backend that gets text rather than parsed JSON back, so
+    fence stripping, truncation repair and schema validation stay identical
+    whichever path produced the answer.
+    """
+    raw = _strip_fence(text)
     parsed = _parse_json_response(raw, required_keys=required_keys)
 
     if not isinstance(parsed, dict):

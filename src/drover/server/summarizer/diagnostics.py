@@ -16,7 +16,10 @@ from typing import Any, Optional
 from drover.server.summarizer.backends.config import (
     DEFAULT_API_MODEL,
     DEFAULT_CLAUDE_CREDENTIALS_PATH,
+    DEFAULT_HARNESS_MODEL,
+    DEFAULT_HARNESS_POLICY,
     DEFAULT_LOCAL_MODEL,
+    SUMMARIZER_BACKEND_POLICIES,
 )
 
 
@@ -77,8 +80,9 @@ def inspect_claude_credentials(path: Optional[str] = None) -> dict[str, Any]:
 
 def summarize_backend_auth(
     *,
-    backend_policy: str = "hybrid",
+    backend_policy: str = DEFAULT_HARNESS_POLICY,
     api_model: Optional[str] = None,
+    harness_model: Optional[str] = None,
     local_model: Optional[str] = None,
     local_ollama_url: Optional[str] = None,
     gpu_relay_url: Optional[str] = None,
@@ -86,8 +90,13 @@ def summarize_backend_auth(
     base_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """Return a safe no-network report for summarizer auth/backend config."""
-    if backend_policy not in ("hybrid", "cloud", "local"):
+    from drover.server.harness.structured.claude import resolve_binary
+
+    retired_policy = backend_policy == "local"
+    if backend_policy not in SUMMARIZER_BACKEND_POLICIES:
         backend_policy = "invalid"
+    elif retired_policy:
+        backend_policy = DEFAULT_HARNESS_POLICY
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     env_oauth = os.environ.get("ANTHROPIC_OAUTH_TOKEN")
     credentials = inspect_claude_credentials()
@@ -118,8 +127,13 @@ def summarize_backend_auth(
     if credentials["expired"] is True:
         warnings.append("Claude credentials OAuth token appears expired")
     cloud_allowed = backend_policy in ("hybrid", "cloud")
-    local_allowed = backend_policy in ("hybrid", "local")
+    harness_allowed = backend_policy in ("harness", "hybrid")
+    harness_cli = resolve_binary()
 
+    if retired_policy:
+        warnings.append(
+            'backend_policy=local is retired and now runs the claude-code harness; set backend_policy = "harness"'
+        )
     if cloud_allowed and not effective_auth:
         warnings.append(
             "no Anthropic credentials available (API key, OAuth env token, or valid Claude credentials file)"
@@ -128,23 +142,19 @@ def summarize_backend_auth(
         warnings.append(
             "backend_policy=cloud will leave summarize jobs queued until Anthropic auth is fixed"
         )
-    if backend_policy == "local" and effective_auth:
-        warnings.append("backend_policy=local ignores available Anthropic credentials")
-    if backend_policy == "local" and not (local_ollama or (relay and ollama)):
+    if harness_allowed and harness_cli is None:
         warnings.append(
-            "backend_policy=local has no local Ollama/GPU backend configured"
+            "no claude-code CLI found on PATH or in ~/.local/share/claude/versions; "
+            "summarize jobs will stay queued"
         )
-    if (
-        backend_policy == "hybrid"
-        and not effective_auth
-        and (local_ollama or (relay and ollama))
-    ):
+    if backend_policy == "hybrid" and not effective_auth and harness_cli:
         warnings.append(
-            "hybrid policy will fall back to local Ollama because Anthropic auth is unavailable"
+            "hybrid policy will fall back to the claude-code harness because Anthropic auth is unavailable"
         )
     if backend_policy == "invalid":
         warnings.append(
-            "invalid summarizer backend_policy; expected hybrid, cloud, or local"
+            "invalid summarizer backend_policy; expected "
+            + ", ".join(SUMMARIZER_BACKEND_POLICIES)
         )
     if bool(relay) ^ bool(ollama):
         warnings.append(
@@ -154,10 +164,14 @@ def summarize_backend_auth(
     return {
         "backend_policy": backend_policy,
         "api_model": api_model or DEFAULT_API_MODEL,
+        "harness_model": harness_model or DEFAULT_HARNESS_MODEL,
+        # Ollama is no longer a summarizer backend; these describe the host
+        # embeddings and advisory local analysis still use.
         "local_model": local_model or DEFAULT_LOCAL_MODEL,
         "base_url_present": bool(resolved_base_url),
         "anthropic_ready": bool(cloud_allowed and effective_auth),
-        "local_ready": bool(local_allowed and (local_ollama or (relay and ollama))),
+        "harness_ready": bool(harness_allowed and harness_cli),
+        "harness_cli_present": bool(harness_cli),
         "anthropic_configured": bool(effective_auth),
         "local_configured": bool(local_ollama or (relay and ollama)),
         "effective_auth": effective_auth,

@@ -116,9 +116,14 @@ _REDIS_JOB_STREAM_SUFFIXES = {
 
 
 def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
-    """Return whether starting summarizer-like workers can make progress."""
+    """Return whether starting summarizer-like workers can make progress.
+
+    Checked before the workers start, so a host with no usable backend leaves
+    its jobs pending rather than burning each one's retry budget discovering
+    the same thing per job.
+    """
     return (backend_cfg.allows_anthropic and backend_cfg.has_anthropic_creds) or (
-        backend_cfg.allows_local_backend and backend_cfg.has_local_backend
+        backend_cfg.allows_harness_backend and backend_cfg.has_harness_backend
     )
 
 
@@ -240,12 +245,14 @@ freshness_threshold_seconds = 600
 
 [summarizer]
 # backend_policy:
-#   hybrid = prefer Anthropic, fall back to local Ollama only when cloud auth is unavailable
-#   cloud  = require Anthropic; never silently fall back to local Ollama
-#   local  = require local/GPU Ollama; never call Anthropic
-backend_policy  = "hybrid"
+#   harness = summarize with the local claude-code CLI (no API key needed)
+#   hybrid  = prefer the Anthropic API, fall back to claude-code when cloud auth fails
+#   cloud   = require the Anthropic API; never fall back
+#   local   = retired; treated as "harness" with a warning
+backend_policy  = "harness"
 api_model        = "claude-haiku-4-5-20251001"
-local_model      = "qwen3.5:35b-a3b"
+harness_model    = "haiku"  # model alias passed to `claude --model`
+local_model      = "qwen3.5:35b-a3b"  # embeddings/advisory only; not summaries
 local_ollama_url = ""   # e.g. "http://127.0.0.1:11435" — no wake relay
 gpu_relay_url    = ""   # e.g. "http://gpu-host.local:9753" — optional WoL relay
 gpu_ollama_url   = ""   # e.g. "http://gpu-host.local:11434" — optional Ollama host
@@ -468,6 +475,7 @@ def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
     return SummarizerBackendConfig.from_runtime(
         api_model=cfg.summarizer_api_model,
         backend_policy=cfg.summarizer_backend_policy,
+        harness_model=cfg.summarizer_harness_model,
         local_model=cfg.summarizer_local_model,
         local_ollama_url=cfg.summarizer_local_ollama_url or None,
         gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1642,6 +1650,7 @@ def run(
             mcp_backend_cfg = SummarizerBackendConfig.from_runtime(
                 api_model=cfg.summarizer_api_model,
                 backend_policy=cfg.summarizer_backend_policy,
+                harness_model=cfg.summarizer_harness_model,
                 local_model=cfg.summarizer_local_model,
                 local_ollama_url=cfg.summarizer_local_ollama_url or None,
                 gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1686,6 +1695,7 @@ def run(
                 summarizer_report=summarize_backend_auth(
                     backend_policy=cfg.summarizer_backend_policy,
                     api_model=cfg.summarizer_api_model,
+                    harness_model=cfg.summarizer_harness_model,
                     local_model=cfg.summarizer_local_model,
                     local_ollama_url=cfg.summarizer_local_ollama_url or None,
                     gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1773,6 +1783,7 @@ def run(
         content_backend_cfg = SummarizerBackendConfig.from_runtime(
             api_model=cfg.summarizer_api_model,
             backend_policy=cfg.summarizer_backend_policy,
+            harness_model=cfg.summarizer_harness_model,
             local_model=cfg.summarizer_local_model,
             local_ollama_url=cfg.summarizer_local_ollama_url or None,
             gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1804,6 +1815,7 @@ def run(
             backend_cfg = SummarizerBackendConfig.from_runtime(
                 api_model=cfg.summarizer_api_model,
                 backend_policy=cfg.summarizer_backend_policy,
+                harness_model=cfg.summarizer_harness_model,
                 local_model=cfg.summarizer_local_model,
                 local_ollama_url=cfg.summarizer_local_ollama_url or None,
                 gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1819,7 +1831,7 @@ def run(
                 log.warning(
                     "summarizer not started: no Anthropic creds "
                     "(ANTHROPIC_API_KEY/ANTHROPIC_OAUTH_TOKEN/Claude credentials) "
-                    "and no [summarizer] local_ollama_url or gpu_*_url configured — jobs will remain queued"
+                    "and no claude-code CLI on PATH — jobs will remain queued"
                 )
             else:
                 try:
@@ -1834,10 +1846,10 @@ def run(
                     )
                     summarizer.start()
                     log.info(
-                        "summarizer ready (policy=%s, api=%s, local=%s)",
+                        "summarizer ready (policy=%s, api=%s, claude_code=%s)",
                         backend_cfg.backend_policy,
                         "yes" if backend_cfg.has_anthropic_creds else "no",
-                        "yes" if backend_cfg.has_local_backend else "no",
+                        "yes" if backend_cfg.has_harness_backend else "no",
                     )
                 except Exception:  # noqa: BLE001
                     log.exception("summarizer failed to start; continuing without it")
@@ -1862,6 +1874,7 @@ def run(
             backend_cfg = SummarizerBackendConfig.from_runtime(
                 api_model=cfg.summarizer_api_model,
                 backend_policy=cfg.summarizer_backend_policy,
+                harness_model=cfg.summarizer_harness_model,
                 local_model=cfg.summarizer_local_model,
                 local_ollama_url=cfg.summarizer_local_ollama_url or None,
                 gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1909,6 +1922,7 @@ def run(
             backend_cfg = SummarizerBackendConfig.from_runtime(
                 api_model=cfg.summarizer_api_model,
                 backend_policy=cfg.summarizer_backend_policy,
+                harness_model=cfg.summarizer_harness_model,
                 local_model=cfg.summarizer_local_model,
                 local_ollama_url=cfg.summarizer_local_ollama_url or None,
                 gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -1918,7 +1932,7 @@ def run(
             if not _summarizer_backend_available(backend_cfg):
                 log.warning(
                     "brief worker not started: no Anthropic creds "
-                    "and no [summarizer] local_ollama_url or gpu_*_url configured"
+                    "and no claude-code CLI on PATH"
                 )
             else:
                 briefs = BriefWorker(
@@ -2725,6 +2739,7 @@ def summarizer_doctor(ctx: click.Context) -> None:
     report = summarize_backend_auth(
         backend_policy=cfg.summarizer_backend_policy,
         api_model=cfg.summarizer_api_model,
+        harness_model=cfg.summarizer_harness_model,
         local_model=cfg.summarizer_local_model,
         local_ollama_url=cfg.summarizer_local_ollama_url or None,
         gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
@@ -2734,10 +2749,13 @@ def summarizer_doctor(ctx: click.Context) -> None:
     click.echo("drover-server summarizer-doctor")
     click.echo("==============================")
     click.echo(f"  API model       : {report['api_model']}")
-    click.echo(f"  Local model     : {report['local_model']}")
+    click.echo(f"  Harness model   : {report['harness_model']}")
     click.echo(f"  Policy          : {report['backend_policy']}")
     click.echo(f"  Anthropic ready : {'yes' if report['anthropic_ready'] else 'no'}")
-    click.echo(f"  Local ready     : {'yes' if report['local_ready'] else 'no'}")
+    click.echo(
+        f"  claude-code CLI : {'yes' if report['harness_cli_present'] else 'no'}"
+    )
+    click.echo(f"  Harness ready   : {'yes' if report['harness_ready'] else 'no'}")
     click.echo(f"  Effective auth  : {report['effective_auth'] or 'none'}")
     click.echo("\nauth sources:")
     click.echo(

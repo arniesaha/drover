@@ -83,11 +83,13 @@ Use `uv run drover-server mcp tools` to inspect the live server surface.
 
 ## Context Backends
 
-Summaries and briefs can use Anthropic credentials or a configured local
-Ollama-compatible backend. Embeddings can use an OpenAI-compatible endpoint or
-configured Ollama backend. These integrations are optional; durable ingest and
-the command plane continue to work without them.
+Summaries, briefs and recaps use either Anthropic credentials or the
+`claude-code` CLI installed on the host (`[summarizer] backend_policy`:
+`harness`, `hybrid`, or `cloud`). Embeddings can use an OpenAI-compatible
+endpoint or a configured Ollama backend. These integrations are optional;
+durable ingest and the command plane continue to work without them.
 
 External model providers receive the content submitted to their configured
-workers. Choose local backends when that data must remain entirely on your
-hardware.
+workers, and that includes the `claude-code` path: it runs locally but sends
+the transcript to Anthropic under your Claude Code login. Only the embeddings
+backend and advisory content analysis can be kept entirely on your hardware.

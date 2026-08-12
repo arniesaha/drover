@@ -7,6 +7,7 @@ import textwrap
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 import pyarrow as pa
@@ -227,7 +228,7 @@ def test_harness_audit_sequences_mixed_session_is_safe_nonzero_json(tmp_path):
         ).fetchone() == (3,)
 
 
-def test_summarizer_backend_available_requires_api_or_local_backend(
+def test_summarizer_backend_available_requires_api_or_claude_code(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv(
@@ -237,25 +238,33 @@ def test_summarizer_backend_available_requires_api_or_local_backend(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("DROVER_LOCAL_OLLAMA_URL", raising=False)
     monkeypatch.delenv("NEXUS_LOCAL_OLLAMA_URL", raising=False)
-    assert not _summarizer_backend_available(SummarizerBackendConfig())
-    assert _summarizer_backend_available(SummarizerBackendConfig(api_key="sk-test"))
-    assert _summarizer_backend_available(
-        SummarizerBackendConfig.from_runtime(local_ollama_url="http://127.0.0.1:11435")
-    )
-    assert _summarizer_backend_available(
-        SummarizerBackendConfig(
-            gpu_rig=GpuRig(relay_url="http://relay", ollama_url="http://ollama")
+
+    with patch(
+        "drover.server.harness.structured.claude.resolve_binary",
+        return_value="/usr/local/bin/claude",
+    ):
+        assert _summarizer_backend_available(SummarizerBackendConfig())
+        assert _summarizer_backend_available(SummarizerBackendConfig(api_key="sk-test"))
+        # An Ollama host no longer makes the summarizer runnable on its own.
+        assert not _summarizer_backend_available(
+            SummarizerBackendConfig(
+                backend_policy="cloud",
+                gpu_rig=GpuRig(relay_url="http://relay", ollama_url="http://ollama"),
+            )
         )
-    )
-    assert not _summarizer_backend_available(
-        SummarizerBackendConfig(
-            backend_policy="cloud",
-            gpu_rig=GpuRig(relay_url="http://relay", ollama_url="http://ollama"),
+
+    with patch(
+        "drover.server.harness.structured.claude.resolve_binary", return_value=None
+    ):
+        assert not _summarizer_backend_available(SummarizerBackendConfig())
+        assert not _summarizer_backend_available(
+            SummarizerBackendConfig.from_runtime(
+                local_ollama_url="http://127.0.0.1:11435"
+            )
         )
-    )
-    assert not _summarizer_backend_available(
-        SummarizerBackendConfig(backend_policy="local", api_key="sk-test")
-    )
+        assert _summarizer_backend_available(
+            SummarizerBackendConfig(backend_policy="hybrid", api_key="sk-test")
+        )
 
 
 def test_build_redis_job_streams_includes_live_recap(monkeypatch) -> None:
@@ -1307,8 +1316,10 @@ def test_cli_summarizer_doctor_reports_auth_without_network(tmp_path, monkeypatc
     res = runner.invoke(main, ["--config", str(cfg), "summarizer-doctor"])
 
     assert res.exit_code == 0, res.output
-    assert "Policy          : hybrid" in res.output
-    assert "Anthropic ready : yes" in res.output
+    # The default policy is the claude-code harness, so Anthropic credentials
+    # are reported as configured but not the selected backend.
+    assert "Policy          : harness" in res.output
+    assert "Anthropic ready : no" in res.output
     assert "Effective auth  : claude_credentials" in res.output
     assert "tok-live" not in res.output
 

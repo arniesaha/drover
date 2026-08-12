@@ -83,6 +83,7 @@ class DroverConfig:
     # Summarizer backend knobs (all optional — sensible fallbacks via env)
     summarizer_backend_policy: str
     summarizer_api_model: str
+    summarizer_harness_model: str
     summarizer_local_model: str
     summarizer_local_ollama_url: str  # empty string = disabled; no wake relay
     summarizer_gpu_relay_url: str  # empty string = disabled
@@ -156,8 +157,12 @@ _DEFAULTS = {
         "principal_id": "unknown",
     },
     "summarizer": {
-        "backend_policy": "hybrid",
+        # harness: summarize through the claude-code CLI already installed and
+        # authenticated on the host. No API key, and no local model that cannot
+        # hold the response schema.
+        "backend_policy": "harness",
         "api_model": "claude-haiku-4-5-20251001",
+        "harness_model": "haiku",
         "local_model": "qwen3.5:35b-a3b",
         "local_ollama_url": "",
         "gpu_relay_url": "",
@@ -254,6 +259,7 @@ def _from_dict(d: dict) -> DroverConfig:
         principal_id=d["agent"]["principal_id"],
         summarizer_backend_policy=s["backend_policy"],
         summarizer_api_model=s["api_model"],
+        summarizer_harness_model=s["harness_model"],
         summarizer_local_model=s["local_model"],
         summarizer_local_ollama_url=s["local_ollama_url"],
         summarizer_gpu_relay_url=s["gpu_relay_url"],

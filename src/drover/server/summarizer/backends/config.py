@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
+from drover.server.summarizer.backends.harness import DEFAULT_HARNESS_MODEL
 from drover.server.wol import GpuRig
 
 DEFAULT_API_MODEL = "claude-haiku-4-5-20251001"
@@ -20,9 +21,31 @@ DEFAULT_LOCAL_OLLAMA_LAUNCHD_PLIST = (
 )
 
 DEFAULT_CLAUDE_CREDENTIALS_PATH = "~/.claude/.credentials.json"
-SummarizerBackendPolicy = Literal["hybrid", "cloud", "local"]
+DEFAULT_HARNESS_POLICY = "harness"
+SummarizerBackendPolicy = Literal["harness", "hybrid", "cloud", "local"]
+SUMMARIZER_BACKEND_POLICIES = ("harness", "hybrid", "cloud", "local")
 
 _log = logging.getLogger("drover.summarizer.backends.config")
+
+
+def resolve_summarizer_policy(policy: str) -> str:
+    """Map a configured policy onto one the router still implements.
+
+    ``local`` is retired: the Ollama summarizer it named is gone. Hosts that
+    still carry it in ``~/.drover/config.toml`` fall through to ``harness``
+    rather than failing every job, because the alternative on an unattended
+    box is 5 wasted attempts and a dead letter per session. It is a warning,
+    not a silent rename: unlike Ollama, claude-code sends the transcript to
+    Anthropic under the machine's existing Claude Code login.
+    """
+    if policy == "local":
+        _log.warning(
+            "summarizer backend_policy=local is retired (the local Ollama "
+            "summarizer was removed); using the claude-code harness instead. "
+            'Set backend_policy = "harness" in ~/.drover/config.toml.'
+        )
+        return DEFAULT_HARNESS_POLICY
+    return policy
 
 
 def _read_oauth_token_from_credentials_file(
@@ -63,24 +86,42 @@ def _read_oauth_token_from_credentials_file(
 class SummarizerBackendConfig:
     """All knobs the backend layer needs in one struct.
 
-    Either Anthropic credentials (``api_key`` OR ``auth_token``) or an
-    Ollama backend (``gpu_rig``) must be set; ``select_backend`` raises if
-    neither path is configured. ``wake_on_first_call`` controls whether the
-    Ollama backend should wake a remote GPU rig before the first request;
-    Mac-local Ollama keeps it enabled so the backend can kickstart the
-    user LaunchAgent on demand before the first request.
+    Summaries need either Anthropic credentials (``api_key`` OR
+    ``auth_token``) or an installed ``claude-code`` CLI; ``select_backend``
+    raises if neither exists.
+
+    ``gpu_rig`` no longer feeds the summarizer. It stays because two other
+    consumers read it from here: the embeddings worker (which has no
+    claude-code equivalent) and advisory local content analysis.
+    ``wake_on_first_call`` still controls whether those wake a remote GPU rig
+    before the first request; Mac-local Ollama keeps it enabled so the
+    LaunchAgent can be kickstarted on demand.
     """
 
-    backend_policy: SummarizerBackendPolicy = "hybrid"
+    backend_policy: SummarizerBackendPolicy = DEFAULT_HARNESS_POLICY
     api_key: Optional[str] = None
     auth_token: Optional[str] = None  # Claude.ai Pro/Max OAuth (Bearer)
     base_url: Optional[str] = None  # e.g. AgentWeave proxy
     api_model: str = DEFAULT_API_MODEL
     gpu_rig: Optional[GpuRig] = None
     local_model: str = DEFAULT_LOCAL_MODEL
+    harness_model: str = DEFAULT_HARNESS_MODEL
     wake_on_first_call: bool = True
     local_ollama_launchd_label: Optional[str] = None
     local_ollama_launchd_plist: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Normalize once, at construction, so the router and every
+        # availability check read a policy that is actually implemented —
+        # and so a retired value warns once per config, not once per poll.
+        if self.backend_policy not in SUMMARIZER_BACKEND_POLICIES:
+            raise ValueError(
+                "summarizer backend_policy must be one of: "
+                + ", ".join(SUMMARIZER_BACKEND_POLICIES)
+            )
+        resolved = resolve_summarizer_policy(self.backend_policy)
+        if resolved != self.backend_policy:
+            object.__setattr__(self, "backend_policy", resolved)
 
     @property
     def has_anthropic_creds(self) -> bool:
@@ -88,15 +129,22 @@ class SummarizerBackendConfig:
 
     @property
     def has_local_backend(self) -> bool:
+        """Whether an Ollama host is configured (embeddings/advisory, not summaries)."""
         return self.gpu_rig is not None
+
+    @property
+    def has_harness_backend(self) -> bool:
+        from drover.server.harness.structured.claude import resolve_binary
+
+        return resolve_binary() is not None
 
     @property
     def allows_anthropic(self) -> bool:
         return self.backend_policy in ("hybrid", "cloud")
 
     @property
-    def allows_local_backend(self) -> bool:
-        return self.backend_policy in ("hybrid", "local")
+    def allows_harness_backend(self) -> bool:
+        return self.backend_policy in ("harness", "hybrid")
 
     def effective_auth_token(self) -> Optional[str]:
         """Return the freshest OAuth token, re-reading the credentials file.
@@ -125,6 +173,7 @@ class SummarizerBackendConfig:
         backend_policy: Optional[str] = None,
         api_model: Optional[str] = None,
         local_model: Optional[str] = None,
+        harness_model: Optional[str] = None,
         local_ollama_url: Optional[str] = None,
         gpu_relay_url: Optional[str] = None,
         gpu_ollama_url: Optional[str] = None,
@@ -173,12 +222,8 @@ class SummarizerBackendConfig:
                 os.environ.get("DROVER_SUMMARIZER_BACKEND_POLICY")
                 or os.environ.get("NEXUS_SUMMARIZER_BACKEND_POLICY")
             )
-            or "hybrid"
+            or DEFAULT_HARNESS_POLICY
         )
-        if policy not in ("hybrid", "cloud", "local"):
-            raise ValueError(
-                "summarizer backend_policy must be one of: hybrid, cloud, local"
-            )
 
         return cls(
             backend_policy=policy,  # type: ignore[arg-type]
@@ -188,6 +233,9 @@ class SummarizerBackendConfig:
             api_model=api_model or DEFAULT_API_MODEL,
             gpu_rig=rig,
             local_model=local_model or DEFAULT_LOCAL_MODEL,
+            harness_model=harness_model
+            or os.environ.get("DROVER_SUMMARIZER_HARNESS_MODEL")
+            or DEFAULT_HARNESS_MODEL,
             wake_on_first_call=wake_on_first_call,
             local_ollama_launchd_label=local_ollama_launchd_label
             or (
