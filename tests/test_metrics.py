@@ -4646,6 +4646,57 @@ def test_quality_and_observatory_snapshots_read_an_isolated_copy(tmp_path, monke
         assert path.name == live.name, "copy should keep the database filename"
 
 
+def test_quality_snapshot_includes_committed_rows_still_in_the_wal(
+    tmp_path, monkeypatch
+):
+    collector = _make_collector(tmp_path)
+    writer = duckdb.connect(str(collector.duckdb_path))
+    try:
+        writer.execute("CREATE TABLE wal_probe (value VARCHAR)")
+        writer.execute("INSERT INTO wal_probe VALUES ('committed')")
+        assert Path(str(collector.duckdb_path) + ".wal").exists()
+
+        def read_copy(*, duckdb_path, **kwargs):
+            con = duckdb.connect(str(duckdb_path))
+            try:
+                value = con.execute("SELECT value FROM wal_probe").fetchone()[0]
+            finally:
+                con.close()
+            return {"runtime_audit": {}, "wal_probe": value}
+
+        monkeypatch.setattr(metrics, "quality_snapshot", read_copy)
+
+        assert collector._quality_snapshot()["wal_probe"] == "committed"
+    finally:
+        writer.close()
+
+
+def test_observatory_snapshot_includes_committed_rows_still_in_the_wal(
+    tmp_path, monkeypatch
+):
+    collector = _make_collector(tmp_path)
+    writer = duckdb.connect(str(collector.duckdb_path))
+    try:
+        writer.execute("CREATE TABLE wal_probe (value VARCHAR)")
+        writer.execute("INSERT INTO wal_probe VALUES ('committed')")
+        assert Path(str(collector.duckdb_path) + ".wal").exists()
+
+        def read_copy(*, duckdb_path, **kwargs):
+            con = duckdb.connect(str(duckdb_path))
+            try:
+                value = con.execute("SELECT value FROM wal_probe").fetchone()[0]
+            finally:
+                con.close()
+            return {"wal_probe": value}
+
+        monkeypatch.setattr(metrics, "pipeline_observatory_snapshot", read_copy)
+
+        result = collector._observatory_snapshot({"runtime_audit": {}})
+        assert result["wal_probe"] == "committed"
+    finally:
+        writer.close()
+
+
 def test_copy_backed_snapshots_use_the_parallel_snapshot_role(tmp_path, monkeypatch):
     """The isolated copy is the only reader allowed extra DuckDB threads.
 
