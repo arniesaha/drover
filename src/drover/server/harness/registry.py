@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import duckdb
 
-from drover.server.db import duckdb_connect_lock
+from drover.server.db import control_plane_connection
 from drover.server.harness.models import (
     HarnessEvent,
     HarnessEventPage,
@@ -22,16 +22,6 @@ from drover.server.harness.models import (
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
 
-# DuckDB's Python client is not safe against two threads in one process
-# calling duckdb.connect() on the same database file at nearly the same
-# instant: the loser raises "Binder Error: Unique file handle conflict"
-# instead of waiting (observed live in the structured-session E2E when two
-# sessions' pump threads wrote to one registry concurrently -- see
-# tests/test_structured_e2e.py). Serialize the ENTIRE connect->use->close
-# window per resolved database path, process-wide. The lock table lives in
-# drover.server.db so worker/diagnostic connects (which only serialize the
-# connect call) contend on the same lock as registry windows.
-_db_lock = duckdb_connect_lock
 _SESSION_PREVIEW_CANDIDATE_LIMIT = 5
 
 
@@ -68,20 +58,23 @@ class HarnessRegistry:
 
     @contextmanager
     def _connect(self) -> Iterator[duckdb.DuckDBPyConnection]:
-        """Yield a connection, holding this database's process-wide lock.
+        """Yield the control plane's connection for this database.
 
-        Concurrent duckdb.connect() calls to one file from multiple threads
-        raise BinderException ("Unique file handle conflict"), so the whole
-        connect -> use -> close window is serialized per resolved path (see
-        _db_lock above). Existing ``with self._connect() as con:`` call
+        This registry *is* the control plane -- ``/harness``,
+        ``/harness/hosts`` and ``/harness/sessions`` are all calls on it --
+        so every window goes through ``control_plane_connection``: its own
+        lock, and on the hub server its own pinned connection, neither of
+        them reachable by an analytical reader (issue #95).
+
+        Windows are still serialized against each other, which is what the
+        process-wide connect lock used to buy here: two threads racing
+        ``duckdb.connect()`` on one file raise BinderException ("Unique file
+        handle conflict"), and DuckDB's Python connection is not safe for
+        concurrent use either. Existing ``with self._connect() as con:`` call
         sites work unchanged.
         """
-        with _db_lock(self.duckdb_path):
-            con = duckdb.connect(str(self.duckdb_path))
-            try:
-                yield con
-            finally:
-                con.close()
+        with control_plane_connection(self.duckdb_path) as con:
+            yield con
 
     def register_host(
         self,
