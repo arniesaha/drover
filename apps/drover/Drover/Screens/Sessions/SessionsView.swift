@@ -152,6 +152,12 @@ struct SessionsView: View {
         // screens (chat, terminal, the launch sheet) declare their own bars
         // and are unaffected.
         .toolbar(.hidden, for: .navigationBar)
+        // Both this and the scene-phase change below ask the store to poll —
+        // the screen appearing and the app becoming active are separate
+        // events and either can happen first. That overlap used to cancel the
+        // first load, because starting tore the running loop down (#85);
+        // `startPolling()` now leaves a live loop alone, so the two calls can
+        // stay independent and neither has to know about the other.
         .task { store.startPolling() }
         .task(id: store.snapshot?.cockpitAPIVersion) {
             guard let snapshot = store.snapshot else {

@@ -388,6 +388,148 @@ struct StoreTests {
     #expect(store.lastRefreshOutcome == nil)
 }
 
+/// The stuck screen itself, reproduced without a device (#85).
+///
+/// Captured live on a phone 2026-08-11 17:09: "Connecting… / 3 attempts ·
+/// request cancelled", sitting there while the hub was up. Every cancellation
+/// returns early without touching `lastError`, so a first load that keeps
+/// being torn down renders an eternal spinner — strictly worse than an honest
+/// failure, which at least offers Retry. A *run* of them has to become
+/// actionable, or the only cure is luck.
+@Test @MainActor func aFirstLoadLostToRepeatedCancellationBecomesRetriable() async throws {
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    let store = SessionStore(client: client())
+
+    await store.refresh()
+    await store.refresh()
+    #expect(store.lastError == nil, "a blip or two is still just a slow start")
+
+    await store.refresh()
+
+    #expect(!store.hasLoadedOnce)
+    #expect(store.lastError != nil, "an eternal spinner is not an outcome")
+    #expect(!store.isReachable)
+    #expect(store.connectingDetail?.contains("cancel") == true,
+            "the instrumentation that made this diagnosable stays")
+}
+
+/// The other half of the same decision: giving up is only ever about the
+/// *first* load. A superseded poll over a fleet that has already loaded must
+/// still pass in silence, however many of them there are — flashing an
+/// unreachable banner over a healthy fleet is the bug that put the early
+/// return in `refresh()` in the first place.
+@Test @MainActor func cancellationsNeverFlashUnreachableOverALoadedFleet() async throws {
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    MockURLProtocol.handler = nil
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    for _ in 0..<5 { await store.refresh() }
+
+    #expect(store.isReachable)
+    #expect(store.lastError == nil)
+    #expect(store.snapshot != nil)
+}
+
+@Test @MainActor func aLandedSnapshotClearsTheGivenUpFirstLoad() async throws {
+    MockURLProtocol.transportError = URLError(.cancelled)
+    let store = SessionStore(client: client())
+    for _ in 0..<3 { await store.refresh() }
+    #expect(store.lastError != nil)
+
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    defer { MockURLProtocol.handler = nil }
+    await store.refresh()
+
+    #expect(store.hasLoadedOnce)
+    #expect(store.lastError == nil)
+    #expect(store.isReachable)
+}
+
+/// A cancelled first load must not cost a whole poll interval (#85).
+///
+/// The loop slept the full five seconds after a cancellation exactly as it
+/// does after a success, so a burst of launch-time churn could starve the
+/// first load for tens of seconds and the screen had nothing to show for it.
+/// With a minute-long interval the difference is unmistakable: retry promptly
+/// and this resolves in about a second; wait out the interval and the test
+/// times out on one attempt.
+@Test @MainActor func aCancelledFirstLoadRetriesWithoutWaitingOutTheInterval() async throws {
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    let store = SessionStore(client: client())
+
+    store.startPolling(every: 60)
+    let deadline = Date().addingTimeInterval(3)
+    while store.lastError == nil, Date() < deadline {
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+    store.stopPolling()
+
+    #expect(store.refreshAttempts >= 3)
+    #expect(store.lastError != nil,
+            "a first load stuck behind cancellations must become retriable in seconds")
+}
+
+/// And the prompt retry stops once it has become retriable. Racing ahead is
+/// worth it only while the screen is a spinner the user cannot act on; past
+/// that it is four requests a second at a hub whose slowness (#95) is what
+/// widened the cancellation window in the first place.
+@Test @MainActor func theFastRetryStopsOnceTheScreenIsActionable() async throws {
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    let store = SessionStore(client: client())
+
+    store.startPolling(every: 60)
+    let deadline = Date().addingTimeInterval(3)
+    while store.lastError == nil, Date() < deadline {
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+    let attemptsWhenItGaveUp = store.refreshAttempts
+    try? await Task.sleep(for: .seconds(1))
+    store.stopPolling()
+
+    #expect(store.refreshAttempts == attemptsWhenItGaveUp,
+            "kept hammering after giving up: \(store.refreshAttempts) attempts")
+}
+
+/// Re-entry must leave a running loop alone (#85).
+///
+/// `startPolling()` used to call `stopPolling()` first, which cancels the
+/// in-flight request — and `SessionsView` calls it from both `.task` and the
+/// scene-phase change, so an ordinary launch cancelled its own first load.
+/// A `/harness` answering in 10ms hides that; one answering in seconds (#95)
+/// does not.
+@Test @MainActor func startPollingDoesNotTearDownARunningLoop() async throws {
+    MockURLProtocol.handler = { _ in
+        Thread.sleep(forTimeInterval: 0.3)  // a hub under load, not an instant one
+        return (200, snapshotJSON)
+    }
+    defer { MockURLProtocol.handler = nil }
+
+    let store = SessionStore(client: client())
+    store.startPolling(every: 5)
+    // The churn a launch produces, all of it inside one request's window.
+    for _ in 0..<5 {
+        try? await Task.sleep(for: .milliseconds(20))
+        store.startPolling(every: 5)
+    }
+
+    #expect(store.refreshAttempts == 1, "re-entry started \(store.refreshAttempts) requests")
+    #expect(store.lastRefreshOutcome == nil, "re-entry cancelled the first load")
+
+    let deadline = Date().addingTimeInterval(3)
+    while !store.hasLoadedOnce, Date() < deadline {
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+    store.stopPolling()
+    #expect(store.hasLoadedOnce)
+}
+
 }
 
 }  // extension MockNetworkTests
