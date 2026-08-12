@@ -424,12 +424,12 @@ EOF
   [ -n "$paired" ] || fail \
     "the hub refused the pairing code (expired, already used, or throttled). Ask for a fresh one with: drover-server pair-host --name $host_id"
 
-  token="$(printf '%s' "$paired" \
+  host_token="$(printf '%s' "$paired" \
     | "$DROVER_HOME/runtime/current/bin/python" -c \
       'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null || echo '')"
-  [ -n "$token" ] || fail "the hub's pairing response was not understood"
+  [ -n "$host_token" ] || fail "the hub's pairing response was not understood"
 
-  ( umask 077; printf '%s\n' "$token" > "$DROVER_HOME/api_token" )
+  ( umask 077; printf "%s\n" "$host_token" > "$DROVER_HOME/api_token" )
   success "host credential stored"
 
   # Rewrite the harnessd unit with the connection mode the probe chose.

@@ -132,3 +132,20 @@ def test_release_workflow_never_runs_on_pull_requests() -> None:
     workflow = load_workflow("release.yml")
     assert "pull_request" not in workflow["on"]
     assert "pull_request_target" not in workflow["on"]
+
+
+def test_ci_runs_the_shell_tests() -> None:
+    """The installer is shell, so pytest alone would leave it unguarded."""
+    steps = " ".join(
+        step.get("run", "")
+        for step in load_workflow("ci.yml")["jobs"]["build-and-test"]["steps"]
+    )
+    assert "tests/shell" in steps, "installer shell tests must run in CI"
+    assert "bash -n install.sh" in steps, "install.sh must at least parse in CI"
+
+
+def test_ci_stays_github_hosted_after_the_shell_step() -> None:
+    """Adding shell tests must not quietly move CI onto the fleet host."""
+    workflow = load_workflow("ci.yml")
+    assert workflow["jobs"]["build-and-test"]["runs-on"] == "ubuntu-latest"
+    assert workflow["permissions"] == {"contents": "read"}

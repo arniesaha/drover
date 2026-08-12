@@ -50,3 +50,20 @@ jobs:
 
     - name: Run tests with pytest
       run: pytest tests/
+
+    # The installer is shell, so pytest alone leaves it unguarded. Every
+    # suite runs against stubs and temp directories and never touches the
+    # network. Grouped per suite, and the loop keeps going so one failure
+    # does not hide the others.
+    - name: Run installer shell tests
+      run: |
+        bash -n install.sh
+        bash -n scripts/lib/verify.sh
+        bash -n scripts/lib/detect.sh
+        status=0
+        for suite in tests/shell/test_*.sh; do
+          echo "::group::$suite"
+          bash "$suite" || status=1
+          echo "::endgroup::"
+        done
+        exit "$status"
