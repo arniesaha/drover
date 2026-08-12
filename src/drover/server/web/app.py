@@ -59,7 +59,7 @@ log = logging.getLogger("drover.metrics")
 # credential yet is exactly the caller it exists for. It is hardened inside
 # _redeem_pairing_code (single-use codes, TTL, per-source throttle) rather
 # than by this gate.
-_PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login", "/auth/pair"}
+_PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login", "/auth/pair", "/harness/probe"}
 
 # Total budget for a spoke to send its hello after the 101, across every
 # frame it sends -- not per recv. See _accept_relay_websocket.
@@ -865,6 +865,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/auth/pair":
             self._redeem_pairing_code()
             return
+        if path == "/harness/probe":
+            self._probe_join_candidate()
+            return
         if path == "/auth/pair-codes":
             self._mint_pairing_code()
             return
@@ -1567,6 +1570,79 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return True
         self._send(404, "application/json", '{"error": "pairing is not enabled"}\n')
         return False
+
+    def _probe_join_candidate(self) -> None:
+        """Can the hub reach the machine that is joining?
+
+        Gated by an unburned host code rather than a bearer token, because the
+        joining machine has no credential yet. Deliberately does not burn the
+        code: the installer redeems it immediately afterwards, so consuming it
+        here would make a failed probe cost a fresh code.
+
+        This is the only route that makes the server dial an address a caller
+        supplied, so the address bounds below are load-bearing.
+        """
+        import ipaddress
+        import socket
+        import urllib.error
+        import urllib.request
+
+        if not self._pairing_ready():
+            return
+        body = self._read_json()
+        if body is None:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "request body must be valid JSON"}\n',
+            )
+            return
+        try:
+            entry = self.pairing.peek(
+                str(body.get("code") or ""), source=self._pair_source()
+            )
+        except ThrottledSource:
+            self._send(429, "application/json", '{"error": "too many attempts"}\n')
+            return
+        except UnknownCode:
+            self._send(
+                410, "application/json", '{"error": "unknown or expired code"}\n'
+            )
+            return
+        if entry.scope != "host":
+            self._send(400, "application/json", '{"error": "host code required"}\n')
+            return
+
+        target = str(body.get("url") or "")
+        parsed = urlparse(target)
+        if parsed.scheme != "http" or not parsed.hostname:
+            self._send(400, "application/json", '{"error": "http url required"}\n')
+            return
+        # Only ever dial private space. Without this the route is an
+        # unauthenticated request forwarder pointed anywhere the hub can
+        # reach. ipaddress.is_private returns False for Tailscale's
+        # 100.64.0.0/10 (shared address space, not private), so the CGNAT
+        # range is allowed explicitly or every tailnet join would be refused.
+        try:
+            resolved = socket.gethostbyname(parsed.hostname)
+            address = ipaddress.ip_address(resolved)
+            in_cgnat = address in ipaddress.ip_network("100.64.0.0/10")
+            if not (address.is_private or in_cgnat):
+                raise ValueError("public address")
+        except (OSError, ValueError):
+            self._send(400, "application/json", '{"error": "private url required"}\n')
+            return
+
+        reachable = True
+        try:
+            with urllib.request.urlopen(target, timeout=3):
+                pass
+        except urllib.error.HTTPError:
+            # It answered. The status says nothing about reachability.
+            reachable = True
+        except Exception:  # noqa: BLE001 - any transport failure means no route
+            reachable = False
+        self._send(200, "application/json", json.dumps({"reachable": reachable}) + "\n")
 
     def _mint_pairing_code(self) -> None:
         if not self._pairing_ready():
