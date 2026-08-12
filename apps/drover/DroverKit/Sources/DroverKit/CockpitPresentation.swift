@@ -236,6 +236,24 @@ public struct ProviderSectionPresentation: Sendable, Equatable {
     }
 }
 
+/// Keeps a failed activity query visible instead of silently presenting an
+/// empty analytics page. In particular, a missing cost value must never look
+/// like a measured zero-dollar result.
+public struct ObservedUsageSectionPresentation: Sendable, Equatable {
+    public static let identifier = "analytics-observed-unavailable"
+    public let warningText: String?
+
+    public var accessibilityLabel: String? { warningText }
+
+    public init(section: SectionEnvelope<ActivitySummary>) {
+        if section.status == .ok, section.data != nil {
+            warningText = nil
+        } else {
+            warningText = "Observed usage, including API cost, is temporarily unavailable. Pull to refresh and try again."
+        }
+    }
+}
+
 /// Deterministic display values for one provider-reported quota window.
 /// SwiftUI receives strings and state only; it never derives quota semantics.
 public struct ProviderCapacityPresentation: Sendable, Equatable {

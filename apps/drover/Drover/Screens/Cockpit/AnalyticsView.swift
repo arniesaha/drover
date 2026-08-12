@@ -135,9 +135,19 @@ struct AnalyticsView: View {
 
     @ViewBuilder
     private func observedSection(_ snapshot: AnalyticsSnapshot) -> some View {
-        if let activity = snapshot.activity.data {
-            VStack(alignment: .leading, spacing: 10) {
-                CockpitSectionHeading(title: "Observed usage", source: "Drover observed", action: nil)
+        let presentation = ObservedUsageSectionPresentation(section: snapshot.activity)
+        VStack(alignment: .leading, spacing: 10) {
+            CockpitSectionHeading(title: "Observed usage", source: "Drover observed", action: nil)
+            if let warningText = presentation.warningText {
+                CockpitCard {
+                    Label(warningText, systemImage: "exclamationmark.triangle")
+                        .droverText(.nested)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(presentation.accessibilityLabel ?? warningText)
+                .accessibilityIdentifier(ObservedUsageSectionPresentation.identifier)
+            } else if let activity = snapshot.activity.data {
                 let metadata = ObservedAggregatePresentation(
                     metadata: activity.metadata,
                     fallbackCoverage: activity.coverage
@@ -189,8 +199,8 @@ struct AnalyticsView: View {
                     values: store.analyticsModels, activity: activity
                 )
             }
-            .accessibilityIdentifier("analytics-drover-observed")
         }
+        .accessibilityIdentifier("analytics-drover-observed")
     }
 
     @ViewBuilder
