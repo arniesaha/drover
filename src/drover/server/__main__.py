@@ -26,7 +26,9 @@ from drover.config import (
     DroverConfig,
     default_config,
     default_config_path,
+    default_token_file,
     load_config,
+    resolve_api_token_env,
 )
 from drover.schema import EXPECTED_TABLES, bootstrap
 from drover.server import ledger_shadow
@@ -95,6 +97,7 @@ from drover.server.summarizer.worker import SummarizerWorker
 from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
 from drover.server.web.auth import load_auth
 from drover.server.web.pairing import PairingCodes
+from drover.server.web.qr import pairing_url, qr_lines
 from drover.session_audit import audit_session_consistency_db, format_session_audit
 from drover.task_id import compute_task_id
 
@@ -294,6 +297,67 @@ def _resolve_config(path: Optional[str]) -> DroverConfig:
     if p.exists():
         return load_config(p)
     return default_config()
+
+
+def _advertised_host_port(cfg: DroverConfig) -> str:
+    """Where clients should dial this hub.
+
+    ``[server] advertised_url`` is written by the installer once it has
+    detected a private address. Until then this falls back to loopback, which
+    is correct for a simulator on the same machine and useless for a phone,
+    so callers warn when they see it.
+    """
+    configured = cfg.server_advertised_url.strip()
+    if configured:
+        for scheme in ("http://", "https://"):
+            if configured.startswith(scheme):
+                configured = configured[len(scheme) :]
+        return configured.rstrip("/")
+    return f"127.0.0.1:{cfg.metrics_http_port}"
+
+
+def _local_api_token(cfg: DroverConfig) -> str:
+    token = resolve_api_token_env() or cfg.auth_api_token.strip()
+    if token:
+        return token
+    try:
+        return default_token_file().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise click.ClickException(
+            f"no API token available: set DROVER_API_TOKEN or start "
+            f"drover-server once to create {default_token_file()} ({exc})"
+        ) from exc
+
+
+def _local_api_request(
+    cfg: DroverConfig, method: str, path: str, payload: Optional[dict] = None
+) -> dict:
+    """Call the locally running hub.
+
+    Pairing codes live in the hub's memory, and this CLI is a different
+    process, so minting has to go over loopback rather than in-process.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{cfg.metrics_http_port}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Authorization", f"Bearer {_local_api_token(cfg)}")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        raise click.ClickException(
+            f"drover-server refused {method} {path}: HTTP {exc.code}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(
+            f"could not reach drover-server on 127.0.0.1:{cfg.metrics_http_port} "
+            f"-- is it running? ({exc.reason})"
+        ) from exc
 
 
 def _bootstrap_if_missing(cfg: DroverConfig) -> None:
@@ -566,6 +630,97 @@ def session_cmd() -> None:
 @main.group(name="harness")
 def harness_cmd() -> None:
     """Audit and migrate Drover harness data."""
+
+
+@main.command(name="pair")
+@click.option("--label", default="New device", show_default=True, help="Device label")
+@click.pass_context
+def pair_cmd(ctx: click.Context, label: str) -> None:
+    """Print a QR code that pairs a phone with this fleet."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    minted = _local_api_request(
+        cfg, "POST", "/auth/pair-codes", {"scope": "device", "label": label}
+    )
+    host_port = _advertised_host_port(cfg)
+    url = pairing_url(host_port, minted["code"], minted["fleet_name"])
+
+    click.echo("")
+    click.echo("  Scan with the Drover app:")
+    click.echo("")
+    for line in qr_lines(url):
+        click.echo("  " + line)
+    click.echo("")
+    click.echo(f"  Or enter the code manually: {minted['code']}")
+    click.echo(f"  {url}")
+    minutes = max(minted["expires_in_seconds"] // 60, 1)
+    click.echo(f"  Expires in {minutes} min. Single use.")
+    if host_port.startswith("127.0.0.1") or host_port.startswith("localhost"):
+        click.echo("")
+        click.echo(
+            "  Warning: this address is only reachable from this machine. Set "
+            "[server] advertised_url in ~/.drover/config.toml to a private LAN "
+            "or Tailscale address before pairing a phone."
+        )
+    click.echo("")
+
+
+@main.command(name="pair-host")
+@click.option("--name", required=True, help="Host id for the machine being added")
+@click.pass_context
+def pair_host_cmd(ctx: click.Context, name: str) -> None:
+    """Print the one-liner that joins another machine to this fleet."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    minted = _local_api_request(
+        cfg,
+        "POST",
+        "/auth/pair-codes",
+        {"scope": "host", "label": name, "host_id": name},
+    )
+    host_port = _advertised_host_port(cfg)
+    url = pairing_url(host_port, minted["code"], minted["fleet_name"])
+    minutes = max(minted["expires_in_seconds"] // 60, 1)
+
+    click.echo("")
+    click.echo(f"  Run this on the machine you are adding (expires in {minutes} min):")
+    click.echo("")
+    click.echo(
+        "    curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/"
+        "install.sh \\"
+    )
+    click.echo(f"      | bash -s -- --join '{url}'")
+    click.echo("")
+
+
+@main.group(name="credentials")
+def credentials_cmd() -> None:
+    """List and revoke paired devices and hosts."""
+
+
+@credentials_cmd.command(name="list")
+@click.pass_context
+def credentials_list_cmd(ctx: click.Context) -> None:
+    cfg = _resolve_config(ctx.obj["config_path"])
+    listing = _local_api_request(cfg, "GET", "/auth/credentials")
+    rows = listing.get("credentials") or []
+    if not rows:
+        click.echo("No credentials are paired. Run `drover-server pair` to add one.")
+        return
+    for row in rows:
+        state = "revoked" if row.get("revoked_at") else "active"
+        last_used = row.get("last_used_at") or "never"
+        click.echo(
+            f"{row['id']}  {row['scope']:<6}  {state:<7}  "
+            f"last used {last_used}  {row['label']}"
+        )
+
+
+@credentials_cmd.command(name="revoke")
+@click.argument("credential_id")
+@click.pass_context
+def credentials_revoke_cmd(ctx: click.Context, credential_id: str) -> None:
+    cfg = _resolve_config(ctx.obj["config_path"])
+    _local_api_request(cfg, "DELETE", f"/auth/credentials/{credential_id}")
+    click.echo(f"Revoked {credential_id}.")
 
 
 def _sequence_command_payload(db_path: Path, *, apply: bool) -> dict[str, Any]:
