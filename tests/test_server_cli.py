@@ -1420,3 +1420,18 @@ def test_summarizer_backend_config_forwards_launchd_overrides(tmp_path, monkeypa
     backend_cfg = server_main._summarizer_backend_config(cfg)
     assert backend_cfg.local_ollama_launchd_label == "com.custom.ollama"
     assert backend_cfg.local_ollama_launchd_plist == "/tmp/com.custom.ollama.plist"
+
+
+def test_run_passes_a_pairing_table_to_the_http_server():
+    """The hub must own one PairingCodes instance, or `pair` has nothing to
+    mint into. Booting the real `run` command here would take the DuckDB write
+    lock and start every worker, so this pins the wiring by reading the
+    source; the manual end-to-end check in task 7 is what proves it works.
+    """
+    from pathlib import Path
+
+    import drover.server.__main__ as server_main
+
+    source = Path(server_main.__file__).read_text(encoding="utf-8")
+    assert "from drover.server.web.pairing import PairingCodes" in source
+    assert "pairing=pairing" in source, "start_metrics_server needs the table"

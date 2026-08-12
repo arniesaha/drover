@@ -19,6 +19,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 
 from drover.config import DroverConfig, config_home, resolve_api_token_env
+from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
 
 _TOKEN_FILENAME = "api_token"
 
@@ -29,6 +30,8 @@ class AuthSettings:
     api_token: str
     session_ttl_seconds: int = 30 * 86400
     cookie_name: str = "drover_session"
+    credentials: CredentialStore | None = None
+    legacy_token_enabled: bool = True
 
 
 DISABLED = AuthSettings(enabled=False, api_token="")
@@ -57,7 +60,12 @@ def load_auth(cfg: DroverConfig, token_home: Path | None = None) -> AuthSettings
         or cfg.auth_api_token.strip()
         or _load_or_create_token_file(home)
     )
-    return AuthSettings(enabled=True, api_token=token)
+    return AuthSettings(
+        enabled=True,
+        api_token=token,
+        credentials=CredentialStore(home / CREDENTIALS_FILENAME),
+        legacy_token_enabled=cfg.auth_legacy_token_enabled,
+    )
 
 
 def _cookie_key(api_token: str) -> bytes:
@@ -88,7 +96,24 @@ def verify_session(value: str, auth: AuthSettings, now: float | None = None) -> 
 
 
 def token_matches(auth: AuthSettings, candidate: str) -> bool:
-    return bool(auth.api_token) and hmac.compare_digest(candidate, auth.api_token)
+    """Accept the legacy cluster token or any active per-device credential.
+
+    The credential path hashes the candidate before looking it up, so lookup
+    cost never varies with the secret and there is no per-credential loop.
+    """
+    if (
+        auth.legacy_token_enabled
+        and auth.api_token
+        and hmac.compare_digest(candidate, auth.api_token)
+    ):
+        return True
+    if auth.credentials is None:
+        return False
+    credential = auth.credentials.find_active(candidate)
+    if credential is None:
+        return False
+    auth.credentials.touch(credential.id)
+    return True
 
 
 def request_authorized(auth: AuthSettings, headers) -> bool:

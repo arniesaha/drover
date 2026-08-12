@@ -45,6 +45,7 @@ from drover.server.web.auth import (
     session_cookie_value,
     token_matches,
 )
+from drover.server.web.pairing import PairingCodes, ThrottledSource, UnknownCode
 from drover.server.web.ui import load_page
 
 if TYPE_CHECKING:
@@ -54,7 +55,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("drover.metrics")
 
-_PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login"}
+# /auth/pair is the one public write in the system: a device that has no
+# credential yet is exactly the caller it exists for. It is hardened inside
+# _redeem_pairing_code (single-use codes, TTL, per-source throttle) rather
+# than by this gate.
+_PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login", "/auth/pair"}
 
 # Total budget for a spoke to send its hello after the 101, across every
 # frame it sends -- not per recv. See _accept_relay_websocket.
@@ -553,6 +558,7 @@ def _parse_host_auth_route(path: str) -> dict[str, str] | None:
 class _MetricsHandler(BaseHTTPRequestHandler):
     collector: "MetricsCollector"
     auth: AuthSettings = DISABLED
+    pairing: PairingCodes | None = None
 
     def _gate(self, path: str) -> bool:
         """Authorize the request or write the refusal response.
@@ -584,6 +590,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/auth/login":
             self._send(200, "text/html; charset=utf-8", load_page("login.html"))
+            return
+        if path == "/auth/credentials":
+            self._list_credentials()
             return
         if path in {"/", "/ui"}:
             self._send(200, "text/html; charset=utf-8", load_page("observatory.html"))
@@ -853,6 +862,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             self._send(status, "application/json", payload)
             return
+        if path == "/auth/pair":
+            self._redeem_pairing_code()
+            return
+        if path == "/auth/pair-codes":
+            self._mint_pairing_code()
+            return
         if path == "/harness/events":
             self._ingest_harness_events()
             return
@@ -983,6 +998,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._gate(path):
+            return
+        if path.startswith("/auth/credentials/"):
+            self._revoke_credential(unquote(path.removeprefix("/auth/credentials/")))
             return
         if path == "/insights/content-excerpts":
             status, payload = self.collector.purge_content_excerpts()
@@ -1541,6 +1559,106 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _pair_source(self) -> str:
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _pairing_ready(self) -> bool:
+        if self.pairing is not None and self.auth.credentials is not None:
+            return True
+        self._send(404, "application/json", '{"error": "pairing is not enabled"}\n')
+        return False
+
+    def _mint_pairing_code(self) -> None:
+        if not self._pairing_ready():
+            return
+        body = self._read_json()
+        if body is None:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "request body must be valid JSON"}\n',
+            )
+            return
+        scope = str(body.get("scope") or "device")
+        if scope not in {"device", "host"}:
+            self._send(400, "application/json", '{"error": "unknown scope"}\n')
+            return
+        default_label = "New host" if scope == "host" else "New device"
+        label = str(body.get("label") or "").strip() or default_label
+        raw_host_id = body.get("host_id")
+        host_id = str(raw_host_id).strip() if raw_host_id else None
+        entry = self.pairing.mint(scope=scope, label=label, host_id=host_id)
+        remaining = max(int(entry.expires_at - time.monotonic()), 0)
+        payload = {
+            "code": entry.formatted,
+            "scope": entry.scope,
+            "label": entry.label,
+            "expires_in_seconds": remaining,
+            "fleet_name": self.auth.credentials.fleet_name,
+            "server_id": self.auth.credentials.server_id,
+        }
+        self._send(201, "application/json", json.dumps(payload, sort_keys=True) + "\n")
+
+    def _redeem_pairing_code(self) -> None:
+        if not self._pairing_ready():
+            return
+        body = self._read_json()
+        if body is None:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "request body must be valid JSON"}\n',
+            )
+            return
+        try:
+            entry = self.pairing.redeem(
+                str(body.get("code") or ""), source=self._pair_source()
+            )
+        except ThrottledSource:
+            self._send(
+                429, "application/json", '{"error": "too many pairing attempts"}\n'
+            )
+            return
+        except UnknownCode:
+            # Deliberately identical for unknown, burned, and expired codes.
+            self._send(
+                410, "application/json", '{"error": "unknown or expired code"}\n'
+            )
+            return
+        store = self.auth.credentials
+        label = str(body.get("device_name") or "").strip() or entry.label
+        # Scope comes from the code, never from the body: a device code must
+        # not be redeemable into a host credential.
+        credential, token = store.issue(
+            scope=entry.scope, label=label, host_id=entry.host_id
+        )
+        payload = {
+            "token": token,
+            "credential_id": credential.id,
+            "scope": credential.scope,
+            "server_id": store.server_id,
+            "fleet_name": store.fleet_name,
+        }
+        self._send(201, "application/json", json.dumps(payload, sort_keys=True) + "\n")
+
+    def _list_credentials(self) -> None:
+        if not self._pairing_ready():
+            return
+        payload = {
+            "credentials": [
+                item.as_public_json() for item in self.auth.credentials.list_all()
+            ]
+        }
+        self._send(200, "application/json", json.dumps(payload, sort_keys=True) + "\n")
+
+    def _revoke_credential(self, credential_id: str) -> None:
+        if not self._pairing_ready():
+            return
+        if self.auth.credentials.revoke(credential_id):
+            self._send(204, "application/json", "")
+            return
+        self._send(404, "application/json", '{"error": "unknown credential"}\n')
+
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length") or "0")
         raw = self.rfile.read(length) if length else b"{}"
@@ -1608,6 +1726,7 @@ def start_metrics_server(
     port: int,
     collector: "MetricsCollector",
     auth: AuthSettings | None = None,
+    pairing: PairingCodes | None = None,
 ) -> ThreadingHTTPServer:
     """Start the Drover metrics HTTP server in a daemon thread."""
     from drover.server.relay_manager import RelayManager
@@ -1616,7 +1735,7 @@ def start_metrics_server(
     handler = type(
         "DroverMetricsHandler",
         (_MetricsHandler,),
-        {"collector": collector, "auth": auth or DISABLED},
+        {"collector": collector, "auth": auth or DISABLED, "pairing": pairing},
     )
     server = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(

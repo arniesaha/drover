@@ -71,14 +71,25 @@ Run the authenticated hosts request again and confirm the local host appears.
 
 ## 4. Connect The iOS App
 
-Build the app using [the source-build guide](../apps/drover/README.md). In app
-settings, use:
+Build the app using [the source-build guide](../apps/drover/README.md), then
+pair it:
 
-- Server URL: `http://127.0.0.1:7080` for the simulator on the same Mac.
-- API token: the contents of `~/.drover/api_token`.
+```bash
+uv run drover-server pair
+```
 
-For a physical iPhone, use a private LAN address or a private Tailscale address
-that reaches the server machine. Do not use Tailscale Funnel.
+Scan the QR code with the app. The app receives its own token and stores it in
+the iOS Keychain. Nothing is typed by hand. The code is single use and expires
+after ten minutes.
+
+The QR points at `[server] advertised_url` from `~/.drover/config.toml`. Set
+that to a private LAN address or a private Tailscale address before pairing a
+physical iPhone. While it is unset, the command prints the loopback address and
+warns that only the simulator on this Mac can reach it. Do not use Tailscale
+Funnel.
+
+Manual URL and token entry stays available in app settings as the recovery path
+for when a camera is unavailable.
 
 ## 5. Add Private Tailscale Access
 

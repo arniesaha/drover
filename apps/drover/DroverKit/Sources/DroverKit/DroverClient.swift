@@ -50,6 +50,26 @@ extension DroverError: LocalizedError {
     }
 }
 
+// MARK: - Pairing
+
+/// What the hub hands back when a pairing code is redeemed. The token belongs
+/// to this device alone and is revocable on its own.
+public struct PairResponse: Decodable, Sendable, Equatable {
+    public let token: String
+    public let credentialID: String
+    public let scope: String
+    public let serverID: String
+    public let fleetName: String
+
+    private enum CodingKeys: String, CodingKey {
+        case token
+        case credentialID = "credential_id"
+        case scope
+        case serverID = "server_id"
+        case fleetName = "fleet_name"
+    }
+}
+
 // MARK: - DroverClient
 
 /// Talks to the central Drover server's harness REST API over plain HTTP
@@ -64,6 +84,50 @@ public actor DroverClient {
         self.config = config
         self.token = token
         self.session = session
+    }
+
+    // MARK: Pairing
+
+    /// Redeem a scanned pairing code for this device's own token.
+    ///
+    /// Static, and the only call in the app that sends no `Authorization`
+    /// header: the device has no credential yet, which is the entire point of
+    /// pairing. The hub burns the code on success, so this must not be retried
+    /// blindly — a second attempt with the same code returns 410.
+    public static func pair(
+        payload: PairingPayload,
+        deviceName: String,
+        session: URLSession = .shared
+    ) async throws -> PairResponse {
+        var request = URLRequest(
+            url: payload.serverURL.appendingPathComponent("auth/pair")
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(
+            withJSONObject: ["code": payload.code, "device_name": deviceName]
+        )
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError {
+            throw DroverError.transport(
+                error.code == .cancelled
+                    ? DroverError.cancellationDetail
+                    : error.localizedDescription
+            )
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw DroverError.transport("non-HTTP response")
+        }
+        let validated = try validate(data, response: http)
+        do {
+            return try JSONDecoder().decode(PairResponse.self, from: validated)
+        } catch {
+            throw DroverError.decoding("\(error)")
+        }
     }
 
     // MARK: Public API
@@ -504,6 +568,14 @@ public actor DroverClient {
     }
 
     private func validatedData(_ data: Data, response http: HTTPURLResponse) throws -> Data {
+        try Self.validate(data, response: http)
+    }
+
+    /// Static so the unauthenticated pairing call below can share exactly this
+    /// mapping rather than growing a second copy that drifts from it.
+    nonisolated static func validate(
+        _ data: Data, response http: HTTPURLResponse
+    ) throws -> Data {
         switch http.statusCode {
         case 200..<300:
             return data
@@ -526,7 +598,7 @@ public actor DroverClient {
 
     /// Extracts the `"error"` field from a JSON body, falling back to the
     /// raw body text when it isn't present or isn't valid JSON.
-    private nonisolated func errorText(from data: Data) -> String {
+    nonisolated static func errorText(from data: Data) -> String {
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let text = object["error"] as? String {
             return text
