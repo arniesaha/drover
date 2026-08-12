@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 import time
 
@@ -282,16 +283,24 @@ def test_default_auth_adapters_use_login_shell_command_and_nvm_path(
 
     adapters = default_auth_adapters(shell="/bin/zsh")
 
+    # Quote the way the adapter does. Building these expectations by bare
+    # interpolation only passes while the temp root happens to be free of
+    # shell metacharacters, so it broke the moment TMPDIR moved to a volume
+    # with a space in its name — a test artifact, not a defect: the adapter
+    # has always quoted correctly.
+    quoted_bin = shlex.quote(str(nvm_bin))
+    quoted_codex = shlex.quote(str(codex))
+
     adapter = adapters["codex"]
     assert adapter.status_command == [
         "/bin/zsh",
         "-lc",
-        f"export PATH={nvm_bin}:$PATH; exec {codex} login status",
+        f"export PATH={quoted_bin}:$PATH; exec {quoted_codex} login status",
     ]
     assert adapter.command() == [
         "/bin/zsh",
         "-lc",
-        f"export PATH={nvm_bin}:$PATH; exec {codex} login --device-auth",
+        f"export PATH={quoted_bin}:$PATH; exec {quoted_codex} login --device-auth",
     ]
 
 
@@ -326,7 +335,7 @@ def test_agy_auth_status_reports_the_signed_in_account(monkeypatch, tmp_path):
     assert status.state == "authenticated"
     assert status.label == "someone@example.com"
     assert status.detail == "Antigravity CLI"
-    assert adapter.command()[-1].endswith(f"exec {agy}")
+    assert adapter.command()[-1].endswith(f"exec {shlex.quote(str(agy))}")
 
 
 def test_agy_auth_status_is_unknown_without_sign_in_state(monkeypatch, tmp_path):
