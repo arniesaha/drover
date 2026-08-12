@@ -372,23 +372,29 @@ struct StreamTests {
          "has_older": false, "has_newer": false}
         """.utf8))
     }
-    let connector = FakeConnector([.frames([], thenError: false)])
+    let connector = FakeConnector([
+        .frames([wireMessage(seq: 6, text: "six")], thenError: false)
+    ])
     let stream = MessageStream(
         client: client(), sessionID: "s1", connector: connector,
         reconnectBaseDelay: .milliseconds(10)
     )
 
     var batch: [HarnessMessage] = []
+    var live: [Int] = []
     var drops = 0
     for await event in await stream.events() {
         switch event {
         case let .history(messages, _): batch = messages
+        case let .message(message): live.append(message.seq)
         case .connection(false): drops += 1
-        case .message, .connection(true), .unauthorized: break
+        case .connection(true), .unauthorized: break
         }
-        // The old behaviour never yields history at all, so the drop ceiling
-        // is what ends this loop when the fix is absent.
-        if !batch.isEmpty || drops > MessageStream.gapRetryLimit + 2 { break }
+        // Wait for the live frame, not just the batch: the socket is attached
+        // *after* the window is published, so leaving at `.history` would race
+        // the connect the assertions below are about. Without the fix no
+        // history is ever published, so the drop ceiling ends the loop.
+        if live == [6] || drops > MessageStream.gapRetryLimit + 2 { break }
     }
 
     // The hole (3 and 4) becomes one marker row carrying its own sequence.
@@ -402,7 +408,10 @@ struct StreamTests {
     // retries all ran first.
     #expect(drops == MessageStream.gapRetryLimit)
     #expect(attempts == MessageStream.gapRetryLimit + 1)
+    // Attached at the marked window's bound, and live delivery carries on
+    // across the hole rather than stalling on it.
     #expect(connector.requests.first?.url?.query == "after_seq=5")
+    #expect(live == [6])
 }
 
 @Test func coldCatchUpDoesNotDegradeOnAGapThatHeals() async throws {

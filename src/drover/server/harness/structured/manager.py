@@ -116,6 +116,30 @@ class StructuredSessionManager:
         entry.seq = registry.max_event_seq(session_id)
 
         def emit(message: StructuredMessage) -> None:
+            payload = message.payload or {}
+            # Only a genuine process-level exit ends this entry's life.
+            # ProcessDriver.on_exit() leaves turn_id=None on its "process
+            # exited" status message, but Codex/Agy's per-turn respawn
+            # drivers emit an "exited" status with turn_id SET after every
+            # single turn -- gating on turn_id is None keeps those from
+            # prematurely finalizing (and vanishing from listings) after
+            # their first turn.
+            process_exited = (
+                message.type == "status"
+                and "exited" in payload
+                and message.turn_id is None
+            )
+            # Discard BEFORE recording the event, not after. The exit event is
+            # what makes the session look finished to everything else --
+            # recovery reads the registry and then asks the manager -- so an
+            # entry still listed as live at that moment is exactly the dead
+            # entry recovery must never mistake for an idempotently recovered
+            # session. Discarding afterwards left that window open for the
+            # whole duration of the write, and the write contends for the
+            # registry's process-wide connect lock with every other session's
+            # pump thread, so it is not a micro-window.
+            if process_exited:
+                self._discard_entry(session_id, entry)
             # entry.lock serializes the ENTIRE per-message side effect
             # sequence, not just the awaiting-state mutation: emit() runs
             # from multiple threads for the same session (a driver's own
@@ -131,7 +155,6 @@ class StructuredSessionManager:
             with entry.lock:
                 entry.seq += 1
                 seq = entry.seq
-                payload = message.payload or {}
                 if message.type == "approval_prompt":
                     entry.awaiting = "approval"
                 elif message.type == "approval_response":
@@ -200,19 +223,9 @@ class StructuredSessionManager:
                 if not recorded:
                     record_dropped_events(1)
             on_message(session_id, event_payload)
-            # Only a genuine process-level exit finalizes the session.
-            # ProcessDriver.on_exit() leaves turn_id=None on its "process
-            # exited" status message, but Codex/Agy's per-turn respawn
-            # drivers emit an "exited" status with turn_id SET after every
-            # single turn -- gating on turn_id is None keeps those from
-            # prematurely finalizing (and vanishing from listings) after
-            # their first turn.
-            if (
-                message.type == "status"
-                and "exited" in payload
-                and message.turn_id is None
-            ):
-                self._discard_entry(session_id, entry)
+            # Finalize stays after the write: it records the exit code against
+            # a session whose last event has already landed.
+            if process_exited:
                 finalize(session_id, int(payload["exited"]))
 
         entry.emit = emit
