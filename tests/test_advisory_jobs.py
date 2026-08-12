@@ -53,9 +53,21 @@ from drover.server.ledger import Ledger
 from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import ProviderAccountSnapshot
 from drover.server.__main__ import _create_content_analysis_worker
+from drover.server.db import control_plane_path
 from drover.server.harness.registry import HarnessRegistry
 
 NOW = datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc)
+
+
+def _control_plane_execute(db_path: Path, sql: str, params: list | None = None) -> None:
+    """Write control-plane rows where they live since #95.
+
+    ``harness_sessions`` and ``harness_hosts`` moved out of the lakehouse into
+    their own database. ``load_operational_snapshot`` reads them back through a
+    private copy of that store, so the fixtures have to write to the real one.
+    """
+    with duckdb.connect(str(control_plane_path(db_path))) as con:
+        con.execute(sql, params or [])
 
 
 def _content_config(*, enabled: bool = True, external_consent: bool = False):
@@ -1716,7 +1728,8 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
               cache_read_tokens BIGINT, cost_usd DOUBLE
             )
             """)
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, repo_owner, repo_name, command,
@@ -1756,7 +1769,8 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
             "secret": "do-not-copy",
             "config_content": "PRIVATE PROMPT",
         }
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_hosts (
               host_id, display_name, kind, status, capabilities_json,
@@ -1823,7 +1837,8 @@ def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
               cache_read_tokens BIGINT, cost_usd DOUBLE
             )
             """)
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, command, status, started_at, updated_at
@@ -1855,7 +1870,8 @@ def test_runtime_snapshot_bounds_sessions_inside_the_seven_day_window(
               total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
             )
             """)
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, command, status, model,
@@ -1868,7 +1884,8 @@ def test_runtime_snapshot_bounds_sessions_inside_the_seven_day_window(
             """,
             [NOW, NOW],
         )
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, command, status, model,
@@ -1921,7 +1938,8 @@ def test_runtime_snapshot_uses_latest_session_activity_including_ended_at(
               total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
             )
             """)
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, command, status, model,
@@ -1982,7 +2000,8 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
               total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
             )
             """)
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, command, status, model,
@@ -2320,25 +2339,33 @@ def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(
 ) -> None:
     now = [0.0]
     version = ["stable"]
+    version_calls: list[tuple[str, str]] = []
+
+    def source_version(analyzer_id: str, target_id: str) -> str:
+        version_calls.append((analyzer_id, target_id))
+        return f"facts:{analyzer_id}:{target_id}:{version[0]}"
+
     scheduler = AdvisoryScheduler(
         duckdb_path=db_path,
         analyzer_ids=("deterministic.telemetry_coverage",),
         full_review_interval_seconds=60,
         clock=lambda: now[0],
-        source_version_factory=lambda analyzer_id, target_id: (
-            f"facts:{analyzer_id}:{target_id}:{version[0]}"
-        ),
+        source_version_factory=source_version,
     )
 
     first = scheduler.enqueue_due_full_review()[0]
     assert scheduler.enqueue_due_full_review() == []
     version[0] = "stale-threshold-crossed"
-    changed_in_same_bucket = scheduler.enqueue_due_full_review()
+    assert scheduler.enqueue_due_full_review() == []
+    assert version_calls == [("deterministic.telemetry_coverage", "fleet")]
     now[0] = 60.0
-    unchanged_next_bucket = scheduler.enqueue_due_full_review()
+    changed_next_bucket = scheduler.enqueue_due_full_review()
 
-    assert changed_in_same_bucket[0].job_id == first.job_id
-    assert unchanged_next_bucket == []
+    assert changed_next_bucket[0].job_id == first.job_id
+    assert version_calls == [
+        ("deterministic.telemetry_coverage", "fleet"),
+        ("deterministic.telemetry_coverage", "fleet"),
+    ]
     with duckdb.connect(str(db_path), read_only=True) as con:
         assert (
             con.execute(
@@ -2347,6 +2374,33 @@ def test_scheduler_uses_material_fact_versions_to_coalesce_unchanged_reviews(
             ).fetchone()[0]
             == 2
         )
+
+
+def test_failed_material_version_pass_retries_in_the_same_interval(
+    db_path: Path,
+) -> None:
+    calls = 0
+
+    def source_version(analyzer_id: str, target_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary snapshot failure")
+        return f"facts:{analyzer_id}:{target_id}:stable"
+
+    scheduler = AdvisoryScheduler(
+        duckdb_path=db_path,
+        analyzer_ids=("deterministic.telemetry_coverage",),
+        full_review_interval_seconds=60,
+        clock=lambda: 0.0,
+        source_version_factory=source_version,
+    )
+
+    with pytest.raises(RuntimeError, match="temporary snapshot failure"):
+        scheduler.enqueue_due_full_review()
+
+    assert len(scheduler.enqueue_due_full_review()) == 1
+    assert calls == 2
 
 
 def test_runtime_snapshot_includes_latest_provider_reset_windows(
@@ -2710,7 +2764,8 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
               total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
             )
             """)
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_sessions (
               session_id, host_id, harness, command, status, model,
@@ -2772,7 +2827,8 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
                 ]
             }
         }
-        con.execute(
+        _control_plane_execute(
+            db_path,
             """
             INSERT INTO harness_hosts (
               host_id, display_name, kind, status, capabilities_json,

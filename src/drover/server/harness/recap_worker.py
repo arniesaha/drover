@@ -10,7 +10,7 @@ from typing import Any
 
 import duckdb
 
-from drover.server.db import open_duckdb_connection
+from drover.server.db import control_plane_connection
 from drover.server.harness.recap_jobs import flush_live_recap_publications
 from drover.server.harness.recap_prompt import (
     build_live_recap_prompt,
@@ -139,11 +139,14 @@ class LiveRecapWorker:
         return 1
 
     def _flush_publications(self) -> None:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
+        # Every window in this worker goes through the control plane's
+        # connection, because since #95 `live_recap_jobs`, `live_session_recaps`
+        # and `harness_events` live in the control-plane store. Opening that
+        # file with `open_duckdb_connection` would also reset the store's
+        # instance-wide `memory_limit` and `threads` to an analytical role's,
+        # which is the coupling the split exists to remove.
+        with control_plane_connection(self.duckdb_path) as con:
             flush_live_recap_publications(con, self.job_stream)
-        finally:
-            con.close()
 
     def _resolve_backend(self) -> LLMBackend:
         if self._backend is not None:
@@ -153,8 +156,7 @@ class LiveRecapWorker:
         return select_backend(job_kind="live_recap", config=self._backend_config)
 
     def _claim_due_job(self) -> _Claim | None:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             row = con.execute(
                 """SELECT session_id, desired_source_seq
                    FROM live_recap_jobs
@@ -184,8 +186,6 @@ class LiveRecapWorker:
             if claimed is None:
                 return None
             return _Claim(session_id, source_seq, int(claimed[0]))
-        finally:
-            con.close()
 
     def _claim_stream_job(self) -> _Claim | None:
         deliveries = self.job_stream.read_group("live-recap", count=1)  # type: ignore[union-attr]
@@ -206,8 +206,7 @@ class LiveRecapWorker:
             return None
         session_id = str(session_id)
 
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             row = con.execute(
                 """SELECT desired_source_seq, status, next_run_at
                    FROM live_recap_jobs WHERE session_id=?""",
@@ -244,13 +243,10 @@ class LiveRecapWorker:
             if claimed is None:
                 return None
             return _Claim(session_id, desired_seq, int(claimed[0]), delivery)
-        finally:
-            con.close()
 
     def _load_events(self, session_id: str) -> list[dict[str, Any]]:
         placeholders = ", ".join("?" for _ in _CONTENT_EVENT_TYPES)
-        con = open_duckdb_connection(self.duckdb_path, read_only=True, role="worker")
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             cur = con.execute(
                 f"""SELECT seq, event_type, content_preview
                     FROM harness_events
@@ -265,65 +261,66 @@ class LiveRecapWorker:
                 dict(zip((column[0] for column in cur.description), row))
                 for row in reversed(cur.fetchall())
             ]
-        finally:
-            con.close()
 
     def _complete(self, claim: _Claim, recap: str, model: str) -> bool:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            persisted = con.execute(
-                """INSERT OR REPLACE INTO live_session_recaps
-                   (session_id, recap_text, source_seq, generator_model, generated_at)
-                   SELECT ?, ?, ?, ?, now()
-                   WHERE EXISTS (
-                     SELECT 1 FROM live_recap_jobs
-                      WHERE session_id=? AND desired_source_seq=?
-                        AND status='running' AND attempts=?
-                   )
-                   RETURNING session_id""",
-                [
-                    claim.session_id,
-                    recap,
-                    claim.source_seq,
-                    model,
-                    claim.session_id,
-                    claim.source_seq,
-                    claim.attempts,
-                ],
-            ).fetchone()
-            if persisted is None:
-                con.execute("ROLLBACK")
-                return False
-            finalized = con.execute(
-                """UPDATE live_recap_jobs
-                   SET status='done', last_error=NULL, next_run_at=NULL, updated_at=now()
-                   WHERE session_id=? AND desired_source_seq=?
-                     AND status='running' AND attempts=?
-                   RETURNING session_id""",
-                [claim.session_id, claim.source_seq, claim.attempts],
-            ).fetchone()
-            if finalized is None:
-                con.execute("ROLLBACK")
-                return False
-            con.execute("COMMIT")
-            return True
-        except Exception:
+        with control_plane_connection(self.duckdb_path) as con:
             try:
-                con.execute("ROLLBACK")
-            except duckdb.Error:
-                pass
-            raise
-        finally:
-            con.close()
+                return self._complete_in(con, claim, recap, model)
+            except Exception:
+                try:
+                    con.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+                raise
+
+    @staticmethod
+    def _complete_in(
+        con: duckdb.DuckDBPyConnection, claim: _Claim, recap: str, model: str
+    ) -> bool:
+        con.execute("BEGIN TRANSACTION")
+        persisted = con.execute(
+            """INSERT OR REPLACE INTO live_session_recaps
+               (session_id, recap_text, source_seq, generator_model, generated_at)
+               SELECT ?, ?, ?, ?, now()
+               WHERE EXISTS (
+                 SELECT 1 FROM live_recap_jobs
+                  WHERE session_id=? AND desired_source_seq=?
+                    AND status='running' AND attempts=?
+               )
+               RETURNING session_id""",
+            [
+                claim.session_id,
+                recap,
+                claim.source_seq,
+                model,
+                claim.session_id,
+                claim.source_seq,
+                claim.attempts,
+            ],
+        ).fetchone()
+        if persisted is None:
+            con.execute("ROLLBACK")
+            return False
+        finalized = con.execute(
+            """UPDATE live_recap_jobs
+               SET status='done', last_error=NULL, next_run_at=NULL, updated_at=now()
+               WHERE session_id=? AND desired_source_seq=?
+                 AND status='running' AND attempts=?
+               RETURNING session_id""",
+            [claim.session_id, claim.source_seq, claim.attempts],
+        ).fetchone()
+        if finalized is None:
+            con.execute("ROLLBACK")
+            return False
+        con.execute("COMMIT")
+        return True
 
     def _finish_failure(self, claim: _Claim, error: str) -> None:
         delay_s = min(
             _RETRY_BASE_SECONDS * (2 ** max(claim.attempts - 1, 0)),
             _RETRY_MAX_SECONDS,
         )
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             con.execute(
                 """UPDATE live_recap_jobs
                    SET status='retry_wait', last_error=?,
@@ -339,8 +336,6 @@ class LiveRecapWorker:
                     claim.attempts,
                 ],
             ).fetchone()
-        finally:
-            con.close()
         if claim.delivery is not None:
             # The durable retry row is authoritative. ACK this delivery so
             # exponential waits cannot consume the stream redelivery budget.

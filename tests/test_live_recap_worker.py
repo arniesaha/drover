@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 
 from drover.schema import bootstrap
+from drover.server.db import control_plane_path
 from drover.server.harness.recap_jobs import enqueue_live_recap
 from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.summarizer.backends import BackendError
@@ -22,7 +23,7 @@ def recap_db(
     """Create a bootstrapped database with one content-bearing event."""
     db = tmp_path / "recaps.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
+    con = duckdb.connect(str(control_plane_path(db)))
     con.execute(
         """INSERT INTO harness_events
            (event_id, session_id, event_type, content_preview, payload_json, seq)
@@ -40,7 +41,7 @@ def recap_db(
 
 
 def recap_row(db: Path, session_id: str) -> tuple[object, ...] | None:
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         return con.execute(
             """SELECT recap_text, source_seq, generator_model
                FROM live_session_recaps WHERE session_id=?""",
@@ -49,7 +50,7 @@ def recap_row(db: Path, session_id: str) -> tuple[object, ...] | None:
 
 
 def recap_job(db: Path, session_id: str) -> tuple[object, ...] | None:
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         return con.execute(
             """SELECT desired_source_seq, status FROM live_recap_jobs
                WHERE session_id=?""",
@@ -138,7 +139,7 @@ def test_stale_worker_result_does_not_replace_newer_requested_recap(
     )
     thread.start()
     backend.wait_until_called()
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         enqueue_live_recap(con, "s1", 10)
     backend.release({"recap": "Stale source eight recap."})
     thread.join(timeout=2)
@@ -198,7 +199,7 @@ def test_new_worker_recovers_an_expired_running_claim(tmp_path: Path) -> None:
         == 1
     )
     assert recap_row(db, "s1")[:2] == ("Recovered recap.", 8)
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         assert con.execute(
             "SELECT status, attempts FROM live_recap_jobs WHERE session_id='s1'"
         ).fetchone() == ("done", 2)
@@ -221,7 +222,7 @@ def test_stream_retry_acknowledges_delivery_and_retries_from_durable_due_time(
     assert failing.drain_once() == 1
     assert stream.pending() == []
     assert stream.dead_letters() == []
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         con.execute("""UPDATE live_recap_jobs
                SET next_run_at=now() - INTERVAL '1 second'
                WHERE session_id='s1'""")
@@ -262,7 +263,7 @@ def test_stream_redelivery_does_not_steal_an_unexpired_running_claim(
         == 0
     )
     assert backend.calls == 0
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         assert con.execute(
             "SELECT status, attempts FROM live_recap_jobs WHERE session_id='s1'"
         ).fetchone() == ("running", 1)

@@ -146,6 +146,8 @@ class AdvisoryScheduler:
 
     def enqueue_due_full_review(self) -> list[Job]:
         bucket = math.floor(self.clock() / self.full_review_interval_seconds)
+        if bucket == self._last_bucket:
+            return []
         if self.source_version_factory is not None:
             jobs: list[Job] = []
             for analyzer_id in self.analyzer_ids:
@@ -163,8 +165,6 @@ class AdvisoryScheduler:
                 self._last_source_versions[analyzer_id] = source_version
             self._last_bucket = bucket
             return jobs
-        if bucket == self._last_bucket:
-            return []
         jobs = [
             enqueue_advisory_check(
                 self.duckdb_path,

@@ -128,9 +128,12 @@ def test_a_control_plane_lock_holder_cannot_block_an_analytical_connect(tmp_path
     pin_control_plane_connection(duckdb_path)
 
     def analytical_read() -> int:
+        # `tasks`, not `harness_hosts`: since #95 the control-plane tables are
+        # not in this database at all, which is the stronger form of the same
+        # isolation this test is about.
         con = open_duckdb_connection(duckdb_path, role="diagnostic")
         try:
-            return con.execute("SELECT count(*) FROM harness_hosts").fetchone()[0]
+            return con.execute("SELECT count(*) FROM tasks").fetchone()[0]
         finally:
             con.close()
 

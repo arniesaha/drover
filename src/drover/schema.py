@@ -15,13 +15,23 @@ Layout:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import duckdb
 
 from drover.agent_aliases import canonicalize_sql
 from drover.event_identity import canonical_agent_events_cte
-from drover.server.harness.schema import HARNESS_TABLES, bootstrap_harness_tables
+from drover.server.db import (
+    CONTROL_PLANE_PRIMARY_KEYS,
+    CONTROL_PLANE_TABLES,
+    control_plane_connection,
+    control_plane_path,
+    sql_path_literal,
+)
+from drover.server.harness.schema import bootstrap_harness_tables
+
+log = logging.getLogger("drover.schema")
 
 PARQUET_SUBDIRS = (
     "agent_events",
@@ -35,8 +45,6 @@ EXPECTED_TABLES = (
     "tasks",
     "session_summaries",
     "summarize_jobs",
-    "live_session_recaps",
-    "live_recap_jobs",
     "project_briefs",
     "brief_jobs",
     "session_embeddings",
@@ -55,7 +63,12 @@ EXPECTED_TABLES = (
     "provider_connections",
     "advisory_findings",
     "advisory_occurrences",
-    *HARNESS_TABLES,
+    # `harness_*`, `live_recap_jobs` and `live_session_recaps` are deliberately
+    # absent: issue #95 moved them to the control-plane store, where they get a
+    # DuckDB instance the parquet scans cannot saturate. This tuple is what
+    # `drover-server status` counts against the lakehouse, so leaving them here
+    # would report an error on every healthy hub. `db.CONTROL_PLANE_TABLES` is
+    # the list for the other file.
 )
 EXPECTED_VIEWS = (
     "agent_events",
@@ -1424,6 +1437,109 @@ def _ensure_table_columns(
             con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}")
 
 
+def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
+    """Create the control plane's own database and its tables. Idempotent.
+
+    Issue #95. These tables used to be created inside ``drover.duckdb``, which
+    is what put every ``/harness*`` read on the same DuckDB instance -- one
+    scheduler, one buffer manager, one ``memory_limit`` -- as the parquet scans
+    that repeatedly wedged the hub.
+    """
+    registry_path = control_plane_path(duckdb_path)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with control_plane_connection(registry_path) as con:
+        con.execute(_LIVE_SESSION_RECAPS_DDL)
+        con.execute(_LIVE_RECAP_JOBS_DDL)
+        bootstrap_harness_tables(con)
+    return registry_path
+
+
+def migrate_control_plane_tables(
+    con: duckdb.DuckDBPyConnection, duckdb_path: Path
+) -> dict[str, int]:
+    """Copy pre-split control-plane rows into the control-plane store.
+
+    Runs on every start against a live fleet, so:
+
+    * **Idempotent.** Rows are inserted only where the primary key is absent
+      from the destination, so a second run copies nothing.
+    * **Never destructive.** The destination is authoritative once the first
+      run has completed -- an existing row is left exactly as it is, so a
+      restart cannot resurrect a stale ``status='running'`` over a session the
+      control plane has since completed.
+    * **Verified.** Every source key must exist in the destination afterwards
+      or the migration raises, rather than leaving a hub serving a fleet that
+      silently lost rows.
+    * **Non-lossy.** The pre-split tables are left in ``drover.duckdb``
+      untouched. They cost disk and nothing else, and they are what makes a
+      rollback of this change a restart instead of a data-recovery exercise --
+      #104 shipped for this issue and did not hold, so going backwards has to
+      stay cheap. ``attached_control_plane_snapshot`` shadows them so no reader
+      can answer from them in the meantime. A later cleanup drops them.
+
+    Copies from ``con`` (already open on the analytical store) into an attached
+    control-plane store, rather than the other way round: DuckDB will not let a
+    second instance in this process open a file this one already holds, and at
+    bootstrap time ``con`` is the only open handle.
+    """
+    registry_path = control_plane_path(duckdb_path)
+    legacy = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_type = 'BASE TABLE'"
+        ).fetchall()
+    } & set(CONTROL_PLANE_TABLES)
+    if not legacy:
+        return {}
+
+    alias = "drover_control_plane_migration"
+    try:
+        con.execute(f"ATTACH {sql_path_literal(registry_path)} AS {alias}")
+    except duckdb.Error as exc:
+        # Another process holds the control-plane store. Startup carries on --
+        # `bootstrap_harnessd_schema` sets the same precedent -- and the next
+        # start retries, because this is idempotent.
+        log.warning(
+            "control-plane migration deferred; %s is not attachable now (%s)",
+            registry_path,
+            exc,
+        )
+        return {}
+
+    copied: dict[str, int] = {}
+    try:
+        for table in CONTROL_PLANE_TABLES:
+            if table not in legacy:
+                continue
+            key = CONTROL_PLANE_PRIMARY_KEYS[table]
+            missing_sql = (
+                f"SELECT count(*) FROM main.{table} src "
+                f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+                f"WHERE dst.{key} = src.{key})"
+            )
+            pending = int(con.execute(missing_sql).fetchone()[0])
+            if pending:
+                con.execute(
+                    f"INSERT INTO {alias}.{table} BY NAME "
+                    f"SELECT src.* FROM main.{table} src "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+                    f"WHERE dst.{key} = src.{key})"
+                )
+                remaining = int(con.execute(missing_sql).fetchone()[0])
+                if remaining:
+                    raise RuntimeError(
+                        f"control-plane migration left {remaining} {table} row(s) "
+                        f"behind in {duckdb_path}"
+                    )
+            copied[table] = pending
+    finally:
+        con.execute(f"DETACH {alias}")
+    if any(copied.values()):
+        log.info("migrated control-plane rows into %s: %s", registry_path, copied)
+    return copied
+
+
 def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
     """Create directories, tables, and views.  Idempotent."""
     parquet_dir = Path(parquet_dir)
@@ -1441,8 +1557,6 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
-        con.execute(_LIVE_SESSION_RECAPS_DDL)
-        con.execute(_LIVE_RECAP_JOBS_DDL)
         con.execute(_PROJECT_BRIEFS_DDL)
         con.execute(_BRIEF_JOBS_DDL)
         _ensure_table_columns(con, "brief_jobs", _BRIEF_JOBS_COLUMNS)
@@ -1464,7 +1578,8 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PROVIDER_CONNECTIONS_DDL)
         con.execute(_ADVISORY_FINDINGS_DDL)
         con.execute(_ADVISORY_OCCURRENCES_DDL)
-        bootstrap_harness_tables(con)
+        bootstrap_control_plane_store(duckdb_path)
+        migrate_control_plane_tables(con, duckdb_path)
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))
         con.execute(_span_query_macros(parquet_dir))

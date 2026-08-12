@@ -36,14 +36,32 @@ cross-source relationships without rewriting the fact rows.
 
 ### 2. Operational State
 
-The command plane keeps mutable state in DuckDB:
+The command plane keeps mutable state in a **separate DuckDB database**,
+`drover.registry.duckdb`, beside the lakehouse file:
 
 | Table | Purpose |
 | --- | --- |
 | `harness_hosts` | Host identity, connection kind, capabilities, status, heartbeat |
 | `harness_sessions` | Running or completed session metadata and native resume identity |
 | `harness_events` | Ordered structured/terminal event envelope for a harness session |
-| `tasks` | Logical repository/task rollup across one or more sessions |
+| `live_recap_jobs` | Durable queue for incremental live session recaps |
+| `live_session_recaps` | Latest recap projection per live session |
+
+`tasks`, the logical repository/task rollup across one or more sessions, stays
+in the lakehouse file with the analytical tables.
+
+The separation is deliberate and load-bearing. A DuckDB database file is one
+in-process instance: one task scheduler, one buffer manager, and one
+`memory_limit` shared by every connection to it. While the command plane lived
+in the lakehouse file, any background scan over the parquet-backed views could
+saturate that instance and starve fleet endpoints, which is what repeatedly
+took `/harness*` from milliseconds to timeouts while `/healthz` stayed instant.
+Its own file gives it its own instance and its own budget.
+
+Analytical queries that need command-plane state - the advisory snapshot and
+the cockpit activity rollup - attach a private copy of that (small) database
+rather than the live file, for the same reason the quality snapshot copies the
+lakehouse.
 
 The host daemon remains authoritative for live processes. Registry rows describe
 and route those processes; they do not replace host-local process state.
@@ -111,8 +129,13 @@ DuckDB remains the durable source of job intent and results.
 │   ├── pr_events/part-*.parquet
 │   └── routing/part-*.parquet
 ├── raw_objects/
-└── drover.duckdb
+├── drover.duckdb
+└── drover.registry.duckdb
 ```
+
+`drover.registry.duckdb` is the command-plane store described above. Its
+location can be overridden with `DROVER_CONTROL_PLANE_DUCKDB`; by default it
+sits beside the lakehouse file and is named after it.
 
 `raw_objects/` stores large payloads referenced by URI rather than copied into
 every row. Keep the whole directory private; context may contain prompts,

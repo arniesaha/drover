@@ -17,7 +17,7 @@ from drover.server.cockpit.analytics import (
     AnalyticsFilters,
     activity_analytics,
 )
-from drover.server.db import open_duckdb_connection
+from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
 
 log = logging.getLogger("drover.cockpit")
 
@@ -236,9 +236,24 @@ class CockpitService:
                 else:
                     raise RuntimeError("activity store is unavailable")
                 outcome["connection"] = con
-                outcome["result"] = activity_analytics(
-                    con, filters, cursor_codec=self._cursor_codec
-                )
+                if owns_connection and self.duckdb_path is not None:
+                    # `harness_sessions` lives in the control-plane store since
+                    # #95. Attach a private copy so this query -- the one that
+                    # was in flight during the 2026-08-11 19:45 wedge -- keeps
+                    # correlating fleet sessions with span sessions without
+                    # reading anything the control plane is writing.
+                    #
+                    # Only for a connection this service opened itself: a
+                    # caller-supplied one is not necessarily on `duckdb_path`
+                    # and brings whatever control-plane tables it wants.
+                    with attached_control_plane_snapshot(con, self.duckdb_path):
+                        outcome["result"] = activity_analytics(
+                            con, filters, cursor_codec=self._cursor_codec
+                        )
+                else:
+                    outcome["result"] = activity_analytics(
+                        con, filters, cursor_codec=self._cursor_codec
+                    )
             except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
                 outcome["error"] = exc
             finally:

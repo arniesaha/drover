@@ -24,6 +24,7 @@ from drover.server.__main__ import (
     _summarizer_backend_available,
     main,
 )
+from drover.server.db import control_plane_path
 from drover.server.harness import cli as harness_cli
 from drover.server.harness.recap_jobs import enqueue_live_recap
 from drover.server.ledger import ArtifactSpec, Ledger
@@ -104,7 +105,8 @@ def _write_spans(parquet_dir: Path, rows: list[dict]) -> None:
 
 
 def _insert_legacy_sequence_events(db: Path, *, mixed: bool = False) -> None:
-    with duckdb.connect(str(db)) as con:
+    # `harness_events` lives in the control-plane store since #95.
+    with duckdb.connect(str(control_plane_path(db))) as con:
         con.executemany(
             "INSERT INTO harness_events "
             "(event_id, session_id, event_type, payload_json, created_at, seq) "
@@ -169,7 +171,7 @@ def test_harness_migrate_sequences_dry_run_reports_without_mutating(tmp_path):
         "mixed_sessions": 0,
         "null_event_count": 2,
     }
-    with duckdb.connect(str(db), read_only=True) as con:
+    with duckdb.connect(str(control_plane_path(db)), read_only=True) as con:
         assert con.execute(
             "SELECT count(*) FROM harness_events WHERE seq IS NULL"
         ).fetchone() == (2,)
@@ -192,7 +194,7 @@ def test_harness_migrate_sequences_apply_reports_exact_counts(tmp_path):
         "mixed_sessions": 0,
         "null_event_count": 2,
     }
-    with duckdb.connect(str(db), read_only=True) as con:
+    with duckdb.connect(str(control_plane_path(db)), read_only=True) as con:
         assert con.execute(
             "SELECT event_id, seq FROM harness_events "
             "WHERE session_id = 'private-legacy-session' ORDER BY seq"
@@ -219,7 +221,7 @@ def test_harness_audit_sequences_mixed_session_is_safe_nonzero_json(tmp_path):
     assert "private-legacy-session" not in result.output
     assert "private-mixed-session" not in result.output
     assert "must-not-leak" not in result.output
-    with duckdb.connect(str(db), read_only=True) as con:
+    with duckdb.connect(str(control_plane_path(db)), read_only=True) as con:
         assert con.execute(
             "SELECT count(*) FROM harness_events WHERE seq IS NULL"
         ).fetchone() == (3,)
@@ -277,7 +279,9 @@ def test_build_redis_job_streams_includes_live_recap(monkeypatch) -> None:
 
 def test_seed_redis_streams_publishes_live_recap_source_seq(tmp_path):
     db = seeded_server_db(tmp_path)
-    with duckdb.connect(str(db)) as con:
+    # The recap queue moved to the control-plane store in #95; seeding has to
+    # read it where the control plane keeps it.
+    with duckdb.connect(str(control_plane_path(db))) as con:
         enqueue_live_recap(con, "s1", 12)
     stream = RecordingJobStream()
     counts = _seed_redis_job_streams(duckdb_path=db, streams={"live_recap": stream})
