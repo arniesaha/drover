@@ -462,14 +462,19 @@ def test_send_does_not_swallow_other_final_write_errors():
         _MetricsHandler._send(handler, 200, "application/json", "{}")
 
 
-def test_send_does_not_swallow_disconnect_before_final_write():
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError("headers"), ConnectionResetError("headers")]
+)
+def test_send_treats_expected_header_disconnect_as_access_outcome(caplog, error):
     handler = _send_handler(
         writer=_FailingWriter(AssertionError("write must not run")),
-        end_headers=lambda: (_ for _ in ()).throw(BrokenPipeError("headers")),
+        end_headers=lambda: (_ for _ in ()).throw(error),
     )
 
-    with pytest.raises(BrokenPipeError, match="headers"):
+    with caplog.at_level(logging.INFO, logger="drover.metrics"):
         _MetricsHandler._send(handler, 200, "application/json", "{}")
+
+    assert "client disconnected while sending 2 bytes" in caplog.text
 
 
 def _json_request(url: str, *, payload: dict | None = None):
