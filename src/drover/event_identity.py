@@ -16,6 +16,7 @@ events.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import duckdb
@@ -96,8 +97,89 @@ def _relation_columns(con: duckdb.DuckDBPyConnection, relation: str) -> set[str]
     return {str(col[0]) for col in desc}
 
 
+#: Columns the shared pass carries. Between them they answer every
+#: whole-history metric the runtime audit reports: the row count, the distinct
+#: session-id set, and the duplicate ``id`` / ``dedup_key`` rollups.
+_SCAN_COLUMNS = ("id", "dedup_key", "session_id")
+
+
+@dataclass(frozen=True)
+class AgentEventScan:
+    """One materialised pass over the whole ``agent_events`` history.
+
+    ``agent_events`` is a view over a multi-thousand file parquet tree, so each
+    statement naming it without a ``date >=`` bound re-reads the entire tree.
+    Profiled against a 6,876-file / 2.23M-row store at ``threads=1``, the three
+    whole-history statements the audit issued cost 1.61s (row count), 2.37s
+    (session-set metrics) and 2.71s (duplicate identity) out of an 11.4s audit
+    -- while needing only three columns between them (#78).
+
+    ``relation`` names a temp table holding those three columns pre-aggregated
+    with a ``rows`` count, so consumers sum counts instead of counting rows.
+    """
+
+    relation: str
+    total_rows: int
+    has_id: bool
+    has_dedup_key: bool
+    has_session_id: bool
+
+    @property
+    def row_count_expr(self) -> str:
+        """Aggregate that yields a row count over the pre-aggregated pass."""
+        return "sum(rows)"
+
+
+def scan_agent_events_once(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    source: str = "agent_events",
+    name: str = "agent_event_scan",
+) -> AgentEventScan | None:
+    """Materialise the shared whole-history pass, or ``None`` if unavailable.
+
+    The temp table is connection-local: it never touches the database file, so
+    read-only audit semantics hold. Callers that get ``None`` -- an unreadable
+    relation, or a DuckDB that refused the pass -- must fall back to reading
+    ``source`` directly, which is what every consumer did before #78.
+    """
+    name = _validate_identifier(name, label="scan relation")
+    source = _validate_identifier(source, label="source relation")
+    columns = _relation_columns(con, source)
+    if columns is None:
+        return None
+    present = [column for column in _SCAN_COLUMNS if column in columns]
+    projection = ", ".join(present)
+    # GROUP BY collapses repeated key triples, which keeps the pass smaller
+    # than the source and hands the identity rollup its aggregation for free.
+    # With no key columns at all there is nothing to group and the pass
+    # degenerates to the row count the audit still needs.
+    body = (
+        f"SELECT {projection}, count(*) AS rows FROM {source} GROUP BY {projection}"
+        if present
+        else f"SELECT count(*) AS rows FROM {source}"
+    )
+    try:
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS {body}")
+        row = con.execute(f"SELECT COALESCE(sum(rows), 0) FROM {name}").fetchone()
+    except duckdb.Error:
+        return None
+    return AgentEventScan(
+        relation=name,
+        total_rows=int(row[0]) if row and row[0] is not None else 0,
+        has_id="id" in present,
+        has_dedup_key="dedup_key" in present,
+        has_session_id="session_id" in present,
+    )
+
+
 def _identity_metrics_sql(
-    *, has_id: bool, has_dedup_key: bool, example_limit: int
+    *,
+    has_id: bool,
+    has_dedup_key: bool,
+    example_limit: int,
+    source: str = "agent_events",
+    row_count: str = "count(*)",
 ) -> str:
     """Build the single-pass duplicate-identity query.
 
@@ -112,15 +194,19 @@ def _identity_metrics_sql(
     That also turns the per-id ``count(DISTINCT dedup_key)`` into a distinct
     count over an already-deduplicated relation, which was the single most
     expensive aggregate in the audit (see #78).
+
+    ``source`` and ``row_count`` let the same query run over the shared
+    ``AgentEventScan`` pass, where the rows are already grouped and a row count
+    is ``sum(rows)`` rather than ``count(*)``.
     """
     ctes: list[str] = []
     selects: list[str] = []
     paired = has_id and has_dedup_key
     if paired:
-        ctes.append("""
+        ctes.append(f"""
             identity_pairs AS MATERIALIZED (
-              SELECT id, dedup_key, count(*) AS rows
-              FROM agent_events
+              SELECT id, dedup_key, {row_count} AS rows
+              FROM {source}
               WHERE id IS NOT NULL OR dedup_key IS NOT NULL
               GROUP BY id, dedup_key
             )""")
@@ -135,13 +221,13 @@ def _identity_metrics_sql(
               HAVING sum(rows) > 1
             )""")
         else:
-            ctes.append("""
+            ctes.append(f"""
             duplicate_ids AS MATERIALIZED (
-              SELECT id, count(*) AS rows, 0 AS dedup_keys
-              FROM agent_events
+              SELECT id, {row_count} AS rows, 0 AS dedup_keys
+              FROM {source}
               WHERE id IS NOT NULL
               GROUP BY id
-              HAVING count(*) > 1
+              HAVING {row_count} > 1
             )""")
         selects.extend(
             [
@@ -178,13 +264,13 @@ def _identity_metrics_sql(
               HAVING sum(rows) > 1
             )""")
         else:
-            ctes.append("""
+            ctes.append(f"""
             duplicate_dedup_keys AS MATERIALIZED (
-              SELECT dedup_key, count(*) AS rows
-              FROM agent_events
+              SELECT dedup_key, {row_count} AS rows
+              FROM {source}
               WHERE dedup_key IS NOT NULL
               GROUP BY dedup_key
-              HAVING count(*) > 1
+              HAVING {row_count} > 1
             )""")
         selects.extend(
             [
@@ -206,7 +292,10 @@ def _identity_metrics_sql(
 
 
 def audit_agent_event_identity(
-    con: duckdb.DuckDBPyConnection, *, example_limit: int = 5
+    con: duckdb.DuckDBPyConnection,
+    *,
+    example_limit: int = 5,
+    scan: AgentEventScan | None = None,
 ) -> dict[str, Any]:
     """Return read-only duplicate identity metrics for ``agent_events``.
 
@@ -215,6 +304,10 @@ def audit_agent_event_identity(
     The report intentionally tracks both historical/source ``id`` collisions and
     canonical ``dedup_key`` collisions. Consumers that need logical event
     uniqueness should dedupe on ``dedup_key`` per ``EVENT_IDENTITY_SEMANTICS``.
+
+    Pass ``scan`` to read the caller's shared whole-history pass instead of
+    re-reading the parquet tree. The metrics are identical either way; the
+    pass is only a cheaper place to read the same three columns from.
     """
     report: dict[str, Any] = {
         "status": "ok",
@@ -228,20 +321,27 @@ def audit_agent_event_identity(
         "duplicate_id_examples": [],
     }
 
-    columns = _relation_columns(con, "agent_events")
-    if columns is None:
-        report["status"] = "missing"
-        report["error"] = "agent_events relation is not readable"
-        return report
+    if scan is not None:
+        source, row_count = scan.relation, scan.row_count_expr
+        has_id, has_dedup_key = scan.has_id, scan.has_dedup_key
+    else:
+        source, row_count = "agent_events", "count(*)"
+        columns = _relation_columns(con, source)
+        if columns is None:
+            report["status"] = "missing"
+            report["error"] = "agent_events relation is not readable"
+            return report
+        has_id = "id" in columns
+        has_dedup_key = "dedup_key" in columns
 
-    has_id = "id" in columns
-    has_dedup_key = "dedup_key" in columns
     try:
         row = con.execute(
             _identity_metrics_sql(
                 has_id=has_id,
                 has_dedup_key=has_dedup_key,
                 example_limit=max(0, int(example_limit)),
+                source=source,
+                row_count=row_count,
             )
         ).fetchone()
     except duckdb.Error as e:
