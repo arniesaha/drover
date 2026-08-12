@@ -58,7 +58,11 @@ from drover.server.context_catalog import (
     import_bundle,
     load_bundle,
 )
-from drover.server.db import open_duckdb_connection
+from drover.server.db import (
+    close_control_plane_connections,
+    open_duckdb_connection,
+    pin_control_plane_connection,
+)
 from drover.server.decisions import derive_decisions
 from drover.server.doctor import audit_lakehouse, format_runtime_audit, runtime_audit
 from drover.server.embeddings.client import EmbeddingBackendConfig
@@ -1350,6 +1354,12 @@ def run(
     """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
     cfg = _resolve_config(ctx.obj["config_path"])
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    # Before any worker starts, so if the pin is taken at all, the one moment
+    # the control plane touches the shared connect lock is a moment when
+    # nothing is scanning. Off by default -- it would hold DuckDB's file lock
+    # against a co-resident harnessd -- and db.py logs which way it went. The
+    # /harness* lock split in control_plane_connection applies regardless (#95).
+    pin_control_plane_connection(cfg.duckdb_path)
     stop = threading.Event()
 
     job_streams: dict[str, RedisJobStream] = {}
@@ -1744,6 +1754,10 @@ def run(
         if receiver is not None:
             receiver.stop()
         watcher.stop()
+        # Last, so nothing is still reading through it. A pin outlives every
+        # worker by design, and a restart would otherwise race the database
+        # lock against its own predecessor.
+        close_control_plane_connections()
 
 
 @main.command()

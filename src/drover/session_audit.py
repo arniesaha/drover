@@ -13,7 +13,7 @@ from typing import Any
 
 import duckdb
 
-from drover.event_identity import canonical_agent_events_cte
+from drover.event_identity import AgentEventScan, canonical_agent_events_cte
 
 LEGACY_SESSIONS_REMEDIATION = (
     "Back up the DuckDB file before making changes. The sessions relation is a "
@@ -48,7 +48,7 @@ def _safe_scalar(
 
 _SESSION_SET_SQL = """
 WITH event_sessions AS MATERIALIZED (
-  SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL
+  SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL
 ), summary_sessions AS MATERIALIZED (
   SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
 )
@@ -69,12 +69,12 @@ SELECT
 """
 
 _EVENT_SESSIONS_SQL = (
-    "SELECT count(DISTINCT session_id) FROM agent_events WHERE session_id IS NOT NULL"
+    "SELECT count(DISTINCT session_id) FROM {events} WHERE session_id IS NOT NULL"
 )
 
 _EVENT_SESSIONS_WITHOUT_SUMMARY_SQL = """
 SELECT count(*)
-FROM (SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL) e
+FROM (SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL) e
 LEFT JOIN (
   SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
 ) ss USING (session_id)
@@ -87,16 +87,16 @@ FROM (
   SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
 ) ss
 LEFT JOIN (
-  SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL
+  SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL
 ) e USING (session_id)
 WHERE e.session_id IS NULL
 """
 
 
 def _session_set_metrics(
-    con: duckdb.DuckDBPyConnection, *, warnings: list[str]
+    con: duckdb.DuckDBPyConnection, *, warnings: list[str], events: str
 ) -> tuple[int | None, int | None, int | None]:
-    """Return the three session-set metrics from a single ``agent_events`` scan.
+    """Return the three session-set metrics from a single ``events`` scan.
 
     These metrics all derive from the same two DISTINCT session-id sets. Asking
     for them separately meant three full scans of the ``agent_events`` parquet
@@ -105,21 +105,24 @@ def _session_set_metrics(
     partial results rather than losing all three.
     """
     try:
-        row = con.execute(_SESSION_SET_SQL).fetchone()
+        row = con.execute(_SESSION_SET_SQL.format(events=events)).fetchone()
     except duckdb.Error:
         return (
             _safe_scalar(
-                con, _EVENT_SESSIONS_SQL, warnings=warnings, label="event_sessions"
+                con,
+                _EVENT_SESSIONS_SQL.format(events=events),
+                warnings=warnings,
+                label="event_sessions",
             ),
             _safe_scalar(
                 con,
-                _EVENT_SESSIONS_WITHOUT_SUMMARY_SQL,
+                _EVENT_SESSIONS_WITHOUT_SUMMARY_SQL.format(events=events),
                 warnings=warnings,
                 label="event_sessions_without_summary",
             ),
             _safe_scalar(
                 con,
-                _SUMMARIES_WITHOUT_EVENTS_SQL,
+                _SUMMARIES_WITHOUT_EVENTS_SQL.format(events=events),
                 warnings=warnings,
                 label="summaries_without_events",
             ),
@@ -170,13 +173,24 @@ def audit_session_consistency(
     *,
     duckdb_path: Path | str | None = None,
     include_expensive_checks: bool = True,
+    scan: AgentEventScan | None = None,
 ) -> dict[str, Any]:
     """Return a read-only session/session-summary consistency report.
 
     The caller owns the DuckDB connection. All queries are ``SELECT`` metadata or
     count queries; this function intentionally performs no schema bootstrap,
     repair, backfill, DDL, or writes.
+
+    ``scan`` is the caller's shared whole-history pass over ``agent_events``
+    (see ``drover.event_identity``). When it carries ``session_id`` the
+    session-set queries read it instead of re-scanning the parquet tree; the
+    reported numbers are the same either way. ``event_count_mismatches`` still
+    reads ``agent_events`` because canonical dedupe ranks on columns the pass
+    does not carry.
     """
+    events = (
+        scan.relation if scan is not None and scan.has_session_id else "agent_events"
+    )
 
     warnings: list[str] = []
     report: dict[str, Any] = {
@@ -221,7 +235,7 @@ def audit_session_consistency(
         event_sessions,
         event_sessions_without_summary,
         summaries_without_events,
-    ) = _session_set_metrics(con, warnings=warnings)
+    ) = _session_set_metrics(con, warnings=warnings, events=events)
     report["event_sessions"] = event_sessions
     if include_expensive_checks:
         report["sessions_rows"] = _safe_scalar(
@@ -232,9 +246,9 @@ def audit_session_consistency(
         )
         report["event_sessions_missing_session_row"] = _safe_scalar(
             con,
-            """
+            f"""
             SELECT count(*)
-            FROM (SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL) e
+            FROM (SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL) e
             LEFT JOIN (SELECT DISTINCT session_id FROM sessions WHERE session_id IS NOT NULL) s
               USING (session_id)
             WHERE s.session_id IS NULL
@@ -244,10 +258,10 @@ def audit_session_consistency(
         )
         report["session_rows_without_events"] = _safe_scalar(
             con,
-            """
+            f"""
             SELECT count(*)
             FROM (SELECT DISTINCT session_id FROM sessions WHERE session_id IS NOT NULL) s
-            LEFT JOIN (SELECT DISTINCT session_id FROM agent_events WHERE session_id IS NOT NULL) e
+            LEFT JOIN (SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL) e
               USING (session_id)
             WHERE e.session_id IS NULL
             """,

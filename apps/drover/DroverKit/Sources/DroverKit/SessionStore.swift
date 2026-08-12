@@ -195,6 +195,17 @@ public final class SessionStore {
         SnapshotFreshness(lastUpdate: lastSuccessfulRefresh, isReachable: isReachable, now: now)
     }
 
+    /// Consecutive cancellations while nothing has ever loaded. Reset by a
+    /// success and by an honest failure, so it only ever counts an unbroken
+    /// run of first loads torn down before they landed.
+    private var cancelledFirstLoads = 0
+
+    /// How many of those it takes before the screen stops pretending it is
+    /// merely slow. Two is already the point at which `connectingDetail`
+    /// starts explaining itself; the third says there is nothing left to wait
+    /// for.
+    private static let cancelledFirstLoadLimit = 3
+
     /// The line the "Connecting…" screen shows once it has been sitting there
     /// long enough to owe an explanation.
     ///
@@ -218,6 +229,7 @@ public final class SessionStore {
             isReachable = true
             hasLoadedOnce = true
             refreshAttempts = 0
+            cancelledFirstLoads = 0
             lastRefreshOutcome = nil
             lastSuccessfulRefresh = Date()
         } catch {
@@ -229,19 +241,45 @@ public final class SessionStore {
             // It is still recorded. Returning without a trace is what made a
             // load stuck behind repeated cancellations indistinguishable from
             // an unreachable hub, and left "Connecting…" with nothing to say.
-            if let droverError = error as? DroverError, droverError.isCancellation {
-                lastRefreshOutcome = "request cancelled"
+            if Self.isCancellation(error) {
+                lastRefreshOutcome = Self.cancelledOutcome
+                noteCancelledFirstLoad()
                 return
             }
-            if (error as? URLError)?.code == .cancelled {
-                lastRefreshOutcome = "request cancelled"
-                return
-            }
+            cancelledFirstLoads = 0
             isReachable = false
             lastError = Self.errorMessage(for: error)
             lastRefreshOutcome = lastError
             // Deliberately keep the cached `snapshot` as-is.
         }
+    }
+
+    /// A first load lost to cancellation, again.
+    ///
+    /// Passing in silence is right for a *single* superseded poll and stays
+    /// that way — over a fleet that has already loaded it is right every time.
+    /// But before anything has landed, silence renders as an eternal spinner
+    /// with no retry and no explanation, which self-heals only by luck (#85):
+    /// a `/harness` taking seconds instead of milliseconds (#95) gives every
+    /// scene-phase change a wide window to cancel in, and each cancellation
+    /// looks exactly like the last.
+    ///
+    /// So an unbroken run of them stops being treated as a slow start and
+    /// becomes what it already is in practice — a failure the user can retry.
+    /// This is the existing unreachable presentation, not a new one.
+    private func noteCancelledFirstLoad() {
+        guard !hasLoadedOnce else { return }
+        cancelledFirstLoads += 1
+        guard cancelledFirstLoads >= Self.cancelledFirstLoadLimit else { return }
+        isReachable = false
+        lastError = "The first load kept being interrupted before it landed — the hub may be busy."
+    }
+
+    private static let cancelledOutcome = "request cancelled"
+
+    private nonisolated static func isCancellation(_ error: Error) -> Bool {
+        if let droverError = error as? DroverError { return droverError.isCancellation }
+        return (error as? URLError)?.code == .cancelled
     }
 
     // MARK: - Handoff
@@ -272,23 +310,54 @@ public final class SessionStore {
 
     // MARK: - Polling
 
+    /// Starts the poll loop, or leaves a running one exactly as it is.
+    ///
+    /// This used to call `stopPolling()` first, which cancels the in-flight
+    /// request — and `SessionsView` calls it from both `.task` and the
+    /// scene-phase change, so an ordinary launch could cancel its own first
+    /// load and render "Connecting…" over a healthy fleet (#85). Re-entry has
+    /// nothing to do when a loop is already polling, so it now does nothing.
+    /// Backgrounding still calls `stopPolling()`, which clears the task, so
+    /// the foreground event that follows genuinely restarts the loop.
     public func startPolling(every seconds: Double = 5) {
-        stopPolling()
+        guard pollingTask == nil else { return }
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 // Belt two: if the store is gone, exit instead of spinning
                 // forever as an empty loop. The `do` scope releases the
                 // strong reference before the sleep so the loop never keeps
                 // a dropped store alive across a poll interval.
+                var delay = seconds
                 do {
                     guard let self else { return }
                     await self.refresh()
+                    delay = self.pollDelay(base: seconds)
                 }
                 guard !Task.isCancelled else { return }
-                try? await Task.sleep(for: .seconds(seconds))
+                try? await Task.sleep(for: .seconds(delay))
             }
         }
     }
+
+    /// How long to wait before the next poll.
+    ///
+    /// A cancellation before anything has ever loaded retries almost at once
+    /// rather than sleeping out the interval: the whole point of the first
+    /// load is that there is nothing on screen until it lands, and making a
+    /// torn-down attempt cost five seconds is what let a burst of launch-time
+    /// churn starve it (#85). Everything else — a success, an honest failure
+    /// — keeps the ordinary cadence.
+    ///
+    /// It also stops once the screen has given up (`lastError` is set): from
+    /// there the user has a Retry button, and a hub slow enough to widen the
+    /// cancellation window (#95) is the last thing that should be polled four
+    /// times a second forever.
+    private func pollDelay(base seconds: Double) -> Double {
+        guard !hasLoadedOnce, cancelledFirstLoads > 0, lastError == nil else { return seconds }
+        return min(Self.cancelledFirstLoadRetry, seconds)
+    }
+
+    private static let cancelledFirstLoadRetry = 0.25
 
     public func stopPolling() {
         pollingTask?.cancel()

@@ -538,6 +538,11 @@ public enum MessageType: String, Sendable, Equatable {
     case toolResult = "tool_result"
     case approvalPrompt = "approval_prompt"
     case approvalResponse = "approval_response"
+    /// A hole in the transcript, marked in band. The hub writes these when a
+    /// durable event write is permanently lost; `MessageStream` synthesizes
+    /// them for events that never reached the hub at all (#99). Either way the
+    /// row says the same thing: content is missing here.
+    case transcriptGap = "transcript.gap"
     case status, error, raw
     case unknown  // any unrecognized wire string decodes to this
 
@@ -598,10 +603,10 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         displayBlocks = DisplayBlock.segment(text)
     }
 
-    /// Test-only direct construction, bypassing JSON decoding entirely. Not
-    /// `public` — reachable only via `@testable import DroverKit` from this
-    /// package's own test targets (see `HarnessMessage.fixture` in test
-    /// support).
+    /// Direct construction, bypassing JSON decoding entirely. Not `public` —
+    /// reachable only from within DroverKit (`transcriptGap` below) and, via
+    /// `@testable import DroverKit`, from this package's own test targets (see
+    /// `HarnessMessage.fixture` in test support).
     init(
         id: String = UUID().uuidString,
         seq: Int,
@@ -622,6 +627,24 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         self.payload = payload
         self.displayText = Self.parseDisplayText(text)
         self.displayBlocks = DisplayBlock.segment(text)
+    }
+
+    /// A marker row standing in for sequences `from...through`, which the
+    /// stream has concluded will never arrive. It takes the first missing
+    /// sequence as its own so it sorts into place and merges like any other
+    /// message — the sequence is genuinely unused, so nothing is displaced.
+    static func transcriptGap(from: Int, through: Int) -> HarnessMessage {
+        let count = max(1, through - from + 1)
+        return HarnessMessage(
+            id: "transcript-gap-\(from)-\(through)",
+            seq: from,
+            type: .transcriptGap,
+            role: "system",
+            text: count == 1
+                ? "1 message is missing from this transcript"
+                : "\(count) messages are missing from this transcript",
+            payload: ["missing": .number(Double(count))]
+        )
     }
 }
 

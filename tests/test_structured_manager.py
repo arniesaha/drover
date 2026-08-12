@@ -113,6 +113,50 @@ def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
     return mgr, driver_holder["driver"], registry, on_messages, finalized
 
 
+def test_exit_entry_is_gone_before_its_event_is_recorded(monkeypatch, tmp_path):
+    """A completed driver must not be listed as live at the moment its exit
+    event lands. That event is what makes the session look finished to
+    everything else -- recovery reads the registry and then asks the manager
+    (_recover_structured_session's is_alive/has checks) -- so an entry still
+    present then is precisely the dead entry recovery can mistake for an
+    idempotently recovered session. Discarding after the write left that
+    window open for the whole duration of a registry write, which is what
+    made test_two_concurrent_structured_sessions_do_not_corrupt_registry fail
+    under load."""
+    mgr, driver, registry, _on_messages, finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    live_at_write: list[bool] = []
+    real_append_event = registry.append_event
+
+    def spy(**kwargs):
+        live_at_write.append(mgr.has("sess-1"))
+        return real_append_event(**kwargs)
+
+    monkeypatch.setattr(registry, "append_event", spy)
+
+    driver.emit(
+        StructuredMessage(
+            type="status", role="system", text="still running", payload={}
+        )
+    )
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="process exited",
+            payload={"exited": 0},
+            turn_id=None,
+        )
+    )
+
+    # Live while running; already gone when the exit event is written.
+    assert live_at_write == [True, False]
+    assert not mgr.has("sess-1")
+    assert finalized == [("sess-1", 0)]
+
+
 def test_finalize_only_triggers_on_turn_id_none_exit(monkeypatch, tmp_path):
     mgr, driver, registry, _on_messages, finalized = _build_manager(
         monkeypatch, tmp_path

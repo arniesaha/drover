@@ -454,9 +454,15 @@ def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> N
 
 
 def _append_harness_metrics(lines: list[str]) -> None:
-    # Non-zero means registry writes failed permanently and transcript
-    # content was lost. Gaps are marked in-band with transcript.gap events.
-    from drover.server.harness.daemon import dropped_event_count
+    # Two distinct losses, deliberately counted apart. The first is a local
+    # registry write that failed permanently; the second is an event this host
+    # recorded fine but could never hand to the hub, which the first counter
+    # can by definition never see (#99). Gaps are marked in-band with
+    # transcript.gap events.
+    from drover.server.harness.daemon import (
+        dropped_event_count,
+        undelivered_event_count,
+    )
 
     lines.extend(
         [
@@ -464,6 +470,10 @@ def _append_harness_metrics(lines: list[str]) -> None:
             "Harness events permanently lost after write retries.",
             "# TYPE drover_harness_dropped_events_total counter",
             f"drover_harness_dropped_events_total {dropped_event_count()}",
+            "# HELP drover_harness_undelivered_events_total "
+            "Harness events the pusher could never deliver to the hub.",
+            "# TYPE drover_harness_undelivered_events_total counter",
+            f"drover_harness_undelivered_events_total {undelivered_event_count()}",
         ]
     )
 
