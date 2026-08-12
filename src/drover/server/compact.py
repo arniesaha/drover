@@ -44,11 +44,11 @@ def compact_partition(
         return CompactResult(files_before=1, files_after=1, rows=rows)
 
     # Read each file via ParquetFile (avoids the dataset auto-merge that
-    # chokes on string-vs-dictionary inconsistencies). Cast every result
+    # chokes on string-vs-dictionary inconsistencies). Conform every result
     # to a unified non-dictionary schema before concat.
     tables = [pq.ParquetFile(f).read() for f in files]
     target_schema = _unify_schema([t.schema for t in tables])
-    normalized = [t.cast(target_schema) for t in tables]
+    normalized = [_conform(t, target_schema) for t in tables]
     combined = pa.concat_tables(normalized)
 
     if dedup_column and dedup_column in combined.schema.names:
@@ -83,8 +83,34 @@ def _unify_schema(schemas: list[pa.Schema]) -> pa.Schema:
             t = f.type
             if pa.types.is_dictionary(t):
                 t = t.value_type
-            fields.setdefault(f.name, t)
+            known = fields.get(f.name)
+            # A column that happened to be entirely NULL when a file was
+            # written is stored as type `null`. Keeping the first type seen
+            # would then pin the union to `null` and every real value in a
+            # later file would fail to cast into it, so a concrete type always
+            # wins over `null` regardless of which file we met first.
+            if known is None or (pa.types.is_null(known) and not pa.types.is_null(t)):
+                fields[f.name] = t
     return pa.schema([pa.field(name, t) for name, t in fields.items()])
+
+
+def _conform(table: pa.Table, target: pa.Schema) -> pa.Table:
+    """Reshape ``table`` to exactly ``target``, filling absent columns with NULL.
+
+    ``Table.cast`` only retypes columns a table already has: it rejects a
+    target whose field *names* differ at all. Schemas here evolve -- `spans`
+    gained ``agent_model``, ``associated_with`` and ``stop_reason`` part-way
+    through, so a partition can hold files written on either side of that --
+    and compaction used to die on the first such partition. Rows written
+    before a column existed read back as NULL, which is what they mean.
+    """
+    columns = []
+    for field in target:
+        if field.name in table.schema.names:
+            columns.append(table.column(field.name).cast(field.type))
+        else:
+            columns.append(pa.nulls(table.num_rows, type=field.type))
+    return pa.Table.from_arrays(columns, schema=target)
 
 
 def _dedup(table: pa.Table, key_col: str) -> pa.Table:
