@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -13,6 +13,8 @@ import secrets
 from typing import Any, Literal
 
 import duckdb
+
+from drover.event_identity import canonical_agent_events_cte
 
 _MAX_DAYS = 365
 _MAX_BREAKDOWNS = 100
@@ -242,7 +244,9 @@ def _materialized_session_facts(
 ):
     """Yield one connection-scoped copy of the normalized request facts."""
     relation = f"analytics_session_facts_{secrets.token_hex(8)}"
-    base_sql, params = _session_facts_sql(filters, snapshot_at)
+    span_dates = _span_partition_dates(con, filters, snapshot_at)
+    event_dates = _agent_event_partition_dates(con, filters, snapshot_at, span_dates)
+    base_sql, params = _session_facts_sql(filters, snapshot_at, span_dates, event_dates)
     con.execute(
         f"CREATE TEMP TABLE {relation} AS {base_sql} SELECT * FROM filtered_sessions",
         params,
@@ -256,6 +260,62 @@ def _materialized_session_facts(
             # Preserve the query failure that caused cleanup to run. A failed
             # transaction removes the request-scoped table when it rolls back.
             pass
+
+
+def _span_partition_dates(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    snapshot_at: datetime,
+) -> tuple[str, ...]:
+    """Return only span partitions that contain activity in this window.
+
+    ``span_partition_activity`` is refreshed at bootstrap and ingestion, so a
+    request retains long-running spans without inspecting old Parquet files.
+    """
+    rows = con.execute(
+        """
+        WITH bounds AS (
+          SELECT CAST(? AS TIMESTAMPTZ)
+                 - CAST(? AS INTEGER) * INTERVAL '1 day' AS cutoff
+        )
+        SELECT date
+        FROM span_partition_activity, bounds
+        WHERE latest_activity_at >= bounds.cutoff
+        ORDER BY date
+        """,
+        [snapshot_at, filters.days],
+    ).fetchall()
+    return tuple(str(row[0]) for row in rows)
+
+
+def _agent_event_partition_dates(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    snapshot_at: datetime,
+    span_dates: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return agent-event partitions that can contribute to this window.
+
+    Recent dates reconstruct event-only sessions. Adjacent dates preserve the
+    established cross-midnight repo attribution for every included span. The
+    inventory reads file paths only, so no global Parquet relation is bound.
+    """
+    available = {str(row[0]) for row in con.execute("""
+            SELECT date
+            FROM agent_event_partitions
+            WHERE date IS NOT NULL AND date <> '_seed'
+            """).fetchall()}
+    cutoff_date = (snapshot_at - timedelta(days=filters.days + 1)).date()
+    needed = {value for value in available if value >= cutoff_date.isoformat()}
+    for value in span_dates:
+        try:
+            span_date = date.fromisoformat(value)
+        except ValueError:
+            continue
+        needed.update(
+            (span_date + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1)
+        )
+    return tuple(sorted(available & needed))
 
 
 def _activity_analytics_from_facts(
@@ -367,10 +427,39 @@ def _activity_analytics_from_facts(
 
 
 def _session_facts_sql(
-    filters: AnalyticsFilters, snapshot_at: datetime
+    filters: AnalyticsFilters,
+    snapshot_at: datetime,
+    span_dates: tuple[str, ...],
+    event_dates: tuple[str, ...],
 ) -> tuple[str, list[Any]]:
     where: list[str] = []
     params: list[Any] = [snapshot_at, filters.days]
+    if event_dates:
+        event_source = "\nUNION ALL BY NAME\n".join(
+            "SELECT * FROM agent_events_for_date(?)" for _ in event_dates
+        )
+        params.extend(event_dates)
+    else:
+        event_source = """
+          SELECT
+            NULL::VARCHAR AS id,
+            NULL::VARCHAR AS dedup_key,
+            NULL::VARCHAR AS session_id,
+            NULL::VARCHAR AS agent_id,
+            NULL::TIMESTAMPTZ AS timestamp,
+            NULL::VARCHAR AS repo_owner,
+            NULL::VARCHAR AS repo_name,
+            NULL::VARCHAR AS branch,
+            NULL::VARCHAR AS date
+          WHERE FALSE
+        """
+    if span_dates:
+        span_source = "\nUNION ALL BY NAME\n".join(
+            "SELECT * FROM spans_for_date(?)" for _ in span_dates
+        )
+        params.extend(span_dates)
+    else:
+        span_source = "SELECT * FROM spans_for_date('_seed')"
     for column, value in (
         ("host_id", filters.host_id),
         ("harness", filters.harness),
@@ -387,6 +476,88 @@ def _session_facts_sql(
         WITH bounds AS (
           SELECT CAST(? AS TIMESTAMPTZ)
                  - CAST(? AS INTEGER) * INTERVAL '1 day' AS cutoff
+        ),
+        bounded_agent_events AS (
+          {event_source}
+        ),
+        {canonical_agent_events_cte(source="bounded_agent_events")},
+        session_base AS (
+          SELECT
+            session_id,
+            min(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS started_at,
+            max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS ended_at
+          FROM canonical_agent_events, bounds
+          WHERE session_id IS NOT NULL
+            AND TRY_CAST(timestamp AS TIMESTAMPTZ) >= bounds.cutoff
+          GROUP BY session_id
+        ),
+        bounded_spans AS (
+          {span_source}
+        ),
+        span_session_days AS (
+          SELECT DISTINCT session_id, date
+          FROM bounded_spans
+          WHERE session_id IS NOT NULL AND date IS NOT NULL
+        ),
+        span_agent_days AS (
+          SELECT DISTINCT agent_id, date
+          FROM bounded_spans
+          WHERE agent_id IS NOT NULL AND date IS NOT NULL
+        ),
+        session_repos AS (
+          SELECT session_id, date, repo_owner, repo_name
+          FROM (
+            SELECT sd.session_id,
+                   sd.date,
+                   ae.repo_owner,
+                   ae.repo_name,
+                   row_number() OVER (
+                     PARTITION BY sd.session_id, sd.date
+                     ORDER BY count(*) DESC, ae.repo_owner, ae.repo_name
+                   ) AS rn
+            FROM span_session_days sd
+            JOIN canonical_agent_events ae
+              ON ae.session_id = sd.session_id
+             AND ae.date BETWEEN strftime(
+                   TRY_CAST(sd.date AS DATE) - INTERVAL '1 day', '%Y-%m-%d'
+                 )
+                 AND strftime(
+                   TRY_CAST(sd.date AS DATE) + INTERVAL '1 day', '%Y-%m-%d'
+                 )
+            WHERE ae.repo_owner IS NOT NULL
+            GROUP BY sd.session_id, sd.date, ae.repo_owner, ae.repo_name
+          )
+          WHERE rn = 1
+        ),
+        agent_day_repos AS (
+          SELECT agent_id, date, repo_owner, repo_name
+          FROM (
+            SELECT sad.agent_id,
+                   sad.date,
+                   ae.repo_owner,
+                   ae.repo_name,
+                   row_number() OVER (
+                     PARTITION BY sad.agent_id, sad.date
+                     ORDER BY count(*) DESC, ae.repo_owner, ae.repo_name
+                   ) AS rn
+            FROM span_agent_days sad
+            JOIN canonical_agent_events ae
+              ON ae.agent_id = sad.agent_id AND ae.date = sad.date
+            WHERE ae.repo_owner IS NOT NULL
+            GROUP BY sad.agent_id, sad.date, ae.repo_owner, ae.repo_name
+          )
+          WHERE rn = 1
+        ),
+        enriched_spans AS (
+          SELECT
+            s.* EXCLUDE (repo_owner, repo_name),
+            COALESCE(s.repo_owner, sr.repo_owner, adr.repo_owner) AS repo_owner,
+            COALESCE(s.repo_name, sr.repo_name, adr.repo_name) AS repo_name
+          FROM bounded_spans s
+          LEFT JOIN session_repos sr
+            ON s.session_id = sr.session_id AND s.date = sr.date
+          LEFT JOIN agent_day_repos adr
+            ON s.agent_id = adr.agent_id AND s.date = adr.date
         ),
         span_sessions AS (
           SELECT
@@ -426,18 +597,11 @@ def _session_facts_sql(
               cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
             ) AS has_cache,
             bool_or(duration_ms IS NOT NULL) AS has_latency
-          FROM spans_enriched, bounds
+          FROM enriched_spans, bounds
           WHERE session_id IS NOT NULL
             AND COALESCE(GREATEST(end_time, start_time), end_time, start_time)
                 >= bounds.cutoff
           GROUP BY session_id
-        ),
-        session_base AS (
-          SELECT s.*
-          FROM sessions s, bounds
-          WHERE COALESCE(
-              GREATEST(s.ended_at, s.started_at), s.ended_at, s.started_at
-            ) >= bounds.cutoff
         ),
         harness_base AS (
           SELECT hs.*

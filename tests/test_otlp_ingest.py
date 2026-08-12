@@ -174,6 +174,13 @@ def test_ingest_partitions_by_date(tmp_path: Path) -> None:
     # _seed plus two real date partitions
     assert "date=2024-05-08" in date_dirs
     assert "date=2024-05-09" in date_dirs
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT date FROM span_partition_activity ORDER BY date"
+        ).fetchall() == [("2024-05-08",), ("2024-05-09",)]
+    finally:
+        con.close()
 
 
 def test_ingest_upserts_tasks(tmp_path: Path) -> None:

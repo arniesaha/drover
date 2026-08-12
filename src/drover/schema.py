@@ -63,6 +63,7 @@ EXPECTED_TABLES = (
     "provider_connections",
     "advisory_findings",
     "advisory_occurrences",
+    "span_partition_activity",
     # `harness_*`, `live_recap_jobs` and `live_session_recaps` are deliberately
     # absent: issue #95 moved them to the control-plane store, where they get a
     # DuckDB instance the parquet scans cannot saturate. This tuple is what
@@ -98,6 +99,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   last_activity_at  TIMESTAMP,
   session_count     INTEGER,
   total_cost_usd    DOUBLE
+);
+"""
+
+_SPAN_PARTITION_ACTIVITY_DDL = """
+CREATE TABLE IF NOT EXISTS span_partition_activity (
+  date VARCHAR PRIMARY KEY,
+  latest_activity_at TIMESTAMPTZ NOT NULL
 );
 """
 
@@ -794,6 +802,14 @@ def _span_query_macros(parquet_dir: Path) -> str:
     """
     span_attr_select = _span_attr_select()
     return f"""
+CREATE OR REPLACE VIEW span_partitions AS
+SELECT DISTINCT regexp_extract(file, '/date=([^/]+)/', 1) AS date
+FROM glob('{parquet_dir}/spans/date=*/*.parquet');
+
+CREATE OR REPLACE VIEW agent_event_partitions AS
+SELECT DISTINCT regexp_extract(file, '/date=([^/]+)/', 1) AS date
+FROM glob('{parquet_dir}/agent_events/date=*/agent_id=*/*.parquet');
+
 CREATE OR REPLACE MACRO spans_for_date(partition_date) AS TABLE
 WITH raw_spans AS (
   SELECT *
@@ -876,6 +892,28 @@ LEFT JOIN agent_day_repos adr
   ON adr.agent_id = s.agent_id
  AND adr.date     = s.date;
 """
+
+
+def _refresh_span_partition_activity(con: duckdb.DuckDBPyConnection) -> None:
+    """Refresh the small request-time index of span partition activity."""
+    con.execute("""
+        DELETE FROM span_partition_activity
+        WHERE date NOT IN (
+          SELECT date FROM span_partitions WHERE date <> '_seed'
+        )
+        """)
+    con.execute("""
+        INSERT INTO span_partition_activity BY NAME
+        SELECT
+          date,
+          max(COALESCE(GREATEST(end_time, start_time), end_time, start_time))
+            AS latest_activity_at
+        FROM spans
+        WHERE date IS NOT NULL AND date <> '_seed'
+        GROUP BY date
+        ON CONFLICT (date) DO UPDATE SET
+          latest_activity_at = EXCLUDED.latest_activity_at
+        """)
 
 
 def _pr_events_view(parquet_dir: Path) -> str:
@@ -1559,6 +1597,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
     con = duckdb.connect(str(duckdb_path))
     try:
         con.execute(_TASKS_DDL)
+        con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
@@ -1588,6 +1627,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))
         con.execute(_span_query_macros(parquet_dir))
+        _refresh_span_partition_activity(con)
         con.execute(_SESSION_LINKS_VIEW)
         con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
         con.execute(_pr_events_view(parquet_dir))
