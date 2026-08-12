@@ -782,7 +782,17 @@ SELECT
   COALESCE(s.routing_reason, {_json_first_attr('s', 'prov.routing.reason', 'mux.reason', 'mux.fallback_reason')}) AS routing_reason,
   COALESCE(s.redaction_level, {_json_first_attr('s', 'redaction.level')}) AS redaction_level,
   COALESCE(s.sensitivity, {_json_first_attr('s', 'sensitivity', 'redaction.sensitivity')}) AS sensitivity,
-  COALESCE(s.cost_usd, TRY_CAST({_json_first_attr('s', 'cost.usd')} AS DOUBLE)) AS cost_usd,
+  CASE
+    WHEN COALESCE(
+      s.cost_usd,
+      TRY_CAST({_json_first_attr('s', 'cost.usd')} AS DOUBLE)
+    ) >= 0
+    THEN COALESCE(
+      s.cost_usd,
+      TRY_CAST({_json_first_attr('s', 'cost.usd')} AS DOUBLE)
+    )
+    ELSE NULL
+  END AS cost_usd,
   COALESCE(s.prompt_tokens, TRY_CAST({_json_first_attr('s', 'prov.llm.prompt_tokens')} AS BIGINT)) AS prompt_tokens,
   COALESCE(s.completion_tokens, TRY_CAST({_json_first_attr('s', 'prov.llm.completion_tokens')} AS BIGINT)) AS completion_tokens,
   COALESCE(s.total_tokens, TRY_CAST({_json_first_attr('s', 'prov.llm.total_tokens')} AS BIGINT)) AS total_tokens,

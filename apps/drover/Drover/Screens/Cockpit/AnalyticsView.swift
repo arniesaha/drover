@@ -161,7 +161,10 @@ struct AnalyticsView: View {
                         alignment: .leading,
                         spacing: 12
                     ) {
-                        analyticsMetric(format(activity.totals.sessionCount), "Sessions")
+                        analyticsMetric(
+                            format(activity.totals.sessionCount),
+                            "Observed sessions"
+                        )
                         analyticsMetric(format(activity.totals.totalTokens), "Tokens")
                         analyticsMetric(currency(activity.totals.costUSD), "API cost")
                     }

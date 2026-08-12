@@ -127,6 +127,49 @@ def test_spans_view_derives_repo_from_safe_agentweave_cwd_attr(tmp_path: Path) -
     assert row == ("OpenClaw", None, None)
 
 
+def test_spans_view_treats_negative_cost_sentinel_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    when = datetime(2026, 5, 12, 10, 0, tzinfo=timezone.utc)
+    _write_span(
+        parquet_dir,
+        trace_id="trace-negative-cost",
+        span_id="span-negative-cost",
+        parent_span_id=None,
+        name="llm.claude-opus-5",
+        service_name="agentweave-proxy",
+        start_time=when,
+        end_time=when,
+        duration_ms=1.0,
+        session_id="session-negative-cost",
+        task_id=None,
+        agent_id="nas-claude",
+        cost_usd=-1.0,
+        attributes_json=json.dumps({"cost.usd": -1.0}),
+        dedup_key="span-negative-cost",
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    con = duckdb.connect(str(duckdb_path), read_only=True)
+    try:
+        normalized = con.execute(
+            "SELECT cost_usd FROM spans WHERE span_id='span-negative-cost'"
+        ).fetchone()
+        raw = con.execute(
+            """
+            SELECT cost_usd
+            FROM read_parquet(?, hive_partitioning=true, union_by_name=true)
+            WHERE span_id='span-negative-cost'
+            """,
+            [str(parquet_dir / "spans" / "date=*" / "*.parquet")],
+        ).fetchone()
+    finally:
+        con.close()
+
+    assert raw == (-1.0,)
+    assert normalized == (None,)
+
+
 def test_span_inherits_repo_from_same_agent_same_day(tmp_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     when = datetime(2026, 5, 12, 10, 0, tzinfo=timezone.utc)

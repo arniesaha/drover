@@ -485,7 +485,10 @@ def _session_facts_sql(
           SELECT
             session_id,
             min(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS started_at,
-            max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS ended_at
+            max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS ended_at,
+            mode(repo_owner || '/' || repo_name) FILTER (
+              WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
+            ) AS project_key
           FROM canonical_agent_events, bounds
           WHERE session_id IS NOT NULL
             AND TRY_CAST(timestamp AS TIMESTAMPTZ) >= bounds.cutoff
@@ -635,6 +638,7 @@ def _session_facts_sql(
             COALESCE(ss.model, hs.model) AS model,
             COALESCE(
               ss.project_key,
+              sb.project_key,
               CASE
                 WHEN hs.repo_owner IS NOT NULL AND hs.repo_name IS NOT NULL
                   THEN hs.repo_owner || '/' || hs.repo_name
@@ -681,7 +685,7 @@ def _session_facts_sql(
               GREATEST(s.ended_at, s.started_at), s.ended_at, s.started_at
             ) AS latest_activity_at,
             NULL AS host_id, NULL AS harness,
-            NULL AS provider, NULL AS model, NULL AS project_key,
+            NULL AS provider, NULL AS model, s.project_key,
             NULL AS total_tokens, NULL AS cost_usd,
             NULL AS cache_read_tokens, NULL AS cache_write_tokens,
             NULL AS total_latency_ms, FALSE AS has_tokens, FALSE AS has_cost,

@@ -455,6 +455,37 @@ def test_analytics_preserves_cross_midnight_session_attribution():
     assert [project.project_key for project in result.projects] == ["event/project"]
 
 
+def test_analytics_attributes_event_only_sessions_to_their_repository():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    con.execute(
+        """
+        INSERT INTO sessions VALUES (
+          'event-only', 'macmini-claude', NULL, ?, ?,
+          'arniesaha', 'drover', 'main'
+        )
+        """,
+        [now, now],
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+        filtered = activity_analytics(
+            con,
+            AnalyticsFilters(days=7, project_key="arniesaha/drover"),
+        )
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 1
+    assert [
+        (project.project_key, project.session_count) for project in result.projects
+    ] == [("arniesaha/drover", 1)]
+    assert filtered.totals.session_count == 1
+    assert [project.project_key for project in filtered.projects] == [
+        "arniesaha/drover"
+    ]
+
+
 def test_analytics_removes_materialized_session_facts_after_failure(
     low_coverage_analytics_db, monkeypatch
 ):
