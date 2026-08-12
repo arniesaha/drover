@@ -4620,6 +4620,177 @@ def test_quality_and_observatory_snapshots_read_an_isolated_copy(tmp_path, monke
         assert path.name == live.name, "copy should keep the database filename"
 
 
+def test_copy_backed_snapshots_use_the_parallel_snapshot_role(tmp_path, monkeypatch):
+    """The isolated copy is the only reader allowed extra DuckDB threads.
+
+    ``threads`` is instance-wide, so it can only be raised safely on a
+    connection that owns its instance. These two do -- they read a private
+    tempdir copy -- and at threads=1 they were the whole /metrics bill (#78).
+    """
+    collector = _make_collector(tmp_path)
+    roles: list[str] = []
+
+    def fake_quality(*, duckdb_path, role="diagnostic", **kwargs):
+        roles.append(role)
+        return {"runtime_audit": {}}
+
+    def fake_observatory(*, duckdb_path, role="diagnostic", **kwargs):
+        roles.append(role)
+        return {}
+
+    monkeypatch.setattr(metrics, "quality_snapshot", fake_quality)
+    monkeypatch.setattr(metrics, "pipeline_observatory_snapshot", fake_observatory)
+
+    quality = collector._quality_snapshot()
+    collector._observatory_snapshot(quality)
+
+    assert roles == ["snapshot", "snapshot"]
+
+
+def test_live_database_metrics_stay_on_the_single_threaded_role(tmp_path, monkeypatch):
+    """Everything in the same refresh that reads the *live* file keeps
+    threads=1. Those connections share the hub's DuckDB instance, and that is
+    the sharing that caused the 2026-08-04 outage (#91)."""
+    collector = _make_collector(tmp_path)
+    roles: list[str] = []
+    real_open = metrics.open_duckdb_connection
+
+    def _recording_open(*args, **kwargs):
+        roles.append(str(kwargs.get("role", "worker")))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(metrics, "open_duckdb_connection", _recording_open)
+    metrics._append_operational_health_metrics(
+        [], Path(collector.duckdb_path), {"categories": {}}
+    )
+
+    assert roles, "expected at least one live-database read"
+    assert set(roles) == {"diagnostic"}
+
+
+class _CountingQuality:
+    """Wraps the real quality snapshot so renders stay realistic but countable.
+
+    Each render is stamped with its ordinal in ``score`` so a caller can tell
+    which one it was handed, and the second render onward can be held open to
+    observe what a scrape gets while a rebuild is in flight.
+    """
+
+    def __init__(self, monkeypatch, *, hold_from: int | None = None):
+        self._real = metrics.quality_snapshot
+        self.threads: list[str] = []
+        self.started = threading.Semaphore(0)
+        self.release = threading.Event()
+        self._hold_from = hold_from
+        monkeypatch.setattr(metrics, "quality_snapshot", self)
+
+    def __call__(self, **kwargs):
+        ordinal = len(self.threads) + 1
+        self.threads.append(threading.current_thread().name)
+        self.started.release()
+        if self._hold_from is not None and ordinal >= self._hold_from:
+            assert self.release.wait(30), "held render was never released"
+        snapshot = self._real(**kwargs)
+        snapshot["score"] = float(ordinal)
+        return snapshot
+
+    def wait_for_render(self, ordinal: int) -> None:
+        assert self.started.acquire(timeout=30), f"render {ordinal} never started"
+
+
+def test_warm_takes_the_cold_render_off_the_request_path(tmp_path, monkeypatch):
+    """Nothing warmed the metrics cache after a restart, so the first scrape
+    paid for the cold DuckDB open and the whole parquet glob: 35.6s measured
+    on the Mac hub (#78). The server should pay that itself, as it already
+    does for the cockpit.
+    """
+    collector = _make_collector(tmp_path)
+    quality = _CountingQuality(monkeypatch)
+
+    collector.warm()
+    assert len(quality.threads) == 1, "warm should build the render"
+
+    collector.render_prometheus()
+    assert (
+        len(quality.threads) == 1
+    ), "the first scrape after warm should be a cache hit"
+
+
+def test_expired_metrics_cache_is_served_stale_while_it_refreshes(
+    tmp_path, monkeypatch
+):
+    """An expired cache must not make a scraper wait for the rebuild.
+
+    The rebuild is seconds of DuckDB work behind a 60s TTL, so under
+    Prometheus's scrape interval roughly one scrape in four used to absorb all
+    of it. It is served stale and refreshed behind the request instead.
+    """
+    collector = _make_collector(tmp_path)
+    quality = _CountingQuality(monkeypatch, hold_from=2)
+
+    assert json.loads(collector.render_json())["quality"]["score"] == 1.0
+    quality.wait_for_render(1)
+    collector._cached_until = monotonic()  # expire it
+
+    started = monotonic()
+    stale = json.loads(collector.render_json())
+    elapsed = monotonic() - started
+
+    assert stale["quality"]["score"] == 1.0, "should serve the previous render"
+    assert elapsed < 2.0, f"stale read blocked for {elapsed:.1f}s"
+
+    quality.wait_for_render(2)
+    assert (
+        quality.threads[1] != quality.threads[0]
+    ), "the rebuild must not run on the calling thread"
+
+    quality.release.set()
+    deadline = monotonic() + 30
+    while monotonic() < deadline:
+        if json.loads(collector.render_json())["quality"]["score"] == 2.0:
+            break
+    else:  # pragma: no cover - only on a hung refresh
+        pytest.fail("background refresh never replaced the stale render")
+
+
+def test_expired_cache_triggers_only_one_background_refresh(tmp_path, monkeypatch):
+    """Concurrent scrapes share one rebuild; they must not each start one."""
+    collector = _make_collector(tmp_path)
+    quality = _CountingQuality(monkeypatch, hold_from=2)
+
+    collector.render_json()
+    quality.wait_for_render(1)
+    collector._cached_until = monotonic()
+
+    for _ in range(5):
+        collector.render_json()
+
+    quality.wait_for_render(2)
+    quality.release.set()
+    assert (
+        len(quality.threads) == 2
+    ), f"expected one background rebuild, got {len(quality.threads) - 1}"
+
+
+def test_cache_older_than_the_stale_window_is_rebuilt_synchronously(
+    tmp_path, monkeypatch
+):
+    """Serving stale forever would freeze the numbers if refreshes kept
+    failing, and frozen metrics look healthy. Past the window the caller
+    waits for a real rebuild again."""
+    collector = _make_collector(tmp_path)
+    collector.max_stale_seconds = 5.0
+    quality = _CountingQuality(monkeypatch)
+
+    collector.render_json()
+    collector._cached_until = monotonic() - 10.0
+
+    payload = json.loads(collector.render_json())
+
+    assert quality.threads == [threading.current_thread().name] * 2
+    assert payload["quality"]["score"] == 2.0
+
+
 def test_harness_snapshot_works_while_this_process_holds_the_db(tmp_path):
     """The hub serves snapshots from the same process that owns the database.
 

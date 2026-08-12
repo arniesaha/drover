@@ -74,6 +74,13 @@ _TEST_AUTH = AuthSettings(enabled=True, api_token=_TEST_TOKEN)
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 
 
+# A session create spawns a CLI subprocess behind this request, so the HTTP
+# call is not a cheap lookup. 5s was a coin flip on a contended runner (issue
+# #90: reproduced as a bare `TimeoutError: timed out` out of urlopen while the
+# daemon was still writing its 201). These are hang guards, not budgets.
+_HTTP_TIMEOUT = 30
+
+
 def _json_request(url: str, *, payload: dict | None = None):
     data = None
     headers = dict(_AUTH_HEADERS)
@@ -81,25 +88,45 @@ def _json_request(url: str, *, payload: dict | None = None):
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
 def _authed_get(url: str):
     request = urllib.request.Request(url, headers=_AUTH_HEADERS)
-    return urllib.request.urlopen(request, timeout=5)
+    return urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT)
 
 
-def _wait_until(predicate, timeout: float = 15) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_until(predicate, timeout: float = 30, *, what: str = "condition") -> None:
+    """Poll ``predicate`` until it is true, or fail with WHY it never was.
+
+    The old version swallowed every exception and raised a bare "condition
+    was not met before timeout", so a predicate that raised on every single
+    attempt was indistinguishable from one that merely ran out of time --
+    which is exactly the state this test failed in on CI (issue #90). Keep
+    the last exception and the last value and put them in the message.
+
+    Also monotonic: ``time.time()`` can step backwards under NTP correction
+    and silently extend or truncate the wait.
+    """
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    last_value: object = None
+    while time.monotonic() < deadline:
         try:
-            if predicate():
+            last_value = predicate()
+            if last_value:
                 return
-        except Exception:
-            pass
+            last_error = None
+        except Exception as exc:  # noqa: BLE001 - reported below
+            last_error = exc
         time.sleep(0.1)
-    raise AssertionError("condition was not met before timeout")
+    detail = (
+        f"last call raised {type(last_error).__name__}: {last_error}"
+        if last_error is not None
+        else f"last value was {last_value!r}"
+    )
+    raise AssertionError(f"{what} was not met within {timeout}s; {detail}")
 
 
 def _fetch_session(base_url: str, session_id: str) -> dict:
@@ -178,7 +205,10 @@ def test_structured_session_events_reach_central(tmp_path):
         assert body["mode"] == "structured"
         sid = body["session_id"]
 
-        _wait_until(lambda: _fetch_session(base_url, sid)["awaiting"] == "approval")
+        _wait_until(
+            lambda: _fetch_session(base_url, sid)["awaiting"] == "approval",
+            what="session awaiting=approval",
+        )
 
         status, _ = _json_request(
             f"{base_url}/sessions/{sid}/permission",
@@ -186,7 +216,10 @@ def test_structured_session_events_reach_central(tmp_path):
         )
         assert status == 200
 
-        _wait_until(lambda: _fetch_session(base_url, sid)["awaiting"] == "input")
+        _wait_until(
+            lambda: _fetch_session(base_url, sid)["awaiting"] == "input",
+            what="session awaiting=input",
+        )
 
         expected_types = [
             "user_input",
@@ -203,7 +236,8 @@ def test_structured_session_events_reach_central(tmp_path):
                 return json.loads(response.read())["messages"]
 
         _wait_until(
-            lambda: [m["type"] for m in _messages()] == expected_types, timeout=10
+            lambda: [m["type"] for m in _messages()] == expected_types,
+            what=f"central mirrored {expected_types}",
         )
 
         messages = _messages()
@@ -265,7 +299,7 @@ def test_two_concurrent_structured_sessions_do_not_corrupt_registry(tmp_path):
         for sid in session_ids:
             _wait_until(
                 lambda sid=sid: _fetch_session(base_url, sid)["awaiting"] == "input",
-                timeout=20,
+                what=f"session {sid} awaiting=input",
             )
 
         for sid in session_ids:

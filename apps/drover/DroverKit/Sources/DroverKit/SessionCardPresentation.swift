@@ -44,7 +44,16 @@ public struct SessionCardPresentation: Sendable, Equatable {
     /// `harness · host · state`, quiet. Never repeats what the title says.
     public let subtitle: String
 
-    public let action: Action
+    /// The single verb the card offers — or `nil` when the snapshot it was
+    /// drawn from is stale.
+    ///
+    /// Every verb here is derived from `attention`, and `attention` is exactly
+    /// what a snapshot nobody could refresh cannot vouch for. A card once read
+    /// "asked a question" with an **Answer** beside it while the session had
+    /// long since gone back to work; acting on that pushes a turn into a
+    /// session mid-work (#81). Offering nothing is the honest answer — the
+    /// card still opens on tap, and the session screen fetches live state.
+    public let action: Action?
 
     /// Terminal cards only: `$` while attached, `‹` once exited.
     public let sigil: String?
@@ -59,10 +68,30 @@ public struct SessionCardPresentation: Sendable, Equatable {
 
     public let projectName: String?
 
-    public init(session: SessionSummary, hostTitle: String) {
+    /// True when this card describes a snapshot we could not refresh. Nothing
+    /// on it is wrong on purpose — it is simply older than it looks.
+    public let isStale: Bool
+
+    /// What a stale card says where its verb would have been: how old the
+    /// snapshot itself is. Nil while fresh.
+    public let staleNote: String?
+
+    /// The session's activity age, measured against the snapshot rather than
+    /// against now, so a frozen card stops counting up. Nil while fresh — a
+    /// live card keeps the ticking relative formatter (#81).
+    public let frozenActivityText: String?
+
+    public init(
+        session: SessionSummary,
+        hostTitle: String,
+        freshness: SnapshotFreshness = .live
+    ) {
         harness = HarnessPresentation(session.harness)
         species = session.isStructured ? .conversation : .terminal
         projectName = Self.projectName(for: session.cwd)
+        isStale = freshness.isStale
+        staleNote = freshness.staleNote
+        frozenActivityText = freshness.frozenActivityText(for: session.activityDate)
 
         let attention = session.attention
         let state = Self.statePhrase(attention, species: species)
@@ -73,12 +102,13 @@ public struct SessionCardPresentation: Sendable, Equatable {
         case .conversation:
             kicker = projectName
             sigil = nil
-            action = switch attention {
+            let verb: Action = switch attention {
             case .needsApproval: .approve
             case .needsInput: .answer
             case .working: .watch
             case .done, .errored: .resume
             }
+            action = freshness.isStale ? nil : verb
             if let titleText = Self.firstLine(of: session.recap) ?? Self.firstLine(of: session.preview) {
                 title = titleText
                 isTitlePlaceholder = false
@@ -94,7 +124,8 @@ public struct SessionCardPresentation: Sendable, Equatable {
 
         case .terminal:
             sigil = (attention == .working) ? "$" : "‹"
-            action = (attention == .working) ? .attach : .reopen
+            let verb: Action = (attention == .working) ? .attach : .reopen
+            action = freshness.isStale ? nil : verb
             if let lastLine = Self.lastLine(of: session.preview) {
                 kicker = path
                 title = lastLine

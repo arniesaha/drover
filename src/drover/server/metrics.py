@@ -793,6 +793,11 @@ class MetricsCollector:
     # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel
     # live, but N polling clients should still share one render.
     harness_ttl_seconds: float = 2.0
+    # How long past ttl_seconds an expired render may still be served while
+    # its replacement is built in the background. Serving stale forever would
+    # freeze the numbers whenever refreshes keep failing, and frozen metrics
+    # read as healthy ones; past this the caller waits and the error surfaces.
+    max_stale_seconds: float = 300.0
     cockpit_service: "CockpitService | None" = None
     advisory_service: "InsightsService | None" = None
     # Where InsightsService reads config and, beside it, the durable
@@ -806,6 +811,8 @@ class MetricsCollector:
     _cached_until: float = field(default=0.0, init=False)
     _harness_cached_json: str | None = field(default=None, init=False)
     _harness_cached_until: float = field(default=0.0, init=False)
+    _refreshing: bool = field(default=False, init=False)
+    _refresh_guard: threading.Lock = field(default_factory=threading.Lock, init=False)
     _session_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False)
     _session_locks_guard: threading.Lock = field(
         default_factory=threading.Lock, init=False
@@ -1933,40 +1940,88 @@ class MetricsCollector:
             except Exception:
                 pass
 
+    def warm(self) -> None:
+        """Build the first render before anyone asks for it.
+
+        Cold, a refresh copies the whole database and then reads a parquet
+        tree DuckDB has never globbed in this instance: 35.6s measured on the
+        Mac hub after a restart, against 7-15s warm (#78). Whoever scrapes
+        first should not be the one paying that, so the server pays it itself
+        -- the same bargain ``_warm_cockpit`` already makes.
+        """
+        self._refresh_if_needed()
+
     def _refresh_if_needed(self) -> None:
         now = time.monotonic()
-        if self._cached_text is not None and now < self._cached_until:
-            return
+        if self._cached_text is not None:
+            if now < self._cached_until:
+                return
+            if now < self._cached_until + self.max_stale_seconds:
+                # Expired but still usable. A rebuild is seconds of DuckDB
+                # work; making the scraper that happens to arrive first wait
+                # for it is what turned a 60s TTL into 7-15s scrapes. Hand
+                # back the previous render and rebuild behind the request.
+                self._refresh_in_background()
+                return
         with self._lock:
             now = time.monotonic()
             if self._cached_text is not None and now < self._cached_until:
                 return
-            snapshot = self._quality_snapshot()
-            lines = [format_prometheus(snapshot).rstrip()]
-            _append_details_metrics(lines, snapshot)
-            _append_operational_health_metrics(lines, self.duckdb_path, snapshot)
-            _append_summarizer_metrics(lines, self.summarizer_report)
-            _append_redis_metrics(lines, self.job_streams)
-            _append_adoption_metrics(lines, snapshot)
-            _append_harness_metrics(lines)
-            observatory = self._observatory_snapshot(snapshot)
-            redis_streams = _redis_stream_snapshots(self.job_streams)
-            self._cached_text = "\n".join(lines) + "\n"
-            self._cached_json = (
-                json.dumps(
-                    {
-                        "quality": snapshot,
-                        "observatory": observatory,
-                        "redis_streams": redis_streams,
-                        "summarizer": dict(self.summarizer_report),
-                        "redis_queues": sorted(self.job_streams),
-                    },
-                    sort_keys=True,
-                    default=str,
-                )
-                + "\n"
+            self._rebuild()
+
+    def _refresh_in_background(self) -> None:
+        """Rebuild off the request path, at most one rebuild at a time."""
+        with self._refresh_guard:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def run() -> None:
+            try:
+                with self._lock:
+                    self._rebuild()
+            except Exception as exc:  # noqa: BLE001 - a scrape must not die here
+                # The cache keeps its old timestamp, so the next scrape tries
+                # again, and once the staleness window closes the failure
+                # surfaces to the caller instead of being served as data.
+                log.warning("background metrics refresh failed: %s", exc)
+            finally:
+                with self._refresh_guard:
+                    self._refreshing = False
+
+        threading.Thread(target=run, name="drover-metrics-refresh", daemon=True).start()
+
+    def _rebuild(self) -> None:
+        """Render every cached payload. Callers must hold ``self._lock``."""
+        snapshot = self._quality_snapshot()
+        lines = [format_prometheus(snapshot).rstrip()]
+        _append_details_metrics(lines, snapshot)
+        _append_operational_health_metrics(lines, self.duckdb_path, snapshot)
+        _append_summarizer_metrics(lines, self.summarizer_report)
+        _append_redis_metrics(lines, self.job_streams)
+        _append_adoption_metrics(lines, snapshot)
+        _append_harness_metrics(lines)
+        observatory = self._observatory_snapshot(snapshot)
+        redis_streams = _redis_stream_snapshots(self.job_streams)
+        self._cached_text = "\n".join(lines) + "\n"
+        self._cached_json = (
+            json.dumps(
+                {
+                    "quality": snapshot,
+                    "observatory": observatory,
+                    "redis_streams": redis_streams,
+                    "summarizer": dict(self.summarizer_report),
+                    "redis_queues": sorted(self.job_streams),
+                },
+                sort_keys=True,
+                default=str,
             )
-            self._cached_until = now + self.ttl_seconds
+            + "\n"
+        )
+        # Timed from when the render landed, not from when it started: the
+        # rebuild itself takes seconds, and charging those to the TTL would
+        # expire a render that is only just finished.
+        self._cached_until = time.monotonic() + self.ttl_seconds
 
     def _quality_snapshot(self) -> dict:
         source = Path(self.duckdb_path)
@@ -1988,9 +2043,12 @@ class MetricsCollector:
         #
         # Do NOT "optimize" this into a live read to save the copy. That was
         # tried (927e446, 2026-08-04) and is exactly what caused the outage.
-        # The copy costs ~0.6s behind a 60s TTL; the live read cost the fleet.
-        # The real cure is making quality_snapshot fast -- spans_enriched is
-        # the known offender -- and until then this stays.
+        # The copy costs ~0.9s behind a 60s TTL; the live read cost the fleet.
+        #
+        # Owning the instance is also what earns role="snapshot": DuckDB's
+        # `threads` is instance-wide, so only a reader with its own instance
+        # can raise it without touching the live one. Measured 13.7-14.8s at
+        # threads=1 vs 6.6-8.1s here (#78).
         with tempfile.TemporaryDirectory(prefix="drover-metrics-") as tmp:
             snapshot = Path(tmp) / source.name
             shutil.copy2(source, snapshot)
@@ -1998,6 +2056,7 @@ class MetricsCollector:
                 duckdb_path=snapshot,
                 incoming_dir=self.incoming_dir,
                 deep=False,
+                role="snapshot",
             )
 
     def _observatory_snapshot(self, quality: dict) -> dict:
@@ -2017,6 +2076,7 @@ class MetricsCollector:
                     runtime_audit=audit,
                     max_artifacts=10,
                     max_projects=10,
+                    role="snapshot",
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render observatory drilldown: %s", exc)

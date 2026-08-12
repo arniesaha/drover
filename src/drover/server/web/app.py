@@ -67,6 +67,13 @@ MIRROR_QUEUE_MAX = 2048
 # Cap on one batched write, so a huge backlog is drained in several bounded
 # windows rather than one that holds the connect lock for seconds.
 MIRROR_BATCH_MAX = 128
+# Teardown drain budget for a closing relay terminal channel. Both bounds are
+# safety rails, not the expected path: the drain stops as soon as the channel
+# has nothing buffered, which is immediately in the common case. They exist
+# because teardown runs on a request-handler thread that a still-chattering
+# peer must not be able to hold open.
+MIRROR_DRAIN_MAX = 256
+MIRROR_DRAIN_SECONDS = 2.0
 _MESSAGE_PAGE_DEFAULT = 200
 _MESSAGE_PAGE_MAX = 500
 _GZIP_MIN_BYTES = 1024
@@ -248,6 +255,55 @@ def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | 
         "content_preview": _optional_str(event.get("content_preview")),
         "created_at": _parse_event_timestamp(event.get("created_at")),
     }
+
+
+def _drain_channel_into_mirror(
+    channel: Any, session_id: str, mirror: "_EventMirror"
+) -> int:
+    """Rescue events still buffered on a terminal channel that is closing.
+
+    harnessd deliberately sends a PTY read's raw ``output`` frame *before*
+    the ``terminal.output`` event frame that records it ("echo first — wire
+    delivery never waits on registry bookkeeping"), so the trailing event
+    frame is the single most likely thing to be in flight at any detach.
+
+    The forwarding loop exits the instant the app side goes away: the reader
+    thread sets ``stop`` and ``channel_to_browser`` returns from the top of
+    its ``while``, without reading what the channel already has. Closing the
+    channel then discarded it -- events harnessd had already generated,
+    assigned an ``event_id``, and durably recorded in its own registry, gone
+    from the hub's copy forever and with nothing counting them. Detaching
+    promptly after output is the normal client behaviour, so this was a
+    routine gap in the hub's event log, not a rare race.
+
+    Draining is safe precisely because mirroring is idempotent on
+    ``event_id`` (see ``append_events_if_new``): re-offering a record the
+    loop already handled costs a skipped insert, never a duplicate.
+
+    Returns the number of mirrorable records rescued.
+    """
+    rescued = 0
+    deadline = time.monotonic() + MIRROR_DRAIN_SECONDS
+    while rescued < MIRROR_DRAIN_MAX and time.monotonic() < deadline:
+        try:
+            message = channel.recv(timeout_s=0.05)
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            break
+        if message is None:
+            # Nothing buffered: the backlog is drained (or the channel is
+            # already closed). Either way there is nothing left to rescue.
+            break
+        record = _harness_event_record(session_id, message)
+        if record is not None:
+            mirror.offer(record)
+            rescued += 1
+    if rescued:
+        log.debug(
+            "rescued %d harness event(s) from closing terminal channel for %s",
+            rescued,
+            session_id,
+        )
+    return rescued
 
 
 class _EventMirror:
@@ -1114,6 +1170,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             channel_to_browser()
             stop.set()
         finally:
+            # Drain BEFORE closing: whatever the forwarding loop had not read
+            # yet is still recoverable until the channel goes away.
+            if mirror is not None:
+                _drain_channel_into_mirror(channel, session_id, mirror)
             channel.close()
             if mirror is not None:
                 mirror.close()

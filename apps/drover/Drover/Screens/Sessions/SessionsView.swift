@@ -124,7 +124,20 @@ struct SessionsView: View {
                             .buttonStyle(.bordered)
                         }
                     } else {
-                        ProgressView("Connecting…")
+                        // The spinner alone cannot distinguish a hub that is
+                        // unreachable from a first load repeatedly torn down
+                        // before it lands — which is exactly why a recurring
+                        // stuck "Connecting…" could not be diagnosed from the
+                        // phone (#85). After the second failure it says which.
+                        VStack(spacing: 8) {
+                            ProgressView("Connecting…")
+                            if let detail = store.connectingDetail {
+                                Text(detail)
+                                    .droverText(.subtitle)
+                                    .multilineTextAlignment(.center)
+                                    .accessibilityIdentifier("connecting-detail")
+                            }
+                        }
                     }
                 }
             }
@@ -210,6 +223,16 @@ struct SessionsView: View {
     /// it can be tested without a view.
     private var inboxSessions: [SessionSummary] {
         store.inboxSessions
+    }
+
+    /// How far behind the snapshot every card below is drawn from.
+    ///
+    /// Recomputed on each render, which is what keeps the age honest: a failed
+    /// poll still mutates `refreshAttempts` and `lastRefreshOutcome`, so an
+    /// unreachable hub re-renders this screen every five seconds and the cards'
+    /// ages climb even though no snapshot lands.
+    private var freshness: SnapshotFreshness {
+        store.freshness()
     }
 
     private var providerSectionStatus: DataStatus {
@@ -325,7 +348,11 @@ struct SessionsView: View {
                 TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
             }
         } label: {
-            SessionRow(session: session, hostTitle: hostTitle(for: session))
+            SessionRow(
+                session: session,
+                hostTitle: hostTitle(for: session),
+                freshness: freshness
+            )
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(session.id)

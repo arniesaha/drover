@@ -1230,11 +1230,19 @@ def runtime_audit(
     source_duckdb_path: Optional[Path] = None,
     diagnostic_db_path: Optional[Path] = None,
     deep: bool = True,
+    role: str = "diagnostic",
 ) -> dict:
     """Return a read-only operational health report for a Drover runtime DB.
 
     Missing tables/views are represented with ``None`` counts and empty
     sections. The function does not bootstrap schemas or mutate the database.
+
+    ``role`` picks the DuckDB connection profile. It defaults to
+    ``diagnostic`` (one thread) because this function is reachable from the
+    CLI and from in-process diagnostics pointed at the *live* database, where
+    ``threads`` is instance-wide and extra threads starve every other live
+    reader (#91). Callers that handed us a private copy -- ``/metrics`` does
+    -- should pass ``role="snapshot"`` for parallelism they cannot leak.
     """
     duckdb_path = Path(duckdb_path)
     source_duckdb_path = Path(source_duckdb_path) if source_duckdb_path else duckdb_path
@@ -1340,7 +1348,7 @@ def runtime_audit(
         return report
 
     try:
-        con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")
+        con = open_duckdb_connection(duckdb_path, read_only=True, role=role)
     except duckdb.Error as e:
         report["warnings"].append(f"failed to open DuckDB read-only: {e}")
         for name in RUNTIME_KEY_RELATIONS:

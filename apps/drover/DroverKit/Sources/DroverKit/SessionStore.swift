@@ -172,27 +172,74 @@ public final class SessionStore {
 
     // MARK: - Refresh
 
+    /// How many times `refresh()` has been attempted since the last success.
+    /// Reset on success, so it only ever describes an unresolved stretch.
+    public private(set) var refreshAttempts = 0
+
+    /// Why the last attempt did not produce a snapshot, including the
+    /// cancellations that are otherwise invisible. Nil once one succeeds.
+    public private(set) var lastRefreshOutcome: String?
+
+    /// When the snapshot currently being rendered actually landed.
+    ///
+    /// Only a *success* moves this. Keeping the cached snapshot through a
+    /// failure is deliberate (see `refresh()`); restamping it on failure would
+    /// make the cache look freshly fetched, which is the same lie the ticking
+    /// card timestamps were telling (#81).
+    public private(set) var lastSuccessfulRefresh: Date?
+
+    /// How far behind the rendered snapshot is, for the views drawn from it.
+    /// `now` is a parameter so a card's staleness can be tested without
+    /// waiting for a clock.
+    public func freshness(now: Date = Date()) -> SnapshotFreshness {
+        SnapshotFreshness(lastUpdate: lastSuccessfulRefresh, isReachable: isReachable, now: now)
+    }
+
+    /// The line the "Connecting…" screen shows once it has been sitting there
+    /// long enough to owe an explanation.
+    ///
+    /// A wedged first load and an unreachable hub look identical from the
+    /// phone — same spinner, same silence — which is exactly why the recurring
+    /// report could not be diagnosed from the device (#85). One blip is
+    /// normal, so this stays quiet until the second failure.
+    public var connectingDetail: String? {
+        guard !hasLoadedOnce, refreshAttempts >= 2 else { return nil }
+        let plural = refreshAttempts == 1 ? "attempt" : "attempts"
+        return "\(refreshAttempts) \(plural) · \(lastRefreshOutcome ?? "no response yet")"
+    }
+
     public func refresh() async {
         guard let client else { return }
+        refreshAttempts += 1
         do {
             let fresh = try await client.snapshot()
             snapshot = fresh
             lastError = nil
             isReachable = true
             hasLoadedOnce = true
+            refreshAttempts = 0
+            lastRefreshOutcome = nil
+            lastSuccessfulRefresh = Date()
         } catch {
             // A cancelled request means *we* tore it down (a superseded poll,
             // a dismissed screen) — the hub never said anything. Treating it
             // as a failure flashed an unreachable banner over a perfectly
             // healthy fleet.
+            //
+            // It is still recorded. Returning without a trace is what made a
+            // load stuck behind repeated cancellations indistinguishable from
+            // an unreachable hub, and left "Connecting…" with nothing to say.
             if let droverError = error as? DroverError, droverError.isCancellation {
+                lastRefreshOutcome = "request cancelled"
                 return
             }
             if (error as? URLError)?.code == .cancelled {
+                lastRefreshOutcome = "request cancelled"
                 return
             }
             isReachable = false
             lastError = Self.errorMessage(for: error)
+            lastRefreshOutcome = lastError
             // Deliberately keep the cached `snapshot` as-is.
         }
     }

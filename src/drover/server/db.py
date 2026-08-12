@@ -26,6 +26,22 @@ from typing import Mapping, Optional
 
 import duckdb
 
+#: Parallelism ceiling for the ``snapshot`` role. Measured against the live
+#: 2.32M-row / 6,505-file store: one snapshot took 14.8s/13.7s at 1 thread,
+#: 6.6s/8.1s at 4, and 6.3s/7.0s at 8. Four threads is the knee; more buys
+#: nothing and costs the live server cores it still needs.
+_SNAPSHOT_MAX_THREADS = 4
+
+
+def snapshot_thread_default(cpu_count: int) -> int:
+    """Threads for the ``snapshot`` role on a machine with ``cpu_count`` cores.
+
+    Always leaves at least one core for the live server, so a snapshot can
+    slow itself down but never starve the hub of CPU outright.
+    """
+    return max(1, min(_SNAPSHOT_MAX_THREADS, int(cpu_count) - 1))
+
+
 ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     "worker": {
         "memory_limit": "2GB",
@@ -40,6 +56,22 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     "diagnostic": {
         "memory_limit": "2GB",
         "threads": "1",
+        "preserve_insertion_order": "false",
+    },
+    # Read-only analytics against a *private copy* of the database, never the
+    # live file. `threads` is a DuckDB instance-wide setting: raising it on a
+    # connection to the live database raises it for the harness registry and
+    # every other live reader sharing that instance, which is how the
+    # 2026-08-04 outage happened (#91, PR #76, PR #93). A copy is a separate
+    # instance with its own scheduler, so its thread count cannot reach the
+    # live one. Only the OS-level CPU share is shared, and that is bounded
+    # both by snapshot_thread_default (never the last core) and by the fact
+    # that finishing ~2x sooner shortens the window of contention.
+    #
+    # Do NOT point a `snapshot` connection at the live database.
+    "snapshot": {
+        "memory_limit": "2GB",
+        "threads": str(snapshot_thread_default(os.cpu_count() or 1)),
         "preserve_insertion_order": "false",
     },
 }
@@ -83,7 +115,10 @@ def open_duckdb_connection(
         con = duckdb.connect(str(duckdb_path))
     settings = dict(ROLE_DEFAULTS.get(role, ROLE_DEFAULTS["worker"]))
     prefix = f"DUCKDB_{role.upper()}"
-    fallback_prefix = "DUCKDB_DIAGNOSTIC" if role == "diagnostic" else "DUCKDB_WORKER"
+    # `snapshot` deliberately does not fall back to the diagnostic or worker
+    # env vars: the whole point of the role is that throttling live readers
+    # must not throttle the isolated copy, and vice versa.
+    fallback_prefix = prefix if role in {"diagnostic", "snapshot"} else "DUCKDB_WORKER"
 
     def _env_setting(suffix: str, default: str) -> str:
         for name in (
