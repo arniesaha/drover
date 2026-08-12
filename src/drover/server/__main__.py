@@ -59,7 +59,10 @@ from drover.server.context_catalog import (
     load_bundle,
 )
 from drover.server.db import (
+    CONTROL_PLANE_TABLES,
     close_control_plane_connections,
+    control_plane_connection,
+    control_plane_path,
     open_duckdb_connection,
     pin_control_plane_connection,
 )
@@ -348,33 +351,52 @@ def _seed_redis_job_streams(
     try:
         for key, stream in streams.items():
             table, column, field = table_map[key]
-            if key == "brief":
-                selected = f"{column}, source_session_id, source_version"
-            elif key in ("summarize", "embed_session"):
-                selected = f"{column}, source_version"
-            elif key == "live_recap":
-                selected = f"{column}, desired_source_seq"
-            else:
-                selected = column
-            rows = con.execute(
-                f"SELECT {selected} FROM {table} "
-                "WHERE status='pending' ORDER BY enqueued_at ASC"
-            ).fetchall()
-            for row in rows:
-                payload = {field: str(row[0])}
-                if key == "brief" and row[1] is not None:
-                    payload["source_session_id"] = str(row[1])
-                if key == "brief" and row[2] is not None:
-                    payload["source_version"] = str(row[2])
-                elif key in ("summarize", "embed_session") and row[1] is not None:
-                    payload["source_version"] = str(row[1])
-                elif key == "live_recap":
-                    payload["source_seq"] = str(row[1])
-                stream.add(payload)
-            counts[key] = len(rows)
+            if table in CONTROL_PLANE_TABLES:
+                # `live_recap_jobs` moved to the control-plane store in #95.
+                # Seeding is a startup read of a queue that the control plane
+                # owns, so it reads it where the control plane keeps it.
+                with control_plane_connection(duckdb_path) as cp_con:
+                    counts[key] = _seed_one_stream(
+                        cp_con, stream, key, table, column, field
+                    )
+                continue
+            counts[key] = _seed_one_stream(con, stream, key, table, column, field)
     finally:
         con.close()
     return counts
+
+
+def _seed_one_stream(
+    con: Any,
+    stream: RedisJobStream,
+    key: str,
+    table: str,
+    column: str,
+    field: str,
+) -> int:
+    if key == "brief":
+        selected = f"{column}, source_session_id, source_version"
+    elif key in ("summarize", "embed_session"):
+        selected = f"{column}, source_version"
+    elif key == "live_recap":
+        selected = f"{column}, desired_source_seq"
+    else:
+        selected = column
+    rows = con.execute(
+        f"SELECT {selected} FROM {table} WHERE status='pending' ORDER BY enqueued_at ASC"
+    ).fetchall()
+    for row in rows:
+        payload = {field: str(row[0])}
+        if key == "brief" and row[1] is not None:
+            payload["source_session_id"] = str(row[1])
+        if key == "brief" and row[2] is not None:
+            payload["source_version"] = str(row[2])
+        elif key in ("summarize", "embed_session") and row[1] is not None:
+            payload["source_version"] = str(row[1])
+        elif key == "live_recap":
+            payload["source_seq"] = str(row[1])
+        stream.add(payload)
+    return len(rows)
 
 
 def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
@@ -589,7 +611,10 @@ def _emit_sequence_command_result(
     "db_path",
     required=True,
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    help="Exact DuckDB path to audit.",
+    help=(
+        "Exact DuckDB path to audit. Either the lakehouse path or the "
+        "control-plane store beside it; harness events live in the latter."
+    ),
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
 @click.pass_context
@@ -608,7 +633,10 @@ def harness_audit_sequences_cmd(
     "db_path",
     required=True,
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    help="Exact DuckDB path to migrate.",
+    help=(
+        "Exact DuckDB path to migrate. Either the lakehouse path or the "
+        "control-plane store beside it; harness events live in the latter."
+    ),
 )
 @click.option(
     "--apply", is_flag=True, help="Apply sequence migration. Default is dry-run."
@@ -1164,6 +1192,7 @@ def status(ctx: click.Context) -> None:
         incoming_dir : {cfg.incoming_dir}
         parquet_dir  : {cfg.parquet_dir}
         duckdb_path  : {cfg.duckdb_path}
+        control_plane_duckdb_path : {control_plane_path(cfg.duckdb_path)}
         otlp_grpc_port : {cfg.otlp_grpc_port}
         mcp_http_port  : {cfg.mcp_http_port}
         metrics_http_port : {cfg.metrics_http_port}
@@ -1188,6 +1217,18 @@ def status(ctx: click.Context) -> None:
                 click.echo(f"  {v:20s} {n}")
         finally:
             con.close()
+
+    # Counted separately because they live in a separate database (#95).
+    try:
+        with control_plane_connection(cfg.duckdb_path) as con:
+            for t in CONTROL_PLANE_TABLES:
+                try:
+                    n = con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                except duckdb.Error as e:
+                    n = f"error: {e}"
+                click.echo(f"  {t:20s} {n}")
+    except duckdb.Error as exc:
+        click.echo(f"  control plane        error: {exc}")
 
 
 @main.command(name="export-bundle")
@@ -1354,11 +1395,13 @@ def run(
     """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
     cfg = _resolve_config(ctx.obj["config_path"])
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-    # Before any worker starts, so if the pin is taken at all, the one moment
-    # the control plane touches the shared connect lock is a moment when
-    # nothing is scanning. Off by default -- it would hold DuckDB's file lock
-    # against a co-resident harnessd -- and db.py logs which way it went. The
-    # /harness* lock split in control_plane_connection applies regardless (#95).
+    # After bootstrap, which is what creates and migrates the control-plane
+    # store, and before any worker starts, so the one moment the control plane
+    # touches a connect lock is a moment when nothing is scanning. Pins the
+    # control-plane store, not the lakehouse. Off by default -- it would hold
+    # DuckDB's file lock against a co-resident harnessd, which shares that
+    # store -- and db.py logs which way it went. The lock split and the
+    # separate database in control_plane_connection apply regardless (#95).
     pin_control_plane_connection(cfg.duckdb_path)
     stop = threading.Event()
 

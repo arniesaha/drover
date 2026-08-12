@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
@@ -35,6 +36,7 @@ from drover.server.advisory.types import (
     Severity,
 )
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
+from drover.server.db import control_plane_path
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -538,7 +540,7 @@ def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
     monkeypatch.setattr(metrics, "quality_snapshot", lambda **_: _snapshot())
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         con.executemany(
             "INSERT INTO harness_events "
             "(event_id, session_id, event_type, payload_json, created_at, seq) "
@@ -549,6 +551,8 @@ def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
                 ("mixed-2", "private-mixed-session", None),
             ],
         )
+    # summarize_jobs is analytical and stayed in the lakehouse.
+    with duckdb.connect(str(db)) as con:
         con.executemany(
             "INSERT INTO summarize_jobs "
             "(session_id, status, attempts, max_attempts, next_run_at, updated_at) "
@@ -606,13 +610,13 @@ def test_sequence_health_report_does_not_materialize_event_metadata(
 ):
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    with duckdb.connect(str(db)) as con:
+    with duckdb.connect(str(control_plane_path(db))) as con:
         con.execute(
             "INSERT INTO harness_events "
             "(event_id, session_id, event_type, payload_json, created_at, seq) "
             "VALUES ('event-1', 'session-1', 'user_input', '{}', now(), NULL)"
         )
-    real = duckdb.connect(str(db))
+    real = duckdb.connect(str(control_plane_path(db)))
 
     class AggregateOnlyConnection:
         def execute(self, query, parameters=None):
@@ -625,11 +629,13 @@ def test_sequence_health_report_does_not_materialize_event_metadata(
         def close(self):
             real.close()
 
-    monkeypatch.setattr(
-        metrics,
-        "open_duckdb_connection",
-        lambda *args, **kwargs: AggregateOnlyConnection(),
-    )
+    # `sequence_health_report` reads harness_events through the control plane's
+    # connection since #95, so that is the seam to intercept.
+    @contextmanager
+    def aggregate_only(*args, **kwargs):
+        yield AggregateOnlyConnection()
+
+    monkeypatch.setattr(metrics, "control_plane_connection", aggregate_only)
 
     assert metrics.sequence_health_report(db) == {
         "null_event_count": 1,
@@ -3494,7 +3500,7 @@ def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(tmp_path
     finally:
         server.shutdown()
 
-    with duckdb.connect(str(collector.duckdb_path)) as con:
+    with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
         assert con.execute(
             "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
             ["harness-recap-wire"],
@@ -3540,7 +3546,7 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         )
         assert status == 200
         assert body == {"ingested": 2}
-        with duckdb.connect(str(collector.duckdb_path)) as con:
+        with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
             assert con.execute(
                 "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
                 ["harness-race"],
@@ -3571,7 +3577,7 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         )
 
         assert registry.get_session("harness-race") is not None
-        with duckdb.connect(str(collector.duckdb_path)) as con:
+        with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
             assert con.execute(
                 "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
                 ["harness-race"],
@@ -3589,7 +3595,7 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
     finally:
         server.shutdown()
 
-    with duckdb.connect(str(collector.duckdb_path)) as con:
+    with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
         marker_after_recovery = con.execute(
             "SELECT recap_reconcile_needed FROM harness_sessions "
             "WHERE session_id = ?",
@@ -3609,7 +3615,7 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
 
     assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 0
     assert marker_after_recovery == (False,)
-    with duckdb.connect(str(collector.duckdb_path)) as con:
+    with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
         assert con.execute(
             "SELECT recap_reconcile_needed FROM harness_sessions "
             "WHERE session_id = ?",

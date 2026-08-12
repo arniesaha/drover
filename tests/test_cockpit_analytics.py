@@ -28,6 +28,7 @@ from drover.server.cockpit.analytics import (
     activity_analytics,
 )
 from drover.server.cockpit.service import CockpitService
+from drover.server.db import attached_control_plane_snapshot
 
 
 def _analytics_connection(
@@ -259,7 +260,10 @@ def test_analytics_handles_empty_bootstrapped_lakehouse(tmp_path: Path):
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     con = duckdb.connect(str(duckdb_path))
     try:
-        result = activity_analytics(con, AnalyticsFilters(days=7))
+        # `harness_sessions` lives in the control-plane store since #95, so a
+        # reader of the lakehouse reaches it the way CockpitService does.
+        with attached_control_plane_snapshot(con, duckdb_path):
+            result = activity_analytics(con, AnalyticsFilters(days=7))
     finally:
         con.close()
 

@@ -296,7 +296,7 @@ def test_manager_wire_completion_enqueues_recap_at_emitted_sequence(
 
     event = registry.list_events("sess-1")[0]
     assert event.payload["payload"]["turn_complete"] is True
-    with duckdb.connect(str(registry.duckdb_path)) as con:
+    with duckdb.connect(str(registry.control_plane_path)) as con:
         assert con.execute(
             "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
             ["sess-1"],

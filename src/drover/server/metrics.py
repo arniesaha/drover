@@ -26,7 +26,11 @@ from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
 )
-from drover.server.db import open_duckdb_connection
+from drover.server.db import (
+    control_plane_connection,
+    control_plane_path,
+    open_duckdb_connection,
+)
 from drover.server.jobs import RedisJobStream
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -310,8 +314,16 @@ def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, i
     Dry-runs reuse the migration's read-only classification helper. This
     preserves its exact eligibility rules without writing the source database
     or selecting event content.
+
+    ``harness_events`` moved to the control-plane store in #95, so ``db_path``
+    is resolved there and read through the control plane's own connection.
+    ``/metrics`` calls this in the server process; opening that file with an
+    analytical role would reset the control-plane instance's ``memory_limit``
+    and ``threads``, which is precisely the coupling the split removes. The
+    connection is read-write either way now -- only the ``apply`` branch
+    writes, as before.
     """
-    source = Path(db_path)
+    source = control_plane_path(db_path)
     if not source.exists():
         return {
             "null_event_count": 0,
@@ -319,8 +331,7 @@ def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, i
             "mixed_sessions": 0,
         }
 
-    con = open_duckdb_connection(source, read_only=not apply, role="diagnostic")
-    try:
+    with control_plane_connection(source) as con:
         audit = audit_legacy_harness_event_sequences(con)
         if apply:
             report = migrate_legacy_harness_event_sequences(con)
@@ -329,8 +340,6 @@ def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, i
         else:
             all_null_sessions = len(audit.all_null_sessions)
             mixed_sessions = len(audit.mixed_sessions)
-    finally:
-        con.close()
     return {
         "null_event_count": audit.null_event_count,
         "all_null_sessions": all_null_sessions,

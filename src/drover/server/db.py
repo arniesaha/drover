@@ -15,20 +15,35 @@ diagnostics from crashing each other (issue #2):
    same file at nearly the same instant race the instance cache and the
    loser raises "Binder Error: Unique file handle conflict". The connect
    call itself is serialized per resolved path, process-wide.
-3. **The control plane reads somewhere else.** ``/harness*`` state goes
-   through ``control_plane_connection``, which always has its own lock and
-   -- when ``DROVER_CONTROL_PLANE_PIN=1`` -- its own pinned connection.
-   Nothing analytical may take that lock or be handed that connection;
-   ``tests/test_control_plane_isolation.py`` enforces both directions.
+3. **The control plane reads somewhere else.** ``/harness*`` state lives in
+   its own database *file* (``control_plane_path``) and is reached through
+   ``control_plane_connection``, which has its own lock and -- when
+   ``DROVER_CONTROL_PLANE_PIN=1`` -- its own pinned connection. A separate
+   file is what makes it a separate DuckDB instance, with its own scheduler,
+   buffer manager and ``memory_limit``; a separate connection to the same
+   file is none of those things (issue #95, 2026-08-11). Nothing analytical
+   may take that lock, be handed that connection, or open that file;
+   ``tests/test_control_plane_isolation.py`` and
+   ``tests/test_control_plane_store.py`` enforce every direction.
+4. **Analytical readers see control-plane state through a copy.** Two live
+   queries genuinely join across both worlds, and DuckDB refuses to ``ATTACH``
+   a file another instance in the process already holds ("Unique file handle
+   conflict"). ``attached_control_plane_snapshot`` attaches a private copy of
+   the (small) control-plane store instead -- #76's pattern, at megabytes
+   rather than 700MB.
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
+import shutil
+import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -84,7 +99,66 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
         "threads": str(snapshot_thread_default(os.cpu_count() or 1)),
         "preserve_insertion_order": "false",
     },
+    # The control-plane store, and only it. This role exists to be *small*.
+    #
+    # `memory_limit` is a DuckDB instance-wide setting, so before the store was
+    # split every role's "2GB" was one 2GB budget shared by the control plane
+    # and every analytical worker. On 2026-08-11 the hub logged
+    # "failed to allocate 16.0 MiB (1.8 GiB/1.8 GiB used)" from the cockpit and
+    # "failed to pin block of size 4.0 KiB (1.8 GiB/1.8 GiB used)" from the
+    # advisory worker within minutes of each other. A budget the control plane
+    # cannot lose is the point of the split.
+    #
+    # 256MB against a working set of 3 hosts, 120 sessions and 41,649 events:
+    # the whole store materialized uncompressed is tens of megabytes, and the
+    # widest statement here (`latest_session_previews`, a window function over
+    # the events of at most ~120 sessions) touches a fraction of it. That is
+    # several times the headroom it can use, and one eighth of the analytical
+    # budget -- so the two instances together stay well inside the ~6GB free on
+    # a 16GB host that is already paging. It must also be set explicitly: a
+    # fresh instance otherwise defaults to ~80% of host RAM, which on this
+    # machine would be 12.7 GiB and would trade one failure for a worse one.
+    #
+    # Two threads, not one: everything here is an indexed point lookup except
+    # that one window function. The setting cannot leak into analytics, because
+    # this role is only ever applied to a different file.
+    "control_plane": {
+        "memory_limit": "256MB",
+        "threads": "2",
+        "preserve_insertion_order": "false",
+    },
 }
+
+#: Tables that belong to the control plane and live in ``control_plane_path``.
+#: The recap queue and its projection are here because ``HarnessRegistry``
+#: writes them in the same transaction as the event that triggers them.
+CONTROL_PLANE_TABLES = (
+    "harness_hosts",
+    "harness_sessions",
+    "harness_events",
+    "live_session_recaps",
+    "live_recap_jobs",
+)
+
+#: Primary keys, used by the migration to copy without duplicating.
+CONTROL_PLANE_PRIMARY_KEYS = {
+    "harness_hosts": "host_id",
+    "harness_sessions": "session_id",
+    "harness_events": "event_id",
+    "live_session_recaps": "session_id",
+    "live_recap_jobs": "session_id",
+}
+
+#: Appended to the analytical store's stem, so ``drover.duckdb`` is joined by
+#: ``drover.registry.duckdb`` in the same directory. Derived from the stem
+#: rather than fixed, so two lakehouses sharing a directory (which the test
+#: suite does constantly) do not share one control plane.
+CONTROL_PLANE_SUFFIX = ".registry.duckdb"
+
+#: Prefix for the catalog alias a snapshot copy is attached under. Deliberately
+#: unlikely to collide with a real catalog name; a per-window counter is
+#: appended because ``ATTACH`` is instance-wide and readers overlap.
+CONTROL_PLANE_SNAPSHOT_ALIAS = "drover_control_plane"
 
 _CONNECT_LOCKS: dict[str, threading.Lock] = {}
 _CONNECT_LOCKS_GUARD = threading.Lock()
@@ -112,6 +186,32 @@ def _path_key(duckdb_path: str | Path) -> str:
     return str(Path(duckdb_path).expanduser().resolve())
 
 
+def control_plane_path(duckdb_path: str | Path) -> Path:
+    """Where the control plane's own database file lives.
+
+    Issue #95. ``/harness*`` state is 3 hosts, 120 sessions and 41,649 events;
+    it was living inside a 640.8 MB analytical store, which meant it shared
+    that store's DuckDB instance -- one scheduler, one buffer manager, one
+    ``memory_limit`` -- with every parquet scan in the process. Its own file is
+    the only thing that separates them; PR #104 gave it its own lock and its
+    own connection and the wedge recurred on ``c7900e7`` regardless.
+
+    Idempotent: handed the control-plane path it returns it unchanged, so a
+    caller that has already resolved (or an operator who configured the store
+    directly) does not end up with ``drover.registry.registry.duckdb``.
+
+    ``DROVER_CONTROL_PLANE_DUCKDB`` overrides the location outright, for a hub
+    that wants the control plane on different storage from the lakehouse.
+    """
+    override = os.environ.get("DROVER_CONTROL_PLANE_DUCKDB", "").strip()
+    if override:
+        return Path(override).expanduser()
+    path = Path(duckdb_path).expanduser()
+    if path.name.endswith(CONTROL_PLANE_SUFFIX):
+        return path
+    return path.with_name(path.stem + CONTROL_PLANE_SUFFIX)
+
+
 def duckdb_connect_lock(duckdb_path: str | Path) -> threading.Lock:
     """Process-wide lock serializing duckdb.connect() per resolved path.
 
@@ -130,9 +230,11 @@ def control_plane_lock(duckdb_path: str | Path) -> threading.Lock:
     """Process-wide lock serializing control-plane windows per resolved path.
 
     Never the same object as ``duckdb_connect_lock`` for the same path, so an
-    analytical reader and a fleet listing cannot queue behind each other.
+    analytical reader and a fleet listing cannot queue behind each other. The
+    path is resolved to the control-plane store first, so passing the
+    analytical path here still locks the control plane and never the lakehouse.
     """
-    key = _path_key(duckdb_path)
+    key = _path_key(control_plane_path(duckdb_path))
     with _CONTROL_PLANE_GUARD:
         lock = _CONTROL_PLANE_LOCKS.get(key)
         if lock is None:
@@ -141,18 +243,18 @@ def control_plane_lock(duckdb_path: str | Path) -> threading.Lock:
 
 
 def pin_control_plane_connection(duckdb_path: str | Path) -> bool:
-    """Open and keep the control plane's own connection to ``duckdb_path``.
+    """Open and keep the control plane's own connection to its store.
 
     **Off unless ``DROVER_CONTROL_PLANE_PIN=1``, and deliberately so.** A pin
     holds DuckDB's exclusive file lock for the life of the process. DuckDB
     grants one process at a time write access, so on a host where the hub
     server and ``drover-harnessd`` share ``cfg.duckdb_path`` -- the
-    single-machine setup in getting-started.md -- a pin would take harnessd's
-    registry permanently dark, and harnessd serves its fleet endpoints from
-    that registry. That they collide today is not a guess:
+    single-machine setup in getting-started.md -- they now also share the
+    control-plane store derived from it, and a pin would take harnessd's
+    registry permanently dark. That they collide today is not a guess:
     ``bootstrap_harnessd_schema`` catches "Could not set lock" and carries on
     "best-effort", which works only because the server's windows are short.
-    Enable it on a hub whose database file no process else opens.
+    Enable it on a hub whose control-plane store no process else opens.
 
     The lock split in ``control_plane_connection`` is on unconditionally and
     is the part that fixes #95's queueing; this is the further latency win,
@@ -165,8 +267,10 @@ def pin_control_plane_connection(duckdb_path: str | Path) -> bool:
     ``bootstrap_harnessd_schema`` sets the same precedent.
 
     Only the process that owns the database file should ever call this;
-    harnessd and the CLI never do.
+    harnessd and the CLI never do. ``duckdb_path`` may be either the analytical
+    path or the control-plane path; it is resolved either way.
     """
+    duckdb_path = control_plane_path(duckdb_path)
     if os.environ.get("DROVER_CONTROL_PLANE_PIN", "0").strip().lower() not in {
         "1",
         "true",
@@ -220,14 +324,27 @@ def _connect_control_plane(duckdb_path: str | Path) -> duckdb.DuckDBPyConnection
     This is the only moment the control plane touches ``duckdb_connect_lock``:
     two threads racing ``duckdb.connect()`` on one file still lose to a
     "Unique file handle conflict" (see the module docstring), and a pin is
-    opened once per process. No role settings are applied on purpose --
-    ``threads`` and ``memory_limit`` are DuckDB *instance* settings, so
-    writing them here would reconfigure every analytical reader sharing the
-    instance, and the control plane's indexed lookups do not care what they
-    are set to.
+    opened once per process. The lock is keyed on the control-plane path, so
+    it is a different lock from the analytical store's and no analytical
+    connect can be waiting on it.
+
+    Role settings *are* applied, and that is new with the store split. They are
+    DuckDB instance settings; while the control plane shared the analytical
+    file, writing them here would have reconfigured every analytical reader on
+    that instance, so #104 deliberately left them alone. Now the file is its
+    own instance, an unset ``memory_limit`` would default to ~80% of host RAM,
+    and setting it is the only way the control plane gets a budget an
+    analytical scan cannot spend.
     """
+    duckdb_path = control_plane_path(duckdb_path)
     with duckdb_connect_lock(duckdb_path):
-        return duckdb.connect(str(duckdb_path))
+        con = duckdb.connect(str(duckdb_path))
+    try:
+        _apply_role_settings(con, "control_plane")
+    except Exception:
+        con.close()
+        raise
+    return con
 
 
 @contextmanager
@@ -260,19 +377,21 @@ def control_plane_connection(
       lock against a co-resident harnessd; see
       ``pin_control_plane_connection``.
 
-    What this does *not* buy: a private DuckDB instance. One file is one
-    instance in one process -- a second ``duckdb.connect`` joins the cached
-    instance and ``ATTACH`` from a separate instance raises "Unique file
-    handle conflict" -- so the task scheduler stays shared. Splitting the
-    control-plane tables into their own file is the remaining step (option 1
-    in #95); this is the staging post that stops the queueing.
+    * **Its own database file**, which is what makes it a private DuckDB
+      instance. One file is one instance in one process, so while the registry
+      tables lived in ``drover.duckdb`` every ``/harness*`` read shared that
+      store's scheduler, buffer manager and ``memory_limit`` with every
+      parquet scan -- whichever lock it held, pinned or not. The lock split
+      shipped in #104 and the wedge recurred on ``c7900e7`` for exactly this
+      reason. ``duckdb_path`` is resolved through ``control_plane_path``, so
+      this function can never open the analytical store.
 
     Without a pin -- the default, and always for harnessd and the CLI -- the
     window opens a connection of its own, still under the control-plane lock,
     and still holds the shared connect lock only across the connect itself
-    rather than the whole window. That alone is the fix for the queueing.
+    rather than the whole window.
     """
-    key = _path_key(duckdb_path)
+    key = _path_key(control_plane_path(duckdb_path))
     with control_plane_lock(duckdb_path):
         with _CONTROL_PLANE_GUARD:
             con = _CONTROL_PLANE_CONNECTIONS.get(key)
@@ -329,12 +448,35 @@ def open_duckdb_connection(
         )
     with duckdb_connect_lock(duckdb_path):
         con = duckdb.connect(str(duckdb_path))
+    try:
+        _apply_role_settings(con, role, settings_overrides=settings_overrides)
+    except Exception:
+        con.close()
+        raise
+    return con
+
+
+def _apply_role_settings(
+    con: duckdb.DuckDBPyConnection,
+    role: str,
+    *,
+    settings_overrides: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Apply one role's settings to an already-open connection.
+
+    Every one of these is a DuckDB *instance* setting, not a connection
+    setting, so which file the connection is on decides who else they land on.
+    """
     settings = dict(ROLE_DEFAULTS.get(role, ROLE_DEFAULTS["worker"]))
     prefix = f"DUCKDB_{role.upper()}"
-    # `snapshot` deliberately does not fall back to the diagnostic or worker
-    # env vars: the whole point of the role is that throttling live readers
-    # must not throttle the isolated copy, and vice versa.
-    fallback_prefix = prefix if role in {"diagnostic", "snapshot"} else "DUCKDB_WORKER"
+    # `snapshot` and `control_plane` deliberately do not fall back to the
+    # diagnostic or worker env vars: the whole point of both roles is that
+    # throttling live analytical readers must not throttle them, or vice versa.
+    fallback_prefix = (
+        prefix
+        if role in {"diagnostic", "snapshot", "control_plane"}
+        else "DUCKDB_WORKER"
+    )
 
     def _env_setting(suffix: str, default: str) -> str:
         for name in (
@@ -351,14 +493,220 @@ def open_duckdb_connection(
     if settings_overrides:
         settings.update({str(k): str(v) for k, v in settings_overrides.items()})
 
+    con.execute("SET memory_limit=?", [settings["memory_limit"]])
+    con.execute("SET threads=?", [int(settings["threads"])])
+    con.execute(
+        "SET preserve_insertion_order=?",
+        [settings["preserve_insertion_order"].lower() == "true"],
+    )
+
+
+def sql_path_literal(value: str | Path) -> str:
+    """Quote a path for ``ATTACH``, which takes no bind parameters."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@contextmanager
+def control_plane_snapshot(duckdb_path: str | Path) -> Iterator[Path | None]:
+    """Yield a private copy of the control-plane store, or None if it is absent.
+
+    The copy is #76's pattern applied to a much smaller file. It is isolation,
+    not caching: DuckDB refuses to ``ATTACH`` a database another instance in
+    the same process already holds ("Unique file handle conflict"), so an
+    analytical reader in the hub *cannot* attach the live control-plane store
+    even if it wanted to, and attaching it from the analytical instance would
+    put the two back on one scheduler anyway.
+
+    What made this unaffordable in #76 was size -- 700MB per read, growing.
+    The control-plane store is the 3 hosts, 120 sessions and 41,649 events
+    that used to sit inside it, so the same objection does not apply.
+
+    One copy is nonetheless reused until the store changes, keyed on its mtime
+    and size. These readers are not occasional: ``AdvisoryScheduler`` asks each
+    of six analyzers for a source version on the advisory worker's 5s poll, so
+    a copy per window would be a permanent write load on a host that is already
+    paging. A generation a reader still holds is never overwritten or deleted --
+    an attached DuckDB file has to stay exactly as it was attached -- so a
+    refresh writes a new file and the old one goes when its last reader leaves.
+    """
+    source = control_plane_path(duckdb_path)
+    if not source.exists():
+        log.debug("no control-plane store at %s; skipping snapshot", source)
+        yield None
+        return
+    entry = _acquire_control_plane_snapshot(source)
     try:
-        con.execute("SET memory_limit=?", [settings["memory_limit"]])
-        con.execute("SET threads=?", [int(settings["threads"])])
-        con.execute(
-            "SET preserve_insertion_order=?",
-            [settings["preserve_insertion_order"].lower() == "true"],
+        yield entry.path
+    finally:
+        _release_control_plane_snapshot(source, entry)
+
+
+@dataclass
+class _CachedSnapshot:
+    """One copy of the control-plane store, and whether anyone holds it."""
+
+    path: Path
+    signature: tuple[int, int, int, int]
+    busy: bool = False
+
+
+#: At most one *idle* copy is kept per store. Concurrent readers each get their
+#: own file, because DuckDB refuses to attach one file twice in a process
+#: ("Unique file handle conflict") and the cockpit and advisory workers are
+#: separate threads on the same analytical instance. Sequential readers -- the
+#: common case, and the frequent one -- reuse the idle copy instead of writing
+#: a fresh one every few hundred milliseconds.
+_SNAPSHOT_IDLE: dict[str, _CachedSnapshot] = {}
+_SNAPSHOT_DIRS: dict[str, tempfile.TemporaryDirectory] = {}
+_SNAPSHOT_SEQUENCE = itertools.count()
+_SNAPSHOT_GUARD = threading.Lock()
+
+
+def _write_ahead_log(source: Path) -> Path:
+    """DuckDB's WAL for ``source``, whether or not it currently exists."""
+    return source.with_name(source.name + ".wal")
+
+
+def _snapshot_signature(source: Path) -> tuple[int, int, int, int]:
+    """Identify the store's contents, including anything only in the WAL.
+
+    Both files count. DuckDB checkpoints on last close, so an unpinned hub
+    usually has an empty WAL -- but a pinned one, or a co-resident harnessd
+    holding the store, does not, and a signature blind to the WAL would serve a
+    cached copy that is missing every row written since the last checkpoint.
+    """
+    stat = source.stat()
+    wal = _write_ahead_log(source)
+    wal_stat = wal.stat() if wal.exists() else None
+    return (
+        stat.st_mtime_ns,
+        stat.st_size,
+        wal_stat.st_mtime_ns if wal_stat else 0,
+        wal_stat.st_size if wal_stat else 0,
+    )
+
+
+def _copy_store(source: Path, destination: Path) -> None:
+    """Copy the store *and its WAL*, which is where recent rows actually are.
+
+    Measured on DuckDB 1.5.2: with a connection held open, an insert lives
+    entirely in ``<db>.wal``, and a copy of the database file alone yields a
+    database in which the table does not exist. Copying the pair and attaching
+    it ``READ_ONLY`` replays the log and returns the rows.
+    """
+    shutil.copy2(source, destination)
+    wal = _write_ahead_log(source)
+    if wal.exists():
+        shutil.copy2(wal, _write_ahead_log(destination))
+
+
+def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
+    """Return a copy of ``source`` as it is now, marked as in use.
+
+    Reuses the idle copy when the store has not changed since it was taken.
+    Otherwise writes a new one, under the guard on purpose: copying outside it
+    and publishing afterwards would let every concurrent reader copy the same
+    file at once, which is the pile-up this exists to prevent.
+    """
+    key = _path_key(source)
+    signature = _snapshot_signature(source)
+    with _SNAPSHOT_GUARD:
+        idle = _SNAPSHOT_IDLE.get(key)
+        if idle is not None and idle.signature == signature:
+            del _SNAPSHOT_IDLE[key]
+            idle.busy = True
+            return idle
+        if idle is not None:
+            del _SNAPSHOT_IDLE[key]
+            _remove_snapshot(idle)
+
+        directory = _SNAPSHOT_DIRS.get(key)
+        if directory is None:
+            directory = _SNAPSHOT_DIRS[key] = tempfile.TemporaryDirectory(
+                prefix="drover-control-plane-"
+            )
+        fresh = Path(directory.name) / (
+            f"{source.stem}-{next(_SNAPSHOT_SEQUENCE)}{source.suffix}"
         )
-    except Exception:
-        con.close()
-        raise
-    return con
+        _copy_store(source, fresh)
+        return _CachedSnapshot(
+            path=fresh, signature=_snapshot_signature(source), busy=True
+        )
+
+
+def _release_control_plane_snapshot(source: Path, entry: _CachedSnapshot) -> None:
+    """Park the copy for the next reader, or delete it if one is already parked."""
+    key = _path_key(source)
+    entry.busy = False
+    with _SNAPSHOT_GUARD:
+        if key in _SNAPSHOT_IDLE:
+            _remove_snapshot(entry)
+            return
+        _SNAPSHOT_IDLE[key] = entry
+
+
+def _remove_snapshot(entry: _CachedSnapshot) -> None:
+    try:
+        entry.path.unlink(missing_ok=True)
+        _write_ahead_log(entry.path).unlink(missing_ok=True)
+    except OSError:
+        log.debug("failed to remove the control-plane snapshot %s", entry.path)
+
+
+@contextmanager
+def attached_control_plane_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    duckdb_path: str | Path,
+) -> Iterator[None]:
+    """Let one analytical connection read control-plane tables, from a copy.
+
+    Two live queries genuinely join across both worlds and must keep working
+    after the split:
+
+    * ``advisory/worker.py`` -- ``spans_enriched`` JOIN ``bounded_sessions``,
+      which derives from ``harness_sessions``.
+    * ``cockpit/analytics.py`` -- ``harness_sessions`` correlated with span
+      sessions via ``EXISTS (SELECT 1 FROM span_sessions ...)``.
+
+    Their SQL is left exactly as it was. Each control-plane table is exposed as
+    a ``TEMP VIEW`` over the attached copy, and DuckDB resolves the temp
+    catalog first, so ``FROM harness_sessions`` reads the copy. That also
+    shadows the pre-split tables still sitting in ``drover.duckdb``: the
+    migration leaves them in place so a rollback is a restart rather than a
+    data-recovery exercise, and shadowing is what stops a reader silently
+    answering from that frozen copy.
+
+    Temp views belong to one connection, so nothing leaks to another reader,
+    and both they and the attachment are released on the way out.
+
+    The catalog alias is unique per window. ``ATTACH`` is instance-wide rather
+    than per connection, and the cockpit and the advisory worker are two threads
+    on the same analytical instance -- a shared alias would fail the second one
+    with "database with name ... already exists" and then detach the first one's
+    snapshot out from under its query.
+    """
+    with control_plane_snapshot(duckdb_path) as snapshot:
+        if snapshot is None:
+            yield
+            return
+        alias = f"{CONTROL_PLANE_SNAPSHOT_ALIAS}_{next(_SNAPSHOT_SEQUENCE)}"
+        con.execute(f"ATTACH {sql_path_literal(snapshot)} AS {alias} (READ_ONLY)")
+        try:
+            for table in CONTROL_PLANE_TABLES:
+                con.execute(
+                    f"CREATE OR REPLACE TEMP VIEW {table} AS "
+                    f"SELECT * FROM {alias}.{table}"
+                )
+            yield
+        finally:
+            for table in CONTROL_PLANE_TABLES:
+                try:
+                    con.execute(f"DROP VIEW IF EXISTS temp.{table}")
+                except Exception:  # noqa: BLE001 - teardown is best effort
+                    log.debug("failed to drop the temp view for %s", table)
+            try:
+                con.execute(f"DETACH {alias}")
+            except Exception:  # noqa: BLE001 - an interrupted query may have
+                # left the connection unable to run anything; the temp copy is
+                # removed by the TemporaryDirectory either way.
+                log.debug("failed to detach the control-plane snapshot")

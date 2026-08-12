@@ -9,6 +9,7 @@ import pytest
 
 import drover.server.harness.registry as registry_module
 from drover.schema import bootstrap
+from drover.server.db import control_plane_path
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     bootstrap_harness_tables,
@@ -17,10 +18,16 @@ from drover.server.harness.schema import (
 
 
 def _registry(tmp_path):
+    """Return the registry and the path its tables actually live at.
+
+    Since #95 that is the control-plane store, not the lakehouse: the registry
+    resolves it from the lakehouse path it is handed, and the resolution is
+    idempotent, so ``HarnessRegistry`` accepts either.
+    """
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    return HarnessRegistry(duckdb_path), duckdb_path
+    return HarnessRegistry(duckdb_path), control_plane_path(duckdb_path)
 
 
 def test_bootstrap_creates_harness_tables(tmp_path):
@@ -954,7 +961,9 @@ def _session(reg, host_id, *, status, minutes_ago):
     when = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc) - timedelta(
         minutes=minutes_ago
     )
-    with duckdb.connect(str(reg.duckdb_path)) as con:
+    # `control_plane_path`, not `duckdb_path`: the registry's tables live in
+    # the control-plane store since #95.
+    with duckdb.connect(str(reg.control_plane_path)) as con:
         con.execute(
             "UPDATE harness_sessions SET status = ?, updated_at = ? WHERE session_id = ?",
             [status, when, s.session_id],
