@@ -272,6 +272,67 @@ def test_analytics_handles_empty_bootstrapped_lakehouse(tmp_path: Path):
     assert result.coverage.attributable_session_percent == 0.0
 
 
+def test_analytics_materializes_session_facts_once(low_coverage_analytics_db):
+    """One response must not rebuild the Parquet-backed session facts per card."""
+
+    class ObservedConnection:
+        def __init__(self, con):
+            self.con = con
+            self.span_scans = 0
+            self.created_materialization = False
+            self.dropped_materialization = False
+
+        def execute(self, sql, parameters=None):
+            normalized = " ".join(str(sql).lower().split())
+            if "spans_enriched" in normalized:
+                self.span_scans += 1
+            if "create" in normalized and "temp" in normalized:
+                self.created_materialization = True
+            if "drop table" in normalized:
+                self.dropped_materialization = True
+            if parameters is None:
+                return self.con.execute(sql)
+            return self.con.execute(sql, parameters)
+
+    observed = ObservedConnection(low_coverage_analytics_db)
+
+    result = activity_analytics(observed, AnalyticsFilters(days=7))
+
+    assert result.totals.session_count == 3
+    assert observed.span_scans == 1
+    assert observed.created_materialization
+    assert observed.dropped_materialization
+
+
+def test_analytics_removes_materialized_session_facts_after_failure(
+    low_coverage_analytics_db, monkeypatch
+):
+    from drover.server.cockpit import analytics as analytics_module
+
+    dropped = False
+
+    class ObservedConnection:
+        def execute(self, sql, parameters=None):
+            nonlocal dropped
+            if "drop table" in " ".join(str(sql).lower().split()):
+                dropped = True
+            if parameters is None:
+                return low_coverage_analytics_db.execute(sql)
+            return low_coverage_analytics_db.execute(sql, parameters)
+
+    def fail_after_materialization(*_args, **_kwargs):
+        raise RuntimeError("fingerprint failed")
+
+    monkeypatch.setattr(
+        analytics_module, "_snapshot_fingerprint", fail_after_materialization
+    )
+
+    with pytest.raises(RuntimeError, match="fingerprint failed"):
+        activity_analytics(ObservedConnection(), AnalyticsFilters(days=7))
+
+    assert dropped
+
+
 def test_analytics_bounds_harness_sessions_by_latest_activity():
     con = _analytics_connection()
     now = datetime.now(timezone.utc)
