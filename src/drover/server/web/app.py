@@ -1581,8 +1581,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("Pragma", "no-cache")
             self.send_header("Expires", "0")
-        self.end_headers()
         try:
+            self.end_headers()
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
             log.info(
