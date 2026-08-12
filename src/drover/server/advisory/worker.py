@@ -53,7 +53,7 @@ from drover.server.advisory.model_analyzer import (
     ModelFindingError,
 )
 from drover.server.advisory.types import FindingCandidate
-from drover.server.db import open_duckdb_connection
+from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
 from drover.server.ledger import ArtifactSpec, Job, Ledger
 
 log = logging.getLogger("drover.advisory")
@@ -1003,22 +1003,29 @@ def load_operational_snapshot(
         telemetry: tuple[TelemetryAggregate, ...] = ()
         routing: tuple[RoutingAggregate, ...] = ()
         hooks: tuple[HookDescriptor, ...] = ()
-        if analyzer_id in {
-            ConnectorFreshnessAnalyzer.analyzer_id,
-            ProviderResetWindowAnalyzer.analyzer_id,
-        }:
-            providers = _load_provider_facts(con, target_id, analyzed_at)
-        elif analyzer_id in {
-            TelemetryCoverageAnalyzer.analyzer_id,
-            CacheReadEfficiencyAnalyzer.analyzer_id,
-        }:
-            telemetry = _load_telemetry_facts(con, target_id, analyzed_at)
-        elif analyzer_id == RoutingMismatchAnalyzer.analyzer_id:
-            routing = _load_routing_facts(con, target_id, analyzed_at)
-        elif analyzer_id == HookValidityAnalyzer.analyzer_id:
-            hooks = _load_hook_facts(con, target_id, analyzed_at)
-        else:
-            raise ValueError(f"unsupported operational analyzer: {analyzer_id}")
+        # Three of these four fact loaders read control-plane tables --
+        # `harness_sessions` joined to `spans_enriched`, and `harness_hosts`
+        # for the hook descriptors -- which since #95 live in their own
+        # database. This attaches a private copy of that (small) store so the
+        # queries below can stay exactly as they were, without this analytical
+        # reader ever touching the live control-plane file.
+        with attached_control_plane_snapshot(con, Path(duckdb_path)):
+            if analyzer_id in {
+                ConnectorFreshnessAnalyzer.analyzer_id,
+                ProviderResetWindowAnalyzer.analyzer_id,
+            }:
+                providers = _load_provider_facts(con, target_id, analyzed_at)
+            elif analyzer_id in {
+                TelemetryCoverageAnalyzer.analyzer_id,
+                CacheReadEfficiencyAnalyzer.analyzer_id,
+            }:
+                telemetry = _load_telemetry_facts(con, target_id, analyzed_at)
+            elif analyzer_id == RoutingMismatchAnalyzer.analyzer_id:
+                routing = _load_routing_facts(con, target_id, analyzed_at)
+            elif analyzer_id == HookValidityAnalyzer.analyzer_id:
+                hooks = _load_hook_facts(con, target_id, analyzed_at)
+            else:
+                raise ValueError(f"unsupported operational analyzer: {analyzer_id}")
     finally:
         con.close()
     return AnalysisSnapshot(

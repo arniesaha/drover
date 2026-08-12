@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import duckdb
 
-from drover.server.db import control_plane_connection
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import (
@@ -136,10 +136,17 @@ def _rows(
 
 
 class HarnessRegistry:
-    """Small DuckDB-backed registry for Drover command-plane state."""
+    """Small DuckDB-backed registry for Drover command-plane state.
+
+    ``duckdb_path`` is the *lakehouse* path every caller already has; the
+    registry resolves its own store from it (``control_plane_path``) and never
+    opens the lakehouse itself. Passing the control-plane path directly also
+    works -- the resolution is idempotent.
+    """
 
     def __init__(self, duckdb_path: str | Path):
         self.duckdb_path = Path(duckdb_path)
+        self.control_plane_path = control_plane_path(duckdb_path)
 
     @contextmanager
     def _connect(self) -> Iterator[duckdb.DuckDBPyConnection]:
@@ -148,17 +155,22 @@ class HarnessRegistry:
         This registry *is* the control plane -- ``/harness``,
         ``/harness/hosts`` and ``/harness/sessions`` are all calls on it --
         so every window goes through ``control_plane_connection``: its own
-        lock, and on the hub server its own pinned connection, neither of
-        them reachable by an analytical reader (issue #95).
+        database file, its own lock, and on the hub server its own pinned
+        connection, none of them reachable by an analytical reader (#95).
 
-        Windows are still serialized against each other, which is what the
-        process-wide connect lock used to buy here: two threads racing
+        The file is the part that matters. PR #104 gave this path its own lock
+        and the wedge recurred on ``c7900e7`` anyway, because a connection to
+        ``drover.duckdb`` joins ``drover.duckdb``'s DuckDB instance whatever
+        lock opened it -- one scheduler, one buffer manager, one
+        ``memory_limit`` shared with every parquet scan in the process.
+
+        Windows are still serialized against each other: two threads racing
         ``duckdb.connect()`` on one file raise BinderException ("Unique file
         handle conflict"), and DuckDB's Python connection is not safe for
         concurrent use either. Existing ``with self._connect() as con:`` call
         sites work unchanged.
         """
-        with control_plane_connection(self.duckdb_path) as con:
+        with control_plane_connection(self.control_plane_path) as con:
             yield con
 
     def register_host(

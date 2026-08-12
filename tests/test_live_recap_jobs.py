@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 
 from drover.schema import bootstrap
+from drover.server.db import control_plane_path
 from drover.server.harness.recap_jobs import (
     LiveRecap,
     enqueue_live_recap,
@@ -20,7 +21,9 @@ from drover.server.harness.recap_jobs import (
 def _bootstrapped(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     duckdb_path = tmp_path / "recaps.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    return duckdb.connect(str(duckdb_path))
+    # The recap queue lives in the control-plane store since #95: the registry
+    # enqueues in the same transaction as the event that triggered it.
+    return duckdb.connect(str(control_plane_path(duckdb_path)))
 
 
 def test_enqueue_coalesces_to_newest_source_seq(tmp_path: Path) -> None:

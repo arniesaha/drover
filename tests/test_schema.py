@@ -114,10 +114,17 @@ def test_bootstrap_creates_expected_tables(tmp_lakehouse):
 
 
 def test_bootstrap_creates_live_recap_tables(tmp_lakehouse):
-    """A fresh lakehouse persists both recap projections and queued work."""
+    """A fresh lakehouse persists both recap projections and queued work.
+
+    In the control-plane store since #95: ``HarnessRegistry`` enqueues a recap
+    in the same transaction as the event that triggered it, so the queue has to
+    live wherever the events do.
+    """
+    from drover.server.db import control_plane_path
+
     parquet_dir, duckdb_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
     try:
         tables = {
             row[0]
