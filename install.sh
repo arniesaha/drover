@@ -94,6 +94,38 @@ check_existing_install() {
   exit 1
 }
 
+# --- join URL ----------------------------------------------------------------
+# Parsed in the main shell for the same reason validate_explicit_url is: a
+# `fail` inside a command substitution exits only the subshell, so a refusal
+# would print and the install would carry on regardless.
+HUB_ADDRESS="" JOIN_CODE=""
+parse_join_url() {
+  local url="$1" query pair host
+  case "$url" in
+    drover://*) ;;
+    *) fail "join URL must start with drover:// (got: $url)" ;;
+  esac
+  url="${url#drover://}"
+  HUB_ADDRESS="${url%%\?*}"
+  [ -n "$HUB_ADDRESS" ] || fail "join URL has no host"
+  case "$url" in
+    *\?*) query="${url#*\?}" ;;
+    *)    query="" ;;
+  esac
+  # bash 3.2 has no associative arrays, so walk the pairs.
+  local IFS='&'
+  for pair in $query; do
+    case "$pair" in
+      code=*) JOIN_CODE="${pair#code=}" ;;
+    esac
+  done
+  unset IFS
+  [ -n "$JOIN_CODE" ] || fail "join URL has no code parameter"
+  host="${HUB_ADDRESS%%:*}"
+  is_private_address "$host" \
+    || fail "$host is not a private address; refusing to join a public hub"
+}
+
 # --- address -----------------------------------------------------------------
 # Validated in the main shell, deliberately NOT inside resolve_address: that
 # runs in a command substitution, where `fail` exits only the subshell. The
@@ -128,6 +160,7 @@ EOF
 
 check_existing_install
 validate_explicit_url
+[ -n "$JOIN_URL" ] && parse_join_url "$JOIN_URL"
 read -r ADDRESS_KIND ADDRESS <<EOF
 $(resolve_address)
 EOF
@@ -151,7 +184,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     info "  would enable linger so the units survive logout"
   fi
   if [ -n "$JOIN_URL" ]; then
-    info "  would join via $JOIN_URL"
+    # Never echo the code itself: a join one-liner ends up in chat logs and
+    # terminal scrollback often enough to matter, and it is a live credential
+    # until it is redeemed or expires.
+    info "  would join hub $HUB_ADDRESS with a single-use code"
+    info "  would probe reachability, then register as direct or relay"
   else
     info "  would run: drover-server pair"
   fi
@@ -258,23 +295,35 @@ PY
 }
 
 # --- units -------------------------------------------------------------------
+# install_units <mode> <central-url> [extra harnessd args]
+#   mode "fleet" installs the hub and a local harnessd.
+#   mode "join"  installs harnessd only: a joining machine must not start a
+#                second hub, which would give the fleet two control planes.
 install_units() {
+  local mode="$1" central_url="$2" extra="${3:-}"
   local host_id; host_id="$(hostname -s 2>/dev/null || echo drover-host)"
   local bin="$DROVER_HOME/runtime/current/bin"
-  "$bin/python" - "$OS" "$HOME" "$DROVER_HOME" "$host_id" <<'PY'
-import os, sys
+  "$bin/python" - "$OS" "$HOME" "$DROVER_HOME" "$host_id" "$mode" \
+    "$central_url" "$extra" <<'PY'
+import sys
 from pathlib import Path
 from drover.server.service_units import render_launchd, render_systemd, runtime_bin
 
-os_name, home, drover_home, host_id = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+os_name = sys.argv[1]
+home = Path(sys.argv[2])
+drover_home = Path(sys.argv[3])
+host_id, mode, central_url, extra = sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
+
 bin_dir = runtime_bin(drover_home)
 path_entries = [str(bin_dir), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
 
-jobs = [
-    ("server", str(bin_dir / "drover-server"), ["run"]),
-    ("harnessd", str(bin_dir / "drover-harnessd"),
-     ["--host-id", host_id, "--central-url", "http://127.0.0.1:7080"]),
-]
+harnessd_args = ["--host-id", host_id, "--central-url", central_url]
+harnessd_args += [part for part in extra.split() if part]
+
+jobs = [("harnessd", str(bin_dir / "drover-harnessd"), harnessd_args)]
+if mode == "fleet":
+    jobs.insert(0, ("server", str(bin_dir / "drover-server"), ["run"]))
+
 if os_name == "darwin":
     target = home / "Library" / "LaunchAgents"
     target.mkdir(parents=True, exist_ok=True)
@@ -295,21 +344,97 @@ else:
         print(str(target / f"drover-{short}.service"))
 PY
 
+  local shorts="harnessd"
+  [ "$mode" = "fleet" ] && shorts="server harnessd"
+
   if [ "$OS" = "darwin" ]; then
-    local label
-    for label in com.drover.server com.drover.harnessd; do
-      launchctl unload "$HOME/Library/LaunchAgents/$label.plist" 2>/dev/null || true
-      launchctl load -w "$HOME/Library/LaunchAgents/$label.plist" 2>/dev/null || true
+    local short
+    for short in $shorts; do
+      local plist="$HOME/Library/LaunchAgents/com.drover.$short.plist"
+      launchctl unload "$plist" 2>/dev/null || true
+      launchctl load -w "$plist" 2>/dev/null || true
     done
   else
     # Without lingering, user units stop at logout and never come back after a
     # reboot, which is the difference between a fleet host and a laptop.
     loginctl enable-linger "$USER" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable --now drover-server.service drover-harnessd.service \
-      2>/dev/null || true
+    local short
+    for short in $shorts; do
+      systemctl --user enable --now "drover-$short.service" 2>/dev/null || true
+    done
   fi
   success "services installed and started"
+}
+
+# --- join --------------------------------------------------------------------
+# Probe first, redeem second. The probe deliberately does not burn the code,
+# so a machine that turns out to be unreachable can be retried without asking
+# the hub for a fresh one.
+join_fleet() {
+  local host_id local_addr probe_body reachable listen_args paired token
+  host_id="$(hostname -s 2>/dev/null || echo drover-host)"
+  read -r _kind local_addr <<EOF
+$(detect_address)
+EOF
+  local_addr="${local_addr%%:*}"
+
+  info "asking the hub whether it can reach this machine..."
+  # 7081 is harnessd's own port. If something is already listening there --
+  # a re-run, or --adopt over an existing install -- it is already a better
+  # answer to the probe than a throwaway server, and starting one would
+  # either fail to bind or fight the daemon. Only start one if the port is
+  # free, and only ever kill the pid we started ourselves.
+  local probe_pid=""
+  if lsof -nP -iTCP:7081 -sTCP:LISTEN >/dev/null 2>&1; then
+    info "  something already answers on :7081; probing that"
+  else
+    "$DROVER_HOME/runtime/current/bin/python" -m http.server 7081 --bind 0.0.0.0 \
+      >/dev/null 2>&1 &
+    probe_pid=$!
+    sleep 1
+  fi
+  probe_body="$(curl -fsS --max-time 15 -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"code\":\"$JOIN_CODE\",\"url\":\"http://${local_addr}:7081\"}" \
+    "http://${HUB_ADDRESS}/harness/probe" 2>/dev/null || echo '')"
+  if [ -n "$probe_pid" ]; then
+    kill "$probe_pid" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+  fi
+
+  case "$probe_body" in
+    *'"reachable": true'*|*'"reachable":true'*) reachable=1 ;;
+    *) reachable=0 ;;
+  esac
+
+  if [ "$reachable" -eq 1 ]; then
+    success "hub can reach this machine; registering as a direct host"
+    listen_args="--listen 0.0.0.0:7081 --local-url http://${local_addr}:7081"
+  else
+    success "hub cannot reach this machine; registering as a relay host"
+    listen_args="--relay"
+  fi
+
+  info "redeeming the pairing code..."
+  paired="$(curl -fsS --max-time 15 -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"code\":\"$JOIN_CODE\",\"device_name\":\"$host_id\"}" \
+    "http://${HUB_ADDRESS}/auth/pair" 2>/dev/null || echo '')"
+  [ -n "$paired" ] || fail \
+    "the hub refused the pairing code (expired, already used, or throttled). Ask for a fresh one with: drover-server pair-host --name $host_id"
+
+  token="$(printf '%s' "$paired" \
+    | "$DROVER_HOME/runtime/current/bin/python" -c \
+      'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null || echo '')"
+  [ -n "$token" ] || fail "the hub's pairing response was not understood"
+
+  ( umask 077; printf '%s\n' "$token" > "$DROVER_HOME/api_token" )
+  success "host credential stored"
+
+  # Rewrite the harnessd unit with the connection mode the probe chose.
+  install_units "$listen_args" "http://${HUB_ADDRESS}"
+  success "joined $HUB_ADDRESS as $host_id"
 }
 
 wait_for_health() {
@@ -327,18 +452,22 @@ ensure_uv
 VERSION="$(resolve_version)"
 info "  version:   $VERSION"
 install_runtime "$VERSION"
-write_config "$ADDRESS"
-install_units
-
-if wait_for_health; then
-  success "drover-server is up"
-else
-  warn "drover-server did not answer /healthz yet; check the logs before pairing"
-fi
 
 if [ -n "$JOIN_URL" ]; then
-  join_fleet "$JOIN_URL"
+  # A joining machine runs harnessd only and never writes a server config:
+  # its control plane is the hub it is joining.
+  join_fleet
+  echo
+  info "This machine is now part of the fleet at $HUB_ADDRESS."
+  info "It will appear in the app shortly."
 else
+  write_config "$ADDRESS"
+  install_units fleet "http://127.0.0.1:7080"
+  if wait_for_health; then
+    success "drover-server is up"
+  else
+    warn "drover-server did not answer /healthz yet; check the logs before pairing"
+  fi
   echo
   "$DROVER_HOME/runtime/current/bin/drover-server" pair || true
 fi
