@@ -28,12 +28,30 @@ def test_public_pr_workflows_stay_github_hosted() -> None:
     assert "workflow_dispatch" in python_ci["on"]
 
 
-def test_trusted_workflow_has_no_pull_request_trigger() -> None:
+def test_trusted_workflow_never_runs_untrusted_code() -> None:
+    """The self-hosted runner must never execute code from an unmerged PR.
+
+    That runner is the Mac mini hosting the live fleet, so a `pull_request`
+    trigger would run arbitrary contributor code beside the hub, its DuckDB
+    store and the API token. `pull_request_target` is worse still -- it runs
+    with repository secrets -- so both are barred.
+
+    The allowed triggers are asserted as a *subset* rather than an exact set:
+    which of them are wired up is an operational choice (the workflow moved
+    to manual-only so a full pytest and Xcode build would stop landing on the
+    fleet host after every merge), whereas never running untrusted code is
+    the invariant.
+    """
     workflow = load_workflow("trusted-mac.yml")
 
     assert workflow["permissions"] == {"contents": "read"}
-    assert set(workflow["on"]) == {"push", "workflow_dispatch"}
-    assert workflow["on"]["push"]["branches"] == ["main"]
+    triggers = set(workflow["on"])
+    assert "pull_request" not in triggers
+    assert "pull_request_target" not in triggers
+    assert triggers <= {"push", "workflow_dispatch"}
+    assert triggers, "the workflow must remain runnable somehow"
+    if "push" in triggers:
+        assert workflow["on"]["push"]["branches"] == ["main"]
     assert "${{ github.ref }}" in workflow["concurrency"]["group"]
     for job in workflow["jobs"].values():
         assert job["runs-on"] == TRUSTED_RUNNER

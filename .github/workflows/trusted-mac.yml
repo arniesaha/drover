@@ -1,8 +1,25 @@
 name: Trusted Mac verification
 
+# Manual only. This runner is the Mac mini that hosts the live fleet -- the
+# hub, harnessd and the DuckDB store all share its 16GB. A run here is a full
+# pytest suite plus an Xcode build, measured at 14.5-20.5 minutes at ~1.3GB
+# RSS, and firing it on every merge is enough to starve the hub: on
+# 2026-08-11 seven merges put ~90 minutes of that load on the host and
+# /harness went from sub-millisecond to 22-second stalls and 30s timeouts
+# while /healthz stayed fast.
+#
+# Nothing is lost by making this manual. The merge gate is
+# ["build-and-test", "Build and test iOS app"], which come from ci.yml
+# (ubuntu-latest) and ios.yml (macos-15) -- both GitHub-hosted, neither
+# touching this machine. This workflow has never been a required check; it
+# adds real-ARM64 and real-toolchain coverage on top, which is worth having
+# deliberately rather than reflexively.
+#
+#   gh workflow run "Trusted Mac verification" --ref main
+#
+# Run it after a batch of merges, before a release, or when a change is
+# plausibly platform-sensitive -- not once per PR.
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
