@@ -114,3 +114,63 @@ def test_session_cookie_value_flags():
     assert "SameSite=Strict" in header
     assert "Path=/" in header
     assert f"Max-Age={a.session_ttl_seconds}" in header
+
+
+def test_config_has_legacy_token_and_advertised_url_defaults():
+    cfg = default_config()
+    assert cfg.auth_legacy_token_enabled is True
+    assert cfg.server_advertised_url == ""
+
+
+def test_load_auth_attaches_a_credential_store(monkeypatch, tmp_path):
+    monkeypatch.delenv("DROVER_API_TOKEN", raising=False)
+    settings = load_auth(default_config(), token_home=tmp_path)
+    assert settings.credentials is not None
+    assert (tmp_path / "credentials.json").exists()
+
+
+def test_device_token_authorizes_like_the_cluster_token(tmp_path):
+    from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
+
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    _, token = store.issue(scope="device", label="Phone")
+    settings = _auth(credentials=store)
+
+    assert request_authorized(settings, _Headers({"Authorization": f"Bearer {token}"}))
+
+
+def test_revoked_device_token_is_refused(tmp_path):
+    from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
+
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    credential, token = store.issue(scope="device", label="Phone")
+    store.revoke(credential.id)
+    settings = _auth(credentials=store)
+
+    assert not request_authorized(
+        settings, _Headers({"Authorization": f"Bearer {token}"})
+    )
+
+
+def test_legacy_token_can_be_switched_off(tmp_path):
+    from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
+
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    _, token = store.issue(scope="device", label="Phone")
+    settings = _auth(credentials=store, legacy_token_enabled=False)
+
+    assert not request_authorized(
+        settings, _Headers({"Authorization": "Bearer test-token"})
+    )
+    assert request_authorized(settings, _Headers({"Authorization": f"Bearer {token}"}))
+
+
+def test_using_a_device_token_records_last_used(tmp_path):
+    from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
+
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    _, token = store.issue(scope="device", label="Phone")
+    settings = _auth(credentials=store)
+
+    request_authorized(settings, _Headers({"Authorization": f"Bearer {token}"}))
+    assert store.list_all()[0].last_used_at is not None

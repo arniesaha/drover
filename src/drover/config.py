@@ -119,6 +119,12 @@ class DroverConfig:
     # DROVER_API_TOKEN env > this field > auto-generated ~/.drover/api_token.
     auth_enabled: bool
     auth_api_token: str
+    # False stops accepting the one shared cluster token, leaving only
+    # per-device credentials. Defaults true so upgrading never locks anyone out.
+    auth_legacy_token_enabled: bool
+    # Address the pairing QR points clients at. Empty means "not configured";
+    # the installer writes the detected private address here.
+    server_advertised_url: str
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     harness_favorite_cwds: tuple[str, ...]
@@ -143,6 +149,7 @@ _DEFAULTS = {
         "otlp_grpc_port": 4317,
         "mcp_http_port": 7077,
         "metrics_http_port": 7080,
+        "advertised_url": "",
     },
     "agent": {
         "agent_id": "unknown-agent",
@@ -187,6 +194,7 @@ _DEFAULTS = {
     "auth": {
         "enabled": True,
         "api_token": "",
+        "legacy_token_enabled": True,
     },
     "harness": {
         "favorite_cwds": [],
@@ -274,6 +282,8 @@ def _from_dict(d: dict) -> DroverConfig:
         redis_jobs_high_water=int(j["high_water"]),
         auth_enabled=bool(d["auth"]["enabled"]),
         auth_api_token=d["auth"]["api_token"],
+        auth_legacy_token_enabled=bool(d["auth"]["legacy_token_enabled"]),
+        server_advertised_url=str(d["server"]["advertised_url"]),
         harness_favorite_cwds=tuple(
             str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
         ),
