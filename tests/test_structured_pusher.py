@@ -5,6 +5,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
 
+from drover.server.harness.daemon import (
+    reset_undelivered_event_count,
+    undelivered_event_count,
+)
+from drover.server.harness.structured import pusher as pusher_module
 from drover.server.harness.structured.pusher import EventPusher
 
 
@@ -221,3 +226,61 @@ def test_pusher_stop_drops_with_counts_only_line_when_central_stays_down(capfd):
     assert "dropping 1 undelivered events at shutdown" in stderr
     assert "sensitive text" not in stderr
     assert "secret-token" not in stderr
+
+
+def test_pusher_keeps_a_batch_that_outlived_its_retry_attempts(monkeypatch):
+    # Issue #99: ten events vanished mid-stream while the session kept
+    # running. An outage longer than one cycle's attempts used to discard the
+    # batch permanently, so the hub's copy of the transcript grew a hole
+    # nothing could ever fill. The batch must survive to the next cycle and go
+    # out when central comes back -- without stop() being what rescues it.
+    monkeypatch.setattr(pusher_module, "_RETRY_BACKOFF_SECONDS", 0.0)
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        _FakeCentralHandler.failing = True
+        pusher = EventPusher(
+            f"http://127.0.0.1:{port}", "secret-token", batch_interval=0.05
+        )
+        pusher.start()
+        pusher.push("s1", {"event_id": "e1", "type": "assistant_output", "payload": {}})
+        assert _wait_until(
+            lambda: len(_FakeCentralHandler.requests) >= pusher_module._MAX_ATTEMPTS,
+            timeout=5.0,
+        )
+        exhausted = len(_FakeCentralHandler.requests)
+        _FakeCentralHandler.failing = False
+        delivered = _wait_until(
+            lambda: len(_FakeCentralHandler.requests) > exhausted, timeout=5.0
+        )
+        last = _FakeCentralHandler.requests[-1]
+        pusher.stop()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert delivered
+    assert [event["event_id"] for event in last["body"]["events"]] == ["e1"]
+
+
+def test_pusher_counts_events_it_can_never_deliver(capfd):
+    # The loss in #99 was invisible: drover_harness_dropped_events_total sat
+    # at 0 because it only covers registry writes, and nothing counted the
+    # push path at all. Whatever the pusher genuinely cannot hand over must
+    # move a counter.
+    reset_undelivered_event_count()
+    # A port with no listener, so every POST fails fast.
+    probe = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCentralHandler)
+    port = probe.server_address[1]
+    probe.server_close()
+
+    pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token", batch_interval=0.1)
+    pusher.start()
+    pusher.push("s1", {"event_id": "e1", "type": "assistant_output", "payload": {}})
+    pusher.push("s1", {"event_id": "e2", "type": "assistant_output", "payload": {}})
+    sleep(0.3)  # let the worker attempt delivery and enter its backoff
+    pusher.stop()
+    capfd.readouterr()
+
+    assert undelivered_event_count() == 2
+    reset_undelivered_event_count()
