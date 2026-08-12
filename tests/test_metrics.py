@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import drover.server.harness.registry as registry_module
 from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server import metrics
@@ -42,6 +43,7 @@ from drover.server.harness.daemon import (
 )
 from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.pty import PtySessionManager
+from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import (
     OPCODE_PING,
@@ -3499,8 +3501,10 @@ def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(tmp_path
         ).fetchone() == (12,)
 
 
-def test_split_db_completion_before_session_create_is_reconciled_once(tmp_path):
-    """An EventPusher completion may beat the central create-response sync."""
+def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
+    tmp_path, monkeypatch
+):
+    """Removing the worker orphan-reconcile poll permanently loses the newest recap."""
     collector = _make_collector(tmp_path)
     registry = HarnessRegistry(collector.duckdb_path)
     event = {
@@ -3514,6 +3518,17 @@ def test_split_db_completion_before_session_create_is_reconciled_once(tmp_path):
         "turn_id": "turn-race",
         "ts": "2026-07-06T00:00:23+00:00",
     }
+    older_event = {
+        "event_id": "harness-event-race-7",
+        "session_id": "harness-race",
+        "seq": 7,
+        "type": "status",
+        "role": "system",
+        "text": "older turn complete",
+        "payload": {"turn_complete": True, "awaiting": "input"},
+        "turn_id": "turn-older",
+        "ts": "2026-07-06T00:00:07+00:00",
+    }
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3521,10 +3536,10 @@ def test_split_db_completion_before_session_create_is_reconciled_once(tmp_path):
         port = server.server_address[1]
         status, body = _json_request(
             f"http://127.0.0.1:{port}/harness/events",
-            payload={"events": [event]},
+            payload={"events": [older_event, event]},
         )
         assert status == 200
-        assert body == {"ingested": 1}
+        assert body == {"ingested": 2}
         with duckdb.connect(str(collector.duckdb_path)) as con:
             assert con.execute(
                 "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
@@ -3540,29 +3555,41 @@ def test_split_db_completion_before_session_create_is_reconciled_once(tmp_path):
                 "mode": "structured",
             }
         )
+        real_enqueue = registry_module.enqueue_live_recap
+        attempts = 0
+
+        def unavailable_once(con, session_id, source_seq):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("queue temporarily unavailable")
+            return real_enqueue(con, session_id, source_seq)
+
+        monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable_once)
         collector._sync_created_harness_session(
             "nas", {"harness": "codex", "mode": "structured"}, response_body
         )
 
-        status, body = _json_request(
-            f"http://127.0.0.1:{port}/harness/events",
-            payload={"events": [event]},
-        )
-        assert status == 200
-        assert body == {"ingested": 0}
-        collector._sync_created_harness_session(
-            "nas", {"harness": "codex", "mode": "structured"}, response_body
-        )
+        assert registry.get_session("harness-race") is not None
+        with duckdb.connect(str(collector.duckdb_path)) as con:
+            assert con.execute(
+                "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
+                ["harness-race"],
+            ).fetchone() == (0,)
+
+        # drain_once is the production worker loop's scheduled retry boundary.
+        # No backend is needed to prove queue recovery: generation moves the
+        # recovered row to retry_wait after reporting its missing backend.
+        assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 1
     finally:
         server.shutdown()
 
-    assert registry.get_session("harness-race") is not None
     with duckdb.connect(str(collector.duckdb_path)) as con:
         assert con.execute(
-            "SELECT desired_source_seq, count(*) FROM live_recap_jobs "
-            "WHERE session_id = ? GROUP BY desired_source_seq",
+            "SELECT desired_source_seq, status, count(*) FROM live_recap_jobs "
+            "WHERE session_id = ? GROUP BY desired_source_seq, status",
             ["harness-race"],
-        ).fetchone() == (23, 1)
+        ).fetchone() == (23, "retry_wait", 1)
 
 
 def _event(seq: int, text: str) -> dict:

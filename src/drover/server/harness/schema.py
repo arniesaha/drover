@@ -164,6 +164,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "permission_mode": "VARCHAR",
             "model": "VARCHAR",
             "thinking_effort": "VARCHAR",
+            "recap_reconcile_needed": "BOOLEAN DEFAULT FALSE",
         },
     )
     con.execute(_HARNESS_EVENTS_DDL)

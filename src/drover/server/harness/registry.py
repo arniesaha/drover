@@ -65,6 +65,10 @@ def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
     return isinstance(inner, dict) and inner.get("turn_complete") is True
 
 
+def _supports_live_recaps(mode: str | None, harness: str) -> bool:
+    return mode == "structured" or (mode is None and harness != "shell")
+
+
 def _enqueue_recap_if_completion(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -72,7 +76,7 @@ def _enqueue_recap_if_completion(
     event_type: str,
     payload: dict[str, Any] | None,
     seq: int | None,
-) -> None:
+) -> bool:
     """Queue a recap only for a completed turn from a structured session."""
     if (
         event_type != "status"
@@ -81,22 +85,22 @@ def _enqueue_recap_if_completion(
         or not isinstance(seq, int)
         or isinstance(seq, bool)
     ):
-        return
+        return False
     session = con.execute(
         "SELECT mode, harness FROM harness_sessions WHERE session_id = ?",
         [session_id],
     ).fetchone()
     if session is None:
-        return
+        return False
     mode, harness = session
-    if mode != "structured" and not (mode is None and harness != "shell"):
-        return
-    enqueue_live_recap(con, session_id, seq)
+    if not _supports_live_recaps(mode, harness):
+        return False
+    return enqueue_live_recap(con, session_id, seq)
 
 
 def _enqueue_latest_stored_completion(
     con: duckdb.DuckDBPyConnection, session_id: str
-) -> None:
+) -> bool:
     """Recover the newest completion that arrived before session metadata."""
     rows = con.execute(
         """SELECT payload_json, seq
@@ -112,14 +116,14 @@ def _enqueue_latest_stored_completion(
             continue
         if not isinstance(payload, dict) or not _is_turn_completion_payload(payload):
             continue
-        _enqueue_recap_if_completion(
+        return _enqueue_recap_if_completion(
             con,
             session_id=session_id,
             event_type="status",
             payload=payload,
             seq=seq,
         )
-        return
+    return False
 
 
 def _rows(
@@ -258,9 +262,10 @@ class HarnessRegistry:
                       session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
                       command, status, started_at, updated_at, native_session_id,
                       native_resume_label, source_session_id, handoff_mode, mode,
-                      permission_mode, model, thinking_effort
+                      permission_mode, model, thinking_effort,
+                      recap_reconcile_needed
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         session_id,
@@ -282,9 +287,21 @@ class HarnessRegistry:
                         permission_mode,
                         model,
                         thinking_effort,
+                        _supports_live_recaps(mode, harness),
                     ],
                 )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+            con.execute("BEGIN TRANSACTION")
+            try:
                 _enqueue_latest_stored_completion(con, session_id)
+                con.execute(
+                    "UPDATE harness_sessions SET recap_reconcile_needed = FALSE "
+                    "WHERE session_id = ?",
+                    [session_id],
+                )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -302,6 +319,34 @@ class HarnessRegistry:
                 [session_id],
             )
         return HarnessSession.from_row(rows[0]) if rows else None
+
+    def reconcile_orphan_completions(self, *, limit: int = 100) -> int:
+        """Retry derived recap reconciliation left pending by session creation."""
+        with self._connect() as con:
+            con.execute("BEGIN TRANSACTION")
+            try:
+                rows = con.execute(
+                    """SELECT s.session_id
+                         FROM harness_sessions s
+                        WHERE s.recap_reconcile_needed
+                        ORDER BY s.updated_at, s.session_id
+                        LIMIT ?""",
+                    [max(1, int(limit))],
+                ).fetchall()
+                enqueued = 0
+                for (session_id,) in rows:
+                    enqueued += _enqueue_latest_stored_completion(con, str(session_id))
+                    con.execute(
+                        "UPDATE harness_sessions "
+                        "SET recap_reconcile_needed = FALSE "
+                        "WHERE session_id = ?",
+                        [session_id],
+                    )
+                con.execute("COMMIT")
+                return enqueued
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
 
     def list_sessions(
         self,

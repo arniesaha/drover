@@ -16,6 +16,7 @@ from drover.server.harness.recap_prompt import (
     build_live_recap_prompt,
     normalize_live_recap,
 )
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.jobs import Delivery
 from drover.server.summarizer.backends import (
     BackendError,
@@ -94,6 +95,7 @@ class LiveRecapWorker:
 
     def drain_once(self) -> int:
         """Process one recap generation, returning one when a delivery was handled."""
+        HarnessRegistry(self.duckdb_path).reconcile_orphan_completions()
         self._flush_publications()
         claim = self._claim_stream_job() if self.job_stream is not None else None
         if claim is None:

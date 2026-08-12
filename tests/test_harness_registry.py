@@ -657,10 +657,10 @@ def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
     assert _recap_job(duckdb_path, "s1") == (12,)
 
 
-def test_session_materialization_rolls_back_when_orphan_recap_enqueue_fails(
+def test_session_materialization_survives_when_orphan_recap_enqueue_fails(
     tmp_path, monkeypatch
 ):
-    """Session creation and orphan-completion recovery are one transaction."""
+    """A derived recap queue failure must not roll back the core session row."""
     registry, duckdb_path = _registry(tmp_path)
     registry.append_event(
         event_id="e12",
@@ -684,7 +684,7 @@ def test_session_materialization_rolls_back_when_orphan_recap_enqueue_fails(
             mode="structured",
         )
 
-    assert registry.get_session("s1") is None
+    assert registry.get_session("s1") is not None
     assert registry.get_event("e12") is not None
     assert _recap_job(duckdb_path, "s1") is None
 
