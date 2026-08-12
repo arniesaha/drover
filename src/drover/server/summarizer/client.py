@@ -34,6 +34,7 @@ ACTIVE_BRIEF_REQUIRED_KEYS = (
     "suggested_next",
 )
 ACTIVE_BRIEF_OPTIONAL_KEYS = ("files_touched", "open_blockers")
+LIVE_RECAP_REQUIRED_KEYS = ("recap",)
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _OPEN_FENCE_RE = re.compile(r"^```(?:json)?\s*", re.DOTALL)
@@ -49,6 +50,7 @@ _STRING_FIELDS = {
     "current_objective",
     "suggested_next",
     "open_blockers",
+    "recap",
 }
 _STRING_LIST_FIELDS = {"open_questions", "key_files", "files_touched"}
 

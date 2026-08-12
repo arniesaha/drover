@@ -345,6 +345,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     public var cwd: String?
     public var lastActivity: Date?
     public var preview: String?
+    public var recap: String?
+    public var recapSourceSeq: Int?
     public var startedAt: Date?
     public var updatedAt: Date?
     public var endedAt: Date?
@@ -361,6 +363,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         cwd: String?,
         lastActivity: Date?,
         preview: String? = nil,
+        recap: String? = nil,
+        recapSourceSeq: Int? = nil,
         startedAt: Date? = nil,
         updatedAt: Date? = nil,
         endedAt: Date? = nil,
@@ -376,6 +380,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         self.cwd = cwd
         self.lastActivity = lastActivity
         self.preview = preview
+        self.recap = recap
+        self.recapSourceSeq = recapSourceSeq
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.endedAt = endedAt
@@ -393,6 +399,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         case cwd
         case lastActivity = "last_activity"
         case preview
+        case recap
+        case recapSourceSeq = "recap_source_seq"
         case startedAt = "started_at"
         case updatedAt = "updated_at"
         case endedAt = "ended_at"
@@ -412,6 +420,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         let rawDate = try? container.decode(String.self, forKey: .lastActivity)
         lastActivity = WireDate.parse(rawDate)
         preview = try? container.decode(String.self, forKey: .preview)
+        recap = try? container.decode(String.self, forKey: .recap)
+        recapSourceSeq = try? container.decode(Int.self, forKey: .recapSourceSeq)
         let rawStartedAt = try? container.decode(String.self, forKey: .startedAt)
         startedAt = WireDate.parse(rawStartedAt)
         let rawUpdatedAt = try? container.decode(String.self, forKey: .updatedAt)

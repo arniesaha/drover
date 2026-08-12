@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from drover.server.harness.structured.codex import CodexDriver, default_command
+from drover.server.harness.structured.codex import (
+    CodexDriver,
+    default_command,
+    resolve_effective_context_window,
+)
 
 FIXTURES_DIR = Path("tests/fixtures/structured")
 CODEX_FIXTURES = [
@@ -64,9 +68,63 @@ print(json.dumps({"type": "turn.completed", "usage": {}}), flush=True)
 
 FAIL_CODEX = "import sys; sys.exit(3)"
 
+WINDOW_CODEX = """
+import json
+print(json.dumps({"type": "turn.completed", "usage": {}}), flush=True)
+"""
+
 
 def _driver(sink: list) -> CodexDriver:
     return CodexDriver(["true"], None, sink.append)
+
+
+def _write_models_cache(
+    codex_home: Path,
+    *,
+    slug: str = "gpt-5.6-sol",
+    window: int | float | str = 272_000,
+    percent: int | float | str = 95,
+) -> None:
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": slug,
+                        "context_window": window,
+                        # This intentionally differs from context_window: the
+                        # API maximum is not the runtime-effective limit.
+                        "max_context_window": 1_000_000,
+                        "effective_context_window_percent": percent,
+                    }
+                ]
+            }
+        )
+    )
+
+
+def _driver_with_window_resolver(resolver, sink: list) -> CodexDriver:
+    return CodexDriver(
+        [sys.executable, "-c", WINDOW_CODEX],
+        None,
+        sink.append,
+        context_window_resolver=resolver,
+    )
+
+
+def _emitted_turn_complete(messages: list):
+    _wait_for(
+        messages,
+        lambda emitted: any(
+            message.type == "status" and message.payload.get("turn_complete")
+            for message in emitted
+        ),
+    )
+    return next(
+        message
+        for message in messages
+        if message.type == "status" and message.payload.get("turn_complete")
+    )
 
 
 def _wait_for(got: list, predicate, timeout: float = 10.0) -> None:
@@ -88,6 +146,109 @@ def test_default_command_uses_binary():
 def test_default_command_falls_back_to_which(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda name: None)
     assert default_command(None) == ["codex"]
+
+
+# -- runtime-effective context window ---------------------------------------
+
+
+def test_context_window_resolver_applies_effective_percentage(tmp_path):
+    _write_models_cache(tmp_path)
+
+    assert (
+        resolve_effective_context_window("gpt-5.6-sol", codex_home=tmp_path) == 258_400
+    )
+
+
+def test_context_window_resolver_uses_codex_home_environment(tmp_path, monkeypatch):
+    _write_models_cache(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    assert resolve_effective_context_window("gpt-5.6-sol") == 258_400
+
+
+@pytest.mark.parametrize(
+    ("cache_contents", "model"),
+    [
+        (None, "gpt-5.6-sol"),
+        ("not valid json", "gpt-5.6-sol"),
+        (json.dumps({"models": []}), "gpt-5.6-sol"),
+        (json.dumps({"models": [{"slug": "gpt-5.6-sol"}]}), "gpt-5.6-sol"),
+        (json.dumps({"models": []}), None),
+    ],
+)
+def test_context_window_resolver_degrades_for_unavailable_or_invalid_catalog(
+    tmp_path, cache_contents, model
+):
+    if cache_contents is not None:
+        (tmp_path / "models_cache.json").write_text(cache_contents)
+
+    assert resolve_effective_context_window(model, codex_home=tmp_path) is None
+
+
+def test_context_window_resolver_accepts_numeric_catalog_strings(tmp_path):
+    _write_models_cache(tmp_path, window="272000", percent="95")
+
+    assert (
+        resolve_effective_context_window("gpt-5.6-sol", codex_home=tmp_path) == 258_400
+    )
+
+
+@pytest.mark.parametrize(
+    ("window", "percent"),
+    [
+        ("not-a-number", 95),
+        (272_000, "not-a-number"),
+        (True, 95),
+        (-272_000, 95),
+        (272_000, 0),
+        (272_000, 101),
+    ],
+)
+def test_context_window_resolver_rejects_invalid_catalog_numbers(
+    tmp_path, window, percent
+):
+    _write_models_cache(tmp_path, window=window, percent=percent)
+
+    assert resolve_effective_context_window("gpt-5.6-sol", codex_home=tmp_path) is None
+
+
+def test_turn_completed_carries_model_and_effective_window():
+    emitted: list = []
+    driver = _driver_with_window_resolver(lambda model: 258_400, emitted)
+
+    driver.send_turn("inspect", "t1", model="gpt-5.6-sol")
+    message = _emitted_turn_complete(emitted)
+
+    assert message.payload["model"] == "gpt-5.6-sol"
+    assert message.payload["model_context_window"] == 258_400
+    driver.close()
+
+
+def test_turn_completed_keeps_model_when_window_is_unavailable():
+    emitted: list = []
+    driver = _driver_with_window_resolver(lambda model: None, emitted)
+
+    driver.send_turn("inspect", "t1", model="gpt-5.6-sol")
+    message = _emitted_turn_complete(emitted)
+
+    assert message.payload["model"] == "gpt-5.6-sol"
+    assert "model_context_window" not in message.payload
+    driver.close()
+
+
+def test_turn_completed_without_model_degrades_without_failing_turn():
+    emitted: list = []
+    driver = _driver_with_window_resolver(
+        lambda model: pytest.fail("a missing model must not invoke the resolver"),
+        emitted,
+    )
+
+    driver.send_turn("inspect", "t1")
+    message = _emitted_turn_complete(emitted)
+
+    assert "model" not in message.payload
+    assert "model_context_window" not in message.payload
+    driver.close()
 
 
 def test_restored_driver_resumes_native_thread_on_first_turn():

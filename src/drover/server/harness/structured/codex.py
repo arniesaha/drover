@@ -35,11 +35,14 @@ supersede):
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
 import subprocess
 import threading
 from collections import deque
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 from drover.server.harness.structured.driver import EmitFn, StructuredMessage
 
@@ -48,6 +51,49 @@ _STDERR_TAIL_LINES = 20
 
 def default_command(binary: str | None = None) -> list[str]:
     return [binary or shutil.which("codex") or "codex"]
+
+
+def _catalog_number(value: Any) -> float | None:
+    """Return a finite catalog number, rejecting booleans and malformed values."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def resolve_effective_context_window(
+    model: str | None, *, codex_home: Path | None = None
+) -> int | None:
+    """Resolve Codex's runtime context limit from its local model catalog."""
+    if not model:
+        return None
+    home = codex_home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        catalog = json.loads((home / "models_cache.json").read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return None
+    for entry in models:
+        if not isinstance(entry, dict) or entry.get("slug") != model:
+            continue
+        context_window = _catalog_number(entry.get("context_window"))
+        effective_percent = _catalog_number(
+            entry.get("effective_context_window_percent")
+        )
+        if (
+            context_window is None
+            or context_window <= 0
+            or effective_percent is None
+            or not 0 < effective_percent <= 100
+        ):
+            return None
+        return round(context_window * effective_percent / 100)
+    return None
 
 
 class CodexDriver:
@@ -60,11 +106,15 @@ class CodexDriver:
         emit: EmitFn,
         *,
         native_session_id: str | None = None,
+        context_window_resolver: Callable[[str | None], int | None] | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.emit = emit
         self._thread_id = native_session_id
+        self._context_window_resolver = (
+            context_window_resolver or resolve_effective_context_window
+        )
         # _turn_lock guards _turn_active/_turn_process/_turn_thread. A turn
         # is "in flight" from send_turn setting _turn_active (under the
         # lock) until the worker's finally clears it -- never inferred from
@@ -77,6 +127,7 @@ class CodexDriver:
         self._turn_active = False
         self._turn_process: subprocess.Popen[str] | None = None
         self._turn_thread: threading.Thread | None = None
+        self._turn_model: str | None = None
         self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._closed = False
 
@@ -142,17 +193,24 @@ class CodexDriver:
             if self._closed:
                 raise RuntimeError("driver is closed")
             self._stderr_tail.clear()
-            process = subprocess.Popen(
-                self._argv_for(text, model=model, thinking_effort=thinking_effort),
-                cwd=self.cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
+            self._turn_model = model
+            try:
+                process = subprocess.Popen(
+                    self._argv_for(text, model=model, thinking_effort=thinking_effort),
+                    cwd=self.cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            except Exception:
+                self._turn_model = None
+                raise
             worker = threading.Thread(
-                target=self._run_turn, args=(process, turn_id), daemon=True
+                target=self._run_turn,
+                args=(process, turn_id, self._turn_model),
+                daemon=True,
             )
             self._turn_active = True
             self._turn_process = process
@@ -195,13 +253,16 @@ class CodexDriver:
             text,
         ]
 
-    def _run_turn(self, process: subprocess.Popen[str], turn_id: str) -> None:
+    def _run_turn(
+        self, process: subprocess.Popen[str], turn_id: str, model: str | None
+    ) -> None:
         try:
-            returncode = self._pump_turn(process)
+            returncode = self._pump_turn(process, model=model)
         finally:
             with self._turn_lock:
                 self._turn_process = None
                 self._turn_active = False
+                self._turn_model = None
         if returncode != 0:
             tail = "\n".join(self._stderr_tail)
             self.emit(
@@ -223,7 +284,7 @@ class CodexDriver:
             )
         )
 
-    def _pump_turn(self, process: subprocess.Popen[str]) -> int:
+    def _pump_turn(self, process: subprocess.Popen[str], *, model: str | None) -> int:
         stderr_thread = threading.Thread(
             target=self._pump_stderr, args=(process,), daemon=True
         )
@@ -233,7 +294,7 @@ class CodexDriver:
             line = line.rstrip("\n")
             if not line.strip():
                 continue  # blank lines are keepalive/noise, not output
-            for message in self.parse_line(line):
+            for message in self.parse_line(line, model=model):
                 self.emit(message)
         returncode = process.wait()
         # Drain stderr fully before reading self._stderr_tail, so the error
@@ -249,7 +310,9 @@ class CodexDriver:
 
     # -- parsing ---------------------------------------------------------------
 
-    def parse_line(self, line: str) -> list[StructuredMessage]:
+    def parse_line(
+        self, line: str, *, model: str | None = None
+    ) -> list[StructuredMessage]:
         try:
             obj: dict[str, Any] = json.loads(line)
         except json.JSONDecodeError:
@@ -281,16 +344,25 @@ class CodexDriver:
         if kind == "item.completed":
             return self._on_item_completed(obj)
         if kind == "turn.completed":
+            payload: dict[str, Any] = {
+                "turn_complete": True,
+                "awaiting": "input",
+                "usage": obj.get("usage"),
+            }
+            if model:
+                payload["model"] = model
+                try:
+                    context_window = self._context_window_resolver(model)
+                except Exception:
+                    context_window = None
+                if context_window is not None:
+                    payload["model_context_window"] = context_window
             return [
                 StructuredMessage(
                     type="status",
                     role="system",
                     text="turn complete",
-                    payload={
-                        "turn_complete": True,
-                        "awaiting": "input",
-                        "usage": obj.get("usage"),
-                    },
+                    payload=payload,
                 )
             ]
         if isinstance(kind, str) and ("error" in kind or "failed" in kind):

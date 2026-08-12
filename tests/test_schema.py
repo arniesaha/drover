@@ -113,6 +113,24 @@ def test_bootstrap_creates_expected_tables(tmp_lakehouse):
         assert t in tables, f"missing table {t}"
 
 
+def test_bootstrap_creates_live_recap_tables(tmp_lakehouse):
+    """A fresh lakehouse persists both recap projections and queued work."""
+    parquet_dir, duckdb_path = tmp_lakehouse
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_type='BASE TABLE'"
+            ).fetchall()
+        }
+        assert {"live_session_recaps", "live_recap_jobs"} <= tables
+    finally:
+        con.close()
+
+
 def test_bootstrap_is_idempotent(tmp_lakehouse):
     parquet_dir, db_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)

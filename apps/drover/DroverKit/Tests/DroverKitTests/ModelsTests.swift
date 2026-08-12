@@ -55,6 +55,19 @@ import Testing
     #expect(session.endedAt == nil)
 }
 
+/// Fleet snapshots may include a recap produced from the most recent
+/// structured turn. Both fields are optional so older snapshots still decode.
+@Test func sessionSummaryDecodesLiveRecap() throws {
+    let json = Data(
+        #"{"session_id":"s1","recap":"Improving previews; testing refresh.","recap_source_seq":12}"#.utf8
+    )
+
+    let session = try JSONDecoder().decode(SessionSummary.self, from: json)
+
+    #expect(session.recap == "Improving previews; testing refresh.")
+    #expect(session.recapSourceSeq == 12)
+}
+
 @Test(arguments: [
     ("structured", "shell", true),
     ("structured", "claude-code", true),

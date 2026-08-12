@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 
+import duckdb
 from drover.schema import bootstrap
 import pytest
 
@@ -273,6 +274,33 @@ def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_
         )
         == 2
     )
+
+
+def test_manager_wire_completion_enqueues_recap_at_emitted_sequence(
+    monkeypatch, tmp_path
+):
+    """StructuredMessage.to_payload nests completion inside its wire payload."""
+    _mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    driver.emit(
+        StructuredMessage(
+            type="status",
+            role="system",
+            text="turn complete",
+            payload={"turn_complete": True, "awaiting": "input"},
+            turn_id="turn-1",
+        )
+    )
+
+    event = registry.list_events("sess-1")[0]
+    assert event.payload["payload"]["turn_complete"] is True
+    with duckdb.connect(str(registry.duckdb_path)) as con:
+        assert con.execute(
+            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
+            ["sess-1"],
+        ).fetchone() == (event.seq,)
 
 
 def test_manager_does_not_duplicate_per_turn_driver_inflight_state(

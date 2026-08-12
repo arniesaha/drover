@@ -28,6 +28,22 @@ import Testing
     #expect(card.sigil == nil)
 }
 
+/// A live recap is a fresher description of structured work than the initial
+/// prompt, so it replaces the preview as the card title.
+@Test func conversationCardPrefersRecapOverInitialPrompt() {
+    let session = SessionSummary(
+        id: "s1", hostID: "mac-mini", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: "/Volumes/M2 1/drover",
+        lastActivity: nil, preview: "Initial request",
+        recap: "Implementing recaps; testing snapshots."
+    )
+
+    let card = SessionCardPresentation(session: session, hostTitle: "Mac Mini")
+
+    #expect(card.title == "Implementing recaps; testing snapshots.")
+    #expect(card.isTitlePlaceholder == false)
+}
+
 /// A multi-line preview still has to yield a single loud line.
 @Test func conversationCardTakesTheFirstMeaningfulPreviewLine() {
     let session = SessionSummary(
@@ -97,6 +113,21 @@ import Testing
     #expect(card.action == .attach)
     #expect(card.sigil == "$")
     #expect(card.subtitle == "Shell · Mac Mini · attached")
+}
+
+/// Recaps describe structured conversations only; a terminal must retain its
+/// final output line even if an unexpected recap is present in its snapshot.
+@Test func terminalCardKeepsLastOutputPreviewWhenRecapIsPresent() {
+    let session = SessionSummary(
+        id: "p1", hostID: "mac-mini", harness: "shell", mode: "pty",
+        status: "running", awaiting: nil, cwd: "/Users/arnabmac/src/drover",
+        lastActivity: nil, preview: "build started\n40 passed",
+        recap: "This must not replace terminal output."
+    )
+
+    let card = SessionCardPresentation(session: session, hostTitle: "Mac Mini")
+
+    #expect(card.title == "40 passed")
 }
 
 /// With nothing printed yet the working directory is the loudest true thing,

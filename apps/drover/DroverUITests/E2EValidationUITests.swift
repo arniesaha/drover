@@ -35,6 +35,38 @@ final class E2EValidationUITests: XCTestCase {
     }
 
     @MainActor
+    func testDeterministicChatHeaderLayoutAtAccessibilitySize() {
+        let expectedTitle = "Improving live session recaps across every narrow chat header"
+        let expectedMetadata = "Codex · ctx 93.6K / 258.4K · 36%"
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_HEADER_FIXTURE"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_HEADER_TITLE"] = expectedTitle
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_HEADER_METADATA"] = expectedMetadata
+        app.launch()
+
+        let title = app.staticTexts["chat-recap-title"]
+        let metadata = app.staticTexts["chat-header-metadata"]
+        let menu = app.buttons["chat-menu"]
+        let navigationBar = app.navigationBars.firstMatch
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        XCTAssertTrue(metadata.waitForExistence(timeout: 10))
+        XCTAssertTrue(menu.exists)
+        XCTAssertTrue(navigationBar.exists)
+        XCTAssertEqual(title.label, expectedTitle)
+        XCTAssertEqual(metadata.label, expectedMetadata)
+
+        // The full accessibility labels remain available while both visible
+        // frames stay on one line, ordered, and inside the compact nav bar.
+        XCTAssertLessThanOrEqual(title.frame.height, 40)
+        XCTAssertLessThanOrEqual(metadata.frame.height, 30)
+        XCTAssertLessThanOrEqual(title.frame.maxY, metadata.frame.minY + 1)
+        XCTAssertGreaterThanOrEqual(title.frame.minX, navigationBar.frame.minX)
+        XCTAssertLessThanOrEqual(title.frame.maxX, navigationBar.frame.maxX)
+        XCTAssertLessThanOrEqual(title.frame.maxX, menu.frame.minX)
+        XCTAssertLessThanOrEqual(metadata.frame.maxY, navigationBar.frame.maxY + 1)
+    }
+
+    @MainActor
     func testLoginLaunchChatResumeTerminate() throws {
         let env = ProcessInfo.processInfo.environment
         guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
@@ -127,6 +159,7 @@ final class E2EValidationUITests: XCTestCase {
         let horseradish = app.staticTexts["HORSERADISH"]
         XCTAssertTrue(horseradish.waitForExistence(timeout: 240),
                       "the starting prompt should produce the exact reply bubble")
+
         shoot(app, "05-chat-first-reply")
 
         // ── 4. A follow-up turn through the composer ──────────────────────
@@ -192,6 +225,55 @@ final class E2EValidationUITests: XCTestCase {
 
         // Hold briefly so external screenshots can catch the final state.
         Thread.sleep(forTimeInterval: 3)
+    }
+
+    /// Header-specific fixture: `DROVER_SMOKE_RECAP_SESSION_ID` must name a
+    /// Codex structured session whose snapshot row already carries the recap
+    /// below and whose event stream includes a Codex turn-completion payload
+    /// with context usage. Keeping that fixture separate from the mutating
+    /// launch/resume smoke test makes the recap and provider deterministic.
+    @MainActor
+    func testSeededCodexRecapHeader() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
+            throw XCTSkip("DROVER_SMOKE_TOKEN not set — seeded recap E2E skipped")
+        }
+        guard let sessionID = env["DROVER_SMOKE_RECAP_SESSION_ID"], !sessionID.isEmpty else {
+            XCTFail(
+                "DROVER_SMOKE_RECAP_SESSION_ID is required when live E2E is enabled; "
+                    + "seed a Codex recap session before running this suite"
+            )
+            return
+        }
+        let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
+        let expectedRecap = "Improving previews; verifying the chat header."
+
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_BASE_URL"] = serverURL
+        app.launchEnvironment["DROVER_TOKEN"] = token
+        app.launch()
+
+        let row = app.buttons[sessionID]
+        XCTAssertTrue(row.waitForExistence(timeout: 30),
+                      "seeded Codex recap session should be listed")
+        row.tap()
+
+        let title = app.staticTexts.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@",
+            "chat-recap-title", expectedRecap
+        )).firstMatch
+        XCTAssertTrue(title.waitForExistence(timeout: 30),
+                      "chat should render the seeded recap title")
+        XCTAssertEqual(title.label, expectedRecap)
+
+        let metadata = app.staticTexts.matching(NSPredicate(
+            format: "identifier == %@ AND label CONTAINS[c] %@ AND label CONTAINS[c] %@",
+            "chat-header-metadata", "Codex", "ctx"
+        )).firstMatch
+        XCTAssertTrue(metadata.waitForExistence(timeout: 30),
+                      "chat should render Codex context metadata")
+        XCTAssertTrue(metadata.label.contains("Codex"))
+        XCTAssertTrue(metadata.label.contains("ctx"))
     }
 
     /// Diagnostic reproduction against an explicitly selected long session.

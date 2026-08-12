@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import drover.server.harness.registry as registry_module
 from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server import metrics
@@ -42,6 +43,7 @@ from drover.server.harness.daemon import (
 )
 from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.pty import PtySessionManager
+from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import (
     OPCODE_PING,
@@ -370,6 +372,39 @@ def _make_collector(tmp_path) -> MetricsCollector:
         summarizer_report={},
         ttl_seconds=60,
     )
+
+
+def collector_with_session(
+    tmp_path,
+    *,
+    preview: str,
+    recap: tuple[str, int] | None = None,
+    event_type: str = "user_input",
+) -> MetricsCollector:
+    """Create one fleet session with a prompt and optional recap projection."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    session = registry.create_session(
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/Volumes/M2 1/drover",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type=event_type,
+        content_preview=preview,
+    )
+    if recap is not None:
+        with registry._connect() as con:
+            con.execute(
+                """INSERT INTO live_session_recaps
+                   (session_id, recap_text, source_seq, generator_model, generated_at)
+                   VALUES (?, ?, ?, 'test-recap-model', now())""",
+                [session.session_id, recap[0], recap[1]],
+            )
+    return collector
 
 
 def _swift_content_consent_fixture(name: str) -> dict:
@@ -1284,6 +1319,46 @@ def test_harness_snapshot_includes_latest_user_or_assistant_preview(tmp_path):
     payload = json.loads(collector.render_harness_json())
 
     assert payload["sessions"][0]["preview"] == "Refactor session screen cards"
+
+
+def test_harness_snapshot_includes_live_recap_and_preview_fallback(tmp_path):
+    collector = collector_with_session(
+        tmp_path,
+        preview="Improve the chat list",
+        recap=("Improving chat titles; wiring recap refresh.", 12),
+    )
+
+    payload = collector.harness_snapshot()
+
+    session = payload["sessions"][0]
+    assert session["preview"] == "Improve the chat list"
+    assert session["recap"] == "Improving chat titles; wiring recap refresh."
+    assert session["recap_source_seq"] == 12
+
+
+def test_harness_snapshot_missing_recap_emits_null_fields(tmp_path):
+    collector = collector_with_session(tmp_path, preview="Improve the chat list")
+
+    session = collector.harness_snapshot()["sessions"][0]
+
+    assert session["preview"] == "Improve the chat list"
+    assert session["recap"] is None
+    assert session["recap_source_seq"] is None
+
+
+def test_harness_snapshot_recap_preserves_terminal_preview(tmp_path):
+    collector = collector_with_session(
+        tmp_path,
+        preview="git status --short",
+        recap=("Checking the working tree before the snapshot change.", 9),
+        event_type="terminal.input",
+    )
+
+    session = collector.harness_snapshot()["sessions"][0]
+
+    assert session["preview"] == "git status --short"
+    assert session["recap"] == "Checking the working tree before the snapshot change."
+    assert session["recap_source_seq"] == 9
 
 
 def test_metrics_collector_marks_stale_harness_hosts(tmp_path):
@@ -3381,6 +3456,169 @@ def _ingest_events(port: int, events: list[dict]) -> None:
         f"http://127.0.0.1:{port}/harness/events", payload={"events": events}
     )
     assert status == 200
+
+
+def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(tmp_path):
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.create_session(
+        host_id="nas",
+        harness="codex",
+        command="codex",
+        session_id="harness-recap-wire",
+        status="running",
+        mode="structured",
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    event = {
+        "event_id": "harness-event-recap-wire-12",
+        "session_id": "harness-recap-wire",
+        "seq": 12,
+        "type": "status",
+        "role": "system",
+        "text": "turn complete",
+        "payload": {"turn_complete": True, "awaiting": "input"},
+        "turn_id": "turn-1",
+        "ts": "2026-07-06T00:00:12+00:00",
+    }
+    try:
+        port = server.server_address[1]
+        status, body = _json_request(
+            f"http://127.0.0.1:{port}/harness/events",
+            payload={"events": [event]},
+        )
+        assert status == 200
+        assert body == {"ingested": 1}
+    finally:
+        server.shutdown()
+
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        assert con.execute(
+            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
+            ["harness-recap-wire"],
+        ).fetchone() == (12,)
+
+
+def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
+    tmp_path, monkeypatch
+):
+    """Removing the worker orphan-reconcile poll permanently loses the newest recap."""
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    event = {
+        "event_id": "harness-event-race-23",
+        "session_id": "harness-race",
+        "seq": 23,
+        "type": "status",
+        "role": "system",
+        "text": "turn complete",
+        "payload": {"turn_complete": True, "awaiting": "input"},
+        "turn_id": "turn-race",
+        "ts": "2026-07-06T00:00:23+00:00",
+    }
+    older_event = {
+        "event_id": "harness-event-race-7",
+        "session_id": "harness-race",
+        "seq": 7,
+        "type": "status",
+        "role": "system",
+        "text": "older turn complete",
+        "payload": {"turn_complete": True, "awaiting": "input"},
+        "turn_id": "turn-older",
+        "ts": "2026-07-06T00:00:07+00:00",
+    }
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        status, body = _json_request(
+            f"http://127.0.0.1:{port}/harness/events",
+            payload={"events": [older_event, event]},
+        )
+        assert status == 200
+        assert body == {"ingested": 2}
+        with duckdb.connect(str(collector.duckdb_path)) as con:
+            assert con.execute(
+                "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
+                ["harness-race"],
+            ).fetchone() == (0,)
+
+        response_body = json.dumps(
+            {
+                "session_id": "harness-race",
+                "harness": "codex",
+                "command": ["codex"],
+                "status": "running",
+                "mode": "structured",
+            }
+        )
+        real_enqueue = registry_module.enqueue_live_recap
+        attempts = 0
+
+        def unavailable_once(con, session_id, source_seq):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("queue temporarily unavailable")
+            return real_enqueue(con, session_id, source_seq)
+
+        monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable_once)
+        collector._sync_created_harness_session(
+            "nas", {"harness": "codex", "mode": "structured"}, response_body
+        )
+
+        assert registry.get_session("harness-race") is not None
+        with duckdb.connect(str(collector.duckdb_path)) as con:
+            assert con.execute(
+                "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
+                ["harness-race"],
+            ).fetchone() == (0,)
+            assert con.execute(
+                "SELECT recap_reconcile_needed FROM harness_sessions "
+                "WHERE session_id = ?",
+                ["harness-race"],
+            ).fetchone() == (True,)
+
+        # drain_once is the production worker loop's scheduled retry boundary.
+        # No backend is needed to prove queue recovery: generation moves the
+        # recovered row to retry_wait after reporting its missing backend.
+        assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 1
+    finally:
+        server.shutdown()
+
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        marker_after_recovery = con.execute(
+            "SELECT recap_reconcile_needed FROM harness_sessions "
+            "WHERE session_id = ?",
+            ["harness-race"],
+        ).fetchone()
+        assert con.execute(
+            "SELECT desired_source_seq, status, count(*) FROM live_recap_jobs "
+            "WHERE session_id = ? GROUP BY desired_source_seq, status",
+            ["harness-race"],
+        ).fetchone() == (23, "retry_wait", 1)
+        # Remove ordinary due-job work from the second poll. If reconciliation
+        # cleanup were missing, the still-marked session would recreate this
+        # row from the stored completion and drain_once would handle it again.
+        con.execute(
+            "DELETE FROM live_recap_jobs WHERE session_id = ?", ["harness-race"]
+        )
+
+    assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 0
+    assert marker_after_recovery == (False,)
+    with duckdb.connect(str(collector.duckdb_path)) as con:
+        assert con.execute(
+            "SELECT recap_reconcile_needed FROM harness_sessions "
+            "WHERE session_id = ?",
+            ["harness-race"],
+        ).fetchone() == (False,)
+        assert con.execute(
+            "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
+            ["harness-race"],
+        ).fetchone() == (0,)
 
 
 def _event(seq: int, text: str) -> dict:

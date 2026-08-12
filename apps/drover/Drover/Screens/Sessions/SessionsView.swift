@@ -343,7 +343,13 @@ struct SessionsView: View {
     private func row(for session: SessionSummary) -> some View {
         NavigationLink {
             if session.isStructured {
-                ChatView(client: client, sessionID: session.id, harness: session.harness)
+                ChatView(
+                    client: client,
+                    sessionID: session.id,
+                    harness: session.harness,
+                    recap: session.recap ?? session.preview,
+                    recapSourceSeq: session.recapSourceSeq
+                )
             } else {
                 TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
             }

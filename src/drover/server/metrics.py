@@ -20,6 +20,7 @@ from drover.server.harness.daemon import (
     _STRUCTURED_DEFAULT_COMMANDS,
     native_transcript_for_session,
 )
+from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
@@ -728,13 +729,19 @@ def _harness_host_dict(
     return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
 
 
-def _harness_session_dict(session: Any, preview: str | None = None) -> dict[str, Any]:
+def _harness_session_dict(
+    session: Any,
+    preview: str | None = None,
+    recap: LiveRecap | None = None,
+) -> dict[str, Any]:
     item = dict(session.__dict__)
     _wire_datetimes(
         item,
         ("started_at", "updated_at", "ended_at", "last_activity"),
     )
     item["preview"] = _optional_str(preview)
+    item["recap"] = _optional_str(recap.text if recap else None)
+    item["recap_source_seq"] = recap.source_seq if recap else None
     return item
 
 
@@ -1620,6 +1627,13 @@ class MetricsCollector:
             previews = registry.latest_session_previews(
                 [session.session_id for session in sessions]
             )
+            try:
+                recaps = registry.latest_live_recaps(
+                    [session.session_id for session in sessions]
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("failed to load live session recaps: %s", exc)
+                recaps = {}
             return {
                 "cockpit_api_version": 1,
                 "cockpit_sections": list(COCKPIT_SECTIONS),
@@ -1630,6 +1644,7 @@ class MetricsCollector:
                     _harness_session_dict(
                         session,
                         previews.get(session.session_id),
+                        recaps.get(session.session_id),
                     )
                     for session in sessions
                 ],

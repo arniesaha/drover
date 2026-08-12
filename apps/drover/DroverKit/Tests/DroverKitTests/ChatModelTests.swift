@@ -16,6 +16,98 @@ private final class RequestCounter: @unchecked Sendable {
     var value: Int { lock.lock(); defer { lock.unlock() }; return count }
 }
 
+/// Supplies ordered `/harness` snapshots through the same URL-protocol
+/// transport used by the production client, while exposing just the request
+/// count needed to prove the refresh is bounded.
+private final class SnapshotClient: @unchecked Sendable {
+    private let lock = NSLock()
+    private var responses: [Data]
+    private let repeating: Data?
+    private var requestCount = 0
+
+    let client = DroverClient(
+        config: ServerConfig(urlString: "http://test.local:7080")!,
+        token: "test-token",
+        session: MockURLProtocol.session()
+    )
+
+    init(responses: [Data] = [], repeating: Data? = nil) {
+        self.responses = responses
+        self.repeating = repeating
+    }
+
+    func nextResponse() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        requestCount += 1
+        if !responses.isEmpty { return responses.removeFirst() }
+        return repeating ?? Data(#"{"hosts": [], "sessions": [], "cwd_suggestions": []}"#.utf8)
+    }
+
+    var snapshotRequestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestCount
+    }
+}
+
+/// A deliberately non-cooperative response: once the request is in flight,
+/// cancellation cannot make its already-produced snapshot disappear. This
+/// exposes stale state writes after a chat has been stopped or superseded.
+private final class DelayedSnapshotResponse: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    private let release = DispatchSemaphore(value: 0)
+    private let response: Data
+
+    init(_ response: Data) {
+        self.response = response
+    }
+
+    func waitForRelease() -> Data {
+        lock.lock()
+        started = true
+        lock.unlock()
+        release.wait()
+        return response
+    }
+
+    var hasStarted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return started
+    }
+
+    func finish() { release.signal() }
+}
+
+private func snapshotClient(responses: [Data] = [], repeating: Data? = nil) -> SnapshotClient {
+    let snapshotClient = SnapshotClient(responses: responses, repeating: repeating)
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        return (200, snapshotClient.nextResponse())
+    }
+    return snapshotClient
+}
+
+private func sessionJSON(recap: String? = nil, source: Int? = nil, preview: String? = nil) -> Data {
+    let recapField = recap.map { #", "recap": "\#($0)""# } ?? ""
+    let sourceField = source.map { #", "recap_source_seq": \#($0)"# } ?? ""
+    let previewField = preview.map { #", "preview": "\#($0)""# } ?? ""
+    return Data("""
+    {"hosts": [{"host_id": "host-1", "status": "online",
+      "capabilities": {"display_name": "Host", "harnesses": [
+        {"name": "codex", "enabled": true}]}}],
+     "sessions": [{"session_id": "s1", "host_id": "host-1", "harness": "codex",
+       "mode": "structured", "status": "running", "awaiting": null\(recapField)\(sourceField)\(previewField)}],
+     "cwd_suggestions": []}
+    """.utf8)
+}
+
+private func turnComplete(seq: Int) -> HarnessMessage {
+    .fixture(seq: seq, type: .status, payload: ["turn_complete": .bool(true)])
+}
+
 @MainActor
 private func waitUntil(
     timeout: Duration = .seconds(5), _ condition: () -> Bool
@@ -27,11 +119,198 @@ private func waitUntil(
     }
 }
 
+@MainActor
+private func eventually(_ condition: () -> Bool) async {
+    do {
+        try await waitUntil(timeout: .seconds(1), condition)
+    } catch {
+        Issue.record("Timed out waiting for asynchronous condition")
+    }
+}
+
 /// `.serialized`: several tests here mutate the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment.
 extension MockNetworkTests {
 @Suite(.serialized)
 struct ChatModelTests {
+
+@Test @MainActor func initialRecapBecomesHeaderTitle() {
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Improving previews; awaiting tests.", recapSourceSeq: 8)
+
+    #expect(model.headerTitle == "Improving previews; awaiting tests.")
+}
+
+@Test @MainActor func missingContextUsesHarnessOnlyHeaderMetadata() {
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex")
+
+    #expect(model.headerMetadata == "Codex")
+}
+
+@Test @MainActor func headerMetadataJoinsHarnessAndContextGauge() {
+    let model = ChatModel(
+        client: client(), sessionID: "s1", harness: "codex",
+        initialMessages: [.fixture(
+            seq: 12, type: .status,
+            payload: [
+                "turn_complete": .bool(true),
+                "usage": .object(["input_tokens": .number(100)]),
+                "model_context_window": .number(1_000),
+            ]
+        )]
+    )
+
+    #expect(model.headerMetadata == "Codex · ctx 100 / 1K · 10%")
+}
+
+@Test @MainActor func turnCompletePollsUntilRecapReachesSourceSequence() async {
+    let snapshots = snapshotClient(responses: [
+        sessionJSON(recap: "Old", source: 8),
+        sessionJSON(recap: "New", source: 12),
+    ])
+    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+
+    await eventually { model.recap == "New" }
+    #expect(model.recapSourceSeq == 12)
+    #expect(snapshots.snapshotRequestCount == 2)
+}
+
+@Test @MainActor func recapPollRetriesAfterFailedSnapshot() async {
+    let requests = RequestCounter()
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        requests.bump()
+        if requests.value == 1 {
+            return (500, Data(#"{"error": "temporary failure"}"#.utf8))
+        }
+        return (200, sessionJSON(recap: "Recovered", source: 12))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+
+    await eventually { model.recap == "Recovered" }
+    #expect(model.recapSourceSeq == 12)
+    #expect(requests.value == 2)
+}
+
+@Test @MainActor func recapPollKeepsCurrentTextUntilTargetSourceArrives() async {
+    let requests = RequestCounter()
+    let target = DelayedSnapshotResponse(sessionJSON(recap: "Target", source: 12))
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        requests.bump()
+        if requests.value == 1 {
+            return (200, sessionJSON(recap: "Intermediate", source: 10))
+        }
+        return (200, target.waitForRelease())
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+    await eventually { target.hasStarted }
+
+    #expect(model.recap == "Old")
+    #expect(model.recapSourceSeq == 8)
+
+    target.finish()
+    await eventually { model.recap == "Target" }
+    #expect(model.recapSourceSeq == 12)
+}
+
+@Test @MainActor func recapPollStopsAfterConfiguredAttemptsAndKeepsLastGoodText() async {
+    let snapshots = snapshotClient(repeating: sessionJSON(recap: "Old", source: 8))
+    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+
+    await eventually { snapshots.snapshotRequestCount == 3 }
+    #expect(model.recap == "Old")
+}
+
+@Test @MainActor func missingGeneratedRecapDoesNotReplaceCurrentTextWithPreview() async {
+    let snapshots = snapshotClient(responses: [sessionJSON(preview: "Fallback preview")])
+    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+                          recap: "Current", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 1)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+
+    await eventually { snapshots.snapshotRequestCount == 1 }
+    #expect(model.recap == "Current")
+    #expect(model.recapSourceSeq == 8)
+}
+
+@Test @MainActor func olderGeneratedRecapDoesNotReplaceNewerState() async {
+    let snapshots = snapshotClient(responses: [sessionJSON(recap: "Stale", source: 7)])
+    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+                          recap: "Current", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 1)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+
+    await eventually { snapshots.snapshotRequestCount == 1 }
+    #expect(model.recap == "Current")
+    #expect(model.recapSourceSeq == 8)
+}
+
+@Test @MainActor func recapTransportFailureKeepsCurrentText() async throws {
+    MockURLProtocol.transportError = URLError(.notConnectedToInternet)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Current", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 1)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.recap == "Current")
+    #expect(model.recapSourceSeq == 8)
+}
+
+@Test @MainActor func stopCancelsPendingRecapPoll() async throws {
+    let snapshots = snapshotClient(repeating: sessionJSON(recap: "Old", source: 8))
+    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .seconds(1), recapPollAttempts: 3)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+    await eventually { snapshots.snapshotRequestCount == 1 }
+    model.stop()
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(snapshots.snapshotRequestCount == 1)
+}
+
+@Test @MainActor func stopDoesNotApplyALateRecapSnapshot() async throws {
+    let delayed = DelayedSnapshotResponse(sessionJSON(recap: "Late", source: 12))
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        return (200, delayed.waitForRelease())
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+                          recap: "Current", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 1)
+
+    model.ingest(.message(turnComplete(seq: 12)))
+    await eventually { delayed.hasStarted }
+    model.stop()
+    delayed.finish()
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(model.recap == "Current")
+    #expect(model.recapSourceSeq == 8)
+}
 
 @Test @MainActor func pendingApprovalTracksAnswerPairs() async throws {
     let model = ChatModel.fixture()   // internal init taking [HarnessMessage] directly
@@ -144,24 +423,24 @@ struct ChatModelTests {
     #expect(model.harnessPresentation.symbolName == "chevron.left.forwardslash.chevron.right")
 }
 
-@Test @MainActor func loadHandoffTargetsUpdatesHarnessPresentation() async throws {
+@Test @MainActor func loadSessionMetadataUpdatesHarnessPresentation() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let model = ChatModel(client: client(), sessionID: "harness-1", harness: "codex")
     #expect(model.harnessPresentation.name == "Codex")
-    await model.loadHandoffTargets()
+    await model.loadSessionMetadata()
     #expect(model.harnessPresentation.name == "Antigravity")
     #expect(model.harnessPresentation.symbolName == "sparkles")
 }
 
-@Test @MainActor func loadHandoffTargetsListsHostHarnesses() async throws {
+@Test @MainActor func loadSessionMetadataListsHostHarnesses() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let model = ChatModel(client: client(), sessionID: "harness-1")
     #expect(model.handoffHarnesses.isEmpty)
-    await model.loadHandoffTargets()
+    await model.loadSessionMetadata()
     #expect(model.handoffHarnesses == ["shell", "claude-code", "agy"])
 }
 
-@Test @MainActor func loadHandoffTargetsSeedsRunPreferencesFromSession() async throws {
+@Test @MainActor func loadSessionMetadataSeedsRunPreferencesFromSession() async throws {
     let snapshot = Data("""
     {"hosts": [{"host_id": "mac-mini", "status": "online",
       "capabilities": {"display_name": "Mac Mini", "harnesses": [
@@ -175,16 +454,16 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in (200, snapshot) }
     let model = ChatModel(client: client(), sessionID: "harness-preferred")
 
-    await model.loadHandoffTargets()
+    await model.loadSessionMetadata()
 
     #expect(model.selectedModel == "claude-fable-5[1m]")
     #expect(model.thinkingEffort == "xhigh")
 }
 
-@Test @MainActor func loadHandoffTargetsUnknownSessionLeavesListEmpty() async throws {
+@Test @MainActor func loadSessionMetadataUnknownSessionLeavesListEmpty() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let model = ChatModel(client: client(), sessionID: "not-in-snapshot")
-    await model.loadHandoffTargets()
+    await model.loadSessionMetadata()
     #expect(model.handoffHarnesses.isEmpty)
 }
 
@@ -203,6 +482,7 @@ struct ChatModelTests {
 @Test @MainActor func inFlightConflictQueuesTurnAndAutoSendsOnTurnComplete() async throws {
     nonisolated(unsafe) var turnPosts: [String] = []
     MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         turnPosts.append(body["text"] as? String ?? "")
         if turnPosts.count == 1 {
@@ -312,6 +592,7 @@ struct ChatModelTests {
 @Test @MainActor func queuedTurnOmitsLockedClaudePreferences() async throws {
     nonisolated(unsafe) var preferenceKeys: [[String]] = []
     MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         preferenceKeys.append(body.keys.filter { $0 == "model" || $0 == "thinking_effort" })
         if preferenceKeys.count == 1 {
@@ -353,6 +634,7 @@ struct ChatModelTests {
     let attachment = TurnAttachment(mediaType: "image/png", data: Data([0x0A, 0x0B]))
     nonisolated(unsafe) var turnPosts: [[String: Any]] = []
     MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         turnPosts.append(body)
         if turnPosts.count == 1 {
@@ -408,9 +690,10 @@ struct ChatModelTests {
     #expect(model.hint == message)
 }
 
-@Test @MainActor func turnCompleteWithoutQueueIsANoOp() async throws {
+@Test @MainActor func turnCompleteWithoutQueueDoesNotPostTurn() async throws {
     nonisolated(unsafe) var posts = 0
-    MockURLProtocol.handler = { _ in
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
         posts += 1
         return (202, Data(#"{"turn_id": "t"}"#.utf8))
     }

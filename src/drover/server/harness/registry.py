@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,14 +13,19 @@ from uuid import uuid4
 import duckdb
 
 from drover.server.db import control_plane_connection
+from drover.server.harness.auth import redact_auth_text
+from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import (
     HarnessEvent,
     HarnessEventPage,
     HarnessHost,
     HarnessSession,
 )
-from drover.server.harness.auth import redact_auth_text
-from drover.server.harness.events import normalize_harness_event
+from drover.server.harness.recap_jobs import (
+    LiveRecap,
+    enqueue_live_recap,
+    latest_live_recaps,
+)
 
 _SESSION_PREVIEW_CANDIDATE_LIMIT = 5
 
@@ -40,6 +45,75 @@ def _looks_like_traceback(value: str) -> bool:
         or lowered.startswith("stack trace")
         or "\n  file " in lowered
     )
+
+
+def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
+    """Accept both legacy flat payloads and StructuredMessage wire envelopes."""
+    if payload.get("turn_complete") is True:
+        return True
+    inner = payload.get("payload")
+    return isinstance(inner, dict) and inner.get("turn_complete") is True
+
+
+def _supports_live_recaps(mode: str | None, harness: str) -> bool:
+    return mode == "structured" or (mode is None and harness != "shell")
+
+
+def _enqueue_recap_if_completion(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any] | None,
+    seq: int | None,
+) -> bool:
+    """Queue a recap only for a completed turn from a structured session."""
+    if (
+        event_type != "status"
+        or not payload
+        or not _is_turn_completion_payload(payload)
+        or not isinstance(seq, int)
+        or isinstance(seq, bool)
+    ):
+        return False
+    session = con.execute(
+        "SELECT mode, harness FROM harness_sessions WHERE session_id = ?",
+        [session_id],
+    ).fetchone()
+    if session is None:
+        return False
+    mode, harness = session
+    if not _supports_live_recaps(mode, harness):
+        return False
+    return enqueue_live_recap(con, session_id, seq)
+
+
+def _enqueue_latest_stored_completion(
+    con: duckdb.DuckDBPyConnection, session_id: str
+) -> bool:
+    """Recover the newest completion that arrived before session metadata."""
+    rows = con.execute(
+        """SELECT payload_json, seq
+             FROM harness_events
+            WHERE session_id = ? AND event_type = 'status' AND seq IS NOT NULL
+            ORDER BY seq DESC, created_at DESC""",
+        [session_id],
+    ).fetchall()
+    for payload_json, seq in rows:
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or not _is_turn_completion_payload(payload):
+            continue
+        return _enqueue_recap_if_completion(
+            con,
+            session_id=session_id,
+            event_type="status",
+            payload=payload,
+            seq=seq,
+        )
+    return False
 
 
 def _rows(
@@ -173,38 +247,58 @@ class HarnessRegistry:
         started_at = started_at or now
         session_id = session_id or f"harness-{uuid4()}"
         with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO harness_sessions (
-                  session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
-                  command, status, started_at, updated_at, native_session_id,
-                  native_resume_label, source_session_id, handoff_mode, mode,
-                  permission_mode, model, thinking_effort
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(
+                    """
+                    INSERT INTO harness_sessions (
+                      session_id, host_id, harness, repo_owner, repo_name, branch, cwd,
+                      command, status, started_at, updated_at, native_session_id,
+                      native_resume_label, source_session_id, handoff_mode, mode,
+                      permission_mode, model, thinking_effort,
+                      recap_reconcile_needed
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        session_id,
+                        host_id,
+                        harness,
+                        repo_owner,
+                        repo_name,
+                        branch,
+                        cwd,
+                        command,
+                        status,
+                        started_at,
+                        now,
+                        native_session_id,
+                        native_resume_label,
+                        source_session_id,
+                        handoff_mode,
+                        mode,
+                        permission_mode,
+                        model,
+                        thinking_effort,
+                        _supports_live_recaps(mode, harness),
+                    ],
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    session_id,
-                    host_id,
-                    harness,
-                    repo_owner,
-                    repo_name,
-                    branch,
-                    cwd,
-                    command,
-                    status,
-                    started_at,
-                    now,
-                    native_session_id,
-                    native_resume_label,
-                    source_session_id,
-                    handoff_mode,
-                    mode,
-                    permission_mode,
-                    model,
-                    thinking_effort,
-                ],
-            )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+            con.execute("BEGIN TRANSACTION")
+            try:
+                _enqueue_latest_stored_completion(con, session_id)
+                con.execute(
+                    "UPDATE harness_sessions SET recap_reconcile_needed = FALSE "
+                    "WHERE session_id = ?",
+                    [session_id],
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         session = self.get_session(session_id)
         if session is None:
             raise RuntimeError(f"failed to create harness session {session_id!r}")
@@ -218,6 +312,34 @@ class HarnessRegistry:
                 [session_id],
             )
         return HarnessSession.from_row(rows[0]) if rows else None
+
+    def reconcile_orphan_completions(self, *, limit: int = 100) -> int:
+        """Retry derived recap reconciliation left pending by session creation."""
+        with self._connect() as con:
+            con.execute("BEGIN TRANSACTION")
+            try:
+                rows = con.execute(
+                    """SELECT s.session_id
+                         FROM harness_sessions s
+                        WHERE s.recap_reconcile_needed
+                        ORDER BY s.updated_at, s.session_id
+                        LIMIT ?""",
+                    [max(1, int(limit))],
+                ).fetchall()
+                enqueued = 0
+                for (session_id,) in rows:
+                    enqueued += _enqueue_latest_stored_completion(con, str(session_id))
+                    con.execute(
+                        "UPDATE harness_sessions "
+                        "SET recap_reconcile_needed = FALSE "
+                        "WHERE session_id = ?",
+                        [session_id],
+                    )
+                con.execute("COMMIT")
+                return enqueued
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
 
     def list_sessions(
         self,
@@ -374,26 +496,39 @@ class HarnessRegistry:
             content_preview=content_preview,
         )
         with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO harness_events (
-                  event_id, session_id, event_type, normalized_type,
-                  normalized_source, content_preview, payload_json, created_at, seq
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(
+                    """
+                    INSERT INTO harness_events (
+                      event_id, session_id, event_type, normalized_type,
+                      normalized_source, content_preview, payload_json, created_at, seq
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        event_id,
+                        session_id,
+                        event_type,
+                        normalized["normalized_type"],
+                        normalized["normalized_source"],
+                        normalized["content_preview"],
+                        _json_dumps(payload),
+                        created_at,
+                        seq,
+                    ],
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    event_id,
-                    session_id,
-                    event_type,
-                    normalized["normalized_type"],
-                    normalized["normalized_source"],
-                    normalized["content_preview"],
-                    _json_dumps(payload),
-                    created_at,
-                    seq,
-                ],
-            )
+                _enqueue_recap_if_completion(
+                    con,
+                    session_id=session_id,
+                    event_type=event_type,
+                    payload=payload,
+                    seq=seq,
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         event = self.get_event(event_id)
         if event is None:
             raise RuntimeError(f"failed to append harness event {event_id!r}")
@@ -432,6 +567,7 @@ class HarnessRegistry:
                 ).fetchall()
             }
             params = []
+            inserted_records: list[tuple[dict[str, Any], int | None]] = []
             for event_id, record in unique.items():
                 if event_id in existing:
                     continue
@@ -443,6 +579,9 @@ class HarnessRegistry:
                     normalized_source=record.get("normalized_source"),
                     content_preview=record.get("content_preview"),
                 )
+                seq = record.get("seq")
+                if not isinstance(seq, int) or isinstance(seq, bool):
+                    seq = None
                 params.append(
                     [
                         event_id,
@@ -453,21 +592,36 @@ class HarnessRegistry:
                         normalized["content_preview"],
                         _json_dumps(record.get("payload")),
                         record.get("created_at") or _now(),
-                        None,
+                        seq,
                     ]
                 )
+                inserted_records.append((record, seq))
             if not params:
                 return 0
-            con.executemany(
-                """
-                INSERT INTO harness_events (
-                  event_id, session_id, event_type, normalized_type,
-                  normalized_source, content_preview, payload_json, created_at, seq
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.executemany(
+                    """
+                    INSERT INTO harness_events (
+                      event_id, session_id, event_type, normalized_type,
+                      normalized_source, content_preview, payload_json, created_at, seq
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    params,
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                params,
-            )
+                for record, seq in inserted_records:
+                    _enqueue_recap_if_completion(
+                        con,
+                        session_id=record["session_id"],
+                        event_type=record["event_type"],
+                        payload=record.get("payload"),
+                        seq=seq,
+                    )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return len(params)
 
     def max_event_seq(self, session_id: str) -> int:
@@ -615,6 +769,14 @@ class HarnessRegistry:
             if preview:
                 previews[session_id] = preview
         return previews
+
+    def latest_live_recaps(self, session_ids: list[str]) -> dict[str, LiveRecap]:
+        """Return the durable recap projection for the requested sessions."""
+        session_ids = [session_id for session_id in session_ids if session_id]
+        if not session_ids:
+            return {}
+        with self._connect() as con:
+            return latest_live_recaps(con, session_ids)
 
     @staticmethod
     def _session_event_preview(row: dict[str, Any]) -> str:
