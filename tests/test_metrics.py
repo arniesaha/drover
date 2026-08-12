@@ -508,9 +508,7 @@ def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp
         summarizer_report={
             "backend_policy": "hybrid",
             "anthropic_ready": True,
-            "local_ready": True,
-            "allows_anthropic": True,
-            "allows_local": True,
+            "harness_ready": True,
         },
         job_streams={"summarize": _Stream()},
         ttl_seconds=60,
@@ -526,6 +524,8 @@ def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp
     assert "drover_openclaw_unmatched_spans 5" in text
     assert 'drover_summarizer_policy{policy="hybrid"} 1' in text
     assert 'drover_summarizer_backend_ready{backend="anthropic"} 1' in text
+    assert 'drover_summarizer_backend_ready{backend="claude-code"} 1' in text
+    assert 'drover_summarizer_backend_allowed{backend="claude-code"} 1' in text
     assert 'drover_redis_job_stream_length{queue="summarize"} 4' in text
     assert 'drover_redis_job_stream_pending{queue="summarize"} 1' in text
     assert (

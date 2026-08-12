@@ -44,6 +44,8 @@ _RUNTIME_PATTERNS = (
     "wol relay",
     "relay unreachable",
     "ollama",
+    "claude-code readiness",
+    "cli exited",
     "timeout",
     "temporarily unavailable",
     "503",
@@ -108,17 +110,22 @@ def retry_errored_jobs(
     include_validation: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Reset matching errored summarize_jobs to pending.
+    """Reset matching errored or dead-lettered summarize_jobs to pending.
 
     ``apply=False`` is a dry run and returns the jobs that would be reset.
     ``attempts`` is left intact so operators keep failure history.
+
+    Dead-lettered jobs are included because ``dead_letter_streak`` is
+    otherwise terminal: once a session has burned its generations, nothing
+    re-enqueues it, so fixing the backend would never bring it back. This is
+    that escape hatch, and the only place the streak is cleared by hand.
     """
     con = open_duckdb_connection(duckdb_path)
     try:
         rows = con.execute(
             """SELECT session_id, last_error
                FROM summarize_jobs
-               WHERE status='errored'
+               WHERE status IN ('errored', 'dead_lettered')
                ORDER BY updated_at NULLS LAST, enqueued_at ASC, session_id ASC"""
         ).fetchall()
         matched = [
@@ -131,8 +138,10 @@ def retry_errored_jobs(
         if apply and matched:
             con.executemany(
                 """UPDATE summarize_jobs
-                   SET status='pending', updated_at=now()
-                   WHERE session_id=? AND status='errored'""",
+                   SET status='pending', updated_at=now(),
+                       next_run_at=NULL, dead_lettered_at=NULL,
+                       dead_letter_streak=0
+                   WHERE session_id=? AND status IN ('errored', 'dead_lettered')""",
                 [(sid,) for sid, _ in matched],
             )
             updated = [sid for sid, _ in matched]

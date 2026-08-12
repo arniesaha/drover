@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from unittest.mock import patch
 
 import duckdb
 
@@ -40,7 +41,7 @@ def test_summarizer_auth_diagnostics_reports_file_token_without_llm_call(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
 
-    report = summarize_backend_auth(api_model="claude-test")
+    report = summarize_backend_auth(api_model="claude-test", backend_policy="hybrid")
 
     assert report["backend_policy"] == "hybrid"
     assert report["anthropic_ready"] is True
@@ -58,7 +59,7 @@ def test_summarizer_auth_diagnostics_flags_expired_credentials(tmp_path, monkeyp
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
 
-    report = summarize_backend_auth()
+    report = summarize_backend_auth(backend_policy="hybrid")
 
     assert report["anthropic_ready"] is False
     assert report["auth_sources"]["claude_credentials"]["exists"] is True
@@ -78,7 +79,6 @@ def test_summarizer_auth_diagnostics_reports_local_ollama_without_relay(
     report = summarize_backend_auth(local_ollama_url="http://127.0.0.1:11435")
 
     assert report["anthropic_ready"] is False
-    assert report["local_ready"] is True
     assert report["local_configured"] is True
     assert report["local_ollama"] == {"url_present": True, "wake_relay": False}
     assert report["gpu"] == {"relay_url_present": False, "ollama_url_present": False}
@@ -101,11 +101,49 @@ def test_summarizer_auth_diagnostics_cloud_policy_blocks_local_fallback(
     assert report["backend_policy"] == "cloud"
     assert report["anthropic_ready"] is False
     assert report["local_configured"] is True
-    assert report["local_ready"] is False
+    assert report["harness_ready"] is False
     assert "backend_policy=cloud" in " ".join(report["warnings"])
 
 
-def test_summarizer_auth_diagnostics_local_policy_ignores_cloud_creds(
+def test_summarizer_auth_diagnostics_reports_the_harness_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "DROVER_CLAUDE_CREDENTIALS_PATH", str(tmp_path / "no-creds.json")
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
+
+    with patch(
+        "drover.server.harness.structured.claude.resolve_binary",
+        return_value="/usr/local/bin/claude",
+    ):
+        report = summarize_backend_auth()
+
+    assert report["backend_policy"] == "harness"
+    assert report["harness_ready"] is True
+    assert report["harness_model"] == "haiku"
+    assert report["anthropic_ready"] is False
+    assert report["warnings"] == []
+
+
+def test_summarizer_auth_diagnostics_warns_when_the_cli_is_missing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "DROVER_CLAUDE_CREDENTIALS_PATH", str(tmp_path / "no-creds.json")
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
+
+    with patch(
+        "drover.server.harness.structured.claude.resolve_binary", return_value=None
+    ):
+        report = summarize_backend_auth()
+
+    assert report["harness_ready"] is False
+    assert "claude-code CLI" in " ".join(report["warnings"])
+
+
+def test_summarizer_auth_diagnostics_reports_local_policy_as_retired(
     tmp_path, monkeypatch
 ):
     creds = tmp_path / ".credentials.json"
@@ -114,16 +152,46 @@ def test_summarizer_auth_diagnostics_local_policy_ignores_cloud_creds(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
 
-    report = summarize_backend_auth(
-        backend_policy="local",
-        local_ollama_url="http://127.0.0.1:11435",
-    )
+    with patch(
+        "drover.server.harness.structured.claude.resolve_binary",
+        return_value="/usr/local/bin/claude",
+    ):
+        report = summarize_backend_auth(
+            backend_policy="local",
+            local_ollama_url="http://127.0.0.1:11435",
+        )
 
-    assert report["backend_policy"] == "local"
-    assert report["anthropic_configured"] is True
+    assert report["backend_policy"] == "harness"
     assert report["anthropic_ready"] is False
-    assert report["local_ready"] is True
-    assert "ignores available Anthropic" in " ".join(report["warnings"])
+    assert report["harness_ready"] is True
+    assert "retired" in " ".join(report["warnings"])
+
+
+def test_retry_clears_the_dead_letter_streak_so_capped_jobs_can_run_again(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    con = duckdb.connect(str(db))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs "
+            "(session_id, status, attempts, last_error, dead_letter_streak) "
+            "VALUES ('capped', 'dead_lettered', 5, "
+            "'claude-code readiness: CLI not found on PATH', 3)"
+        )
+    finally:
+        con.close()
+
+    applied = retry_errored_jobs(db, apply=True)
+
+    assert applied["updated"] == ["capped"]
+    con = duckdb.connect(str(db))
+    try:
+        assert con.execute(
+            "SELECT status, dead_letter_streak FROM summarize_jobs "
+            "WHERE session_id='capped'"
+        ).fetchone() == ("pending", 0)
+    finally:
+        con.close()
 
 
 def test_classify_retryable_auth_and_rate_limit_errors_only_by_default():

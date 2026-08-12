@@ -18,7 +18,7 @@ def test_load_from_path():
     assert cfg.agent_id == "test-agent"
     assert cfg.principal_id == "test-user"
     assert cfg.processed_retention_days == 7
-    assert cfg.summarizer_backend_policy == "hybrid"
+    assert cfg.summarizer_backend_policy == "harness"
     assert cfg.summarizer_local_ollama_url == ""
     assert cfg.embeddings_api_base_url == ""
     assert cfg.embeddings_api_model == "text-embedding-3-small"
@@ -52,6 +52,16 @@ def test_loads_local_ollama_summarizer_config(tmp_path):
     assert cfg.summarizer_backend_policy == "local"
     assert cfg.summarizer_local_model == "qwen2.5:7b"
     assert cfg.summarizer_local_ollama_url == "http://127.0.0.1:11435"
+
+
+def test_loads_harness_summarizer_model(tmp_path):
+    cfg_file = tmp_path / "summarizer.toml"
+    cfg_file.write_text("[summarizer]\nharness_model = 'sonnet'\n")
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.summarizer_harness_model == "sonnet"
+    assert default_config().summarizer_harness_model == "haiku"
 
 
 def test_redis_shadow_defaults_off():

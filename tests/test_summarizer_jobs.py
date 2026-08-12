@@ -126,6 +126,67 @@ def test_fifth_failure_dead_letters_generation(tmp_path: Path) -> None:
         con.close()
 
 
+def _dead_letter_once(con: duckdb.DuckDBPyConnection, session_id: str, version: str):
+    """Drive one generation all the way to dead_lettered."""
+    assert enqueue_summary_generation(con, session_id, version) is True
+    con.execute(
+        "UPDATE summarize_jobs SET status='running', attempts=4 WHERE session_id=?",
+        [session_id],
+    )
+    return finish_summary_failure(
+        con,
+        session_id,
+        version,
+        "backend failed",
+        now=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        jitter=lambda _low, _high: 0,
+    )
+
+
+def test_dead_letter_counts_against_a_durable_streak(tmp_path: Path) -> None:
+    con, _ = _bootstrapped(tmp_path)
+    try:
+        assert _dead_letter_once(con, "s1", "v1") == "dead_lettered"
+
+        assert con.execute(
+            "SELECT dead_letter_streak FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == (1,)
+    finally:
+        con.close()
+
+
+def test_new_source_version_reruns_but_keeps_the_failure_history(
+    tmp_path: Path,
+) -> None:
+    con, _ = _bootstrapped(tmp_path)
+    try:
+        _dead_letter_once(con, "s1", "v1")
+
+        assert enqueue_summary_generation(con, "s1", "v2") is True
+
+        assert con.execute(
+            "SELECT status, attempts, dead_letter_streak, last_error "
+            "FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == ("pending", 0, 1, "backend failed")
+    finally:
+        con.close()
+
+
+def test_repeated_dead_letters_stop_opening_new_generations(tmp_path: Path) -> None:
+    con, _ = _bootstrapped(tmp_path)
+    try:
+        for version in ("v1", "v2", "v3"):
+            assert _dead_letter_once(con, "s1", version) == "dead_lettered"
+
+        assert enqueue_summary_generation(con, "s1", "v4") is False
+        assert con.execute(
+            "SELECT source_version, status, dead_letter_streak "
+            "FROM summarize_jobs WHERE session_id='s1'"
+        ).fetchone() == ("v3", "dead_lettered", 3)
+    finally:
+        con.close()
+
+
 def test_stale_failure_cannot_spend_new_generation_budget(tmp_path: Path) -> None:
     con, _ = _bootstrapped(tmp_path)
     try:
@@ -248,6 +309,7 @@ def test_bootstrap_adds_retry_columns_to_existing_table(tmp_path: Path) -> None:
         assert columns["next_run_at"] is None
         assert columns["dead_lettered_at"] is None
         assert columns["stream_publish_needed"] is not None
+        assert columns["dead_letter_streak"] == "0"
         brief_columns = {
             row[1]: row[4]
             for row in con.execute("PRAGMA table_info('brief_jobs')").fetchall()

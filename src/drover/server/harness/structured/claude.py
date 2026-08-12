@@ -21,8 +21,18 @@ from typing import Any
 from drover.server.harness.structured.driver import ProcessDriver, StructuredMessage
 
 
+def resolve_binary(binary: str | None = None) -> str | None:
+    """Locate the ``claude`` executable the way the daemon does.
+
+    ``None`` means nothing was found: PATH has no ``claude`` and no versioned
+    install exists. Callers that can degrade (the summarizer's harness
+    backend) need to tell that apart from a CLI that ran and failed.
+    """
+    return binary or shutil.which("claude") or _versioned_claude_binary()
+
+
 def default_command(binary: str | None = None) -> list[str]:
-    resolved_binary = binary or shutil.which("claude") or _versioned_claude_binary()
+    resolved_binary = resolve_binary(binary)
     return [
         resolved_binary or "claude",
         "-p",

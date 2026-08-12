@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS summarize_jobs (
   max_attempts     INTEGER DEFAULT 5,
   next_run_at      TIMESTAMP,
   dead_lettered_at TIMESTAMP,
-  stream_publish_needed BOOLEAN DEFAULT FALSE
+  stream_publish_needed BOOLEAN DEFAULT FALSE,
+  dead_letter_streak INTEGER DEFAULT 0
 );
 """
 
@@ -142,6 +143,10 @@ _SUMMARIZE_JOBS_COLUMNS = {
     "next_run_at": "TIMESTAMP",
     "dead_lettered_at": "TIMESTAMP",
     "stream_publish_needed": "BOOLEAN DEFAULT FALSE",
+    # Survives the per-generation attempt reset, so a session that keeps
+    # producing events can no longer buy an unbounded number of fresh
+    # retry budgets for a summary that never succeeds.
+    "dead_letter_streak": "INTEGER DEFAULT 0",
 }
 
 _LIVE_SESSION_RECAPS_DDL = """

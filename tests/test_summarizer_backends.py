@@ -11,6 +11,7 @@ import requests
 from drover.server.summarizer.backends import (
     BackendError,
     SummarizerBackendConfig,
+    local_analysis_backend,
     select_backend,
 )
 from drover.server.summarizer.backends.anthropic import AnthropicBackend
@@ -292,21 +293,27 @@ def test_ollama_backend_kickstarts_launchd_before_request() -> None:
 
 
 def test_select_backend_incremental_prefers_api_when_anthropic_available() -> None:
-    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=_rig())
+    cfg = SummarizerBackendConfig(
+        backend_policy="hybrid", api_key="sk-test", gpu_rig=_rig()
+    )
     b = select_backend(job_kind="incremental", config=cfg)
     assert b.name == "hybrid"
     assert b.model == cfg.api_model
 
 
 def test_select_backend_backfill_prefers_api() -> None:
-    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=_rig())
+    cfg = SummarizerBackendConfig(
+        backend_policy="hybrid", api_key="sk-test", gpu_rig=_rig()
+    )
     b = select_backend(job_kind="backfill", config=cfg)
     assert b.name == "hybrid"
     assert b.model == cfg.api_model
 
 
 def test_select_backend_live_recap_requires_recap_key() -> None:
-    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=None)
+    cfg = SummarizerBackendConfig(
+        backend_policy="cloud", api_key="sk-test", gpu_rig=None
+    )
 
     backend = select_backend(job_kind="live_recap", config=cfg)
 
@@ -315,40 +322,74 @@ def test_select_backend_live_recap_requires_recap_key() -> None:
     assert backend.optional_keys == ()
 
 
-def test_select_backend_live_recap_local_requires_string_recap() -> None:
+def test_select_backend_live_recap_harness_requires_recap_key() -> None:
+    cfg = SummarizerBackendConfig(backend_policy="harness", api_key=None, gpu_rig=None)
+
+    backend = select_backend(job_kind="live_recap", config=cfg)
+
+    assert backend.name == "claude-code"
+    assert backend.required_keys == ("recap",)
+    assert backend.optional_keys == ()
+
+
+def test_select_backend_hybrid_is_plain_anthropic_without_a_cli() -> None:
     cfg = SummarizerBackendConfig(
-        backend_policy="local",
-        api_key=None,
-        gpu_rig=_rig(),
+        backend_policy="hybrid", api_key="sk-test", gpu_rig=None
     )
-    envelope = {"response": json.dumps({"recap": 1})}
-
-    with (
-        patch("drover.server.wol.requests.get", return_value=_FakeResp()),
-        patch(
-            "drover.server.summarizer.backends.ollama.requests.post",
-            return_value=_FakeResp(payload=envelope),
-        ),
+    with patch(
+        "drover.server.harness.structured.claude.resolve_binary", return_value=None
     ):
-        backend = select_backend(job_kind="live_recap", config=cfg)
-        with pytest.raises(BackendError, match="recap must be a string"):
-            backend.summarize("prompt")
-
-
-def test_select_backend_falls_back_to_api_when_no_rig() -> None:
-    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=None)
-    b = select_backend(job_kind="incremental", config=cfg)
+        b = select_backend(job_kind="incremental", config=cfg)
     assert b.name == "anthropic"
 
 
-def test_select_backend_falls_back_to_local_when_no_api() -> None:
+def test_select_backend_harness_policy_uses_the_claude_code_cli() -> None:
+    cfg = SummarizerBackendConfig(backend_policy="harness", api_key=None, gpu_rig=None)
+    b = select_backend(job_kind="incremental", config=cfg)
+    assert b.name == "claude-code"
+
+
+def test_select_backend_harness_policy_ignores_anthropic_credentials() -> None:
+    cfg = SummarizerBackendConfig(
+        backend_policy="harness", api_key="sk-test", gpu_rig=_rig()
+    )
+    b = select_backend(job_kind="incremental", config=cfg)
+    assert b.name == "claude-code"
+
+
+def test_select_backend_harness_policy_requires_the_cli() -> None:
+    cfg = SummarizerBackendConfig(backend_policy="harness", api_key=None, gpu_rig=None)
+    with (
+        patch(
+            "drover.server.harness.structured.claude.resolve_binary", return_value=None
+        ),
+        pytest.raises(BackendError, match="claude-code CLI"),
+    ):
+        select_backend(job_kind="incremental", config=cfg)
+
+
+def test_select_backend_never_routes_summaries_to_ollama() -> None:
     cfg = SummarizerBackendConfig(api_key=None, gpu_rig=_rig())
     b = select_backend(job_kind="backfill", config=cfg)
-    assert b.name == "ollama"
+    assert b.name == "claude-code"
 
 
-def test_select_backend_hybrid_falls_back_to_local_on_anthropic_401() -> None:
-    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=_rig())
+def test_select_backend_retired_local_policy_falls_through_to_harness(caplog) -> None:
+    cfg = SummarizerBackendConfig(
+        backend_policy="local", api_key="sk-test", gpu_rig=_rig()
+    )
+
+    with caplog.at_level("WARNING"):
+        b = select_backend(job_kind="incremental", config=cfg)
+
+    assert b.name == "claude-code"
+    assert "backend_policy=local" in caplog.text
+
+
+def test_select_backend_hybrid_falls_back_to_harness_on_anthropic_401() -> None:
+    cfg = SummarizerBackendConfig(
+        backend_policy="hybrid", api_key="sk-test", gpu_rig=_rig()
+    )
     b = select_backend(job_kind="incremental", config=cfg)
 
     with (
@@ -372,13 +413,16 @@ def test_select_backend_hybrid_falls_back_to_local_on_anthropic_401() -> None:
         out = b.summarize("prompt")
 
     assert out["summary_md"] == "local summary"
+    assert b.fallback.name == "claude-code"
     assert b.model == b.fallback.model
     primary_summarize.assert_called_once_with("prompt")
     fallback_summarize.assert_called_once_with("prompt")
 
 
 def test_select_backend_hybrid_does_not_fallback_on_non_auth_anthropic_error() -> None:
-    cfg = SummarizerBackendConfig(api_key="sk-test", gpu_rig=_rig())
+    cfg = SummarizerBackendConfig(
+        backend_policy="hybrid", api_key="sk-test", gpu_rig=_rig()
+    )
     b = select_backend(job_kind="incremental", config=cfg)
 
     with (
@@ -415,40 +459,32 @@ def test_select_backend_cloud_policy_refuses_local_fallback() -> None:
         select_backend(job_kind="incremental", config=cfg)
 
 
-def test_select_backend_local_policy_ignores_api_credentials() -> None:
-    cfg = SummarizerBackendConfig(
-        backend_policy="local",
-        api_key="sk-test",
-        gpu_rig=_rig(),
-    )
-    b = select_backend(job_kind="incremental", config=cfg)
-    assert b.name == "ollama"
-
-
-def test_select_backend_local_policy_requires_local_backend() -> None:
-    cfg = SummarizerBackendConfig(
-        backend_policy="local",
-        api_key="sk-test",
-        gpu_rig=None,
-    )
-    with pytest.raises(BackendError, match="backend_policy=local"):
-        select_backend(job_kind="incremental", config=cfg)
-
-
-def test_select_backend_local_ollama_kickstarts_launchd_when_no_api() -> None:
+def test_local_analysis_backend_is_still_ollama_for_advisory_content() -> None:
     cfg = SummarizerBackendConfig.from_runtime(
         local_ollama_url="http://127.0.0.1:11435"
     )
-    b = select_backend(job_kind="backfill", config=cfg)
-    assert b.name == "ollama"
+
+    b = local_analysis_backend(cfg)
+
     assert isinstance(b, OllamaBackend)
     assert b.wake_on_first_call is True
     assert b.launchd_label == "com.drover.mac-ollama-embeddings"
 
 
-def test_select_backend_raises_when_neither_configured() -> None:
+def test_local_analysis_backend_requires_a_configured_ollama() -> None:
     cfg = SummarizerBackendConfig(api_key=None, gpu_rig=None)
-    with pytest.raises(BackendError, match="no backend configured"):
+    with pytest.raises(BackendError, match="local_ollama_url"):
+        local_analysis_backend(cfg)
+
+
+def test_select_backend_raises_when_neither_configured() -> None:
+    cfg = SummarizerBackendConfig(backend_policy="hybrid", api_key=None, gpu_rig=None)
+    with (
+        patch(
+            "drover.server.harness.structured.claude.resolve_binary", return_value=None
+        ),
+        pytest.raises(BackendError, match="no backend configured"),
+    ):
         select_backend(job_kind="incremental", config=cfg)
 
 
@@ -501,15 +537,19 @@ def test_from_runtime_reads_backend_policy_from_arg() -> None:
     )
     assert cfg.backend_policy == "cloud"
     assert cfg.allows_anthropic is True
-    assert cfg.allows_local_backend is False
+    assert cfg.allows_harness_backend is False
 
 
 def test_from_runtime_reads_backend_policy_from_env(monkeypatch) -> None:
-    monkeypatch.setenv("DROVER_SUMMARIZER_BACKEND_POLICY", "local")
+    monkeypatch.setenv("DROVER_SUMMARIZER_BACKEND_POLICY", "harness")
     cfg = SummarizerBackendConfig.from_runtime(api_key="sk-test")
-    assert cfg.backend_policy == "local"
+    assert cfg.backend_policy == "harness"
     assert cfg.allows_anthropic is False
-    assert cfg.allows_local_backend is True
+
+
+def test_from_runtime_defaults_to_the_harness_policy() -> None:
+    assert SummarizerBackendConfig.from_runtime().backend_policy == "harness"
+    assert SummarizerBackendConfig().backend_policy == "harness"
 
 
 def test_from_runtime_rejects_unknown_backend_policy() -> None:

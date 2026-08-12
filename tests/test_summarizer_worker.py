@@ -159,6 +159,35 @@ def test_worker_drains_one_pending_job(tmp_path: Path) -> None:
         con.close()
 
 
+def test_successful_summary_clears_the_dead_letter_streak(tmp_path: Path) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _write_events(parquet_dir, "sess-W1b")
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    _enqueue(duckdb_path, "sess-W1b")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "UPDATE summarize_jobs SET dead_letter_streak=2 WHERE session_id='sess-W1b'"
+        )
+    finally:
+        con.close()
+
+    SummarizerWorker(
+        duckdb_path=duckdb_path,
+        api_key="sk-test",
+        _llm_call=_fake_llm_call,
+    ).drain_once()
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute(
+            "SELECT status, dead_letter_streak FROM summarize_jobs "
+            "WHERE session_id='sess-W1b'"
+        ).fetchone() == ("done", 0)
+    finally:
+        con.close()
+
+
 def test_worker_parks_failure_until_retry_time_when_no_api_key(tmp_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _write_events(parquet_dir, "sess-W2")
