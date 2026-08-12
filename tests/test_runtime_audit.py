@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from click.testing import CliRunner
 
-from drover.event_identity import audit_agent_event_identity
+from drover.event_identity import audit_agent_event_identity, scan_agent_events_once
 from drover.schema import bootstrap
 from drover.server.__main__ import main
 from drover.server.doctor import format_runtime_audit, runtime_audit
@@ -1556,6 +1556,12 @@ def test_metrics_hot_path_does_not_repeat_full_history_agent_event_scans(
     refresh. Each unbounded ``agent_events`` statement reads the whole parquet
     tree, so the cost of this audit is set by how many such statements it
     issues, not by how much work each one does. Regression guard for #78.
+
+    Statement-level profile against a 6,876-file / 2.23M-row store at
+    ``threads=1``: the three whole-history statements this used to allow --
+    the row count, the session-set metrics and the duplicate-identity
+    metrics -- cost 1.61s + 2.37s + 2.71s of an 11.4s audit. They read three
+    columns between them, so they now share one pass.
     """
     from drover.server import doctor as doctor_module
 
@@ -1577,8 +1583,9 @@ def test_metrics_hot_path_does_not_repeat_full_history_agent_event_scans(
     ]
     scans = _full_history_agent_event_scans(statements)
 
-    # One row count, one session-consistency pass, one event-identity pass.
-    assert len(scans) <= 3, (
+    # One shared pass feeding the row count, the session-set metrics and the
+    # duplicate-identity metrics.
+    assert len(scans) == 1, (
         f"{len(scans)} unbounded agent_events scans in the /metrics hot path:\n"
         + "\n".join(f"  - {scan[:120]}" for scan in scans)
     )
@@ -1586,6 +1593,72 @@ def test_metrics_hot_path_does_not_repeat_full_history_agent_event_scans(
     assert report["table_counts"]["agent_events"] == 10
     assert report["session_consistency"]["event_sessions"] == 9
     assert report["agent_event_identity"]["status"] == "ok"
+
+
+def test_shared_agent_event_pass_matches_reading_agent_events_directly() -> None:
+    """The one-pass numbers must equal what three separate scans reported.
+
+    The pass pre-aggregates ``(id, dedup_key, session_id)`` with a row count,
+    so every consumer now sums counts instead of counting rows. NULL ids,
+    NULL dedup_keys and repeated pairs are exactly where that rewrite could
+    drift, so they are all present here.
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(
+            "CREATE TABLE agent_events "
+            "(id VARCHAR, dedup_key VARCHAR, session_id VARCHAR)"
+        )
+        con.execute("""
+            INSERT INTO agent_events VALUES
+              ('a', 'k1', 's1'),
+              ('a', 'k1', 's1'),
+              ('a', 'k2', 's2'),
+              (NULL, 'k2', 's2'),
+              ('b', NULL, NULL),
+              (NULL, NULL, 's3')
+            """)
+        direct = audit_agent_event_identity(con)
+
+        scan = scan_agent_events_once(con)
+        assert scan is not None
+        pooled = audit_agent_event_identity(con, scan=scan)
+    finally:
+        con.close()
+
+    assert scan.total_rows == 6
+    assert pooled == direct
+
+
+def test_shared_agent_event_pass_leaves_nothing_in_the_database(
+    tmp_path: Path,
+) -> None:
+    """The pass is connection-local, so the audit stays a read-only reader.
+
+    ``runtime_audit`` documents that it never mutates the database. The shared
+    pass is the audit's only DDL, and it must stay a TEMP table: anything
+    persisted here would be written into the live store by every CLI run and
+    into the /metrics copy on every refresh.
+    """
+    db, incoming = _seed_runtime_db(tmp_path)
+
+    runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24, deep=False)
+
+    con = duckdb.connect(str(db))
+    try:
+        persisted = con.execute("SELECT table_name FROM duckdb_tables()").fetchall()
+    finally:
+        con.close()
+    assert "agent_event_scan" not in {str(name) for (name,) in persisted}
+
+
+def test_scan_agent_events_once_reports_missing_relation() -> None:
+    """No ``agent_events`` relation means no pass, and callers fall back."""
+    con = duckdb.connect(":memory:")
+    try:
+        assert scan_agent_events_once(con) is None
+    finally:
+        con.close()
 
 
 def test_agent_event_identity_without_dedup_key_column() -> None:
