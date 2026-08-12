@@ -126,6 +126,12 @@ class DroverConfig:
     # Address the pairing QR points clients at. Empty means "not configured";
     # the installer writes the detected private address here.
     server_advertised_url: str
+    # Bind address for the cockpit HTTP surface. Lives in config rather than
+    # only in --metrics-host, because a service unit's argv is one regenerated
+    # unit away from silently reverting the server to loopback, and that
+    # failure is invisible until the app stops loading any screen. An
+    # explicitly passed --metrics-host still wins.
+    server_metrics_host: str
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     harness_favorite_cwds: tuple[str, ...]
@@ -151,6 +157,8 @@ _DEFAULTS = {
         "mcp_http_port": 7077,
         "metrics_http_port": 7080,
         "advertised_url": "",
+        # Hardened default: binding beyond loopback must be a deliberate act.
+        "metrics_host": "127.0.0.1",
     },
     "agent": {
         "agent_id": "unknown-agent",
@@ -290,6 +298,7 @@ def _from_dict(d: dict) -> DroverConfig:
         auth_api_token=d["auth"]["api_token"],
         auth_legacy_token_enabled=bool(d["auth"]["legacy_token_enabled"]),
         server_advertised_url=str(d["server"]["advertised_url"]),
+        server_metrics_host=str(d["server"]["metrics_host"]),
         harness_favorite_cwds=tuple(
             str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
         ),
