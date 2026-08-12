@@ -101,3 +101,34 @@ def test_trusted_python_runs_each_test_module_in_a_fresh_process() -> None:
         '        print("::endgroup::", flush=True)\n'
         "PY\n"
     )
+
+
+def test_release_workflow_is_tag_triggered_and_publishes_three_artifacts() -> None:
+    workflow = load_workflow("release.yml")
+
+    assert set(workflow["on"]) == {"push", "workflow_dispatch"}
+    assert workflow["on"]["push"]["tags"] == ["v*"]
+    # Publishing a release needs write; nothing else in this repo does.
+    assert workflow["permissions"] == {"contents": "write"}
+    # A manual run must name the tag: on workflow_dispatch GITHUB_REF_NAME is
+    # the branch, so without this the job would publish a release called
+    # "main".
+    assert "ref" in workflow["on"]["workflow_dispatch"]["inputs"]
+
+    job = workflow["jobs"]["release"]
+    assert job["runs-on"] == "ubuntu-latest"
+    steps = " ".join(step.get("run", "") for step in job["steps"])
+    assert "uv build" in steps
+    assert "uv export" in steps
+    assert "sha256sum" in steps
+    assert "SHA256SUMS.txt" in steps
+    # An export that silently drops hashes would make --require-hashes a
+    # no-op at install time, so the build must fail rather than ship one.
+    assert "--hash=sha256:" in steps
+
+
+def test_release_workflow_never_runs_on_pull_requests() -> None:
+    """A PR that could cut a release would let a fork publish artifacts."""
+    workflow = load_workflow("release.yml")
+    assert "pull_request" not in workflow["on"]
+    assert "pull_request_target" not in workflow["on"]
