@@ -98,6 +98,28 @@ def test_device_bearer_deletes_its_apns_token_idempotently(server):
     )
 
 
+def test_deletion_rejects_legacy_cookie_and_host_credentials(server):
+    _, store, auth = server
+    device, _ = store.issue(scope="device", label="Phone")
+    _, host_token = store.issue(scope="host", label="Mac", host_id="mac")
+    store.set_apns_registration(device.id, token="apns-1", environment="sandbox")
+
+    assert (
+        request(server, "DELETE", "/auth/device/apns", token="cluster-token")[0] == 401
+    )
+    assert (
+        request(
+            server,
+            "DELETE",
+            "/auth/device/apns",
+            cookie=f"{auth.cookie_name}={mint_session(auth)}",
+        )[0]
+        == 401
+    )
+    assert request(server, "DELETE", "/auth/device/apns", token=host_token)[0] == 403
+    assert store.get(device.id).apns_token == "apns-1"
+
+
 @pytest.mark.parametrize(
     "payload, raw",
     [
