@@ -177,10 +177,18 @@ struct AnalyticsView: View {
                             Text(value.projectKey).droverText(.h2)
                             Text("\(format(value.totalTokens)) tokens · \(value.sessionCount) sessions")
                                 .droverText(.body)
-                            Text("Harnesses: \(contributors(value.harnesses))")
+                            Text("Harnesses: " + contributors(
+                                value.harnesses,
+                                attributedSessionCount: value.harnessAttributedSessionCount,
+                                totalSessionCount: value.sessionCount
+                            ))
                                 .droverText(.nested)
                                 .fixedSize(horizontal: false, vertical: true)
-                            Text("Hosts: \(contributors(value.hosts))")
+                            Text("Hosts: " + contributors(
+                                value.hosts,
+                                attributedSessionCount: value.hostAttributedSessionCount,
+                                totalSessionCount: value.sessionCount
+                            ))
                                 .droverText(.nested)
                                 .fixedSize(horizontal: false, vertical: true)
                             aggregateCaption(value.metadata, activity: activity)
@@ -267,8 +275,14 @@ struct AnalyticsView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func contributors(_ values: [String]) -> String {
-        values.isEmpty ? "Unavailable" : values.joined(separator: ", ")
+    private func contributors(
+        _ values: [String], attributedSessionCount: Int, totalSessionCount: Int
+    ) -> String {
+        AnalyticsContributorPresentation(
+            values: values,
+            attributedSessionCount: attributedSessionCount,
+            totalSessionCount: totalSessionCount
+        ).text
     }
 
     private func analyticsMetric(_ value: String, _ label: String) -> some View {

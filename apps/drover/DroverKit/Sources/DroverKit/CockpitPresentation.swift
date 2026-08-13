@@ -1,5 +1,22 @@
 import Foundation
 
+public struct AnalyticsContributorPresentation: Sendable, Equatable {
+    public let text: String
+
+    public init(
+        values: [String], attributedSessionCount: Int, totalSessionCount: Int
+    ) {
+        let known = values.isEmpty ? nil : values.joined(separator: ", ")
+        let unavailable = max(0, totalSessionCount - attributedSessionCount)
+        guard unavailable > 0 else {
+            text = known ?? "Unavailable"
+            return
+        }
+        let missing = "unavailable for \(unavailable) session\(unavailable == 1 ? "" : "s")"
+        text = known.map { "\($0) · \(missing)" } ?? missing.prefix(1).uppercased() + missing.dropFirst()
+    }
+}
+
 public enum AnalyticsDistributionSection: String, CaseIterable, Sendable {
     case projects, harnesses, hosts, models
 

@@ -363,6 +363,18 @@ private let populatedActivity = #"{"totals":{"session_count":12,"total_tokens":1
 
 private let populatedProjects = #"[{"project_key":"arniesaha/drover","session_count":12,"total_tokens":1234,"cost_usd":1.25,"cache_read_tokens":100,"cache_write_tokens":20,"total_latency_ms":500,"harnesses":["codex"],"hosts":["mac-mini"],"metric":"tokens"}]"#
 
+@Test func analyticsContributorsDiscloseMissingSessionAttribution() {
+    #expect(AnalyticsContributorPresentation(
+        values: ["claude-code"], attributedSessionCount: 1, totalSessionCount: 3
+    ).text == "claude-code · unavailable for 2 sessions")
+    #expect(AnalyticsContributorPresentation(
+        values: [], attributedSessionCount: 0, totalSessionCount: 1
+    ).text == "Unavailable for 1 session")
+    #expect(AnalyticsContributorPresentation(
+        values: ["codex", "agy"], attributedSessionCount: 2, totalSessionCount: 2
+    ).text == "codex, agy")
+}
+
 private func decodeActivitySection(
     status: String, data: String
 ) throws -> SectionEnvelope<ActivitySummary> {

@@ -122,7 +122,9 @@ class ProjectActivity:
     total_latency_ms: float
     average_latency_ms: float | None
     harnesses: tuple[str, ...]
+    harness_attributed_session_count: int
     hosts: tuple[str, ...]
+    host_attributed_session_count: int
     metadata: AggregateMetadata
 
 
@@ -351,10 +353,10 @@ def _activity_analytics_from_facts(
     attributable_sessions = int(aggregate[7] or 0)
     coverage = Coverage(
         attributable_session_percent=_percent(attributable_sessions, session_count),
-        token_percent=_percent(int(aggregate[8] or 0), attributable_sessions),
-        cost_percent=_percent(int(aggregate[9] or 0), attributable_sessions),
-        cache_percent=_percent(int(aggregate[10] or 0), attributable_sessions),
-        latency_percent=_percent(int(aggregate[11] or 0), attributable_sessions),
+        token_percent=_percent(int(aggregate[8] or 0), session_count),
+        cost_percent=_percent(int(aggregate[9] or 0), session_count),
+        cache_percent=_percent(int(aggregate[10] or 0), session_count),
+        latency_percent=_percent(int(aggregate[11] or 0), session_count),
     )
     metadata = _aggregate_metadata(coverage, aggregate[12])
     project_metric: Literal["tokens", "sessions"] = (
@@ -450,6 +452,7 @@ def _session_facts_sql(
             NULL::VARCHAR AS repo_owner,
             NULL::VARCHAR AS repo_name,
             NULL::VARCHAR AS branch,
+            NULL::VARCHAR AS raw_data,
             NULL::VARCHAR AS date
           WHERE FALSE
         """
@@ -488,7 +491,28 @@ def _session_facts_sql(
             max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS ended_at,
             mode(repo_owner || '/' || repo_name) FILTER (
               WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
-            ) AS project_key
+            ) AS project_key,
+            bool_or(
+              CASE
+                WHEN json_valid(raw_data) THEN ends_with(
+                  rtrim(COALESCE(
+                    NULLIF(trim(json_extract_string(raw_data, '$.cwd')), ''),
+                    NULLIF(trim(json_extract_string(
+                      raw_data, '$.currentWorkingDirectory'
+                    )), ''),
+                    NULLIF(trim(json_extract_string(
+                      raw_data, '$.working_directory'
+                    )), ''),
+                    NULLIF(trim(json_extract_string(
+                      raw_data, '$.workspaceDir'
+                    )), ''),
+                    ''
+                  ), '/'),
+                  '/claude/mem/observer/sessions'
+                )
+                ELSE FALSE
+              END
+            ) AS is_claude_mem_observer
           FROM canonical_agent_events, bounds
           WHERE session_id IS NOT NULL
             AND TRY_CAST(timestamp AS TIMESTAMPTZ) >= bounds.cutoff
@@ -697,6 +721,7 @@ def _session_facts_sql(
             AND NOT EXISTS (
               SELECT 1 FROM span_sessions ss WHERE ss.session_id = s.session_id
             )
+            AND NOT s.is_claude_mem_observer
         ),
         filtered_sessions AS (
           SELECT * FROM session_facts WHERE {filter_sql}
@@ -744,7 +769,9 @@ def _project_breakdowns(
           COALESCE(sum(total_latency_ms), 0) AS total_latency_ms,
           avg(total_latency_ms) FILTER (WHERE has_latency) AS average_latency_ms,
           list(DISTINCT harness ORDER BY harness) FILTER (WHERE harness IS NOT NULL),
+          count(*) FILTER (WHERE harness IS NOT NULL),
           list(DISTINCT host_id ORDER BY host_id) FILTER (WHERE host_id IS NOT NULL),
+          count(*) FILTER (WHERE host_id IS NOT NULL),
           count(*) FILTER (WHERE has_tokens) AS token_sessions,
           count(*) FILTER (WHERE has_cost) AS cost_sessions,
           count(*) FILTER (WHERE has_cache) AS cache_sessions,
@@ -772,16 +799,18 @@ def _project_breakdowns(
             total_latency_ms=float(row[6]),
             average_latency_ms=float(row[7]) if row[7] is not None else None,
             harnesses=tuple(row[8] or ()),
-            hosts=tuple(row[9] or ()),
+            harness_attributed_session_count=int(row[9]),
+            hosts=tuple(row[10] or ()),
+            host_attributed_session_count=int(row[11]),
             metadata=_aggregate_metadata(
                 Coverage(
                     attributable_session_percent=100.0,
-                    token_percent=_percent(int(row[10]), int(row[1])),
-                    cost_percent=_percent(int(row[11]), int(row[1])),
-                    cache_percent=_percent(int(row[12]), int(row[1])),
-                    latency_percent=_percent(int(row[13]), int(row[1])),
+                    token_percent=_percent(int(row[12]), int(row[1])),
+                    cost_percent=_percent(int(row[13]), int(row[1])),
+                    cache_percent=_percent(int(row[14]), int(row[1])),
+                    latency_percent=_percent(int(row[15]), int(row[1])),
                 ),
-                row[14],
+                row[16],
             ),
         )
         for row in page_rows
@@ -868,10 +897,10 @@ def _dimension_breakdowns(
             metadata=_aggregate_metadata(
                 Coverage(
                     attributable_session_percent=_percent(int(row[8]), int(row[1])),
-                    token_percent=_percent(int(row[9]), int(row[8])),
-                    cost_percent=_percent(int(row[10]), int(row[8])),
-                    cache_percent=_percent(int(row[11]), int(row[8])),
-                    latency_percent=_percent(int(row[12]), int(row[8])),
+                    token_percent=_percent(int(row[9]), int(row[1])),
+                    cost_percent=_percent(int(row[10]), int(row[1])),
+                    cache_percent=_percent(int(row[11]), int(row[1])),
+                    latency_percent=_percent(int(row[12]), int(row[1])),
                 ),
                 row[13],
             ),

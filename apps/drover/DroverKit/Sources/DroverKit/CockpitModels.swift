@@ -203,7 +203,9 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
     public let totalLatencyMS: Double
     public let averageLatencyMS: Double?
     public let harnesses: [String]
+    public let harnessAttributedSessionCount: Int
     public let hosts: [String]
+    public let hostAttributedSessionCount: Int
     public let metadata: ObservedAggregateMetadata?
 
     private enum CodingKeys: String, CodingKey {
@@ -216,6 +218,8 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
         case totalLatencyMS = "total_latency_ms"
         case averageLatencyMS = "average_latency_ms"
         case harnesses, hosts, metadata
+        case harnessAttributedSessionCount = "harness_attributed_session_count"
+        case hostAttributedSessionCount = "host_attributed_session_count"
     }
 
     public init(from decoder: Decoder) throws {
@@ -229,7 +233,13 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
         totalLatencyMS = try container.decode(Double.self, forKey: .totalLatencyMS)
         averageLatencyMS = try container.decodeIfPresent(Double.self, forKey: .averageLatencyMS)
         harnesses = try container.decodeIfPresent([String].self, forKey: .harnesses) ?? []
+        harnessAttributedSessionCount = try container.decodeIfPresent(
+            Int.self, forKey: .harnessAttributedSessionCount
+        ) ?? (harnesses.isEmpty ? 0 : sessionCount)
         hosts = try container.decodeIfPresent([String].self, forKey: .hosts) ?? []
+        hostAttributedSessionCount = try container.decodeIfPresent(
+            Int.self, forKey: .hostAttributedSessionCount
+        ) ?? (hosts.isEmpty ? 0 : sessionCount)
         metadata = try container.decodeIfPresent(ObservedAggregateMetadata.self, forKey: .metadata)
     }
 }
