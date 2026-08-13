@@ -76,7 +76,7 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 /// (encrypted at the WireGuard/Tailscale hop, not at this layer — see
 /// `NSAllowsArbitraryLoads` in the app's Info.plist).
 public actor DroverClient {
-    private static let cockpitRequestTimeout: TimeInterval = 30
+    private static let cockpitRequestTimeout: TimeInterval = 60
     private let config: ServerConfig
     private let token: String
     private let session: URLSession
