@@ -9,6 +9,10 @@ struct AnalyticsView: View {
     @State private var provider: String?
     @State private var model: String?
     @State private var project: String?
+    /// Which number every distribution list is ordered by. One control for all
+    /// of them: comparing "ranked by sessions" in one section against "ranked
+    /// by tokens" in the next is exactly the confusion this is meant to remove.
+    @State private var rank: DistributionRank = .sessions
 
     var body: some View {
         ScrollView {
@@ -42,29 +46,30 @@ struct AnalyticsView: View {
         .refreshable { await reload() }
     }
 
+    /// Wraps rather than scrolling sideways: a filter parked off the right
+    /// edge is one nobody knows exists, and at accessibility text sizes three
+    /// chips can already exceed the screen width on their own.
     private var filterStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                Menu("\(days) days") {
-                    ForEach([1, 7, 14, 30, 90, 365], id: \.self) { value in
-                        Button("\(value) days") { days = value; Task { await reload() } }
-                    }
+        FlowLayout(spacing: 8, lineSpacing: 8) {
+            Menu("\(days) days") {
+                ForEach([1, 7, 14, 30, 90, 365], id: \.self) { value in
+                    Button("\(value) days") { days = value; Task { await reload() } }
                 }
-                AnalyticsFilterMenu(title: "Host", selection: host, values: hostValues) {
-                    host = $0; Task { await reload() }
-                }
-                AnalyticsFilterMenu(title: "Harness", selection: harness, values: harnessValues) {
-                    harness = $0; Task { await reload() }
-                }
-                AnalyticsFilterMenu(title: "Provider", selection: provider, values: providerValues) {
-                    provider = $0; Task { await reload() }
-                }
-                AnalyticsFilterMenu(title: "Model", selection: model, values: modelValues) {
-                    model = $0; Task { await reload() }
-                }
-                AnalyticsFilterMenu(title: "Project", selection: project, values: projectValues) {
-                    project = $0; Task { await reload() }
-                }
+            }
+            AnalyticsFilterMenu(title: "Host", selection: host, values: hostValues) {
+                host = $0; Task { await reload() }
+            }
+            AnalyticsFilterMenu(title: "Harness", selection: harness, values: harnessValues) {
+                harness = $0; Task { await reload() }
+            }
+            AnalyticsFilterMenu(title: "Provider", selection: provider, values: providerValues) {
+                provider = $0; Task { await reload() }
+            }
+            AnalyticsFilterMenu(title: "Model", selection: model, values: modelValues) {
+                model = $0; Task { await reload() }
+            }
+            AnalyticsFilterMenu(title: "Project", selection: project, values: projectValues) {
+                project = $0; Task { await reload() }
             }
         }
         .buttonStyle(.bordered)
@@ -77,6 +82,10 @@ struct AnalyticsView: View {
         let accounts = snapshot.providerCapacity.data ?? []
         let section = ProviderSectionPresentation(
             status: snapshot.providerCapacity.status,
+            // Without this the server's actual reason never reaches the user
+            // here, unlike ProviderCapacitySection, and every failure reads as
+            // the same generic sentence.
+            message: store.analyticsError,
             hasRetainedValues: !accounts.isEmpty
         )
         if !accounts.isEmpty || snapshot.providerCapacity.status != .ok {
@@ -152,12 +161,19 @@ struct AnalyticsView: View {
                     metadata: activity.metadata,
                     fallbackCoverage: activity.coverage
                 )
+                // Said once, here, instead of on every row below.
                 Text("\(metadata.freshnessText) · \(metadata.coverageText)")
                     .droverText(.subtitle)
                     .fixedSize(horizontal: false, vertical: true)
                 CockpitCard {
+                    // A wider minimum than the old 88pt: at accessibility
+                    // sizes three columns crushed the longest metric label
+                    // into a stack of single words. Reflows two-up, then one.
+                    // (Deliberately not naming that label here — a Python
+                    // test greps these sources and counts its occurrences,
+                    // comments included.)
                     LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: 88), alignment: .leading)],
+                        columns: [GridItem(.adaptive(minimum: 116), alignment: .leading)],
                         alignment: .leading,
                         spacing: 12
                     ) {
@@ -170,44 +186,34 @@ struct AnalyticsView: View {
                     }
                 }
 
-                distributionHeading("Projects", dimension: .projects)
-                ForEach(store.analyticsProjects, id: \.projectKey) { value in
-                    CockpitCard {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(value.projectKey).droverText(.h2)
-                            Text("\(format(value.totalTokens)) tokens · \(value.sessionCount) sessions")
-                                .droverText(.body)
-                            Text("Harnesses: " + contributors(
-                                value.harnesses,
-                                attributedSessionCount: value.harnessAttributedSessionCount,
-                                totalSessionCount: value.sessionCount
-                            ))
-                                .droverText(.nested)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text("Hosts: " + contributors(
-                                value.hosts,
-                                attributedSessionCount: value.hostAttributedSessionCount,
-                                totalSessionCount: value.sessionCount
-                            ))
-                                .droverText(.nested)
-                                .fixedSize(horizontal: false, vertical: true)
-                            aggregateCaption(value.metadata, activity: activity)
-                        }
-                    }
-                }
-                paginationControls(.projects)
-
-                dimensionSection(
-                    title: "Harnesses", dimension: .harnesses,
-                    values: store.analyticsHarnesses, activity: activity
+                distributionSection(
+                    title: "Projects", singular: "project", glyph: "folder",
+                    dimension: .projects,
+                    entries: store.analyticsProjects.map {
+                        DistributionPresentationBuilder.Entry(
+                            key: $0.projectKey,
+                            sessionCount: $0.sessionCount,
+                            totalTokens: $0.totalTokens,
+                            metadata: $0.metadata,
+                            secondaryText: projectContributors($0)
+                        )
+                    },
+                    activity: activity
                 )
-                dimensionSection(
-                    title: "Hosts", dimension: .hosts,
-                    values: store.analyticsHosts, activity: activity
+                distributionSection(
+                    title: "Harnesses", singular: "harness", glyph: "cpu",
+                    dimension: .harnesses,
+                    entries: entries(store.analyticsHarnesses), activity: activity
                 )
-                dimensionSection(
-                    title: "Models", dimension: .models,
-                    values: store.analyticsModels, activity: activity
+                distributionSection(
+                    title: "Hosts", singular: "host", glyph: "desktopcomputer",
+                    dimension: .hosts,
+                    entries: entries(store.analyticsHosts), activity: activity
+                )
+                distributionSection(
+                    title: "Models", singular: "model", glyph: "sparkles",
+                    dimension: .models,
+                    entries: entries(store.analyticsModels), activity: activity
                 )
             }
         }
@@ -215,32 +221,40 @@ struct AnalyticsView: View {
     }
 
     @ViewBuilder
-    private func dimensionSection(
+    private func distributionSection(
         title: String,
+        singular: String,
+        glyph: String,
         dimension: AnalyticsDimension,
-        values: [ActivityBreakdown],
+        entries: [DistributionPresentationBuilder.Entry],
         activity: ActivitySummary
     ) -> some View {
-        distributionHeading(title, dimension: dimension)
-        ForEach(values, id: \.key) { value in
-            CockpitCard {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(value.key).droverText(.h2)
-                    Text("\(format(value.totalTokens)) tokens · \(value.sessionCount) sessions")
-                        .droverText(.body)
-                    aggregateCaption(value.metadata, activity: activity)
-                }
-            }
-        }
-        paginationControls(dimension)
+        let section = DistributionPresentationBuilder.section(
+            title: title,
+            singular: singular,
+            entries: entries,
+            rank: rank,
+            sectionMetadata: activity.metadata,
+            fallbackCoverage: activity.coverage
+        )
+        DistributionSectionView(
+            section: section,
+            glyph: glyph,
+            onToggleRank: { rank = rank.other },
+            trailing: AnyView(paginationControls(dimension))
+        )
+        .accessibilityIdentifier("analytics-distribution-\(dimension.rawValue)")
     }
 
-    private func distributionHeading(
-        _ title: String, dimension: AnalyticsDimension
-    ) -> some View {
-        Text(title)
-            .droverText(.h3)
-            .accessibilityIdentifier("analytics-distribution-\(dimension.rawValue)")
+    private func entries(_ values: [ActivityBreakdown]) -> [DistributionPresentationBuilder.Entry] {
+        values.map {
+            DistributionPresentationBuilder.Entry(
+                key: $0.key,
+                sessionCount: $0.sessionCount,
+                totalTokens: $0.totalTokens,
+                metadata: $0.metadata
+            )
+        }
     }
 
     @ViewBuilder
@@ -263,16 +277,20 @@ struct AnalyticsView: View {
         }
     }
 
-    private func aggregateCaption(
-        _ rowMetadata: ObservedAggregateMetadata?, activity: ActivitySummary
-    ) -> some View {
-        let value = ObservedAggregatePresentation(
-            metadata: rowMetadata ?? activity.metadata,
-            fallbackCoverage: activity.coverage
+    /// Who touched this project. Unlike source/freshness/coverage this is
+    /// different on every row, so it is not what the redesign collapses.
+    private func projectContributors(_ value: ProjectActivity) -> String {
+        let harnesses = contributors(
+            value.harnesses,
+            attributedSessionCount: value.harnessAttributedSessionCount,
+            totalSessionCount: value.sessionCount
         )
-        return Text("\(value.sourceText) · \(value.freshnessText) · \(value.coverageText)")
-            .droverText(.subtitle)
-            .fixedSize(horizontal: false, vertical: true)
+        let hosts = contributors(
+            value.hosts,
+            attributedSessionCount: value.hostAttributedSessionCount,
+            totalSessionCount: value.sessionCount
+        )
+        return "\(harnesses) · \(hosts)"
     }
 
     private func contributors(
