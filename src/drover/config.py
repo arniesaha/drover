@@ -143,6 +143,13 @@ class DroverConfig:
     advisory_full_review_interval_seconds: float
     advisory_poll_interval_seconds: float
     advisory_content: AdvisoryContentConfig
+    # APNs push for "needs you" transitions. Disabled unless an auth key is
+    # present; see the [apns] block in _DEFAULTS.
+    apns_enabled: bool
+    apns_key_path: str
+    apns_key_id: str
+    apns_team_id: str
+    apns_bundle_id: str
 
 
 _DEFAULTS = {
@@ -211,6 +218,17 @@ _DEFAULTS = {
     },
     "harness": {
         "favorite_cwds": [],
+    },
+    # Off until the operator drops the .p8 auth key from the Apple developer
+    # portal onto the host and fills in the ids beside it. With `enabled` off
+    # (or any field blank) the push path is inert and the app falls back to
+    # its foreground watcher and BGTask poller.
+    "apns": {
+        "enabled": False,
+        "key_path": "",
+        "key_id": "",
+        "team_id": "",
+        "bundle_id": "com.arnab.drover",
     },
     "provider": {
         "freshness_threshold_seconds": 600.0,
@@ -317,6 +335,11 @@ def _from_dict(d: dict) -> DroverConfig:
             max_bundle_bytes=int(content["max_bundle_bytes"]),
             excerpt_max_chars=int(content["excerpt_max_chars"]),
         ),
+        apns_enabled=bool(d["apns"]["enabled"]),
+        apns_key_path=str(d["apns"]["key_path"]),
+        apns_key_id=str(d["apns"]["key_id"]),
+        apns_team_id=str(d["apns"]["team_id"]),
+        apns_bundle_id=str(d["apns"]["bundle_id"]),
     )
 
 

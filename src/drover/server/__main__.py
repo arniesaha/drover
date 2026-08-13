@@ -377,6 +377,22 @@ def _bootstrap_if_missing(cfg: DroverConfig) -> None:
         bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
 
 
+def _configure_push(cfg: DroverConfig, auth) -> None:
+    """Register the APNs sender, if one is configured and auth is on.
+
+    Push targets device credentials, which only exist when auth is enabled --
+    with auth off there is nothing paired to push to.
+    """
+    if not getattr(auth, "enabled", False) or auth.credentials is None:
+        return
+    try:
+        from drover.server.push import configure as configure_push
+
+        configure_push(cfg, auth.credentials)
+    except Exception:  # noqa: BLE001
+        log.exception("APNs push failed to configure; continuing without it")
+
+
 def _redis_job_stream_config(cfg: DroverConfig, suffix: str) -> RedisJobStreamConfig:
     return RedisJobStreamConfig(
         stream=f"{cfg.redis_jobs_stream_prefix}:{suffix}",
@@ -1708,6 +1724,10 @@ def run(
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
             auth = load_auth(cfg)
+            # Register the push sender before the HTTP surface starts taking
+            # harness events, so the first awaiting transition after boot is
+            # already deliverable.
+            _configure_push(cfg, auth)
             metrics_collector = MetricsCollector(
                 duckdb_path=cfg.duckdb_path,
                 incoming_dir=cfg.incoming_dir,
@@ -1788,6 +1808,9 @@ def run(
     try:
         if metrics_collector is None:
             auth = load_auth(cfg)
+            # Metrics off, but harnessd's local emit() path still records
+            # awaiting transitions through the registry, so push still applies.
+            _configure_push(cfg, auth)
             metrics_collector = MetricsCollector(
                 duckdb_path=cfg.duckdb_path,
                 incoming_dir=cfg.incoming_dir,

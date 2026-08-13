@@ -45,6 +45,30 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _dispatch_awaiting_push(
+    *, session_id: str, awaiting: str | None, harness: str | None, cwd: str | None
+) -> None:
+    """Tell the push layer a session changed awaiting state.
+
+    Imported lazily and wrapped: push is an optional, best-effort add-on, and
+    nothing about recording harness activity may fail because APNs is
+    misconfigured, unreachable, or not installed.
+    """
+    try:
+        from drover.server.push import AwaitingTransition, dispatch_awaiting_transition
+
+        dispatch_awaiting_transition(
+            AwaitingTransition(
+                session_id=session_id,
+                harness=harness or "",
+                cwd=cwd,
+                awaiting=awaiting,
+            )
+        )
+    except Exception:  # noqa: BLE001 - never break activity recording
+        pass
+
+
 def _json_dumps(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
 
@@ -485,11 +509,32 @@ class HarnessRegistry:
     ) -> None:
         stamp = last_activity or _now()
         with self._connect() as con:
+            # Read the prior value inside the same window as the write: this
+            # is the one chokepoint both the local emit() path and the remote
+            # /harness/events ingest path funnel through, so a transition seen
+            # here is seen exactly once however the event arrived.
+            previous = con.execute(
+                "SELECT awaiting, harness, cwd FROM harness_sessions "
+                "WHERE session_id = ?",
+                [session_id],
+            ).fetchone()
             con.execute(
                 "UPDATE harness_sessions SET awaiting = ?, last_activity = ? "
                 "WHERE session_id = ?",
                 [awaiting, stamp, session_id],
             )
+        # Only a real change notifies. A harness that re-emits "still awaiting
+        # input" every few seconds must not produce a banner every few
+        # seconds, and that dedup belongs here rather than in the sender:
+        # the state machine is what knows the difference.
+        if previous is None or previous[0] == awaiting:
+            return
+        _dispatch_awaiting_push(
+            session_id=session_id,
+            awaiting=awaiting,
+            harness=previous[1],
+            cwd=previous[2],
+        )
 
     def update_session_native_id(self, session_id: str, native_session_id: str) -> None:
         native_session_id = native_session_id.strip()
