@@ -41,6 +41,7 @@ from drover.server.harness.relay_protocol import RELAY_CONTROL_FRAME_BYTES
 from drover.server.web.auth import (
     DISABLED,
     AuthSettings,
+    bearer_credential,
     request_authorized,
     session_cookie_value,
     token_matches,
@@ -997,9 +998,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib method name
+        path = urlparse(self.path).path
+        if path == "/auth/device/apns":
+            self._set_device_apns_registration()
+            return
+        if not self._gate(path):
+            return
+        self._send(404, "text/plain; charset=utf-8", "not found\n")
+
     def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/auth/device/apns":
+            self._clear_device_apns_registration()
+            return
         if not self._gate(path):
             return
         if path.startswith("/auth/credentials/"):
@@ -1734,6 +1747,60 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(204, "application/json", "")
             return
         self._send(404, "application/json", '{"error": "unknown credential"}\n')
+
+    def _device_bearer_credential(self):
+        credential = bearer_credential(self.auth, self.headers)
+        if credential is None:
+            self._send(
+                401, "application/json", '{"error": "authentication required"}\n'
+            )
+            return None
+        if credential.scope != "device":
+            self._send(
+                403, "application/json", '{"error": "device credential required"}\n'
+            )
+            return None
+        return credential
+
+    def _set_device_apns_registration(self) -> None:
+        credential = self._device_bearer_credential()
+        if credential is None:
+            return
+        body = self._read_json()
+        if body is None:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "request body must be a JSON object"}\n',
+            )
+            return
+        raw_token = body.get("token")
+        environment = body.get("environment")
+        if not isinstance(raw_token, str) or environment not in {
+            "sandbox",
+            "production",
+        }:
+            self._send(
+                400, "application/json", '{"error": "invalid APNs registration"}\n'
+            )
+            return
+        token = raw_token.strip()
+        if not token:
+            self._send(
+                400, "application/json", '{"error": "invalid APNs registration"}\n'
+            )
+            return
+        self.auth.credentials.set_apns_registration(
+            credential.id, token=token, environment=environment
+        )
+        self._send(204, "application/json", "")
+
+    def _clear_device_apns_registration(self) -> None:
+        credential = self._device_bearer_credential()
+        if credential is None:
+            return
+        self.auth.credentials.clear_apns_registration(credential.id)
+        self._send(204, "application/json", "")
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length") or "0")
