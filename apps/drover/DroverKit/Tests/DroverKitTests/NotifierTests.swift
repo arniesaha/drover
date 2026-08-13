@@ -277,6 +277,168 @@ struct NotifierTests {
     #expect(badges == [0, 0, 1])
 }
 
+// MARK: - sync (the push double-alert)
+
+@Test func syncAbsorbsWhatIsWaitingWithoutAlerting() async throws {
+    // The hub already pushed for these while the app was backgrounded; the
+    // app opening must not announce them a second time.
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let waiting = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+        (id: "sess-2", harness: "codex", status: "running", awaiting: "approval", cwd: "/p/b"),
+    ]))
+
+    await watcher.sync(waiting)
+
+    let notifications = await spy.notifications
+    #expect(notifications.isEmpty)
+    // The badge is still the truth, so it is set either way.
+    #expect(await spy.badgeCounts == [2])
+}
+
+@Test func aSyncedSessionIsNotReAlertedByTheNextEvaluate() async throws {
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let waiting = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+
+    await watcher.sync(waiting)
+    await watcher.evaluate(waiting)
+
+    // This is the reported bug: pushed alert, then a generic local one the
+    // moment the app opened.
+    #expect(await spy.notifications.isEmpty)
+}
+
+@Test func syncDoesNotSuppressATransitionThatHappensAfterwards() async throws {
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let waiting = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+    await watcher.sync(waiting)
+
+    let alsoSecond = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+        (id: "sess-2", harness: "codex", status: "running", awaiting: "approval", cwd: "/p/b"),
+    ]))
+    await watcher.evaluate(alsoSecond)
+
+    // Absorbing the backlog must not go on to mute the session that starts
+    // waiting while the user is watching.
+    let ids = await spy.notifications.map(\.id)
+    #expect(ids == ["sess-2"])
+}
+
+@Test func syncOnAnIdleFleetClearsTheBadge() async throws {
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let idle = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: nil, cwd: "/p/a"),
+    ]))
+
+    await watcher.sync(idle)
+
+    #expect(await spy.badgeCounts == [0])
+}
+
+@Test func aLocalNotificationCarriesItsSessionIdForTapRouting() async throws {
+    // The tap handler reads this key; without it a local alert can only fall
+    // back to the request identifier.
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-42", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+
+    await watcher.evaluate(asking)
+
+    #expect(await spy.notifications.map(\.id) == ["sess-42"])
+}
+
+// MARK: - One announcer at a time
+
+@Test func onceTheHubPushesTheAppStopsAnnouncing() async throws {
+    // The reported bug: the hub's push, then a generic "<harness> needs you"
+    // from this watcher for the same transition.
+    let defaults = testDefaults()
+    PushRegistration.setActive(true, in: defaults)
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+
+    await watcher.evaluate(asking)
+
+    #expect(await spy.notifications.isEmpty)
+}
+
+@Test func theBadgeIsStillMaintainedWhileTheHubAnnounces() async throws {
+    // Silencing the alert must not silence the count — the badge and the list
+    // are what stay truthful if a push is ever lost.
+    let defaults = testDefaults()
+    PushRegistration.setActive(true, in: defaults)
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+        (id: "sess-2", harness: "codex", status: "running", awaiting: "approval", cwd: "/p/b"),
+    ]))
+
+    await watcher.evaluate(asking)
+
+    #expect(await spy.badgeCounts == [2])
+}
+
+@Test func aDeviceWithoutPushKeepsItsLocalAlerts() async throws {
+    // Never registered, or registration was withdrawn: the app is the only
+    // thing that can tell the user, so it must still do it.
+    let defaults = testDefaults()
+    PushRegistration.setActive(false, in: defaults)
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+
+    await watcher.evaluate(asking)
+
+    #expect(await spy.notifications.map(\.id) == ["sess-1"])
+}
+
+@Test func aDeviceThatNeverRegisteredDefaultsToAnnouncingLocally() async throws {
+    // No flag written at all — the pre-push behaviour has to survive.
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+
+    await watcher.evaluate(asking)
+
+    #expect(await spy.notifications.count == 1)
+}
+
+@Test func theSeenSetIsKeptWarmWhileTheHubAnnounces() async throws {
+    // If push is turned off later, the app must not then announce a backlog
+    // of transitions the user was already told about.
+    let defaults = testDefaults()
+    PushRegistration.setActive(true, in: defaults)
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+    await AttentionWatcher(notifier: SpyNotifier(), seenStore: defaults).evaluate(asking)
+
+    PushRegistration.setActive(false, in: defaults)
+    let spy = SpyNotifier()
+    await AttentionWatcher(notifier: spy, seenStore: defaults).evaluate(asking)
+
+    #expect(await spy.notifications.isEmpty)
+}
+
 }
 
 }  // extension MockNetworkTests

@@ -222,7 +222,13 @@ resolve_version() {
 
 # --- install -----------------------------------------------------------------
 install_runtime() {
-  local version="$1" target="$DROVER_HOME/runtime/$version"
+  # Two statements, not one. Under `set -u`, bash declares every name in a
+  # single `local` before assigning any of them, so a later assignment that
+  # expands an earlier one on the same line sees it unset and aborts —
+  # "install.sh: line N: version: unbound variable", at install time, on
+  # someone else's machine.
+  local version="$1"
+  local target="$DROVER_HOME/runtime/$version"
   local base="https://github.com/${REPO}/releases/download/v${version}"
   local tmp; tmp="$(mktemp -d)"
 
