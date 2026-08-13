@@ -20,6 +20,7 @@ from drover.server.harness.daemon import (
     native_transcript_for_session,
 )
 from drover.server.harness.recap_jobs import LiveRecap
+from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
@@ -758,7 +759,12 @@ def _harness_session_dict(
         ("started_at", "updated_at", "ended_at", "last_activity"),
     )
     item["preview"] = _optional_str(preview)
-    item["recap"] = _optional_str(recap.text if recap else None)
+    # Cleaned on the way out as well as on write, so recaps stored before the
+    # subject was dropped do not keep narrating "The user is ..." until every
+    # session happens to be re-recapped.
+    item["recap"] = _optional_str(
+        drop_user_subject(recap.text) if recap and recap.text else None
+    )
     item["recap_source_seq"] = recap.source_seq if recap else None
     return item
 

@@ -19,6 +19,16 @@ _MAX_EVENT_CHARS = 500
 _MARKDOWN_RE = re.compile(r"(?:`{1,3}|\*{1,3}|^#{1,6}\s*)", re.MULTILINE)
 _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 _WHITESPACE_RE = re.compile(r"\s+")
+# The sentence subject, and the auxiliary that would be left dangling without
+# it. Models narrate recaps as "The user is doing X"; on a two-line inbox card
+# those words cost a third of the first line and say nothing that tells one
+# session apart from another. Anchored, and requiring whitespace after "user",
+# so a possessive ("the user's credentials") or a mid-sentence mention
+# ("adding a user lookup") is left alone -- there the word is the topic.
+_USER_SUBJECT_RE = re.compile(
+    r"\A(?:the\s+)?user\s+(?:(?:is|are|was|were|has|have|had)(?:\s+|\Z))?",
+    re.IGNORECASE,
+)
 
 
 def load_live_recap_template() -> str:
@@ -52,12 +62,30 @@ def build_live_recap_prompt(
     return tmpl.replace("{turns}", turns)
 
 
+def drop_user_subject(text: str) -> str:
+    """Strip a leading "The user is ..." and recapitalize what is left.
+
+    Returns an empty string when the subject was the whole sentence, since a
+    recap of "Is" is worse than no recap at all.
+    """
+    remainder = _USER_SUBJECT_RE.sub("", text, count=1).lstrip()
+    if remainder == text:
+        return text
+    if not remainder:
+        return ""
+    # Only the first character: the rest may carry meaningful case ("OTLP").
+    return remainder[0].upper() + remainder[1:]
+
+
 def normalize_live_recap(value: Any, *, max_chars: int = 160) -> str:
     """Return one bounded plain-text recap, or an empty string for invalid input."""
     if not isinstance(value, str) or max_chars <= 0:
         return ""
 
     text = _WHITESPACE_RE.sub(" ", _MARKDOWN_RE.sub("", value)).strip()
+    # Before the length cap, so the budget is spent on the recap and not on
+    # its subject.
+    text = drop_user_subject(text)
     sentence_end = _SENTENCE_END_RE.search(text)
     if sentence_end is not None:
         text = text[: sentence_end.end()]

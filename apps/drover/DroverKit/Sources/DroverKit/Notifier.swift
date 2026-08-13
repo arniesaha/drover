@@ -51,8 +51,16 @@ public struct LocalNotifier: Notifying {
 /// A fetch failure changes nothing — no alert, no badge update, and the seen
 /// set is left untouched, so a transient network blip can never either spam
 /// a false alert or silently suppress a real one on the next successful check.
+///
+/// The badge counts sessions that want the user *and* that the user has not
+/// opened yet. Opening one is not answering it — it stays in the inbox, still
+/// flagged — but the badge exists to say "go look", and once you have looked
+/// it has done its job. Read receipts are pruned the moment a session stops
+/// needing the user, so its next question badges again; without that, a
+/// session read once would stay silent for the life of the install.
 public struct AttentionWatcher: Sendable {
     public static let seenKey = "drover.needsyou.seen"
+    public static let readKey = "drover.needsyou.read"
 
     private let notifier: Notifying
     // `UserDefaults` isn't `Sendable`, but it's documented thread-safe and is
@@ -81,9 +89,7 @@ public struct AttentionWatcher: Sendable {
     /// fetch. Shares the persisted seen-set with the BGTask path, so the two
     /// never double-alert for the same transition.
     public func evaluate(_ snapshot: HarnessSnapshot) async {
-        let needsYou = snapshot.sessions.filter {
-            $0.attention == .needsApproval || $0.attention == .needsInput
-        }
+        let needsYou = Self.needsYou(in: snapshot)
         let previousIDs = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
         let fresh = SessionStore.newlyNeedsYou(current: snapshot.sessions, previousIDs: previousIDs)
 
@@ -95,8 +101,38 @@ public struct AttentionWatcher: Sendable {
             )
         }
 
-        await notifier.setBadge(needsYou.count)
+        let read = prunedRead(against: needsYou)
+        await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
+    }
+
+    /// Record that the user has opened this session, and refresh the badge to
+    /// match. Marking a session that is not asking for anything is harmless:
+    /// it is pruned on the next pass and never counted in the first place.
+    public func markRead(_ sessionID: String, in snapshot: HarnessSnapshot) async {
+        let needsYou = Self.needsYou(in: snapshot)
+        var read = prunedRead(against: needsYou)
+        read.insert(sessionID)
+        seenStore.set(Array(read), forKey: Self.readKey)
+        await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
+    }
+
+    /// The stored receipts, minus any session that no longer wants the user.
+    /// Pruning here rather than on a timer keeps the set bounded by the inbox
+    /// and makes "asked, read, asked again" behave like a new question.
+    private func prunedRead(against needsYou: [SessionSummary]) -> Set<String> {
+        let stored = Set(seenStore.stringArray(forKey: Self.readKey) ?? [])
+        let pruned = stored.intersection(needsYou.map(\.id))
+        if pruned != stored {
+            seenStore.set(Array(pruned), forKey: Self.readKey)
+        }
+        return pruned
+    }
+
+    private static func needsYou(in snapshot: HarnessSnapshot) -> [SessionSummary] {
+        snapshot.sessions.filter {
+            $0.attention == .needsApproval || $0.attention == .needsInput
+        }
     }
 
     private static func bodySuffix(_ session: SessionSummary) -> String {
