@@ -234,12 +234,15 @@ struct CockpitSectionHeading: View {
     var disclosure: Disclosure? = nil
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        // Wraps rather than sharing one line. Three items squeezed side by
+        // side hyphenated every heading at accessibility sizes — "BUSIEST
+        // PROJECT-S", "RECENT / ACTIVITY", "Drover ob-served" — and a heading
+        // broken mid-word is harder to read than one on two lines.
+        FlowLayout(spacing: 8, lineSpacing: 4) {
             Text(title).droverText(.h3)
             if let source {
                 Text(source).droverText(.subtitle)
             }
-            Spacer(minLength: 8)
             if let action {
                 Button("See all", action: action)
                     .font(.system(.caption, design: .default, weight: .medium))
