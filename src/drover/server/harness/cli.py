@@ -85,6 +85,7 @@ def run_harnessd_from_options(
         content_consent_path=resolved_config_path.with_name(
             f".{resolved_config_path.name}.harness-content-consent.json"
         ),
+        cfg=cfg,
     )
 
 
