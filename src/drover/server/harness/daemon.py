@@ -31,8 +31,10 @@ from uuid import uuid4
 
 from drover.config import config_home, default_token_file, resolve_api_token_env
 from drover.server.harness.auth import (
+    AuthFlowInputError,
     AuthFlowLaunchError,
     AuthFlowManager,
+    TerminalSignInRequired,
     default_auth_adapters,
     default_login_shell,
     executable_path_prefix,
@@ -122,6 +124,9 @@ _ATTACHMENT_EXTENSIONS = {
 }
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_ADVISORY_BUNDLE_REQUEST_BYTES = 128 * 1024
+# An OAuth code paste, with room to spare. Bounded so a stray body cannot be
+# typed wholesale into a live terminal.
+_MAX_AUTH_INPUT_CHARS = 4096
 
 
 def save_turn_attachments(
@@ -1229,6 +1234,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if auth_route and auth_route[2] == "cancel":
             self._auth_cancel(auth_route[0], auth_route[1] or "")
             return
+        if auth_route and auth_route[2] == "input":
+            self._auth_input(auth_route[0], auth_route[1] or "")
+            return
         if parsed.path == "/advisory/content-bundle":
             self._advisory_content_bundle()
             return
@@ -1305,6 +1313,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         except KeyError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
             return
+        except TerminalSignInRequired as exc:
+            # Not a failure to report as one: the client is expected to open
+            # a PTY session instead, so say which mode applies.
+            self._write_json(
+                {"error": str(exc), "harness": harness, "sign_in": "terminal"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
         except AuthFlowLaunchError as exc:
             self._write_json(
                 {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1333,6 +1349,34 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             snapshot = self.server.state.auth.cancel(harness, flow_id)
         except KeyError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        snapshot["host_id"] = self.server.state.host_id
+        self._write_json(snapshot)
+
+    def _auth_input(self, harness: str, flow_id: str) -> None:
+        body = self._read_json()
+        if body is None:
+            self._write_json({"error": "invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            self._write_json(
+                {"error": "text must be a non-empty string"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if len(text) > _MAX_AUTH_INPUT_CHARS:
+            self._write_json(
+                {"error": "text is too long"}, status=HTTPStatus.BAD_REQUEST
+            )
+            return
+        try:
+            snapshot = self.server.state.auth.send_input(harness, flow_id, text)
+        except KeyError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            return
+        except AuthFlowInputError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
             return
         snapshot["host_id"] = self.server.state.host_id
         self._write_json(snapshot)
@@ -2949,9 +2993,9 @@ def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
         len(parts) == 5
         and parts[0] == "auth"
         and parts[2] == "flows"
-        and parts[4] == "cancel"
+        and parts[4] in {"cancel", "input"}
     ):
-        return parts[1], parts[3], "cancel"
+        return parts[1], parts[3], parts[4]
     return None
 
 

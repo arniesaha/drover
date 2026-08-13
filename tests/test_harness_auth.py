@@ -13,6 +13,7 @@ from drover.server.harness.auth import (
     CommandAuthAdapter,
     HarnessAuthStatus,
     StaticAuthAdapter,
+    TerminalSignInRequired,
     default_auth_adapters,
     redact_auth_text,
 )
@@ -151,6 +152,7 @@ def test_static_adapter_reports_unavailable_status():
         "state": "unavailable",
         "label": None,
         "detail": "auth is not supported for openclaw",
+        "sign_in": "flow",
     }
 
 
@@ -750,3 +752,271 @@ def test_manager_discards_terminal_flow_without_followup_api_call():
         time.sleep(0.01)
 
     assert flow["flow_id"] not in manager._flows_by_id
+
+
+# --- Real-CLI regressions -------------------------------------------------
+#
+# The three cases below were all captured from the actual harness CLIs on a
+# Mac mini; each broke sign-in from the iOS app in a different way. Keeping
+# the literal CLI bytes here means a future rewrite of the output parser has
+# to keep working against what the tools really emit, not a tidied-up
+# paraphrase of it.
+
+
+def test_redaction_keeps_the_oauth_authorize_code_flag():
+    """``code=true`` is a request flag, not a credential.
+
+    ``claude auth login`` builds its authorize URL with ``code=true``, which
+    is what asks claude.com to display a pasteable code instead of
+    completing a redirect. Redacting it turned the URL the app offers into a
+    dead end: the browser opened, but no code was ever shown.
+    """
+    url = (
+        "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a"
+        "&response_type=code&state=l4XrPFyhWvwEjxoiYHWxBAlMlwLqhZu"
+    )
+
+    redacted = redact_auth_text(url)
+
+    assert "code=true" in redacted
+
+
+def test_redaction_still_hides_a_real_authorization_code():
+    text = "callback https://example.test/cb?code=ac_01H9XYZsecretvalue&state=ok"
+
+    redacted = redact_auth_text(text)
+
+    assert "ac_01H9XYZsecretvalue" not in redacted
+    assert "code=<redacted>" in redacted
+
+
+def test_manager_strips_ansi_colour_before_capturing_the_login_url(tmp_path):
+    """codex colourises the device URL; the escape tail must not ride along.
+
+    ``codex login --device-auth`` prints the URL wrapped in SGR colour
+    codes. The trailing reset used to be captured as part of the URL, and
+    iOS percent-encoded it into ``/device%1B%5B0m`` -- which is why tapping
+    "Open Browser" landed on an OpenAI "your session has ended" page.
+    """
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import time\n"
+        "print('   \\x1b[94mhttps://auth.openai.com/codex/device\\x1b[0m', flush=True)\n"
+        "time.sleep(0.05)\n"
+    )
+    adapter = StaticAuthAdapter(
+        "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
+        start_command=[sys.executable, str(script)],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+    current = wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
+
+    assert current["login_url"] == "https://auth.openai.com/codex/device"
+
+
+def test_manager_strips_osc8_hyperlinks_before_capturing_the_login_url(tmp_path):
+    """claude wraps its URL in an OSC-8 hyperlink, printing the target twice."""
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import time\n"
+        "print('visit: \\x1b]8;;https://claude.com/cai/oauth/authorize?code=true\\x1b\\\\"
+        "\\x1b[94mhttps://claude.com/cai/oauth/authorize?code=true\\x1b[39m"
+        "\\x1b]8;;\\x1b\\\\', flush=True)\n"
+        "time.sleep(0.05)\n"
+    )
+    adapter = StaticAuthAdapter(
+        "claude-code",
+        status_value=HarnessAuthStatus("claude-code", "authenticated"),
+        start_command=[sys.executable, str(script)],
+    )
+    manager = AuthFlowManager({"claude-code": adapter})
+
+    flow = manager.start("claude-code")
+    current = wait_for_state(manager, "claude-code", flow["flow_id"], "authenticated")
+
+    assert current["login_url"] == "https://claude.com/cai/oauth/authorize?code=true"
+
+
+def test_manager_extracts_device_codes_with_uneven_groups(tmp_path):
+    """codex device codes are ``XXXX-XXXXX``; the matcher assumed 4-and-4.
+
+    A real code from ``codex login --device-auth`` is e.g. ``P1KY-AS6MU``.
+    The old pattern required every hyphen-separated group to be exactly four
+    characters, so the code was silently never surfaced and the app showed a
+    device page with nothing to type into it.
+    """
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import time\n"
+        "print('   \\x1b[94mP1KY-AS6MU\\x1b[0m', flush=True)\n"
+        "time.sleep(0.05)\n"
+    )
+    adapter = StaticAuthAdapter(
+        "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
+        start_command=[sys.executable, str(script)],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+    current = wait_for_state(manager, "codex", flow["flow_id"], "authenticated")
+
+    assert current["user_code"] == "P1KY-AS6MU"
+
+
+# --- PTY-backed flows and typed input -------------------------------------
+
+
+def test_claude_login_runs_under_a_pty_and_accepts_typed_input(tmp_path):
+    """``claude auth login`` prompts on a terminal and reads the code back.
+
+    Verified against the real CLI: with a pipe on stdin it prints the
+    authorize URL and then hangs indefinitely, because its prompt never
+    renders without a terminal. Under a PTY it prompts and completes. The
+    pasted code therefore needs a route all the way back to the child.
+    """
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import sys\n"
+        "print('visit https://example.test/authorize?code=true', flush=True)\n"
+        "answer = sys.stdin.readline().strip()\n"
+        "sys.exit(0 if answer == 'PASTED-CODE' else 3)\n"
+    )
+    adapter = StaticAuthAdapter(
+        "claude-code",
+        status_value=HarnessAuthStatus("claude-code", "authenticated"),
+        start_command=[sys.executable, str(script)],
+        requires_pty=True,
+    )
+    manager = AuthFlowManager({"claude-code": adapter}, timeout_s=10, retention_s=60)
+
+    flow = manager.start("claude-code")
+    waiting = wait_for_state(
+        manager, "claude-code", flow["flow_id"], "waiting_for_user", timeout_s=5
+    )
+    assert waiting["login_url"] == "https://example.test/authorize?code=true"
+    assert waiting["supports_input"] is True
+
+    manager.send_input("claude-code", flow["flow_id"], "PASTED-CODE")
+
+    current = wait_for_state(
+        manager, "claude-code", flow["flow_id"], "authenticated", timeout_s=5
+    )
+    assert current["state"] == "authenticated"
+
+
+def test_pty_flow_reports_a_wrong_code_as_a_failure(tmp_path):
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import sys\n"
+        "print('visit https://example.test/authorize', flush=True)\n"
+        "sys.stdin.readline()\n"
+        "sys.exit(3)\n"
+    )
+    adapter = StaticAuthAdapter(
+        "claude-code",
+        status_value=HarnessAuthStatus("claude-code", "unauthenticated"),
+        start_command=[sys.executable, str(script)],
+        requires_pty=True,
+    )
+    manager = AuthFlowManager({"claude-code": adapter}, timeout_s=10, retention_s=60)
+
+    flow = manager.start("claude-code")
+    wait_for_state(
+        manager, "claude-code", flow["flow_id"], "waiting_for_user", timeout_s=5
+    )
+    manager.send_input("claude-code", flow["flow_id"], "WRONG")
+
+    current = wait_for_state(
+        manager, "claude-code", flow["flow_id"], "failed", timeout_s=5
+    )
+    assert "3" in (current["last_error"] or "")
+
+
+def test_pipe_backed_flows_do_not_advertise_input(tmp_path):
+    """codex's device flow needs no typing; the app should not offer a field."""
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import time\nprint('https://example.test/device', flush=True)\n"
+        "time.sleep(0.05)\n"
+    )
+    adapter = StaticAuthAdapter(
+        "codex",
+        status_value=HarnessAuthStatus("codex", "authenticated"),
+        start_command=[sys.executable, str(script)],
+    )
+    manager = AuthFlowManager({"codex": adapter})
+
+    flow = manager.start("codex")
+
+    assert flow["supports_input"] is False
+    with pytest.raises(RuntimeError, match="does not accept input"):
+        manager.send_input("codex", flow["flow_id"], "anything")
+
+
+def test_send_input_rejects_a_finished_flow(tmp_path):
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import sys\nprint('https://example.test/authorize', flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
+    adapter = StaticAuthAdapter(
+        "claude-code",
+        status_value=HarnessAuthStatus("claude-code", "authenticated"),
+        start_command=[sys.executable, str(script)],
+        requires_pty=True,
+    )
+    manager = AuthFlowManager({"claude-code": adapter}, timeout_s=10, retention_s=60)
+
+    flow = manager.start("claude-code")
+    manager.cancel("claude-code", flow["flow_id"])
+
+    with pytest.raises(RuntimeError, match="no longer accepting input"):
+        manager.send_input("claude-code", flow["flow_id"], "PASTED-CODE")
+
+
+# --- Terminal-only harnesses ----------------------------------------------
+
+
+def test_agy_sign_in_is_terminal_only(monkeypatch, tmp_path):
+    """agy ships no login command at all.
+
+    ``agy --help`` lists no ``login``/``auth`` subcommand, and ``agy login``
+    is treated as a prompt: the bare binary opens a full-screen bubbletea
+    TUI. Scraping cannot drive that, so the app is told to hand the user a
+    real terminal instead of starting a flow that can only fail with
+    "error opening TTY".
+    """
+    adapter, _agy, _home = _agy_adapter(monkeypatch, tmp_path)
+
+    assert adapter.sign_in == "terminal"
+    assert adapter.status().sign_in == "terminal"
+
+
+def test_starting_a_terminal_only_flow_is_refused(monkeypatch, tmp_path):
+    adapter, _agy, _home = _agy_adapter(monkeypatch, tmp_path)
+    manager = AuthFlowManager({"agy": adapter})
+
+    with pytest.raises(TerminalSignInRequired, match="terminal"):
+        manager.start("agy")
+
+
+def test_claude_and_codex_advertise_their_sign_in_modes(monkeypatch, tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("claude", "codex", "agy"):
+        path = bindir / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+
+    adapters = default_auth_adapters()
+
+    assert adapters["claude-code"].requires_pty is True
+    assert adapters["claude-code"].sign_in == "flow"
+    assert adapters["codex"].requires_pty is False
+    assert adapters["codex"].sign_in == "flow"
+    assert adapters["agy"].sign_in == "terminal"

@@ -39,6 +39,74 @@ struct AuthFlowModelTests {
         #expect(model.flow?.state == .cancelled)
     }
 
+    @Test @MainActor func submitCodePostsTheTypedTextAndAppliesTheSnapshot() async throws {
+        MockURLProtocol.handler = { request in
+            #expect(request.url?.path
+                == "/harness/hosts/mac-mini/auth/claude-code/flows/auth-flow-1/input")
+            #expect(request.httpMethod == "POST")
+            #expect(request.bodyStreamData() == Data(#"{"text":"PASTED-CODE"}"#.utf8))
+            return (200, Data(#"{"host_id":"mac-mini","harness":"claude-code","flow_id":"auth-flow-1","state":"waiting_for_user","supports_input":true}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "claude-code")
+        model.flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: Data(#"{"host_id":"mac-mini","harness":"claude-code","flow_id":"auth-flow-1","state":"waiting_for_user","supports_input":true}"#.utf8))
+        model.codeEntry = "  PASTED-CODE\n"
+
+        await model.submitCode()
+
+        #expect(model.flow?.supportsInput == true)
+        #expect(model.errorMessage == nil)
+        // Cleared so a second paste cannot silently resend the first.
+        #expect(model.codeEntry.isEmpty)
+    }
+
+    @Test @MainActor func submitCodeIgnoresBlankEntryWithoutCallingTheHost() async throws {
+        let state = PollTestState()
+        MockURLProtocol.handler = { _ in
+            state.incrementRequests()
+            return (200, Data(#"{"host_id":"mac-mini","harness":"claude-code","flow_id":"auth-flow-1","state":"waiting_for_user"}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "mac-mini", harness: "claude-code")
+        model.flow = try waitingFlow()
+        model.codeEntry = "   "
+
+        await model.submitCode()
+
+        #expect(state.requestCount == 0)
+    }
+
+    @Test @MainActor func terminalOnlyHarnessIsReportedWithoutStartingAFlow() async throws {
+        // harnessd answers 409 rather than launching a TUI that can only die
+        // with "bubbletea: error opening TTY". A host that refuses the start
+        // is telling us the mode changed, so the model re-reads status
+        // instead of leaving the user on a dead error string.
+        let state = PollTestState()
+        MockURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/start") == true {
+                state.incrementRequests()
+                return (409, Data(#"{"error":"agy can only be signed in from a terminal session","harness":"agy","sign_in":"terminal"}"#.utf8))
+            }
+            return (200, Data(#"{"host_id":"nas","harness":"agy","state":"unknown","sign_in":"terminal"}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "nas", harness: "agy")
+
+        await model.start()
+
+        #expect(state.requestCount == 1)
+        #expect(model.requiresTerminalSignIn)
+        #expect(model.flow == nil)
+    }
+
+    @Test @MainActor func statusMarksTerminalOnlyHarnessesBeforeAnyStart() async throws {
+        MockURLProtocol.handler = { _ in
+            (200, Data(#"{"host_id":"nas","harness":"agy","state":"unknown","sign_in":"terminal"}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "nas", harness: "agy")
+
+        await model.refreshStatus()
+
+        #expect(model.requiresTerminalSignIn)
+    }
+
     @Test @MainActor func pollingAppliesTerminalFlowThenStops() async throws {
         let state = PollTestState()
         MockURLProtocol.handler = { _ in

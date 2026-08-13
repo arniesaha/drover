@@ -441,3 +441,39 @@ func hostPresenceDerivation(status: String, expected: HostPresence) {
     let host = try JSONDecoder().decode(HostSummary.self, from: json)
     #expect(host.harnesses == ["claude-code", "shell"])
 }
+
+@Test func harnessAuthStatusDecodesTerminalOnlySignIn() throws {
+    let data = Data("""
+    {"host_id":"nas","harness":"agy","state":"unknown","label":null,
+     "detail":"Antigravity CLI","sign_in":"terminal"}
+    """.utf8)
+    let status = try JSONDecoder().decode(HarnessAuthStatus.self, from: data)
+    #expect(status.signIn == .terminal)
+}
+
+@Test func harnessAuthStatusDefaultsToTheManagedFlow() throws {
+    // Hosts running an older harnessd omit the key entirely.
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"codex","state":"unauthenticated"}
+    """.utf8)
+    let status = try JSONDecoder().decode(HarnessAuthStatus.self, from: data)
+    #expect(status.signIn == .flow)
+}
+
+@Test func harnessAuthFlowDecodesInputSupport() throws {
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"claude-code","flow_id":"auth-flow-1",
+     "state":"waiting_for_user","supports_input":true}
+    """.utf8)
+    let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
+    #expect(flow.supportsInput)
+}
+
+@Test func harnessAuthFlowWithoutInputSupportDoesNotOfferAField() throws {
+    let data = Data("""
+    {"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1",
+     "state":"waiting_for_user"}
+    """.utf8)
+    let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
+    #expect(!flow.supportsInput)
+}

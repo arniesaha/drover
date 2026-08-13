@@ -544,6 +544,20 @@ def _parse_host_auth_route(path: str) -> dict[str, str] | None:
         and parts[:2] == ["harness", "hosts"]
         and parts[3] == "auth"
         and parts[5] == "flows"
+        and parts[7] == "input"
+    ):
+        return {
+            "host_id": parts[2],
+            "harness": parts[4],
+            "flow_id": parts[6],
+            "action": "input",
+            "method": "POST",
+        }
+    if (
+        len(parts) == 8
+        and parts[:2] == ["harness", "hosts"]
+        and parts[3] == "auth"
+        and parts[5] == "flows"
         and parts[7] == "cancel"
     ):
         return {
@@ -910,11 +924,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         auth_route = _parse_host_auth_route(path)
         if auth_route and auth_route["method"] == "POST":
+            payload = None
+            if auth_route["action"] == "input":
+                payload = self._read_json()
+                if payload is None:
+                    self._send(
+                        400,
+                        "application/json",
+                        '{"error": "request body must be valid JSON"}\n',
+                    )
+                    return
             status, body = self.collector.proxy_harness_auth(
                 auth_route["host_id"],
                 auth_route["harness"],
                 auth_route["action"],
                 flow_id=auth_route.get("flow_id"),
+                payload=payload,
             )
             self._send(status, "application/json", body)
             return

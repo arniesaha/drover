@@ -3287,3 +3287,121 @@ def test_structured_session_rejects_unknown_permission_mode(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_harnessd_routes_typed_code_into_a_pty_login_flow(tmp_path):
+    """The paste-your-code step needs a route, not just a running process.
+
+    Without one, `claude auth login` sits on its prompt until the flow
+    expires: the app can show the authorize URL but has nowhere to send what
+    the browser hands back.
+    """
+    script = tmp_path / "login.py"
+    script.write_text(
+        "import sys\n"
+        "print('visit https://example.test/authorize?code=true', flush=True)\n"
+        "answer = sys.stdin.readline().strip()\n"
+        "sys.exit(0 if answer == 'PASTED-CODE' else 3)\n"
+    )
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {
+            "claude-code": StaticAuthAdapter(
+                "claude-code",
+                status_value=HarnessAuthStatus("claude-code", "authenticated"),
+                start_command=[sys.executable, str(script)],
+                requires_pty=True,
+            )
+        },
+        timeout_s=10,
+        retention_s=60,
+    )
+
+    def call(path, payload):
+        request = urllib.request.Request(
+            f"{base_url}{path}",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        started = call("/auth/claude-code/start", {})
+        flow_id = started["flow_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if state.auth.snapshot("claude-code", flow_id)["supports_input"]:
+                break
+            time.sleep(0.02)
+
+        submitted = call(
+            f"/auth/claude-code/flows/{flow_id}/input", {"text": "PASTED-CODE"}
+        )
+        assert submitted["flow_id"] == flow_id
+
+        deadline = time.time() + 5
+        state_name = None
+        while time.time() < deadline:
+            state_name = state.auth.snapshot("claude-code", flow_id)["state"]
+            if state_name == "authenticated":
+                break
+            time.sleep(0.02)
+    finally:
+        state.auth.close_all()
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert state_name == "authenticated"
+
+
+def test_harnessd_refuses_to_start_a_terminal_only_sign_in(tmp_path):
+    """agy sign-in must be reported as terminal-only, not attempted.
+
+    Launching it anyway is what produced the app's "bubbletea: error opening
+    TTY" dead end, since the bare binary only opens a full-screen TUI.
+    """
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.auth = AuthFlowManager(
+        {
+            "agy": StaticAuthAdapter(
+                "agy",
+                status_value=HarnessAuthStatus("agy", "unknown"),
+                start_command=["/nonexistent"],
+                sign_in="terminal",
+            )
+        }
+    )
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/auth/agy/start",
+            data=b"{}",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(request, timeout=5)
+        payload = json.loads(refused.value.read())
+
+        status_request = urllib.request.Request(
+            f"{base_url}/auth/agy/status",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(status_request, timeout=5) as response:
+            status_body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert refused.value.code == 409
+    assert payload["sign_in"] == "terminal"
+    assert status_body["sign_in"] == "terminal"

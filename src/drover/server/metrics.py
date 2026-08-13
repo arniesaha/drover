@@ -1406,6 +1406,7 @@ class MetricsCollector:
         action: str,
         *,
         flow_id: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> tuple[int, str]:
         host = self._harness_host(host_id)
         if host is None:
@@ -1413,8 +1414,8 @@ class MetricsCollector:
 
         if action in {"status", "start"}:
             path = f"/auth/{quote(harness, safe='')}/{action}"
-        elif action in {"flow", "cancel"} and flow_id:
-            suffix = "" if action == "flow" else "/cancel"
+        elif action in {"flow", "cancel", "input"} and flow_id:
+            suffix = {"flow": "", "cancel": "/cancel", "input": "/input"}[action]
             path = f"/auth/{quote(harness, safe='')}/flows/{quote(flow_id, safe='')}{suffix}"
         else:
             return _json_response(400, {"error": "invalid auth action"})
@@ -1423,7 +1424,8 @@ class MetricsCollector:
             host,
             path,
             method="GET" if action in {"status", "flow"} else "POST",
-            payload={},
+            # Only the input action carries one; the rest are bodyless POSTs.
+            payload=payload or {},
         )
         try:
             payload = json.loads(body)

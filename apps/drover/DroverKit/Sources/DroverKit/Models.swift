@@ -112,12 +112,28 @@ public enum HarnessAuthState: String, Sendable, Equatable, Decodable {
     }
 }
 
+/// How a harness expects to be signed in. `agy` ships no login command at
+/// all -- the only way in is its full-screen TUI -- so the app has to hand
+/// the user a terminal instead of driving a managed flow.
+public enum HarnessSignInMode: String, Sendable, Equatable, Decodable {
+    case flow
+    case terminal
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = HarnessSignInMode(rawValue: raw) ?? .flow
+    }
+}
+
 public struct HarnessAuthStatus: Sendable, Equatable, Decodable {
     public var hostID: String
     public var harness: String
     public var state: HarnessAuthState
     public var label: String?
     public var detail: String?
+    /// Absent on hosts that predate terminal sign-in; those only ever ran
+    /// managed flows, so `.flow` is the right reading of silence.
+    public var signIn: HarnessSignInMode = .flow
 
     private enum CodingKeys: String, CodingKey {
         case hostID = "host_id"
@@ -125,6 +141,17 @@ public struct HarnessAuthStatus: Sendable, Equatable, Decodable {
         case state
         case label
         case detail
+        case signIn = "sign_in"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hostID = (try? container.decode(String.self, forKey: .hostID)) ?? ""
+        harness = try container.decode(String.self, forKey: .harness)
+        state = try container.decode(HarnessAuthState.self, forKey: .state)
+        label = try? container.decode(String.self, forKey: .label)
+        detail = try? container.decode(String.self, forKey: .detail)
+        signIn = (try? container.decode(HarnessSignInMode.self, forKey: .signIn)) ?? .flow
     }
 }
 
@@ -139,6 +166,9 @@ public struct HarnessAuthFlow: Sendable, Equatable, Decodable {
     public var message: String?
     public var expiresAt: Date?
     public var lastError: String?
+    /// True while the CLI is on a terminal and still waiting: `claude auth
+    /// login` needs the code from the browser typed back to it.
+    public var supportsInput: Bool = false
 
     private enum CodingKeys: String, CodingKey {
         case hostID = "host_id"
@@ -151,6 +181,7 @@ public struct HarnessAuthFlow: Sendable, Equatable, Decodable {
         case message
         case expiresAt = "expires_at"
         case lastError = "last_error"
+        case supportsInput = "supports_input"
     }
 
     public init(from decoder: Decoder) throws {
@@ -172,6 +203,7 @@ public struct HarnessAuthFlow: Sendable, Equatable, Decodable {
         let rawExpires = try? container.decode(String.self, forKey: .expiresAt)
         expiresAt = WireDate.parse(rawExpires)
         lastError = try? container.decode(String.self, forKey: .lastError)
+        supportsInput = (try? container.decode(Bool.self, forKey: .supportsInput)) ?? false
     }
 
     public var isTerminal: Bool {
