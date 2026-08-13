@@ -185,3 +185,30 @@ def test_push_triggered_workflows_never_use_the_bare_inputs_context() -> None:
             assert (
                 "inputs." not in line or "github.event.inputs." in line
             ), f"{name} references the bare inputs context: {line.strip()}"
+
+
+def test_workflows_only_use_allowlisted_actions() -> None:
+    """This repository restricts Actions to `actions/*`.
+
+    Verified-creator actions are disallowed, so a third-party `uses:` does not
+    fail a step: it fails the whole run at load time as a startup_failure with
+    no job and no logs. v0.1.1 was tagged twice with no release before this
+    was spotted. Confirm the live policy with:
+
+        gh api repos/arniesaha/drover/actions/permissions/selected-actions
+    """
+    offenders = []
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- uses:") and not stripped.startswith("uses:"):
+                continue
+            ref = stripped.split("uses:", 1)[1].strip()
+            if ref.startswith("./") or ref.startswith("docker://"):
+                continue
+            if not ref.startswith("actions/"):
+                offenders.append(f"{path.name}: {ref}")
+    assert not offenders, (
+        "these actions are outside the repository allowlist and will cause a "
+        f"startup_failure: {offenders}"
+    )
