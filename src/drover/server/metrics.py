@@ -1049,13 +1049,21 @@ class MetricsCollector:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)
             return _json_response(500, {"error": str(exc)})
-        return _json_response(
-            200,
-            {
-                "host": host.__dict__,
-                "content_consent": self._insights().content_consent_state(),
-            },
-        )
+        body = {
+            "host": host.__dict__,
+            "content_consent": self._insights().content_consent_state(),
+        }
+        # Every harnessd already polls this endpoint every 15 seconds, so the
+        # fleet's target version rides this response rather than needing a
+        # channel of its own. No planner, or no target, means no extra keys,
+        # and a host that sees none simply stays where it is.
+        planner = getattr(self, "update_planner", None)
+        if planner is not None:
+            try:
+                body.update(planner.as_heartbeat_payload())
+            except Exception:  # noqa: BLE001 - never fail a heartbeat over this
+                log.exception("could not attach an update target to a heartbeat")
+        return _json_response(200, body)
 
     def proxy_create_harness_session(
         self, host_id: str, payload: Mapping[str, Any]
