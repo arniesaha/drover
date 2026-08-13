@@ -268,6 +268,17 @@ public actor DroverClient {
         return try decode(HarnessAuthFlow.self, from: data)
     }
 
+    /// Type a line into a running login CLI -- the code the browser hands
+    /// back at the end of an OAuth round trip. Only flows reporting
+    /// `supportsInput` have a terminal on the other end to receive it.
+    public func submitAuthInput(hostID: String, harness: String, flowID: String,
+                                text: String) async throws -> HarnessAuthFlow {
+        let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/flows/\(encodePathComponent(flowID))/input"
+        let body = try JSONSerialization.data(withJSONObject: ["text": text])
+        let data = try await request(path: path, method: "POST", body: body)
+        return try decode(HarnessAuthFlow.self, from: data)
+    }
+
     public func cancelAuthFlow(hostID: String, harness: String, flowID: String) async throws -> HarnessAuthFlow {
         let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/flows/\(encodePathComponent(flowID))/cancel"
         let data = try await request(path: path, method: "POST", body: Data("{}".utf8))

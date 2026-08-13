@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -11,8 +12,12 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Protocol, Sequence
+from typing import Any, Iterator, Protocol, Sequence
 from uuid import uuid4
+
+import codecs
+
+from .pty import make_controlling_tty_preexec, resize_pty
 
 _SECRET_QUERY_KEYS = {
     "authorization",
@@ -52,10 +57,28 @@ _SECRET_KEY_NAME_RE = (
     r"[A-Z0-9_-]*"
 )
 _URL_RE = re.compile(r"https?://[^\s)'\"]+")
-_USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}(?:-[A-Z0-9]{4})+\b")
+# Hyphenated one-time codes. Group widths vary by provider -- codex issues
+# `P1KY-AS6MU` (4 then 5), so pinning every group to four characters silently
+# dropped the code and left the device page with nothing to enter.
+_USER_CODE_GROUPS = r"[A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})+"
+_USER_CODE_RE = re.compile(rf"\b{_USER_CODE_GROUPS}\b")
 _USER_CODE_CONTEXT_RE = re.compile(
-    r"(?i)\b(?:pairing|user|device)\s+code\s*:\s*([A-Z0-9]{4}(?:-[A-Z0-9]{4})+)\b"
+    rf"(?i)\b(?:pairing|user|device)\s+code\s*:\s*({_USER_CODE_GROUPS})\b"
 )
+# Terminal control sequences. Login CLIs colourise their URLs and codes, and
+# claude wraps its URL in an OSC-8 hyperlink; left in place the trailing reset
+# is captured as part of the URL itself.
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_ESCAPE_RE = re.compile(r"\x1b[@-Z\\-_]")
+# Query parameters whose value is a fixed flag rather than a credential.
+# `claude auth login` sets `code=true` to ask for a pasteable code; redacting
+# it produced a URL that opened but could never yield one.
+# Bare fragment, not a compiled pattern: it is spliced into a larger regex
+# that already carries the case-insensitive flag, and an inline `(?i)` is
+# only legal at the very start of an expression.
+_NON_SECRET_CODE_VALUE = r"(?:true|false|0|1)(?=[&\s]|$)"
+_CODE_FLAG_RE = re.compile(r"(?i)\A(?:true|false|0|1)\Z")
 _AUTHORIZATION_RE = re.compile(r"(?i)(\bauthorization\s*:\s*)[^\r\n,;]+")
 _BEARER_TOKEN_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=:-]+")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
@@ -69,7 +92,7 @@ _COLON_SECRET_RE = re.compile(
 )
 _SPACED_ASSIGN_SECRET_RE = re.compile(
     rf"(?i)(?<![\"\w])((?:x[-_])?(?:{_SECRET_KEY_PATTERN}|{_SECRET_KEY_NAME_RE}))(\s*=\s*)"
-    r'(?:"[^"]*"|\'[^\']*\'|[^&\s,}]+)'
+    r'("[^"]*"|\'[^\']*\'|[^&\s,}]+)'
 )
 _ENV_SPACE_SECRET_RE = re.compile(
     rf"(?<![\"\w])((?:X[-_])?{_SECRET_KEY_NAME_RE})([ \t]+)"
@@ -92,6 +115,7 @@ _PROVIDER_TOKEN_RE = re.compile(
     r")(?![A-Za-z0-9_-])"
 )
 _URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/\s?#@]+@")
+_PTY_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 _TERMINAL_FLOW_STATES = {"authenticated", "failed", "expired", "cancelled"}
 _PROCESS_STOP_TIMEOUT_S = 0.2
 
@@ -100,12 +124,28 @@ class AuthFlowLaunchError(RuntimeError):
     """Authentication CLI could not be started on this host."""
 
 
+class TerminalSignInRequired(RuntimeError):
+    """This harness can only be signed in from an interactive terminal.
+
+    Raised instead of launching a flow that is structurally incapable of
+    succeeding -- agy has no login subcommand, only a full-screen TUI.
+    """
+
+
+class AuthFlowInputError(RuntimeError):
+    """Typed input could not be delivered to the authentication CLI."""
+
+
 @dataclass(frozen=True)
 class HarnessAuthStatus:
     harness: str
     state: str
     label: str | None = None
     detail: str | None = None
+    # How a client should sign this harness in: "flow" drives the managed
+    # start/poll/input lifecycle, "terminal" means hand the user a PTY
+    # session because the CLI only authenticates through its own TUI.
+    sign_in: str = "flow"
 
     def as_json(self, *, host_id: str | None = None) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -113,6 +153,7 @@ class HarnessAuthStatus:
             "state": self.state,
             "label": self.label,
             "detail": self.detail,
+            "sign_in": self.sign_in,
         }
         if host_id is not None:
             data["host_id"] = host_id
@@ -130,6 +171,9 @@ class HarnessAuthFlowSnapshot:
     message: str | None = None
     expires_at: str | None = None
     last_error: str | None = None
+    # True when the CLI is running on a PTY and can still be typed into, so
+    # the client knows whether to offer a "paste your code" field.
+    supports_input: bool = False
 
     def as_json(self, *, host_id: str | None = None) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -142,6 +186,7 @@ class HarnessAuthFlowSnapshot:
             "message": self.message,
             "expires_at": self.expires_at,
             "last_error": self.last_error,
+            "supports_input": self.supports_input,
         }
         if host_id is not None:
             data["host_id"] = host_id
@@ -150,6 +195,10 @@ class HarnessAuthFlowSnapshot:
 
 class HarnessAuthAdapter(Protocol):
     harness: str
+    # Whether the login CLI must be given a controlling terminal.
+    requires_pty: bool
+    # "flow" or "terminal" -- see HarnessAuthStatus.sign_in.
+    sign_in: str
 
     def status(self) -> HarnessAuthStatus: ...
 
@@ -161,18 +210,36 @@ class StaticAuthAdapter:
     harness: str
     status_value: HarnessAuthStatus | None = None
     start_command: list[str] | None = None
+    requires_pty: bool = False
+    sign_in: str = "flow"
 
     def status(self) -> HarnessAuthStatus:
-        return self.status_value or HarnessAuthStatus(
+        if self.status_value is not None:
+            return replace(self.status_value, sign_in=self.sign_in)
+        return HarnessAuthStatus(
             self.harness,
             "unavailable",
             detail=f"auth is not supported for {self.harness}",
+            sign_in=self.sign_in,
         )
 
     def command(self) -> list[str]:
         if not self.start_command:
             raise RuntimeError(f"auth is not supported for {self.harness}")
         return self.start_command
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    """Redact ``key=value``, sparing the OAuth ``code`` request flag.
+
+    Everything reaching this is a candidate secret, so the exemption is kept
+    as narrow as it can be: only the literal name ``code``, and only when its
+    whole value is a boolean. A real authorization code never looks like this.
+    """
+    key, separator, value = match.group(1), match.group(2), match.group(3)
+    if key.lower() == "code" and _CODE_FLAG_RE.match(value):
+        return match.group(0)
+    return f"{key}{separator}<redacted>"
 
 
 def redact_auth_text(text: str) -> str:
@@ -183,18 +250,35 @@ def redact_auth_text(text: str) -> str:
     redacted = _PROVIDER_TOKEN_RE.sub("<redacted>", redacted)
     redacted = _JSON_SECRET_RE.sub(r'\1"<redacted>"', redacted)
     redacted = _COLON_SECRET_RE.sub(r"\1\2<redacted>", redacted)
-    redacted = _SPACED_ASSIGN_SECRET_RE.sub(r"\1\2<redacted>", redacted)
+    redacted = _SPACED_ASSIGN_SECRET_RE.sub(_redact_assignment, redacted)
     redacted = _ENV_SPACE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     redacted = _KEY_SPACE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     redacted = _PHRASE_SPACE_SECRET_RE.sub(r"\1\2<redacted>", redacted)
     for key in sorted(_SECRET_QUERY_KEYS, key=len, reverse=True):
+        name = re.escape(key).replace("_", r"[-_]")
+        # `code` is the one key that carries a flag as often as a secret.
+        # Skip the boolean literals and redact everything else, so a real
+        # authorization code in a callback URL is still hidden.
+        guard = f"(?!{_NON_SECRET_CODE_VALUE})" if key == "code" else ""
         redacted = re.sub(
-            rf"(?i)({re.escape(key).replace('_', r'[-_]')}=)[^&\s]+",
-            rf"\1<redacted>",
+            rf"(?i)({name}=){guard}[^&\s]+",
+            r"\1<redacted>",
             redacted,
         )
     redacted = re.sub(r"(?i)client_secret(?==)", "client_<redacted>", redacted)
     return redacted
+
+
+def strip_ansi(text: str) -> str:
+    """Drop terminal control sequences from a line of CLI output.
+
+    OSC sequences go first: an OSC-8 hyperlink encloses the URL it points
+    at, so removing the CSI colour codes inside it before the wrapper would
+    leave the target stranded as bare text next to its visible duplicate.
+    """
+    stripped = _OSC_RE.sub("", text)
+    stripped = _CSI_RE.sub("", stripped)
+    return _ESCAPE_RE.sub("", stripped)
 
 
 def _extract_safe_user_code(text: str) -> str | None:
@@ -207,8 +291,13 @@ class CommandAuthAdapter:
     harness: str
     status_command: list[str]
     login_command: list[str]
+    requires_pty: bool = False
+    sign_in: str = "flow"
 
     def status(self) -> HarnessAuthStatus:
+        return replace(self._probe(), sign_in=self.sign_in)
+
+    def _probe(self) -> HarnessAuthStatus:
         try:
             result = subprocess.run(
                 self.status_command,
@@ -313,6 +402,60 @@ def _parse_agy_status(
     ).exists():
         return HarnessAuthStatus("agy", "authenticated", detail="Antigravity CLI")
     return HarnessAuthStatus("agy", "unknown", detail=output or None)
+
+
+def _spawn_on_pty(command: Sequence[str]) -> tuple[subprocess.Popen[Any], int]:
+    """Start a login CLI with a controlling terminal it can prompt on.
+
+    Sized generously in columns so the CLI does not hard-wrap the authorize
+    URL: a wrapped URL arrives as several lines and the extractor would only
+    ever capture the first fragment.
+    """
+    master_fd, slave_fd = os.openpty()
+    resize_pty(slave_fd, rows=24, cols=400)
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            preexec_fn=make_controlling_tty_preexec(slave_fd),
+        )
+    except BaseException:
+        os.close(master_fd)
+        raise
+    finally:
+        os.close(slave_fd)
+    return process, master_fd
+
+
+def _iter_pty_lines(master_fd: int) -> Iterator[str]:
+    """Yield decoded lines from a PTY master until the child's side closes.
+
+    A PTY is a stream of bytes with no EOF until the last slave descriptor
+    goes away, at which point macOS and Linux both surface EIO rather than an
+    empty read -- so that is the loop's terminating condition, not `not data`.
+    Carriage returns are treated as line breaks because terminal output uses
+    CRLF and TUIs repaint with bare CRs.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    while True:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        pending += decoder.decode(chunk)
+        parts = _PTY_LINE_BREAK_RE.split(pending)
+        pending = parts.pop()
+        for part in parts:
+            yield part
+    pending += decoder.decode(b"", final=True)
+    if pending:
+        yield pending
 
 
 def default_login_shell() -> str:
@@ -436,13 +579,19 @@ def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthA
     adapters: dict[str, HarnessAuthAdapter] = {}
     claude = _resolve_login_command("claude", shell=shell)
     if claude is not None:
+        # `claude auth login` renders its "Paste code here" prompt through
+        # ink, which needs a terminal: on a pipe it prints the authorize URL
+        # and then hangs forever without ever prompting.
         adapters["claude-code"] = CommandAuthAdapter(
             "claude-code",
             _command_with_args(claude, "auth", "status", "--json"),
             _command_with_args(claude, "auth", "login"),
+            requires_pty=True,
         )
     codex = _resolve_login_command("codex", shell=shell)
     if codex is not None:
+        # The device-code flow is line-oriented and needs no terminal; the
+        # user finishes it entirely in a browser.
         adapters["codex"] = CommandAuthAdapter(
             "codex",
             _command_with_args(codex, "login", "status"),
@@ -450,10 +599,15 @@ def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthA
         )
     agy = _resolve_login_command("agy", shell=shell)
     if agy is not None:
+        # agy exposes no login subcommand -- signing in means driving the
+        # full-screen TUI the bare binary opens, so there is nothing here a
+        # managed flow could scrape or answer.
         adapters["agy"] = CommandAuthAdapter(
             "agy",
             _command_with_args(agy, "--version"),
             list(agy),
+            requires_pty=True,
+            sign_in="terminal",
         )
     return adapters
 
@@ -462,10 +616,16 @@ def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthA
 class _AuthFlow:
     flow_id: str
     harness: str
-    process: subprocess.Popen[str]
+    # `Popen[Any]`: PTY-backed flows are byte-mode (their streams are the
+    # terminal, not pipes), pipe-backed ones are text-mode.
+    process: subprocess.Popen[Any]
     pgid: int
     started_at: float
     timeout_s: float
+    # Write end of the child's terminal, when it was given one. Its presence
+    # is what makes a flow answerable: pipe-backed flows have no way to
+    # deliver a pasted code.
+    master_fd: int | None = None
     state: str = "starting"
     login_url: str | None = None
     user_code: str | None = None
@@ -493,6 +653,10 @@ class _AuthFlow:
                 message=self.message,
                 expires_at=expires_at,
                 last_error=self.last_error,
+                supports_input=(
+                    self.master_fd is not None
+                    and self.state not in _TERMINAL_FLOW_STATES
+                ),
             )
 
 
@@ -519,22 +683,33 @@ class AuthFlowManager:
     def start(self, harness: str) -> dict[str, Any]:
         with self._lock:
             self._discard_expired_flows()
+            adapter = self._adapter(harness)
+            if getattr(adapter, "sign_in", "flow") == "terminal":
+                raise TerminalSignInRequired(
+                    f"{harness} can only be signed in from a terminal session"
+                )
             existing_id = self._active_flow_ids.get(harness)
             existing = self._flows_by_id.get(existing_id) if existing_id else None
             if existing is not None and not self._is_terminal(existing):
                 return existing.snapshot().as_json()
 
+            master_fd: int | None = None
             try:
-                process = subprocess.Popen(
-                    self._adapter(harness).command(),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="replace",
-                    bufsize=1,
-                    start_new_session=True,
-                )
+                if getattr(adapter, "requires_pty", False):
+                    # Closes its own terminal if the spawn fails, so there is
+                    # nothing to clean up here.
+                    process, master_fd = _spawn_on_pty(adapter.command())
+                else:
+                    process = subprocess.Popen(
+                        adapter.command(),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        errors="replace",
+                        bufsize=1,
+                        start_new_session=True,
+                    )
             except OSError as exc:
                 raise AuthFlowLaunchError(
                     "authentication command could not start"
@@ -546,6 +721,7 @@ class AuthFlowManager:
                 pgid=process.pid,
                 started_at=time.time(),
                 timeout_s=self._timeout_s,
+                master_fd=master_fd,
             )
             self._flows_by_id[flow.flow_id] = flow
             self._active_flow_ids[harness] = flow.flow_id
@@ -561,6 +737,30 @@ class AuthFlowManager:
 
     def snapshot(self, harness: str, flow_id: str) -> dict[str, Any]:
         return self._flow(harness, flow_id).snapshot().as_json()
+
+    def send_input(self, harness: str, flow_id: str, text: str) -> dict[str, Any]:
+        """Type a line into a running login CLI, e.g. a pasted OAuth code.
+
+        Never logged or retained: the text goes straight to the terminal and
+        whatever the CLI echoes back travels the same redaction path as the
+        rest of its output.
+        """
+        flow = self._flow(harness, flow_id)
+        with flow.lock:
+            if flow.state in _TERMINAL_FLOW_STATES:
+                raise AuthFlowInputError(
+                    f"authentication flow is no longer accepting input: {flow.state}"
+                )
+            if flow.master_fd is None:
+                raise AuthFlowInputError(f"{harness} sign-in does not accept input")
+            payload = text.rstrip("\r\n") + "\r"
+            try:
+                os.write(flow.master_fd, payload.encode("utf-8"))
+            except OSError as exc:
+                raise AuthFlowInputError("could not deliver input") from exc
+        # Snapshot outside the flow lock: `snapshot()` takes it, and it is a
+        # plain non-reentrant Lock.
+        return flow.snapshot().as_json()
 
     def cancel(self, harness: str, flow_id: str) -> dict[str, Any]:
         flow = self._flow(harness, flow_id)
@@ -628,7 +828,7 @@ class AuthFlowManager:
         ).start()
 
     @staticmethod
-    def _stop_process(process: subprocess.Popen[str], pgid: int) -> None:
+    def _stop_process(process: subprocess.Popen[Any], pgid: int) -> None:
         def send_group(sig: int) -> bool:
             try:
                 os.killpg(pgid, sig)
@@ -679,11 +879,38 @@ class AuthFlowManager:
         flow.process.wait()
         self._stop_process(flow.process, flow.pgid)
 
+    @staticmethod
+    def _output_lines(flow: _AuthFlow) -> Iterator[str]:
+        if flow.master_fd is not None:
+            return _iter_pty_lines(flow.master_fd)
+        assert flow.process.stdout is not None
+        return iter(flow.process.stdout)
+
     def _consume_output(self, flow: _AuthFlow) -> None:
         try:
-            assert flow.process.stdout is not None
-            for raw_line in flow.process.stdout:
-                raw_line = raw_line.rstrip()
+            self._read_until_exit(flow)
+        finally:
+            # The reader owns the terminal: it is the only thread that can
+            # close the master safely, once nothing is blocked reading it.
+            self._release_pty(flow)
+
+    @staticmethod
+    def _release_pty(flow: _AuthFlow) -> None:
+        with flow.lock:
+            master_fd, flow.master_fd = flow.master_fd, None
+        if master_fd is not None:
+            with suppress(OSError):
+                os.close(master_fd)
+
+    def _read_until_exit(self, flow: _AuthFlow) -> None:
+        try:
+            for raw_line in self._output_lines(flow):
+                raw_line = strip_ansi(raw_line).rstrip()
+                # A terminal emits far more blank lines than a pipe does --
+                # CRLF pairs and TUI repaints -- and an empty message would
+                # replace the URL the user still needs to see.
+                if not raw_line:
+                    continue
                 safe_user_code = _extract_safe_user_code(raw_line)
                 line = redact_auth_text(raw_line)
                 with flow.lock:

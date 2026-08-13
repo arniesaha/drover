@@ -65,7 +65,7 @@ class PtySessionManager:
         child_env.setdefault("COLORTERM", "truecolor")
 
         master_fd, slave_fd = os.openpty()
-        _resize_pty(slave_fd, rows=rows, cols=cols)
+        resize_pty(slave_fd, rows=rows, cols=cols)
         try:
             process = subprocess.Popen(
                 list(argv),
@@ -75,7 +75,7 @@ class PtySessionManager:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
-                preexec_fn=_make_child_preexec(slave_fd),
+                preexec_fn=make_controlling_tty_preexec(slave_fd),
             )
         finally:
             os.close(slave_fd)
@@ -128,7 +128,7 @@ class PtySessionManager:
         if running.process.poll() is not None:
             self._cleanup_running(session_id, running)
             raise KeyError(f"unknown PTY session: {session_id}")
-        _resize_pty(running.master_fd, rows=rows, cols=cols)
+        resize_pty(running.master_fd, rows=rows, cols=cols)
 
     def read(
         self,
@@ -226,7 +226,13 @@ def _signal_process(process: subprocess.Popen[bytes], sig: int) -> None:
         return
 
 
-def _make_child_preexec(slave_fd: int):
+def make_controlling_tty_preexec(slave_fd: int):
+    """Put the child in its own session with the PTY as its controlling tty.
+
+    Also used by the harness auth flows, whose login CLIs refuse to prompt
+    without one.
+    """
+
     def preexec() -> None:
         os.setsid()
         try:
@@ -250,7 +256,7 @@ def _normalize_command(command: str | list[str] | tuple[str, ...]) -> tuple[str,
     return argv
 
 
-def _resize_pty(fd: int, *, rows: int, cols: int) -> None:
+def resize_pty(fd: int, *, rows: int, cols: int) -> None:
     try:
         import fcntl
         import struct

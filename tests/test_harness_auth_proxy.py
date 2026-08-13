@@ -30,11 +30,13 @@ class _HarnessAuthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
         self.__class__.requests.append(
             {
                 "method": "POST",
                 "path": self.path,
                 "authorization": self.headers.get("Authorization"),
+                "body": self.rfile.read(length).decode() if length else None,
             }
         )
         body = json.dumps(
@@ -297,3 +299,46 @@ def test_proxy_harness_auth_builds_quoted_upstream_paths(tmp_path):
         calls[-1][1]
         == "http://127.0.0.1:30400/auth/provider%2Ftest/flows/flow%2F1/cancel"
     )
+
+
+def test_host_auth_route_parser_accepts_the_input_action():
+    assert _parse_host_auth_route(
+        "/harness/hosts/h/auth/claude-code/flows/flow%2F1/input"
+    ) == {
+        "host_id": "h",
+        "harness": "claude-code",
+        "flow_id": "flow/1",
+        "action": "input",
+        "method": "POST",
+    }
+
+
+def test_central_forwards_the_typed_code_body_upstream(tmp_path):
+    """The proxy posts an empty body for every other auth action.
+
+    Input is the one that carries a payload, so a forwarding bug here is
+    invisible until a real paste silently arrives as `{}` and the CLI keeps
+    waiting.
+    """
+    upstream, central, base = _start_proxy_pair(tmp_path)
+    try:
+        req = urllib.request.Request(
+            f"{base}/harness/hosts/mac-mini/auth/claude-code/flows/auth-flow-1/input",
+            data=json.dumps({"text": "PASTED-CODE"}).encode(),
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = json.loads(response.read().decode())
+    finally:
+        _close_proxy_pair(upstream, central)
+
+    assert response.status == 200
+    assert body["host_id"] == "mac-mini"
+    recorded = _HarnessAuthHandler.requests[0]
+    assert recorded["method"] == "POST"
+    assert recorded["path"] == "/auth/claude-code/flows/auth-flow-1/input"
+    assert json.loads(recorded["body"] or "{}") == {"text": "PASTED-CODE"}

@@ -20,6 +20,17 @@ public final class AuthFlowModel {
     public var flow: HarnessAuthFlow?
     public var isStarting = false
     public var errorMessage: String?
+    /// What the user pastes back from the provider's page. Held only until
+    /// it is handed to the host, then cleared.
+    public var codeEntry = ""
+    public var isSubmitting = false
+
+    /// This harness authenticates through its own terminal UI, so the app
+    /// should open a PTY session rather than drive a managed flow.
+    public var requiresTerminalSignIn: Bool { status?.signIn == .terminal }
+
+    /// True once the CLI is on a terminal and waiting to be typed into.
+    public var canSubmitCode: Bool { flow?.supportsInput == true }
 
     public init(client: DroverClient, hostID: String, harness: String) {
         self.client = client
@@ -48,6 +59,33 @@ public final class AuthFlowModel {
             flow = try await client.startAuthFlow(hostID: hostID, harness: harness)
             errorMessage = nil
             startPolling()
+        } catch DroverError.conflict(let message) {
+            // The host refused to start a flow. That is how a terminal-only
+            // harness answers, so re-read status: if the mode is what
+            // changed, the sheet can offer a terminal instead of an error.
+            await refreshStatus()
+            errorMessage = requiresTerminalSignIn ? nil : message
+        } catch {
+            errorMessage = Self.errorMessage(for: error)
+        }
+    }
+
+    /// Hand the pasted code to the login CLI waiting on its terminal.
+    public func submitCode() async {
+        let text = codeEntry.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let flow, !flow.isTerminal else { return }
+
+        isSubmitting = true
+        defer { isSubmitting = false }
+
+        do {
+            self.flow = try await client.submitAuthInput(
+                hostID: hostID, harness: harness, flowID: flow.flowID, text: text)
+            codeEntry = ""
+            errorMessage = nil
+            // The CLI exits shortly after accepting the code; polling is
+            // what turns that into an `authenticated` state on screen.
+            if self.flow?.isTerminal == false { startPolling() }
         } catch {
             errorMessage = Self.errorMessage(for: error)
         }
