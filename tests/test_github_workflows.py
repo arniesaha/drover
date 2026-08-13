@@ -212,3 +212,23 @@ def test_workflows_only_use_allowlisted_actions() -> None:
         "these actions are outside the repository allowlist and will cause a "
         f"startup_failure: {offenders}"
     )
+
+
+def test_release_verifies_the_published_artifact_end_to_end() -> None:
+    """Unit tests cannot catch an install that refuses itself.
+
+    v0.1.1 passed every suite, published three correct artifacts, and still
+    could not install: drover-server had no --version flag and install.sh
+    smoke-tests exactly that. Only running the real script against the real
+    release finds that class of bug.
+    """
+    job = load_workflow("release.yml")["jobs"]["verify-install"]
+    assert job["needs"] == "release", "nothing to install before publishing"
+    assert job["runs-on"] == "ubuntu-latest", "a clean machine, not the fleet"
+
+    steps = " ".join(step.get("run", "") for step in job["steps"])
+    assert "bash install.sh" in steps, "must run the real installer"
+    assert "--version" in steps, "must assert the smoke gate v0.1.1 failed"
+    assert "runtime/current" in steps
+    assert "healthz" in steps, "must prove the installed build actually serves"
+    assert "drover://" in steps, "must prove pairing works after install"

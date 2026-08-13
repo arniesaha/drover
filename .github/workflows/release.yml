@@ -100,3 +100,95 @@ jobs:
           dist/drover-*-py3-none-any.whl \
           dist/requirements.lock.txt \
           dist/SHA256SUMS.txt
+
+  # Install the release we just published, on a clean machine, the way a
+  # stranger would. Unit tests cannot catch this class of bug: v0.1.1 passed
+  # every suite, published three correct artifacts, and still could not
+  # install, because drover-server had no --version flag and install.sh
+  # smoke-tests exactly that before activating. The only thing that finds
+  # that is running the real script against the real release.
+  #
+  # Runs after publishing rather than before, because there is no release to
+  # install until then. A failure here means the release is bad and should be
+  # deleted, not that the check is wrong.
+  verify-install:
+    name: Install the published release on a clean machine
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Wait for the release assets to be queryable
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="${{ github.event.inputs.ref || github.ref_name }}"
+        for _ in $(seq 1 30); do
+          if gh release view "$TAG" --json assets \
+               --jq '.assets[].name' | grep -q 'py3-none-any.whl'; then
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "release $TAG never exposed a wheel" >&2
+        exit 1
+
+    - name: Run install.sh exactly as a user would
+      run: |
+        set -x
+        bash install.sh --version "${{ github.event.inputs.ref || github.ref_name }}"
+
+    - name: The runtime is laid out and activated
+      run: |
+        VERSION="$(echo "${{ github.event.inputs.ref || github.ref_name }}" | sed 's/^v//')"
+        test -d "$HOME/.drover/runtime/$VERSION" \
+          || { echo "no runtime/$VERSION" >&2; exit 1; }
+        test -L "$HOME/.drover/runtime/current" \
+          || { echo "current is not a symlink" >&2; exit 1; }
+        test "$(readlink "$HOME/.drover/runtime/current")" = "$VERSION" \
+          || { echo "current does not point at $VERSION" >&2; exit 1; }
+
+    - name: The installed build runs and reports its own version
+      run: |
+        VERSION="$(echo "${{ github.event.inputs.ref || github.ref_name }}" | sed 's/^v//')"
+        # This is the assertion v0.1.1 would have failed.
+        "$HOME/.drover/runtime/current/bin/drover-server" --version
+        "$HOME/.drover/runtime/current/bin/drover-server" --version \
+          | grep -q "$VERSION"
+
+    - name: Config carries the detected address
+      run: |
+        grep -q '^advertised_url' "$HOME/.drover/config.toml"
+        grep -q '^metrics_host' "$HOME/.drover/config.toml"
+        cat "$HOME/.drover/config.toml"
+
+    - name: Service units point at current and set PATH explicitly
+      run: |
+        UNIT="$HOME/.config/systemd/user/drover-server.service"
+        test -f "$UNIT" || { echo "no server unit written" >&2; exit 1; }
+        test -f "$HOME/.config/systemd/user/drover-harnessd.service"
+        cat "$UNIT"
+        # Both properties have silently broken real hosts before.
+        grep -q 'Environment=PATH=' "$UNIT"
+        grep -q 'runtime/current/bin' "$UNIT"
+        grep -qv 'runtime/0\.' "$UNIT"
+
+    - name: The server actually serves, and pairing prints a QR
+      run: |
+        # Started directly rather than through systemd: `systemctl --user`
+        # is not reliably available on a hosted runner, and install.sh
+        # tolerates that by design. What matters here is that the installed
+        # build works, not which supervisor started it.
+        pkill -f 'drover-server run' || true
+        "$HOME/.drover/runtime/current/bin/drover-server" run &
+        for _ in $(seq 1 30); do
+          curl -fsS --max-time 2 http://127.0.0.1:7080/healthz && break
+          sleep 2
+        done
+        curl -fsS --max-time 5 http://127.0.0.1:7080/healthz
+
+        OUT="$("$HOME/.drover/runtime/current/bin/drover-server" pair)"
+        echo "$OUT"
+        echo "$OUT" | grep -q 'drover://' || { echo "no pairing URL" >&2; exit 1; }
+        echo "$OUT" | grep -q '█' || { echo "no QR rendered" >&2; exit 1; }
+        pkill -f 'drover-server run' || true
