@@ -14,6 +14,16 @@ from drover.server.web.credentials import (
     verifier_from_token,
 )
 
+PUBLIC_CREDENTIAL_KEYS = {
+    "id",
+    "scope",
+    "label",
+    "created_at",
+    "host_id",
+    "last_used_at",
+    "revoked_at",
+}
+
 
 def _store(tmp_path) -> CredentialStore:
     return CredentialStore(tmp_path / CREDENTIALS_FILENAME)
@@ -90,6 +100,70 @@ def test_public_json_never_leaks_the_verifier(tmp_path):
     public = credential.as_public_json()
     assert "verifier" not in public
     assert public["label"] == "Phone"
+
+
+def test_public_json_is_an_explicit_allowlist(tmp_path):
+    store = _store(tmp_path)
+    credential, _ = store.issue(scope="device", label="Phone")
+    assert store.set_apns_registration(
+        credential.id, token="secret-device-token", environment="sandbox"
+    )
+    public = store.get(credential.id).as_public_json()
+    assert set(public) == PUBLIC_CREDENTIAL_KEYS
+    assert "secret-device-token" not in json.dumps(public)
+
+
+def test_apns_registration_writes_inside_touch_debounce(tmp_path):
+    store = _store(tmp_path)
+    credential, _ = store.issue(scope="device", label="Phone")
+    store.touch(credential.id, now=1000)
+    assert store.set_apns_registration(
+        credential.id, token="token-1", environment="sandbox"
+    )
+    assert store.set_apns_registration(
+        credential.id, token="token-2", environment="production"
+    )
+    loaded = CredentialStore(tmp_path / CREDENTIALS_FILENAME).get(credential.id)
+    assert (loaded.apns_token, loaded.apns_environment) == (
+        "token-2",
+        "production",
+    )
+
+
+def test_clear_apns_registration_compares_expected_token(tmp_path):
+    store = _store(tmp_path)
+    credential, _ = store.issue(scope="device", label="Phone")
+    store.set_apns_registration(credential.id, token="new-token", environment="sandbox")
+    assert not store.clear_apns_registration(credential.id, expected_token="old-token")
+    assert store.get(credential.id).apns_token == "new-token"
+    assert store.clear_apns_registration(credential.id, expected_token="new-token")
+    assert store.get(credential.id).apns_token is None
+
+
+def test_revoke_destroys_apns_capability(tmp_path):
+    store = _store(tmp_path)
+    credential, _ = store.issue(scope="device", label="Phone")
+    store.set_apns_registration(
+        credential.id, token="device-token", environment="sandbox"
+    )
+    assert store.revoke(credential.id)
+    revoked = store.get(credential.id)
+    assert revoked.revoked_at is not None
+    assert revoked.apns_token is None
+    assert revoked.apns_environment is None
+
+
+def test_apns_registration_rejects_invalid_environment_and_non_device(tmp_path):
+    store = _store(tmp_path)
+    host, _ = store.issue(scope="host", label="build-mac", host_id="build-mac")
+
+    with pytest.raises(ValueError, match="unknown APNs environment"):
+        store.set_apns_registration(
+            host.id, token="device-token", environment="development"
+        )
+    assert not store.set_apns_registration(
+        host.id, token="device-token", environment="sandbox"
+    )
 
 
 def test_touch_is_debounced(tmp_path):

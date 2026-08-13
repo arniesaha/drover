@@ -26,6 +26,7 @@ STORE_VERSION = 1
 TOKEN_BYTES = 32
 TOUCH_DEBOUNCE_SECONDS = 60.0
 SCOPES = ("device", "host")
+APNS_ENVIRONMENTS = ("sandbox", "production")
 _VERIFIER_DOMAIN = b"drover-cred-v1\0"
 
 
@@ -48,6 +49,8 @@ class Credential:
     host_id: str | None = None
     last_used_at: str | None = None
     revoked_at: str | None = None
+    apns_token: str | None = None
+    apns_environment: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -63,13 +66,21 @@ class Credential:
             "host_id": self.host_id,
             "last_used_at": self.last_used_at,
             "revoked_at": self.revoked_at,
+            "apns_token": self.apns_token,
+            "apns_environment": self.apns_environment,
         }
 
     def as_public_json(self) -> dict:
-        """Everything except the verifier, safe to serve over the API."""
-        data = self.as_json()
-        del data["verifier"]
-        return data
+        """Return an explicit allowlist so future private fields stay private."""
+        return {
+            "id": self.id,
+            "scope": self.scope,
+            "label": self.label,
+            "created_at": self.created_at,
+            "host_id": self.host_id,
+            "last_used_at": self.last_used_at,
+            "revoked_at": self.revoked_at,
+        }
 
 
 class CredentialStore:
@@ -119,6 +130,53 @@ class CredentialStore:
             credential_id = self._by_verifier.get(verifier)
             return self._by_id.get(credential_id) if credential_id else None
 
+    def get(self, credential_id: str) -> Credential | None:
+        with self._lock:
+            return self._by_id.get(credential_id)
+
+    def set_apns_registration(
+        self, credential_id: str, *, token: str, environment: str
+    ) -> bool:
+        if environment not in APNS_ENVIRONMENTS:
+            raise ValueError(f"unknown APNs environment: {environment}")
+        with self._lock:
+            credential = self._by_id.get(credential_id)
+            if (
+                credential is None
+                or not credential.is_active
+                or credential.scope != "device"
+            ):
+                return False
+            self._by_id[credential_id] = replace(
+                credential,
+                apns_token=token,
+                apns_environment=environment,
+            )
+            self._write()
+            return True
+
+    def clear_apns_registration(
+        self, credential_id: str, *, expected_token: str | None = None
+    ) -> bool:
+        with self._lock:
+            credential = self._by_id.get(credential_id)
+            if (
+                credential is None
+                or credential.apns_token is None
+                or (
+                    expected_token is not None
+                    and credential.apns_token != expected_token
+                )
+            ):
+                return False
+            self._by_id[credential_id] = replace(
+                credential,
+                apns_token=None,
+                apns_environment=None,
+            )
+            self._write()
+            return True
+
     def touch(self, credential_id: str, *, now: float | None = None) -> None:
         """Record use, debounced so a busy client is not a write per request."""
         moment = time.time() if now is None else now
@@ -138,7 +196,12 @@ class CredentialStore:
             credential = self._by_id.get(credential_id)
             if credential is None or not credential.is_active:
                 return False
-            self._by_id[credential_id] = replace(credential, revoked_at=_now_iso())
+            self._by_id[credential_id] = replace(
+                credential,
+                revoked_at=_now_iso(),
+                apns_token=None,
+                apns_environment=None,
+            )
             self._by_verifier.pop(credential.verifier, None)
             self._write()
             return True
@@ -176,6 +239,8 @@ class CredentialStore:
                     host_id=item.get("host_id"),
                     last_used_at=item.get("last_used_at"),
                     revoked_at=item.get("revoked_at"),
+                    apns_token=item.get("apns_token"),
+                    apns_environment=item.get("apns_environment"),
                 )
             except KeyError:
                 continue

@@ -404,6 +404,30 @@ public actor DroverClient {
         _ = try await request(path: path, method: "POST", body: nil)
     }
 
+    /// Hand the hub this device's APNs token so it can push "needs you"
+    /// alerts when the app is not running.
+    ///
+    /// Registration is per *credential*, not per install: the hub stores the
+    /// token against the device credential this client's bearer token belongs
+    /// to, so re-pairing a phone replaces its registration rather than
+    /// accumulating dead ones.
+    public func registerAPNsToken(
+        _ token: Data, environment: APNsEnvironment = .current()
+    ) async throws {
+        let payload: [String: String] = [
+            "token": token.apnsHexString,
+            "environment": environment.rawValue,
+        ]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        _ = try await request(path: "/auth/device/apns", method: "PUT", body: body)
+    }
+
+    /// Drop this device's registration, so a signed-out phone stops lighting
+    /// up for a fleet it no longer belongs to.
+    public func unregisterAPNsToken() async throws {
+        _ = try await request(path: "/auth/device/apns", method: "DELETE", body: nil)
+    }
+
     /// Deliberately bypasses the shared `request()` helper: its contract is
     /// different from the authed endpoints — it answers "is the server
     /// reachable?" as a Bool, sends no Authorization header, and collapses

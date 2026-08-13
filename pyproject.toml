@@ -27,6 +27,14 @@ dependencies = [
     # Pure Python with no transitive dependencies, which matters for an
     # install path that has to work everywhere. Renders the pairing QR.
     "segno>=1.6",
+    # APNs push. Both were already present transitively (httpx under anthropic,
+    # cryptography under it), so the only genuinely new wheel is h2 -- but this
+    # path imports them directly and an undeclared transitive dep is one
+    # upstream release away from vanishing. The http2 extra is not optional:
+    # the APNs provider API speaks HTTP/2 only, and httpx raises at client
+    # construction if the h2 package is missing.
+    "httpx[http2]>=0.27",
+    "cryptography>=42.0",
 ]
 
 [project.scripts]
