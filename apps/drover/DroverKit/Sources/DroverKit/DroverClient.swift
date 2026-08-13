@@ -76,6 +76,7 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 /// (encrypted at the WireGuard/Tailscale hop, not at this layer — see
 /// `NSAllowsArbitraryLoads` in the app's Info.plist).
 public actor DroverClient {
+    private static let cockpitRequestTimeout: TimeInterval = 30
     private let config: ServerConfig
     private let token: String
     private let session: URLSession
@@ -141,7 +142,10 @@ public actor DroverClient {
         let url = try queryURL(path: "/cockpit/overview", items: [
             ("days", String(days)),
         ])
-        let data = try await request(url: url, method: "GET", body: nil)
+        let data = try await request(
+            url: url, method: "GET", body: nil,
+            timeout: Self.cockpitRequestTimeout
+        )
         return try decode(CockpitOverview.self, from: data)
     }
 
@@ -160,7 +164,10 @@ public actor DroverClient {
             ("host_cursor", filters.hostCursor),
             ("model_cursor", filters.modelCursor),
         ])
-        let data = try await request(url: url, method: "GET", body: nil)
+        let data = try await request(
+            url: url, method: "GET", body: nil,
+            timeout: Self.cockpitRequestTimeout
+        )
         return try decode(AnalyticsSnapshot.self, from: data)
     }
 

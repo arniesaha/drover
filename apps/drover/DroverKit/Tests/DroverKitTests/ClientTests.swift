@@ -427,6 +427,7 @@ struct ClientTests {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/cockpit/overview")
         #expect(request.url?.query == "days=7")
+        #expect(request.timeoutInterval == 30)
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
         return (200, emptyOverviewJSON)
     }
@@ -438,6 +439,7 @@ struct ClientTests {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/analytics")
         #expect(request.url?.query == "days=30&host_id=mac%20mini&harness=codex&provider=openai&model=gpt-5.6-sol&project_key=arniesaha%2Fdrover")
+        #expect(request.timeoutInterval == 30)
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
         return (200, emptyAnalyticsJSON)
     }
