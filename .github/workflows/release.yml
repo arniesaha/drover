@@ -42,6 +42,21 @@ jobs:
     - name: Build the wheel
       run: uv build --wheel --out-dir dist
 
+    # A wheel is named after pyproject's version, not the tag. If those drift
+    # every step here still succeeds and the release looks fine, but the
+    # failure lands later on a stranger's machine as a 404 mid-install. Worse,
+    # a host that installed "0.1.1" from a package reporting 0.1.0 never
+    # converges and reinstalls on every heartbeat. Fail the build instead.
+    - name: Refuse a wheel that does not match the tag
+      run: |
+        expected="drover-${RELEASE_TAG#v}-py3-none-any.whl"
+        if [ ! -f "dist/$expected" ]; then
+          echo "tag ${RELEASE_TAG} expects dist/$expected, but the build produced:" >&2
+          ls -1 dist >&2
+          echo "bump version in pyproject.toml to match the tag" >&2
+          exit 1
+        fi
+
     - name: Export a hash-pinned universal lockfile
       run: |
         uv export --no-emit-project --no-dev --format requirements-txt \

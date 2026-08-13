@@ -149,3 +149,17 @@ def test_ci_stays_github_hosted_after_the_shell_step() -> None:
     workflow = load_workflow("ci.yml")
     assert workflow["jobs"]["build-and-test"]["runs-on"] == "ubuntu-latest"
     assert workflow["permissions"] == {"contents": "read"}
+
+
+def test_release_refuses_a_wheel_that_does_not_match_the_tag() -> None:
+    """pyproject's version names the wheel; the tag names the release.
+
+    When they drift every step still succeeds and the failure lands later, on
+    someone else's machine, as a 404 mid-install.
+    """
+    steps = " ".join(
+        step.get("run", "")
+        for step in load_workflow("release.yml")["jobs"]["release"]["steps"]
+    )
+    assert "py3-none-any.whl" in steps
+    assert "pyproject.toml to match the tag" in steps

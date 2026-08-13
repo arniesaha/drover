@@ -223,17 +223,29 @@ resolve_version() {
 # --- install -----------------------------------------------------------------
 install_runtime() {
   local version="$1" target="$DROVER_HOME/runtime/$version"
-  local wheel="drover-${version}-py3-none-any.whl"
   local base="https://github.com/${REPO}/releases/download/v${version}"
   local tmp; tmp="$(mktemp -d)"
 
+  curl -fsSL "$base/SHA256SUMS.txt" -o "$tmp/SHA256SUMS.txt" \
+    || fail "release v${version} has no SHA256SUMS.txt (does it have artifacts?)"
+
+  # Read the wheel's filename out of the manifest rather than building it from
+  # the tag. A wheel is named after the version in pyproject.toml, which is
+  # not guaranteed to equal the tag: constructing the name here would 404 on
+  # any release where those drifted, and would do it only at install time on
+  # someone else's machine.
+  local wheel
+  wheel="$(awk '$2 ~ /^\*?\.?\/?drover-.*-py3-none-any\.whl$/ {
+                  sub(/^[*.]*\//, "", $2); sub(/^\*/, "", $2); print $2; exit }' \
+           "$tmp/SHA256SUMS.txt")"
+  [ -n "$wheel" ] \
+    || fail "release v${version} lists no drover wheel in SHA256SUMS.txt"
+
   info "downloading ${wheel}..."
   curl -fsSL "$base/$wheel" -o "$tmp/$wheel" \
-    || fail "could not download $wheel (does release v${version} have artifacts?)"
+    || fail "could not download $wheel from release v${version}"
   curl -fsSL "$base/requirements.lock.txt" -o "$tmp/requirements.lock.txt" \
     || fail "could not download requirements.lock.txt"
-  curl -fsSL "$base/SHA256SUMS.txt" -o "$tmp/SHA256SUMS.txt" \
-    || fail "could not download SHA256SUMS.txt"
 
   verify_against_manifest "$tmp/$wheel" "$wheel" "$tmp/SHA256SUMS.txt" \
     || fail "refusing to install: $wheel failed checksum verification"
