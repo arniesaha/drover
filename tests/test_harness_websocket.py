@@ -144,6 +144,53 @@ def test_wire_payload_rejects_null_canonical_event_metadata():
         event.wire_payload()
 
 
+def test_wire_payload_drops_the_duplicated_command_output():
+    """Shell output is carried by `text`; the payload copy is dead weight.
+
+    The codex adapter no longer writes it, but every event already on disk
+    still has it — measured live at 992KB across 236 tool results, for a
+    field with exactly one reference in the codebase: the line that used to
+    produce it. Stripping here rather than only at the source is what makes
+    existing sessions smaller immediately, instead of waiting for their
+    history to age out of the window.
+    """
+    event = HarnessEvent(
+        event_id="e1",
+        session_id="s1",
+        event_type="tool_result",
+        payload={
+            "text": "lots of shell output\n",
+            "payload": {
+                "tool": "shell",
+                "exit_code": 0,
+                "aggregated_output": "lots of shell output\n",
+            },
+        },
+        seq=4,
+    )
+
+    wire = event.wire_payload()
+
+    assert "aggregated_output" not in wire["payload"]
+    assert wire["text"] == "lots of shell output\n"
+    assert wire["payload"]["exit_code"] == 0
+    assert wire["payload"]["tool"] == "shell"
+
+
+def test_wire_payload_leaves_other_payloads_untouched():
+    event = HarnessEvent(
+        event_id="e2",
+        session_id="s1",
+        event_type="assistant_output",
+        payload={"text": "hello", "payload": {"thinking": True}},
+        seq=5,
+    )
+
+    wire = event.wire_payload()
+
+    assert wire["payload"] == {"thinking": True}
+
+
 def test_terminal_websocket_sends_input_and_captures_transcript(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     try:

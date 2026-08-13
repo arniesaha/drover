@@ -443,6 +443,44 @@ def test_parse_command_execution_started_and_completed():
     assert result.payload["status"] == "completed"
 
 
+def test_command_output_is_not_sent_twice():
+    """`text` already carries the output; the payload must not repeat it.
+
+    The payload splats the whole codex item, which re-included
+    `aggregated_output` — so every shell result crossed the wire twice.
+    Measured on a live session: one tool result was 762KB duplicated, and
+    1,306KB of a 2,889KB transcript page was this and nothing else. Shell
+    output is the largest thing a session produces, which makes it exactly
+    the wrong field to send twice.
+
+    Nothing reads `payload.aggregated_output`: before this change it appeared
+    once in the entire codebase, on the line that produced it.
+    """
+    line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": "ls",
+                "aggregated_output": "a very large amount of shell output\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        }
+    )
+
+    result = _driver([]).parse_line(line)[0]
+
+    assert result.text == "a very large amount of shell output\n"
+    assert "aggregated_output" not in result.payload
+    # Everything the client actually renders from must survive.
+    assert result.payload["exit_code"] == 0
+    assert result.payload["status"] == "completed"
+    assert result.payload["tool"] == "shell"
+    assert result.payload["tool_use_id"] == "item_1"
+
+
 def test_parse_non_json_line_degrades_to_raw():
     message = _driver([]).parse_line("not json at all")[0]
     assert message.type == "raw"
