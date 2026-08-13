@@ -72,4 +72,26 @@ final class AppEnvironment {
         generation += 1
         return .success
     }
+
+    /// Forget this device's credential and return the app to onboarding.
+    ///
+    /// Local only, deliberately. The usual reason to sign out is to re-pair
+    /// this same phone, and revoking server-side would also cut off anything
+    /// else still holding that token. Revocation belongs on the hub, where it
+    /// can name which credential is going away:
+    ///
+    ///     drover-server credentials list
+    ///     drover-server credentials revoke <id>
+    ///
+    /// Everything a fresh install lacks is cleared, so the next pairing
+    /// cannot inherit half the old configuration.
+    func signOut() {
+        try? tokenStore.delete()
+        defaults.removeObject(forKey: ServerConfig.defaultsKey)
+        client = nil
+        config = nil
+        // Bump so a view holding a store built from the old client rebuilds
+        // rather than rendering against a dead one.
+        generation += 1
+    }
 }

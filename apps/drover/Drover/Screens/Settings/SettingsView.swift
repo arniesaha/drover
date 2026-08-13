@@ -22,6 +22,7 @@ struct SettingsView: View {
     @State private var isValidating = false
     @State private var statusMessage: String?
     @State private var statusIsError = false
+    @State private var showSignOutConfirmation = false
 
     var body: some View {
         ScrollView {
@@ -75,6 +76,11 @@ struct SettingsView: View {
                 }
 
                 saveButton
+
+                // Only offered once there is something to sign out of.
+                if environment.client != nil {
+                    signOutButton
+                }
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)
@@ -192,6 +198,47 @@ struct SettingsView: View {
         .buttonStyle(.plain)
         .disabled(!canSave)
         .accessibilityIdentifier("settings-save")
+    }
+
+    /// Quieter than "Test & Save": this is a recovery action, not the primary
+    /// one, and it should not compete with it for attention. Confirmed
+    /// first, because the token is not recoverable from the app afterwards.
+    private var signOutButton: some View {
+        Button(role: .destructive) {
+            showSignOutConfirmation = true
+        } label: {
+            Text("Sign Out")
+                .font(.system(.subheadline, design: .default, weight: .medium))
+                .foregroundStyle(DroverColor.faint)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.line, lineWidth: 1)
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("settings-sign-out")
+        .confirmationDialog(
+            "Sign out of this fleet?",
+            isPresented: $showSignOutConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Sign Out", role: .destructive) {
+                environment.signOut()
+                token = ""
+                urlString = ""
+                statusMessage = nil
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This phone forgets its token and returns to pairing. The "
+                + "credential stays valid on the server; revoke it there with "
+                + "drover-server credentials revoke."
+            )
+        }
     }
 
     private var canSave: Bool {
