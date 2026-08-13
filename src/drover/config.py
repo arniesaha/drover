@@ -132,6 +132,15 @@ class DroverConfig:
     # failure is invisible until the app stops loading any screen. An
     # explicitly passed --metrics-host still wins.
     server_metrics_host: str
+    # Fleet auto-update. The hub picks a target version and hosts converge on
+    # it over the heartbeat they already send. A non-empty pinned_version
+    # freezes the whole fleet on that version.
+    update_enabled: bool
+    update_check_interval_hours: int
+    update_pinned_version: str
+    update_quiesce_timeout_hours: int
+    update_keep_versions: int
+    update_repo: str
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     harness_favorite_cwds: tuple[str, ...]
@@ -215,6 +224,17 @@ _DEFAULTS = {
         "enabled": True,
         "api_token": "",
         "legacy_token_enabled": True,
+    },
+    "update": {
+        "enabled": True,
+        "check_interval_hours": 6,
+        # Non-empty freezes the fleet on that version.
+        "pinned_version": "",
+        # After this long waiting for a host to go idle, the host reports
+        # update_blocked rather than forcing anything. It never interrupts.
+        "quiesce_timeout_hours": 6,
+        "keep_versions": 2,
+        "repo": "arniesaha/drover",
     },
     "harness": {
         "favorite_cwds": [],
@@ -317,6 +337,12 @@ def _from_dict(d: dict) -> DroverConfig:
         auth_legacy_token_enabled=bool(d["auth"]["legacy_token_enabled"]),
         server_advertised_url=str(d["server"]["advertised_url"]),
         server_metrics_host=str(d["server"]["metrics_host"]),
+        update_enabled=bool(d["update"]["enabled"]),
+        update_check_interval_hours=int(d["update"]["check_interval_hours"]),
+        update_pinned_version=str(d["update"]["pinned_version"]).strip().lstrip("v"),
+        update_quiesce_timeout_hours=int(d["update"]["quiesce_timeout_hours"]),
+        update_keep_versions=int(d["update"]["keep_versions"]),
+        update_repo=str(d["update"]["repo"]),
         harness_favorite_cwds=tuple(
             str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
         ),
