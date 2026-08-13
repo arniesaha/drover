@@ -2985,9 +2985,16 @@ def register_daemon_host(state: HarnessDaemonState) -> None:
         return
 
 
-def register_daemon_host_remote(state: HarnessDaemonState) -> bool:
+def register_daemon_host_remote(state: HarnessDaemonState) -> dict[str, Any] | None:
+    """Register, and return the hub's response body, or None on failure.
+
+    The body is the hub-to-host control channel: it already carries
+    content_consent, and now target_version too.
+    """
     if not state.central_url:
-        return False
+        return None
+    from drover import __version__ as drover_version
+
     payload = {
         "host_id": state.host_id,
         "display_name": state.display_name,
@@ -2997,6 +3004,8 @@ def register_daemon_host_remote(state: HarnessDaemonState) -> bool:
         "status": "online",
         "connection_kind": "relay" if state.relay else "direct",
         "capabilities": state.capabilities(),
+        # So the hub can see version skew across the fleet without asking.
+        "agent_version": drover_version,
     }
     return _post_central_json(state, "/harness/hosts", payload)
 
@@ -3021,9 +3030,19 @@ def _post_central_json(
     state: HarnessDaemonState,
     path: str,
     payload: dict[str, Any],
-) -> bool:
+) -> dict[str, Any] | None:
+    """POST to the hub and return its parsed body, or None on any failure.
+
+    The body is the hub-to-host control channel. It already carried
+    content_consent; target_version rides the same path rather than opening a
+    second one.
+
+    Note that an empty body is ``{}`` and means success. Callers must test
+    ``is None`` rather than truthiness, or a hub with nothing to say will read
+    as an unreachable hub.
+    """
     if not state.central_url:
-        return False
+        return None
     base = state.central_url.rstrip("/")
     request = Request(
         f"{base}{path}",
@@ -3036,30 +3055,30 @@ def _post_central_json(
     try:
         with urlopen(request, timeout=5) as response:
             if not 200 <= response.status < 300:
-                return False
+                return None
             body = response.read(64 * 1024 + 1)
             if len(body) > 64 * 1024:
-                return False
+                return None
             try:
-                payload = json.loads(body.decode("utf-8")) if body else {}
+                parsed = json.loads(body.decode("utf-8")) if body else {}
             except (UnicodeDecodeError, json.JSONDecodeError):
-                return False
-            remote_consent = (
-                payload.get("content_consent") if isinstance(payload, dict) else None
-            )
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            remote_consent = parsed.get("content_consent")
             if remote_consent is not None:
                 if (
                     not isinstance(remote_consent, dict)
                     or set(remote_consent) != {"enabled", "epoch"}
                     or state.content_consent is None
                 ):
-                    return False
+                    return None
                 state.content_consent.apply(
                     enabled=remote_consent["enabled"], epoch=remote_consent["epoch"]
                 )
-            return True
+            return parsed
     except (OSError, URLError, ValueError):
-        return False
+        return None
 
 
 def resolve_daemon_token(host_token: str | None) -> str:

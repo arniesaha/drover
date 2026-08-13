@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import drover
 from dataclasses import replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -323,7 +324,7 @@ def test_daemon_can_register_host_with_central_server(tmp_path):
     )
 
     try:
-        assert register_daemon_host_remote(state) is True
+        assert register_daemon_host_remote(state) is not None
     finally:
         central.shutdown()
         central.server_close()
@@ -333,6 +334,10 @@ def test_daemon_can_register_host_with_central_server(tmp_path):
             "path": "/harness/hosts",
             "authorization": "Bearer secret",
             "body": {
+                # Sent so the hub can see version skew across the fleet.
+                # Compared against the symbol rather than a literal, so a
+                # version bump does not break this assertion.
+                "agent_version": drover.__version__,
                 "capabilities": state.capabilities(),
                 "connection_kind": "direct",
                 "display_name": "NAS",
@@ -373,7 +378,7 @@ def test_reconnecting_daemon_reconciles_revoked_consent_from_registration(tmp_pa
     )
 
     try:
-        assert register_daemon_host_remote(state) is True
+        assert register_daemon_host_remote(state) is not None
     finally:
         _CentralRegistrationHandler.response_payload = {"ok": True}
         central.shutdown()
@@ -402,7 +407,7 @@ def test_relay_daemon_registers_itself_as_relay_connected(tmp_path):
     )
 
     try:
-        assert register_daemon_host_remote(state) is True
+        assert register_daemon_host_remote(state) is not None
     finally:
         central.shutdown()
         central.server_close()

@@ -153,3 +153,51 @@ either.
 `scripts/enroll-host.sh` has been removed. It required a hand-placed fleet
 token and refused every mode except relay; `install.sh --join` covers what it
 did and picks the mode from an actual reachability check.
+
+## Updates
+
+The hub decides what version the fleet runs. It polls the release feed on a
+timer and publishes a target on the heartbeat every `drover-harnessd` already
+sends, so no new channel and no inbound access to a host is involved.
+
+A host that is behind installs the new version beside its current one and then
+waits. It activates only when it has no live work: no running structured
+session, and no attached terminal. If it cannot tell, it treats itself as busy.
+An update deferred costs hours; an update that interrupts a turn costs work
+nobody gets back.
+
+Activation is a symlink flip plus a restart. Nothing is ever upgraded in place,
+which is what makes going back cheap.
+
+```bash
+drover-server update --check     # installed, active, target, any pin
+drover-server rollback           # return to the previous installed version
+drover-server rollback --to 0.1.2
+```
+
+Two safety rails, neither optional:
+
+- A version that cannot report its own version never gets the symlink.
+- Before flipping, the host records what it is leaving. If the new version
+  cannot reach the hub within ninety seconds, it puts the symlink back. A bad
+  release costs ninety seconds rather than physical access to the machine.
+
+`rollback` covers the other case: a version that starts, registers, and is
+still wrong.
+
+To freeze the fleet, pin it. A pinned hub never contacts the release feed:
+
+```toml
+[update]
+enabled = true
+check_interval_hours = 6
+pinned_version = "0.1.2"
+keep_versions = 2
+```
+
+Setting `enabled = false` stops the hub publishing any target, and hosts stay
+where they are.
+
+Version skew is expected during a rollout and is not an error. The hub keeps
+serving hosts that have not converged yet, and a host waiting for quiesce is
+fully functional the whole time.
