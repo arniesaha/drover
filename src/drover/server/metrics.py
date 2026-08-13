@@ -1034,6 +1034,14 @@ class MetricsCollector:
         capabilities = payload.get("capabilities")
         if capabilities is not None and not isinstance(capabilities, dict):
             return _json_response(400, {"error": "capabilities must be an object"})
+        # Only a real string counts. `_optional_str` would happily turn a dict
+        # into its repr and store that as the fleet's idea of a version, and a
+        # malformed heartbeat should cost the version field, not the whole
+        # registration -- a host that cannot register is a host you lose.
+        raw_version = payload.get("agent_version")
+        agent_version = (
+            raw_version.strip() or None if isinstance(raw_version, str) else None
+        )
         try:
             registry = HarnessRegistry(self.duckdb_path)
             host = registry.register_host(
@@ -1045,6 +1053,7 @@ class MetricsCollector:
                 connection_kind=str(payload.get("connection_kind") or "direct"),
                 status=status,
                 capabilities=capabilities,
+                agent_version=agent_version,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)
