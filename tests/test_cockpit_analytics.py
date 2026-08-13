@@ -1380,7 +1380,7 @@ def test_a_slow_activity_section_cannot_blank_the_whole_overview(monkeypatch):
 def test_default_activity_budget_accommodates_the_bounded_lakehouse_query():
     from drover.server.cockpit import service as service_module
 
-    assert 5 <= service_module.ACTIVITY_BUDGET_SECONDS <= 10
+    assert 15 <= service_module.ACTIVITY_BUDGET_SECONDS <= 25
 
 
 def test_a_healthy_activity_section_is_untouched_by_the_budget():
