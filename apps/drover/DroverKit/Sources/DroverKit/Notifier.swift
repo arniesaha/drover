@@ -72,9 +72,22 @@ public struct AttentionWatcher: Sendable {
     // other `nonisolated(unsafe)` uses in this package.
     private nonisolated(unsafe) let seenStore: UserDefaults
 
-    public init(notifier: Notifying, seenStore: UserDefaults = .standard) {
+    /// False once the hub is pushing: the badge and the seen-set are still
+    /// this watcher's job, but announcing is not, or the user gets two alerts
+    /// for one transition.
+    private let announcesLocally: Bool
+
+    public init(
+        notifier: Notifying,
+        seenStore: UserDefaults = .standard,
+        announcesLocally: Bool? = nil
+    ) {
         self.notifier = notifier
         self.seenStore = seenStore
+        // Resolved from the same store the registrar writes to, so the BGTask
+        // path gets the right answer in a freshly relaunched process.
+        self.announcesLocally = announcesLocally
+            ?? !PushRegistration.isActive(in: seenStore)
     }
 
     public func check(client: DroverClient) async {
@@ -117,17 +130,25 @@ public struct AttentionWatcher: Sendable {
     /// "response completed" alerts arrive near-real-time without a second
     /// fetch. Shares the persisted seen-set with the BGTask path, so the two
     /// never double-alert for the same transition.
+    ///
+    /// Once the hub is pushing, neither of them announces at all: the server
+    /// sends a push for every awaiting transition whether the app is running
+    /// or not, so anything said here as well is the same alert twice. The
+    /// badge and the seen-set are still maintained, so the count stays honest
+    /// and behaviour is sane if push is ever turned off again.
     public func evaluate(_ snapshot: HarnessSnapshot) async {
         let needsYou = Self.needsYou(in: snapshot)
         let previousIDs = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
         let fresh = SessionStore.newlyNeedsYou(current: snapshot.sessions, previousIDs: previousIDs)
 
-        for session in fresh {
-            await notifier.notify(
-                title: "\(session.harness) needs you",
-                body: "\(Self.cwdBasename(session)) — \(Self.bodySuffix(session))",
-                id: session.id
-            )
+        if announcesLocally {
+            for session in fresh {
+                await notifier.notify(
+                    title: "\(session.harness) needs you",
+                    body: "\(Self.cwdBasename(session)) — \(Self.bodySuffix(session))",
+                    id: session.id
+                )
+            }
         }
 
         let read = prunedRead(against: needsYou)

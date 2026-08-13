@@ -11,6 +11,31 @@ public enum NotificationPayloadKey {
     public static let sessionID = "session_id"
 }
 
+/// Whether the hub is currently announcing "needs you" over APNs.
+///
+/// Once a device token is registered, the hub sends a push for *every*
+/// awaiting transition — backgrounded or not. Anything the app announces
+/// locally on top of that is a second alert for the same event, which is
+/// exactly what it looked like: the hub's push, and then a generic
+/// "<harness> needs you" from `AttentionWatcher`.
+///
+/// Kept in `UserDefaults` rather than in an object because the BGTask path
+/// runs in a process the OS may have relaunched from scratch, with no live
+/// app state to consult.
+public enum PushRegistration {
+    static let key = "drover.push.hubAnnounces"
+
+    public static func setActive(_ active: Bool, in store: UserDefaults = .standard) {
+        store.set(active, forKey: key)
+    }
+
+    /// Defaults to false, so a device that has never registered keeps the
+    /// local alerts it has always had.
+    public static func isActive(in store: UserDefaults = .standard) -> Bool {
+        store.bool(forKey: key)
+    }
+}
+
 /// Where a tapped notification puts the session it was about, until a screen
 /// is ready to navigate there.
 ///

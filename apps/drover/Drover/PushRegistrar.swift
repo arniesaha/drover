@@ -52,6 +52,8 @@ final class PushRegistrar {
         try? await client.unregisterAPNsToken()
         uploadedToken = nil
         self.client = nil
+        // Nothing is pushing any more, so local alerts are the only ones left.
+        PushRegistration.setActive(false)
     }
 
     private func uploadIfReady() {
@@ -60,6 +62,9 @@ final class PushRegistrar {
             do {
                 try await client.registerAPNsToken(deviceToken)
                 uploadedToken = deviceToken
+                // From here the hub announces every awaiting transition, so
+                // the app's own watcher must stop doing it too.
+                PushRegistration.setActive(true)
             } catch {
                 // Leave `uploadedToken` unset so the next launch or
                 // reconfigure retries. Push is best-effort; the foreground

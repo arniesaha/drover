@@ -35,10 +35,6 @@ struct SessionsView: View {
     @State private var showFinished = false
     @State private var showAnalytics = false
     @State private var showInsights = false
-    /// True whenever the app has just come to the foreground (launch included),
-    /// so the next attention check absorbs what is already waiting rather than
-    /// re-alerting for something the hub's push has already covered.
-    @State private var absorbNextAttentionCheck = true
 
     init(
         client: DroverClient,
@@ -179,9 +175,6 @@ struct SessionsView: View {
             } else {
                 store.stopPolling()
                 cockpitStore.stopForegroundPolling()
-                // Anything that starts waiting from here on is the hub's to
-                // announce, so the next check on return must not repeat it.
-                absorbNextAttentionCheck = true
             }
         }
         // Foreground polling drives the same AttentionWatcher diff the
@@ -191,20 +184,13 @@ struct SessionsView: View {
         // seen-set means the BGTask path never double-alerts for the same
         // transition.
         //
-        // The hub's APNs push is the one path that cannot share that seen-set,
-        // so the first check after the app becomes active absorbs whatever is
-        // already waiting instead of alerting about it — otherwise every
-        // pushed alert was followed by a second, generic, local one the moment
-        // the app opened.
+        // Once the hub is pushing it announces every transition itself, and
+        // `AttentionWatcher` falls back to badge-and-seen-set only — otherwise
+        // each pushed alert was followed by a second, generic, local one.
         .onChange(of: store.needsYou) { _, _ in
             guard let snapshot = store.snapshot else { return }
             let watcher = AttentionWatcher(notifier: notifier)
-            if absorbNextAttentionCheck {
-                absorbNextAttentionCheck = false
-                Task { await watcher.sync(snapshot) }
-            } else {
-                Task { await watcher.evaluate(snapshot) }
-            }
+            Task { await watcher.evaluate(snapshot) }
         }
         // A tapped alert names one session; open that session rather than
         // leaving the user on the list to find it again themselves.
