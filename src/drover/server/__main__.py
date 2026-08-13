@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import click
+import drover
 import duckdb
 
 from drover.agent_aliases import canonicalize
@@ -576,6 +577,12 @@ def _diagnostic_db_path(path: Path):
 
 
 @click.group()
+# Load-bearing beyond convenience. `drover-server --version` is the smoke test
+# install.sh runs before it will activate a freshly installed version, so
+# without this flag every install downloads, verifies, installs, and then
+# refuses itself. Verified against a real v0.1.1 artifact, which failed
+# exactly that way.
+@click.version_option(version=drover.__version__, prog_name="drover-server")
 @click.option("--config", "config_path", default=None, help="Path to config TOML")
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG logging")
 @click.pass_context
