@@ -29,14 +29,11 @@ COCKPIT_SECTIONS = (
     "insights",
 )
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
-# The iOS client abandons a cockpit request at 15s (DroverClient's default
-# timeoutInterval). The overview is one response, so the activity section has to
-# leave room for the other sections, for a cold cache, and for a phone's
-# transport. Measured on the live fleet, a 6s budget still produced a 12.4s cold
-# overview -- inside the limit, but with too little margin to survive a slow
-# network. A query that cannot answer in 6s cannot answer in 3s either, so the
-# shorter budget costs nothing real and buys back the headroom.
-ACTIVITY_BUDGET_SECONDS = 3.0
+# The bounded query takes about four seconds against the production lakehouse
+# on the external APFS volume. Cockpit and analytics requests use a dedicated
+# 30-second iOS timeout, so this still leaves over 20 seconds for the remaining
+# sequential sections and phone transport while interrupting a runaway scan.
+ACTIVITY_BUDGET_SECONDS = 8.0
 _INTERRUPT_GRACE_SECONDS = 1.0
 # Repeat callers are answered from the last result rather than re-running the
 # scan. The iOS client polls the overview every 30s, so with several clients
