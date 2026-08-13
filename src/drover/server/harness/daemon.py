@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
-from drover.config import default_token_file, resolve_api_token_env
+from drover.config import config_home, default_token_file, resolve_api_token_env
 from drover.server.harness.auth import (
     AuthFlowInputError,
     AuthFlowLaunchError,
@@ -47,6 +47,12 @@ from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
+from drover.server.harness.updater import (
+    REGISTRATION_DEADLINE_SECONDS,
+    HostUpdater,
+    default_restarter,
+    verify_after_restart,
+)
 from drover.server.harness.structured import agy as _structured_agy
 from drover.server.harness.structured import claude as _structured_claude
 from drover.server.harness.structured import codex as _structured_codex
@@ -57,6 +63,7 @@ from drover.server.harness.worktree import (
     cleanup_session_worktree,
     create_session_worktree,
 )
+from drover.server.runtime import RuntimeLayout
 from drover.server.harness.websocket import (
     WebSocketClosed,
     accept_key,
@@ -66,7 +73,7 @@ from drover.server.harness.websocket import (
 )
 
 if TYPE_CHECKING:
-    from drover.config import AdvisoryContentConfig
+    from drover.config import AdvisoryContentConfig, DroverConfig
     from drover.server.providers.codex import CodexUsageProbe
     from drover.server.providers.types import (
         ProviderAccountSnapshot,
@@ -1084,6 +1091,15 @@ class HarnessDaemonState:
     # True when this daemon dials the hub instead of waiting to be dialled;
     # visible here so the registration payload can advertise which it is.
     relay: bool = False
+    # Set after construction rather than passed in: HostUpdater takes the
+    # state itself, to ask whether this host is idle enough to activate.
+    # None whenever [update] is disabled, which is what makes the config
+    # kill switch reach the host and not just the hub.
+    updater: Any = None
+    # Whether we have ever reached the hub since this process started. The
+    # rollback watchdog reads it to decide whether a freshly activated
+    # version can talk to the hub at all, so it must never be reset.
+    registered_at_least_once: bool = False
     terminated_session_ids: set[str] = field(default_factory=set)
     worktrees_dir: Path = field(
         default_factory=lambda: Path.home() / ".drover" / "worktrees"
@@ -3054,13 +3070,70 @@ def register_daemon_host_remote(state: HarnessDaemonState) -> dict[str, Any] | N
     return _post_central_json(state, "/harness/hosts", payload)
 
 
+def _heartbeat_once(state: HarnessDaemonState) -> None:
+    """One beat: register, then act on whatever the hub said back.
+
+    Split out of the loop so the wiring is testable without a thread and a
+    fifteen-second sleep. That the loop discarded this body is precisely how
+    fleet auto-update shipped inert.
+    """
+    body = register_daemon_host_remote(state)
+    if body is None:
+        return
+    # An empty body is a successful registration with nothing to say, so this
+    # tests `is None` rather than truthiness; the watchdog reads this flag to
+    # decide whether a freshly activated version can talk to the hub at all.
+    state.registered_at_least_once = True
+    updater = getattr(state, "updater", None)
+    if updater is not None:
+        updater.observe(body)
+        updater.maybe_activate()
+
+
+def _rollback_watchdog(
+    state: HarnessDaemonState,
+    layout: RuntimeLayout,
+    *,
+    deadline_seconds: float = REGISTRATION_DEADLINE_SECONDS,
+    sleep=time.sleep,
+    restarter=default_restarter,
+) -> None:
+    """Undo a flip whose new version cannot reach the hub.
+
+    Only ever does anything when a rollback marker is on disk, so on an
+    ordinary start this reads the marker, finds none, and returns.
+    """
+    deadline = monotonic() + deadline_seconds
+    while monotonic() < deadline and not state.registered_at_least_once:
+        sleep(2)
+    if verify_after_restart(layout, registered=state.registered_at_least_once):
+        return
+    # The symlink now points back at the previous version, but this process is
+    # still the new one. The service manager owns the restart; asking it to
+    # bounce us is what actually puts the old version back in memory.
+    restarter()
+
+
+def _start_rollback_watchdog(
+    state: HarnessDaemonState, layout: RuntimeLayout
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_rollback_watchdog,
+        args=(state, layout),
+        name="drover-harnessd-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def start_remote_heartbeat(state: HarnessDaemonState) -> threading.Thread | None:
     if not state.central_url:
         return None
 
     def loop() -> None:
         while True:
-            register_daemon_host_remote(state)
+            _heartbeat_once(state)
             time.sleep(15)
 
     thread = threading.Thread(
@@ -3168,6 +3241,7 @@ def run_harnessd(
     relay: bool = False,
     advisory_content: "AdvisoryContentConfig | None" = None,
     content_consent_path: Path | None = None,
+    cfg: "DroverConfig | None" = None,
 ) -> None:
     consent_path = content_consent_path or (
         Path(duckdb_path).parent / ".harness-content-consent.json"
@@ -3201,9 +3275,15 @@ def run_harnessd(
         log.warning(
             "harnessd running WITHOUT auth: set DROVER_API_TOKEN or --host-token"
         )
+    if cfg is not None and cfg.update_enabled:
+        # Constructed here rather than passed into the state, because it takes
+        # the state itself to ask whether this host is idle.
+        layout = RuntimeLayout(config_home())
+        state.updater = HostUpdater(state, layout, cfg)
+        _start_rollback_watchdog(state, layout)
     pusher = wire_event_pusher(state)
     register_daemon_host(state)
-    register_daemon_host_remote(state)
+    _heartbeat_once(state)
     start_remote_heartbeat(state)
     server = create_harness_server(
         listen_host=listen_host,
