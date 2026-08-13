@@ -24,6 +24,7 @@ import duckdb
 from drover.agent_aliases import canonicalize
 from drover.config import (
     AdvisoryContentConfig,
+    config_home,
     DroverConfig,
     default_config,
     default_config_path,
@@ -99,6 +100,8 @@ from drover.server.summarizer.diagnostics import summarize_backend_auth
 from drover.server.summarizer.retry import retry_errored_jobs
 from drover.server.summarizer.worker import SummarizerWorker
 from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
+from drover.server.runtime import RuntimeLayout
+from drover.server.update_planner import UpdatePlanner
 from drover.server.web.auth import load_auth
 from drover.server.web.pairing import PairingCodes
 from drover.server.web.qr import pairing_url, qr_lines
@@ -742,6 +745,91 @@ def pair_host_cmd(ctx: click.Context, name: str) -> None:
     )
     click.echo(f"      | bash -s -- --join '{url}'")
     click.echo("")
+
+
+def _start_update_checker(planner, cfg: DroverConfig, stop) -> None:
+    """Poll the release feed on a timer, jittered, until shutdown.
+
+    Refreshing only decides a target; hosts converge on their own heartbeat.
+    The hub's own convergence is deliberately left out of this thread: it
+    would have to restart the process it is running in, and doing that from a
+    daemon thread while requests are in flight is worse than telling the
+    operator to run `drover-server update --check` and act.
+    """
+    import random
+    import threading
+
+    interval = max(cfg.update_check_interval_hours, 1) * 3600
+
+    def loop() -> None:
+        # Jitter the first check so a fleet restarted together does not poll
+        # GitHub in lockstep.
+        if stop.wait(random.uniform(0, 60)):
+            return
+        while not stop.is_set():
+            try:
+                planner.refresh()
+            except Exception:  # noqa: BLE001 - a timer must outlive a bad poll
+                log.exception("update check failed; will retry")
+            if stop.wait(interval + random.uniform(0, 300)):
+                return
+
+    threading.Thread(target=loop, name="drover-update-check", daemon=True).start()
+
+
+@main.command(name="rollback")
+@click.option("--to", "target", default=None, help="Version to activate")
+def rollback_cmd(target: str | None) -> None:
+    """Point the runtime symlink at an earlier installed version.
+
+    The watchdog already handles a version that cannot come up at all. This is
+    for the other case: it starts, registers, and is still wrong.
+    """
+    layout = RuntimeLayout(config_home())
+    installed = layout.installed_versions()
+    active = layout.active_version()
+
+    if target is None:
+        earlier = [version for version in installed if version != active]
+        if not earlier:
+            raise click.ClickException(
+                "no earlier version is installed "
+                f"(have: {', '.join(installed) or 'none'})"
+            )
+        target = earlier[-1]
+    elif target.lstrip("v") not in installed:
+        raise click.ClickException(
+            f"{target} is not installed (have: {', '.join(installed) or 'none'})"
+        )
+    else:
+        target = target.lstrip("v")
+
+    layout.flip(target)
+    # Otherwise the next start sees a marker for a flip we just undid and
+    # rolls back again on top of this.
+    layout.clear_marker()
+    click.echo(f"Activated {target} (was {active or 'unknown'}).")
+    click.echo("Restart drover-server and drover-harnessd to pick it up.")
+
+
+@main.command(name="update")
+@click.option("--check", is_flag=True, help="Report the target version and exit")
+@click.pass_context
+def update_cmd(ctx: click.Context, check: bool) -> None:
+    """Report what version this fleet is converging on."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    layout = RuntimeLayout(config_home())
+    planner = UpdatePlanner(cfg, layout)
+    planner.refresh()
+    target = planner.target()
+
+    click.echo(f"installed: {', '.join(layout.installed_versions()) or 'none'}")
+    click.echo(f"active:    {layout.active_version() or 'unknown'}")
+    click.echo(f"target:    {target.version if target else 'up to date'}")
+    if cfg.update_pinned_version:
+        click.echo(f"pinned:    {cfg.update_pinned_version}")
+    if not cfg.update_enabled:
+        click.echo("updates:   disabled in config")
 
 
 @main.group(name="credentials")
@@ -1767,6 +1855,16 @@ def run(
             # `drover-server pair` reaches the hub over loopback rather than
             # minting in-process. A restart invalidates outstanding codes.
             pairing = PairingCodes()
+
+            # The hub decides what the fleet converges on and publishes it on
+            # the heartbeat every harnessd already sends. Attached to the
+            # collector rather than threaded through, because the only thing
+            # that reads it is the registration response.
+            if cfg.update_enabled:
+                planner = UpdatePlanner(cfg, RuntimeLayout(config_home()))
+                metrics_collector.update_planner = planner
+                _start_update_checker(planner, cfg, stop)
+
             metrics_server = start_metrics_server(
                 host=metrics_host,
                 port=cfg.metrics_http_port,
