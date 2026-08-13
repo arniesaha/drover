@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +72,9 @@ class AwaitingTransition:
     harness: str
     cwd: str | None
     awaiting: str | None
+    #: What the agent last said, already redacted by the registry. Empty when
+    #: the session has no visible assistant output yet.
+    preview: str = ""
 
     @property
     def needs_user(self) -> bool:
@@ -79,15 +83,78 @@ class AwaitingTransition:
     def alert_title(self) -> str:
         return f"{self.harness or 'Harness'} needs you"
 
+    def alert_subtitle(self) -> str:
+        """Where and what, so the body is free to carry the agent's words.
+
+        Empty without a preview, because then the body already says exactly
+        this and a notification repeating itself reads worse than a plain one.
+        """
+        if not self.summary():
+            return ""
+        return f"{self._project()} · {_AWAITING_TITLES.get(self.awaiting or '', 'your turn')}"
+
     def alert_body(self) -> str:
+        """The agent's own words when there are any, else the old summary.
+
+        "claude-code needs you / drover — your turn" tells you a session
+        stopped, not whether it stopped on something you care about. Quoting
+        the last message is the difference between unlocking the phone to find
+        out and knowing before you do.
+        """
+        return self.summary() or self._fallback_body()
+
+    def summary(self) -> str:
+        return _condense(self.preview)
+
+    def _fallback_body(self) -> str:
         suffix = _AWAITING_TITLES.get(self.awaiting or "", "your turn")
-        return f"{_basename(self.cwd) or self.harness or 'session'} — {suffix}"
+        return f"{self._project()} — {suffix}"
+
+    def _project(self) -> str:
+        return _basename(self.cwd) or self.harness or "session"
 
 
 def _basename(cwd: str | None) -> str:
     if not cwd:
         return ""
     return Path(cwd).name
+
+
+#: Long enough to carry a real sentence or two on a lock screen, short enough
+#: that iOS is not the thing doing the truncating (it shows ~4 lines expanded).
+_SUMMARY_MAX_CHARS = 220
+
+
+def _condense(text: str | None) -> str:
+    """Flatten an agent message into one notification-shaped line.
+
+    Assistant output is markdown over many lines ("Here's where things
+    stand.\\n**Done**\\n- ..."), and a notification renders none of it: the
+    newlines collapse anyway and the bold markers show up as literal asterisks.
+    So whitespace folds to single spaces and the emphasis markers are dropped,
+    while backticks stay -- `git push --force` reads as code even unrendered,
+    and stripping them would silently change what a command looks like.
+    """
+    if not text:
+        return ""
+    condensed = " ".join(str(text).split())
+    condensed = condensed.replace("**", "").replace("__", "")
+    # Leading list/heading markers survive the whitespace fold as stray
+    # punctuation once the line breaks are gone.
+    condensed = re.sub(r"(?:^|(?<= ))[#>]+ (?=\S)", "", condensed)
+    condensed = re.sub(r"(?:^|(?<= ))[-*+] (?=\S)", "• ", condensed)
+    condensed = condensed.strip()
+    if len(condensed) <= _SUMMARY_MAX_CHARS:
+        return condensed
+    # Cut on a word boundary; a mid-word truncation reads like corruption.
+    cut = condensed[:_SUMMARY_MAX_CHARS]
+    space = cut.rfind(" ")
+    if space > _SUMMARY_MAX_CHARS // 2:
+        cut = cut[:space]
+    cut = cut.rstrip(" ,;:—-•")
+    # A cut that happens to land on a sentence end is already a clean stop;
+    # "inflated the counts.…" reads like a typo rather than a truncation.
+    return cut if cut.endswith((".", "!", "?")) else cut + "…"
 
 
 def _b64url(raw: bytes) -> str:
@@ -227,11 +294,17 @@ class APNsSender:
         self._badge_source = counter
 
     def _payload(self, transition: AwaitingTransition, badge: int | None) -> bytes:
+        alert: dict = {
+            "title": transition.alert_title(),
+            "body": transition.alert_body(),
+        }
+        subtitle = transition.alert_subtitle()
+        if subtitle:
+            # Only present alongside a real preview, so the three lines never
+            # say the same thing twice.
+            alert["subtitle"] = subtitle
         aps: dict = {
-            "alert": {
-                "title": transition.alert_title(),
-                "body": transition.alert_body(),
-            },
+            "alert": alert,
             "sound": "default",
             # Matches LocalNotifier's .timeSensitive so a pushed alert and a
             # locally-generated one behave identically under Focus.

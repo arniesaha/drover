@@ -322,3 +322,69 @@ def test_dispatch_survives_a_broken_sender():
         dispatch_awaiting_transition(_transition())
     finally:
         set_sender(None)
+
+
+# --- notification body ------------------------------------------------------
+
+
+def test_body_quotes_the_agent_rather_than_a_generic_phrase(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    client = FakeClient()
+    sender = APNsSender(config, store, client=client)
+
+    sender._deliver(_transition(preview="Ready to deploy. Want me to push?"))
+
+    alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
+    assert alert["body"] == "Ready to deploy. Want me to push?"
+    # Title still identifies the harness; the subtitle carries what the body
+    # used to say, so nothing is lost by promoting the message.
+    assert alert["title"] == "claude-code needs you"
+    assert alert["subtitle"] == "drover · approval required"
+
+
+def test_without_a_preview_the_old_wording_survives(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    client = FakeClient()
+
+    APNsSender(config, store, client=client)._deliver(_transition(preview=""))
+
+    alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
+    assert alert["body"] == "drover — approval required"
+    # No subtitle, because it would only repeat the body.
+    assert "subtitle" not in alert
+
+
+def test_markdown_is_flattened_for_a_lock_screen():
+    from drover.server.push.apns import _condense
+
+    assert _condense("**Done**\n- one\n- two") == "Done • one • two"
+    # Backticks stay: `git push --force` still reads as a command, and
+    # stripping them would change what the command looks like.
+    assert _condense("Run `git push --force`") == "Run `git push --force`"
+
+
+def test_long_messages_are_cut_on_a_word_boundary():
+    from drover.server.push.apns import _SUMMARY_MAX_CHARS, _condense
+
+    body = _condense("word " * 200)
+
+    assert len(body) <= _SUMMARY_MAX_CHARS + 1  # + the ellipsis
+    assert body.endswith("…")
+    assert "wor…" not in body  # never mid-word
+
+
+def test_a_cut_landing_on_a_sentence_end_gets_no_ellipsis():
+    from drover.server.push.apns import _condense
+
+    text = ("alpha " * 34) + "end. " + ("beta " * 40)
+    body = _condense(text)
+
+    # "…the end.…" reads like a typo rather than a truncation.
+    assert not body.endswith(".…")
+
+
+def test_blank_previews_never_produce_a_body_of_whitespace():
+    from drover.server.push.apns import _condense
+
+    assert _condense("   \n\t ") == ""
+    assert _condense(None) == ""

@@ -45,8 +45,18 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: Awaiting values that mean the agent is blocked on the user, and therefore
+#: worth a notification. Anything else (including None) is a clear.
+_AWAITING_STATES = ("input", "approval")
+
+
 def _dispatch_awaiting_push(
-    *, session_id: str, awaiting: str | None, harness: str | None, cwd: str | None
+    *,
+    session_id: str,
+    awaiting: str | None,
+    harness: str | None,
+    cwd: str | None,
+    preview: str = "",
 ) -> None:
     """Tell the push layer a session changed awaiting state.
 
@@ -63,6 +73,7 @@ def _dispatch_awaiting_push(
                 harness=harness or "",
                 cwd=cwd,
                 awaiting=awaiting,
+                preview=preview,
             )
         )
     except Exception:  # noqa: BLE001 - never break activity recording
@@ -526,18 +537,67 @@ class HarnessRegistry:
                 "WHERE session_id = ?",
                 [awaiting, stamp, session_id],
             )
-        # Only a real change notifies. A harness that re-emits "still awaiting
-        # input" every few seconds must not produce a banner every few
-        # seconds, and that dedup belongs here rather than in the sender:
-        # the state machine is what knows the difference.
-        if previous is None or previous[0] == awaiting:
+            # Only a real change notifies. A harness that re-emits "still
+            # awaiting input" every few seconds must not produce a banner every
+            # few seconds, and that dedup belongs here rather than in the
+            # sender: the state machine is what knows the difference.
+            changed = previous is not None and previous[0] != awaiting
+            # Read what the agent last said while the window is still open,
+            # rather than paying a second serialized _connect() for it. Only
+            # for a transition that will actually alert -- a clear costs
+            # nothing extra.
+            preview = (
+                self._attention_preview(con, session_id)
+                if changed and awaiting in _AWAITING_STATES
+                else ""
+            )
+        if not changed:
             return
         _dispatch_awaiting_push(
             session_id=session_id,
             awaiting=awaiting,
             harness=previous[1],
             cwd=previous[2],
+            preview=preview,
         )
+
+    @staticmethod
+    def _attention_preview(con: duckdb.DuckDBPyConnection, session_id: str) -> str:
+        """The agent's last words, for the body of a "needs you" alert.
+
+        "claude-code needs you" tells you nothing you could act on; what the
+        agent actually just said is the whole reason to pick the phone up. The
+        newest ``assistant_output`` is that text, and at the moment of an
+        awaiting transition it is always present -- unlike a live recap, which
+        a worker generates asynchronously and may not have written yet.
+
+        Rows whose ``content_preview`` is just the event type are the harness's
+        placeholder for a thinking-only turn with no visible text; they are
+        skipped rather than shown, so a few candidates are fetched instead of
+        one.
+        """
+        rows = con.execute(
+            """
+            SELECT content_preview, payload_json, event_type
+              FROM harness_events
+             WHERE session_id = ?
+               AND event_type = 'assistant_output'
+             ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
+             LIMIT ?
+            """,
+            [session_id, _SESSION_PREVIEW_CANDIDATE_LIMIT],
+        ).fetchall()
+        for content_preview, payload_json, event_type in rows:
+            candidate = str(content_preview or "").strip()
+            if not candidate or candidate == str(event_type or ""):
+                continue
+            # Same redaction and traceback filtering the session list uses --
+            # this text leaves the host for Apple's servers, so a leaked token
+            # here would be worse than anywhere else it is shown.
+            safe = HarnessRegistry._safe_session_preview(candidate)
+            if safe:
+                return safe
+        return ""
 
     def update_session_native_id(self, session_id: str, native_session_id: str) -> None:
         native_session_id = native_session_id.strip()
