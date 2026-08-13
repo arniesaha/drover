@@ -163,3 +163,25 @@ def test_release_refuses_a_wheel_that_does_not_match_the_tag() -> None:
     )
     assert "py3-none-any.whl" in steps
     assert "pyproject.toml to match the tag" in steps
+
+
+def test_push_triggered_workflows_never_use_the_bare_inputs_context() -> None:
+    """`inputs` exists only for workflow_dispatch and workflow_call.
+
+    Referencing it in a workflow that also triggers on push fails the entire
+    run at load time with "Unrecognized named-value: 'inputs'": a
+    startup_failure with no job and no logs. That is how v0.1.1 came to be
+    tagged with no release attached. `github.event.inputs` is always defined
+    and is null on a push, so it is the portable spelling.
+    """
+    for name in ("ci.yml", "ios.yml", "trusted-mac.yml", "release.yml"):
+        workflow = load_workflow(name)
+        if "push" not in workflow["on"]:
+            continue
+        raw = (WORKFLOWS_DIR / name).read_text()
+        for line in raw.splitlines():
+            if "${{" not in line:
+                continue
+            assert (
+                "inputs." not in line or "github.event.inputs." in line
+            ), f"{name} references the bare inputs context: {line.strip()}"
