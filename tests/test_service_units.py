@@ -120,3 +120,29 @@ def test_both_renderers_follow_current_rather_than_a_version():
         assert "runtime/current/bin" in rendered
         # A version-pinned path is the bug this guards against.
         assert "runtime/0." not in rendered
+
+
+def test_keep_alive_defaults_true_for_daemons():
+    rendered = render_launchd(
+        "com.drover.server",
+        "/bin/true",
+        [],
+        home=Path("/home/x"),
+        path_entries=["/usr/bin"],
+    )
+    assert plistlib.loads(rendered.encode("utf-8"))["KeepAlive"] is True
+
+
+def test_keep_alive_can_be_turned_off_for_one_shots():
+    """launchd restarts a KeepAlive job the moment it exits, including on
+    success, which turns a run-once script into a restart loop. This fleet
+    has already lost a release-verification script to exactly that."""
+    rendered = render_launchd(
+        "com.drover.release.verify",
+        "/bin/true",
+        [],
+        home=Path("/home/x"),
+        path_entries=["/usr/bin"],
+        keep_alive=False,
+    )
+    assert plistlib.loads(rendered.encode("utf-8"))["KeepAlive"] is False

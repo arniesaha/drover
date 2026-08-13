@@ -29,11 +29,19 @@ def render_launchd(
     *,
     home: Path,
     path_entries: list[str],
+    keep_alive: bool = True,
 ) -> str:
     """A launchd job as plist XML.
 
     Built through ``plistlib`` rather than string formatting so an argument
     containing ``&`` or ``<`` cannot produce a plist launchd refuses to parse.
+
+    ``keep_alive`` defaults true because the only jobs rendered here are
+    long-running daemons that must come back after a crash. Pass false for
+    anything one-shot: launchd restarts a ``KeepAlive`` job the moment it
+    exits, *including when it exits successfully*, which turns a script that
+    runs once into a restart loop. That has already happened on this fleet
+    once, to a release-verification script that restarted 112 times.
     """
     log_dir = Path(home) / "Library" / "Logs" / "drover"
     short = label.rsplit(".", 1)[-1]
@@ -41,7 +49,7 @@ def render_launchd(
         "Label": label,
         "ProgramArguments": [program, *arguments],
         "EnvironmentVariables": {"PATH": ":".join(path_entries)},
-        "KeepAlive": True,
+        "KeepAlive": keep_alive,
         "RunAtLoad": True,
         "StandardOutPath": str(log_dir / f"{short}.out.log"),
         "StandardErrorPath": str(log_dir / f"{short}.err.log"),
