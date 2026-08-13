@@ -33,7 +33,13 @@ import Testing
         )
     }
 
-    private func codexCompletion(seq: Int, input: Int, cached: Int, window: Int?) -> HarnessMessage {
+    private func codexCompletion(
+        seq: Int,
+        input: Int,
+        cached: Int,
+        window: Int?,
+        contextInput: Int? = nil
+    ) -> HarnessMessage {
         var payload: [String: JSONValue] = [
             "turn_complete": .bool(true),
             "usage": .object([
@@ -43,6 +49,9 @@ import Testing
         ]
         if let window {
             payload["model_context_window"] = .number(Double(window))
+        }
+        if let contextInput {
+            payload["context_input_tokens"] = .number(Double(contextInput))
         }
         return HarnessMessage.fixture(
             seq: seq, type: .status, text: "turn complete", payload: payload
@@ -109,36 +118,85 @@ import Testing
         #expect(ContextGauge(messages: [resultWithUsage]) == nil)
     }
 
-    @Test func codexUsesDeltaBetweenCumulativeTurnTotals() {
+    @Test func codexUsesLatestRequestInsteadOfTurnWideProcessedInput() {
+        // The real turn processed 18,407,236 - 12,411,010 = 5,996,226
+        // input tokens across its model calls, while the final prompt was 160K.
         let messages = [
-            codexCompletion(seq: 10, input: 2_519_550, cached: 2_403_200, window: 258_400),
-            codexCompletion(seq: 20, input: 2_613_140, cached: 2_495_744, window: 258_400),
+            codexCompletion(
+                seq: 10,
+                input: 12_411_010,
+                cached: 12_034_944,
+                window: 258_400,
+                contextInput: 230_000
+            ),
+            codexCompletion(
+                seq: 20,
+                input: 18_407_236,
+                cached: 17_790_848,
+                window: 258_400,
+                contextInput: 160_000
+            ),
         ]
+
         let gauge = ContextGauge(messages: messages, harness: "codex")
-        #expect(gauge?.usedTokens == 93_590)
-        #expect(gauge?.window == 258_400)
-        #expect(gauge?.text == "ctx 93.6K / 258.4K · 36%")
+
+        #expect(gauge?.usedTokens == 160_000)
+        #expect(gauge?.text == "ctx 160K / 258.4K · 62%")
+    }
+
+    @Test func codexOmitsGaugeWhenNewestCompletionHasNoPreciseContextUsage() {
+        let messages = [
+            codexCompletion(
+                seq: 10,
+                input: 12_411_010,
+                cached: 12_034_944,
+                window: 258_400,
+                contextInput: 230_000
+            ),
+            codexCompletion(
+                seq: 20,
+                input: 18_407_236,
+                cached: 17_790_848,
+                window: 258_400
+            ),
+        ]
+
+        #expect(ContextGauge(messages: messages, harness: "codex") == nil)
     }
 
     @Test func codexDoesNotAddCachedInputAgain() {
         let gauge = ContextGauge(messages: [
-            codexCompletion(seq: 1, input: 100_000, cached: 90_000, window: 258_400),
+            codexCompletion(
+                seq: 1,
+                input: 1_000_000,
+                cached: 900_000,
+                window: 258_400,
+                contextInput: 100_000
+            ),
         ], harness: "codex")
         #expect(gauge?.usedTokens == 100_000)
     }
 
-    @Test func codexUsesLatestValueAfterCounterReset() {
+    @Test func codexUsesNewestPreciseContextValue() {
         let gauge = ContextGauge(messages: [
-            codexCompletion(seq: 1, input: 300_000, cached: 250_000, window: 258_400),
-            codexCompletion(seq: 2, input: 40_000, cached: 35_000, window: 258_400),
+            codexCompletion(
+                seq: 1, input: 300_000, cached: 250_000, window: 258_400, contextInput: 80_000
+            ),
+            codexCompletion(
+                seq: 2, input: 900_000, cached: 850_000, window: 258_400, contextInput: 40_000
+            ),
         ], harness: "codex")
         #expect(gauge?.usedTokens == 40_000)
     }
 
-    @Test func codexUsesExactZeroAfterCounterReset() {
+    @Test func codexUsesExactZeroFromPreciseContextUsage() {
         let gauge = ContextGauge(messages: [
-            codexCompletion(seq: 1, input: 300_000, cached: 250_000, window: 258_400),
-            codexCompletion(seq: 2, input: 0, cached: 0, window: 258_400),
+            codexCompletion(
+                seq: 1, input: 300_000, cached: 250_000, window: 258_400, contextInput: 80_000
+            ),
+            codexCompletion(
+                seq: 2, input: 900_000, cached: 850_000, window: 258_400, contextInput: 0
+            ),
         ], harness: "codex")
         #expect(gauge?.usedTokens == 0)
         #expect(gauge?.window == 258_400)
@@ -147,7 +205,9 @@ import Testing
 
     @Test func codexWithoutWindowShowsAbsoluteUsage() {
         let gauge = ContextGauge(messages: [
-            codexCompletion(seq: 1, input: 93_590, cached: 90_000, window: nil),
+            codexCompletion(
+                seq: 1, input: 1_000_000, cached: 900_000, window: nil, contextInput: 93_590
+            ),
         ], harness: "codex")
         #expect(gauge?.text == "ctx 93.6K")
     }
@@ -155,7 +215,11 @@ import Testing
     @Test func extremeCodexUsageBoundsPercentageWithoutTrapping() {
         let gauge = ContextGauge(messages: [
             codexCompletion(
-                seq: 1, input: 1_000_000_000_000_000_000, cached: 0, window: 1
+                seq: 1,
+                input: 1_000_000_000_000_000_000,
+                cached: 0,
+                window: 1,
+                contextInput: 1_000_000_000_000_000_000
             ),
         ], harness: "codex")
         #expect(gauge?.text == "ctx 1000000000000M / 1 · 9223372036854775807%")

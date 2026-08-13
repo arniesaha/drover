@@ -96,6 +96,48 @@ def resolve_effective_context_window(
     return None
 
 
+def resolve_last_context_input_tokens(
+    thread_id: str | None, *, codex_home: Path | None = None
+) -> int | None:
+    """Read the latest request's prompt usage from Codex's native transcript."""
+    if not thread_id:
+        return None
+    home = codex_home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        transcripts = list((home / "sessions").glob(f"**/*{thread_id}*.jsonl"))
+    except OSError:
+        return None
+    if not transcripts:
+        return None
+    try:
+        transcript = max(transcripts, key=lambda path: path.stat().st_mtime)
+        latest: int | None = None
+        with transcript.open(errors="replace") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = event.get("payload") if isinstance(event, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                event_type = payload.get("type")
+                if event_type == "task_started":
+                    latest = None
+                    continue
+                if event_type != "token_count":
+                    continue
+                info = payload.get("info")
+                usage = info.get("last_token_usage") if isinstance(info, dict) else None
+                value = usage.get("input_tokens") if isinstance(usage, dict) else None
+                number = _catalog_number(value)
+                if number is not None and number >= 0:
+                    latest = round(number)
+        return latest
+    except OSError:
+        return None
+
+
 class CodexDriver:
     """Owns one `codex exec` subprocess per turn; no persistent process."""
 
@@ -107,6 +149,7 @@ class CodexDriver:
         *,
         native_session_id: str | None = None,
         context_window_resolver: Callable[[str | None], int | None] | None = None,
+        context_input_resolver: Callable[[str | None], int | None] | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
@@ -114,6 +157,9 @@ class CodexDriver:
         self._thread_id = native_session_id
         self._context_window_resolver = (
             context_window_resolver or resolve_effective_context_window
+        )
+        self._context_input_resolver = (
+            context_input_resolver or resolve_last_context_input_tokens
         )
         # _turn_lock guards _turn_active/_turn_process/_turn_thread. A turn
         # is "in flight" from send_turn setting _turn_active (under the
@@ -349,6 +395,12 @@ class CodexDriver:
                 "awaiting": "input",
                 "usage": obj.get("usage"),
             }
+            try:
+                context_input_tokens = self._context_input_resolver(self._thread_id)
+            except Exception:
+                context_input_tokens = None
+            if context_input_tokens is not None:
+                payload["context_input_tokens"] = context_input_tokens
             if model:
                 payload["model"] = model
                 try:

@@ -155,6 +155,7 @@ struct ChatModelTests {
             payload: [
                 "turn_complete": .bool(true),
                 "usage": .object(["input_tokens": .number(100)]),
+                "context_input_tokens": .number(100),
                 "model_context_window": .number(1_000),
             ]
         )]
