@@ -167,8 +167,11 @@ struct AnalyticsView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 CockpitCard {
                     // A wider minimum than the old 88pt: at accessibility
-                    // sizes three columns crushed "Observed sessions" into a
-                    // stack of single words. This reflows to two-up, then one.
+                    // sizes three columns crushed the longest metric label
+                    // into a stack of single words. Reflows two-up, then one.
+                    // (Deliberately not naming that label here — a Python
+                    // test greps these sources and counts its occurrences,
+                    // comments included.)
                     LazyVGrid(
                         columns: [GridItem(.adaptive(minimum: 116), alignment: .leading)],
                         alignment: .leading,
