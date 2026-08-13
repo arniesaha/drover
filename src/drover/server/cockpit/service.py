@@ -29,11 +29,13 @@ COCKPIT_SECTIONS = (
     "insights",
 )
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
-# The bounded query takes about four seconds against the production lakehouse
-# on the external APFS volume. Cockpit and analytics requests use a dedicated
-# 30-second iOS timeout, so this still leaves over 20 seconds for the remaining
-# sequential sections and phone transport while interrupting a runaway scan.
-ACTIVITY_BUDGET_SECONDS = 8.0
+# The bounded query is usually about four seconds against the production
+# lakehouse, but a cold concurrent read has exceeded eight seconds and older
+# live measurements put the complete cold overview at 12.4 seconds. Cockpit
+# requests use a dedicated 60-second iOS timeout, leaving ample room for the
+# remaining sequential sections and phone transport while still interrupting a
+# genuinely runaway scan.
+ACTIVITY_BUDGET_SECONDS = 20.0
 _INTERRUPT_GRACE_SECONDS = 1.0
 # Repeat callers are answered from the last result rather than re-running the
 # scan. The iOS client polls the overview every 30s, so with several clients
