@@ -7,12 +7,25 @@ import DroverKit
 /// exactly when the near-real-time "response completed" alerts from the
 /// polling path arrive. Presenting as a banner (not an alert) keeps them
 /// glanceable.
+/// `@MainActor` here is load-bearing, not decoration.
+///
+/// These delegate methods are `async`. Without actor isolation Swift resumes
+/// them on the cooperative pool, and when they return UIKit does its own
+/// post-completion work — `_updateSnapshotAndStateRestoration`, through
+/// `_performBlockAfterCATransactionCommitSynchronizes` — on whatever thread
+/// the continuation landed on. Off the main thread that trips an internal
+/// UIKit assertion and the process aborts, so *every* notification tap killed
+/// the app: three crash reports on device in one afternoon, all SIGABRT, all
+/// faulting in `didReceive` on `com.apple.root.user-initiated-qos.cooperative`.
 private final class ForegroundNotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions {
-        [.banner, .sound, .badge]
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (
+            UNNotificationPresentationOptions
+        ) -> Void
+    ) {
+        completionHandler([.banner, .sound, .badge])
     }
 
     /// A "needs you" alert is about one session, so tapping it should land on
@@ -21,16 +34,27 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
     /// key (and uses the id as the request identifier).
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse
-    ) async {
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
         let request = response.notification.request
-        guard
-            let sessionID = NotificationRoute.sessionID(
-                userInfo: request.content.userInfo,
-                requestIdentifier: request.identifier
-            )
-        else { return }
-        await MainActor.run { NotificationRoute.shared.open(sessionID: sessionID) }
+        // Parsed here: pure, and it keeps the non-Sendable response off the
+        // hop below.
+        let sessionID = NotificationRoute.sessionID(
+            userInfo: request.content.userInfo,
+            requestIdentifier: request.identifier
+        )
+        // The completion-handler form of this delegate method is delivered on
+        // the main thread, which is the whole reason for preferring it: the
+        // handler is what releases UIKit to do its own post-tap work, and
+        // that work aborts the process if it runs anywhere else.
+        // `assumeIsolated` states that contract rather than assuming it
+        // quietly — if it were ever violated this would fail loudly here
+        // instead of deep inside UIKit.
+        MainActor.assumeIsolated {
+            if let sessionID { NotificationRoute.shared.open(sessionID: sessionID) }
+        }
+        completionHandler()
     }
 }
 
