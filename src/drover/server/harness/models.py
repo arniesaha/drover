@@ -27,6 +27,9 @@ class HarnessHost:
     local_url: str | None = None
     tailscale_url: str | None = None
     connection_kind: str = "direct"
+    # What the host says it is running. None for a host old enough not to
+    # report one, which is ordinary during a rollout rather than an error.
+    agent_version: str | None = None
     last_seen_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -42,6 +45,7 @@ class HarnessHost:
             tailscale_url=row.get("tailscale_url"),
             connection_kind=row.get("connection_kind") or "direct",
             capabilities=_loads_object(row.get("capabilities_json")),
+            agent_version=row.get("agent_version"),
             last_seen_at=row.get("last_seen_at"),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),

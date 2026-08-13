@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   connection_kind   VARCHAR,
   status            VARCHAR NOT NULL,
   capabilities_json VARCHAR NOT NULL,
+  agent_version     VARCHAR,
   last_seen_at      TIMESTAMP,
   created_at        TIMESTAMP NOT NULL DEFAULT now(),
   updated_at        TIMESTAMP NOT NULL DEFAULT now()
@@ -147,7 +148,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     _ensure_harness_columns(
         con,
         "harness_hosts",
-        {"connection_kind": "VARCHAR"},
+        {"connection_kind": "VARCHAR", "agent_version": "VARCHAR"},
     )
     con.execute(_HARNESS_SESSIONS_DDL)
     _ensure_harness_columns(
