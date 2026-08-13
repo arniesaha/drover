@@ -128,3 +128,90 @@ def test_activity_is_still_recorded_when_no_sender_is_registered(registry):
     registry.update_session_activity("sess-1", awaiting="approval")
 
     assert registry.get_session("sess-1").awaiting == "approval"
+
+
+# --- notification preview ---------------------------------------------------
+
+
+def _assistant_says(registry, text, *, seq, session_id="sess-1"):
+    registry.append_event(
+        session_id=session_id,
+        event_type="assistant_output",
+        content_preview=text,
+        seq=seq,
+    )
+
+
+def test_alert_carries_what_the_agent_last_said(registry, sender):
+    _assistant_says(registry, "Ready to deploy. Want me to push?", seq=1)
+
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert sender.sent[0].preview == "Ready to deploy. Want me to push?"
+
+
+def test_newest_message_wins(registry, sender):
+    _assistant_says(registry, "an older thought", seq=1)
+    _assistant_says(registry, "the latest word", seq=2)
+
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert sender.sent[0].preview == "the latest word"
+
+
+def test_thinking_only_turns_are_skipped(registry, sender):
+    # The harness stores the event type as the preview when a turn produced
+    # no visible text; showing "assistant_output" as the body would be worse
+    # than showing nothing.
+    _assistant_says(registry, "the real message", seq=1)
+    _assistant_says(registry, "assistant_output", seq=2)
+
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert sender.sent[0].preview == "the real message"
+
+
+def test_session_with_nothing_said_yet_has_no_preview(registry, sender):
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert sender.sent[0].preview == ""
+    # And still alerts, on the old generic wording.
+    assert sender.sent[0].alert_body() == "drover — your turn"
+
+
+def test_preview_is_redacted_before_it_leaves_the_host(registry, sender):
+    # This text goes to Apple's servers, so the same redaction the session
+    # list uses has to apply here too.
+    _assistant_says(registry, "run: export ANTHROPIC_API_KEY=sk-ant-secret123", seq=1)
+
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert "sk-ant-secret123" not in sender.sent[0].preview
+
+
+def test_other_sessions_messages_are_not_borrowed(registry, sender):
+    registry.create_session(
+        session_id="sess-2",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+        cwd="/Users/x/work/other",
+        status="running",
+        started_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+    )
+    _assistant_says(registry, "belongs to sess-2", seq=1, session_id="sess-2")
+
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert sender.sent[0].preview == ""
+
+
+def test_clearing_awaiting_does_not_pay_for_a_preview(registry, sender):
+    _assistant_says(registry, "some message", seq=1)
+    registry.update_session_activity("sess-1", awaiting="input")
+    registry.update_session_activity("sess-1", awaiting=None)
+
+    # The clear still dispatches (the badge cares), but skips the query for
+    # text no notification will ever show.
+    assert sender.sent[-1].awaiting is None
+    assert sender.sent[-1].preview == ""
