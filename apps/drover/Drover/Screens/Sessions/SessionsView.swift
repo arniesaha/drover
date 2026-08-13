@@ -342,17 +342,25 @@ struct SessionsView: View {
 
     private func row(for session: SessionSummary) -> some View {
         NavigationLink {
-            if session.isStructured {
-                ChatView(
-                    client: client,
-                    sessionID: session.id,
-                    harness: session.harness,
-                    recap: session.recap ?? session.preview,
-                    recapSourceSeq: session.recapSourceSeq
-                )
-            } else {
-                TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
+            Group {
+                if session.isStructured {
+                    ChatView(
+                        client: client,
+                        sessionID: session.id,
+                        harness: session.harness,
+                        recap: session.recap ?? session.preview,
+                        recapSourceSeq: session.recapSourceSeq
+                    )
+                } else {
+                    TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
+                }
             }
+            // Opening the session is what clears it from the badge. Marked
+            // here rather than inside the destination screens because this is
+            // the only place that holds the snapshot the count is derived
+            // from, and it keeps both screens ignorant of badges entirely.
+            .task { await markRead(session) }
+            .onDisappear { Task { await markRead(session) } }
         } label: {
             SessionRow(
                 session: session,
@@ -380,6 +388,14 @@ struct SessionsView: View {
                 }
             }
         }
+    }
+
+    /// Marked on open and again on leaving: the session may only start asking
+    /// for something while the user is already reading it, and that should
+    /// not leave a badge behind them.
+    private func markRead(_ session: SessionSummary) async {
+        guard let snapshot = store.snapshot else { return }
+        await AttentionWatcher(notifier: notifier).markRead(session.id, in: snapshot)
     }
 
     /// Host id → display title from the fleet snapshot, so provider cards can

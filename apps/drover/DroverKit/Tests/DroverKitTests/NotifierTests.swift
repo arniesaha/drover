@@ -159,6 +159,124 @@ struct NotifierTests {
     #expect(Set(defaults.stringArray(forKey: AttentionWatcher.seenKey) ?? []) == ["sess-1"])  // seen set untouched
 }
 
+
+// MARK: - Read receipts
+//
+// The badge counts sessions that still want the user *and* that the user has
+// not looked at yet. Opening a session is not the same as answering it — the
+// session stays in the inbox, and stays needs-you — but the badge is a prompt
+// to go look, and once you have looked it has done its job.
+
+@Test func openingANeedySessionClearsItFromTheBadge() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-a", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/p/a"),
+        (id: "sess-b", harness: "agy", status: "running", awaiting: "input", cwd: "/p/b"),
+    ]))
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    await watcher.evaluate(snapshot)
+
+    await watcher.markRead("sess-a", in: snapshot)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [2, 1])
+}
+
+@Test func aReadSessionStaysReadAcrossLaterRefreshes() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-a", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/p/a"),
+        (id: "sess-b", harness: "agy", status: "running", awaiting: "input", cwd: "/p/b"),
+    ]))
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    await watcher.evaluate(snapshot)
+    await watcher.markRead("sess-a", in: snapshot)
+
+    await watcher.evaluate(snapshot)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [2, 1, 1])
+}
+
+@Test func readingEverySessionEmptiesTheBadgeWithoutEmptyingTheInbox() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-a", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/p/a"),
+    ]))
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    await watcher.evaluate(snapshot)
+
+    await watcher.markRead("sess-a", in: snapshot)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [1, 0])
+    // The session is untouched — the badge is a prompt, not the inbox.
+    #expect(snapshot.sessions.contains { $0.id == "sess-a" && $0.attention == .needsApproval })
+}
+
+@Test func aSessionThatAsksAgainAfterBeingReadBadgesAgain() async throws {
+    // Read receipts are pruned when a session stops needing the user, so the
+    // next question is a fresh one. Without pruning, a session read once
+    // would never badge again for the life of the install.
+    let spy = SpyNotifier()
+    let defaults = testDefaults()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
+
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/p/a"),
+    ]))
+    await watcher.evaluate(asking)
+    await watcher.markRead("sess-1", in: asking)
+
+    let working = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: nil, cwd: "/p/a"),
+    ]))
+    await watcher.evaluate(working)
+
+    await watcher.evaluate(asking)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [1, 0, 0, 1])
+}
+
+@Test func markingAnUnrelatedSessionReadDoesNotChangeTheBadge() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-a", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/p/a"),
+        (id: "sess-working", harness: "shell", status: "running", awaiting: nil, cwd: "/p/w"),
+    ]))
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    await watcher.evaluate(snapshot)
+
+    await watcher.markRead("sess-working", in: snapshot)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [1, 1])
+}
+
+
+@Test func openingASessionBeforeItAsksDoesNotSwallowTheLaterQuestion() async throws {
+    // A receipt means "I have seen this question", not "I have seen this
+    // session". Recording one for a session that was merely working would
+    // suppress the badge for a question asked minutes after the user left.
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+
+    let working = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: nil, cwd: "/p/a"),
+    ]))
+    await watcher.evaluate(working)
+    await watcher.markRead("sess-1", in: working)
+
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+    await watcher.evaluate(asking)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [0, 0, 1])
+}
+
 }
 
 }  // extension MockNetworkTests
