@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 from drover.config import default_config
 from drover.server.updates import (
@@ -276,3 +277,86 @@ def test_install_fails_when_the_result_cannot_smoke_test(tmp_path):
         )
         is False
     ), "no binary was produced, so this must not report success"
+
+
+def test_a_failed_install_does_not_poison_the_next_attempt(tmp_path):
+    """A failure must not leave the version permanently uninstallable.
+
+    Observed live while testing the smoke gate: the first attempt at a bad
+    version failed at the gate, as designed. Every attempt after it failed
+    earlier and for a different reason —
+
+        ERROR install step returned nonzero: uv venv .../runtime/9.9.9
+
+    because the failed install left its directory behind and `uv venv` refuses
+    a directory that already exists. Two consequences, and the second is the
+    serious one. The real cause is reported once and then buried under a
+    misleading error. And any transient failure -- a network blip, a full
+    disk, an interrupted uv -- strands that version on that host forever,
+    because the retry can never again reach the code that would have
+    succeeded. Recovery means someone opening a shell to delete a directory,
+    on the machine the rollback design exists to avoid visiting.
+    """
+    artifact, payload, lock = _artifact()
+    layout = RuntimeLayout(tmp_path)
+    attempts = []
+
+    class _Result:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    def runner(cmd, **kwargs):
+        attempts.append(cmd)
+        if cmd[:2] == ["uv", "venv"]:
+            target = Path(cmd[2])
+            if target.exists():
+                # What uv actually does: refuses rather than clobbering.
+                return _Result(1)
+            target.mkdir(parents=True)
+            # First attempt only: leave the tree half-built, the way an
+            # install killed partway through would.
+            if len(attempts) <= 1:
+                return _Result(1)
+            binary = layout.executable("drover-server", artifact.version)
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+        return _Result(0)
+
+    opener = _download_opener(payload, lock)
+    assert install_version(layout, artifact, runner=runner, opener=opener) is False
+
+    # The retry must get a clean run at it rather than tripping over the
+    # wreckage of the first.
+    assert install_version(layout, artifact, runner=runner, opener=opener) is True
+    assert layout.smoke_test(artifact.version)
+
+
+def test_a_failed_install_does_not_count_as_an_installed_version(tmp_path):
+    """A half-built tree must not masquerade as a version that is there.
+
+    `installed_versions` lists directories, so wreckage left behind reads as
+    installed — which means `prune(keep=2)` can retain it and drop a good
+    older version instead. The newest name wins the sort, so the broken one is
+    exactly the one that survives.
+    """
+    artifact, payload, lock = _artifact()
+    layout = RuntimeLayout(tmp_path)
+
+    class _Result:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    def runner(cmd, **kwargs):
+        if cmd[:2] == ["uv", "venv"]:
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
+            return _Result(1)
+        return _Result(0)
+
+    assert (
+        install_version(
+            layout, artifact, runner=runner, opener=_download_opener(payload, lock)
+        )
+        is False
+    )
+    assert artifact.version not in layout.installed_versions()
