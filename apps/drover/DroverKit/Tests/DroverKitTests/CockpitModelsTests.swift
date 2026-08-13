@@ -84,6 +84,19 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     #expect(snapshot.activity.data?.pagination.hosts.nextCursor == "next-host")
 }
 
+@Test func analyticsDecodesProjectContributorAttributionCounts() throws {
+    let project = try JSONDecoder().decode(ProjectActivity.self, from: Data(#"""
+    {"project_key":"arniesaha/drover","session_count":3,"total_tokens":0,
+     "cost_usd":0,"cache_read_tokens":0,"cache_write_tokens":0,
+     "total_latency_ms":0,"harnesses":["claude-code"],
+     "harness_attributed_session_count":1,"hosts":[],
+     "host_attributed_session_count":0}
+    """#.utf8))
+
+    #expect(project.harnessAttributedSessionCount == 1)
+    #expect(project.hostAttributedSessionCount == 0)
+}
+
 @Test func overviewDecodesPartialProviderFailureWithoutDroppingActivity() throws {
     let fixture = Data(#"""
     {

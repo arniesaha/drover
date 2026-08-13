@@ -63,7 +63,8 @@ def _analytics_connection(
           ended_at TIMESTAMPTZ,
           repo_owner VARCHAR,
           repo_name VARCHAR,
-          branch VARCHAR
+          branch VARCHAR,
+          raw_data VARCHAR
         );
         CREATE TABLE harness_sessions (
           session_id VARCHAR,
@@ -87,6 +88,7 @@ def _analytics_connection(
             repo_owner,
             repo_name,
             branch,
+            raw_data,
             strftime(started_at, '%Y-%m-%d') AS date
           FROM sessions
           UNION ALL
@@ -100,6 +102,7 @@ def _analytics_connection(
             repo_owner,
             repo_name,
             branch,
+            raw_data,
             strftime(ended_at, '%Y-%m-%d') AS date
           FROM sessions;
         CREATE MACRO agent_events_for_date(partition_date) AS TABLE
@@ -462,7 +465,7 @@ def test_analytics_attributes_event_only_sessions_to_their_repository():
         """
         INSERT INTO sessions VALUES (
           'event-only', 'macmini-claude', NULL, ?, ?,
-          'arniesaha', 'drover', 'main'
+          'arniesaha', 'drover', 'main', NULL
         )
         """,
         [now, now],
@@ -484,6 +487,104 @@ def test_analytics_attributes_event_only_sessions_to_their_repository():
     assert [project.project_key for project in filtered.projects] == [
         "arniesaha/drover"
     ]
+
+
+def test_analytics_excludes_event_only_claude_mem_observer_sessions():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    observer_raw = json.dumps({"cwd": "/Users/test//claude/mem/observer/sessions"})
+    similarly_named_raw = json.dumps(
+        {"cwd": "/Users/test/claude/mem/observer/sessions-copy"}
+    )
+    observer_fallback_raw = json.dumps(
+        {
+            "cwd": "",
+            "workspaceDir": "/Users/test/claude/mem/observer/sessions",
+        }
+    )
+    con.executemany(
+        """
+        INSERT INTO sessions VALUES (?, 'macmini-claude', NULL, ?, ?,
+          'arniesaha', 'drover', 'main', ?)
+        """,
+        [
+            ("observer-helper", now, now, observer_raw),
+            ("observer-helper-fallback", now, now, observer_fallback_raw),
+            ("legitimate-session", now, now, similarly_named_raw),
+        ],
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 1
+    assert result.projects[0].session_count == 1
+
+
+def test_dimension_coverage_uses_every_displayed_session():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    con.executemany(
+        """
+        INSERT INTO harness_sessions VALUES (?, 'mac-mini', 'claude-code',
+          ?, ?, 'model-a', ?, ?, ?)
+        """,
+        [
+            ("with-telemetry", "acme", "project", now, now, now),
+            ("without-telemetry", None, None, now, now, now),
+        ],
+    )
+    con.execute(
+        """
+        INSERT INTO spans_enriched VALUES (
+          'span-with-telemetry', 'with-telemetry', ?, ?, 100,
+          'claude-code', 'anthropic', 'model-a', NULL, 'acme', 'project',
+          42, NULL, NULL, 0.01, NULL, NULL
+        )
+        """,
+        [now, now],
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.harnesses[0].session_count == 2
+    assert result.harnesses[0].metadata.coverage.token_percent == 50.0
+
+
+def test_project_reports_partial_harness_and_host_attribution():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    con.execute(
+        """
+        INSERT INTO sessions VALUES (
+          'event-only', 'macmini-claude', NULL, ?, ?,
+          'arniesaha', 'drover', 'main', NULL
+        )
+        """,
+        [now, now],
+    )
+    _insert_session(
+        con,
+        session_id="registered",
+        project="arniesaha/drover",
+        host="mac-mini",
+        harness="claude-code",
+        tokens=None,
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    project = result.projects[0]
+    assert project.session_count == 2
+    assert project.harnesses == ("claude-code",)
+    assert project.harness_attributed_session_count == 1
+    assert project.hosts == ("mac-mini",)
+    assert project.host_attributed_session_count == 1
 
 
 def test_analytics_removes_materialized_session_facts_after_failure(
