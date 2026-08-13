@@ -1462,3 +1462,34 @@ def test_run_passes_a_pairing_table_to_the_http_server():
     source = Path(server_main.__file__).read_text(encoding="utf-8")
     assert "from drover.server.web.pairing import PairingCodes" in source
     assert "pairing=pairing" in source, "start_metrics_server needs the table"
+
+
+def test_version_flag_exists_because_the_installer_smoke_tests_it():
+    """`drover-server --version` is the installer's smoke gate.
+
+    install.sh and the fleet updater both run exactly this before they will
+    activate a freshly installed version. Without the flag, every install
+    downloads, verifies, installs, and then refuses itself -- which is how
+    v0.1.1 shipped broken. Asserting the real command, not an equivalent.
+    """
+    import drover
+
+    result = CliRunner().invoke(main, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert drover.__version__ in result.output
+
+
+def test_version_matches_the_packaged_version():
+    """A host reporting a version other than what it installed never
+    converges: the hub keeps seeing skew and asks it to update forever."""
+    import tomllib
+    from pathlib import Path
+
+    import drover
+
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+    # In an editable checkout importlib reports whatever was last installed,
+    # so only assert equality when the package metadata is present and real.
+    if drover.__version__ != "0.0.0":
+        assert drover.__version__ == declared
