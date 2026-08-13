@@ -35,6 +35,10 @@ struct SessionsView: View {
     @State private var showFinished = false
     @State private var showAnalytics = false
     @State private var showInsights = false
+    /// True whenever the app has just come to the foreground (launch included),
+    /// so the next attention check absorbs what is already waiting rather than
+    /// re-alerting for something the hub's push has already covered.
+    @State private var absorbNextAttentionCheck = true
 
     init(
         client: DroverClient,
@@ -175,6 +179,9 @@ struct SessionsView: View {
             } else {
                 store.stopPolling()
                 cockpitStore.stopForegroundPolling()
+                // Anything that starts waiting from here on is the hub's to
+                // announce, so the next check on return must not repeat it.
+                absorbNextAttentionCheck = true
             }
         }
         // Foreground polling drives the same AttentionWatcher diff the
@@ -183,11 +190,33 @@ struct SessionsView: View {
         // near-real-time, the badge stays in sync, and the shared persisted
         // seen-set means the BGTask path never double-alerts for the same
         // transition.
+        //
+        // The hub's APNs push is the one path that cannot share that seen-set,
+        // so the first check after the app becomes active absorbs whatever is
+        // already waiting instead of alerting about it — otherwise every
+        // pushed alert was followed by a second, generic, local one the moment
+        // the app opened.
         .onChange(of: store.needsYou) { _, _ in
             guard let snapshot = store.snapshot else { return }
             let watcher = AttentionWatcher(notifier: notifier)
-            Task { await watcher.evaluate(snapshot) }
+            if absorbNextAttentionCheck {
+                absorbNextAttentionCheck = false
+                Task { await watcher.sync(snapshot) }
+            } else {
+                Task { await watcher.evaluate(snapshot) }
+            }
         }
+        // A tapped alert names one session; open that session rather than
+        // leaving the user on the list to find it again themselves.
+        .onChange(of: NotificationRoute.shared.pendingSessionID) { _, _ in
+            openSessionFromNotification()
+        }
+        // A cold launch delivers the tap before the first poll returns, so the
+        // id cannot resolve to a session yet. Try again when the list arrives.
+        .onChange(of: store.snapshot?.sessions.count) { _, _ in
+            openSessionFromNotification()
+        }
+        .onAppear { openSessionFromNotification() }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
                 LaunchView(client: client, snapshot: store.snapshot) { sessionID, isStructured, harness in
@@ -393,6 +422,26 @@ struct SessionsView: View {
     /// Marked on open and again on leaving: the session may only start asking
     /// for something while the user is already reading it, and that should
     /// not leave a badge behind them.
+    /// Push straight into the session a tapped alert was about.
+    ///
+    /// Reuses the destination `LaunchView` already navigates through, so a
+    /// notification lands on exactly the screen launching that session would.
+    /// The id is only consumed once a matching session is actually in the
+    /// snapshot: a cold launch delivers the tap before the first poll returns,
+    /// and dropping it there would strand the user on the list.
+    private func openSessionFromNotification() {
+        guard let pending = NotificationRoute.shared.pendingSessionID else { return }
+        guard let session = store.snapshot?.sessions.first(where: { $0.id == pending }) else {
+            return
+        }
+        _ = NotificationRoute.shared.consume()
+        launchedSession = LaunchedSession(
+            id: session.id,
+            isStructured: session.isStructured,
+            harness: session.harness
+        )
+    }
+
     private func markRead(_ session: SessionSummary) async {
         guard let snapshot = store.snapshot else { return }
         await AttentionWatcher(notifier: notifier).markRead(session.id, in: snapshot)

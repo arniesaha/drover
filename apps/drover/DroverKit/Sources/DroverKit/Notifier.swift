@@ -31,6 +31,9 @@ public struct LocalNotifier: Notifying {
         // deferral (requires the time-sensitive entitlement; without it iOS
         // silently downgrades to .active, so this is safe either way).
         content.interruptionLevel = .timeSensitive
+        // Same key the push payload carries, so tapping either kind of alert
+        // opens the session by exactly one code path.
+        content.userInfo[NotificationPayloadKey.sessionID] = id
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         try? await UNUserNotificationCenter.current().add(request)
     }
@@ -82,6 +85,31 @@ public struct AttentionWatcher: Sendable {
             return  // silence: never a false alert, never a lost seen-set
         }
         await evaluate(snapshot)
+    }
+
+    /// Record what currently needs the user as already-seen, alerting about
+    /// none of it.
+    ///
+    /// The seen-set is shared by the BGTask and foreground paths, but *not* by
+    /// the server's APNs push — the hub cannot write into this app's
+    /// `UserDefaults`. So a session that started waiting while the app was
+    /// backgrounded is pushed by the hub, and is then still "new" to this
+    /// watcher when the app opens, which fired a *second*, generic, local
+    /// alert for a transition the user had already been told about.
+    ///
+    /// Absorbing whatever is waiting at the moment the app becomes active
+    /// closes that gap. A transition landing in that same first refresh is
+    /// absorbed too, which is the right trade: by then the user is looking at
+    /// the sessions list where it already appears, and a banner for something
+    /// on screen is noise.
+    public func sync(_ snapshot: HarnessSnapshot) async {
+        let needsYou = Self.needingUser(snapshot.sessions)
+        await notifier.setBadge(needsYou.count)
+        seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
+    }
+
+    static func needingUser(_ sessions: [SessionSummary]) -> [SessionSummary] {
+        sessions.filter { $0.attention == .needsApproval || $0.attention == .needsInput }
     }
 
     /// Diff/notify from a snapshot the caller already holds — the foreground

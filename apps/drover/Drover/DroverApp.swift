@@ -14,6 +14,24 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
     ) async -> UNNotificationPresentationOptions {
         [.banner, .sound, .badge]
     }
+
+    /// A "needs you" alert is about one session, so tapping it should land on
+    /// that session rather than the list. Handles both kinds identically: the
+    /// hub's push carries `session_id`, and `LocalNotifier` writes the same
+    /// key (and uses the id as the request identifier).
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let request = response.notification.request
+        guard
+            let sessionID = NotificationRoute.sessionID(
+                userInfo: request.content.userInfo,
+                requestIdentifier: request.identifier
+            )
+        else { return }
+        await MainActor.run { NotificationRoute.shared.open(sessionID: sessionID) }
+    }
 }
 
 @main
