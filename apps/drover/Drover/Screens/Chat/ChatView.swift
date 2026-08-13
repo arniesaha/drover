@@ -80,16 +80,24 @@ struct ChatView: View {
             // messages arrive underneath.
             transcript
                 .overlay {
+                    // The fade belongs to the indicator, not to the
+                    // transcript. Applied one level up it wrapped the whole
+                    // message list in an implicit animation keyed on
+                    // `hasConnectedOnce` — which flips at exactly the moment
+                    // the first rows land, so the insertion animated
+                    // underneath the initial scroll-to-bottom and parked the
+                    // ScrollView past its own content. The transcript was
+                    // fully populated (189 messages, 63 rows, confirmed on
+                    // device) and the screen was blank.
                     if DroverLoadingMark.shouldShow(
                         hasConnectedOnce: model.hasConnectedOnce,
                         elapsed: coldOpenIsSlow ? DroverLoadingMark.appearAfter : 0
                     ) {
                         DroverLoadingMarkView()
                             .transition(.opacity)
+                            .animation(.easeIn(duration: 0.2), value: coldOpenIsSlow)
                     }
                 }
-                .animation(.easeIn(duration: 0.2), value: coldOpenIsSlow)
-                .animation(.easeIn(duration: 0.2), value: model.hasConnectedOnce)
 
             // Read once: `artifacts` is cached, but two reads still cost two
             // dictionary lookups and obscure that this is one value.
