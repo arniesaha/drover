@@ -11,12 +11,14 @@ from drover.config import default_config
 from drover.server.web import auth as web_auth
 from drover.server.web.auth import (
     AuthSettings,
+    bearer_credential,
     load_auth,
     mint_session,
     request_authorized,
     session_cookie_value,
     verify_session,
 )
+from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
 
 
 class _Headers(dict):
@@ -174,3 +176,48 @@ def test_using_a_device_token_records_last_used(tmp_path):
 
     request_authorized(settings, _Headers({"Authorization": f"Bearer {token}"}))
     assert store.list_all()[0].last_used_at is not None
+
+
+def test_bearer_credential_returns_active_credential(tmp_path):
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    device, device_token = store.issue(scope="device", label="Phone")
+    host, host_token = store.issue(scope="host", label="build-mac", host_id="build-mac")
+    settings = _auth(credentials=store)
+
+    device_result = bearer_credential(
+        settings, _Headers({"Authorization": f"Bearer {device_token}"})
+    )
+    host_result = bearer_credential(
+        settings, _Headers({"Authorization": f"Bearer {host_token}"})
+    )
+
+    assert device_result is not None
+    assert device_result.id == device.id
+    assert device_result.scope == "device"
+    assert host_result is not None
+    assert host_result.id == host.id
+    assert host_result.scope == "host"
+    assert store.get(device.id).last_used_at is not None
+
+
+def test_bearer_credential_rejects_legacy_cookie_and_revoked(tmp_path):
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    credential, token = store.issue(scope="device", label="Phone")
+    settings = _auth(credentials=store)
+
+    assert (
+        bearer_credential(settings, _Headers({"Authorization": "Bearer test-token"}))
+        is None
+    )
+    assert (
+        bearer_credential(
+            settings,
+            _Headers({"Cookie": f"{settings.cookie_name}={mint_session(settings)}"}),
+        )
+        is None
+    )
+    assert store.revoke(credential.id)
+    assert (
+        bearer_credential(settings, _Headers({"Authorization": f"Bearer {token}"}))
+        is None
+    )

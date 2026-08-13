@@ -19,7 +19,11 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 
 from drover.config import DroverConfig, config_home, resolve_api_token_env
-from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
+from drover.server.web.credentials import (
+    CREDENTIALS_FILENAME,
+    Credential,
+    CredentialStore,
+)
 
 _TOKEN_FILENAME = "api_token"
 
@@ -95,8 +99,26 @@ def verify_session(value: str, auth: AuthSettings, now: float | None = None) -> 
     return int(payload) > (now if now is not None else time.time())
 
 
+def _credential_for_token(auth: AuthSettings, candidate: str) -> Credential | None:
+    """Resolve and touch an active per-credential bearer token."""
+    if auth.credentials is None:
+        return None
+    credential = auth.credentials.find_active(candidate)
+    if credential is not None:
+        auth.credentials.touch(credential.id)
+    return credential
+
+
+def bearer_credential(auth: AuthSettings, headers) -> Credential | None:
+    """Resolve an active per-credential Authorization bearer token only."""
+    authorization = headers.get("Authorization", "") or ""
+    if not authorization.startswith("Bearer "):
+        return None
+    return _credential_for_token(auth, authorization.removeprefix("Bearer ").strip())
+
+
 def token_matches(auth: AuthSettings, candidate: str) -> bool:
-    """Accept the legacy cluster token or any active per-device credential.
+    """Accept the legacy cluster token or any active per-credential token.
 
     The credential path hashes the candidate before looking it up, so lookup
     cost never varies with the secret and there is no per-credential loop.
@@ -107,13 +129,7 @@ def token_matches(auth: AuthSettings, candidate: str) -> bool:
         and hmac.compare_digest(candidate, auth.api_token)
     ):
         return True
-    if auth.credentials is None:
-        return False
-    credential = auth.credentials.find_active(candidate)
-    if credential is None:
-        return False
-    auth.credentials.touch(credential.id)
-    return True
+    return _credential_for_token(auth, candidate) is not None
 
 
 def request_authorized(auth: AuthSettings, headers) -> bool:
