@@ -60,7 +60,10 @@ def _analytics_connection(
           agent_id VARCHAR,
           task_id VARCHAR,
           started_at TIMESTAMPTZ,
-          ended_at TIMESTAMPTZ
+          ended_at TIMESTAMPTZ,
+          repo_owner VARCHAR,
+          repo_name VARCHAR,
+          branch VARCHAR
         );
         CREATE TABLE harness_sessions (
           session_id VARCHAR,
@@ -73,6 +76,52 @@ def _analytics_connection(
           ended_at TIMESTAMPTZ,
           updated_at TIMESTAMPTZ
         );
+        CREATE VIEW agent_events AS
+          SELECT
+            'start-' || session_id AS id,
+            'start-' || session_id AS dedup_key,
+            session_id,
+            agent_id,
+            task_id,
+            started_at AS timestamp,
+            repo_owner,
+            repo_name,
+            branch,
+            strftime(started_at, '%Y-%m-%d') AS date
+          FROM sessions
+          UNION ALL
+          SELECT
+            'end-' || session_id AS id,
+            'end-' || session_id AS dedup_key,
+            session_id,
+            agent_id,
+            task_id,
+            ended_at AS timestamp,
+            repo_owner,
+            repo_name,
+            branch,
+            strftime(ended_at, '%Y-%m-%d') AS date
+          FROM sessions;
+        CREATE MACRO agent_events_for_date(partition_date) AS TABLE
+          SELECT * FROM agent_events WHERE date = partition_date;
+        CREATE VIEW spans AS
+          SELECT *, NULL::VARCHAR AS agent_id,
+                 strftime(start_time, '%Y-%m-%d') AS date
+          FROM spans_enriched;
+        CREATE MACRO spans_for_date(partition_date) AS TABLE
+          SELECT * FROM spans WHERE date = partition_date;
+        CREATE MACRO spans_enriched_for_date(partition_date) AS TABLE
+          SELECT * FROM spans_enriched
+          WHERE strftime(start_time, '%Y-%m-%d') = partition_date;
+        CREATE VIEW span_partition_activity AS
+          SELECT date,
+                 max(COALESCE(GREATEST(end_time, start_time), end_time, start_time))
+                   AS latest_activity_at
+          FROM spans
+          GROUP BY date;
+        CREATE VIEW span_partitions AS SELECT DISTINCT date FROM spans;
+        CREATE VIEW agent_event_partitions AS
+          SELECT DISTINCT date FROM agent_events;
         """)
     return con
 
@@ -102,7 +151,11 @@ def _insert_session(
         [session_id, host, harness, owner, name, model, now, now, now],
     )
     con.execute(
-        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        """
+        INSERT INTO sessions (
+          session_id, agent_id, task_id, started_at, ended_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
         [session_id, f"agent-{host}", None, now, now],
     )
     con.execute(
@@ -284,7 +337,7 @@ def test_analytics_materializes_session_facts_once(low_coverage_analytics_db):
 
         def execute(self, sql, parameters=None):
             normalized = " ".join(str(sql).lower().split())
-            if "spans_enriched" in normalized:
+            if "spans_for_date" in normalized:
                 self.span_scans += 1
             if "create" in normalized and "temp" in normalized:
                 self.created_materialization = True
@@ -302,6 +355,135 @@ def test_analytics_materializes_session_facts_once(low_coverage_analytics_db):
     assert observed.span_scans == 1
     assert observed.created_materialization
     assert observed.dropped_materialization
+
+
+def test_analytics_never_reads_the_global_enriched_span_view(
+    low_coverage_analytics_db,
+):
+    """A bounded response must not bind every historical attribution file."""
+
+    class RejectingGlobalEnrichment:
+        def __init__(self, con):
+            self.con = con
+            self.bounded_reads = 0
+
+        def execute(self, sql, parameters=None):
+            normalized = " ".join(str(sql).lower().split())
+            if "from spans_enriched" in normalized or "from spans," in normalized:
+                raise AssertionError("analytics used a global span view")
+            if "spans_for_date" in normalized:
+                self.bounded_reads += 1
+            if parameters is None:
+                return self.con.execute(sql)
+            return self.con.execute(sql, parameters)
+
+    observed = RejectingGlobalEnrichment(low_coverage_analytics_db)
+
+    result = activity_analytics(observed, AnalyticsFilters(days=7))
+
+    assert result.totals.session_count == 3
+    assert observed.bounded_reads == 1
+
+
+def test_analytics_never_reads_the_global_sessions_view(
+    low_coverage_analytics_db,
+):
+    """A bounded response must not bind every historical agent-event file."""
+
+    class RejectingGlobalSessions:
+        def __init__(self, con):
+            self.con = con
+            self.bounded_reads = 0
+
+        def execute(self, sql, parameters=None):
+            normalized = " ".join(str(sql).lower().split())
+            if (
+                "from sessions " in normalized
+                or "from sessions," in normalized
+                or "from agent_events " in normalized
+                or "from agent_events," in normalized
+            ):
+                raise AssertionError("analytics used a global event view")
+            if "agent_events_for_date" in normalized:
+                self.bounded_reads += 1
+            if parameters is None:
+                return self.con.execute(sql)
+            return self.con.execute(sql, parameters)
+
+    observed = RejectingGlobalSessions(low_coverage_analytics_db)
+
+    result = activity_analytics(observed, AnalyticsFilters(days=7))
+
+    assert result.totals.session_count == 3
+    assert observed.bounded_reads == 1
+
+
+def test_analytics_preserves_cross_midnight_session_attribution():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc)
+    span_time = now.replace(hour=0, minute=5, second=0, microsecond=0)
+    event_time = span_time - timedelta(minutes=10)
+    _insert_session(
+        con,
+        session_id="cross-midnight",
+        project="direct/project",
+        host="mac-mini",
+        harness="codex",
+        tokens=10,
+    )
+    con.execute(
+        """
+        UPDATE sessions
+        SET started_at=?, ended_at=?, repo_owner='event', repo_name='project'
+        WHERE session_id='cross-midnight'
+        """,
+        [event_time, event_time],
+    )
+    con.execute(
+        """
+        UPDATE spans_enriched
+        SET start_time=?, end_time=?, repo_owner=NULL, repo_name=NULL
+        WHERE session_id='cross-midnight'
+        """,
+        [span_time, span_time],
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert [project.project_key for project in result.projects] == ["event/project"]
+
+
+def test_analytics_attributes_event_only_sessions_to_their_repository():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    con.execute(
+        """
+        INSERT INTO sessions VALUES (
+          'event-only', 'macmini-claude', NULL, ?, ?,
+          'arniesaha', 'drover', 'main'
+        )
+        """,
+        [now, now],
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+        filtered = activity_analytics(
+            con,
+            AnalyticsFilters(days=7, project_key="arniesaha/drover"),
+        )
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 1
+    assert [
+        (project.project_key, project.session_count) for project in result.projects
+    ] == [("arniesaha/drover", 1)]
+    assert filtered.totals.session_count == 1
+    assert [project.project_key for project in filtered.projects] == [
+        "arniesaha/drover"
+    ]
 
 
 def test_analytics_removes_materialized_session_facts_after_failure(

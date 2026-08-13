@@ -359,6 +359,27 @@ def ingest_otlp_request(
 
         if new_rows:
             _write_partition(new_rows, parquet_dir)
+            partition_activity: dict[str, Any] = {}
+            for row in new_rows:
+                partition_date = row["start_time"].strftime("%Y-%m-%d")
+                activity_at = max(
+                    row.get("end_time") or row["start_time"], row["start_time"]
+                )
+                partition_activity[partition_date] = max(
+                    partition_activity.get(partition_date, activity_at), activity_at
+                )
+            for partition_date, latest_activity_at in partition_activity.items():
+                con.execute(
+                    """
+                    INSERT INTO span_partition_activity VALUES (?, ?)
+                    ON CONFLICT (date) DO UPDATE SET
+                      latest_activity_at = greatest(
+                        span_partition_activity.latest_activity_at,
+                        EXCLUDED.latest_activity_at
+                      )
+                    """,
+                    [partition_date, latest_activity_at],
+                )
             _upsert_tasks(con, new_rows)
             for row in new_rows:
                 span_id = row.get("span_id")

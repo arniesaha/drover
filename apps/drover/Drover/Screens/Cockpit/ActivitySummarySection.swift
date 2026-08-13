@@ -14,7 +14,10 @@ struct ActivitySummarySection: View {
             CockpitCard {
                 VStack(alignment: .leading, spacing: 9) {
                     HStack(alignment: .top, spacing: 16) {
-                        ActivityMetric(value: format(activity.totals.sessionCount), label: "Sessions")
+                        ActivityMetric(
+                            value: format(activity.totals.sessionCount),
+                            label: "Observed sessions"
+                        )
                         ActivityMetric(value: format(activity.totals.totalTokens), label: "Tokens")
                         ActivityMetric(value: currency(activity.totals.costUSD), label: "API cost")
                     }
