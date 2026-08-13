@@ -254,6 +254,29 @@ struct NotifierTests {
     #expect(badges == [1, 1])
 }
 
+
+@Test func openingASessionBeforeItAsksDoesNotSwallowTheLaterQuestion() async throws {
+    // A receipt means "I have seen this question", not "I have seen this
+    // session". Recording one for a session that was merely working would
+    // suppress the badge for a question asked minutes after the user left.
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+
+    let working = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: nil, cwd: "/p/a"),
+    ]))
+    await watcher.evaluate(working)
+    await watcher.markRead("sess-1", in: working)
+
+    let asking = try HarnessSnapshot.decode(from: snapshotData([
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "input", cwd: "/p/a"),
+    ]))
+    await watcher.evaluate(asking)
+
+    let badges = await spy.badgeCounts
+    #expect(badges == [0, 0, 1])
+}
+
 }
 
 }  // extension MockNetworkTests

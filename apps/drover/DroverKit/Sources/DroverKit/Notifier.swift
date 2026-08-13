@@ -63,9 +63,10 @@ public struct AttentionWatcher: Sendable {
     public static let readKey = "drover.needsyou.read"
 
     private let notifier: Notifying
-    // `UserDefaults` isn't `Sendable`, but it's documented thread-safe and is
-    // only ever read/written synchronously within `check(client:)` — same
-    // rationale as the other `nonisolated(unsafe)` uses in this package.
+    // Holds both the seen-set and the read receipts. `UserDefaults` isn't
+    // `Sendable`, but it's documented thread-safe and is only ever read and
+    // written synchronously inside these methods — same rationale as the
+    // other `nonisolated(unsafe)` uses in this package.
     private nonisolated(unsafe) let seenStore: UserDefaults
 
     public init(notifier: Notifying, seenStore: UserDefaults = .standard) {
@@ -106,14 +107,20 @@ public struct AttentionWatcher: Sendable {
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
     }
 
-    /// Record that the user has opened this session, and refresh the badge to
-    /// match. Marking a session that is not asking for anything is harmless:
-    /// it is pruned on the next pass and never counted in the first place.
+    /// Record that the user has seen what this session is asking, and refresh
+    /// the badge to match.
+    ///
+    /// A receipt says "I have seen this question", not "I have seen this
+    /// session", so one is only kept for a session that is asking right now.
+    /// Recording it for a merely-working session would suppress the badge for
+    /// a question that session asks minutes after the user has left it.
     public func markRead(_ sessionID: String, in snapshot: HarnessSnapshot) async {
         let needsYou = Self.needsYou(in: snapshot)
         var read = prunedRead(against: needsYou)
-        read.insert(sessionID)
-        seenStore.set(Array(read), forKey: Self.readKey)
+        if needsYou.contains(where: { $0.id == sessionID }) {
+            read.insert(sessionID)
+            seenStore.set(Array(read), forKey: Self.readKey)
+        }
         await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
     }
 
