@@ -21,6 +21,7 @@ from drover.server.harness.structured.codex import (
     CodexDriver,
     default_command,
     resolve_effective_context_window,
+    resolve_last_context_input_tokens,
 )
 
 FIXTURES_DIR = Path("tests/fixtures/structured")
@@ -212,6 +213,75 @@ def test_context_window_resolver_rejects_invalid_catalog_numbers(
     assert resolve_effective_context_window("gpt-5.6-sol", codex_home=tmp_path) is None
 
 
+def test_context_input_resolver_uses_latest_native_request_usage(tmp_path):
+    thread_id = "019ffc1f-01cc-78d1-b2ac-688296f6e3e0"
+    session_dir = tmp_path / "sessions/2026/08/13"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / f"rollout-2026-08-13T10-15-16-{thread_id}.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"input_tokens": 5_000_000},
+                            "last_token_usage": {"input_tokens": 230_000},
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"input_tokens": 5_996_226},
+                            "last_token_usage": {"input_tokens": 160_000},
+                        },
+                    },
+                },
+            ]
+        )
+    )
+
+    assert resolve_last_context_input_tokens(thread_id, codex_home=tmp_path) == 160_000
+
+
+def test_context_input_resolver_does_not_reuse_usage_before_latest_task(tmp_path):
+    thread_id = "019ffc1f-01cc-78d1-b2ac-688296f6e3e0"
+    session_dir = tmp_path / "sessions/2026/08/13"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / f"rollout-2026-08-13T10-15-16-{thread_id}.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {"input_tokens": 230_000},
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": None},
+                },
+            ]
+        )
+    )
+
+    assert resolve_last_context_input_tokens(thread_id, codex_home=tmp_path) is None
+
+
 def test_turn_completed_carries_model_and_effective_window():
     emitted: list = []
     driver = _driver_with_window_resolver(lambda model: 258_400, emitted)
@@ -222,6 +292,28 @@ def test_turn_completed_carries_model_and_effective_window():
     assert message.payload["model"] == "gpt-5.6-sol"
     assert message.payload["model_context_window"] == 258_400
     driver.close()
+
+
+def test_turn_completed_carries_current_request_context_usage():
+    driver = CodexDriver(
+        ["true"],
+        None,
+        lambda _message: None,
+        context_input_resolver=lambda thread_id: 160_000,
+    )
+    driver.parse_line('{"type":"thread.started","thread_id":"thread-abc"}')
+
+    message = driver.parse_line(
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 18_407_236},
+            }
+        ),
+        model="gpt-5.6-sol",
+    )[0]
+
+    assert message.payload["context_input_tokens"] == 160_000
 
 
 def test_turn_completed_keeps_model_when_window_is_unavailable():
