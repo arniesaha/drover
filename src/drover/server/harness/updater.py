@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from drover.config import DroverConfig
 from drover.server.runtime import RuntimeLayout, compare_versions
@@ -60,17 +61,56 @@ def is_quiescent(state) -> bool:
         return False
 
 
+# Used only when this process cannot tell what started it. Hosts installed by
+# the installer get these names; hosts set up by hand may not, which is the
+# whole reason the names are discovered first.
+_FALLBACK_SYSTEMD_UNIT = "drover-harnessd.service"
+_FALLBACK_LAUNCHD_LABEL = "com.drover.harnessd"
+_SELF_CGROUP = Path("/proc/self/cgroup")
+
+
+def _systemd_unit(cgroup: Path | None = None) -> str:
+    """The systemd unit this process is running under.
+
+    systemd does not hand a service its own unit name, but it does put the
+    process in a cgroup named after it, so the answer is on disk. Read rather
+    than assumed because the storage host's unit is `drover-nas-harnessd`, and
+    restarting a unit that does not exist fails silently.
+    """
+    try:
+        text = (cgroup or _SELF_CGROUP).read_text(encoding="utf-8")
+    except OSError:
+        return _FALLBACK_SYSTEMD_UNIT
+    for segment in reversed(text.strip().split("/")):
+        name = segment.strip()
+        if name.endswith(".service"):
+            return name
+    return _FALLBACK_SYSTEMD_UNIT
+
+
+def _launchd_label() -> str:
+    """The launchd job label, from the environment launchd gives its jobs.
+
+    launchd sets this to "0" for anything it did not start as a job, which is
+    every developer shell, so that case falls back rather than trying to
+    kickstart a label that is not one.
+    """
+    label = os.environ.get("XPC_SERVICE_NAME", "").strip()
+    if not label or label == "0":
+        return _FALLBACK_LAUNCHD_LABEL
+    return label
+
+
 def default_restarter() -> None:
     """Ask the service manager to restart us; it owns the process, not we."""
     if sys.platform == "darwin":
-        subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.drover.harnessd"],
-            check=False,
-        )
+        target = f"gui/{os.getuid()}/{_launchd_label()}"
+        log.info("asking launchd to restart %s", target)
+        subprocess.run(["launchctl", "kickstart", "-k", target], check=False)
     else:
-        subprocess.run(
-            ["systemctl", "--user", "restart", "drover-harnessd.service"], check=False
-        )
+        unit = _systemd_unit()
+        log.info("asking systemd to restart %s", unit)
+        subprocess.run(["systemctl", "--user", "restart", unit], check=False)
 
 
 class HostUpdater:
