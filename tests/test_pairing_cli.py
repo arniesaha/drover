@@ -29,9 +29,18 @@ def test_advertised_host_port_falls_back_to_loopback():
     assert _advertised_host_port(cfg) == f"127.0.0.1:{cfg.metrics_http_port}"
 
 
-def test_pair_prints_a_qr_and_warns_about_loopback(monkeypatch):
+def _pair_cli(monkeypatch, cfg):
+    """Invoke `pair` against a given config rather than whatever is on disk.
+
+    `pair` takes no --config here, so without this the command loads the real
+    ~/.drover/config.toml. That made the loopback assertion below pass only on
+    machines where advertised_url is unset -- which is to say, machines where
+    pairing is not configured. It passed in CI and failed on every host that
+    had been set up properly, which is exactly backwards.
+    """
     import drover.server.__main__ as server_main
 
+    monkeypatch.setattr(server_main, "_resolve_config", lambda path: cfg)
     monkeypatch.setattr(
         server_main,
         "_local_api_request",
@@ -41,12 +50,34 @@ def test_pair_prints_a_qr_and_warns_about_loopback(monkeypatch):
             "fleet_name": "home-fleet",
         },
     )
-    result = CliRunner().invoke(main, ["pair"])
+    return CliRunner().invoke(main, ["pair"])
+
+
+def test_pair_prints_a_qr_and_warns_about_loopback(monkeypatch):
+    result = _pair_cli(monkeypatch, default_config())
     assert result.exit_code == 0, result.output
     assert "K7QP-2M4X" in result.output
     assert "drover://127.0.0.1:7080?v=1&code=K7QP-2M4X&n=home-fleet" in result.output
     assert "█" in result.output, "the QR itself must be rendered"
     assert "only reachable from this machine" in result.output
+
+
+def test_pair_uses_the_configured_advertised_address(monkeypatch):
+    """The configured case had no coverage at all, which is why the leak hid.
+
+    A phone scans this QR from outside the machine, so the address the hub
+    advertises is the whole point of the code; loopback is the fallback, not
+    the subject.
+    """
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="http://100.64.0.10:7080"
+    )
+
+    result = _pair_cli(monkeypatch, cfg)
+
+    assert result.exit_code == 0, result.output
+    assert "drover://100.64.0.10:7080?v=1&code=K7QP-2M4X&n=home-fleet" in result.output
+    assert "only reachable from this machine" not in result.output
 
 
 def test_pair_host_prints_a_pasteable_command(monkeypatch):
