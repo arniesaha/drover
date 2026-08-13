@@ -24,6 +24,9 @@ struct DroverApp: App {
     // The notification center holds its delegate weakly — keep it alive for
     // the app's lifetime.
     private let notificationPresenter = ForegroundNotificationPresenter()
+    // The only route an APNs device token has into the app: the remote-
+    // notification delegate callbacks have no SwiftUI equivalent.
+    @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var pushDelegate
 
     init() {
         // Must happen before the app finishes launching, so this lives in
@@ -152,8 +155,20 @@ private struct RootView: View {
     }
 
     private func requestNotificationPermissionIfConfigured() async {
-        guard environment.client != nil else { return }
-        _ = try? await UNUserNotificationCenter.current()
-            .requestAuthorization(options: [.alert, .badge, .sound])
+        guard let client = environment.client else { return }
+        let granted = (try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .badge, .sound])) ?? false
+
+        // Hand over the client regardless of the authorization answer: a
+        // token already registered with the hub must still be refreshed (or
+        // re-pointed at a new hub) even if the user has since turned alerts
+        // off, and a device with no token simply never uploads one.
+        PushRegistrar.shared.updateClient(client)
+
+        // Asking for the token requires authorization — without it iOS never
+        // calls back, and with it this is idempotent (the existing token is
+        // returned rather than a new one minted).
+        guard granted else { return }
+        PushRegistrar.shared.requestTokenFromSystem()
     }
 }

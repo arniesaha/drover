@@ -22,6 +22,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.arnab.drover
         CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: Drover/Drover.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
@@ -51,12 +52,20 @@ targets:
           drover-server. The camera is not used for anything else.
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
-    # No entitlements: the time-sensitive notifications capability
-    # (com.apple.developer.usernotifications.time-sensitive) is not supported
-    # by personal development teams, so requesting it breaks on-device deploys
-    # with a free Apple ID. LocalNotifier still marks "needs you" alerts
-    # .timeSensitive — iOS silently downgrades them to .active without the
-    # entitlement. Paid-team builds can re-add it here to break through Focus.
+    # Requires a paid team: neither the push nor the time-sensitive
+    # entitlement is grantable to a personal one, which is why this app spent
+    # its first months on local notifications alone (iOS silently downgraded
+    # every .timeSensitive alert to .active). Adding `aps-environment` also
+    # makes automatic signing enable the Push Notifications capability on the
+    # App ID, so the first build after this change needs network and
+    # -allowProvisioningUpdates, which scripts/deploy-ios.sh already passes.
+    # Referenced via CODE_SIGN_ENTITLEMENTS rather than xcodegen's
+    # `entitlements:` key, because that key *generates* the file from inline
+    # `properties` and would overwrite the checked-in one with an empty plist.
+    # Deliberately still just [fetch]: "needs you" arrives as a visible alert
+    # push, which needs no background mode. `remote-notification` would only
+    # be required for silent content-available pushes, and adding it without
+    # implementing didReceiveRemoteNotification would be dead config.
   DroverTests:
     type: bundle.unit-test
     platform: iOS

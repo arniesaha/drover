@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Development, because the app is installed over devicectl with a
+	     development provisioning profile; APNs then issues sandbox device
+	     tokens and the server must talk to api.sandbox.push.apple.com. A
+	     TestFlight or App Store build needs "production" here instead, and
+	     APNsEnvironment.current() reads this same value back out of the
+	     embedded profile at runtime so the two can never disagree. -->
+	<key>aps-environment</key>
+	<string>development</string>
+	<!-- Breaks "needs you" alerts through Focus and lock-screen deferral,
+	     which is the entire point of the notification: the harness is
+	     blocked on the user. Not grantable to a personal team, which is why
+	     this file did not exist before. -->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
+	<true/>
+</dict>
+</plist>
