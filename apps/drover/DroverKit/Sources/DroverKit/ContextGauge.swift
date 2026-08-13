@@ -3,8 +3,8 @@ import Foundation
 /// How full the model's context window is *right now*.
 ///
 /// Claude reports one API call's prompt usage on each assistant message.
-/// Codex reports cumulative input on turn completions, so its current prompt
-/// pressure is the delta between consecutive completion totals.
+/// Codex's turn completion total spans every model call in the turn. Drover
+/// enriches that completion with the native transcript's latest-request usage.
 public struct ContextGauge: Sendable, Equatable {
     public let usedTokens: Int
     /// Nil when the newest provider-specific usage payload has no window.
@@ -47,27 +47,21 @@ public struct ContextGauge: Sendable, Equatable {
         return nil
     }
 
-    /// Codex completion usage is cumulative. The newest minus the preceding
-    /// valid sample is the latest prompt; a first or reset sample stands alone.
+    /// Only the newest completion is relevant. A missing precise value must not
+    /// fall back to cumulative turn usage or an older, stale completion.
     private static func latestCodexContext(
         _ messages: [HarnessMessage]
     ) -> (usedTokens: Int, window: Int?)? {
-        var samples: [(input: Int, window: Int?)] = []
         for message in messages.reversed() {
             guard message.type == .status,
-                  message.payload["turn_complete"]?.boolValue == true,
-                  let usage = message.payload["usage"]?.objectValue,
-                  let input = nonnegativeInt(usage["input_tokens"]?.numberValue) else { continue }
+                  message.payload["turn_complete"]?.boolValue == true else { continue }
+            guard let input = nonnegativeInt(
+                message.payload["context_input_tokens"]?.numberValue
+            ) else { return nil }
             let window = positiveInt(message.payload["model_context_window"]?.numberValue)
-            samples.append((input, window))
-            if samples.count == 2 { break }
+            return (input, window)
         }
-
-        guard let latest = samples.first else { return nil }
-        guard samples.count == 2 else { return (latest.input, latest.window) }
-        let previous = samples[1].input
-        let used = latest.input >= previous ? latest.input - previous : latest.input
-        return (used, latest.window)
+        return nil
     }
 
     private static func positiveInt(_ number: Double?) -> Int? {
