@@ -481,7 +481,13 @@ class CodexDriver:
                         "tool_use_id": item.get("id"),
                         "exit_code": item.get("exit_code"),
                         "status": item.get("status"),
-                        **item,
+                        # Everything else codex reported, minus the output
+                        # itself: `text` above already carries it, and shell
+                        # output is the largest thing a session produces. Sent
+                        # twice it accounted for 1,306KB of a 2,889KB
+                        # transcript page on a live session — for a field
+                        # nothing reads.
+                        **{k: v for k, v in item.items() if k != "aggregated_output"},
                     },
                 )
             ]

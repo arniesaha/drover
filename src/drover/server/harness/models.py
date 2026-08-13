@@ -128,6 +128,17 @@ class HarnessEvent:
         payload["event_id"] = self.event_id
         payload["session_id"] = self.session_id
         payload["seq"] = self.seq
+        # Shell output already rides in `text`. The codex adapter used to put
+        # a second copy in the payload as well, which on a live session was
+        # 992KB across 236 tool results — for a field nothing has ever read.
+        # The adapter no longer writes it, but every event already stored
+        # does, so it is dropped here too rather than waiting for that history
+        # to age out of the transcript window.
+        inner = payload.get("payload")
+        if isinstance(inner, dict) and "aggregated_output" in inner:
+            payload["payload"] = {
+                key: value for key, value in inner.items() if key != "aggregated_output"
+            }
         return payload
 
     @classmethod
