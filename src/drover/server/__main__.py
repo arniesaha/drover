@@ -1530,9 +1530,11 @@ def export_bundle_cmd(
 )
 @click.option(
     "--metrics-host",
-    default="127.0.0.1",
-    show_default=True,
-    help="Cockpit/metrics HTTP bind host (set explicitly for a trusted private network)",
+    default=None,
+    help=(
+        "Cockpit/metrics HTTP bind host. Overrides [server] metrics_host in "
+        "config.toml, which defaults to 127.0.0.1."
+    ),
 )
 @click.option(
     "--no-summarizer", is_flag=True, help="Skip starting the summarizer worker"
@@ -1551,7 +1553,7 @@ def run(
     no_mcp: bool,
     mcp_host: str,
     no_metrics: bool,
-    metrics_host: str,
+    metrics_host: Optional[str],
     no_summarizer: bool,
     no_briefs: bool,
     no_embeddings: bool,
@@ -1567,6 +1569,16 @@ def run(
     # store -- and db.py logs which way it went. The lock split and the
     # separate database in control_plane_connection apply regardless (#95).
     pin_control_plane_connection(cfg.duckdb_path)
+
+    # An explicit --metrics-host wins; otherwise the bind comes from
+    # [server] metrics_host in config.toml. Keeping it in config matters
+    # because a service unit's argv is one regenerated unit away from
+    # silently reverting the server to loopback, and that failure is
+    # invisible until the app stops loading any screen.
+    if metrics_host is None:
+        metrics_host = cfg.server_metrics_host
+    log.info("cockpit HTTP binding to %s:%s", metrics_host, cfg.metrics_http_port)
+
     stop = threading.Event()
 
     job_streams: dict[str, RedisJobStream] = {}

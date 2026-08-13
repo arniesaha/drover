@@ -4,14 +4,43 @@ The first supported setup runs `drover-server`, `drover-harnessd`, and the
 agent CLI on one machine. Add other trusted machines only after the local path
 works.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
+```
+
+That installs a verified release into `~/.drover/runtime/<version>`, starts
+both services, detects an address your phone can reach, and prints a QR code
+to pair with. It refuses to run if it finds a Drover service it did not
+create; pass `--adopt` to migrate an existing source install.
+
+Useful flags:
+
+- `--dry-run` prints exactly what it would do and changes nothing.
+- `--url <host:port>` overrides address detection. Private addresses only.
+- `--version vX.Y.Z` pins a release instead of taking the latest.
+- `--join <drover://...>` adds this machine to an existing fleet. See
+  [Multi-Host](multi-host.md).
+
+Adding a second machine is one pasted command, printed by
+`drover-server pair-host` on the machine that already runs the hub.
+
 ## Prerequisites
 
 - macOS or Linux with Python 3.11+
-- [uv](https://docs.astral.sh/uv/)
 - At least one supported agent CLI installed and signed in
 - Xcode 16+ and XcodeGen only if you are building the iOS app
 
-## 1. Install
+The installer brings its own [uv](https://docs.astral.sh/uv/) if you do not
+have it.
+
+## Build From Source
+
+Contributors, and anyone who would rather not run an installer, can do the
+same thing by hand.
+
+### 1. Install
 
 ```bash
 git clone https://github.com/arniesaha/drover.git
@@ -34,7 +63,7 @@ The server enables bearer-token authentication by default. On first start it
 creates `~/.drover/api_token` with mode `0600` unless `DROVER_API_TOKEN` or an
 explicit config value is provided.
 
-## 2. Start The Central Process
+### 2. Start The Central Process
 
 ```bash
 uv run drover-server run
@@ -52,7 +81,7 @@ curl -fsS \
   http://127.0.0.1:7080/harness/hosts
 ```
 
-## 3. Start A Local Harness Host
+### 3. Start A Local Harness Host
 
 ```bash
 uv run drover-harnessd \
@@ -69,7 +98,7 @@ central server owns the fleet API and proxies app requests to the daemon.
 
 Run the authenticated hosts request again and confirm the local host appears.
 
-## 4. Connect The iOS App
+## Connect The iOS App
 
 Build the app using [the source-build guide](../apps/drover/README.md), then
 pair it:
@@ -91,27 +120,34 @@ Funnel.
 Manual URL and token entry stays available in app settings as the recovery path
 for when a camera is unavailable.
 
-## 5. Add Private Tailscale Access
+## Add Private Tailscale Access
 
 Install Tailscale on the server machine and iPhone, sign both into the same
 tailnet, and verify the phone can reach the machine's private Tailscale address.
 Keep port `7080` private to the tailnet.
 
-Central listeners bind to `127.0.0.1` by default. Bind only the cockpit HTTP
-surface to the private interface when the iOS app must connect from another
-device:
+Central listeners bind to `127.0.0.1` by default. The installer detects a
+private address and writes both keys for you; set them by hand only on a
+source install:
 
-```bash
-uv run drover-server run --metrics-host 0.0.0.0
+```toml
+[server]
+metrics_host = "0.0.0.0"
+advertised_url = "100.64.0.10:7080"
 ```
 
-Use `http://<private-tailscale-ip>:7080` in the app. The bearer token is still
-required. Review [Security](security.md) before changing bind addresses.
+`metrics_host` is the bind, and `advertised_url` is what the pairing QR points
+at. Both live in config rather than only in a command line, because a
+regenerated service unit that dropped the flag would silently revert the
+server to loopback, and that failure is invisible until the app stops loading.
+An explicit `--metrics-host` still overrides the config value.
+
+Review [Security](security.md) before changing bind addresses.
 
 OTLP and MCP remain loopback-only unless you also set `--otlp-host` or
 `--mcp-host` explicitly.
 
-## 6. Verify The Context Surface
+## Verify The Context Surface
 
 ```bash
 uv run drover-server status

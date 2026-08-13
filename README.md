@@ -48,32 +48,23 @@ See [Architecture](docs/architecture.md) for the component boundaries and
 
 ## Quickstart
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Requires macOS or Linux with Python 3.11+.
 
 ```bash
-git clone https://github.com/arniesaha/drover.git
-cd drover
-uv sync --extra dev
-uv run drover-server init
-uv run drover-server run
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
 ```
 
-In another terminal, start a local harness host:
+This installs a checksum-verified release, starts the server and a local
+harness host, detects an address your phone can reach, and prints a QR code.
+Scan it with the app and you are connected: no token is typed or copied.
 
-```bash
-uv run drover-harnessd \
-  --host-id local \
-  --kind macos \
-  --central-url http://127.0.0.1:7080 \
-  --local-url http://127.0.0.1:7081
-```
+Add another machine with the one-liner printed by
+`drover-server pair-host --name <host>`.
 
-`init` enables the local cockpit on `127.0.0.1:7080`. The first server start
-creates `~/.drover/api_token` with mode `0600`. Use
-that token when configuring the iOS app or calling the harness API.
+Pass `--dry-run` to see exactly what it would do without changing anything.
 
-Continue with [Getting Started](docs/getting-started.md) for verification,
-private Tailscale setup, and optional context ingestion.
+Continue with [Getting Started](docs/getting-started.md) for the source-build
+path, verification, private Tailscale setup, and optional context ingestion.
 
 ## Context store
 

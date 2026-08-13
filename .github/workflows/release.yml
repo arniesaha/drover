@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag to build and publish, e.g. v0.1.1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release artifacts
+    runs-on: ubuntu-latest
+    steps:
+    # On a tag push GITHUB_REF_NAME is the tag, which is what we want. On
+    # workflow_dispatch it is the *branch*, so a manual run without this
+    # would publish a release named "main". Resolve once and use RELEASE_TAG
+    # everywhere below.
+    - name: Resolve the tag being released
+      run: |
+        TAG="${{ inputs.ref || github.ref_name }}"
+        case "$TAG" in
+          v*) ;;
+          *) echo "refusing to release non-tag ref: $TAG" >&2; exit 1 ;;
+        esac
+        echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref || github.ref }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        version: "0.5.29"
+
+    - name: Build the wheel
+      run: uv build --wheel --out-dir dist
+
+    - name: Export a hash-pinned universal lockfile
+      run: |
+        uv export --no-emit-project --no-dev --format requirements-txt \
+          > dist/requirements.lock.txt
+        # Load-bearing: a lockfile without hashes makes --require-hashes a
+        # no-op at install time, which would leave "checksum verified" true
+        # of only Drover's own small fraction of the installed bytes.
+        grep -q -- "--hash=sha256:" dist/requirements.lock.txt
+
+    - name: Generate the checksum manifest
+      run: |
+        cd dist
+        sha256sum drover-*-py3-none-any.whl requirements.lock.txt \
+          > SHA256SUMS.txt
+        cat SHA256SUMS.txt
+
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "${RELEASE_TAG}" \
+          --title "${RELEASE_TAG}" \
+          --generate-notes \
+          dist/drover-*-py3-none-any.whl \
+          dist/requirements.lock.txt \
+          dist/SHA256SUMS.txt

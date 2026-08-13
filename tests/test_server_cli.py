@@ -427,9 +427,25 @@ def test_cli_init_writes_default_config(tmp_path):
 
 
 def test_run_help_uses_loopback_bind_defaults():
+    """Every bind still defaults to loopback, and still says so.
+
+    --otlp-host and --mcp-host carry their default on the flag. --metrics-host
+    no longer does: its default now comes from [server] metrics_host, so the
+    installer can persist a detected private address somewhere a regenerated
+    service unit cannot silently drop. The loopback default moved rather than
+    disappeared, so assert both halves.
+    """
+    from drover.config import default_config
+
     result = CliRunner().invoke(main, ["run", "--help"])
     assert result.exit_code == 0, result.output
-    assert result.output.count("[default: 127.0.0.1]") == 3
+    assert result.output.count("[default: 127.0.0.1]") == 2
+
+    metrics_help = result.output.split("--metrics-host")[1].split("--no-summarizer")[0]
+    assert "127.0.0.1" in metrics_help
+    assert "metrics_host" in metrics_help
+
+    assert default_config().server_metrics_host == "127.0.0.1"
 
 
 def test_cli_init_does_not_overwrite_existing(tmp_path):

@@ -277,3 +277,21 @@ def test_content_analysis_rejects_unsafe_configuration(tmp_path, field, value):
 
     with pytest.raises(ValueError, match=field):
         load_config(cfg_file)
+
+
+def test_server_metrics_host_defaults_to_loopback():
+    """Hardened default: binding wide open must be a deliberate act."""
+    assert default_config().server_metrics_host == "127.0.0.1"
+
+
+def test_server_metrics_host_is_read_from_config(tmp_path):
+    """The installer writes the detected private address here.
+
+    It must be a real config key, not decoration: --metrics-host lives only in
+    a service unit's argv, and a regenerated unit that dropped the flag would
+    silently revert the server to loopback. That failure is invisible until
+    the app stops loading any screen.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text('[server]\nmetrics_host = "100.64.0.10"\n', encoding="utf-8")
+    assert load_config(path).server_metrics_host == "100.64.0.10"

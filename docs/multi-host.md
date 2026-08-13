@@ -30,6 +30,31 @@ uv run drover-server run --metrics-host 0.0.0.0
 Only add `--mcp-host` or `--otlp-host` when remote agents or collectors need
 those listeners too.
 
+## Adding A Machine
+
+On the machine that already runs the hub:
+
+```bash
+drover-server pair-host --name build-mac
+```
+
+That prints a one-liner to paste on the new machine, carrying a single-use
+code that expires in fifteen minutes:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh \
+  | bash -s -- --join 'drover://100.64.0.10:7080?v=1&code=H3TW-9KQ2'
+```
+
+The joining machine installs `drover-harnessd` only, never a second hub. It
+asks whether the hub can reach it back, then registers as a direct host if so
+and a relay host if not, so nobody has to know in advance which applies. That
+probe does not consume the code, so a machine that turns out to be unreachable
+can be retried without asking for a fresh one.
+
+The two sections below describe the same modes for a source install, where you
+pick the mode yourself.
+
 ## Direct Hosts
 
 Use a direct host when the central server can reach its private address. Bind
@@ -107,7 +132,24 @@ it.
 
 ## Service Installation
 
-The repository includes launchd and systemd templates under `scripts/`. Treat
-them as starting points: review paths, bind addresses, environment variables,
-and token-file permissions before loading a service. Source-build service
-packaging remains in progress for v0.1.
+The installer writes and loads service units for you: launchd agents on macOS,
+systemd user units on Linux, with lingering enabled so they survive a logout.
+Both point at `~/.drover/runtime/current`, so an upgrade is a symlink flip
+rather than a unit rewrite, and both set `PATH` explicitly, because a unit
+that inherits nothing cannot find the agent CLIs it exists to drive.
+
+To see what would be written without touching anything:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh \
+  | bash -s -- --dry-run
+```
+
+For a source install, generate the same units with
+`drover.server.service_units`, or write your own; review paths, bind
+addresses, environment variables, and token-file permissions before loading
+either.
+
+`scripts/enroll-host.sh` has been removed. It required a hand-placed fleet
+token and refused every mode except relay; `install.sh --join` covers what it
+did and picks the mode from an actual reachability check.
