@@ -41,6 +41,9 @@ struct ChatView: View {
     /// growth pushing the bottom away must not; that was the stuck-button
     /// race: a tall new row unpinned before the coalesced scroll fired).
     @State private var scrollPhase: ScrollPhase = .idle
+    /// Flipped by a timer once the cold open has lasted long enough to be
+    /// worth acknowledging. A local open beats it and the screen stays quiet.
+    @State private var coldOpenIsSlow = false
 
     init(
         client: DroverClient,
@@ -70,7 +73,23 @@ struct ChatView: View {
                 ReconnectingPill(accessibilityID: "chat-reconnecting")
             }
 
+            // A cold open assembles its window over four serialized round
+            // trips, so the transcript area is genuinely empty until the
+            // first of them lands. Overlaid rather than swapped in: the
+            // transcript keeps its geometry, so nothing jumps when the
+            // messages arrive underneath.
             transcript
+                .overlay {
+                    if DroverLoadingMark.shouldShow(
+                        hasConnectedOnce: model.hasConnectedOnce,
+                        elapsed: coldOpenIsSlow ? DroverLoadingMark.appearAfter : 0
+                    ) {
+                        DroverLoadingMarkView()
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeIn(duration: 0.2), value: coldOpenIsSlow)
+                .animation(.easeIn(duration: 0.2), value: model.hasConnectedOnce)
 
             // Read once: `artifacts` is cached, but two reads still cost two
             // dictionary lookups and obscure that this is one value.
@@ -122,6 +141,14 @@ struct ChatView: View {
         .task {
             model.start()
             await model.loadSessionMetadata()
+        }
+        // Separate task so the delay races the connect rather than waiting
+        // behind it: `loadSessionMetadata` above suspends, and a timer sharing
+        // that task would not tick until it returned.
+        .task {
+            try? await Task.sleep(for: .seconds(DroverLoadingMark.appearAfter))
+            guard !Task.isCancelled else { return }
+            coldOpenIsSlow = true
         }
         .onDisappear { model.stop() }
         // A handoff (`/continue`) creates a structured session for

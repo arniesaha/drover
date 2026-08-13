@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -132,11 +133,43 @@ def install_version(
     Already-installed and smoke-clean is treated as success, so a host that
     installed a version and then waited hours for quiesce does not re-download
     it on every heartbeat.
+
+    Anything left of a failed attempt is cleared, both before starting and
+    after failing. `uv venv` refuses a directory that already exists, so a
+    half-built tree left behind makes every retry fail on the wreckage instead
+    of on the real problem — and reports the wrong cause while doing it. Worse,
+    that tree still counts as an installed version, so it can be kept by
+    `prune` in place of a good one.
     """
     target = layout.version_dir(artifact.version)
     if target.exists() and layout.smoke_test(artifact.version):
         return True
 
+    _discard(target)
+    if _install_into(layout, artifact, runner=runner, opener=opener):
+        return True
+    _discard(target)
+    return False
+
+
+def _discard(target: Path) -> None:
+    """Remove a version tree, best effort. A failure here is not fatal."""
+    if not target.exists():
+        return
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        log.warning("could not clear %s; a retry may fail on it", target)
+
+
+def _install_into(
+    layout: RuntimeLayout,
+    artifact: ReleaseArtifact,
+    *,
+    runner,
+    opener,
+) -> bool:
+    target = layout.version_dir(artifact.version)
     with tempfile.TemporaryDirectory() as work_dir:
         work = Path(work_dir)
         wheel = work / Path(artifact.wheel_url).name
