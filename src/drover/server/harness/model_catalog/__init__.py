@@ -2,6 +2,7 @@
 
 from .models import CatalogEnvelope, DiscoveredCatalog, ModelOption, ReasoningOptions
 from .codex import CodexCatalogAdapter
+from .agy import AgyCatalogAdapter
 from .scope import AccountScopeIDs
 from .service import (
     CatalogAdapter,
@@ -21,4 +22,5 @@ __all__ = [
     "AccountScopeIDs",
     "ModelCatalogService",
     "CodexCatalogAdapter",
+    "AgyCatalogAdapter",
 ]
