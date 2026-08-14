@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+import logging
 from threading import RLock
 from typing import Callable, Mapping, Protocol
 
 from .models import CatalogEnvelope, DiscoveredCatalog, STALE_REASONS
 from .scope import AccountScopeIDs
+
+log = logging.getLogger("drover.model_catalog")
 
 
 class CatalogDiscoveryError(RuntimeError):
@@ -100,8 +103,20 @@ class ModelCatalogService:
                     models=discovered.models,
                 )
             except CatalogDiscoveryError as error:
+                log.warning(
+                    "model catalog discovery failed harness=%s stale_reason=%s",
+                    harness,
+                    error.category,
+                    extra={"harness": harness, "stale_reason": error.category},
+                )
                 return self._failed_read(harness, cached, error.category)
             except Exception:
+                log.warning(
+                    "model catalog discovery failed harness=%s stale_reason=%s",
+                    harness,
+                    "protocol_error",
+                    extra={"harness": harness, "stale_reason": "protocol_error"},
+                )
                 return self._failed_read(harness, cached, "protocol_error")
 
             if not envelope.stale or cached is None or cached.envelope.stale:
