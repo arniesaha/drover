@@ -20,10 +20,10 @@ It does not require a Drover cloud service.
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view with active sessions and provider capacity" width="200">
-  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="200">
-  <img src="docs/assets/screenshots/ios-cockpit.png" alt="Drover cockpit view with observed activity and busiest projects" width="200">
-  <img src="docs/assets/screenshots/ios-analytics.png" alt="Drover analytics view with provider capacity and observed usage" width="200">
+  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view with active sessions and provider capacity" width="160">
+  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="160">
+  <img src="docs/assets/screenshots/ios-cockpit.png" alt="Drover cockpit view with observed activity and busiest projects" width="160">
+  <img src="docs/assets/screenshots/ios-analytics.png" alt="Drover analytics view with provider capacity and observed usage" width="160">
 </p>
 
 The dark-mode fleet view groups live work by host and keeps provider capacity
