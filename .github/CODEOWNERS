@@ -1,0 +1,47 @@
+# CODEOWNERS
+#
+# This file defines GitHub code owners for Drover.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Format: path/to/dir * @owner
+# Use @owner for automatic review requests.
+
+# Default ownership - all files
+* @arniesaha
+
+# Documentation
+/docs/*.md @arniesaha
+/docs/*.mdx @arniesaha
+
+# Security documentation
+/docs/security.md @arniesaha
+/docs/threat-model.md @arniesaha
+/SECURITY.md @arniesaha
+
+# GitHub-specific files
+/.github/ @arniesaha
+/.github/workflows/* @arniesaha
+/.github/CODEOWNERS @arniesaha
+
+# Core backend packages
+/drover/pyproject.toml @arniesaha
+/drover/src/drover/* @arniesaha
+/drover/tests/* @arniesaha
+
+# Mobile app
+/apps/drover/*.xcodeproj @arniesaha
+/apps/drover/Sources/* @arniesaha
+/apps/drover/Tests/* @arniesaha
+
+# Deployment and infrastructure
+/deploy/* @arniesaha
+/*.sh @arniesaha
+/Makefile @arniesaha
+
+# Configuration templates
+/*-example @arniesaha
+/*.example @arniesaha
+
+# Build artifacts and generated files
+*.duckdb @arniesaha
+*.parquet @arniesaha
