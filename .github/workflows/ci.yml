@@ -39,24 +39,37 @@ jobs:
           exit 1
         fi
         echo "every workflow uses GitHub-hosted runners"
+
+    - name: Select test scope
+      id: scope
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        python scripts/ci/select_test_scope.py \
+          --base "$BASE_SHA" \
+          --github-output "$GITHUB_OUTPUT"
     
     - name: Set up Python
+      if: steps.scope.outputs.python == 'true'
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
         cache: "pip"
 
     - name: Install dependencies
+      if: steps.scope.outputs.python == 'true'
       run: |
         python -m pip install --upgrade pip
         pip install -e ".[dev]"
 
     - name: Configure git identity (for tests that create tmp git repos)
+      if: steps.scope.outputs.python == 'true'
       run: |
         git config --global user.email "ci@drover.local"
         git config --global user.name "Drover CI"
 
     - name: Check formatting with Black
+      if: steps.scope.outputs.python == 'true'
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
       run: |
@@ -70,7 +83,16 @@ jobs:
           echo "$PY_FILES" | xargs black --check
         fi
 
+    - name: Run lightweight checks
+      if: steps.scope.outputs.python != 'true'
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        git diff --check "$BASE_SHA"...HEAD
+        python scripts/check_public_release.py
+
     - name: Run tests with pytest
+      if: steps.scope.outputs.python == 'true'
       run: pytest tests/
 
     # The installer is shell, so pytest alone leaves it unguarded. Every
@@ -78,6 +100,7 @@ jobs:
     # network. Grouped per suite, and the loop keeps going so one failure
     # does not hide the others.
     - name: Run installer shell tests
+      if: steps.scope.outputs.python == 'true'
       run: |
         bash -n install.sh
         bash -n scripts/lib/verify.sh
