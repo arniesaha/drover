@@ -3,6 +3,7 @@
 from .models import CatalogEnvelope, DiscoveredCatalog, ModelOption, ReasoningOptions
 from .codex import CodexCatalogAdapter
 from .agy import AgyCatalogAdapter
+from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
 from .scope import AccountScopeIDs
 from .service import (
     CatalogAdapter,
@@ -23,4 +24,6 @@ __all__ = [
     "ModelCatalogService",
     "CodexCatalogAdapter",
     "AgyCatalogAdapter",
+    "ClaudeCatalogAdapter",
+    "ClaudeModelPolicy",
 ]

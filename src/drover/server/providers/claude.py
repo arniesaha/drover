@@ -9,27 +9,29 @@ render rather than surfacing as an error.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import getpass
 import hashlib
 import http.client
 import json
 import logging
 import os
 from pathlib import Path
-import subprocess
-import sys
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
+from drover.server.providers.claude_credentials import (
+    ClaudeCredentialError,
+    _load_account_metadata,
+    load_claude_credential,
+)
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
 log = logging.getLogger(__name__)
 
 _USAGE_PATH = "/api/oauth/usage"
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
-_ACCOUNT_LABEL = "Claude Code"
+_MAX_HTTP_BODY_BYTES = 1024 * 1024
 _SOURCE = "claude-oauth-usage"
 # Only the windows whose duration is actually known. Anything else passes
 # through with window_minutes=None; inferring a duration from the key would
@@ -40,15 +42,6 @@ _WINDOW_MINUTES = {
     "seven_day_opus": 10080,
     "seven_day_sonnet": 10080,
 }
-_KEYCHAIN_SERVICE = "Claude Code-credentials"
-# The central server's fetch of /providers/usage times out at 10s (see
-# metrics.py, near line 1017), and read() spends this budget on the
-# Keychain sequentially before spending up to timeout_s (default 5s) on the
-# HTTP call. At 5.0 the two together could exhaust the whole 10s host-fetch
-# budget, losing every provider card for that host (not just this one) to a
-# single slow Keychain prompt. 2.0 leaves headroom for the HTTP leg and the
-# rest of that request.
-_KEYCHAIN_TIMEOUT_S = 2.0
 
 
 class _ProbeFailure(RuntimeError):
@@ -83,15 +76,30 @@ class ClaudeUsageProbe:
         self.base_url = (
             base_url or os.environ.get("ANTHROPIC_BASE_URL") or _DEFAULT_BASE_URL
         ).rstrip("/")
-        self.keychain_reader = keychain_reader or _read_keychain
+        self.keychain_reader = keychain_reader
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = datetime.now(timezone.utc)
-        account_label = self._account_label()
+        _, account_label = _load_account_metadata(self.account_path)
         try:
-            token, plan_label = self._credentials()
-            payload = self._fetch(token)
+            credential = load_claude_credential(
+                credentials_path=self.credentials_path,
+                account_path=self.account_path,
+                keychain_reader=self.keychain_reader,
+            )
+            payload = self._fetch(credential.access_token)
             windows = _windows(payload)
+            plan_label = credential.subscription_type
+        except ClaudeCredentialError as exc:
+            return _snapshot(
+                host_id=host_id,
+                account_label=account_label,
+                status=exc.status,
+                observed_at=observed_at,
+                windows=(),
+                plan_label=None,
+                error_category=exc.category,
+            )
         except _ProbeFailure as exc:
             return _snapshot(
                 host_id=host_id,
@@ -131,100 +139,6 @@ class ClaudeUsageProbe:
             plan_label=plan_label,
             error_category=None,
         )
-
-    def _account_label(self) -> str:
-        """Name the subscription this host is signed into.
-
-        Anthropic's usage endpoint says nothing about *which* account it
-        answered for, and the fleet runs more than one: a personal
-        subscription on some hosts and a work subscription on others. Reported
-        under one generic name they merge into a single card, which attributes
-        one account's consumption to the other's machines. The signed-in
-        identity is in the CLI's own config, so it is read per host and used
-        the way the Codex probe uses its account email.
-
-        Falls back rather than failing: an unreadable or unfamiliar config
-        gives the generic name, which is no worse than before this existed.
-        """
-        try:
-            raw = json.loads(self.account_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return _ACCOUNT_LABEL
-        account = raw.get("oauthAccount") if isinstance(raw, Mapping) else None
-        if not isinstance(account, Mapping):
-            return _ACCOUNT_LABEL
-        for key in ("emailAddress", "organizationName", "accountUuid"):
-            value = account.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return _ACCOUNT_LABEL
-
-    def _credentials(self) -> tuple[str, str | None]:
-        saw_expired = False
-        saw_malformed = False
-        read_failure: _ProbeFailure | None = None
-        for load in (self._keychain_blob, self._file_blob):
-            try:
-                raw = load()
-            except _ProbeFailure as exc:
-                # A source that is present but broken (e.g. an unreadable
-                # credentials file) is a real error, not an absent source --
-                # but it is deferred rather than raised immediately, so an
-                # expired token already seen from an earlier source (the
-                # Keychain runs first) wins: token_expired is more
-                # actionable than a read failure on a later, unrelated
-                # source.
-                read_failure = exc
-                continue
-            except Exception:
-                # A source that cannot be read is a source we do not have. This
-                # includes a Keychain prompt we declined to wait for.
-                continue
-            if raw is None:
-                continue
-            try:
-                parsed = json.loads(raw)
-            except ValueError:
-                saw_malformed = True
-                continue
-            oauth = parsed.get("claudeAiOauth") if isinstance(parsed, Mapping) else None
-            if not isinstance(oauth, Mapping):
-                saw_malformed = True
-                continue
-            token = oauth.get("accessToken")
-            if not isinstance(token, str) or not token:
-                continue
-            expires_at = oauth.get("expiresAt")
-            if isinstance(expires_at, (int, float)) and not isinstance(
-                expires_at, bool
-            ):
-                expiry = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
-                if expiry <= datetime.now(timezone.utc):
-                    saw_expired = True
-                    continue
-            plan = oauth.get("subscriptionType")
-            return token, plan if isinstance(plan, str) and plan else None
-
-        if saw_expired:
-            raise _ProbeFailure("token_expired", status="usage_unavailable")
-        if read_failure is not None:
-            raise read_failure
-        if saw_malformed:
-            raise _ProbeFailure("protocol_error", status="error")
-        raise _ProbeFailure("not_authenticated", status="usage_unavailable")
-
-    def _file_blob(self) -> str | None:
-        try:
-            return self.credentials_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            # Present but unreadable (permission denied, a directory, a
-            # decode failure, ...) is a real error, not an absent source.
-            raise _ProbeFailure("protocol_error", status="error") from exc
-
-    def _keychain_blob(self) -> str | None:
-        return self.keychain_reader()
 
     def _fetch(self, token: str) -> Mapping[str, Any]:
         headers = {
@@ -293,48 +207,13 @@ def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, b
     request = Request(url, headers=headers, method="GET")
     try:
         with _OPENER.open(request, timeout=timeout) as response:
-            return int(response.status), response.read()
+            return int(response.status), response.read(_MAX_HTTP_BODY_BYTES + 1)
     except HTTPError as exc:
-        return int(exc.code), exc.read()
+        return int(exc.code), exc.read(_MAX_HTTP_BODY_BYTES + 1)
     except URLError as exc:
         if isinstance(exc.reason, TimeoutError):
             raise TimeoutError(str(exc.reason)) from None
         raise OSError(str(exc.reason)) from None
-
-
-def _read_keychain() -> str | None:
-    """The live credential on macOS. Returns None on any failure.
-
-    harnessd is a different binary from claude, so macOS may put up a prompt
-    before granting access to the item. The timeout is what stops a refresh
-    cycle hanging behind that dialog; a host whose grant has not been given
-    simply looks like a host that was never signed in.
-    """
-    if sys.platform != "darwin":
-        return None
-    try:
-        result = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-s",
-                _KEYCHAIN_SERVICE,
-                "-a",
-                getpass.getuser(),
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_KEYCHAIN_TIMEOUT_S,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        # Includes TimeoutExpired. Never log: stderr can echo the item.
-        return None
-    if result.returncode != 0:
-        return None
-    blob = result.stdout.strip()
-    return blob or None
 
 
 def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
