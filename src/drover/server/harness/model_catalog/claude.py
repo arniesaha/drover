@@ -44,6 +44,10 @@ _CUSTOM_MODEL_KEYS = (
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
 )
+_AGENTWEAVE_PROXY_URL = "AGENTWEAVE_PROXY_URL"
+_AUTHENTICATION_HEADER_NAMES = frozenset(
+    {"authorization", "x-api-key", "anthropic-beta"}
+)
 
 
 @dataclass(frozen=True)
@@ -221,6 +225,12 @@ class ClaudeCatalogAdapter:
                 "configured" if _has_custom_headers(self.env) else "absent",
             )
         )
+        if _agentweave_proxy_url(self.env) is not None and _has_custom_headers(
+            self.env
+        ):
+            parts.extend(
+                ("agentweave_custom_headers", _custom_headers_fingerprint(self.env))
+            )
         for key in sorted(self.env):
             if _is_non_secret_model_key(key):
                 parts.extend((key, self.env[key]))
@@ -233,6 +243,28 @@ class ClaudeCatalogAdapter:
             )
         except (TypeError, ValueError, OverflowError):
             raise CatalogDiscoveryError("protocol_error") from None
+
+        agentweave_proxy_url = _agentweave_proxy_url(effective_env)
+        if agentweave_proxy_url is not None and _has_custom_headers(effective_env):
+            custom_headers = _custom_headers(effective_env)
+            headers, account_scope_material = self._authentication(
+                effective_env, agentweave_proxy_url
+            )
+            headers.update(custom_headers)
+            account_scope_material = f"{account_scope_material}\0{_custom_headers_fingerprint(effective_env)}"
+            items = self._models(
+                headers, agentweave_proxy_url, allow_missing_pagination=True
+            )
+            version = self._version()
+            try:
+                models = _model_options(items, policy, effective_env)
+                return DiscoveredCatalog(
+                    account_scope_material=account_scope_material,
+                    harness_version=version,
+                    models=models,
+                )
+            except (TypeError, ValueError, OverflowError):
+                raise CatalogDiscoveryError("protocol_error") from None
 
         if _has_custom_headers(effective_env):
             raise CatalogDiscoveryError("unsupported")
@@ -287,7 +319,11 @@ class ClaudeCatalogAdapter:
         return headers, f"{credential.account_identity}\0{base_url}"
 
     def _models(
-        self, headers: dict[str, str], base_url: str
+        self,
+        headers: dict[str, str],
+        base_url: str,
+        *,
+        allow_missing_pagination: bool = False,
     ) -> list[Mapping[str, Any]]:
         after_id: str | None = None
         seen_cursors: set[str] = set()
@@ -332,6 +368,8 @@ class ClaudeCatalogAdapter:
             items.extend(item for item in data if isinstance(item, Mapping))
 
             has_more = page.get("has_more")
+            if "has_more" not in page and allow_missing_pagination:
+                return items
             if not isinstance(has_more, bool):
                 raise CatalogDiscoveryError("protocol_error")
             if not has_more:
@@ -534,6 +572,35 @@ def _has_custom_headers(env: Mapping[str, str]) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _agentweave_proxy_url(env: Mapping[str, str]) -> str | None:
+    value = env.get(_AGENTWEAVE_PROXY_URL)
+    if not _valid_text(value):
+        return None
+    return value.rstrip("/")
+
+
+def _custom_headers(env: Mapping[str, str]) -> dict[str, str]:
+    value = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if not isinstance(value, str) or not value:
+        raise CatalogDiscoveryError("protocol_error")
+
+    headers: dict[str, str] = {}
+    for line in value.splitlines():
+        name, separator, header_value = line.partition(":")
+        name = name.strip()
+        if not separator or not name or name.lower() in _AUTHENTICATION_HEADER_NAMES:
+            raise CatalogDiscoveryError("protocol_error")
+        headers[name] = header_value.lstrip()
+    return headers
+
+
+def _custom_headers_fingerprint(env: Mapping[str, str]) -> str:
+    value = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if not isinstance(value, str) or not value:
+        raise ValueError
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 def _is_non_secret_model_key(key: str) -> bool:
     if key in _THIRD_PARTY_PROVIDER_KEYS or key in _CUSTOM_MODEL_KEYS:
         return True
@@ -541,6 +608,7 @@ def _is_non_secret_model_key(key: str) -> bool:
         return True
     if key in {
         "ANTHROPIC_MODEL",
+        _AGENTWEAVE_PROXY_URL,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
         "CLAUDE_CODE_DISABLE_1M_CONTEXT",
     }:

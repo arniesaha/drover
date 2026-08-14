@@ -217,6 +217,195 @@ def test_custom_headers_configuration_is_unsupported_before_auth_or_http(
     assert side_effects == []
 
 
+def test_agentweave_proxy_catalog_uses_oauth_and_custom_headers(
+    claude_credentials, tmp_path
+):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "AGENTWEAVE_PROXY_URL": "https://agentweave.example/",
+                    "ANTHROPIC_CUSTOM_HEADERS": "X-AgentWeave-Key: gateway-secret",
+                }
+            }
+        )
+    )
+    calls = []
+
+    def opener(url, headers, timeout):
+        calls.append((url, headers, timeout))
+        return (
+            200,
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "claude-opus-5", "display_name": "Opus 5"},
+                        {"id": "claude-sonnet-5", "display_name": "Sonnet 5"},
+                    ]
+                }
+            ).encode(),
+        )
+
+    discovered = ClaudeCatalogAdapter(
+        command=("claude",),
+        credential_loader=lambda: claude_credentials,
+        opener=opener,
+        settings_paths=(settings,),
+        env={},
+        version_reader=lambda command: "2.1.232",
+    ).discover()
+
+    assert [model.id for model in discovered.models] == ["opus", "sonnet"]
+    assert calls[0][0] == "https://agentweave.example/v1/models?limit=1000"
+    assert calls[0][1]["Authorization"] == "Bearer sk-test-token"
+    assert calls[0][1]["X-AgentWeave-Key"] == "gateway-secret"
+    assert "gateway-secret" not in repr(discovered)
+
+
+def test_agentweave_proxy_catalog_uses_api_key_and_custom_headers(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "AGENTWEAVE_PROXY_URL": "https://agentweave.example/",
+                    "ANTHROPIC_API_KEY": "api-key-secret",
+                    "ANTHROPIC_CUSTOM_HEADERS": "X-AgentWeave-Key: gateway-secret",
+                }
+            }
+        )
+    )
+    calls = []
+    adapter = ClaudeCatalogAdapter(
+        command=("claude",),
+        credential_loader=lambda: pytest.fail(
+            "API key must not load OAuth credentials"
+        ),
+        opener=lambda url, headers, timeout: calls.append((url, headers))
+        or (
+            200,
+            json.dumps(
+                {"data": [{"id": "claude-sonnet-5", "display_name": "Sonnet 5"}]}
+            ).encode(),
+        ),
+        settings_paths=(settings,),
+        env={},
+        version_reader=lambda command: "2.1.232",
+    )
+
+    discovered = adapter.discover()
+
+    assert [model.id for model in discovered.models] == ["sonnet"]
+    assert calls[0][0] == "https://agentweave.example/v1/models?limit=1000"
+    assert calls[0][1]["x-api-key"] == "api-key-secret"
+    assert calls[0][1]["X-AgentWeave-Key"] == "gateway-secret"
+    assert "api-key-secret" not in repr(discovered)
+    assert "gateway-secret" not in repr(discovered)
+
+
+@pytest.mark.parametrize(
+    "header_name", ["Authorization", "x-api-key", "aNtHrOpIc-BeTa"]
+)
+def test_agentweave_proxy_rejects_custom_auth_header_before_auth_or_http(
+    tmp_path, header_name
+):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "AGENTWEAVE_PROXY_URL": "https://agentweave.example/",
+                    "ANTHROPIC_CUSTOM_HEADERS": f"{header_name}: forged",
+                }
+            }
+        )
+    )
+    side_effects = []
+    adapter = ClaudeCatalogAdapter(
+        command=("claude",),
+        credential_loader=lambda: side_effects.append("credential"),
+        opener=lambda url, headers, timeout: side_effects.append("http"),
+        settings_paths=(settings,),
+        env={},
+        version_reader=lambda command: "2.1.232",
+    )
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        adapter.discover()
+
+    assert side_effects == []
+
+
+def test_agentweave_header_value_changes_cache_and_account_scope_without_leaking_it(
+    claude_credentials,
+):
+    def adapter_for(tenant):
+        return ClaudeCatalogAdapter(
+            command=("claude",),
+            credential_loader=lambda: claude_credentials,
+            opener=lambda url, headers, timeout: (
+                200,
+                json.dumps(
+                    {"data": [{"id": "claude-sonnet-5", "display_name": "Sonnet 5"}]}
+                ).encode(),
+            ),
+            settings_paths=(),
+            env={
+                "AGENTWEAVE_PROXY_URL": "https://agentweave.example/",
+                "ANTHROPIC_CUSTOM_HEADERS": f"X-AgentWeave-Tenant: {tenant}",
+            },
+            version_reader=lambda command: "2.1.232",
+        )
+
+    first = adapter_for("tenant-one")
+    second = adapter_for("tenant-two")
+    first_catalog = first.discover()
+    second_catalog = second.discover()
+
+    assert first.cache_identity() != second.cache_identity()
+    assert first_catalog.account_scope_material != second_catalog.account_scope_material
+    assert "tenant-one" not in first.cache_identity()
+    assert "tenant-two" not in second.cache_identity()
+    assert "tenant-one" not in repr(first_catalog)
+    assert "tenant-two" not in repr(second_catalog)
+
+
+def test_agentweave_proxy_rejects_explicit_null_pagination_flag(
+    claude_credentials, tmp_path
+):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "AGENTWEAVE_PROXY_URL": "https://agentweave.example/",
+                    "ANTHROPIC_CUSTOM_HEADERS": "X-AgentWeave-Key: gateway-secret",
+                }
+            }
+        )
+    )
+    adapter = ClaudeCatalogAdapter(
+        command=("claude",),
+        credential_loader=lambda: claude_credentials,
+        opener=lambda url, headers, timeout: (
+            200,
+            json.dumps(
+                {
+                    "data": [{"id": "claude-sonnet-5", "display_name": "Sonnet 5"}],
+                    "has_more": None,
+                }
+            ).encode(),
+        ),
+        settings_paths=(settings,),
+        env={},
+        version_reader=lambda command: "2.1.232",
+    )
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        adapter.discover()
+
+
 def test_api_key_auth_paginates_without_loading_oauth(claude_credentials):
     calls = []
 
