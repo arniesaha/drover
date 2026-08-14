@@ -261,3 +261,9 @@ def test_release_verifies_the_published_artifact_end_to_end() -> None:
     assert "runtime/current" in steps
     assert "healthz" in steps, "must prove the installed build actually serves"
     assert "drover://" in steps, "must prove pairing works after install"
+    # Every other assertion in that job runs the binary by absolute path,
+    # which is how "installed but not a command" survived: the runtime lives
+    # under ~/.drover, which is on nobody's PATH.
+    assert (
+        ".local/bin/drover-server" in steps
+    ), "must prove the CLI is reachable as a command, not just on disk"

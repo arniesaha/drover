@@ -183,6 +183,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     info "  would install ~/.config/systemd/user/drover-harnessd.service"
     info "  would enable linger so the units survive logout"
   fi
+  info "  would link drover-server into $HOME/.local/bin"
   if [ -n "$JOIN_URL" ]; then
     # Never echo the code itself: a join one-liner ends up in chat logs and
     # terminal scrollback often enough to matter, and it is a live credential
@@ -385,6 +386,60 @@ PY
   success "services installed and started"
 }
 
+# --- CLI on PATH -------------------------------------------------------------
+# Without this the installer finishes and `drover-server` is still not a
+# command: everything lives under ~/.drover/runtime, which is on nobody's
+# PATH. The pairing hint printed at the end used the absolute path for
+# exactly that reason.
+#
+# The link points through runtime/current, never a version directory, for the
+# same reason the service units must: a pinned path keeps resolving to the old
+# build after an update, which is the trap that made the symlink flip a no-op
+# on every existing host.
+#
+# Only drover-server. drover-harnessd is a daemon nobody types, and putting it
+# on PATH is an invitation to start a second one by hand beside the managed
+# unit.
+link_cli() {
+  local target="$DROVER_HOME/runtime/current/bin/drover-server"
+  local bin_dir="$HOME/.local/bin"
+  local link="$bin_dir/drover-server"
+
+  mkdir -p "$bin_dir" || {
+    warn "could not create $bin_dir; run drover-server from $target"
+    return 0
+  }
+
+  # Never replace something this installer did not put there. A regular file
+  # at that path is someone else's binary, and silently overwriting it is a
+  # worse outcome than not installing ours.
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    warn "$link exists and is not a symlink, so it was left alone"
+    warn "run drover-server from $target instead"
+    return 0
+  fi
+
+  # -f to replace our own older link, -n so an existing symlink-to-directory
+  # is replaced rather than followed into.
+  ln -sfn "$target" "$link" || {
+    warn "could not link drover-server into $bin_dir"
+    return 0
+  }
+  success "linked drover-server into $bin_dir"
+
+  # The link can succeed and the command still not be found, which reads as
+  # the installer having lied. Say so loudly, with the line to fix it.
+  case ":$PATH:" in
+    *":$bin_dir:"*) ;;
+    *)
+      echo
+      warn "$bin_dir is not on your PATH, so 'drover-server' will not be found yet."
+      warn "Add this to your shell profile, then open a new terminal:"
+      printf '\n    export PATH="%s:$PATH"\n\n' "$bin_dir"
+      ;;
+  esac
+}
+
 # --- join --------------------------------------------------------------------
 # Probe first, redeem second. The probe deliberately does not burn the code,
 # so a machine that turns out to be unreachable can be retried without asking
@@ -470,6 +525,9 @@ ensure_uv
 VERSION="$(resolve_version)"
 info "  version:   $VERSION"
 install_runtime "$VERSION"
+# Both paths, not just the hub: a joined host runs harnessd only, but its
+# operator still needs `drover-server --version` to see what it is running.
+link_cli
 
 if [ -n "$JOIN_URL" ]; then
   # A joining machine runs harnessd only and never writes a server config:
@@ -487,5 +545,12 @@ else
     warn "drover-server did not answer /healthz yet; check the logs before pairing"
   fi
   echo
-  "$DROVER_HOME/runtime/current/bin/drover-server" pair || true
+  # Run through the link when it resolves, so the QR is printed by the same
+  # command the user was just told they have. Falling back to the absolute
+  # path keeps pairing working when ~/.local/bin is not on PATH yet.
+  if command -v drover-server >/dev/null 2>&1; then
+    drover-server pair || true
+  else
+    "$DROVER_HOME/runtime/current/bin/drover-server" pair || true
+  fi
 fi
