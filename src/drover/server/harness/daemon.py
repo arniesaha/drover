@@ -1970,11 +1970,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
         model = _optional_text(body.get("model"))
         thinking_effort = _optional_text(body.get("thinking_effort"))
-        try:
-            self._model_catalog_service().validate(harness, model, thinking_effort)
-        except CatalogSelectionError as exc:
-            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
+        if model is not None or thinking_effort is not None:
+            try:
+                self._model_catalog_service().validate(harness, model, thinking_effort)
+            except CatalogSelectionError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         command = body.get("command")
         default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
         if command is None and default_command_fn:
@@ -2144,13 +2145,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if harness == "claude-code":
             model = None
             thinking_effort = None
-        try:
-            self._model_catalog_service().validate(
-                harness or "", model, thinking_effort
-            )
-        except CatalogSelectionError as exc:
-            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
+        if model is not None or thinking_effort is not None:
+            try:
+                self._model_catalog_service().validate(
+                    harness or "", model, thinking_effort
+                )
+            except CatalogSelectionError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         try:
             saved = save_turn_attachments(
                 self.server.state.attachments_dir, session_id, images

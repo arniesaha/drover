@@ -48,7 +48,6 @@ from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.model_catalog import (
     CatalogEnvelope,
     CatalogSelectionError,
-    ModelCatalogService,
     ModelOption,
 )
 from drover.server.harness.pty import PtySessionManager
@@ -594,19 +593,14 @@ def test_model_preference_validation_rejects_launch_before_side_effects(
     assert not state.attachments_dir.exists()
 
 
-def test_model_preference_validation_keeps_null_launch_defaults(tmp_path):
-    class _ExplodingAdapter:
-        def cache_identity(self):
-            raise AssertionError("null preferences must not discover a catalog")
+def test_model_preference_validation_keeps_null_launch_defaults(monkeypatch, tmp_path):
+    def forbidden_factory(host_id, presets):
+        raise AssertionError("null preferences must not construct a catalog service")
 
-        def discover(self):
-            raise AssertionError("null preferences must not discover a catalog")
-
-    server, state, base_url = _start_test_server(tmp_path)
-    state.model_catalog_service = ModelCatalogService(
-        host_id=state.host_id,
-        adapters={"claude-code": _ExplodingAdapter()},
+    monkeypatch.setattr(
+        harness_daemon, "default_model_catalog_service", forbidden_factory
     )
+    server, state, base_url = _start_test_server(tmp_path)
     try:
         status, payload = _json_request(
             f"{base_url}/sessions",
@@ -696,9 +690,23 @@ def test_model_preference_validation_rejects_turn_before_attachment_or_driver(
     assert not state.attachments_dir.exists()
 
 
-def test_model_preference_validation_discards_claude_turn_overrides(tmp_path):
+def test_model_preference_validation_discards_claude_turn_overrides(
+    monkeypatch, tmp_path
+):
+    created = []
+
+    class _ForbiddenService:
+        def validate(self, harness, model, thinking_effort):
+            raise AssertionError("discarded Claude overrides must not be validated")
+
+    def forbidden_factory(host_id, presets):
+        created.append((host_id, presets))
+        return _ForbiddenService()
+
+    monkeypatch.setattr(
+        harness_daemon, "default_model_catalog_service", forbidden_factory
+    )
     server, state, base_url = _start_test_server(tmp_path)
-    state.model_catalog_service = _FakeModelCatalogService()
     state.structured = _FakeStructuredManager(harness="claude-code")
     try:
         status, _ = _json_request(
@@ -715,7 +723,8 @@ def test_model_preference_validation_discards_claude_turn_overrides(tmp_path):
         server.server_close()
 
     assert status == 202
-    assert state.model_catalog_service.validations == [("claude-code", None, None)]
+    assert created == []
+    assert state.model_catalog_service is None
     assert state.structured.turns == [
         (
             "session-1",
