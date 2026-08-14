@@ -569,6 +569,43 @@ struct ChatModelTests {
     #expect(model.runPreferences.thinkingEffort == "high")
 }
 
+@Test @MainActor func nonblankOpaqueSessionSeedsReachTurnSubmissionUnchanged() async throws {
+    let rawModel = " model-with-space "
+    let rawEffort = " effort-with-space "
+    let catalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: rawModel,
+        supportedEfforts: [rawEffort]
+    )
+    nonisolated(unsafe) var sentModel: String?
+    nonisolated(unsafe) var sentEffort: String?
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET", request.url?.path == "/harness" {
+            return (200, sessionJSON(model: rawModel, thinkingEffort: rawEffort))
+        }
+        if request.httpMethod == "GET" {
+            return (200, encodedCatalog(catalog))
+        }
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()
+        ) as! [String: Any]
+        sentModel = body["model"] as? String
+        sentEffort = body["thinking_effort"] as? String
+        return (202, Data(#"{"turn_id":"t1"}"#.utf8))
+    }
+    let model = ChatModel(
+        client: client(), sessionID: "s1", store: chatTestStore()
+    )
+
+    await model.loadSessionMetadata()
+    model.composerText = "continue"
+    await model.sendTurn()
+
+    #expect(model.runPreferences.selectedModel == rawModel)
+    #expect(model.runPreferences.thinkingEffort == rawEffort)
+    #expect(sentModel == rawModel)
+    #expect(sentEffort == rawEffort)
+}
+
 @Test @MainActor func freshCatalogRestoresSessionSeedMissingFromStaleCache() async throws {
     let store = chatTestStore()
     let staleCatalog = fixtureCatalog(

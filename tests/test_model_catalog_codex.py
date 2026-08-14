@@ -1,5 +1,7 @@
 import json
 import stat
+import textwrap
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -283,3 +285,81 @@ def test_cache_identity_tracks_a_path_resolved_bare_codex_executable(
     after = adapter.cache_identity()
 
     assert before != after
+
+
+def _version_flood_adapter(tmp_path, mode: str) -> CodexCatalogAdapter:
+    executable = tmp_path / f"codex-{mode}"
+    executable.write_text(textwrap.dedent(f"""
+            #!/usr/bin/env python3
+            import json
+            import sys
+            import threading
+
+            if "--version" in sys.argv:
+                if {mode!r} == "stdout-and-stderr":
+                    def flood_stderr():
+                        while True:
+                            sys.stderr.write("sensitive diagnostic " * 4096)
+                            sys.stderr.flush()
+
+                    threading.Thread(target=flood_stderr, daemon=True).start()
+                    while True:
+                        sys.stdout.write("x" * 65536)
+                        sys.stdout.flush()
+                for _ in range(64):
+                    sys.stderr.write("sensitive diagnostic " * 4096)
+                    sys.stderr.flush()
+                print("codex-cli 0.147.0")
+                raise SystemExit(0)
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                if "id" not in request:
+                    continue
+                if request["method"] == "initialize":
+                    result = {{"userAgent": "fake"}}
+                elif request["method"] == "account/read":
+                    result = {{
+                        "account": {{
+                            "email": "person@example.com",
+                            "planType": "plus",
+                        }}
+                    }}
+                elif request["method"] == "model/list":
+                    result = {{
+                        "data": [{{
+                            "model": "gpt-test",
+                            "displayName": "GPT Test",
+                            "supportedReasoningEfforts": [],
+                        }}],
+                        "nextCursor": None,
+                    }}
+                else:
+                    continue
+                print(json.dumps({{"id": request["id"], "result": result}}), flush=True)
+            """).lstrip())
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    return CodexCatalogAdapter(
+        (str(executable), "app-server", "--stdio"),
+        codex_home=tmp_path,
+        timeout_s=2,
+    )
+
+
+def test_codex_version_stdout_flood_is_bounded_while_stderr_also_floods(tmp_path):
+    adapter = _version_flood_adapter(tmp_path, "stdout-and-stderr")
+    started = time.monotonic()
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        adapter.discover()
+
+    assert time.monotonic() - started < 1
+
+
+def test_codex_version_discards_large_stderr_independently_from_stdout(tmp_path):
+    adapter = _version_flood_adapter(tmp_path, "stderr-only")
+
+    discovered = adapter.discover()
+
+    assert discovered.harness_version == "codex-cli 0.147.0"
+    assert [model.id for model in discovered.models] == ["gpt-test"]

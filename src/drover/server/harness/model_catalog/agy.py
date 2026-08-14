@@ -132,7 +132,11 @@ class AgyCatalogAdapter:
 
 
 def _run_bounded(
-    command: Sequence[str], *, timeout_s: float, missing_category: str
+    command: Sequence[str],
+    *,
+    timeout_s: float,
+    missing_category: str,
+    os_error_category: str = "protocol_error",
 ) -> tuple[int, bytes]:
     try:
         process = subprocess.Popen(
@@ -142,7 +146,9 @@ def _run_bounded(
         )
     except FileNotFoundError:
         raise CatalogDiscoveryError(missing_category) from None
-    except (OSError, TypeError, ValueError):
+    except OSError:
+        raise CatalogDiscoveryError(os_error_category) from None
+    except (TypeError, ValueError):
         raise CatalogDiscoveryError("protocol_error") from None
 
     assert process.stdout is not None

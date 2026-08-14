@@ -416,6 +416,13 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _optional_identifier(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text.strip() else None
+
+
 def discover_native_resume_sessions(
     *,
     home: Path | None = None,
@@ -1968,8 +1975,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        model = _optional_text(body.get("model"))
-        thinking_effort = _optional_text(body.get("thinking_effort"))
+        model = _optional_identifier(body.get("model"))
+        thinking_effort = _optional_identifier(body.get("thinking_effort"))
         if model is not None or thinking_effort is not None:
             try:
                 self._model_catalog_service().validate(harness, model, thinking_effort)
@@ -2136,8 +2143,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 {"error": "text or images required"}, status=HTTPStatus.BAD_REQUEST
             )
             return
-        model = _optional_text(body.get("model"))
-        thinking_effort = _optional_text(body.get("thinking_effort"))
+        model = _optional_identifier(body.get("model"))
+        thinking_effort = _optional_identifier(body.get("thinking_effort"))
         harness = self.server.state.structured.harness_for(session_id)
         # Claude owns one persistent process, so later turn preferences cannot
         # affect the running model. Silently ignore overrides from older/direct

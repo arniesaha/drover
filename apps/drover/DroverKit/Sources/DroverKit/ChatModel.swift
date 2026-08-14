@@ -652,7 +652,7 @@ public final class ChatModel {
     private static func nonEmpty(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return trimmed.isEmpty ? nil : value
     }
 
     /// Compatibility entry point for existing callers. Metadata loading grew

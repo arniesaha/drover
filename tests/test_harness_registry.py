@@ -192,7 +192,7 @@ def test_model_catalog_cache_rejects_invalid_or_unbounded_writes(tmp_path):
         }
         for index in range(256)
     ]
-    with pytest.raises(ValueError, match="512 KiB"):
+    with pytest.raises(ValueError, match="public 256 KiB wire limit"):
         registry.save_model_catalog("mac-mini", "codex", "scope-large", oversized)
     assert registry.latest_model_catalog("missing", "codex") is None
     assert registry.latest_model_catalog("mac-mini", "codex") is None

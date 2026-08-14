@@ -1,8 +1,12 @@
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import json
 
 import pytest
 
 from drover.server.harness.model_catalog import (
+    MAX_CATALOG_WIRE_BYTES,
     AccountScopeIDs,
     CatalogDiscoveryError,
     CatalogEnvelope,
@@ -14,6 +18,73 @@ from drover.server.harness.model_catalog import (
 )
 
 NOW = datetime(2026, 8, 14, 18, 22, tzinfo=timezone.utc)
+
+
+def _sized_discovery(target_wire_bytes: int) -> DiscoveredCatalog:
+    material = "catalog-boundary-scope"
+    secret = b"w" * 32
+    descriptions = ["x" for _ in range(256)]
+
+    def payload() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "host_id": "mac-mini",
+            "harness": "codex",
+            "account_scope_id": hmac.new(
+                secret, material.encode("utf-8"), hashlib.sha256
+            ).hexdigest(),
+            "harness_version": "1.0",
+            "discovered_at": NOW.isoformat(),
+            "stale": False,
+            "stale_reason": None,
+            "models": [
+                {
+                    "id": f"model-{index}",
+                    "display_name": f"Model {index}",
+                    "description": description,
+                    "is_default": index == 0,
+                    "reasoning": None,
+                }
+                for index, description in enumerate(descriptions)
+            ],
+        }
+
+    remaining = target_wire_bytes - len(
+        json.dumps(payload(), sort_keys=True).encode("utf-8")
+    )
+    assert remaining >= 0
+    for index in range(len(descriptions)):
+        added = min(remaining, 2_047)
+        descriptions[index] += "x" * added
+        remaining -= added
+    assert remaining == 0
+    assert (
+        len(json.dumps(payload(), sort_keys=True).encode("utf-8")) == target_wire_bytes
+    )
+    return DiscoveredCatalog(
+        account_scope_material=material,
+        harness_version="1.0",
+        models=tuple(
+            ModelOption(
+                id=f"model-{index}",
+                display_name=f"Model {index}",
+                description=description,
+                is_default=index == 0,
+            )
+            for index, description in enumerate(descriptions)
+        ),
+    )
+
+
+class SizedAdapter:
+    def __init__(self, discovered: DiscoveredCatalog):
+        self.discovered = discovered
+
+    def cache_identity(self) -> str:
+        return "sized-v1"
+
+    def discover(self) -> DiscoveredCatalog:
+        return self.discovered
 
 
 class FakeAdapter:
@@ -278,3 +349,108 @@ def test_source_stale_refresh_does_not_replace_fresh_last_known_good_catalog():
     assert source_stale.models[0].id == "stale-native-cache-model"
     assert fallback.stale_reason == "timeout"
     assert fallback.models == fresh.models
+
+
+def test_host_accepts_catalog_just_below_canonical_wire_cap():
+    adapter = SizedAdapter(_sized_discovery(MAX_CATALOG_WIRE_BYTES - 1))
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": adapter},
+        scope_ids=AccountScopeIDs(secret=b"w" * 32),
+        clock=lambda: NOW,
+    )
+
+    catalog = service.read("codex")
+
+    assert catalog.stale is False
+    assert (
+        len(json.dumps(catalog.to_wire(), sort_keys=True).encode("utf-8"))
+        == MAX_CATALOG_WIRE_BYTES - 1
+    )
+
+
+def test_host_oversized_refresh_preserves_smaller_last_known_good_catalog():
+    adapter = SizedAdapter(
+        DiscoveredCatalog(
+            account_scope_material="catalog-boundary-scope",
+            harness_version="1.0",
+            models=(ModelOption(id="last-good", display_name="Last good"),),
+        )
+    )
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": adapter},
+        scope_ids=AccountScopeIDs(secret=b"w" * 32),
+        clock=lambda: NOW,
+    )
+    last_good = service.read("codex")
+    adapter.discovered = _sized_discovery(MAX_CATALOG_WIRE_BYTES + 1)
+
+    degraded = service.read("codex", force=True)
+
+    assert degraded.stale is True
+    assert degraded.stale_reason == "protocol_error"
+    assert degraded.models == last_good.models
+
+
+def test_host_first_oversized_catalog_is_exact_empty_protocol_error():
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": SizedAdapter(_sized_discovery(MAX_CATALOG_WIRE_BYTES + 1))},
+        scope_ids=AccountScopeIDs(secret=b"w" * 32),
+        clock=lambda: NOW,
+    )
+
+    catalog = service.read("codex")
+
+    assert catalog == CatalogEnvelope.empty_failure(
+        "mac-mini", "codex", "protocol_error"
+    )
+
+
+def test_opaque_model_and_effort_ids_round_trip_without_trimming():
+    raw_model = " model-with-space "
+    raw_effort = " effort-with-space "
+    adapter = SizedAdapter(
+        DiscoveredCatalog(
+            account_scope_material="opaque-scope",
+            harness_version="1.0",
+            models=(
+                ModelOption(
+                    id=raw_model,
+                    display_name="Model with intentional spaces",
+                    reasoning=ReasoningOptions(
+                        supported=(raw_effort,), default=raw_effort
+                    ),
+                ),
+            ),
+        )
+    )
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": adapter},
+        scope_ids=AccountScopeIDs(secret=b"o" * 32),
+        clock=lambda: NOW,
+    )
+
+    wire = service.read("codex").to_wire()
+    parsed = CatalogEnvelope.from_wire(wire, "mac-mini", "codex")
+    service.validate("codex", raw_model, raw_effort)
+
+    assert parsed.models[0].id == raw_model
+    assert parsed.models[0].reasoning is not None
+    assert parsed.models[0].reasoning.supported == (raw_effort,)
+    with pytest.raises(CatalogSelectionError, match="no longer available"):
+        service.validate("codex", raw_model.strip(), raw_effort)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ModelOption(id=" \t ", display_name="Model"),
+        lambda: ReasoningOptions(supported=(" \n ",)),
+    ],
+)
+def test_identifier_validation_rejects_whitespace_only_values(factory):
+    with pytest.raises(ValueError):
+        factory()

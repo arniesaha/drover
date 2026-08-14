@@ -23,7 +23,11 @@ from drover.server.harness.daemon import (
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.model_catalog import CatalogEnvelope
+from drover.server.harness.model_catalog import (
+    MAX_CATALOG_WIRE_BYTES,
+    CatalogEnvelope,
+    catalog_wire_bytes,
+)
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
@@ -74,7 +78,6 @@ _HARNESS_STALE_AFTER_SECONDS = 45
 RELAY_MIN_TIMEOUT_S = 5.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
-_MAX_MODEL_CATALOG_RESPONSE_BYTES = 256 * 1024
 
 # Harnesses harnessd can drive as structured sessions (claude-code, codex,
 # agy). A nexus handoff to one of these launches mode="structured" and
@@ -1488,7 +1491,7 @@ class MetricsCollector:
                 method="GET",
                 payload={},
                 timeout_s=7.0,
-                max_response_bytes=_MAX_MODEL_CATALOG_RESPONSE_BYTES,
+                max_response_bytes=MAX_CATALOG_WIRE_BYTES,
             )
         except Exception as exc:  # noqa: BLE001 - normalized to safe metadata
             reason = _model_catalog_exception_reason(exc)
@@ -1504,7 +1507,7 @@ class MetricsCollector:
             return self._stale_model_catalog_response(
                 host_id, harness, "protocol_error"
             )
-        if len(body_bytes) > _MAX_MODEL_CATALOG_RESPONSE_BYTES:
+        if len(body_bytes) > MAX_CATALOG_WIRE_BYTES:
             return self._stale_model_catalog_response(
                 host_id, harness, "protocol_error"
             )
@@ -1515,6 +1518,7 @@ class MetricsCollector:
         try:
             decoded = json.loads(body)
             envelope = CatalogEnvelope.from_wire(decoded, host_id, harness)
+            normalized_body = catalog_wire_bytes(envelope).decode("utf-8")
         except (TypeError, json.JSONDecodeError, ValueError):
             return self._stale_model_catalog_response(
                 host_id, harness, "protocol_error"
@@ -1540,7 +1544,7 @@ class MetricsCollector:
                     harness,
                     exc,
                 )
-        return _json_response(200, envelope.to_wire())
+        return 200, normalized_body
 
     def _stale_model_catalog_response(
         self, host_id: str, harness: str, reason: str
@@ -1548,14 +1552,19 @@ class MetricsCollector:
         cached = HarnessRegistry(self.duckdb_path).latest_model_catalog(
             host_id, harness
         )
-        if cached is None:
-            envelope = CatalogEnvelope.empty_failure(host_id, harness, reason)
-        else:
-            cached = dict(cached)
-            cached["stale"] = True
-            cached["stale_reason"] = reason
-            envelope = CatalogEnvelope.from_wire(cached, host_id, harness)
-        return _json_response(200, envelope.to_wire())
+        try:
+            if cached is None:
+                envelope = CatalogEnvelope.empty_failure(host_id, harness, reason)
+            else:
+                cached = dict(cached)
+                cached["stale"] = True
+                cached["stale_reason"] = reason
+                envelope = CatalogEnvelope.from_wire(cached, host_id, harness)
+            body = catalog_wire_bytes(envelope).decode("utf-8")
+        except (TypeError, ValueError):
+            envelope = CatalogEnvelope.empty_failure(host_id, harness, "protocol_error")
+            body = catalog_wire_bytes(envelope).decode("utf-8")
+        return 200, body
 
     def proxy_harness_auth(
         self,

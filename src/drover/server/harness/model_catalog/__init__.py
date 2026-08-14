@@ -2,7 +2,14 @@
 
 from typing import Any, Mapping
 
-from .models import CatalogEnvelope, DiscoveredCatalog, ModelOption, ReasoningOptions
+from .models import (
+    MAX_CATALOG_WIRE_BYTES,
+    CatalogEnvelope,
+    DiscoveredCatalog,
+    ModelOption,
+    ReasoningOptions,
+    catalog_wire_bytes,
+)
 from .codex import CodexCatalogAdapter
 from .agy import AgyCatalogAdapter
 from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
@@ -43,6 +50,8 @@ __all__ = [
     "ModelOption",
     "DiscoveredCatalog",
     "CatalogEnvelope",
+    "MAX_CATALOG_WIRE_BYTES",
+    "catalog_wire_bytes",
     "CatalogDiscoveryError",
     "CatalogSelectionError",
     "CatalogAdapter",

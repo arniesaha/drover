@@ -654,6 +654,44 @@ def test_model_preference_validation_passes_codex_turn_preferences_unchanged(
     ]
 
 
+def test_model_preference_validation_preserves_opaque_identifier_whitespace(
+    tmp_path,
+):
+    raw_model = " model-with-space "
+    raw_effort = " effort-with-space "
+    server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
+    state.structured = _FakeStructuredManager(harness="codex")
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/session-1/turns",
+            payload={
+                "text": "continue",
+                "model": raw_model,
+                "thinking_effort": raw_effort,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 202
+    assert payload == {"turn_id": "turn-1"}
+    assert state.model_catalog_service.validations == [("codex", raw_model, raw_effort)]
+    assert state.structured.turns == [
+        (
+            "session-1",
+            "continue",
+            {
+                "images": None,
+                "model": raw_model,
+                "thinking_effort": raw_effort,
+            },
+        )
+    ]
+
+
 def test_model_preference_validation_rejects_turn_before_attachment_or_driver(
     tmp_path,
 ):

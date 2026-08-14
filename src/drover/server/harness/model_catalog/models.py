@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import Any
 
 MAX_ID_LENGTH = 256
 MAX_DESCRIPTION_LENGTH = 2_048
 MAX_MODELS = 256
 MAX_REASONING_EFFORTS = 32
+MAX_CATALOG_WIRE_BYTES = 256 * 1024
 
 STALE_REASONS = frozenset(
     {"offline", "timeout", "not_authenticated", "unsupported", "protocol_error"}
@@ -30,6 +32,13 @@ def _optional_bounded_string(value: object, *, name: str, maximum: int) -> str |
     return _bounded_string(value, name=name, maximum=maximum)
 
 
+def _bounded_identifier(value: object, *, name: str) -> str:
+    identifier = _bounded_string(value, name=name, maximum=MAX_ID_LENGTH)
+    if not identifier.strip():
+        raise ValueError(f"{name} must contain a non-whitespace character")
+    return identifier
+
+
 @dataclass(frozen=True)
 class ReasoningOptions:
     supported: tuple[str, ...]
@@ -41,13 +50,11 @@ class ReasoningOptions:
         if len(self.supported) > MAX_REASONING_EFFORTS:
             raise ValueError("too many supported reasoning efforts")
         for effort in self.supported:
-            _bounded_string(effort, name="reasoning effort ID", maximum=MAX_ID_LENGTH)
+            _bounded_identifier(effort, name="reasoning effort ID")
         if len(set(self.supported)) != len(self.supported):
             raise ValueError("supported reasoning efforts must be unique")
         if self.default is not None:
-            _bounded_string(
-                self.default, name="default reasoning effort ID", maximum=MAX_ID_LENGTH
-            )
+            _bounded_identifier(self.default, name="default reasoning effort ID")
             if self.default not in self.supported:
                 raise ValueError("default reasoning effort must be supported")
 
@@ -61,7 +68,7 @@ class ModelOption:
     reasoning: ReasoningOptions | None = None
 
     def __post_init__(self) -> None:
-        _bounded_string(self.id, name="model ID", maximum=MAX_ID_LENGTH)
+        _bounded_identifier(self.id, name="model ID")
         _bounded_string(
             self.display_name, name="model display name", maximum=MAX_ID_LENGTH
         )
@@ -163,6 +170,7 @@ class CatalogEnvelope:
                 raise ValueError("empty catalogs are only allowed for stale failures")
         elif any(value is None for value in metadata):
             raise ValueError("catalog models require discovery metadata")
+        catalog_wire_bytes(self)
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -235,6 +243,16 @@ class CatalogEnvelope:
             stale_reason=reason,
             models=(),
         )
+
+
+def catalog_wire_bytes(envelope: CatalogEnvelope) -> bytes:
+    """Encode one catalog exactly as the public host/central JSON response."""
+    if not isinstance(envelope, CatalogEnvelope):
+        raise TypeError("envelope must be a CatalogEnvelope")
+    encoded = json.dumps(envelope.to_wire(), sort_keys=True).encode("utf-8")
+    if len(encoded) > MAX_CATALOG_WIRE_BYTES:
+        raise ValueError("model catalog exceeds public 256 KiB wire limit")
+    return encoded
 
 
 def model_to_wire(model: ModelOption) -> dict[str, object]:

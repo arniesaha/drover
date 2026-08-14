@@ -155,7 +155,12 @@ class ModelCatalogService:
     ) -> CatalogEnvelope:
         if cached is None:
             return CatalogEnvelope.empty_failure(self._host_id, harness, category)
-        return replace(cached.envelope, stale=True, stale_reason=category)
+        try:
+            return replace(cached.envelope, stale=True, stale_reason=category)
+        except ValueError:
+            return CatalogEnvelope.empty_failure(
+                self._host_id, harness, "protocol_error"
+            )
 
     def _now(self) -> datetime:
         now = self._clock()

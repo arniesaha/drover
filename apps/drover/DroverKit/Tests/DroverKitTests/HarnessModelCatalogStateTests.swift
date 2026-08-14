@@ -355,6 +355,31 @@ struct HarnessModelCatalogStateTests {
         #expect(state.thinkingEffortOverride == "galactic")
     }
 
+    @Test @MainActor func opaqueIdentifiersKeepIntentionalSurroundingWhitespace() {
+        let rawModel = " model-with-space "
+        let rawEffort = " effort-with-space "
+        let store = HarnessModelCatalogStore(defaults: catalogDefaults())
+        let state = HarnessModelCatalogState(client: client(), store: store)
+        state.select(hostID: "mac-mini", harness: "codex")
+        state.apply(fixtureCatalog(
+            scope: "scope-a",
+            model: rawModel,
+            supportedEfforts: [rawEffort]
+        ))
+
+        state.selectedModel = rawModel
+        state.thinkingEffort = rawEffort
+
+        #expect(state.modelOverride == rawModel)
+        #expect(state.thinkingEffortOverride == rawEffort)
+        #expect(store.selection(
+            hostID: "mac-mini", harness: "codex"
+        )?.model == rawModel)
+        #expect(store.selection(
+            hostID: "mac-mini", harness: "codex"
+        )?.thinkingEffort == rawEffort)
+    }
+
     @Test @MainActor func lateResponseCannotReplaceCurrentPair() async {
         let state = HarnessModelCatalogState(
             client: concurrentCatalogClient(),

@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.harness.model_catalog import MAX_CATALOG_WIRE_BYTES
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.metrics import MetricsCollector
 from drover.server.web.app import start_metrics_server
@@ -43,6 +44,45 @@ def _catalog(
             }
         ],
     }
+
+
+def _catalog_with_wire_size(target_wire_bytes: int) -> dict[str, object]:
+    descriptions = ["x" for _ in range(256)]
+
+    def payload() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "host_id": "mac mini",
+            "harness": "codex beta",
+            "account_scope_id": "scope-boundary",
+            "harness_version": "1.2.3",
+            "discovered_at": "2026-08-14T12:00:00+00:00",
+            "stale": False,
+            "stale_reason": None,
+            "models": [
+                {
+                    "id": f"model-{index}",
+                    "display_name": f"Model {index}",
+                    "description": description,
+                    "is_default": index == 0,
+                    "reasoning": None,
+                }
+                for index, description in enumerate(descriptions)
+            ],
+        }
+
+    remaining = target_wire_bytes - len(
+        json.dumps(payload(), sort_keys=True).encode("utf-8")
+    )
+    assert remaining >= 0
+    for index in range(len(descriptions)):
+        added = min(remaining, 2_047)
+        descriptions[index] += "x" * added
+        remaining -= added
+    assert remaining == 0
+    result = payload()
+    assert len(json.dumps(result, sort_keys=True).encode("utf-8")) == target_wire_bytes
+    return result
 
 
 class _CatalogHandler(BaseHTTPRequestHandler):
@@ -159,6 +199,107 @@ def test_direct_proxy_forwards_auth_refresh_and_persists_valid_catalog(
             "mac mini", "codex beta"
         )
         == _catalog()
+    )
+
+
+def test_central_accepts_normalized_catalog_just_below_public_wire_cap(
+    tmp_path, monkeypatch
+):
+    collector = _collector(tmp_path, upstream_url="http://127.0.0.1:1")
+    catalog = _catalog_with_wire_size(MAX_CATALOG_WIRE_BYTES - 1)
+    compact_body = json.dumps(catalog, separators=(",", ":"))
+    assert len(compact_body.encode("utf-8")) < MAX_CATALOG_WIRE_BYTES
+    monkeypatch.setattr(
+        collector,
+        "_harness_request",
+        lambda *args, **kwargs: (200, compact_body),
+    )
+
+    status, body = collector.proxy_harness_model_catalog("mac mini", "codex beta")
+
+    assert status == 200
+    assert json.loads(body) == catalog
+    assert len(body.encode("utf-8")) <= MAX_CATALOG_WIRE_BYTES
+    assert (
+        HarnessRegistry(collector.duckdb_path).latest_model_catalog(
+            "mac mini", "codex beta"
+        )
+        == catalog
+    )
+
+
+def test_central_oversized_normalized_catalog_preserves_last_known_good(
+    tmp_path, monkeypatch
+):
+    collector = _collector(tmp_path, upstream_url="http://127.0.0.1:1")
+    last_good = _catalog(scope_id="scope-last-good")
+    responses = [
+        json.dumps(last_good, separators=(",", ":")),
+        json.dumps(
+            _catalog_with_wire_size(MAX_CATALOG_WIRE_BYTES + 1),
+            separators=(",", ":"),
+        ),
+    ]
+    assert all(
+        len(body.encode("utf-8")) <= MAX_CATALOG_WIRE_BYTES for body in responses
+    )
+    monkeypatch.setattr(
+        collector,
+        "_harness_request",
+        lambda *args, **kwargs: (200, responses.pop(0)),
+    )
+    assert collector.proxy_harness_model_catalog("mac mini", "codex beta")[0] == 200
+
+    status, body = collector.proxy_harness_model_catalog("mac mini", "codex beta")
+
+    assert status == 200
+    assert json.loads(body) == {
+        **last_good,
+        "stale": True,
+        "stale_reason": "protocol_error",
+    }
+    assert (
+        HarnessRegistry(collector.duckdb_path).latest_model_catalog(
+            "mac mini", "codex beta"
+        )
+        == last_good
+    )
+
+
+def test_central_first_oversized_normalized_catalog_is_exact_empty_failure(
+    tmp_path, monkeypatch
+):
+    collector = _collector(tmp_path, upstream_url="http://127.0.0.1:1")
+    oversized = json.dumps(
+        _catalog_with_wire_size(MAX_CATALOG_WIRE_BYTES + 1),
+        separators=(",", ":"),
+    )
+    assert len(oversized.encode("utf-8")) <= MAX_CATALOG_WIRE_BYTES
+    monkeypatch.setattr(
+        collector,
+        "_harness_request",
+        lambda *args, **kwargs: (200, oversized),
+    )
+
+    status, body = collector.proxy_harness_model_catalog("mac mini", "codex beta")
+
+    assert status == 200
+    assert json.loads(body) == {
+        "schema_version": 1,
+        "host_id": "mac mini",
+        "harness": "codex beta",
+        "account_scope_id": None,
+        "harness_version": None,
+        "discovered_at": None,
+        "stale": True,
+        "stale_reason": "protocol_error",
+        "models": [],
+    }
+    assert (
+        HarnessRegistry(collector.duckdb_path).latest_model_catalog(
+            "mac mini", "codex beta"
+        )
+        is None
     )
 
 

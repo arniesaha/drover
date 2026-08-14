@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 from typing import Any, Mapping, Sequence
 
 from drover.server.providers.codex_app_server import (
@@ -15,6 +14,7 @@ from drover.server.providers.codex_app_server import (
     CodexAppServerSession,
 )
 
+from .agy import _run_bounded
 from .models import DiscoveredCatalog, MAX_MODELS, ModelOption, ReasoningOptions
 from .service import CatalogDiscoveryError
 
@@ -139,25 +139,15 @@ class CodexCatalogAdapter:
     def _version(self) -> str:
         if not self.command:
             raise CatalogDiscoveryError("cli_not_found")
-        try:
-            completed = subprocess.run(
-                (self.command[0], "--version"),
-                capture_output=True,
-                check=False,
-                encoding="utf-8",
-                errors="replace",
-                text=True,
-                timeout=self.timeout_s,
-            )
-        except FileNotFoundError:
-            raise CatalogDiscoveryError("cli_not_found") from None
-        except subprocess.TimeoutExpired:
-            raise CatalogDiscoveryError("timeout") from None
-        except OSError:
-            raise CatalogDiscoveryError("unavailable") from None
-        if completed.returncode != 0:
+        returncode, output = _run_bounded(
+            (self.command[0], "--version"),
+            timeout_s=self.timeout_s,
+            missing_category="cli_not_found",
+            os_error_category="unavailable",
+        )
+        if returncode != 0:
             raise CatalogDiscoveryError("process_error")
-        version = completed.stdout.strip()
+        version = output.decode("utf-8", errors="replace").strip()
         if not version:
             raise CatalogDiscoveryError("protocol_error")
         return version
