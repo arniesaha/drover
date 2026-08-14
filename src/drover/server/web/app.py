@@ -18,9 +18,10 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, unquote_to_bytes, urlparse
 
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.relay_protocol import RelayProtocolError, parse_frame
 from drover.server.harness.websocket import (
     OPCODE_CLOSE,
@@ -686,6 +687,69 @@ def _parse_host_auth_route(path: str) -> dict[str, str] | None:
     return None
 
 
+def _parse_model_catalog_route(path: str, query: str) -> tuple[str, str, bool] | None:
+    prefix = "/harness/hosts/"
+    suffix = "/model-catalog"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    encoded_host_id = path[len(prefix) : -len(suffix)]
+    if (
+        not encoded_host_id
+        or "/" in encoded_host_id
+        or len(encoded_host_id) > MAX_ID_LENGTH * 3
+        or len(query) > 4_096
+    ):
+        raise ValueError("invalid model catalog route")
+    _validate_percent_encoding(encoded_host_id)
+    _validate_percent_encoding(query)
+    try:
+        host_id = unquote_to_bytes(encoded_host_id).decode("utf-8")
+        params = parse_qs(
+            query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=4,
+            errors="strict",
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("invalid model catalog route") from exc
+    if not host_id or len(host_id) > MAX_ID_LENGTH:
+        raise ValueError("invalid model catalog host")
+    if set(params) - {"harness", "refresh"}:
+        raise ValueError("unexpected model catalog query parameter")
+    harness_values = params.get("harness")
+    if (
+        harness_values is None
+        or len(harness_values) != 1
+        or not harness_values[0]
+        or len(harness_values[0]) > MAX_ID_LENGTH
+    ):
+        raise ValueError("harness must appear once")
+    refresh_values = params.get("refresh")
+    if refresh_values is None:
+        refresh = False
+    elif len(refresh_values) == 1 and refresh_values[0] in {"0", "1"}:
+        refresh = refresh_values[0] == "1"
+    else:
+        raise ValueError("refresh must appear once and be 0 or 1")
+    return host_id, harness_values[0], refresh
+
+
+def _validate_percent_encoding(value: str) -> None:
+    index = 0
+    while index < len(value):
+        if value[index] != "%":
+            index += 1
+            continue
+        if (
+            index + 2 >= len(value)
+            or value[index + 1] not in "0123456789abcdefABCDEF"
+            or value[index + 2] not in "0123456789abcdefABCDEF"
+        ):
+            raise ValueError("invalid percent encoding")
+        index += 3
+
+
 class _MetricsHandler(BaseHTTPRequestHandler):
     collector: "MetricsCollector"
     auth: AuthSettings = DISABLED
@@ -797,6 +861,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 "application/json",
                 self.collector.render_harness_json(include_sessions=False),
             )
+            return
+        try:
+            model_catalog_route = _parse_model_catalog_route(path, parsed.query)
+        except ValueError as exc:
+            self._send(
+                400,
+                "application/json",
+                json.dumps({"error": str(exc)}) + "\n",
+            )
+            return
+        if model_catalog_route is not None:
+            host_id, harness, refresh = model_catalog_route
+            status, body = self.collector.proxy_harness_model_catalog(
+                host_id, harness, refresh=refresh
+            )
+            self._send(status, "application/json", body)
             return
         auth_route = _parse_host_auth_route(path)
         if auth_route and auth_route["method"] == "GET":

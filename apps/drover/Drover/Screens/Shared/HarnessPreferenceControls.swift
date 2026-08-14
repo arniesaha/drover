@@ -2,31 +2,47 @@ import SwiftUI
 import DroverKit
 
 struct HarnessPreferenceControls: View {
-    let harness: String
+    let runPreferences: HarnessModelCatalogState
     let isEditable: Bool
-    @Binding var selectedModel: String
-    @Binding var thinkingEffort: String
+
+    @State private var showsModelPicker = false
 
     var body: some View {
+        @Bindable var runPreferences = runPreferences
+        let effort = HarnessModelPickerPresentation.effort(
+            in: runPreferences.catalog,
+            selectedModel: runPreferences.selectedModel,
+            selectedEffort: runPreferences.thinkingEffort
+        )
+
         HStack(spacing: 8) {
-            Menu {
-                Button("Default") { selectedModel = "" }
-                ForEach(HarnessRunPreferences.modelSuggestions(for: harness), id: \.self) { model in
-                    Button(model) { selectedModel = model }
-                }
+            Button {
+                showsModelPicker = true
             } label: {
-                PreferenceChip(title: modelLabel, systemImage: "cpu", kind: "Model")
+                PreferenceChip(
+                    title: HarnessModelCatalogPresentation.modelTitle(
+                        selection: runPreferences.selectedModel,
+                        catalog: runPreferences.catalog
+                    ),
+                    systemImage: "cpu",
+                    kind: "Model"
+                )
             }
             .buttonStyle(.plain)
 
-            if HarnessRunPreferences.supportsThinkingEffort(harness) {
+            if let effort {
                 Menu {
-                    Button("Default") { thinkingEffort = "" }
-                    ForEach(HarnessRunPreferences.thinkingEfforts, id: \.self) { effort in
-                        Button(effort.capitalized) { thinkingEffort = effort }
+                    ForEach(effort.choices) { choice in
+                        Button(choice.title) {
+                            runPreferences.thinkingEffort = choice.rawValue
+                        }
                     }
                 } label: {
-                    PreferenceChip(title: thinkingLabel, systemImage: "brain", kind: "Thinking effort")
+                    PreferenceChip(
+                        title: effort.title,
+                        systemImage: "brain",
+                        kind: "Thinking effort"
+                    )
                 }
                 .buttonStyle(.plain)
             }
@@ -41,14 +57,14 @@ struct HarnessPreferenceControls: View {
         .layoutPriority(1)
         .disabled(!isEditable)
         .opacity(isEditable ? 1 : 0.7)
-    }
-
-    private var modelLabel: String {
-        selectedModel.isEmpty ? "Default" : selectedModel
-    }
-
-    private var thinkingLabel: String {
-        thinkingEffort.isEmpty ? "Auto" : thinkingEffort.capitalized
+        .sheet(isPresented: $showsModelPicker) {
+            NavigationStack {
+                HarnessModelPicker(
+                    runPreferences: runPreferences,
+                    isEditable: isEditable
+                )
+            }
+        }
     }
 }
 

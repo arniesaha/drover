@@ -8,8 +8,7 @@ import DroverKit
 struct Composer: View {
     @Binding var text: String
     @Binding var attachments: [TurnAttachment]
-    @Binding var selectedModel: String
-    @Binding var thinkingEffort: String
+    let runPreferences: HarnessModelCatalogState
     let harness: String
     let isSending: Bool
     let onSend: () -> Void
@@ -24,9 +23,7 @@ struct Composer: View {
         GlassPromptSurface(
             text: $text,
             attachments: $attachments,
-            selectedModel: $selectedModel,
-            thinkingEffort: $thinkingEffort,
-            harness: harness,
+            runPreferences: runPreferences,
             arePreferencesEditable: HarnessRunPreferences.canChangeInExistingSession(harness),
             placeholder: "Add feedback...",
             isSending: isSending,

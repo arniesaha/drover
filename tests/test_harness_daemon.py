@@ -24,6 +24,7 @@ from drover.schema import bootstrap
 from drover.server.harness.cli import main as harnessd_cli
 from drover.server.harness import daemon as harness_daemon
 from drover.server.harness import cli as harness_cli
+from drover.server.harness import model_catalog
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
@@ -44,6 +45,11 @@ from drover.server.harness.daemon import (
     wire_event_pusher,
 )
 from drover.server.harness.content_consent import DurableContentConsent
+from drover.server.harness.model_catalog import (
+    CatalogEnvelope,
+    CatalogSelectionError,
+    ModelOption,
+)
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import client_handshake
@@ -278,6 +284,492 @@ def _content_config(
         max_bundle_bytes=2048,
         excerpt_max_chars=320,
     )
+
+
+class _FakeModelCatalogService:
+    def __init__(self, *, discovery_failure: bool = False):
+        self.discovery_failure = discovery_failure
+        self.reads = []
+        self.validations = []
+        self.invalidations = []
+
+    def read(self, harness: str, force: bool = False) -> CatalogEnvelope:
+        self.reads.append((harness, force))
+        if self.discovery_failure:
+            return CatalogEnvelope.empty_failure(
+                "test-host", harness, "not_authenticated"
+            )
+        return CatalogEnvelope(
+            host_id="test-host",
+            harness=harness,
+            account_scope_id="scope-test",
+            harness_version="1.0",
+            discovered_at=datetime(2026, 8, 14, tzinfo=timezone.utc),
+            stale=False,
+            stale_reason=None,
+            models=(ModelOption(id="gpt-5", display_name="GPT-5"),),
+        )
+
+    def validate(
+        self, harness: str, model: str | None, thinking_effort: str | None
+    ) -> None:
+        self.validations.append((harness, model, thinking_effort))
+        if model == "gpt-missing":
+            raise CatalogSelectionError(
+                "gpt-missing is unavailable; refresh model choices and try again"
+            )
+
+    def invalidate(self, harness: str) -> None:
+        self.invalidations.append(harness)
+
+
+class _FakeStructuredManager:
+    def __init__(self, harness: str = "codex"):
+        self.harness = harness
+        self.starts = []
+        self.turns = []
+
+    def has(self, session_id: str) -> bool:
+        return True
+
+    def harness_for(self, session_id: str) -> str:
+        return self.harness
+
+    def start(self, *args, **kwargs) -> None:
+        self.starts.append((args, kwargs))
+
+    def send_turn(self, session_id: str, text: str, **kwargs) -> str:
+        self.turns.append((session_id, text, kwargs))
+        return "turn-1"
+
+
+def _enabled_preset(name: str, executable: str = "/resolved/harness"):
+    return replace(
+        DEFAULT_PRESETS[name],
+        enabled=True,
+        executable=executable,
+    )
+
+
+def test_model_catalog_route_is_host_scoped_and_forceable(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.presets = {"codex": _enabled_preset("codex", "/resolved/codex")}
+    state.model_catalog_service = _FakeModelCatalogService()
+    try:
+        status, payload = _json_request(
+            f"{base_url}/model-catalog?harness=codex&refresh=1"
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert payload["host_id"] == state.host_id
+    assert payload["harness"] == "codex"
+    assert state.model_catalog_service.reads == [("codex", True)]
+
+
+def test_model_catalog_service_is_created_lazily_once(monkeypatch, tmp_path):
+    created = []
+    fake = _FakeModelCatalogService()
+
+    def factory(host_id, presets):
+        created.append((host_id, presets))
+        return fake
+
+    monkeypatch.setattr(harness_daemon, "default_model_catalog_service", factory)
+    server, state, base_url = _start_test_server(tmp_path)
+    state.presets = {"codex": _enabled_preset("codex", "/resolved/codex")}
+    assert state.model_catalog_service is None
+    try:
+        _json_request(f"{base_url}/model-catalog?harness=codex")
+        _json_request(f"{base_url}/model-catalog?harness=codex&refresh=1")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert created == [(state.host_id, state.presets)]
+    assert state.model_catalog_service is fake
+    assert fake.reads == [("codex", False), ("codex", True)]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "?harness=",
+        "?harness=codex&harness=agy",
+        "?harness=codex&refresh=2",
+        "?harness=codex&refresh=0&refresh=1",
+        "?harness=codex&executable=/tmp/untrusted",
+    ],
+)
+def test_model_catalog_route_rejects_malformed_query(tmp_path, query):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.presets = {"codex": _enabled_preset("codex")}
+    state.model_catalog_service = _FakeModelCatalogService()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(f"{base_url}/model-catalog{query}")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 400
+    assert state.model_catalog_service.reads == []
+
+
+@pytest.mark.parametrize("harness", ["unknown", "agy"])
+def test_model_catalog_route_rejects_unknown_or_disabled_harness(tmp_path, harness):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.presets = {
+        "codex": _enabled_preset("codex"),
+        "agy": DEFAULT_PRESETS["agy"],
+    }
+    state.model_catalog_service = _FakeModelCatalogService()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(f"{base_url}/model-catalog?harness={harness}")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 404
+    assert state.model_catalog_service.reads == []
+
+
+def test_model_catalog_route_requires_bearer_token(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {"codex": _enabled_preset("codex")}
+    state.model_catalog_service = _FakeModelCatalogService()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(f"{base_url}/model-catalog?harness=codex")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 401
+    assert state.model_catalog_service.reads == []
+
+
+def test_model_catalog_route_returns_safe_degraded_envelope(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.presets = {"codex": _enabled_preset("codex")}
+    state.model_catalog_service = _FakeModelCatalogService(discovery_failure=True)
+    try:
+        status, payload = _json_request(f"{base_url}/model-catalog?harness=codex")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert payload["stale"] is True
+    assert payload["stale_reason"] == "not_authenticated"
+    assert payload["models"] == []
+
+
+def test_default_model_catalog_service_uses_only_enabled_resolved_presets():
+    presets = {
+        "shell": DEFAULT_PRESETS["shell"],
+        "codex": _enabled_preset("codex", "/resolved/codex"),
+        "claude-code": _enabled_preset("claude-code", "/resolved/claude"),
+        "agy": _enabled_preset("agy", "/resolved/agy"),
+    }
+
+    service = model_catalog.default_model_catalog_service("host-1", presets)
+
+    assert set(service._adapters) == {"codex", "claude-code", "agy"}
+    assert service._adapters["codex"].command == (
+        "/resolved/codex",
+        "app-server",
+        "--stdio",
+    )
+    assert service._adapters["claude-code"].command == ("/resolved/claude",)
+    assert service._adapters["agy"].command == ("/resolved/agy",)
+
+
+def test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll(
+    tmp_path,
+):
+    class _Auth:
+        def start(self, harness):
+            return {"flow_id": "flow-1", "harness": harness, "state": "starting"}
+
+        def send_input(self, harness, flow_id, text):
+            return {"flow_id": flow_id, "harness": harness, "state": "running"}
+
+        def cancel(self, harness, flow_id):
+            return {"flow_id": flow_id, "harness": harness, "state": "cancelled"}
+
+        def snapshot(self, harness, flow_id):
+            return {
+                "flow_id": flow_id,
+                "harness": harness,
+                "state": "authenticated",
+            }
+
+    server, state, base_url = _start_test_server(tmp_path)
+    state.auth = _Auth()
+    state.model_catalog_service = _FakeModelCatalogService()
+    try:
+        _json_request(f"{base_url}/auth/codex/start", payload={})
+        _json_request(
+            f"{base_url}/auth/codex/flows/flow-1/input",
+            payload={"text": "code"},
+        )
+        _json_request(f"{base_url}/auth/codex/flows/flow-1/cancel", payload={})
+        _json_request(f"{base_url}/auth/codex/flows/flow-1")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert state.model_catalog_service.invalidations == [
+        "codex",
+        "codex",
+        "codex",
+        "codex",
+    ]
+
+
+def test_model_preference_validation_rejects_launch_before_side_effects(
+    monkeypatch, tmp_path
+):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
+    state.structured = _FakeStructuredManager()
+    state.attachments_dir = tmp_path / "attachments"
+
+    def forbidden_side_effect(*args, **kwargs):
+        raise AssertionError("launch side effect ran before preference validation")
+
+    monkeypatch.setattr(
+        harness_daemon, "apply_structured_preferences", forbidden_side_effect
+    )
+    monkeypatch.setattr(
+        harness_daemon, "create_session_worktree", forbidden_side_effect
+    )
+    monkeypatch.setattr(harness_daemon, "save_turn_attachments", forbidden_side_effect)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "codex",
+                    "mode": "structured",
+                    "command": ["/nonexistent/codex"],
+                    "cwd": str(tmp_path),
+                    "prompt": "hello",
+                    "images": [
+                        {
+                            "media_type": "image/png",
+                            "data_base64": base64.b64encode(b"image").decode(),
+                        }
+                    ],
+                    "model": "gpt-missing",
+                },
+            )
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 400
+    assert payload == {
+        "error": "gpt-missing is unavailable; refresh model choices and try again"
+    }
+    assert state.model_catalog_service.validations == [("codex", "gpt-missing", None)]
+    assert state.registry.list_sessions(host_id=state.host_id) == []
+    assert state.structured.starts == []
+    assert not state.worktrees_dir.exists()
+    assert not state.attachments_dir.exists()
+
+
+def test_model_preference_validation_keeps_null_launch_defaults(monkeypatch, tmp_path):
+    def forbidden_factory(host_id, presets):
+        raise AssertionError("null preferences must not construct a catalog service")
+
+    monkeypatch.setattr(
+        harness_daemon, "default_model_catalog_service", forbidden_factory
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+            },
+        )
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 201
+    assert payload["model"] is None
+    assert payload["thinking_effort"] is None
+
+
+def test_model_preference_validation_passes_codex_turn_preferences_unchanged(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
+    state.structured = _FakeStructuredManager(harness="codex")
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/session-1/turns",
+            payload={
+                "text": "continue",
+                "model": "gpt-5",
+                "thinking_effort": "high",
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 202
+    assert payload == {"turn_id": "turn-1"}
+    assert state.model_catalog_service.validations == [("codex", "gpt-5", "high")]
+    assert state.structured.turns == [
+        (
+            "session-1",
+            "continue",
+            {"images": None, "model": "gpt-5", "thinking_effort": "high"},
+        )
+    ]
+
+
+def test_model_preference_validation_preserves_opaque_identifier_whitespace(
+    tmp_path,
+):
+    raw_model = " model-with-space "
+    raw_effort = " effort-with-space "
+    server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
+    state.structured = _FakeStructuredManager(harness="codex")
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/session-1/turns",
+            payload={
+                "text": "continue",
+                "model": raw_model,
+                "thinking_effort": raw_effort,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 202
+    assert payload == {"turn_id": "turn-1"}
+    assert state.model_catalog_service.validations == [("codex", raw_model, raw_effort)]
+    assert state.structured.turns == [
+        (
+            "session-1",
+            "continue",
+            {
+                "images": None,
+                "model": raw_model,
+                "thinking_effort": raw_effort,
+            },
+        )
+    ]
+
+
+def test_model_preference_validation_rejects_turn_before_attachment_or_driver(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
+    state.structured = _FakeStructuredManager(harness="codex")
+    state.attachments_dir = tmp_path / "attachments"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/sessions/session-1/turns",
+                payload={
+                    "text": "continue",
+                    "model": "gpt-missing",
+                    "images": [
+                        {
+                            "media_type": "image/png",
+                            "data_base64": base64.b64encode(b"image").decode(),
+                        }
+                    ],
+                },
+            )
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 400
+    assert payload == {
+        "error": "gpt-missing is unavailable; refresh model choices and try again"
+    }
+    assert state.structured.turns == []
+    assert not state.attachments_dir.exists()
+
+
+def test_model_preference_validation_discards_claude_turn_overrides(
+    monkeypatch, tmp_path
+):
+    created = []
+
+    class _ForbiddenService:
+        def validate(self, harness, model, thinking_effort):
+            raise AssertionError("discarded Claude overrides must not be validated")
+
+    def forbidden_factory(host_id, presets):
+        created.append((host_id, presets))
+        return _ForbiddenService()
+
+    monkeypatch.setattr(
+        harness_daemon, "default_model_catalog_service", forbidden_factory
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="claude-code")
+    try:
+        status, _ = _json_request(
+            f"{base_url}/sessions/session-1/turns",
+            payload={
+                "text": "continue",
+                "model": "gpt-missing",
+                "thinking_effort": "impossible",
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 202
+    assert created == []
+    assert state.model_catalog_service is None
+    assert state.structured.turns == [
+        (
+            "session-1",
+            "continue",
+            {"images": None, "model": None, "thinking_effort": None},
+        )
+    ]
 
 
 def test_cli_harnessd_help_documents_core_options():
@@ -2640,6 +3132,7 @@ def test_structured_session_full_lifecycle(tmp_path):
 
 def test_structured_session_inventory_includes_run_preferences(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
     try:
         status, body = _json_request(
             f"{base_url}/sessions",
@@ -2675,6 +3168,7 @@ def test_structured_session_inventory_includes_run_preferences(tmp_path):
 
 def test_claude_turn_cannot_change_persistent_session_preferences(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
     try:
         status, body = _json_request(
             f"{base_url}/sessions",

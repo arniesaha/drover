@@ -27,6 +27,26 @@ def _credentials(tmp_path, *, expires_at_ms: int = 4102444800000):
     return path
 
 
+def test_shared_credential_loader_returns_identity_without_exposing_token(tmp_path):
+    from drover.server.providers.claude_credentials import load_claude_credential
+
+    account = tmp_path / ".claude.json"
+    account.write_text(
+        '{"oauthAccount":{"accountUuid":"account-123","emailAddress":"person@example.com"}}'
+    )
+    credential = load_claude_credential(
+        credentials_path=_credentials(tmp_path),
+        account_path=account,
+        keychain_reader=lambda: None,
+        now=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    assert credential.access_token == "sk-test-token"
+    assert credential.account_identity == "account-123"
+    assert credential.subscription_type == "max"
+    assert "sk-test-token" not in repr(credential)
+
+
 USAGE_BODY = json.dumps(
     {
         "five_hour": {"utilization": 34.5, "resets_at": "2026-08-09T20:00:00Z"},

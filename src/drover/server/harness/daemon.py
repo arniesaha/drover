@@ -44,6 +44,11 @@ from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.models import HarnessEvent
+from drover.server.harness.model_catalog import (
+    CatalogSelectionError,
+    ModelCatalogService,
+    default_model_catalog_service,
+)
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
@@ -409,6 +414,13 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_identifier(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text.strip() else None
 
 
 def discover_native_resume_sessions(
@@ -1130,6 +1142,8 @@ class HarnessDaemonState:
     agy_usage_probe: Any | None = None
     advisory_content: "AdvisoryContentConfig | None" = None
     content_consent: DurableContentConsent | None = None
+    model_catalog_service: ModelCatalogService | None = None
+    model_catalog_service_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def recovery_lock_for(self, session_id: str) -> threading.Lock:
         with self.recovery_locks_guard:
@@ -1154,6 +1168,20 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 
 class HarnessRequestHandler(BaseHTTPRequestHandler):
     server: HarnessHTTPServer
+
+    def _model_catalog_service(self) -> ModelCatalogService:
+        state = self.server.state
+        with state.model_catalog_service_lock:
+            if state.model_catalog_service is None:
+                state.model_catalog_service = default_model_catalog_service(
+                    state.host_id, state.presets
+                )
+            return state.model_catalog_service
+
+    def _invalidate_model_catalog(self, harness: str) -> None:
+        service = self.server.state.model_catalog_service
+        if service is not None:
+            service.invalidate(harness)
 
     def _authorized(self) -> bool:
         token = self.server.state.api_token
@@ -1191,6 +1219,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/capabilities":
             self._write_json(self.server.state.capabilities())
+            return
+        if parsed.path == "/model-catalog":
+            self._model_catalog(parsed.query)
             return
         if parsed.path == "/providers/usage":
             self._provider_usage()
@@ -1331,6 +1362,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         snapshot["host_id"] = self.server.state.host_id
+        self._invalidate_model_catalog(harness)
         self._write_json(snapshot)
 
     def _auth_flow(self, harness: str, flow_id: str) -> None:
@@ -1340,6 +1372,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
             return
         snapshot["host_id"] = self.server.state.host_id
+        if snapshot.get("state") == "authenticated":
+            self._invalidate_model_catalog(harness)
         self._write_json(snapshot)
 
     def _auth_cancel(self, harness: str, flow_id: str) -> None:
@@ -1352,6 +1386,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
             return
         snapshot["host_id"] = self.server.state.host_id
+        self._invalidate_model_catalog(harness)
         self._write_json(snapshot)
 
     def _auth_input(self, harness: str, flow_id: str) -> None:
@@ -1380,7 +1415,44 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
             return
         snapshot["host_id"] = self.server.state.host_id
+        self._invalidate_model_catalog(harness)
         self._write_json(snapshot)
+
+    def _model_catalog(self, query: str) -> None:
+        params = parse_qs(query, keep_blank_values=True)
+        if set(params) - {"harness", "refresh"}:
+            self._write_json(
+                {"error": "invalid model catalog query"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        harness_values = params.get("harness", [])
+        refresh_values = params.get("refresh", [])
+        if (
+            len(harness_values) != 1
+            or not harness_values[0].strip()
+            or len(refresh_values) > 1
+            or (refresh_values and refresh_values[0] not in {"0", "1"})
+        ):
+            self._write_json(
+                {"error": "invalid model catalog query"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        harness = harness_values[0]
+        preset = self.server.state.presets.get(harness)
+        if preset is None or not preset.enabled:
+            self._write_json(
+                {"error": f"unknown or disabled harness preset: {harness}"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+
+        envelope = self._model_catalog_service().read(
+            harness, force=refresh_values == ["1"]
+        )
+        self._write_json(envelope.to_wire())
 
     def _provider_usage(self) -> None:
         observed_at = datetime.now(timezone.utc)
@@ -1903,8 +1975,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        model = _optional_text(body.get("model"))
-        thinking_effort = _optional_text(body.get("thinking_effort"))
+        model = _optional_identifier(body.get("model"))
+        thinking_effort = _optional_identifier(body.get("thinking_effort"))
+        if model is not None or thinking_effort is not None:
+            try:
+                self._model_catalog_service().validate(harness, model, thinking_effort)
+            except CatalogSelectionError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         command = body.get("command")
         default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
         if command is None and default_command_fn:
@@ -2065,6 +2143,23 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 {"error": "text or images required"}, status=HTTPStatus.BAD_REQUEST
             )
             return
+        model = _optional_identifier(body.get("model"))
+        thinking_effort = _optional_identifier(body.get("thinking_effort"))
+        harness = self.server.state.structured.harness_for(session_id)
+        # Claude owns one persistent process, so later turn preferences cannot
+        # affect the running model. Silently ignore overrides from older/direct
+        # clients and preserve the startup preferences stored in the registry.
+        if harness == "claude-code":
+            model = None
+            thinking_effort = None
+        if model is not None or thinking_effort is not None:
+            try:
+                self._model_catalog_service().validate(
+                    harness or "", model, thinking_effort
+                )
+            except CatalogSelectionError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         try:
             saved = save_turn_attachments(
                 self.server.state.attachments_dir, session_id, images
@@ -2073,14 +2168,6 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         text = append_attachment_lines(text, saved)
-        model = _optional_text(body.get("model"))
-        thinking_effort = _optional_text(body.get("thinking_effort"))
-        # Claude owns one persistent process, so later turn preferences cannot
-        # affect the running model. Silently ignore overrides from older/direct
-        # clients and preserve the startup preferences stored in the registry.
-        if self.server.state.structured.harness_for(session_id) == "claude-code":
-            model = None
-            thinking_effort = None
         try:
             turn_id = self.server.state.structured.send_turn(
                 session_id,

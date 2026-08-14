@@ -121,6 +121,17 @@ for line in sys.stdin:
         print("diagnostic " * 20000, file=sys.stderr, flush=True)
     if "id" not in request:
         continue
+    if mode == "stdout_flood":
+        print(json.dumps({"id": request["id"], "result": {"blob": "x" * 1100000}}), flush=True)
+        continue
+    if mode == "stdout_multibyte_flood":
+        payload = json.dumps(
+            {"id": request["id"], "result": {"blob": "é" * 600000}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        sys.stdout.buffer.write(payload + b"\\n")
+        sys.stdout.buffer.flush()
+        continue
     if request["method"] == "initialize":
         result = {"userAgent": "fake"}
     elif request["method"] == "account/read":
@@ -147,6 +158,16 @@ for line in sys.stdin:
                 },
             }
         }
+    elif request["method"] == "model/list":
+        result = {
+            "data": [
+                {
+                    "model": "gpt-5.6-terra",
+                    "displayName": "GPT-5.6 Terra",
+                }
+            ],
+            "nextCursor": None,
+        }
     else:
         continue
     print(json.dumps({"id": request["id"], "result": result}), flush=True)
@@ -155,6 +176,13 @@ for line in sys.stdin:
         command=(sys.executable, "-u", str(script), "success"),
         timeout_command=(sys.executable, "-u", str(script), "timeout"),
         noisy_command=(sys.executable, "-u", str(script), "stderr_flood"),
+        oversized_command=(sys.executable, "-u", str(script), "stdout_flood"),
+        oversized_multibyte_command=(
+            sys.executable,
+            "-u",
+            str(script),
+            "stdout_multibyte_flood",
+        ),
     )
 
 
@@ -318,6 +346,68 @@ def test_codex_probe_reads_plan_and_multiple_windows(fake_codex_app_server):
     assert snapshot.windows[0].resets_at == datetime(
         2024, 11, 7, 2, 40, tzinfo=timezone.utc
     )
+
+
+def test_codex_app_server_session_initializes_once_and_calls_multiple_methods(
+    fake_codex_app_server,
+):
+    from drover.server.providers.codex_app_server import CodexAppServerSession
+
+    with CodexAppServerSession(fake_codex_app_server.command, timeout_s=1) as client:
+        account = client.request("account/read", {"refreshToken": False})
+        models = client.request(
+            "model/list", {"cursor": None, "includeHidden": False, "limit": 100}
+        )
+
+    assert account["account"]["email"] == "person@example.com"
+    assert models["data"][0]["model"] == "gpt-5.6-terra"
+
+
+def test_codex_app_server_transport_imports_in_a_fresh_process():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from drover.server.providers.codex_app_server import "
+            "CodexAppServerSession",
+        ],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_codex_app_server_session_rejects_oversized_stdout(
+    fake_codex_app_server,
+):
+    from drover.server.providers.codex_app_server import (
+        CodexAppServerError,
+        CodexAppServerSession,
+    )
+
+    with pytest.raises(CodexAppServerError, match="protocol_error"):
+        with CodexAppServerSession(
+            fake_codex_app_server.oversized_command, timeout_s=1
+        ):
+            pass
+
+
+def test_codex_app_server_session_applies_stdout_limit_to_encoded_bytes(
+    fake_codex_app_server,
+):
+    from drover.server.providers.codex_app_server import (
+        CodexAppServerError,
+        CodexAppServerSession,
+    )
+
+    with pytest.raises(CodexAppServerError, match="protocol_error"):
+        with CodexAppServerSession(
+            fake_codex_app_server.oversized_multibyte_command, timeout_s=1
+        ):
+            pass
 
 
 def test_codex_probe_separates_a_missing_cli_from_a_host_failure(tmp_path):

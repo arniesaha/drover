@@ -10,6 +10,7 @@ import Observation
 public final class LaunchModel {
     private let client: DroverClient
     private let snapshot: HarnessSnapshot?
+    public let runPreferences: HarnessModelCatalogState
 
     /// Harness names the server can run in a structured (turn-based) mode;
     /// anything else (currently just "shell") only supports a raw PTY.
@@ -22,24 +23,38 @@ public final class LaunchModel {
             // Keep the user's pick when the new host also offers it; only
             // reset to the new host's default when it's no longer valid.
             if !newHarnesses.contains(harness) {
-                harness = Self.defaultHarness(for: newHarnesses)
+                let replacement = Self.defaultHarness(for: newHarnesses)
+                if replacement != harness {
+                    harness = replacement
+                    return
+                }
             }
+            runPreferences.select(hostID: hostID, harness: harness)
         }
     }
-    public var harness: String
+    public var harness: String {
+        didSet {
+            guard oldValue != harness else { return }
+            runPreferences.select(hostID: hostID, harness: harness)
+        }
+    }
     public var cwd: String = ""
     public var prompt: String = ""
     public var promptAttachments: [TurnAttachment] = []
-    public var selectedModel: String = ""
-    public var thinkingEffort: String = ""
     public private(set) var launchError: String?
 
-    public init(client: DroverClient, snapshot: HarnessSnapshot?) {
+    public init(
+        client: DroverClient,
+        snapshot: HarnessSnapshot?,
+        store: HarnessModelCatalogStore = HarnessModelCatalogStore()
+    ) {
         self.client = client
         self.snapshot = snapshot
+        self.runPreferences = HarnessModelCatalogState(client: client, store: store)
         let firstHost = (snapshot?.hosts ?? []).first { $0.status == "online" }
         self.hostID = firstHost?.id ?? ""
         self.harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
+        self.runPreferences.select(hostID: hostID, harness: harness)
     }
 
     /// Online hosts only — offline hosts can't accept a new session.
@@ -72,10 +87,6 @@ public final class LaunchModel {
         Self.structuredCapableHarnesses.contains(harness)
     }
 
-    public var supportsThinkingEffort: Bool {
-        HarnessRunPreferences.supportsThinkingEffort(harness)
-    }
-
     /// Posts `createSession` for the current selection. On success returns
     /// the new session id; on failure sets `launchError` (server-authored
     /// text when available) and returns nil.
@@ -86,10 +97,8 @@ public final class LaunchModel {
         let effectiveImages = isStructured ? promptAttachments : []
         let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveCwd = trimmedCwd.isEmpty ? nil : trimmedCwd
-        let effectiveModel = isStructured ? HarnessRunPreferences.optional(selectedModel) : nil
-        let effectiveThinking = (isStructured && supportsThinkingEffort)
-            ? HarnessRunPreferences.optional(thinkingEffort)
-            : nil
+        let effectiveModel = isStructured ? runPreferences.modelOverride : nil
+        let effectiveThinking = isStructured ? runPreferences.thinkingEffortOverride : nil
 
         do {
             let sessionID = try await client.createSession(

@@ -6,19 +6,17 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-from queue import Empty, Queue
-import subprocess
-import threading
-from time import monotonic
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from drover.server.harness.auth import redact_auth_text
+from drover.server.providers.codex_app_server import (
+    CodexAppServerError,
+    CodexAppServerSession,
+    _stop_process,
+)
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
 log = logging.getLogger(__name__)
-_PROCESS_STOP_TIMEOUT_S = 0.5
-_MAX_CAPTURED_STDERR_CHARS = 16_384
 
 
 class _ProbeFailure(RuntimeError):
@@ -43,211 +41,26 @@ class CodexUsageProbe:
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = datetime.now(timezone.utc)
-        process: subprocess.Popen[str] | None = None
-        reader: threading.Thread | None = None
-        stderr_reader: threading.Thread | None = None
-        lines: Queue[str | None] = Queue()
-        stderr_parts: list[str] = []
+        if self.command is None:
+            return _error_snapshot(host_id, observed_at, "cli_not_found")
         try:
-            if self.command is None:
-                raise _ProbeFailure("cli_not_found")
-            if self.timeout_s <= 0:
-                raise _ProbeFailure("timeout")
-            deadline = monotonic() + self.timeout_s
-            try:
-                process = subprocess.Popen(
-                    self.command,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+            with CodexAppServerSession(self.command, self.timeout_s) as client:
+                account_response = client.request(
+                    "account/read", {"refreshToken": False}
                 )
-            except FileNotFoundError:
-                # Distinct from "unavailable", which is also the host-level
-                # catch-all: the CLI is simply not where we were told it is.
-                raise _ProbeFailure("cli_not_found") from None
-            except OSError:
-                raise _ProbeFailure("unavailable") from None
-
-            if (
-                process.stdin is None
-                or process.stdout is None
-                or process.stderr is None
-            ):
-                raise _ProbeFailure("process_error")
-            reader = _stdout_reader(process.stdout, lines)
-            stderr_reader = _stderr_reader(process.stderr, stderr_parts)
-            initialize = self._request(
-                process,
-                lines,
-                deadline,
-                1,
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "drover",
-                        "title": "Drover",
-                        "version": "0.1.0",
-                    }
-                },
-            )
-            if not isinstance(initialize, Mapping):
-                raise _ProbeFailure("protocol_error")
-            self._notify(process, "initialized", {})
-            account_response = self._request(
-                process,
-                lines,
-                deadline,
-                2,
-                "account/read",
-                {"refreshToken": False},
-            )
-            rate_limit_response = self._request(
-                process,
-                lines,
-                deadline,
-                3,
-                "account/rateLimits/read",
-                None,
-            )
+                rate_limit_response = client.request("account/rateLimits/read", None)
             return _snapshot_from_responses(
                 account_response,
                 rate_limit_response,
                 host_id=host_id,
                 observed_at=observed_at,
             )
+        except CodexAppServerError as exc:
+            return _error_snapshot(host_id, observed_at, exc.category)
         except _ProbeFailure as exc:
             return _error_snapshot(host_id, observed_at, exc.category)
         except (TypeError, ValueError, OverflowError):
             return _error_snapshot(host_id, observed_at, "protocol_error")
-        finally:
-            if process is not None:
-                _stop_process(process)
-            if reader is not None:
-                reader.join(timeout=_PROCESS_STOP_TIMEOUT_S)
-            if stderr_reader is not None:
-                stderr_reader.join(timeout=_PROCESS_STOP_TIMEOUT_S)
-            stderr = "".join(stderr_parts)
-            if stderr:
-                # Stderr can contain CLI or auth diagnostics. It is never
-                # returned in the API response and must be redacted before a
-                # local diagnostic log sees it.
-                log.debug("codex app-server probe stderr: %s", redact_auth_text(stderr))
-
-    def _request(
-        self,
-        process: subprocess.Popen[str],
-        lines: Queue[str | None],
-        deadline: float,
-        request_id: int,
-        method: str,
-        params: Mapping[str, Any] | None,
-    ) -> Mapping[str, Any]:
-        payload: dict[str, Any] = {"id": request_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-        self._write(process, payload)
-        while True:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise _ProbeFailure("timeout")
-            try:
-                line = lines.get(timeout=remaining)
-            except Empty:
-                raise _ProbeFailure("timeout") from None
-            if line is None:
-                raise _ProbeFailure("process_error")
-            try:
-                response = json.loads(line)
-            except json.JSONDecodeError:
-                raise _ProbeFailure("protocol_error") from None
-            if not isinstance(response, Mapping):
-                raise _ProbeFailure("protocol_error")
-            if response.get("id") != request_id:
-                continue
-            if "error" in response or not isinstance(response.get("result"), Mapping):
-                raise _ProbeFailure("protocol_error")
-            return response["result"]
-
-    def _notify(
-        self, process: subprocess.Popen[str], method: str, params: Mapping[str, Any]
-    ) -> None:
-        self._write(process, {"method": method, "params": params})
-
-    @staticmethod
-    def _write(process: subprocess.Popen[str], payload: Mapping[str, Any]) -> None:
-        if process.stdin is None:
-            raise _ProbeFailure("process_error")
-        try:
-            process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-            process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            raise _ProbeFailure("process_error") from None
-
-
-def _stdout_reader(stream, lines: Queue[str | None]) -> threading.Thread:
-    def read_lines() -> None:
-        try:
-            for line in iter(stream.readline, ""):
-                lines.put(line)
-        finally:
-            lines.put(None)
-
-    thread = threading.Thread(target=read_lines, daemon=True)
-    thread.start()
-    return thread
-
-
-def _stderr_reader(stream, captured: list[str]) -> threading.Thread:
-    def read_chunks() -> None:
-        remaining = _MAX_CAPTURED_STDERR_CHARS
-        for chunk in iter(lambda: stream.read(4096), ""):
-            if remaining:
-                captured.append(chunk[:remaining])
-                remaining -= len(chunk)
-
-    thread = threading.Thread(target=read_chunks, daemon=True)
-    thread.start()
-    return thread
-
-
-def _stop_process(process: subprocess.Popen[str]) -> None:
-    """Stop the child, and never raise while doing it.
-
-    This runs inside ``read()``'s ``finally``, where an exception escapes the
-    method itself rather than being caught by its own ``except`` clauses.
-    ``_provider_usage`` calls the probe with no ``try`` and ``harnessd``'s
-    ``do_GET`` has no wrapper, so anything escaping here means no HTTP
-    response at all -- taking the Claude and Google cards down with a Codex
-    problem (the rule ``providers/claude.py`` already follows, drover#65).
-
-    Two ways it can fire, neither yet observed in the wild: a child that
-    outlives ``SIGKILL`` (wedged in uninterruptible sleep) makes the second
-    ``wait`` raise ``TimeoutExpired``, and closing stdin against a dead child
-    raises ``BrokenPipeError``. An abandoned process is worth less than the
-    response, so both are swallowed.
-    """
-    try:
-        if process.poll() is None:
-            process.terminate()
-        try:
-            process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                log.debug("codex app-server survived SIGKILL; abandoning it")
-    except OSError:
-        log.debug("codex app-server could not be stopped", exc_info=True)
-    finally:
-        if process.stdin is not None:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
 
 
 def _snapshot_from_responses(

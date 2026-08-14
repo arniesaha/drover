@@ -13,6 +13,7 @@ public final class ChatModel {
     private let client: DroverClient
     private let sessionID: String
     private let stream: MessageStream
+    public let runPreferences: HarnessModelCatalogState
 
     public private(set) var messages: [HarnessMessage]
     public private(set) var isConnected = false
@@ -129,8 +130,6 @@ public final class ChatModel {
     public var composerText = ""
     /// Images picked in the composer, waiting to ride the next turn.
     public var pendingAttachments: [TurnAttachment] = []
-    public var selectedModel = ""
-    public var thinkingEffort = ""
     /// Text the user sent while the harness was mid-turn (codex/gemini
     /// reject overlapping turns with 409 "turn already in flight"). Held
     /// here and auto-dispatched when the turn-complete status arrives.
@@ -156,6 +155,7 @@ public final class ChatModel {
     /// delivery, queueing, or message sequence handling.
     private nonisolated(unsafe) var recapRefreshTask: Task<Void, Never>?
     private var recapRefreshGeneration = 0
+    private var hasInitializedRunPreferences = false
     private let recapPollInterval: Duration
     private let recapPollAttempts: Int
 
@@ -163,6 +163,7 @@ public final class ChatModel {
         client: DroverClient,
         sessionID: String,
         harness: String? = nil,
+        store: HarnessModelCatalogStore = HarnessModelCatalogStore(),
         recap: String? = nil,
         recapSourceSeq: Int? = nil,
         recapPollInterval: Duration = .seconds(1),
@@ -173,6 +174,7 @@ public final class ChatModel {
             client: client,
             sessionID: sessionID,
             harness: harness,
+            store: store,
             initialMessages: [],
             recap: recap,
             recapSourceSeq: recapSourceSeq,
@@ -189,6 +191,7 @@ public final class ChatModel {
         client: DroverClient,
         sessionID: String,
         harness: String? = nil,
+        store: HarnessModelCatalogStore = HarnessModelCatalogStore(),
         initialMessages: [HarnessMessage],
         recap: String? = nil,
         recapSourceSeq: Int? = nil,
@@ -198,6 +201,7 @@ public final class ChatModel {
     ) {
         self.client = client
         self.sessionID = sessionID
+        self.runPreferences = HarnessModelCatalogState(client: client, store: store)
         self.messages = initialMessages
         self.harnessPresentation = HarnessPresentation(harness ?? "")
         self.recap = recap
@@ -553,11 +557,7 @@ public final class ChatModel {
         guard HarnessRunPreferences.canChangeInExistingSession(harness) else {
             return (nil, nil)
         }
-        let model = HarnessRunPreferences.optional(selectedModel)
-        let thinking = HarnessRunPreferences.supportsThinkingEffort(harness)
-            ? HarnessRunPreferences.optional(thinkingEffort)
-            : nil
-        return (model, thinking)
+        return (runPreferences.modelOverride, runPreferences.thinkingEffortOverride)
     }
 
     public func approve(_ decision: String) async {
@@ -604,6 +604,16 @@ public final class ChatModel {
         guard let metadata = await Self.fetchSessionMetadata(client: client, sessionID: sessionID)
         else { return }
         applySessionMetadata(metadata.snapshot, session: metadata.session)
+        if !hasInitializedRunPreferences {
+            hasInitializedRunPreferences = true
+            runPreferences.select(
+                hostID: metadata.session.hostID,
+                harness: metadata.session.harness,
+                seedModel: Self.nonEmpty(metadata.session.model),
+                seedThinkingEffort: Self.nonEmpty(metadata.session.thinkingEffort)
+            )
+        }
+        await runPreferences.refresh()
     }
 
     /// Fetching is intentionally side-effect free so a recap-refresh task can
@@ -635,17 +645,14 @@ public final class ChatModel {
             recap = preview
             recapSourceSeq = nil
         }
-        if selectedModel.isEmpty, let model = session.model, !model.isEmpty {
-            selectedModel = model
-        }
-        if thinkingEffort.isEmpty,
-           let effort = session.thinkingEffort,
-           !effort.isEmpty,
-           HarnessRunPreferences.supportsThinkingEffort(session.harness) {
-            thinkingEffort = effort
-        }
         guard let host = snapshot.hosts.first(where: { $0.id == session.hostID }) else { return }
         handoffHarnesses = host.harnesses
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : value
     }
 
     /// Compatibility entry point for existing callers. Metadata loading grew

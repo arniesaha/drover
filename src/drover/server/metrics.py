@@ -8,6 +8,7 @@ import hashlib
 import http.client
 import json
 import logging
+import socket
 import tempfile
 import threading
 import time
@@ -22,6 +23,12 @@ from drover.server.harness.daemon import (
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.model_catalog import (
+    MAX_CATALOG_WIRE_BYTES,
+    CatalogEnvelope,
+    catalog_wire_bytes,
+)
+from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
@@ -623,6 +630,39 @@ def _harness_endpoint(host: Any) -> str:
 
 def _json_response(status: int, payload: Mapping[str, Any]) -> tuple[int, str]:
     return status, json.dumps(dict(payload), sort_keys=True, default=str) + "\n"
+
+
+def _model_catalog_failure_reason(status: int, body: str) -> str:
+    if status in {401, 403}:
+        return "not_authenticated"
+    if status == 404:
+        return "unsupported"
+    lowered = body.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout"
+    if any(
+        marker in lowered
+        for marker in (
+            "byte limit",
+            "content-length",
+            "framed response capability",
+            "decode",
+            "utf-8",
+        )
+    ):
+        return "protocol_error"
+    if status == 502 or status >= 500:
+        return "offline"
+    return "protocol_error"
+
+
+def _model_catalog_exception_reason(exc: Exception) -> str:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, (TypeError, ValueError, UnicodeError)):
+        return "protocol_error"
+    lowered = str(exc).lower()
+    return "timeout" if "timed out" in lowered or "timeout" in lowered else "offline"
 
 
 def _insight_response(render) -> tuple[int, str]:
@@ -1413,6 +1453,118 @@ class MetricsCollector:
             method="GET",
             payload={},
         )
+
+    def proxy_harness_model_catalog(
+        self, host_id: str, harness: str, *, refresh: bool = False
+    ) -> tuple[int, str]:
+        """Fetch one host catalog and degrade safely to the central LKG."""
+        if (
+            not isinstance(host_id, str)
+            or not host_id
+            or len(host_id) > MAX_ID_LENGTH
+            or not isinstance(harness, str)
+            or not harness
+            or len(harness) > MAX_ID_LENGTH
+            or not isinstance(refresh, bool)
+        ):
+            return _json_response(400, {"error": "invalid model catalog request"})
+
+        host = self._harness_host(host_id)
+        if host is None:
+            return _json_response(404, {"error": "unknown harness host"})
+        advertised = host.capabilities.get("harnesses")
+        if not isinstance(advertised, list) or not any(
+            isinstance(item, dict)
+            and item.get("name") == harness
+            and item.get("enabled") is True
+            for item in advertised
+        ):
+            return _json_response(404, {"error": "harness is not enabled"})
+
+        path = "/model-catalog?" + urlencode(
+            {"harness": harness, "refresh": "1" if refresh else "0"}
+        )
+        try:
+            status, body = self._harness_request(
+                host,
+                path,
+                method="GET",
+                payload={},
+                timeout_s=7.0,
+                max_response_bytes=MAX_CATALOG_WIRE_BYTES,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalized to safe metadata
+            reason = _model_catalog_exception_reason(exc)
+            return self._stale_model_catalog_response(host_id, harness, reason)
+
+        if not isinstance(body, str):
+            return self._stale_model_catalog_response(
+                host_id, harness, "protocol_error"
+            )
+        try:
+            body_bytes = body.encode("utf-8")
+        except UnicodeEncodeError:
+            return self._stale_model_catalog_response(
+                host_id, harness, "protocol_error"
+            )
+        if len(body_bytes) > MAX_CATALOG_WIRE_BYTES:
+            return self._stale_model_catalog_response(
+                host_id, harness, "protocol_error"
+            )
+        if not 200 <= status < 300:
+            reason = _model_catalog_failure_reason(status, body)
+            return self._stale_model_catalog_response(host_id, harness, reason)
+
+        try:
+            decoded = json.loads(body)
+            envelope = CatalogEnvelope.from_wire(decoded, host_id, harness)
+            normalized_body = catalog_wire_bytes(envelope).decode("utf-8")
+        except (TypeError, json.JSONDecodeError, ValueError):
+            return self._stale_model_catalog_response(
+                host_id, harness, "protocol_error"
+            )
+
+        if envelope.stale:
+            return self._stale_model_catalog_response(
+                host_id, harness, envelope.stale_reason or "protocol_error"
+            )
+
+        if envelope.account_scope_id is not None:
+            try:
+                HarnessRegistry(self.duckdb_path).save_model_catalog(
+                    host_id,
+                    harness,
+                    envelope.account_scope_id,
+                    envelope.to_wire(),
+                )
+            except Exception as exc:  # noqa: BLE001 - live result remains usable
+                log.warning(
+                    "failed to persist model catalog host=%s harness=%s: %s",
+                    host_id,
+                    harness,
+                    exc,
+                )
+        return 200, normalized_body
+
+    def _stale_model_catalog_response(
+        self, host_id: str, harness: str, reason: str
+    ) -> tuple[int, str]:
+        cached = HarnessRegistry(self.duckdb_path).latest_model_catalog(
+            host_id, harness
+        )
+        try:
+            if cached is None:
+                envelope = CatalogEnvelope.empty_failure(host_id, harness, reason)
+            else:
+                cached = dict(cached)
+                cached["stale"] = True
+                cached["stale_reason"] = reason
+                envelope = CatalogEnvelope.from_wire(cached, host_id, harness)
+            body = catalog_wire_bytes(envelope).decode("utf-8")
+        except (TypeError, ValueError):
+            envelope = CatalogEnvelope.empty_failure(host_id, harness, "protocol_error")
+            body = catalog_wire_bytes(envelope).decode("utf-8")
+        return 200, body
 
     def proxy_harness_auth(
         self,

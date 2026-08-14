@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   connection_kind   VARCHAR,
   status            VARCHAR NOT NULL,
   capabilities_json VARCHAR NOT NULL,
+  model_catalogs_json VARCHAR NOT NULL DEFAULT '{}',
   agent_version     VARCHAR,
   last_seen_at      TIMESTAMP,
   created_at        TIMESTAMP NOT NULL DEFAULT now(),
@@ -148,7 +149,11 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     _ensure_harness_columns(
         con,
         "harness_hosts",
-        {"connection_kind": "VARCHAR", "agent_version": "VARCHAR"},
+        {
+            "connection_kind": "VARCHAR",
+            "agent_version": "VARCHAR",
+            "model_catalogs_json": "VARCHAR NOT NULL DEFAULT '{}'",
+        },
     )
     con.execute(_HARNESS_SESSIONS_DDL)
     _ensure_harness_columns(
@@ -194,4 +199,14 @@ def _ensure_harness_columns(
     }
     for name, ddl_type in columns.items():
         if name not in existing:
-            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}")
+            # DuckDB accepts NOT NULL in CREATE TABLE but not in ADD COLUMN.
+            # Add the defaulted column first (which backfills existing rows),
+            # then apply the constraint as a second additive migration step.
+            if " NOT NULL" in ddl_type:
+                con.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} "
+                    f"{ddl_type.replace(' NOT NULL', '')}"
+                )
+                con.execute(f"ALTER TABLE {table} ALTER COLUMN {name} SET NOT NULL")
+            else:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}")
