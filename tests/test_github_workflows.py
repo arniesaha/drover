@@ -1,4 +1,4 @@
-"""Contracts that keep public PR checks separate from trusted Mac work."""
+"""Contracts that keep CI on GitHub-hosted runners and off this fleet."""
 
 from pathlib import Path
 from typing import Any
@@ -6,7 +6,6 @@ from typing import Any
 import yaml
 
 WORKFLOWS_DIR = Path(__file__).parents[1] / ".github" / "workflows"
-TRUSTED_RUNNER = ["self-hosted", "macOS", "ARM64", "drover-ci"]
 
 
 def load_workflow(name: str) -> dict[str, Any]:
@@ -28,21 +27,48 @@ def test_public_pr_workflows_stay_github_hosted() -> None:
     assert "workflow_dispatch" in python_ci["on"]
 
 
-def test_trusted_workflow_never_runs_untrusted_code() -> None:
-    """The self-hosted runner must never execute code from an unmerged PR.
+def test_no_workflow_requests_a_self_hosted_runner() -> None:
+    """A self-hosted runner on a public repo is a remote shell on the fleet.
 
-    That runner is the Mac mini hosting the live fleet, so a `pull_request`
-    trigger would run arbitrary contributor code beside the hub, its DuckDB
-    store and the API token. `pull_request_target` is worse still -- it runs
-    with repository secrets -- so both are barred.
+    This repository had one: a non-ephemeral runner on the Mac mini that is
+    the live hub, holding the DuckDB store, the API token, the APNs keys and
+    the fleet config. Nothing exploited it only because the single workflow
+    naming it happened to be dispatch-only, which is a configuration accident
+    rather than a boundary.
 
-    The allowed triggers are asserted as a *subset* rather than an exact set:
-    which of them are wired up is an operational choice (the workflow moved
-    to manual-only so a full pytest and Xcode build would stop landing on the
-    fleet host after every merge), whereas never running untrusted code is
-    the invariant.
+    It is not enough to bar `pull_request` on the trusted workflow, which is
+    what the earlier version of this test did. For `pull_request` events the
+    workflow definition comes from the merge commit, not the base branch, so
+    a fork PR can introduce a job requesting the runner even when no workflow
+    on `main` does. The only durable invariant is that the label never
+    appears at all.
+
+    ci.yml carries the same check as a shell step so the run fails fast; this
+    is the version that fails locally, before a push.
     """
-    workflow = load_workflow("trusted-mac.yml")
+    offenders = []
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        workflow = load_workflow(path.name)
+        for job_id, job in workflow["jobs"].items():
+            runs_on = job.get("runs-on")
+            if isinstance(runs_on, dict):
+                offenders.append(f"{path.name}:{job_id} selects a runner group")
+                continue
+            labels = [runs_on] if isinstance(runs_on, str) else list(runs_on or [])
+            if any("self-hosted" in label for label in labels):
+                offenders.append(f"{path.name}:{job_id} runs-on {labels}")
+    assert not offenders, f"these jobs would run on our own hardware: {offenders}"
+
+
+def test_macos_verification_never_runs_untrusted_code() -> None:
+    """Extra macOS coverage, and the one workflow that is not a merge gate.
+
+    Hosted, so a `pull_request` trigger would no longer reach the fleet, but
+    it stays barred anyway: a hosted macOS minute costs ten times a Linux one
+    and the required checks already cover PRs. `pull_request_target` is barred
+    on its own merits, since it runs with repository secrets.
+    """
+    workflow = load_workflow("macos.yml")
 
     assert workflow["permissions"] == {"contents": "read"}
     triggers = set(workflow["on"])
@@ -54,29 +80,31 @@ def test_trusted_workflow_never_runs_untrusted_code() -> None:
         assert workflow["on"]["push"]["branches"] == ["main"]
     assert "${{ github.ref }}" in workflow["concurrency"]["group"]
     for job in workflow["jobs"].values():
-        assert job["runs-on"] == TRUSTED_RUNNER
+        assert job["runs-on"] == "macos-15"
         assert "if" not in job
 
     job_names = [job["name"] for job in workflow["jobs"].values()]
     assert len(job_names) == len(set(job_names))
-    assert set(job_names) == {"Python on trusted Mac", "iOS on trusted Mac"}
+    assert set(job_names) == {"Python on macOS"}
 
 
-def test_trusted_python_uses_bounded_host_interpreter_venv() -> None:
-    workflow = load_workflow("trusted-mac.yml")
+def test_macos_python_uses_the_hosted_setup_action() -> None:
+    """The old job built a venv from an interpreter at a fixed $HOME path.
+
+    That only ever existed on the one machine. On a hosted runner the
+    interpreter comes from the setup action, which is also what ci.yml uses.
+    """
+    workflow = load_workflow("macos.yml")
     steps = workflow["jobs"]["python"]["steps"]
     setup = next(step for step in steps if step.get("name") == "Set up Python")
 
-    assert "uses" not in setup
-    assert setup["run"] == (
-        '"$HOME/.local/bin/python3.11" -m venv "$RUNNER_TEMP/python-venv"\n'
-        'echo "$RUNNER_TEMP/python-venv/bin" >> "$GITHUB_PATH"\n'
-        '"$RUNNER_TEMP/python-venv/bin/python" --version\n'
-    )
+    assert setup["uses"].startswith("actions/setup-python@")
+    assert setup["with"]["python-version"] == "3.11"
+    assert "run" not in setup
 
 
-def test_trusted_python_runs_each_test_module_in_a_fresh_process() -> None:
-    workflow = load_workflow("trusted-mac.yml")
+def test_macos_python_runs_each_test_module_in_a_fresh_process() -> None:
+    workflow = load_workflow("macos.yml")
     steps = workflow["jobs"]["python"]["steps"]
     test_step = next(
         step for step in steps if step.get("name") == "Run tests with pytest"
@@ -174,7 +202,8 @@ def test_push_triggered_workflows_never_use_the_bare_inputs_context() -> None:
     tagged with no release attached. `github.event.inputs` is always defined
     and is null on a push, so it is the portable spelling.
     """
-    for name in ("ci.yml", "ios.yml", "trusted-mac.yml", "release.yml"):
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        name = path.name
         workflow = load_workflow(name)
         if "push" not in workflow["on"]:
             continue
