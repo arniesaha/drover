@@ -26,6 +26,7 @@ from drover.server.harness.websocket import (
     client_send_frame,
     client_send_json,
     recv_frame,
+    send_json,
 )
 from drover.server.metrics import MetricsCollector
 from drover.server.web import app as app_module
@@ -463,6 +464,86 @@ def test_event_mirror_close_does_not_leak_a_parked_worker_thread():
     assert not mirror._thread.is_alive(), "worker thread parked forever after close()"
 
 
+def test_event_mirror_retries_a_transient_registry_failure():
+    attempts = 0
+    persisted = []
+
+    class _FlakyRegistry:
+        def append_events_if_new(self, records):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("TransactionException: write-write conflict")
+            persisted.extend(records)
+            return len(records)
+
+    mirror = app_module._EventMirror(_FlakyRegistry())
+    mirror.offer({"event_id": "e-retry", "session_id": "s1"})
+    mirror.close()
+    mirror._thread.join(timeout=5)
+
+    assert not mirror._thread.is_alive()
+    assert attempts == 2
+    assert [record["event_id"] for record in persisted] == ["e-retry"]
+
+
+def test_event_mirror_retains_a_batch_across_retry_cycles_while_attached():
+    attempts = 0
+    persisted = threading.Event()
+
+    class _RecoveringRegistry:
+        def append_events_if_new(self, records):
+            nonlocal attempts
+            attempts += 1
+            if attempts <= app_module.MIRROR_WRITE_ATTEMPTS:
+                raise RuntimeError("registry temporarily unavailable")
+            persisted.set()
+            return len(records)
+
+    mirror = app_module._EventMirror(_RecoveringRegistry())
+    try:
+        mirror.offer({"event_id": "e-retained", "session_id": "s1"})
+        assert persisted.wait(5), "failed batch was not offered on a later cycle"
+    finally:
+        mirror.close()
+        mirror._thread.join(timeout=5)
+
+    assert attempts == app_module.MIRROR_WRITE_ATTEMPTS + 1
+
+
+def test_event_mirror_counts_and_marks_a_permanent_write_failure():
+    from drover.server.harness import daemon as daemon_module
+
+    daemon_module.reset_dropped_event_count()
+    attempts = 0
+    gaps = []
+
+    class _FailingRegistry:
+        def append_events_if_new(self, records):
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("registry unavailable")
+
+        def append_event(self, **kwargs):
+            gaps.append(kwargs)
+
+    mirror = app_module._EventMirror(_FailingRegistry())
+    mirror.offer({"event_id": "e-lost", "session_id": "s1"})
+    mirror.close()
+    mirror._thread.join(timeout=5)
+
+    assert attempts == 3
+    assert daemon_module.dropped_event_count() == 1
+    assert gaps == [
+        {
+            "session_id": "s1",
+            "event_type": "transcript.gap",
+            "payload": {"dropped": 1},
+            "normalized_type": "status",
+        }
+    ]
+
+
 class _StubChannel:
     """A relay channel with a fixed backlog, then nothing (recv -> None)."""
 
@@ -567,3 +648,20 @@ def test_channel_drain_never_raises_out_of_teardown():
 
     mirror = _RecordingMirror()
     assert app_module._drain_channel_into_mirror(_AngryChannel(), "s1", mirror) == 0
+
+
+def test_closing_direct_socket_rescues_its_undrained_events():
+    upstream, hub = socket.socketpair()
+    mirror = _RecordingMirror()
+    try:
+        send_json(upstream, {"type": "output", "data": "hello-direct\n"})
+        send_json(upstream, _event_message("e-direct", "terminal.output"))
+        upstream.shutdown(socket.SHUT_WR)
+
+        rescued = app_module._drain_socket_into_mirror(hub, "s1", mirror)
+
+        assert rescued == 1
+        assert [record["event_id"] for record in mirror.offered] == ["e-direct"]
+    finally:
+        upstream.close()
+        hub.close()

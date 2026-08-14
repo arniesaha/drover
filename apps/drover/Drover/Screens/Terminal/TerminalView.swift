@@ -206,6 +206,7 @@ private struct TerminalRepresentable: UIViewRepresentable {
         context.coordinator.onConnectionChanged = onConnectionChanged
         holder.bridge = context.coordinator
         context.coordinator.attach(view)
+        context.coordinator.installNavigationGesture(on: view)
         let pinch = UIPinchGestureRecognizer(
             target: context.coordinator,
             action: #selector(TerminalBridge.handlePinch(_:)))
