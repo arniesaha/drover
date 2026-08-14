@@ -28,6 +28,9 @@ from drover.server.harness.websocket import (
     client_send_json,
     recv_frame,
 )
+from drover.server.metrics import MetricsCollector
+from drover.server.web.app import start_metrics_server
+from drover.server.web.auth import DISABLED
 
 
 class _FailingRegistry:
@@ -338,6 +341,109 @@ def test_terminal_echo_is_not_serialized_behind_registry_writes(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_direct_hub_echo_is_not_serialized_behind_registry_writes(
+    tmp_path, monkeypatch
+):
+    """A hub audit write must never sit between a key and its echoed output.
+
+    The host daemon emits a ``terminal.input`` event immediately after writing
+    the PTY, then emits the PTY's echoed ``output`` on its next loop.  A direct
+    hub used to persist that input event inline, so every keystroke waited for
+    DuckDB before the echo could even be read from the upstream socket.
+    """
+    harness_server, harness_state, harness_url = _start_test_server(
+        tmp_path / "harness"
+    )
+    hub_server = None
+    release_writes = threading.Event()
+    try:
+        _, created = _json_request(
+            f"{harness_url}/sessions",
+            payload={"harness": "shell", "cwd": str(tmp_path)},
+        )
+        session_id = created["session_id"]
+
+        hub_db = tmp_path / "hub" / "drover.duckdb"
+        bootstrap(parquet_dir=tmp_path / "hub" / "parquet", duckdb_path=hub_db)
+        hub_registry = HarnessRegistry(hub_db)
+        hub_registry.register_host(
+            host_id="direct-host",
+            display_name="Direct Host",
+            kind="linux",
+            local_url=harness_url,
+            connection_kind="direct",
+            capabilities={"harnesses": [{"name": "shell", "enabled": True}]},
+        )
+        hub_registry.create_session(
+            session_id=session_id,
+            host_id="direct-host",
+            harness="shell",
+            command="/bin/sh",
+            status="running",
+            cwd=str(tmp_path),
+        )
+        collector = MetricsCollector(
+            duckdb_path=hub_db,
+            incoming_dir=tmp_path / "hub" / "incoming",
+            summarizer_report={},
+        )
+        hub_server = start_metrics_server(
+            host="127.0.0.1", port=0, collector=collector, auth=DISABLED
+        )
+        hub_host, hub_port = hub_server.server_address
+        sock = socket.create_connection((hub_host, hub_port), timeout=5)
+        try:
+            client_handshake(
+                sock,
+                host=f"{hub_host}:{hub_port}",
+                path=f"/harness/sessions/{session_id}/terminal",
+            )
+            sock.settimeout(5)
+            assert _recv_json(sock)["type"] == "attached"
+            _wait_for_output(sock, "$")
+
+            original_append = HarnessRegistry.append_events_if_new
+            writer_entered = threading.Event()
+
+            def wedged_append(self, records):
+                writer_entered.set()
+                release_writes.wait(10)
+                return original_append(self, records)
+
+            monkeypatch.setattr(HarnessRegistry, "append_events_if_new", wedged_append)
+
+            client_send_json(sock, {"type": "input", "data": "x"})
+            assert writer_entered.wait(2), "the input event never reached a mirror"
+            sock.settimeout(0.75)
+            output = _wait_for_output(sock, "x")
+            assert "x" in output
+
+            # The speedup is decoupling, not dropping: once the registry is
+            # writable again, the queued input event still reaches the hub.
+            release_writes.set()
+            deadline = monotonic() + 5
+            while monotonic() < deadline:
+                if any(
+                    event.event_type == "terminal.input"
+                    for event in hub_registry.list_events(session_id)
+                ):
+                    break
+                time_sleep(0.05)
+            else:
+                raise AssertionError("the hub never persisted the queued input event")
+        finally:
+            release_writes.set()
+            sock.close()
+    finally:
+        release_writes.set()
+        harness_state.pty.close_all()
+        harness_server.shutdown()
+        harness_server.server_close()
+        if hub_server is not None:
+            hub_server.shutdown()
+            hub_server.server_close()
 
 
 def test_terminal_websocket_rejects_unknown_session(tmp_path):

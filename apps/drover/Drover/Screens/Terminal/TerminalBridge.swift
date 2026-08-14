@@ -29,6 +29,11 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     private let stream: TerminalStream
     private weak var terminalView: SwiftTerm.TerminalView?
     private var pumpTask: Task<Void, Never>?
+    private weak var navigationGesture: UILongPressGestureRecognizer?
+    private weak var navigationOverlay: TerminalDirectionOverlay?
+    private var navigationTimer: Timer?
+    private var navigationOrigin = CGPoint.zero
+    private var navigationRepeater = TerminalNavigationRepeater()
 
     /// Fired once, always on the main actor, when the remote process exits
     /// (the daemon's `exit` frame). Socket drops no longer fire this — they
@@ -72,6 +77,20 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     func detach() {
         pumpTask?.cancel()
         pumpTask = nil
+        navigationTimer?.invalidate()
+        navigationTimer = nil
+        navigationRepeater.stop()
+
+        let gesture = navigationGesture
+        let overlay = navigationOverlay
+        navigationGesture = nil
+        navigationOverlay = nil
+        Task { @MainActor [weak view = terminalView, weak gesture, weak overlay] in
+            if let gesture {
+                view?.removeGestureRecognizer(gesture)
+            }
+            overlay?.removeFromSuperview()
+        }
         let stream = stream
         Task { await stream.stop() }
     }
@@ -149,6 +168,131 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
         }
     }
     func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
+
+    // MARK: - Touch navigation
+
+    /// Installs Termius-style hold-and-drag arrow navigation. SwiftTerm's own
+    /// long press opens its selection menu; the product choice here is to make
+    /// a hold exclusively directional while leaving double-tap selection
+    /// intact. Ordinary pans still scroll immediately because the hold must
+    /// recognize before the finger starts moving.
+    @MainActor
+    func installNavigationGesture(on view: SwiftTerm.TerminalView) {
+        let gesture = UILongPressGestureRecognizer(
+            target: self,
+            action: #selector(handleNavigationGesture(_:)))
+        gesture.minimumPressDuration = 0.35
+        gesture.allowableMovement = 14
+        gesture.cancelsTouchesInView = true
+
+        // The custom hold wins explicitly over SwiftTerm's built-in 0.7s
+        // context-menu hold. Double-tap selection/copy is a separate gesture
+        // and remains available.
+        view.gestureRecognizers?
+            .compactMap { $0 as? UILongPressGestureRecognizer }
+            .forEach { $0.require(toFail: gesture) }
+        view.addGestureRecognizer(gesture)
+        navigationGesture = gesture
+    }
+
+    @objc func handleNavigationGesture(_ gesture: UILongPressGestureRecognizer) {
+        MainActor.assumeIsolated {
+            guard let view = terminalView else { return }
+            switch gesture.state {
+            case .began:
+                navigationOrigin = gesture.location(in: view)
+                navigationRepeater.stop()
+                showNavigationOverlay(in: view)
+            case .changed:
+                let location = gesture.location(in: view)
+                updateNavigation(
+                    horizontal: location.x - navigationOrigin.x,
+                    vertical: location.y - navigationOrigin.y)
+            case .ended, .cancelled, .failed:
+                stopNavigationGesture()
+            default:
+                break
+            }
+        }
+    }
+
+    @MainActor
+    private func updateNavigation(horizontal: CGFloat, vertical: CGFloat) {
+        let previous = navigationRepeater.motion
+        let immediate = navigationRepeater.update(
+            horizontal: Double(horizontal),
+            vertical: Double(vertical))
+        let current = navigationRepeater.motion
+        guard current != previous else { return }
+
+        navigationOverlay?.setMotion(current)
+        navigationTimer?.invalidate()
+        navigationTimer = nil
+
+        if let immediate {
+            sendArrow(immediate)
+            UISelectionFeedbackGenerator().selectionChanged()
+        }
+        guard let current else { return }
+
+        let timer = Timer(timeInterval: current.repeatInterval, repeats: true) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self,
+                      let direction = self.navigationRepeater.repeatedDirection()
+                else { return }
+                self.sendArrow(direction)
+            }
+        }
+        timer.tolerance = min(current.repeatInterval * 0.1, 0.01)
+        // Default-mode timers pause while UIKit tracks a finger. Common mode
+        // is load-bearing: the arrows must repeat during the held gesture.
+        RunLoop.main.add(timer, forMode: .common)
+        navigationTimer = timer
+    }
+
+    @MainActor
+    private func sendArrow(_ direction: TerminalNavigationDirection) {
+        guard let view = terminalView else { return }
+        let applicationCursor = view.getTerminal().applicationCursor
+        let bytes: [UInt8]
+        switch direction {
+        case .up:
+            bytes = applicationCursor
+                ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal
+        case .down:
+            bytes = applicationCursor
+                ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal
+        case .left:
+            bytes = applicationCursor
+                ? EscapeSequences.moveLeftApp : EscapeSequences.moveLeftNormal
+        case .right:
+            bytes = applicationCursor
+                ? EscapeSequences.moveRightApp : EscapeSequences.moveRightNormal
+        }
+        view.send(bytes)
+    }
+
+    @MainActor
+    private func showNavigationOverlay(in view: UIView) {
+        navigationOverlay?.removeFromSuperview()
+        let overlay = TerminalDirectionOverlay(frame: CGRect(x: 0, y: 0,
+                                                              width: 104, height: 104))
+        overlay.center = CGPoint(x: max(64, view.bounds.maxX - 64), y: 72)
+        overlay.autoresizingMask = [.flexibleLeftMargin, .flexibleBottomMargin]
+        view.addSubview(overlay)
+        navigationOverlay = overlay
+        overlay.show()
+    }
+
+    @MainActor
+    private func stopNavigationGesture() {
+        navigationTimer?.invalidate()
+        navigationTimer = nil
+        navigationRepeater.stop()
+        navigationOverlay?.hideAndRemove()
+        navigationOverlay = nil
+    }
 
     // MARK: - Font size (pinch-zoom)
 

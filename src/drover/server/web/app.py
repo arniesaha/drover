@@ -65,7 +65,7 @@ _PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login", "/auth/pair", "/harness/p
 # Total budget for a spoke to send its hello after the 101, across every
 # frame it sends -- not per recv. See _accept_relay_websocket.
 RELAY_HELLO_TIMEOUT_S = 10.0
-# Mirror records buffered for one relay terminal attach before the newest are
+# Mirror records buffered for one terminal attach before the newest are
 # dropped. Generous, because the worker below amortizes a whole backlog into a
 # single DuckDB window: filling this means the database has been unavailable
 # for a long time, not that a burst arrived.
@@ -73,6 +73,7 @@ MIRROR_QUEUE_MAX = 2048
 # Cap on one batched write, so a huge backlog is drained in several bounded
 # windows rather than one that holds the connect lock for seconds.
 MIRROR_BATCH_MAX = 128
+MIRROR_WRITE_ATTEMPTS = 3
 # Teardown drain budget for a closing relay terminal channel. Both bounds are
 # safety rails, not the expected path: the drain stops as soon as the channel
 # has nothing buffered, which is immediately in the common case. They exist
@@ -256,7 +257,7 @@ def _parse_insight_route(path: str) -> tuple[str, str | None] | None:
 def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
     """Extract the mirrorable event out of a terminal message, or ``None``.
 
-    Pure and cheap on purpose: the relay drain thread runs this inline and
+    Pure and cheap on purpose: terminal forwarding threads run this inline and
     hands the result to a worker, so nothing that touches the database may
     happen here.
     """
@@ -284,6 +285,17 @@ def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | 
         "content_preview": _optional_str(event.get("content_preview")),
         "created_at": _parse_event_timestamp(event.get("created_at")),
     }
+
+
+def _harness_event_frame_record(session_id: str, frame: Any) -> dict[str, Any] | None:
+    """Extract a mirror record from a raw direct-terminal WebSocket frame."""
+    if frame.opcode != OPCODE_TEXT:
+        return None
+    try:
+        message = json.loads(frame.payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _harness_event_record(session_id, message)
 
 
 def _drain_channel_into_mirror(
@@ -335,11 +347,38 @@ def _drain_channel_into_mirror(
     return rescued
 
 
-class _EventMirror:
-    """Batching, off-thread writer for one relay terminal attach's events.
+def _drain_socket_into_mirror(
+    upstream: socket.socket, session_id: str, mirror: "_EventMirror"
+) -> int:
+    """Rescue event frames buffered on a closing direct terminal socket."""
+    rescued = 0
+    deadline = time.monotonic() + MIRROR_DRAIN_SECONDS
+    upstream.settimeout(0.05)
+    while rescued < MIRROR_DRAIN_MAX and time.monotonic() < deadline:
+        try:
+            frame = recv_frame(upstream)
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            break
+        record = _harness_event_frame_record(session_id, frame)
+        if record is not None:
+            mirror.offer(record)
+            rescued += 1
+        if frame.opcode == OPCODE_CLOSE:
+            break
+    if rescued:
+        log.debug(
+            "rescued %d harness event(s) from closing direct terminal for %s",
+            rescued,
+            session_id,
+        )
+    return rescued
 
-    Why this exists: the relay drain thread used to mirror inline, and every
-    mirror opened DuckDB connections under a process-wide per-path lock that
+
+class _EventMirror:
+    """Batching, off-thread writer for one terminal attach's events.
+
+    Why this exists: terminal forwarding used to mirror inline, and every
+    mirror opens DuckDB connections under a process-wide per-path lock that
     is contended with fleet renders and every host's event ingestion. At PTY
     output rates the drain thread could not keep up, the channel's bounded
     inbound queue overflowed, and it dropped the oldest messages -- silently
@@ -348,8 +387,11 @@ class _EventMirror:
 
     So the two are decoupled: the drain thread only parses and enqueues, and
     this worker does the writing, batching whatever has piled up into one
-    connection window. If anything still has to be dropped it is now mirror
-    records rather than the terminal stream, and loudly.
+    connection window. A failed batch stays pending while the attach is live,
+    preserving order across transient outages. The queue remains bounded so a
+    prolonged registry outage cannot consume unbounded memory or stall terminal
+    output; overflow is counted, marked as a transcript gap when possible, and
+    logged rather than blocking the interactive stream.
     """
 
     def __init__(self, registry: HarnessRegistry) -> None:
@@ -358,9 +400,11 @@ class _EventMirror:
             maxsize=MIRROR_QUEUE_MAX
         )
         self._dropped = 0
+        self._drop_lock = threading.Lock()
+        self._gap_counts: dict[str, int] = {}
         self._closed = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name="relay-event-mirror", daemon=True
+            target=self._run, name="terminal-event-mirror", daemon=True
         )
         self._thread.start()
 
@@ -370,6 +414,7 @@ class _EventMirror:
             self._queue.put_nowait(record)
         except queue.Full:
             self._dropped += 1
+            self._note_dropped([record])
             if self._dropped == 1 or self._dropped % 1000 == 0:
                 log.warning(
                     "harness event mirror dropped %d event(s): writer behind",
@@ -395,17 +440,88 @@ class _EventMirror:
             self._queue.put_nowait(None)
 
     def _run(self) -> None:
+        pending: tuple[list[dict[str, Any]], bool] | None = None
         while True:
-            batch, stopping = self._next_batch()
+            if pending is None:
+                batch, stopping = self._next_batch()
+            else:
+                batch, stopping = pending
+                if self._closed.is_set():
+                    self._note_dropped(batch)
+                    self._flush_gap_markers()
+                    pending = None
+                    if stopping:
+                        return
+                    continue
             if batch:
-                try:
-                    self._registry.append_events_if_new(batch)
-                except Exception as exc:  # noqa: BLE001 - never kill the worker
-                    log.debug(
-                        "failed to mirror %d harness event(s): %s", len(batch), exc
-                    )
+                if self._write_batch(batch):
+                    pending = None
+                    self._flush_gap_markers()
+                elif self._closed.is_set():
+                    self._note_dropped(batch)
+                    pending = None
+                    self._flush_gap_markers()
+                else:
+                    # Keep the exact batch and re-offer it on a later cycle.
+                    # This preserves ordering and turns a multi-second central
+                    # outage into delayed history rather than missing history.
+                    pending = (batch, stopping)
+                    self._closed.wait(0.25)
+                    continue
             if stopping:
+                self._flush_gap_markers()
                 return
+
+    def _write_batch(self, batch: list[dict[str, Any]]) -> bool:
+        for attempt in range(MIRROR_WRITE_ATTEMPTS):
+            try:
+                self._registry.append_events_if_new(batch)
+                return True
+            except Exception as exc:  # noqa: BLE001 - never kill the worker
+                log.debug(
+                    "failed to mirror %d harness event(s), attempt %d/%d: %s",
+                    len(batch),
+                    attempt + 1,
+                    MIRROR_WRITE_ATTEMPTS,
+                    exc,
+                )
+                if attempt + 1 < MIRROR_WRITE_ATTEMPTS:
+                    time.sleep(0.05 * (attempt + 1))
+        return False
+
+    def _note_dropped(self, records: list[dict[str, Any]]) -> None:
+        from drover.server.harness.daemon import record_dropped_events
+
+        record_dropped_events(len(records))
+        with self._drop_lock:
+            for record in records:
+                session_id = str(record.get("session_id") or "").strip()
+                if session_id:
+                    self._gap_counts[session_id] = (
+                        self._gap_counts.get(session_id, 0) + 1
+                    )
+
+    def _flush_gap_markers(self) -> None:
+        with self._drop_lock:
+            pending, self._gap_counts = self._gap_counts, {}
+        for session_id, count in pending.items():
+            try:
+                self._registry.append_event(
+                    session_id=session_id,
+                    event_type="transcript.gap",
+                    payload={"dropped": count},
+                    normalized_type="status",
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort gap marker
+                with self._drop_lock:
+                    self._gap_counts[session_id] = (
+                        self._gap_counts.get(session_id, 0) + count
+                    )
+                log.debug(
+                    "failed to record terminal mirror gap for %s: %s",
+                    session_id,
+                    exc,
+                )
 
     def _next_batch(self) -> tuple[list[dict[str, Any]], bool]:
         """Block for one record, then sweep up everything already queued."""
@@ -1154,6 +1270,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         raw_browser.settimeout(0.25)
         upstream.settimeout(0.25)
         browser = _BrowserSocket(raw_browser)
+        mirror = _EventMirror(self._harness_registry())
 
         def browser_to_upstream() -> None:
             try:
@@ -1174,7 +1291,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         frame = recv_frame(upstream)
                     except socket.timeout:
                         continue
-                    self._mirror_harness_event_frame(session_id, frame)
+                    record = _harness_event_frame_record(session_id, frame)
+                    if record is not None:
+                        mirror.offer(record)
                     browser.send_frame(frame.opcode, frame.payload)
                     if frame.opcode == OPCODE_CLOSE:
                         stop.set()
@@ -1183,10 +1302,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 stop.set()
 
         thread = threading.Thread(target=browser_to_upstream, daemon=True)
-        thread.start()
-        upstream_to_browser()
-        stop.set()
-        upstream.close()
+        try:
+            thread.start()
+            upstream_to_browser()
+        finally:
+            stop.set()
+            _drain_socket_into_mirror(upstream, session_id, mirror)
+            upstream.close()
+            mirror.close()
 
     def _proxy_terminal_over_relay(
         self,
@@ -1443,38 +1566,6 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     continue
         except (OSError, WebSocketClosed):
             pass
-
-    def _mirror_harness_event_frame(self, session_id: str, frame) -> None:
-        if frame.opcode != OPCODE_TEXT:
-            return
-        try:
-            message = json.loads(frame.payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return
-        self._mirror_harness_event_message(session_id, message)
-
-    def _mirror_harness_event_message(self, session_id: str, message: object) -> None:
-        """Persist a parsed harness terminal event message into the hub log.
-
-        Used by the direct terminal-proxy flavor, which decodes a raw
-        websocket frame first (`_mirror_harness_event_frame`, above) and
-        delegates here. This is the sole delivery path for PTY terminal
-        events into the hub's own DuckDB event log -- the daemon's local
-        registry write never reaches the hub on its own.
-
-        Deliberately synchronous here, unlike the relay flavor: there is no
-        bounded queue between the upstream socket and the browser on this
-        path, so a slow write applies TCP backpressure and the session merely
-        runs slow. Nothing is discarded. Moving it off-thread would trade that
-        for a drop path this flavor does not currently have.
-        """
-        record = _harness_event_record(session_id, message)
-        if record is None:
-            return
-        try:
-            self._harness_registry().append_events_if_new([record])
-        except Exception as exc:  # noqa: BLE001
-            log.debug("failed to mirror harness event %s: %s", record["event_id"], exc)
 
     def _ingest_harness_events(self) -> None:
         """POST /harness/events: bulk ingest from a remote host's EventPusher.

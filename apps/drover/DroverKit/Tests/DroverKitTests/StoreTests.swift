@@ -2,6 +2,23 @@ import Foundation
 import Testing
 @testable import DroverKit
 
+private final class PollingRequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
 /// `.serialized`: two tests here mutate the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment.
 extension MockNetworkTests {
@@ -505,7 +522,9 @@ struct StoreTests {
 /// A `/harness` answering in 10ms hides that; one answering in seconds (#95)
 /// does not.
 @Test @MainActor func startPollingDoesNotTearDownARunningLoop() async throws {
+    let requests = PollingRequestCounter()
     MockURLProtocol.handler = { _ in
+        requests.increment()
         Thread.sleep(forTimeInterval: 0.3)  // a hub under load, not an instant one
         return (200, snapshotJSON)
     }
@@ -513,13 +532,24 @@ struct StoreTests {
 
     let store = SessionStore(client: client())
     store.startPolling(every: 5)
+
+    // A full parallel suite can keep the main-actor polling task from starting
+    // for longer than the churn window below. Wait for the transport request;
+    // the production `refreshAttempts` value resets on success, so it is not a
+    // stable count of requests after a slow test process resumes.
+    let startDeadline = Date().addingTimeInterval(3)
+    while requests.value == 0, Date() < startDeadline {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(requests.value == 1, "initial polling request never started")
+
     // The churn a launch produces, all of it inside one request's window.
     for _ in 0..<5 {
         try? await Task.sleep(for: .milliseconds(20))
         store.startPolling(every: 5)
     }
 
-    #expect(store.refreshAttempts == 1, "re-entry started \(store.refreshAttempts) requests")
+    #expect(requests.value == 1, "re-entry started \(requests.value) requests")
     #expect(store.lastRefreshOutcome == nil, "re-entry cancelled the first load")
 
     let deadline = Date().addingTimeInterval(3)
