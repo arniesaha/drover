@@ -59,6 +59,10 @@ This installs a checksum-verified release, starts the server and a local
 harness host, detects an address your phone can reach, and prints a QR code.
 Scan it with the app and you are connected: no token is typed or copied.
 
+It also links `drover-server` into `~/.local/bin`, so it is on your PATH. When
+that directory is not on your PATH, the installer says so and prints the line
+to add.
+
 Add another machine with the one-liner printed by
 `drover-server pair-host --name <host>`.
 

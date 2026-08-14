@@ -156,6 +156,22 @@ jobs:
         "$HOME/.drover/runtime/current/bin/drover-server" --version \
           | grep -q "$VERSION"
 
+    # Every other assertion here runs the binary by absolute path, which is
+    # precisely how the gap survived: the install was correct and
+    # `drover-server` still was not a command.
+    - name: drover-server is reachable as a command, not just on disk
+      run: |
+        VERSION="$(echo "${{ github.event.inputs.ref || github.ref_name }}" | sed 's/^v//')"
+        LINK="$HOME/.local/bin/drover-server"
+        test -L "$LINK" \
+          || { echo "the installer did not link drover-server" >&2; exit 1; }
+        # Through current, so the link follows a symlink flip rather than
+        # pinning the version that happened to be installed first.
+        readlink "$LINK"
+        readlink "$LINK" | grep -q 'runtime/current/bin/drover-server'
+        # And it runs as a bare command name with that directory on PATH.
+        PATH="$HOME/.local/bin:$PATH" drover-server --version | grep -q "$VERSION"
+
     - name: Config carries the detected address
       run: |
         grep -q '^advertised_url' "$HOME/.drover/config.toml"
