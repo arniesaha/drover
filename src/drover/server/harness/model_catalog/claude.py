@@ -215,6 +215,12 @@ class ClaudeCatalogAdapter:
             )
         )
         parts.extend(("base_url", self._base_url(self.env)))
+        parts.extend(
+            (
+                "custom_headers",
+                "configured" if _has_custom_headers(self.env) else "absent",
+            )
+        )
         for key in sorted(self.env):
             if _is_non_secret_model_key(key):
                 parts.extend((key, self.env[key]))
@@ -227,6 +233,9 @@ class ClaudeCatalogAdapter:
             )
         except (TypeError, ValueError, OverflowError):
             raise CatalogDiscoveryError("protocol_error") from None
+
+        if _has_custom_headers(effective_env):
+            raise CatalogDiscoveryError("unsupported")
 
         if any(_truthy(effective_env.get(key)) for key in _THIRD_PARTY_PROVIDER_KEYS):
             # The direct Models API cannot authoritatively enumerate these
@@ -367,7 +376,7 @@ def _model_options(
         if not _valid_text(provider_id):
             continue
         selectable_id = reverse_overrides.get(provider_id, provider_id)
-        alias = _alias_for(selectable_id)
+        alias = _alias_for(provider_id)
         output_id = _policy_selection(
             selectable_id,
             provider_id,
@@ -518,6 +527,11 @@ def _truthy(value: object) -> bool:
         "no",
         "off",
     }
+
+
+def _has_custom_headers(env: Mapping[str, str]) -> bool:
+    value = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    return isinstance(value, str) and bool(value)
 
 
 def _is_non_secret_model_key(key: str) -> bool:

@@ -188,6 +188,35 @@ def test_settings_environment_drives_effective_provider_and_custom_model(tmp_pat
     assert [model.id for model in discovered.models] == ["sonnet", "settings/custom"]
 
 
+@pytest.mark.parametrize("source", ["environment", "settings"])
+def test_custom_headers_configuration_is_unsupported_before_auth_or_http(
+    tmp_path, source
+):
+    settings_paths = ()
+    env = {"ANTHROPIC_CUSTOM_HEADERS": "header material"}
+    if source == "settings":
+        settings = tmp_path / "settings.json"
+        settings.write_text(
+            json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": "header material"}})
+        )
+        settings_paths = (settings,)
+        env = {}
+    side_effects = []
+    adapter = ClaudeCatalogAdapter(
+        command=("claude",),
+        credential_loader=lambda: side_effects.append("credential"),
+        opener=lambda url, headers, timeout: side_effects.append("http"),
+        settings_paths=settings_paths,
+        env=env,
+        version_reader=lambda command: "2.1.232",
+    )
+
+    with pytest.raises(CatalogDiscoveryError, match="unsupported"):
+        adapter.discover()
+
+    assert side_effects == []
+
+
 def test_api_key_auth_paginates_without_loading_oauth(claude_credentials):
     calls = []
 
@@ -406,6 +435,56 @@ def test_alias_is_not_invented_for_a_non_claude_provider_id(
         ).discover()
 
 
+def test_alias_is_not_derived_from_a_model_override_key(claude_credentials, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "availableModels": ["fable"],
+                "modelOverrides": {"claude-fable-5": "corp/fable-prod"},
+            }
+        )
+    )
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        ClaudeCatalogAdapter(
+            command=("claude",),
+            credential_loader=lambda: claude_credentials,
+            opener=lambda url, headers, timeout: (
+                200,
+                _page(
+                    {
+                        "id": "corp/fable-prod",
+                        "display_name": "Corporate Fable",
+                    }
+                ),
+            ),
+            settings_paths=(settings,),
+            env={},
+            version_reader=lambda command: "2.1.232",
+        ).discover()
+
+
+def test_credential_secret_does_not_affect_identity_or_repr():
+    first = ClaudeCredential(
+        access_token="secret-one",
+        account_identity="account-123",
+        account_label="person@example.com",
+        subscription_type="max",
+    )
+    second = ClaudeCredential(
+        access_token="secret-two",
+        account_identity="account-123",
+        account_label="person@example.com",
+        subscription_type="max",
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert "secret-one" not in repr(first)
+    assert "secret-two" not in repr(second)
+
+
 def test_malformed_individual_models_are_discarded(claude_credentials):
     discovered = ClaudeCatalogAdapter(
         command=("claude",),
@@ -584,6 +663,26 @@ def test_cache_identity_ignores_unrelated_model_named_environment_values(tmp_pat
     first = ClaudeCatalogAdapter(**common, env={"PRIVATE_MODEL_NAME": "secret-one"})
     second = ClaudeCatalogAdapter(**common, env={"PRIVATE_MODEL_NAME": "secret-two"})
 
+    assert first.cache_identity() == second.cache_identity()
+
+
+def test_cache_identity_tracks_custom_header_presence_without_its_value(tmp_path):
+    common = dict(
+        command=(str(tmp_path / "claude"),),
+        credential_loader=lambda: pytest.fail("not used"),
+        opener=lambda url, headers, timeout: pytest.fail("not used"),
+        settings_paths=(),
+        version_reader=lambda command: "2.1.232",
+    )
+    absent = ClaudeCatalogAdapter(**common, env={})
+    first = ClaudeCatalogAdapter(
+        **common, env={"ANTHROPIC_CUSTOM_HEADERS": "secret-one"}
+    )
+    second = ClaudeCatalogAdapter(
+        **common, env={"ANTHROPIC_CUSTOM_HEADERS": "secret-two"}
+    )
+
+    assert absent.cache_identity() != first.cache_identity()
     assert first.cache_identity() == second.cache_identity()
 
 

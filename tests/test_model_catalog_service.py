@@ -47,6 +47,25 @@ class FakeAdapter:
         )
 
 
+def test_discovered_catalog_scope_secret_does_not_affect_identity_or_repr():
+    models = (ModelOption(id="model", display_name="Model"),)
+    first = DiscoveredCatalog(
+        account_scope_material="scope-secret-one",
+        harness_version="1",
+        models=models,
+    )
+    second = DiscoveredCatalog(
+        account_scope_material="scope-secret-two",
+        harness_version="1",
+        models=models,
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert "scope-secret-one" not in repr(first)
+    assert "scope-secret-two" not in repr(second)
+
+
 def test_catalog_cache_force_refresh_and_stale_fallback():
     clock = [NOW]
     adapter = FakeAdapter()

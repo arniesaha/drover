@@ -18,7 +18,7 @@ _KEYCHAIN_TIMEOUT_S = 2.0
 
 @dataclass(frozen=True)
 class ClaudeCredential:
-    access_token: str = field(repr=False)
+    access_token: str = field(repr=False, compare=False)
     account_identity: str
     account_label: str
     subscription_type: str | None

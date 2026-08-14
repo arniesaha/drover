@@ -95,7 +95,7 @@ def _validate_models(models: tuple[ModelOption, ...], *, allow_empty: bool) -> N
 
 @dataclass(frozen=True)
 class DiscoveredCatalog:
-    account_scope_material: str = field(repr=False)
+    account_scope_material: str = field(repr=False, compare=False)
     harness_version: str
     models: tuple[ModelOption, ...]
     source_stale: bool = False
