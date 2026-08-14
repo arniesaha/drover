@@ -1,0 +1,98 @@
+name: macOS verification
+
+# Extra macOS coverage on a GitHub-hosted runner. ci.yml runs the suite on
+# ubuntu-latest, and the hub itself is macOS, so the platform that actually
+# runs Drover in production had no Python coverage without this.
+#
+# This replaces the former "Trusted Mac verification", which ran on a
+# self-hosted runner hosted on the Mac mini that IS the live hub. That
+# arrangement became unsafe the moment this repository went public: a
+# self-hosted runner attached to a public repo is one fork-triggerable
+# workflow away from arbitrary code execution on the machine holding the
+# DuckDB store, the API token, the APNs keys and the fleet config. The only
+# thing preventing it was that the workflow happened to be dispatch-only,
+# which is a configuration accident rather than a boundary. See the
+# no-self-hosted guard in ci.yml, which fails the build if one comes back.
+#
+# Still manual. A hosted macOS runner costs ten times a Linux minute, and the
+# merge gate is ["build-and-test", "Build and test iOS app"] from ci.yml and
+# ios.yml. Run this after a batch of merges, before a release, or when a
+# change is plausibly platform-sensitive:
+#
+#   gh workflow run "macOS verification" --ref main
+#
+# The iOS half of the old workflow is gone rather than moved: ios.yml already
+# builds and tests the app on hosted macos-15, and running it twice proved
+# nothing the required check did not already prove.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python on macOS
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Configure git identity for tests
+      run: |
+        git config user.email "ci@drover.local"
+        git config user.name "Drover CI"
+
+    - name: Check changed Python files with Black
+      env:
+        BASE_SHA: ${{ github.event.before }}
+      run: |
+        if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+          BASE_SHA="$(git rev-parse HEAD~1)"
+        fi
+        PY_FILES="$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA"...HEAD -- 'src/**/*.py' 'tests/*.py' 'tests/**/*.py')"
+        if [ -z "$PY_FILES" ]; then
+          echo "No changed Python files to format-check."
+        else
+          echo "$PY_FILES" | xargs black --check
+        fi
+
+    # One pytest process per test module. This began as a memory limit for the
+    # 16 GB hub and is kept because it is the arrangement known to pass: the
+    # suite has a recovery test that is flaky under full-suite load but green
+    # in isolation. Collapsing this into a single pytest run is worth doing,
+    # but as its own change, so a failure is attributable.
+    - name: Run tests with pytest
+      run: |
+        python - <<'PY'
+        from pathlib import Path
+        import subprocess
+        import sys
+
+        test_files = sorted(Path("tests").rglob("test_*.py"))
+        if not test_files:
+            raise SystemExit("no Python test modules found")
+        for test_file in test_files:
+            print(f"::group::{test_file}", flush=True)
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pytest", str(test_file)], check=True
+                )
+            finally:
+                print("::endgroup::", flush=True)
+        PY
