@@ -147,6 +147,16 @@ for line in sys.stdin:
                 },
             }
         }
+    elif request["method"] == "model/list":
+        result = {
+            "data": [
+                {
+                    "model": "gpt-5.6-terra",
+                    "displayName": "GPT-5.6 Terra",
+                }
+            ],
+            "nextCursor": None,
+        }
     else:
         continue
     print(json.dumps({"id": request["id"], "result": result}), flush=True)
@@ -318,6 +328,21 @@ def test_codex_probe_reads_plan_and_multiple_windows(fake_codex_app_server):
     assert snapshot.windows[0].resets_at == datetime(
         2024, 11, 7, 2, 40, tzinfo=timezone.utc
     )
+
+
+def test_codex_app_server_session_initializes_once_and_calls_multiple_methods(
+    fake_codex_app_server,
+):
+    from drover.server.providers.codex_app_server import CodexAppServerSession
+
+    with CodexAppServerSession(fake_codex_app_server.command, timeout_s=1) as client:
+        account = client.request("account/read", {"refreshToken": False})
+        models = client.request(
+            "model/list", {"cursor": None, "includeHidden": False, "limit": 100}
+        )
+
+    assert account["account"]["email"] == "person@example.com"
+    assert models["data"][0]["model"] == "gpt-5.6-terra"
 
 
 def test_codex_probe_separates_a_missing_cli_from_a_host_failure(tmp_path):
