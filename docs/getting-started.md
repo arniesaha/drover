@@ -46,8 +46,18 @@ same thing by hand.
 git clone https://github.com/arniesaha/drover.git
 cd drover
 uv sync --extra dev
+git config core.hooksPath .githooks
 uv run drover-server init
 ```
+
+`git config core.hooksPath .githooks` is a one-time step per clone, and git
+worktrees share the repository configuration, so setting it once covers all of
+them. It enables the pre-commit hook, which runs the public release audit in
+`scripts/check_public_release.py` over the files you have staged and refuses a
+commit that would publish a private value or a planning document. CI runs the
+same audit, but only after a push, and only over what is already committed, so
+without the hook the author gets no signal and everyone else gets a red main.
+Use `git commit --no-verify` to bypass the hook deliberately.
 
 The generated config lives at `~/.drover/config.toml` and enables the local
 cockpit on port `7080`:

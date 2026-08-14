@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 from dataclasses import dataclass
@@ -243,9 +244,54 @@ def _tracked_paths(root: Path) -> list[Path]:
     return [root / name.decode() for name in result.stdout.split(b"\0") if name]
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parents[1]
-    findings = check_paths(_tracked_paths(root), root=root)
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        type=Path,
+        help=(
+            "Files to audit. Defaults to every tracked file, which is what CI "
+            "checks; pass paths explicitly to audit a set git does not track "
+            "yet, such as the staged contents of a commit."
+        ),
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help=(
+            "Repository root the paths are scoped against. Every rule keyed on "
+            "location, including the allowlists, is evaluated relative to it. "
+            "Defaults to the repository this script lives in."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_within(paths: Sequence[Path], root: Path) -> list[Path] | None:
+    resolved: list[Path] = []
+    for raw in paths:
+        path = raw.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            print(f"{raw}: outside the audit root {root}")
+            return None
+        resolved.append(path)
+    return resolved
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    root = (args.root or Path(__file__).resolve().parents[1]).resolve()
+    if args.paths:
+        paths = _resolve_within(args.paths, root)
+        if paths is None:
+            return 2
+    else:
+        paths = _tracked_paths(root)
+    findings = check_paths(paths, root=root)
     for finding in findings:
         path = Path(finding.path)
         try:

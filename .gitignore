@@ -40,6 +40,11 @@ parquet/
 .claude/
 .swiftpm/
 
+# Local instructions for coding agents. Deliberately untracked: AGENTS.md
+# records where internal planning documents actually go, which is private
+# workflow detail this public repository must not publish.
+AGENTS.md
+
 # Local Swift/Xcode build caches
 apps/drover/.derivedData*/
 apps/drover/.xcode-home/

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Run the public release audit over the change being committed.
+#
+# CI runs the same audit, but only after a push, and only over tracked files.
+# By then a private planning document or a leaked private value is already
+# public, and main is red for everyone except the author who introduced it.
+# Worse, `git ls-files` cannot see a file that is staged but not yet tracked,
+# so the very first commit of a new file is exactly the case CI misses.
+#
+# Enable it once per clone: git config core.hooksPath .githooks
+# Bypass it deliberately with: git commit --no-verify
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
+cd "$REPO_ROOT" || exit 1
+
+AUDIT="scripts/check_public_release.py"
+# A branch that does not carry the audit cannot be held to it.
+[ -f "$AUDIT" ] || exit 0
+
+PYTHON=""
+for candidate in python3 python; do
+  if command -v "$candidate" > /dev/null 2>&1; then
+    PYTHON="$candidate"
+    break
+  fi
+done
+if [ -z "$PYTHON" ]; then
+  echo "pre-commit: no python interpreter found, skipping the public release audit" >&2
+  echo "pre-commit: CI will still run it" >&2
+  exit 0
+fi
+
+WORK="$(mktemp -d)" || exit 1
+trap 'rm -rf "$WORK"' EXIT
+
+# Added, copied and modified paths. A deletion publishes no content, and its
+# file is gone from disk anyway.
+git diff --cached --name-only -z --diff-filter=ACM > "$WORK/staged" || exit 1
+
+STAGED=()
+while IFS= read -r -d '' path; do
+  STAGED+=("$path")
+done < "$WORK/staged"
+[ "${#STAGED[@]}" -gt 0 ] || exit 0
+
+# Audit the index, not the working tree. A file can be staged and then edited
+# further, and only the staged content becomes the public commit, so reading
+# the working copy can clear a commit that is about to publish a violation.
+mkdir -p "$WORK/tree" || exit 1
+git checkout-index --prefix="$WORK/tree/" --force -z --stdin < "$WORK/staged" || exit 1
+
+if (cd "$WORK/tree" && "$PYTHON" "$REPO_ROOT/$AUDIT" --root "$WORK/tree" \
+      "${STAGED[@]}") > "$WORK/findings" 2>&1; then
+  exit 0
+fi
+
+{
+  echo "pre-commit: the public release audit rejected the staged change."
+  echo
+  sed 's/^/  /' "$WORK/findings"
+  echo
+  if grep -q "private-planning-path" "$WORK/findings"; then
+    echo "  private-planning-path: planning, spec and design documents are not"
+    echo "  published from this repository. Keep them out of the tree."
+    echo
+  fi
+  echo "Fix the findings above, or commit deliberately with:"
+  echo "  git commit --no-verify"
+} >&2
+exit 1
