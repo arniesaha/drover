@@ -155,6 +155,7 @@ public final class ChatModel {
     /// delivery, queueing, or message sequence handling.
     private nonisolated(unsafe) var recapRefreshTask: Task<Void, Never>?
     private var recapRefreshGeneration = 0
+    private var hasInitializedRunPreferences = false
     private let recapPollInterval: Duration
     private let recapPollAttempts: Int
 
@@ -603,6 +604,15 @@ public final class ChatModel {
         guard let metadata = await Self.fetchSessionMetadata(client: client, sessionID: sessionID)
         else { return }
         applySessionMetadata(metadata.snapshot, session: metadata.session)
+        if !hasInitializedRunPreferences {
+            hasInitializedRunPreferences = true
+            runPreferences.select(
+                hostID: metadata.session.hostID,
+                harness: metadata.session.harness,
+                seedModel: Self.nonEmpty(metadata.session.model),
+                seedThinkingEffort: Self.nonEmpty(metadata.session.thinkingEffort)
+            )
+        }
         await runPreferences.refresh()
     }
 
@@ -620,12 +630,6 @@ public final class ChatModel {
 
     private func applySessionMetadata(_ snapshot: HarnessSnapshot, session: SessionSummary) {
         harnessPresentation = HarnessPresentation(session.harness)
-        runPreferences.select(
-            hostID: session.hostID,
-            harness: session.harness,
-            seedModel: session.model,
-            seedThinkingEffort: session.thinkingEffort
-        )
         if let generatedRecap = session.recap, !generatedRecap.isEmpty {
             let isOlderThanCurrent = {
                 guard let incoming = session.recapSourceSeq,
@@ -643,6 +647,12 @@ public final class ChatModel {
         }
         guard let host = snapshot.hosts.first(where: { $0.id == session.hostID }) else { return }
         handoffHarnesses = host.harnesses
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Compatibility entry point for existing callers. Metadata loading grew

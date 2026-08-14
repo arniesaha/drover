@@ -9,6 +9,8 @@ public final class HarnessModelCatalogState {
     private var selectionGeneration = 0
     private var refreshGeneration = 0
     private var isReconciling = false
+    private var pendingSeedModel: String?
+    private var pendingSeedThinkingEffort: String?
 
     public private(set) var hostID = ""
     public private(set) var harness = ""
@@ -39,6 +41,11 @@ public final class HarnessModelCatalogState {
         self.harness = harness
         statusMessage = nil
 
+        let requestedModel = seedModel.flatMap(normalized)
+        let requestedThinkingEffort = seedThinkingEffort.flatMap(normalized)
+        pendingSeedModel = requestedModel
+        pendingSeedThinkingEffort = requestedThinkingEffort
+
         let cached = store.catalog(hostID: hostID, harness: harness)
         let saved = store.selection(hostID: hostID, harness: harness)
         let cachedScope = concreteAccountScope(cached?.accountScopeID)
@@ -50,9 +57,20 @@ public final class HarnessModelCatalogState {
 
         reconcileWithoutCallbacks {
             catalog = cached
-            selectedModel = seedModel ?? scopedSelection?.model ?? ""
-            thinkingEffort = seedThinkingEffort ?? scopedSelection?.thinkingEffort ?? ""
+            selectedModel = requestedModel ?? scopedSelection?.model ?? ""
+            thinkingEffort = requestedThinkingEffort ?? scopedSelection?.thinkingEffort ?? ""
             reconcileSelection()
+            if cached == nil {
+                selectedModel = ""
+                thinkingEffort = ""
+            }
+        }
+
+        if requestedModel == selectedModel {
+            pendingSeedModel = nil
+        }
+        if requestedThinkingEffort == thinkingEffort {
+            pendingSeedThinkingEffort = nil
         }
     }
 
@@ -107,6 +125,8 @@ public final class HarnessModelCatalogState {
     public func apply(_ freshCatalog: HarnessModelCatalog) {
         guard freshCatalog.hostID == hostID, freshCatalog.harness == harness else { return }
 
+        let requestedModel = pendingSeedModel
+        let requestedThinkingEffort = pendingSeedThinkingEffort
         let previousCatalog = catalog
         let scopeChanged = previousCatalog != nil
             && previousCatalog?.accountScopeID != freshCatalog.accountScopeID
@@ -119,12 +139,22 @@ public final class HarnessModelCatalogState {
             if lostSelection {
                 selectedModel = ""
                 thinkingEffort = ""
-            } else {
-                reconcileSelection()
             }
+            if let requestedModel {
+                selectedModel = requestedModel
+            }
+            if let requestedThinkingEffort {
+                thinkingEffort = requestedThinkingEffort
+            }
+            reconcileSelection()
         }
 
-        statusMessage = lostSelection
+        pendingSeedModel = nil
+        pendingSeedThinkingEffort = nil
+
+        let requestedModelWasUnavailable = requestedModel != nil
+            && selectedModel != requestedModel
+        statusMessage = (lostSelection || requestedModelWasUnavailable)
             ? "The previous model is unavailable for this account."
             : nil
         store.save(catalog: freshCatalog)
@@ -133,6 +163,8 @@ public final class HarnessModelCatalogState {
 
     private func selectionDidChange() {
         guard !isReconciling else { return }
+        pendingSeedModel = nil
+        pendingSeedThinkingEffort = nil
         reconcileWithoutCallbacks {
             reconcileSelection()
         }

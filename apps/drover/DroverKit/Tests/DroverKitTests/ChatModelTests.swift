@@ -100,16 +100,24 @@ private func snapshotClient(responses: [Data] = [], repeating: Data? = nil) -> S
     return snapshotClient
 }
 
-private func sessionJSON(recap: String? = nil, source: Int? = nil, preview: String? = nil) -> Data {
+private func sessionJSON(
+    recap: String? = nil,
+    source: Int? = nil,
+    preview: String? = nil,
+    model: String? = nil,
+    thinkingEffort: String? = nil
+) -> Data {
     let recapField = recap.map { #", "recap": "\#($0)""# } ?? ""
     let sourceField = source.map { #", "recap_source_seq": \#($0)"# } ?? ""
     let previewField = preview.map { #", "preview": "\#($0)""# } ?? ""
+    let modelField = model.map { #", "model": "\#($0)""# } ?? ""
+    let effortField = thinkingEffort.map { #", "thinking_effort": "\#($0)""# } ?? ""
     return Data("""
     {"hosts": [{"host_id": "host-1", "status": "online",
       "capabilities": {"display_name": "Host", "harnesses": [
         {"name": "codex", "enabled": true}]}}],
      "sessions": [{"session_id": "s1", "host_id": "host-1", "harness": "codex",
-       "mode": "structured", "status": "running", "awaiting": null\(recapField)\(sourceField)\(previewField)}],
+       "mode": "structured", "status": "running", "awaiting": null\(recapField)\(sourceField)\(previewField)\(modelField)\(effortField)}],
      "cwd_suggestions": []}
     """.utf8)
 }
@@ -235,6 +243,46 @@ struct ChatModelTests {
     target.finish()
     await eventually { model.recap == "Target" }
     #expect(model.recapSourceSeq == 12)
+}
+
+@Test @MainActor func delayedRecapDoesNotReseedEditedTurnPreferences() async {
+    let store = chatTestStore()
+    let editedModel = HarnessModelOption(
+        id: "edited-model", displayName: "Edited", description: nil,
+        isDefault: false,
+        reasoning: HarnessReasoningOptions(supported: ["high"], default: "high")
+    )
+    let catalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "session-model",
+        supportedEfforts: ["low"], additionalModels: [editedModel]
+    )
+    let delayed = DelayedSnapshotResponse(sessionJSON(
+        recap: "Target", source: 12,
+        model: "session-model", thinkingEffort: "low"
+    ))
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        return (200, delayed.waitForRelease())
+    }
+    let model = ChatModel(
+        client: client(), sessionID: "s1", harness: "codex", store: store,
+        recap: "Old", recapSourceSeq: 8,
+        recapPollInterval: .zero, recapPollAttempts: 1
+    )
+    model.runPreferences.select(hostID: "host-1", harness: "codex")
+    model.runPreferences.apply(catalog)
+    model.runPreferences.selectedModel = "session-model"
+    model.runPreferences.thinkingEffort = "low"
+
+    model.ingest(.message(turnComplete(seq: 12)))
+    await eventually { delayed.hasStarted }
+    model.runPreferences.selectedModel = "edited-model"
+    model.runPreferences.thinkingEffort = "high"
+    delayed.finish()
+
+    await eventually { model.recap == "Target" }
+    #expect(model.runPreferences.selectedModel == "edited-model")
+    #expect(model.runPreferences.thinkingEffort == "high")
 }
 
 @Test @MainActor func recapPollStopsAfterConfiguredAttemptsAndKeepsLastGoodText() async {
@@ -493,6 +541,64 @@ struct ChatModelTests {
     #expect(model.runPreferences.harness == "codex")
     #expect(model.runPreferences.selectedModel == "session-model")
     #expect(model.runPreferences.thinkingEffort == "high")
+}
+
+@Test @MainActor func whitespaceSessionMetadataRestoresStoredScopedPreference() async throws {
+    let store = chatTestStore()
+    let catalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "stored-model",
+        supportedEfforts: ["high"]
+    )
+    store.save(catalog: catalog)
+    store.save(
+        selection: HarnessModelSelection(
+            accountScopeID: "scope-chat", model: "stored-model", thinkingEffort: "high"
+        ),
+        hostID: "host-1", harness: "codex"
+    )
+    MockURLProtocol.handler = { request in
+        request.url?.path == "/harness"
+            ? (200, sessionJSON(model: "   ", thinkingEffort: "  \t "))
+            : (200, encodedCatalog(catalog))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", store: store)
+
+    await model.loadSessionMetadata()
+
+    #expect(model.runPreferences.selectedModel == "stored-model")
+    #expect(model.runPreferences.thinkingEffort == "high")
+}
+
+@Test @MainActor func freshCatalogRestoresSessionSeedMissingFromStaleCache() async throws {
+    let store = chatTestStore()
+    let staleCatalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "stale-model", stale: true
+    )
+    store.save(catalog: staleCatalog)
+    let freshCatalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "session-model",
+        supportedEfforts: ["high"]
+    )
+    let delayedCatalog = DelayedSnapshotResponse(encodedCatalog(freshCatalog))
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" {
+            return (200, sessionJSON(model: "session-model", thinkingEffort: "high"))
+        }
+        return (200, delayedCatalog.waitForRelease())
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", store: store)
+
+    let load = Task { await model.loadSessionMetadata() }
+    await eventually { delayedCatalog.hasStarted }
+    #expect(model.runPreferences.modelOverride == nil)
+    #expect(model.runPreferences.thinkingEffortOverride == nil)
+    delayedCatalog.finish()
+    await load.value
+
+    #expect(model.runPreferences.selectedModel == "session-model")
+    #expect(model.runPreferences.thinkingEffort == "high")
+    #expect(model.runPreferences.modelOverride == "session-model")
+    #expect(model.runPreferences.thinkingEffortOverride == "high")
 }
 
 @Test @MainActor func loadSessionMetadataUnknownSessionLeavesListEmpty() async throws {
