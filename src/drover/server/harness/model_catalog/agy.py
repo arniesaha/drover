@@ -45,8 +45,9 @@ class AgyCatalogAdapter:
         return _fingerprint(parts)
 
     def discover(self) -> DiscoveredCatalog:
-        rows = self._models()
+        _require_executable(self.command)
         account = self._account_label()
+        rows = self._models()
         version = self._version()
         try:
             return DiscoveredCatalog(
@@ -214,6 +215,26 @@ def _stat_metadata(path: Path) -> tuple[str, ...]:
         str(result.st_size),
         str(result.st_mtime_ns),
     )
+
+
+def _require_executable(command: Sequence[str]) -> None:
+    if not command:
+        raise CatalogDiscoveryError("unsupported")
+    try:
+        supplied = Path(command[0])
+    except (TypeError, ValueError):
+        raise CatalogDiscoveryError("protocol_error") from None
+    if supplied.parent == Path("."):
+        resolved = shutil.which(command[0])
+        if resolved is None:
+            raise CatalogDiscoveryError("unsupported")
+        supplied = Path(resolved)
+    try:
+        supplied.stat()
+    except FileNotFoundError:
+        raise CatalogDiscoveryError("unsupported") from None
+    except OSError:
+        raise CatalogDiscoveryError("protocol_error") from None
 
 
 def _executable_path(command: Sequence[str]) -> Path:

@@ -150,6 +150,28 @@ def test_agy_catalog_missing_executable_precedes_missing_account(tmp_path):
         ).discover()
 
 
+def test_agy_catalog_missing_account_precedes_present_nonzero_executable(
+    fake_agy, tmp_path
+):
+    with pytest.raises(CatalogDiscoveryError, match="not_authenticated"):
+        AgyCatalogAdapter(
+            (str(fake_agy), "nonzero"),
+            accounts_path=tmp_path / "missing-accounts.json",
+            timeout_s=1,
+        ).discover()
+
+
+def test_agy_catalog_missing_account_precedes_present_timeout_executable(
+    fake_agy, tmp_path
+):
+    with pytest.raises(CatalogDiscoveryError, match="not_authenticated"):
+        AgyCatalogAdapter(
+            (str(fake_agy), "timeout"),
+            accounts_path=tmp_path / "missing-accounts.json",
+            timeout_s=0.01,
+        ).discover()
+
+
 def test_agy_catalog_timeout_is_safe_failure(fake_agy, tmp_path):
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text('{"active":"person@example.com"}')

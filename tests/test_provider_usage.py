@@ -124,6 +124,14 @@ for line in sys.stdin:
     if mode == "stdout_flood":
         print(json.dumps({"id": request["id"], "result": {"blob": "x" * 1100000}}), flush=True)
         continue
+    if mode == "stdout_multibyte_flood":
+        payload = json.dumps(
+            {"id": request["id"], "result": {"blob": "é" * 600000}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        sys.stdout.buffer.write(payload + b"\\n")
+        sys.stdout.buffer.flush()
+        continue
     if request["method"] == "initialize":
         result = {"userAgent": "fake"}
     elif request["method"] == "account/read":
@@ -169,6 +177,12 @@ for line in sys.stdin:
         timeout_command=(sys.executable, "-u", str(script), "timeout"),
         noisy_command=(sys.executable, "-u", str(script), "stderr_flood"),
         oversized_command=(sys.executable, "-u", str(script), "stdout_flood"),
+        oversized_multibyte_command=(
+            sys.executable,
+            "-u",
+            str(script),
+            "stdout_multibyte_flood",
+        ),
     )
 
 
@@ -377,6 +391,21 @@ def test_codex_app_server_session_rejects_oversized_stdout(
     with pytest.raises(CodexAppServerError, match="protocol_error"):
         with CodexAppServerSession(
             fake_codex_app_server.oversized_command, timeout_s=1
+        ):
+            pass
+
+
+def test_codex_app_server_session_applies_stdout_limit_to_encoded_bytes(
+    fake_codex_app_server,
+):
+    from drover.server.providers.codex_app_server import (
+        CodexAppServerError,
+        CodexAppServerSession,
+    )
+
+    with pytest.raises(CodexAppServerError, match="protocol_error"):
+        with CodexAppServerSession(
+            fake_codex_app_server.oversized_multibyte_command, timeout_s=1
         ):
             pass
 

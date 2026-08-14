@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 log = logging.getLogger(__name__)
 _PROCESS_STOP_TIMEOUT_S = 0.5
 _MAX_CAPTURED_STDERR_CHARS = 16_384
-_MAX_STDOUT_LINE_CHARS = 1_048_576
+_MAX_STDOUT_LINE_BYTES = 1_048_576
 _MAX_PENDING_STDOUT_LINES = 4
 _STDOUT_PROTOCOL_ERROR = object()
 
@@ -94,7 +94,7 @@ class CodexAppServerSession:
         self._process = process
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise CodexAppServerError("process_error")
-        self._reader = _stdout_reader(process.stdout, self._lines)
+        self._reader = _stdout_reader(process.stdout.buffer, self._lines)
         self._stderr_reader = _stderr_reader(process.stderr, self._stderr_parts)
 
     def _request_with_id(
@@ -122,10 +122,10 @@ class CodexAppServerSession:
                 raise CodexAppServerError("protocol_error")
             if line is None:
                 raise CodexAppServerError("process_error")
-            if not isinstance(line, str):
+            if not isinstance(line, bytes):
                 raise CodexAppServerError("protocol_error")
             try:
-                response = json.loads(line)
+                response = json.loads(line.decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
                 raise CodexAppServerError("protocol_error") from None
             if not isinstance(response, Mapping):
@@ -170,10 +170,10 @@ def _stdout_reader(stream, lines: Queue[object]) -> threading.Thread:
     def read_lines() -> None:
         try:
             while True:
-                line = stream.readline(_MAX_STDOUT_LINE_CHARS + 1)
-                if line == "":
+                line = stream.readline(_MAX_STDOUT_LINE_BYTES + 1)
+                if line == b"":
                     break
-                if len(line) > _MAX_STDOUT_LINE_CHARS or not line.endswith("\n"):
+                if len(line) > _MAX_STDOUT_LINE_BYTES or not line.endswith(b"\n"):
                     _signal_stdout_protocol_error(lines)
                     return
                 try:
