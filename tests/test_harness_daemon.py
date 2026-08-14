@@ -508,15 +508,7 @@ def test_harnessd_health_and_capabilities(tmp_path):
 def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     tmp_path,
 ):
-    """Gemini has no pollable quota source, so it always reports
-    usage_unavailable. Claude Code is now polled via a real probe pointed at
-    credentials that don't exist, so it independently lands on
-    usage_unavailable too (not_authenticated) -- this keeps the test hermetic
-    against whatever the machine running it happens to have logged in. The
-    Keychain reader is stubbed out too: the probe now checks the macOS
-    Keychain before the file, and a real signed-in host would otherwise leak
-    its live credential into this test.
-    """
+    """The route must not inspect the runner's real provider credentials."""
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
     state.presets = {
         "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
@@ -526,6 +518,24 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
         credentials_path=tmp_path / "missing-credentials.json",
         keychain_reader=lambda: None,
     )
+
+    class _UnavailableAgyProbe:
+        def read(self, *, host_id):
+            return ProviderAccountSnapshot(
+                snapshot_id="agy-unavailable",
+                dedup_key="agy-unavailable",
+                provider="google",
+                account_label="Antigravity",
+                plan_label=None,
+                host_id=host_id,
+                status="usage_unavailable",
+                observed_at=datetime(2026, 8, 13, tzinfo=timezone.utc),
+                windows=(),
+                source="agy-usage",
+                error_category="not_authenticated",
+            )
+
+    state.agy_usage_probe = _UnavailableAgyProbe()
     try:
         with pytest.raises(urllib.error.HTTPError) as error:
             _json_request(f"{base_url}/providers/usage")
@@ -554,6 +564,48 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     assert {account["status"] for account in body["accounts"]} == {"usage_unavailable"}
     assert all(account["windows"] == [] for account in body["accounts"])
     assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
+
+
+def test_harnessd_provider_usage_uses_configured_agy_probe(tmp_path):
+    """A route-level Agy probe override keeps provider coverage hermetic."""
+
+    class _FixtureAgyProbe:
+        def read(self, *, host_id):
+            return ProviderAccountSnapshot(
+                snapshot_id="agy-fixture",
+                dedup_key="agy-fixture",
+                provider="google",
+                account_label="fixture@example.com",
+                plan_label=None,
+                host_id=host_id,
+                status="ok",
+                observed_at=datetime(2026, 8, 13, tzinfo=timezone.utc),
+                windows=(
+                    ProviderUsageWindow(
+                        kind="five_hour", used_percent=42.0, window_minutes=300
+                    ),
+                ),
+                source="agy-usage",
+            )
+
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {"agy": replace(DEFAULT_PRESETS["agy"], enabled=True)}
+    state.agy_usage_probe = _FixtureAgyProbe()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    assert body["accounts"][0]["account_label"] == "fixture@example.com"
+    assert body["accounts"][0]["windows"][0]["used_percent"] == 42.0
 
 
 def test_harnessd_provider_usage_reports_claude_windows(tmp_path):
@@ -671,9 +723,8 @@ def test_harnessd_provider_usage_probes_codex_at_its_resolved_executable(tmp_pat
     # harnessd inherits a launchd PATH that omits the CLI's install prefix, so a
     # probe spawning a bare "codex" cannot find it. The preset already resolved
     # the absolute path through the login shell; the probe must reuse it.
-    codex = tmp_path / "codex-cli"
-    codex.write_text(f"""\
-#!{sys.executable}
+    codex_program = tmp_path / "codex-cli.py"
+    codex_program.write_text("""\
 import json
 import sys
 
@@ -682,15 +733,19 @@ for line in sys.stdin:
     if "id" not in request:
         continue
     if request["method"] == "initialize":
-        result = {{"userAgent": "fake"}}
+        result = {"userAgent": "fake"}
     elif request["method"] == "account/read":
-        result = {{"account": {{"email": "person@example.com", "planType": "plus"}}}}
+        result = {"account": {"email": "person@example.com", "planType": "plus"}}
     elif request["method"] == "account/rateLimits/read":
-        result = {{"rateLimits": {{"primary": {{"usedPercent": 25}}}}}}
+        result = {"rateLimits": {"primary": {"usedPercent": 25}}}
     else:
         continue
-    print(json.dumps({{"id": request["id"], "result": result}}), flush=True)
+    print(json.dumps({"id": request["id"], "result": result}), flush=True)
 """)
+    codex = tmp_path / "codex-cli"
+    codex.write_text(
+        "#!/bin/sh\n" f"exec '{sys.executable}' '{codex_program}' \"$@\"\n"
+    )
     codex.chmod(0o755)
 
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")

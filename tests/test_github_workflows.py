@@ -28,6 +28,53 @@ def test_public_pr_workflows_stay_github_hosted() -> None:
     assert "workflow_dispatch" in python_ci["on"]
 
 
+def test_public_workflows_select_expensive_suites_from_changed_paths() -> None:
+    python_ci = load_workflow("ci.yml")
+    ios_ci = load_workflow("ios.yml")
+
+    python_steps = python_ci["jobs"]["build-and-test"]["steps"]
+    ios_steps = ios_ci["jobs"]["build-and-test"]["steps"]
+
+    for steps in (python_steps, ios_steps):
+        checkout = steps[0]
+        assert checkout["uses"] == "actions/checkout@v4"
+        assert checkout["with"]["fetch-depth"] == "0"
+        selectors = [
+            step
+            for step in steps
+            if "scripts/ci/select_test_scope.py" in step.get("run", "")
+        ]
+        assert len(selectors) == 1
+        assert selectors[0]["id"] == "scope"
+        assert selectors[0]["env"]["BASE_SHA"] == (
+            "${{ github.event.pull_request.base.sha }}"
+        )
+
+    python_lightweight = next(
+        step for step in python_steps if step.get("name") == "Run lightweight checks"
+    )
+    assert python_lightweight["env"]["BASE_SHA"] == (
+        "${{ github.event.pull_request.base.sha }}"
+    )
+    assert 'git diff --check "$BASE_SHA"...HEAD' in python_lightweight["run"]
+    ios_lightweight = next(
+        step for step in ios_steps if step.get("name") == "Run lightweight checks"
+    )
+    assert ios_lightweight["env"]["BASE_SHA"] == (
+        "${{ github.event.pull_request.base.sha }}"
+    )
+    assert ios_lightweight["run"] == 'git diff --check "$BASE_SHA"...HEAD'
+
+    python_setup = next(
+        step for step in python_steps if step.get("name") == "Set up Python"
+    )
+    assert python_setup["if"] == "steps.scope.outputs.python == 'true'"
+    ios_xcode = next(
+        step for step in ios_steps if step.get("name") == "Show Xcode version"
+    )
+    assert ios_xcode["if"] == "steps.scope.outputs.ios == 'true'"
+
+
 def test_trusted_workflow_never_runs_untrusted_code() -> None:
     """The self-hosted runner must never execute code from an unmerged PR.
 

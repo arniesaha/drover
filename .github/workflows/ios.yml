@@ -24,17 +24,40 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Select test scope
+      id: scope
+      working-directory: .
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        python3 scripts/ci/select_test_scope.py \
+          --base "$BASE_SHA" \
+          --github-output "$GITHUB_OUTPUT"
+
+    - name: Run lightweight checks
+      if: steps.scope.outputs.ios != 'true'
+      working-directory: .
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: git diff --check "$BASE_SHA"...HEAD
 
     - name: Show Xcode version
+      if: steps.scope.outputs.ios == 'true'
       run: xcodebuild -version
 
     - name: Install XcodeGen
+      if: steps.scope.outputs.ios == 'true'
       run: brew install xcodegen
 
     - name: Generate Xcode project
+      if: steps.scope.outputs.ios == 'true'
       run: xcodegen generate
 
     - name: Select iPhone simulator
+      if: steps.scope.outputs.ios == 'true'
       run: |
         simulator_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
         if [ -z "$simulator_id" ]; then
@@ -46,12 +69,14 @@ jobs:
         echo "Selected simulator id=$simulator_id"
 
     - name: Resolve Swift packages
+      if: steps.scope.outputs.ios == 'true'
       run: |
         xcodebuild -project Drover.xcodeproj \
           -scheme Drover \
           -resolvePackageDependencies
 
     - name: Run unit tests
+      if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
         xcodebuild -project Drover.xcodeproj \
@@ -61,6 +86,7 @@ jobs:
           test
 
     - name: Build UI test bundle
+      if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
         xcodebuild -project Drover.xcodeproj \
@@ -70,7 +96,7 @@ jobs:
           build-for-testing
 
     - name: Upload unit test result bundle
-      if: failure()
+      if: failure() && steps.scope.outputs.ios == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: DroverTests.xcresult
@@ -78,7 +104,7 @@ jobs:
         if-no-files-found: ignore
 
     - name: Upload UI build result bundle
-      if: failure()
+      if: failure() && steps.scope.outputs.ios == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: DroverUITests.xcresult

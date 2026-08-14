@@ -1127,6 +1127,7 @@ class HarnessDaemonState:
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     provider_usage_probe: CodexUsageProbe | None = None
     claude_usage_probe: Any | None = None
+    agy_usage_probe: Any | None = None
     advisory_content: "AdvisoryContentConfig | None" = None
     content_consent: DurableContentConsent | None = None
 
@@ -1403,7 +1404,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             if detected.provider == "google":
                 from drover.server.providers.agy import AgyUsageProbe
 
-                snapshot = AgyUsageProbe().read(host_id=self.server.state.host_id)
+                probe = self.server.state.agy_usage_probe
+                if probe is None:
+                    probe = AgyUsageProbe()
+                    self.server.state.agy_usage_probe = probe
+                snapshot = probe.read(host_id=self.server.state.host_id)
                 accounts.append(_provider_snapshot_json(snapshot, detected))
                 continue
             accounts.append(_unavailable_provider_json(detected, observed_at))
