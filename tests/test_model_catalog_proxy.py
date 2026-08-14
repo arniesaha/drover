@@ -181,6 +181,84 @@ def test_proxy_returns_stale_lkg_offline_without_leaking_upstream_body(
     assert "secret upstream detail" not in body
 
 
+def test_stale_upstream_uses_newer_central_lkg(tmp_path, upstream_server):
+    collector = _collector(
+        tmp_path,
+        upstream_url=f"http://127.0.0.1:{upstream_server.server_address[1]}",
+    )
+    central_catalog = _catalog(scope_id="central-newer")
+    central_catalog["discovered_at"] = "2026-08-14T13:00:00+00:00"
+    HarnessRegistry(collector.duckdb_path).save_model_catalog(
+        "mac mini", "codex beta", "central-newer", central_catalog
+    )
+    upstream_stale = _catalog(scope_id="host-older")
+    upstream_stale.update(
+        {
+            "discovered_at": "2026-08-14T12:00:00+00:00",
+            "stale": True,
+            "stale_reason": "timeout",
+            "models": [
+                {
+                    "id": "host-stale-model",
+                    "display_name": "Host stale model",
+                    "description": None,
+                    "is_default": True,
+                    "reasoning": None,
+                }
+            ],
+        }
+    )
+    _CatalogHandler.response_body = json.dumps(upstream_stale).encode()
+
+    status, body = collector.proxy_harness_model_catalog("mac mini", "codex beta")
+
+    assert status == 200
+    assert json.loads(body) == {
+        **central_catalog,
+        "stale": True,
+        "stale_reason": "timeout",
+    }
+    assert (
+        HarnessRegistry(collector.duckdb_path).latest_model_catalog(
+            "mac mini", "codex beta"
+        )
+        == central_catalog
+    )
+
+
+def test_stale_upstream_without_central_lkg_returns_exact_empty_failure(
+    tmp_path, upstream_server
+):
+    collector = _collector(
+        tmp_path,
+        upstream_url=f"http://127.0.0.1:{upstream_server.server_address[1]}",
+    )
+    upstream_stale = _catalog(scope_id="host-only")
+    upstream_stale.update({"stale": True, "stale_reason": "unsupported"})
+    _CatalogHandler.response_body = json.dumps(upstream_stale).encode()
+
+    status, body = collector.proxy_harness_model_catalog("mac mini", "codex beta")
+
+    assert status == 200
+    assert json.loads(body) == {
+        "schema_version": 1,
+        "host_id": "mac mini",
+        "harness": "codex beta",
+        "account_scope_id": None,
+        "harness_version": None,
+        "discovered_at": None,
+        "stale": True,
+        "stale_reason": "unsupported",
+        "models": [],
+    }
+    assert (
+        HarnessRegistry(collector.duckdb_path).latest_model_catalog(
+            "mac mini", "codex beta"
+        )
+        is None
+    )
+
+
 def test_first_proxy_failure_returns_exact_empty_null_metadata_envelope(tmp_path):
     collector = _collector(tmp_path, upstream_url=None)
 

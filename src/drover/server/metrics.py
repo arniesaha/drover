@@ -1520,7 +1520,12 @@ class MetricsCollector:
                 host_id, harness, "protocol_error"
             )
 
-        if not envelope.stale and envelope.account_scope_id is not None:
+        if envelope.stale:
+            return self._stale_model_catalog_response(
+                host_id, harness, envelope.stale_reason or "protocol_error"
+            )
+
+        if envelope.account_scope_id is not None:
             try:
                 HarnessRegistry(self.duckdb_path).save_model_catalog(
                     host_id,
