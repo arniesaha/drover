@@ -211,3 +211,51 @@ def test_identity_change_and_invalidation_bypass_a_fresh_cache():
     service.read("codex")
 
     assert adapter.calls == 3
+
+
+def test_source_stale_refresh_does_not_replace_fresh_last_known_good_catalog():
+    class StagedAdapter:
+        def __init__(self):
+            self.stage = "fresh"
+
+        def cache_identity(self) -> str:
+            return "codex-v1"
+
+        def discover(self) -> DiscoveredCatalog:
+            if self.stage == "failure":
+                raise CatalogDiscoveryError("timeout")
+            return DiscoveredCatalog(
+                account_scope_material="person@example.com|plus",
+                harness_version="0.147.0",
+                source_stale=self.stage == "source-stale",
+                models=(
+                    ModelOption(
+                        id=(
+                            "fresh-model"
+                            if self.stage == "fresh"
+                            else "stale-native-cache-model"
+                        ),
+                        display_name="Catalog model",
+                    ),
+                ),
+            )
+
+    adapter = StagedAdapter()
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": adapter},
+        scope_ids=AccountScopeIDs(secret=b"s" * 32),
+        clock=lambda: NOW,
+    )
+
+    fresh = service.read("codex")
+    adapter.stage = "source-stale"
+    source_stale = service.read("codex", force=True)
+    adapter.stage = "failure"
+    fallback = service.read("codex", force=True)
+
+    assert fresh.models[0].id == "fresh-model"
+    assert source_stale.stale is True
+    assert source_stale.models[0].id == "stale-native-cache-model"
+    assert fallback.stale_reason == "timeout"
+    assert fallback.models == fresh.models

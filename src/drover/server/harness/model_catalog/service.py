@@ -104,9 +104,10 @@ class ModelCatalogService:
             except Exception:
                 return self._failed_read(harness, cached, "protocol_error")
 
-            self._cache[harness] = _CacheEntry(
-                envelope=envelope, identity=identity, expires_at=now + self._ttl
-            )
+            if not envelope.stale or cached is None or cached.envelope.stale:
+                self._cache[harness] = _CacheEntry(
+                    envelope=envelope, identity=identity, expires_at=now + self._ttl
+                )
             return envelope
 
     def validate(
