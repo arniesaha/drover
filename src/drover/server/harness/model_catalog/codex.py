@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +19,8 @@ from .models import DiscoveredCatalog, MAX_MODELS, ModelOption, ReasoningOptions
 from .service import CatalogDiscoveryError
 
 _CACHE_FILES = ("models_cache.json", "config.toml", "auth.json")
+_CONFIGURATION_FILES = ("config.toml", "auth.json")
+_MAX_NATIVE_CACHE_BYTES = 1_048_576
 
 
 class CodexCatalogAdapter:
@@ -39,12 +42,21 @@ class CodexCatalogAdapter:
 
     def cache_identity(self) -> str:
         parts = ["command", *self.command]
-        for path in (Path(self.command[0]) if self.command else Path(""),):
+        for path in (_executable_path(self.command),):
             parts.extend(("executable", str(path), *_stat_metadata(path)))
         for name in _CACHE_FILES:
             path = self.codex_home / name
             parts.extend((name, *_stat_metadata(path)))
-        return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+        return _fingerprint(parts)
+
+    def _effective_configuration_identity(self) -> str:
+        executable = _executable_path(self.command)
+        parts = ["command", *self.command, "executable", str(executable)]
+        parts.extend(_stat_metadata(executable))
+        for name in _CONFIGURATION_FILES:
+            path = self.codex_home / name
+            parts.extend((name, *_stat_metadata(path)))
+        return _fingerprint(parts)
 
     def discover(self) -> DiscoveredCatalog:
         try:
@@ -61,7 +73,9 @@ class CodexCatalogAdapter:
                 account_response = client.request(
                     "account/read", {"refreshToken": False}
                 )
-                account_scope_material = _account_scope_material(account_response)
+                account_scope_material = _account_scope_material(
+                    account_response, self._effective_configuration_identity()
+                )
                 items = _list_models(client)
             harness_version = self._version()
         except CodexAppServerError as exc:
@@ -86,7 +100,13 @@ class CodexCatalogAdapter:
     def _discover_native_cache(self) -> DiscoveredCatalog:
         path = self.codex_home / "models_cache.json"
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            if path.stat().st_size > _MAX_NATIVE_CACHE_BYTES:
+                raise ValueError
+            with path.open("rb") as stream:
+                raw = stream.read(_MAX_NATIVE_CACHE_BYTES + 1)
+            if len(raw) > _MAX_NATIVE_CACHE_BYTES:
+                raise ValueError
+            value = json.loads(raw)
             if not isinstance(value, Mapping):
                 raise ValueError
             version = value.get("client_version")
@@ -95,6 +115,7 @@ class CodexCatalogAdapter:
                 not isinstance(version, str)
                 or not version
                 or not isinstance(entries, list)
+                or len(entries) > MAX_MODELS
             ):
                 raise ValueError
             models = _cached_models(entries)
@@ -106,7 +127,13 @@ class CodexCatalogAdapter:
                 models=models,
                 source_stale=True,
             )
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ):
             raise CatalogDiscoveryError("protocol_error") from None
 
     def _version(self) -> str:
@@ -157,7 +184,9 @@ def _list_models(client: CodexAppServerSession) -> list[Mapping[str, Any]]:
     return items
 
 
-def _account_scope_material(response: Mapping[str, Any]) -> str:
+def _account_scope_material(
+    response: Mapping[str, Any], configuration_identity: str
+) -> str:
     account = response.get("account")
     if not isinstance(account, Mapping):
         raise CatalogDiscoveryError("protocol_error")
@@ -165,7 +194,10 @@ def _account_scope_material(response: Mapping[str, Any]) -> str:
     plan = account.get("planType")
     if not isinstance(email, str) or not email or not isinstance(plan, str) or not plan:
         raise CatalogDiscoveryError("protocol_error")
-    return json.dumps({"email": email, "plan": plan}, separators=(",", ":"))
+    return json.dumps(
+        {"email": email, "plan": plan, "configuration": configuration_identity},
+        separators=(",", ":"),
+    )
 
 
 def _live_models(items: Sequence[Mapping[str, Any]]) -> tuple[ModelOption, ...]:
@@ -267,3 +299,19 @@ def _stat_metadata(path: Path) -> tuple[str, ...]:
         str(result.st_size),
         str(result.st_mtime_ns),
     )
+
+
+def _executable_path(command: Sequence[str]) -> Path:
+    if not command:
+        return Path("")
+    executable = command[0]
+    path = Path(executable)
+    if path.parent == Path("."):
+        resolved = shutil.which(executable)
+        if resolved:
+            return Path(resolved)
+    return path
+
+
+def _fingerprint(parts: Sequence[str]) -> str:
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()

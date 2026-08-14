@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from drover.server.harness.model_catalog import AccountScopeIDs, ModelCatalogService
+from drover.server.harness.model_catalog import (
+    AccountScopeIDs,
+    CatalogDiscoveryError,
+    ModelCatalogService,
+)
 from drover.server.harness.model_catalog.codex import CodexCatalogAdapter
 
 
@@ -180,3 +184,102 @@ def test_uses_native_cache_as_an_offline_stale_catalog(fake_codex_executable, tm
     assert catalog.stale_reason == "offline"
     assert catalog.harness_version == "0.147.0"
     assert [model.id for model in catalog.models] == ["gpt-5.6-terra"]
+
+
+def test_live_scope_changes_when_effective_codex_config_changes(
+    fake_codex_executable, tmp_path
+):
+    (tmp_path / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+    adapter = CodexCatalogAdapter(
+        (str(fake_codex_executable), "app-server", "--stdio"), codex_home=tmp_path
+    )
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": adapter},
+        scope_ids=AccountScopeIDs(secret=b"c" * 32),
+        clock=lambda: datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    before = service.read("codex")
+    (tmp_path / "config.toml").write_text('model = "gpt-5.6-terra"\n')
+    after = service.read("codex", force=True)
+
+    assert before.account_scope_id != after.account_scope_id
+    assert after.models == before.models
+
+
+def test_native_cache_rejects_an_unbounded_mostly_hidden_model_array(
+    fake_codex_executable, tmp_path
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    hidden = {
+        "slug": "hidden-model",
+        "display_name": "Hidden model",
+        "visibility": "hidden",
+    }
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "client_version": "0.147.0",
+                "models": [hidden] * 257
+                + [
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "display_name": "GPT-5.6 Terra",
+                        "visibility": "list",
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        CodexCatalogAdapter(
+            (str(fake_codex_executable), "fail"), codex_home=codex_home
+        ).discover()
+
+
+def test_native_cache_rejects_a_file_larger_than_one_mebibyte(
+    fake_codex_executable, tmp_path
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "client_version": "0.147.0",
+                "padding": "x" * 1_048_577,
+                "models": [
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "display_name": "GPT-5.6 Terra",
+                        "visibility": "list",
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        CodexCatalogAdapter(
+            (str(fake_codex_executable), "fail"), codex_home=codex_home
+        ).discover()
+
+
+def test_cache_identity_tracks_a_path_resolved_bare_codex_executable(
+    tmp_path, monkeypatch
+):
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    executable = binary_dir / "codex"
+    executable.write_text("first version")
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", str(binary_dir))
+    adapter = CodexCatalogAdapter(("codex",), codex_home=tmp_path)
+
+    before = adapter.cache_identity()
+    executable.write_text("replacement version")
+    after = adapter.cache_identity()
+
+    assert before != after
