@@ -8,6 +8,16 @@ private func chatWireMessage(seq: Int, text: String) -> String {
 
 private struct TimeoutError: Error {}
 
+private func chatTestStore() -> HarnessModelCatalogStore {
+    HarnessModelCatalogStore(
+        defaults: UserDefaults(suiteName: "chat-model-test-\(UUID().uuidString)")!
+    )
+}
+
+private func encodedCatalog(_ catalog: HarnessModelCatalog) -> Data {
+    try! JSONEncoder().encode(catalog)
+}
+
 /// Thread-safe counter: `MockURLProtocol.handler` runs off the main actor.
 private final class RequestCounter: @unchecked Sendable {
     private let lock = NSLock()
@@ -441,24 +451,48 @@ struct ChatModelTests {
     #expect(model.handoffHarnesses == ["shell", "claude-code", "agy"])
 }
 
-@Test @MainActor func loadSessionMetadataSeedsRunPreferencesFromSession() async throws {
+@Test @MainActor func sessionMetadataSelectsActualPairAndOverridesStoredPreference() async throws {
+    let store = chatTestStore()
+    let sessionModel = HarnessModelOption(
+        id: "session-model", displayName: "Session", description: nil,
+        isDefault: false,
+        reasoning: HarnessReasoningOptions(supported: ["high"], default: "high")
+    )
+    let catalog = fixtureCatalog(
+        hostID: "mac-mini", harness: "codex", scope: "scope-chat",
+        model: "stored-model", supportedEfforts: ["low"],
+        additionalModels: [sessionModel]
+    )
+    store.save(catalog: catalog)
+    store.save(
+        selection: HarnessModelSelection(
+            accountScopeID: "scope-chat", model: "stored-model", thinkingEffort: "low"
+        ),
+        hostID: "mac-mini", harness: "codex"
+    )
     let snapshot = Data("""
     {"hosts": [{"host_id": "mac-mini", "status": "online",
       "capabilities": {"display_name": "Mac Mini", "harnesses": [
-        {"name": "claude-code", "enabled": true}]}}],
+        {"name": "codex", "enabled": true}]}}],
      "sessions": [
-      {"session_id": "harness-preferred", "host_id": "mac-mini", "harness": "claude-code",
+      {"session_id": "harness-preferred", "host_id": "mac-mini", "harness": "codex",
        "mode": "structured", "status": "running", "awaiting": null,
-       "model": "claude-fable-5[1m]", "thinking_effort": "xhigh"}],
+       "model": "session-model", "thinking_effort": "high"}],
      "cwd_suggestions": []}
     """.utf8)
-    MockURLProtocol.handler = { _ in (200, snapshot) }
-    let model = ChatModel(client: client(), sessionID: "harness-preferred")
+    MockURLProtocol.handler = { request in
+        request.url?.path == "/harness" ? (200, snapshot) : (200, encodedCatalog(catalog))
+    }
+    let model = ChatModel(
+        client: client(), sessionID: "harness-preferred", store: store
+    )
 
     await model.loadSessionMetadata()
 
-    #expect(model.selectedModel == "claude-fable-5[1m]")
-    #expect(model.thinkingEffort == "xhigh")
+    #expect(model.runPreferences.hostID == "mac-mini")
+    #expect(model.runPreferences.harness == "codex")
+    #expect(model.runPreferences.selectedModel == "session-model")
+    #expect(model.runPreferences.thinkingEffort == "high")
 }
 
 @Test @MainActor func loadSessionMetadataUnknownSessionLeavesListEmpty() async throws {
@@ -552,7 +586,49 @@ struct ChatModelTests {
     #expect(model.pendingAttachments.isEmpty)
 }
 
-@Test @MainActor func sendTurnPassesModelAndThinkingPreferences() async throws {
+@Test @MainActor func refreshedCatalogRemovesUnsupportedPreferenceBeforeTurn() async throws {
+    let store = chatTestStore()
+    let oldCatalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "removed-model"
+    )
+    store.save(catalog: oldCatalog)
+    store.save(
+        selection: HarnessModelSelection(
+            accountScopeID: "scope-chat", model: "removed-model", thinkingEffort: "high"
+        ),
+        hostID: "host-1", harness: "codex"
+    )
+    let freshCatalog = fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "available-model"
+    )
+    nonisolated(unsafe) var preferenceKeys: [String] = []
+    MockURLProtocol.handler = { request in
+        switch (request.httpMethod, request.url?.path) {
+        case ("GET", "/harness"):
+            return (200, sessionJSON())
+        case ("GET", _):
+            return (200, encodedCatalog(freshCatalog))
+        default:
+            let body = try! JSONSerialization.jsonObject(
+                with: request.bodyStreamData()) as! [String: Any]
+            preferenceKeys = body.keys.filter {
+                $0 == "model" || $0 == "thinking_effort"
+            }
+            return (202, Data(#"{"turn_id":"t1"}"#.utf8))
+        }
+    }
+    let model = ChatModel(client: client(), sessionID: "s1", store: store)
+
+    await model.loadSessionMetadata()
+    model.composerText = "hi"
+    await model.sendTurn()
+
+    #expect(model.runPreferences.selectedModel.isEmpty)
+    #expect(model.runPreferences.thinkingEffort.isEmpty)
+    #expect(preferenceKeys.isEmpty)
+}
+
+@Test @MainActor func codexSendsValidCatalogOverridesUnchanged() async throws {
     nonisolated(unsafe) var sentModel: String?
     nonisolated(unsafe) var sentThinking: String?
     MockURLProtocol.handler = { request in
@@ -561,13 +637,53 @@ struct ChatModelTests {
         sentThinking = body["thinking_effort"] as? String
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex")
+    let model = ChatModel(
+        client: client(), sessionID: "s1", harness: "codex", store: chatTestStore()
+    )
+    model.runPreferences.select(hostID: "host-1", harness: "codex")
+    model.runPreferences.apply(fixtureCatalog(
+        hostID: "host-1", scope: "scope-chat", model: "gpt-5.6-sol",
+        supportedEfforts: ["xhigh"]
+    ))
     model.composerText = "hi"
-    model.selectedModel = "gpt-5.6-sol"
-    model.thinkingEffort = "xhigh"
+    model.runPreferences.selectedModel = "gpt-5.6-sol"
+    model.runPreferences.thinkingEffort = "xhigh"
     await model.sendTurn()
     #expect(sentModel == "gpt-5.6-sol")
     #expect(sentThinking == "xhigh")
+}
+
+@Test @MainActor func agySendsModelWithoutSeparateEffortWhenMetadataHasNone() async throws {
+    nonisolated(unsafe) var sentModel: String?
+    nonisolated(unsafe) var sentThinking = false
+    MockURLProtocol.handler = { request in
+        let body = try! JSONSerialization.jsonObject(
+            with: request.bodyStreamData()) as! [String: Any]
+        sentModel = body["model"] as? String
+        sentThinking = body.keys.contains("thinking_effort")
+        return (202, Data(#"{"turn_id":"t1"}"#.utf8))
+    }
+    let model = ChatModel(
+        client: client(), sessionID: "s1", harness: "agy", store: chatTestStore()
+    )
+    model.runPreferences.select(hostID: "host-1", harness: "agy")
+    model.runPreferences.apply(HarnessModelCatalog(
+        schemaVersion: 1, hostID: "host-1", harness: "agy",
+        accountScopeID: "scope-agy", harnessVersion: nil, discoveredAt: nil,
+        stale: false, staleReason: nil,
+        models: [HarnessModelOption(
+            id: "gemini-3.6-flash-high", displayName: "Gemini", description: nil,
+            isDefault: false, reasoning: nil
+        )]
+    ))
+    model.runPreferences.selectedModel = "gemini-3.6-flash-high"
+    model.runPreferences.thinkingEffort = "high"
+    model.composerText = "hi"
+
+    await model.sendTurn()
+
+    #expect(sentModel == "gemini-3.6-flash-high")
+    #expect(sentThinking == false)
 }
 
 @Test @MainActor func sendTurnOmitsLockedClaudePreferences() async throws {
@@ -579,15 +695,24 @@ struct ChatModelTests {
         sentThinking = body.keys.contains("thinking_effort")
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "claude-code")
+    let model = ChatModel(
+        client: client(), sessionID: "s1", harness: "claude-code",
+        store: chatTestStore()
+    )
+    model.runPreferences.select(hostID: "host-1", harness: "claude-code")
+    model.runPreferences.apply(fixtureCatalog(
+        hostID: "host-1", harness: "claude-code", scope: "scope-chat",
+        model: "opus", supportedEfforts: ["high"]
+    ))
     model.composerText = "hi"
-    model.selectedModel = "opus"
-    model.thinkingEffort = "high"
+    model.runPreferences.selectedModel = "opus"
+    model.runPreferences.thinkingEffort = "high"
 
     await model.sendTurn()
 
     #expect(sentModel == false)
     #expect(sentThinking == false)
+    #expect(HarnessRunPreferences.canChangeInExistingSession("claude-code") == false)
 }
 
 @Test @MainActor func queuedTurnOmitsLockedClaudePreferences() async throws {
@@ -601,10 +726,18 @@ struct ChatModelTests {
         }
         return (202, Data(#"{"turn_id": "t2"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "claude-code")
+    let model = ChatModel(
+        client: client(), sessionID: "s1", harness: "claude-code",
+        store: chatTestStore()
+    )
+    model.runPreferences.select(hostID: "host-1", harness: "claude-code")
+    model.runPreferences.apply(fixtureCatalog(
+        hostID: "host-1", harness: "claude-code", scope: "scope-chat",
+        model: "opus", supportedEfforts: ["high"]
+    ))
     model.composerText = "queued"
-    model.selectedModel = "opus"
-    model.thinkingEffort = "high"
+    model.runPreferences.selectedModel = "opus"
+    model.runPreferences.thinkingEffort = "high"
     await model.sendTurn()
 
     model.ingest(.message(.fixture(

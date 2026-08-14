@@ -1,34 +1,5 @@
-import Foundation
-
 public enum HarnessRunPreferences {
-    public static let thinkingEfforts = ["low", "medium", "high", "xhigh", "max"]
-
-    public static func supportsThinkingEffort(_ harness: String) -> Bool {
-        harness == "claude-code" || harness == "codex"
-    }
-
     public static func canChangeInExistingSession(_ harness: String) -> Bool {
         harness != "claude-code"
-    }
-
-    public static func modelSuggestions(for harness: String) -> [String] {
-        switch harness {
-        case "claude-code":
-            return ["sonnet", "opus", "fable"]
-        case "codex":
-            return ["gpt-5.6-sol", "gpt-5.5"]
-        case "agy":
-            // agy rejects a bare family name -- every ID it accepts carries
-            // the reasoning tier as a suffix. Taken from `agy models` on the
-            // Mac mini, 2026-08-09 (agy 1.1.11).
-            return ["gemini-3.6-flash-high", "gemini-3.1-pro-high", "claude-sonnet-4-6"]
-        default:
-            return []
-        }
-    }
-
-    public static func optional(_ value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }
