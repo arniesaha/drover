@@ -41,9 +41,10 @@ public final class HarnessModelCatalogState {
 
         let cached = store.catalog(hostID: hostID, harness: harness)
         let saved = store.selection(hostID: hostID, harness: harness)
-        let scopedSelection = cached.flatMap { cachedCatalog in
+        let cachedScope = concreteAccountScope(cached?.accountScopeID)
+        let scopedSelection = cachedScope.flatMap { scope in
             saved.flatMap { selection in
-                selection.accountScopeID == cachedCatalog.accountScopeID ? selection : nil
+                selection.accountScopeID == scope ? selection : nil
             }
         }
 
@@ -155,10 +156,12 @@ public final class HarnessModelCatalogState {
     }
 
     private func persistSelection() {
-        guard !hostID.isEmpty, !harness.isEmpty else { return }
+        guard !hostID.isEmpty,
+              !harness.isEmpty,
+              let accountScopeID = concreteAccountScope(catalog?.accountScopeID) else { return }
         store.save(
             selection: HarnessModelSelection(
-                accountScopeID: catalog?.accountScopeID,
+                accountScopeID: accountScopeID,
                 model: selectedModel,
                 thinkingEffort: thinkingEffort
             ),
@@ -172,6 +175,14 @@ public final class HarnessModelCatalogState {
         isReconciling = true
         operation()
         isReconciling = wasReconciling
+    }
+
+    private func concreteAccountScope(_ accountScopeID: String?) -> String? {
+        guard let accountScopeID,
+              !accountScopeID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return accountScopeID
     }
 
     private func normalized(_ value: String) -> String? {

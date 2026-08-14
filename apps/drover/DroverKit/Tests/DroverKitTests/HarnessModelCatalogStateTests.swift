@@ -213,6 +213,48 @@ struct HarnessModelCatalogStateTests {
         #expect(state.thinkingEffort.isEmpty)
     }
 
+    @Test @MainActor func nilScopeCachedCatalogCannotRestoreNilScopeSelection() {
+        let store = HarnessModelCatalogStore(defaults: catalogDefaults())
+        store.save(catalog: fixtureCatalog(
+            scope: nil,
+            model: "unverified-model",
+            discoveredAt: nil,
+            stale: true
+        ))
+        store.save(selection: HarnessModelSelection(
+            accountScopeID: nil,
+            model: "unverified-model",
+            thinkingEffort: "high"
+        ), hostID: "mac-mini", harness: "codex")
+        let state = HarnessModelCatalogState(client: client(), store: store)
+
+        state.select(hostID: "mac-mini", harness: "codex")
+
+        #expect(state.catalog?.accountScopeID == nil)
+        #expect(state.catalog?.stale == true)
+        #expect(state.selectedModel.isEmpty)
+        #expect(state.thinkingEffort.isEmpty)
+    }
+
+    @Test @MainActor func nilScopeCatalogNeverPersistsSelectionChanges() {
+        let store = HarnessModelCatalogStore(defaults: catalogDefaults())
+        let state = HarnessModelCatalogState(client: client(), store: store)
+        state.select(hostID: "mac-mini", harness: "codex")
+        state.apply(fixtureCatalog(
+            scope: nil,
+            model: "session-model",
+            discoveredAt: nil,
+            stale: true
+        ))
+
+        state.selectedModel = "session-model"
+        state.thinkingEffort = "high"
+
+        #expect(state.modelOverride == "session-model")
+        #expect(state.thinkingEffortOverride == "high")
+        #expect(store.selection(hostID: "mac-mini", harness: "codex") == nil)
+    }
+
     @Test @MainActor func accountChangeResetsAnIncompatibleSelection() async throws {
         let defaults = catalogDefaults()
         let store = HarnessModelCatalogStore(defaults: defaults)
