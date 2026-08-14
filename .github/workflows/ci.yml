@@ -18,6 +18,28 @@ jobs:
       with:
         fetch-depth: 0
 
+    # A self-hosted runner attached to a public repository is one
+    # fork-triggerable workflow away from arbitrary code execution on the
+    # runner host. This repository had exactly that: a non-ephemeral runner
+    # on the Mac mini that runs the live fleet, holding the DuckDB store, the
+    # API token, the APNs keys and the fleet config. Nothing exploited it
+    # only because the single workflow using it happened to be dispatch-only.
+    # That is a configuration accident, not a boundary, so this makes the
+    # absence structural: the next workflow to ask for one fails here.
+    - name: No workflow may request a self-hosted runner
+      run: |
+        if grep -rnE '^[[:space:]]*runs-on:.*self-hosted' .github/workflows/; then
+          echo "::error::the lines above request a self-hosted runner; this repo is public" >&2
+          exit 1
+        fi
+        # The other spelling: `runs-on:` alone on its line, then a runner group.
+        if grep -rn -A3 -E '^[[:space:]]*runs-on:[[:space:]]*$' .github/workflows/ \
+             | grep -qE 'group:'; then
+          echo "::error::a workflow selects a runner group; only GitHub-hosted runners are allowed" >&2
+          exit 1
+        fi
+        echo "every workflow uses GitHub-hosted runners"
+
     - name: Select test scope
       id: scope
       env:

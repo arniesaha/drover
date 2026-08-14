@@ -20,10 +20,10 @@ It does not require a Drover cloud service.
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view with active sessions and provider capacity" width="210">
-  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="210">
-  <img src="docs/assets/screenshots/ios-cockpit.png" alt="Drover cockpit view with observed activity and busiest projects" width="210">
-  <img src="docs/assets/screenshots/ios-analytics.png" alt="Drover analytics view with provider capacity and observed usage" width="210">
+  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view with active sessions and provider capacity" width="200">
+  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="200">
+  <img src="docs/assets/screenshots/ios-cockpit.png" alt="Drover cockpit view with observed activity and busiest projects" width="200">
+  <img src="docs/assets/screenshots/ios-analytics.png" alt="Drover analytics view with provider capacity and observed usage" width="200">
 </p>
 
 The dark-mode fleet view groups live work by host and keeps provider capacity
@@ -58,6 +58,10 @@ curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | 
 This installs a checksum-verified release, starts the server and a local
 harness host, detects an address your phone can reach, and prints a QR code.
 Scan it with the app and you are connected: no token is typed or copied.
+
+It also links `drover-server` into `~/.local/bin`, so it is on your PATH. When
+that directory is not on your PATH, the installer says so and prints the line
+to add.
 
 Add another machine with the one-liner printed by
 `drover-server pair-host --name <host>`.
