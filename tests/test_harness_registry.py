@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 
 import duckdb
 import pytest
@@ -76,6 +77,137 @@ def test_bootstrap_adds_recap_reconcile_marker_to_existing_sessions(tmp_path):
             "SELECT recap_reconcile_needed FROM harness_sessions "
             "WHERE session_id = 'existing-session'"
         ).fetchone() == (False,)
+
+
+def _model_catalog(
+    host_id: str,
+    harness: str,
+    scope_id: str,
+    *,
+    discovered_at: str = "2026-08-14T12:00:00+00:00",
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "host_id": host_id,
+        "harness": harness,
+        "account_scope_id": scope_id,
+        "harness_version": "1.2.3",
+        "discovered_at": discovered_at,
+        "stale": False,
+        "stale_reason": None,
+        "models": [
+            {
+                "id": f"{harness}-default",
+                "display_name": f"{harness} default",
+                "description": None,
+                "is_default": True,
+                "reasoning": None,
+            }
+        ],
+    }
+
+
+def test_bootstrap_adds_model_catalog_column_without_losing_hosts(tmp_path):
+    duckdb_path = tmp_path / "pre-model-catalog.duckdb"
+    with duckdb.connect(str(duckdb_path)) as con:
+        bootstrap_harness_tables(con)
+        con.execute("ALTER TABLE harness_hosts DROP COLUMN model_catalogs_json")
+        con.execute("""INSERT INTO harness_hosts
+                 (host_id, display_name, kind, status, capabilities_json)
+               VALUES ('existing-host', 'Existing', 'macos', 'online', '{}')""")
+
+        bootstrap_harness_tables(con)
+
+        assert con.execute(
+            "SELECT host_id, model_catalogs_json FROM harness_hosts"
+        ).fetchall() == [("existing-host", "{}")]
+
+
+def test_model_catalog_cache_is_scoped_and_keeps_latest_per_harness(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.register_host(host_id="mac-mini", display_name="Mac", kind="macos")
+    codex_a = _model_catalog("mac-mini", "codex", "scope-a")
+    codex_b = _model_catalog(
+        "mac-mini",
+        "codex",
+        "scope-b",
+        discovered_at="2026-08-14T12:01:00+00:00",
+    )
+    codex_c = _model_catalog(
+        "mac-mini",
+        "codex",
+        "scope-c",
+        discovered_at="2026-08-14T12:02:00+00:00",
+    )
+    claude = _model_catalog("mac-mini", "claude-code", "scope-claude")
+
+    registry.save_model_catalog("mac-mini", "codex", "scope-a", codex_a)
+    registry.save_model_catalog("mac-mini", "codex", "scope-b", codex_b)
+    registry.save_model_catalog("mac-mini", "claude-code", "scope-claude", claude)
+    registry.save_model_catalog("mac-mini", "codex", "scope-c", codex_c)
+
+    codex_latest = registry.latest_model_catalog("mac-mini", "codex")
+    assert codex_latest == codex_c
+    assert registry.latest_model_catalog("mac-mini", "claude-code") == claude
+    assert codex_latest is not codex_c
+    assert codex_latest is not None
+    codex_latest["host_id"] = "mutated"
+    assert registry.latest_model_catalog("mac-mini", "codex") == codex_c
+    with registry._connect() as con:
+        stored = json.loads(
+            con.execute(
+                "SELECT model_catalogs_json FROM harness_hosts WHERE host_id = ?",
+                ["mac-mini"],
+            ).fetchone()[0]
+        )
+    assert list(stored["codex"]["scopes"]) == ["scope-b", "scope-c"]
+    assert stored["codex"]["latest_scope_id"] == "scope-c"
+
+
+def test_model_catalog_cache_rejects_invalid_or_unbounded_writes(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.register_host(host_id="mac-mini", display_name="Mac", kind="macos")
+    valid = _model_catalog("mac-mini", "codex", "scope-a")
+
+    with pytest.raises(ValueError, match="unknown harness host"):
+        registry.save_model_catalog("missing", "codex", "scope-a", valid)
+    with pytest.raises(ValueError, match="account scope"):
+        registry.save_model_catalog("mac-mini", "codex", "scope-b", valid)
+    with pytest.raises(ValueError, match="non-stale"):
+        registry.save_model_catalog(
+            "mac-mini",
+            "codex",
+            "scope-a",
+            {**valid, "stale": True, "stale_reason": "offline"},
+        )
+
+    oversized = _model_catalog("mac-mini", "codex", "scope-large")
+    oversized["models"] = [
+        {
+            "id": f"model-{index}",
+            "display_name": f"Model {index}",
+            "description": "x" * 2_048,
+            "is_default": index == 0,
+            "reasoning": None,
+        }
+        for index in range(256)
+    ]
+    with pytest.raises(ValueError, match="512 KiB"):
+        registry.save_model_catalog("mac-mini", "codex", "scope-large", oversized)
+    assert registry.latest_model_catalog("missing", "codex") is None
+    assert registry.latest_model_catalog("mac-mini", "codex") is None
+
+
+def test_latest_model_catalog_treats_malformed_storage_as_a_cache_miss(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.register_host(host_id="mac-mini", display_name="Mac", kind="macos")
+    with registry._connect() as con:
+        con.execute(
+            "UPDATE harness_hosts SET model_catalogs_json = ? WHERE host_id = ?",
+            ["not-json", "mac-mini"],
+        )
+
+    assert registry.latest_model_catalog("mac-mini", "codex") is None
 
 
 def test_register_host_upserts_capabilities_and_heartbeat(tmp_path):

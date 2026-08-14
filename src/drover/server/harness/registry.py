@@ -15,6 +15,7 @@ import duckdb
 from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
+from drover.server.harness.model_catalog import CatalogEnvelope
 from drover.server.harness.models import (
     HarnessEvent,
     HarnessEventPage,
@@ -28,6 +29,8 @@ from drover.server.harness.recap_jobs import (
 )
 
 _SESSION_PREVIEW_CANDIDATE_LIMIT = 5
+_MODEL_CATALOG_CACHE_MAX_BYTES = 512 * 1024
+_MODEL_CATALOG_SCOPES_PER_HARNESS = 2
 
 #: Statuses that mean a session is finished and may therefore be capped out of
 #: a listing. Deliberately an allowlist rather than "not running": statuses are
@@ -281,6 +284,81 @@ class HarnessRegistry:
         query += " ORDER BY display_name, host_id"
         with self._connect() as con:
             return [HarnessHost.from_row(row) for row in _rows(con, query, params)]
+
+    def save_model_catalog(
+        self,
+        host_id: str,
+        harness: str,
+        scope_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist one validated live catalog in the host's bounded LKG cache."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT model_catalogs_json FROM harness_hosts WHERE host_id = ?",
+                [host_id],
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown harness host: {host_id}")
+
+            envelope = CatalogEnvelope.from_wire(payload, host_id, harness)
+            if envelope.stale:
+                raise ValueError("only non-stale model catalogs may be saved")
+            if (
+                envelope.account_scope_id is None
+                or envelope.account_scope_id != scope_id
+            ):
+                raise ValueError("model catalog account scope does not match scope_id")
+
+            try:
+                catalogs = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                catalogs = {}
+            if not isinstance(catalogs, dict):
+                catalogs = {}
+
+            raw_entry = catalogs.get(harness)
+            entry = raw_entry if isinstance(raw_entry, dict) else {}
+            raw_scopes = entry.get("scopes")
+            scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
+            scopes = dict(scopes)
+            scopes.pop(scope_id, None)
+            scopes[scope_id] = envelope.to_wire()
+            while len(scopes) > _MODEL_CATALOG_SCOPES_PER_HARNESS:
+                del scopes[next(iter(scopes))]
+            catalogs[harness] = {
+                "latest_scope_id": scope_id,
+                "scopes": scopes,
+            }
+            serialized = _json_dumps(catalogs)
+            if len(serialized.encode("utf-8")) > _MODEL_CATALOG_CACHE_MAX_BYTES:
+                raise ValueError("model catalog cache exceeds 512 KiB")
+            con.execute(
+                "UPDATE harness_hosts SET model_catalogs_json = ?, updated_at = ? "
+                "WHERE host_id = ?",
+                [serialized, _now(), host_id],
+            )
+
+    def latest_model_catalog(self, host_id: str, harness: str) -> dict[str, Any] | None:
+        """Return a validated copy of the latest persisted catalog, if any."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT model_catalogs_json FROM harness_hosts WHERE host_id = ?",
+                [host_id],
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            catalogs = json.loads(row[0])
+            entry = catalogs[harness]
+            latest_scope_id = entry["latest_scope_id"]
+            payload = entry["scopes"][latest_scope_id]
+            envelope = CatalogEnvelope.from_wire(payload, host_id, harness)
+        except (KeyError, TypeError, json.JSONDecodeError, ValueError):
+            return None
+        if envelope.stale or envelope.account_scope_id != latest_scope_id:
+            return None
+        return envelope.to_wire()
 
     def create_session(
         self,
