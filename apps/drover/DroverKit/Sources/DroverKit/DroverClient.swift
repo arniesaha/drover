@@ -256,6 +256,20 @@ public actor DroverClient {
         return try decode(HarnessAuthStatus.self, from: data)
     }
 
+    public func modelCatalog(
+        hostID: String,
+        harness: String,
+        force: Bool = false
+    ) async throws -> HarnessModelCatalog {
+        let path = "/harness/hosts/\(encodePathComponent(hostID))/model-catalog"
+        let url = try queryURL(path: path, items: [
+            ("harness", harness),
+            ("refresh", force ? "1" : "0"),
+        ])
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(HarnessModelCatalog.self, from: data)
+    }
+
     public func startAuthFlow(hostID: String, harness: String) async throws -> HarnessAuthFlow {
         let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/start"
         let data = try await request(path: path, method: "POST", body: Data("{}".utf8))
