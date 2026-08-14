@@ -60,6 +60,11 @@ drover = ["prompts/*.md", "server/web/static/*.html"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# Passing tests stop leaving their tmp_path behind. The harness suites write a
+# DuckDB per test, so the default ("all", kept for the last 3 runs) reached
+# 8.2 GB in a single day of local runs. A failed test still keeps its directory,
+# which is the only time anyone actually goes looking for one.
+tmp_path_retention_policy = "failed"
 
 [tool.black]
 line-length = 88
