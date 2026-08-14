@@ -45,8 +45,8 @@ class AgyCatalogAdapter:
         return _fingerprint(parts)
 
     def discover(self) -> DiscoveredCatalog:
-        account = self._account_label()
         rows = self._models()
+        account = self._account_label()
         version = self._version()
         try:
             return DiscoveredCatalog(

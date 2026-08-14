@@ -1,4 +1,4 @@
-"""Host-local Claude Code credential loading with redacted values."""
+"""Lightweight host-local Claude credential and HTTP helpers."""
 
 from __future__ import annotations
 
@@ -10,10 +10,13 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import Callable, Mapping
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 _ACCOUNT_LABEL = "Claude Code"
 _KEYCHAIN_SERVICE = "Claude Code-credentials"
 _KEYCHAIN_TIMEOUT_S = 2.0
+_MAX_HTTP_BODY_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -177,3 +180,28 @@ def _read_keychain() -> str | None:
         return None
     blob = result.stdout.strip()
     return blob or None
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Refuse redirects so provider credentials cannot leak to a new target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = build_opener(_NoRedirectHandler)
+
+
+def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+    """Make one bounded GET without following provider-controlled redirects."""
+
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            return int(response.status), response.read(_MAX_HTTP_BODY_BYTES + 1)
+    except HTTPError as exc:
+        return int(exc.code), exc.read(_MAX_HTTP_BODY_BYTES + 1)
+    except URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise TimeoutError(str(exc.reason)) from None
+        raise OSError(str(exc.reason)) from None

@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import subprocess
 import threading
 from time import monotonic
 from typing import Any, Mapping, Sequence
 
-from drover.server.harness.auth import redact_auth_text
-
 log = logging.getLogger(__name__)
 _PROCESS_STOP_TIMEOUT_S = 0.5
 _MAX_CAPTURED_STDERR_CHARS = 16_384
+_MAX_STDOUT_LINE_CHARS = 1_048_576
+_MAX_PENDING_STDOUT_LINES = 4
+_STDOUT_PROTOCOL_ERROR = object()
 
 
 class CodexAppServerError(RuntimeError):
@@ -32,7 +33,7 @@ class CodexAppServerSession:
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
-        self._lines: Queue[str | None] = Queue()
+        self._lines: Queue[object] = Queue(maxsize=_MAX_PENDING_STDOUT_LINES)
         self._stderr_parts: list[str] = []
         self._deadline: float | None = None
         self._next_request_id = 1
@@ -117,8 +118,12 @@ class CodexAppServerSession:
                 line = self._lines.get(timeout=remaining)
             except Empty:
                 raise CodexAppServerError("timeout") from None
+            if line is _STDOUT_PROTOCOL_ERROR:
+                raise CodexAppServerError("protocol_error")
             if line is None:
                 raise CodexAppServerError("process_error")
+            if not isinstance(line, str):
+                raise CodexAppServerError("protocol_error")
             try:
                 response = json.loads(line)
             except json.JSONDecodeError:
@@ -154,22 +159,53 @@ class CodexAppServerSession:
                 # Stderr can contain CLI or auth diagnostics. It is never
                 # returned in an API response and must be redacted before a
                 # local diagnostic log sees it.
+                from drover.server.harness.auth import redact_auth_text
+
                 log.debug("codex app-server probe stderr: %s", redact_auth_text(stderr))
         except Exception:
             log.debug("codex app-server cleanup failed", exc_info=True)
 
 
-def _stdout_reader(stream, lines: Queue[str | None]) -> threading.Thread:
+def _stdout_reader(stream, lines: Queue[object]) -> threading.Thread:
     def read_lines() -> None:
         try:
-            for line in iter(stream.readline, ""):
-                lines.put(line)
+            while True:
+                line = stream.readline(_MAX_STDOUT_LINE_CHARS + 1)
+                if line == "":
+                    break
+                if len(line) > _MAX_STDOUT_LINE_CHARS or not line.endswith("\n"):
+                    _signal_stdout_protocol_error(lines)
+                    return
+                try:
+                    lines.put(line, timeout=_PROCESS_STOP_TIMEOUT_S)
+                except Full:
+                    _signal_stdout_protocol_error(lines)
+                    return
         finally:
-            lines.put(None)
+            try:
+                lines.put_nowait(None)
+            except Full:
+                pass
 
     thread = threading.Thread(target=read_lines, daemon=True)
     thread.start()
     return thread
+
+
+def _signal_stdout_protocol_error(lines: Queue[object]) -> None:
+    try:
+        lines.put_nowait(_STDOUT_PROTOCOL_ERROR)
+        return
+    except Full:
+        pass
+    try:
+        lines.get_nowait()
+    except Empty:
+        pass
+    try:
+        lines.put_nowait(_STDOUT_PROTOCOL_ERROR)
+    except Full:
+        pass
 
 
 def _stderr_reader(stream, captured: list[str]) -> threading.Thread:

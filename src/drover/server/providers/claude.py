@@ -16,12 +16,11 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 from drover.server.providers.claude_credentials import (
     ClaudeCredentialError,
+    _http_get,
     _load_account_metadata,
     load_claude_credential,
 )
@@ -31,7 +30,6 @@ log = logging.getLogger(__name__)
 
 _USAGE_PATH = "/api/oauth/usage"
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
-_MAX_HTTP_BODY_BYTES = 1024 * 1024
 _SOURCE = "claude-oauth-usage"
 # Only the windows whose duration is actually known. Anything else passes
 # through with window_minutes=None; inferring a duration from the key would
@@ -175,45 +173,6 @@ class ClaudeUsageProbe:
         if not isinstance(payload, Mapping):
             raise _ProbeFailure("protocol_error", status="error")
         return payload
-
-
-class _NoRedirectHandler(HTTPRedirectHandler):
-    """Refuse to follow redirects on this request.
-
-    urlopen's default opener follows 3xx responses AND copies the original
-    request's headers -- including this bearer token -- onto the new
-    request it builds, with no restriction on the target host or scheme.
-    /api/oauth/usage is undocumented; a redirect from it is not a case we
-    can reason about, so the only safe move is to refuse to chase it and
-    let the caller treat the raw 3xx as a failure.
-
-    This deliberately does NOT inspect or restrict base_url's own scheme or
-    host. ANTHROPIC_BASE_URL is honoured as-is elsewhere in this module
-    because the Claude CLI honours the same variable, and pointing it at a
-    local http:// proxy is a legitimate operator choice. Do not "harden"
-    this handler into a scheme check on the *original* request -- that
-    would break proxy support for a leak this handler already closes by
-    refusing to hop anywhere in response to a redirect.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_OPENER = build_opener(_NoRedirectHandler)
-
-
-def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
-    request = Request(url, headers=headers, method="GET")
-    try:
-        with _OPENER.open(request, timeout=timeout) as response:
-            return int(response.status), response.read(_MAX_HTTP_BODY_BYTES + 1)
-    except HTTPError as exc:
-        return int(exc.code), exc.read(_MAX_HTTP_BODY_BYTES + 1)
-    except URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
-            raise TimeoutError(str(exc.reason)) from None
-        raise OSError(str(exc.reason)) from None
 
 
 def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:

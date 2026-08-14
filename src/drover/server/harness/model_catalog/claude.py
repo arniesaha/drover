@@ -14,10 +14,10 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
 
-from drover.server.providers.claude import _http_get
 from drover.server.providers.claude_credentials import (
     ClaudeCredential,
     ClaudeCredentialError,
+    _http_get,
     load_claude_credential,
 )
 

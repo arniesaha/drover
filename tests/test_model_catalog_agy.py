@@ -141,6 +141,15 @@ def test_agy_catalog_missing_executable_is_unsupported(tmp_path):
         ).discover()
 
 
+def test_agy_catalog_missing_executable_precedes_missing_account(tmp_path):
+    with pytest.raises(CatalogDiscoveryError, match="unsupported"):
+        AgyCatalogAdapter(
+            (str(tmp_path / "gone"),),
+            accounts_path=tmp_path / "missing-accounts.json",
+            timeout_s=0.05,
+        ).discover()
+
+
 def test_agy_catalog_timeout_is_safe_failure(fake_agy, tmp_path):
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text('{"active":"person@example.com"}')
