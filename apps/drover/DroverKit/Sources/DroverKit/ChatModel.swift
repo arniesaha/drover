@@ -138,6 +138,13 @@ public final class ChatModel {
     public private(set) var queuedTurn: String?
     /// Attachments that were on a turn deferred by the same 409.
     private var queuedAttachments: [TurnAttachment] = []
+    /// Text from a send whose outcome is genuinely unknown. A transport
+    /// failure cannot distinguish "the hub never saw it" from "the hub
+    /// accepted it and the response was lost", so the text stays in the
+    /// composer for a manual retry. If the hub then streams the turn back,
+    /// it demonstrably landed, and continuing to offer the same text is an
+    /// invitation to send it twice.
+    private var unconfirmedTurnText: String?
 
     /// request_id -> the prompt still awaiting an answer. Tiny in practice:
     /// a harness blocks on one approval at a time.
@@ -304,8 +311,13 @@ public final class ChatModel {
             noteApproval(message)
             refreshRecapAfterTurnComplete(message)
             dispatchQueuedTurnIfComplete(message)
+            confirmUnconfirmedTurn(message)
         case .history(let messages, _):
             mergeHistory(messages)
+            // Losing a response usually means losing the socket too, so the
+            // echo that resolves an unconfirmed send often arrives here
+            // rather than as a live message.
+            messages.forEach(confirmUnconfirmedTurn)
         case .connection(let connected):
             isConnected = connected
             if connected { hasConnectedOnce = true }
@@ -433,6 +445,7 @@ public final class ChatModel {
             composerText = ""
             pendingAttachments = []
             hint = nil
+            unconfirmedTurnText = nil
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // The harness rejects overlapping turns — queue instead of
             // erroring, and dispatch when the turn-complete status arrives.
@@ -445,9 +458,32 @@ public final class ChatModel {
             hint = "Queued — sends when the current response finishes."
         } catch {
             // Preserve composerText/attachments on failure (other 409s or
-            // transport) so the user can retry without retyping.
+            // transport) so the user can retry without retyping. Whether the
+            // hub saw this turn is unknown until it does or does not echo.
+            unconfirmedTurnText = text
             applyHint(for: error, action: "send")
         }
+    }
+
+    /// The hub echoing a `user_input` that matches an unconfirmed send is
+    /// proof the turn landed despite the client seeing a failure. Take the
+    /// text back out of the composer: leaving it there reads as "not sent"
+    /// and the obvious next action duplicates the turn.
+    ///
+    /// Only an exact match clears. If the user has typed since, the composer
+    /// holds their words too, and silently discarding those to resolve our
+    /// own ambiguity would be the worse trade.
+    private func confirmUnconfirmedTurn(_ message: HarnessMessage) {
+        guard message.type == .userInput,
+              let unconfirmed = unconfirmedTurnText,
+              message.text == unconfirmed
+        else { return }
+        unconfirmedTurnText = nil
+        guard composerText.trimmingCharacters(in: .whitespacesAndNewlines) == unconfirmed
+        else { return }
+        composerText = ""
+        pendingAttachments = []
+        hint = nil
     }
 
     /// Every harness driver marks end-of-turn with a `status` message whose
@@ -536,6 +572,7 @@ public final class ChatModel {
                 thinkingEffort: preferences.thinking
             )
             hint = nil
+            unconfirmedTurnText = nil
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // Raced a new turn (e.g. an approval resumed it) — keep waiting
             // for the next turn-complete.
@@ -548,6 +585,7 @@ public final class ChatModel {
             // for a manual retry rather than dropping them silently.
             composerText = composerText.isEmpty ? text : "\(text)\n\(composerText)"
             pendingAttachments = images + pendingAttachments
+            unconfirmedTurnText = text
             applyHint(for: error, action: "send")
         }
     }

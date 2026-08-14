@@ -1232,6 +1232,86 @@ struct ChatModelTests {
     #expect(model.isAnswering == false)
 }
 
+// MARK: - Ambiguous send failures (accepted server-side, lost in transit)
+
+@Test @MainActor func echoOfAnAmbiguouslyFailedSendClearsTheComposer() async throws {
+    MockURLProtocol.transportError = URLError(.networkConnectionLost)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    // The response was lost, so the text is held for a manual retry.
+    #expect(model.composerText == "Yes looks good")
+
+    // ...but the hub had accepted the turn after all and streams it back.
+    // The transcript now proves it landed, so continuing to offer the same
+    // text in the composer invites the user to send it a second time.
+    model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "Yes looks good")))
+
+    #expect(model.composerText.isEmpty)
+    #expect(model.hint == nil)
+}
+
+@Test @MainActor func echoOfDifferentTextLeavesAFailedSendInTheComposer() async throws {
+    MockURLProtocol.transportError = URLError(.networkConnectionLost)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+
+    // An unrelated user turn (another device on the same session) says
+    // nothing about ours, so the retry text has to survive it.
+    model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "something else")))
+
+    #expect(model.composerText == "Yes looks good")
+}
+
+@Test @MainActor func echoArrivingInReconnectHistoryClearsTheComposer() async throws {
+    MockURLProtocol.transportError = URLError(.networkConnectionLost)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    #expect(model.composerText == "Yes looks good")
+
+    // Losing the response usually means losing the socket, so the echo most
+    // often arrives in the replay after reconnecting rather than as a live
+    // message. Same proof, so it has to reach the same conclusion.
+    model.ingest(.history([
+        .fixture(seq: 10, type: .userInput, text: "Yes looks good"),
+    ], decodeIssues: []))
+
+    #expect(model.composerText.isEmpty)
+}
+
+@Test @MainActor func echoAfterAFailedQueuedDispatchClearsTheComposer() async throws {
+    nonisolated(unsafe) var turnPosts = 0
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
+        turnPosts += 1
+        if turnPosts == 1 {
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        }
+        return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    #expect(model.composerText.isEmpty)
+
+    // Turn completes, the queued dispatch goes out and appears to fail, so
+    // the text is handed back to the composer.
+    model.ingest(.message(.fixture(seq: 9, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await waitUntil { model.composerText == "Yes looks good" }
+
+    // That dispatch had in fact landed. Same trap, same rule.
+    model.ingest(.message(.fixture(seq: 11, type: .userInput, text: "Yes looks good")))
+
+    #expect(model.composerText.isEmpty)
+}
+
 }
 
 }  // extension MockNetworkTests
