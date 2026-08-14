@@ -79,9 +79,7 @@ struct LaunchView: View {
                     GlassPromptSurface(
                         text: $model.prompt,
                         attachments: $model.promptAttachments,
-                        selectedModel: $model.selectedModel,
-                        thinkingEffort: $model.thinkingEffort,
-                        harness: model.harness,
+                        runPreferences: model.runPreferences,
                         placeholder: "Add instructions...",
                         showsSendButton: false,
                         attachmentAccessibilityIdentifier: "launch-attachment"
@@ -129,7 +127,9 @@ struct LaunchView: View {
                 Button("Cancel") { dismiss() }
             }
         }
-        .sheet(isPresented: $showAuth) {
+        .sheet(isPresented: $showAuth, onDismiss: {
+            Task { await model.runPreferences.refresh(force: true) }
+        }) {
             NavigationStack {
                 HarnessAuthSheet(client: client, hostID: model.hostID, harness: model.harness)
             }
@@ -138,6 +138,9 @@ struct LaunchView: View {
             guard !items.isEmpty else { return }
             pickerItems = []
             Task { await load(items) }
+        }
+        .task(id: "\(model.hostID)\u{1f}\(model.harness)") {
+            await model.runPreferences.refresh()
         }
     }
 

@@ -5,10 +5,8 @@ import DroverKit
 struct GlassPromptSurface<AttachmentButton: View>: View {
     @Binding var text: String
     @Binding var attachments: [TurnAttachment]
-    @Binding var selectedModel: String
-    @Binding var thinkingEffort: String
 
-    let harness: String
+    let runPreferences: HarnessModelCatalogState
     let arePreferencesEditable: Bool
     let placeholder: String
     let sendSystemImage: String
@@ -24,9 +22,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     init(
         text: Binding<String>,
         attachments: Binding<[TurnAttachment]>,
-        selectedModel: Binding<String>,
-        thinkingEffort: Binding<String>,
-        harness: String,
+        runPreferences: HarnessModelCatalogState,
         arePreferencesEditable: Bool = true,
         placeholder: String,
         sendSystemImage: String = "arrow.up",
@@ -39,9 +35,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     ) {
         _text = text
         _attachments = attachments
-        _selectedModel = selectedModel
-        _thinkingEffort = thinkingEffort
-        self.harness = harness
+        self.runPreferences = runPreferences
         self.arePreferencesEditable = arePreferencesEditable
         self.placeholder = placeholder
         self.sendSystemImage = sendSystemImage
@@ -84,10 +78,8 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                     .frame(width: 32, height: 32)
 
                 HarnessPreferenceControls(
-                    harness: harness,
-                    isEditable: arePreferencesEditable,
-                    selectedModel: $selectedModel,
-                    thinkingEffort: $thinkingEffort
+                    runPreferences: runPreferences,
+                    isEditable: arePreferencesEditable
                 )
 
                 Spacer(minLength: 8)
