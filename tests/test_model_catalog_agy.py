@@ -1,5 +1,6 @@
 import stat
 import textwrap
+import time
 
 import pytest
 
@@ -32,6 +33,12 @@ def fake_agy(tmp_path):
                 raise SystemExit(2)
             if mode == "oversized":
                 print("x" * (256 * 1024 + 1))
+                raise SystemExit(0)
+            if mode == "overproduce":
+                while True:
+                    print("x" * 65536, flush=True)
+            if mode == "whitespace":
+                print(" model-with-space \\t Display Name with space ")
                 raise SystemExit(0)
             if mode == "malformed":
                 print("Fetching available models...")
@@ -95,6 +102,33 @@ def test_agy_catalog_process_failures_are_protocol_errors(fake_agy, tmp_path, mo
         AgyCatalogAdapter(
             (str(fake_agy), mode), accounts_path=accounts, timeout_s=1
         ).discover()
+
+
+def test_agy_catalog_terminates_an_overproducing_process_at_the_output_bound(
+    fake_agy, tmp_path
+):
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text('{"active":"person@example.com"}')
+    started = time.monotonic()
+
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        AgyCatalogAdapter(
+            (str(fake_agy), "overproduce"), accounts_path=accounts, timeout_s=2
+        ).discover()
+
+    assert time.monotonic() - started < 1
+
+
+def test_agy_catalog_preserves_non_empty_native_field_whitespace(fake_agy, tmp_path):
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text('{"active":"person@example.com"}')
+
+    discovered = AgyCatalogAdapter(
+        (str(fake_agy), "whitespace"), accounts_path=accounts
+    ).discover()
+
+    assert discovered.models[0].id == " model-with-space "
+    assert discovered.models[0].display_name == " Display Name with space "
 
 
 def test_agy_catalog_missing_executable_is_unsupported(tmp_path):
