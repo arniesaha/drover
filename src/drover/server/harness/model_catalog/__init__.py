@@ -1,6 +1,7 @@
 """Stable public surface for host-native model discovery."""
 
 from .models import CatalogEnvelope, DiscoveredCatalog, ModelOption, ReasoningOptions
+from .codex import CodexCatalogAdapter
 from .scope import AccountScopeIDs
 from .service import (
     CatalogAdapter,
@@ -19,4 +20,5 @@ __all__ = [
     "CatalogAdapter",
     "AccountScopeIDs",
     "ModelCatalogService",
+    "CodexCatalogAdapter",
 ]
