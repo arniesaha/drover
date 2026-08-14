@@ -56,29 +56,62 @@ if [[ -z "${DEVICE_ID}" ]]; then
 fi
 echo "    ${DEVICE_ID}"
 
+LOG_DIR="$(mktemp -d)"
+trap 'rm -rf "${LOG_DIR}"' EXIT
+
 echo "==> building (team ${TEAM_ID})"
-xcodebuild \
+# Build against the device we just resolved, not 'generic/platform=iOS'. A
+# generic destination never names a physical device, so automatic signing has
+# nothing to register: it quietly reuses whichever profile it already has and
+# the mismatch only surfaces later as an opaque install-time
+# ApplicationVerificationFailed. Pinning the id makes -allowProvisioningUpdates
+# add this device to the profile, and makes a missing account fail here.
+if ! xcodebuild \
   -project Drover.xcodeproj \
   -scheme Drover \
   -configuration Debug \
-  -destination 'generic/platform=iOS' \
+  -destination "id=${DEVICE_ID}" \
   -derivedDataPath .derivedData-device \
   DEVELOPMENT_TEAM="${TEAM_ID}" \
   CODE_SIGN_STYLE=Automatic \
   -allowProvisioningUpdates \
-  build \
-  | grep -E '^\*\* |error:|warning: no rule' || true
+  build >"${LOG_DIR}/build.log" 2>&1
+then
+  echo "build failed:" >&2
+  grep -E 'error:|^\*\* ' "${LOG_DIR}/build.log" >&2 || tail -40 "${LOG_DIR}/build.log" >&2
+  exit 1
+fi
+grep -E '^\*\* |warning: no rule' "${LOG_DIR}/build.log" || true
 
 APP=".derivedData-device/Build/Products/Debug-iphoneos/Drover.app"
 [[ -d "${APP}" ]] || { echo "build produced no app bundle at ${APP}" >&2; exit 1; }
 
 echo "==> installing"
-xcrun devicectl device install app --device "${DEVICE_ID}" "${APP}" | grep -E 'App installed|error' || true
+# devicectl has reported a failed install on stdout while still exiting 0, so
+# the output is checked as well as the status. Getting this wrong is worse than
+# it sounds: the launch below then starts the *previous* build and the script
+# signs off with "done", which reads exactly like a successful deploy.
+install_status=0
+xcrun devicectl device install app --device "${DEVICE_ID}" "${APP}" \
+  >"${LOG_DIR}/install.log" 2>&1 || install_status=$?
+if [[ "${install_status}" -ne 0 ]] || grep -qE '^ *ERROR:' "${LOG_DIR}/install.log"; then
+  echo "install failed:" >&2
+  cat "${LOG_DIR}/install.log" >&2
+  exit 1
+fi
+grep -E 'App installed' "${LOG_DIR}/install.log" || true
 
 if [[ "${LAUNCH}" == "1" ]]; then
   echo "==> launching"
+  launch_status=0
   xcrun devicectl device process launch --device "${DEVICE_ID}" "${BUNDLE_ID}" \
-    | grep -E 'Launched|error' || true
+    >"${LOG_DIR}/launch.log" 2>&1 || launch_status=$?
+  if [[ "${launch_status}" -ne 0 ]] || grep -qE '^ *ERROR:' "${LOG_DIR}/launch.log"; then
+    echo "launch failed:" >&2
+    cat "${LOG_DIR}/launch.log" >&2
+    exit 1
+  fi
+  grep -E 'Launched' "${LOG_DIR}/launch.log" || true
 fi
 
 echo "==> done"
