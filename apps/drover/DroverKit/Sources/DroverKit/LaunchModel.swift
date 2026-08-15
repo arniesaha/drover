@@ -9,14 +9,15 @@ import Observation
 @Observable
 public final class LaunchModel {
     private let client: DroverClient
+    /// True only while a `/harness` request this model owns is in flight.
     private(set) public var isFetchingSnapshot: Bool = false
-    private(set) public var snapshot: HarnessSnapshot? {
-        didSet {
-            Task { @MainActor in
-                self.refreshCwdSuggestions()
-            }
-        }
-    }
+    private(set) public var snapshot: HarnessSnapshot?
+    /// Why the last snapshot fetch failed, if it did. The sheet renders this —
+    /// a failed fetch otherwise leaves it with no hosts and no explanation.
+    public private(set) var snapshotError: String?
+    /// The single in-flight fetch. Concurrent callers await it rather than
+    /// starting a second request, so the spinner is raised and lowered once.
+    private var fetchTask: Task<Void, Never>?
     public let runPreferences: HarnessModelCatalogState
 
     /// Harness names the server can run in a structured (turn-based) mode;
@@ -37,18 +38,12 @@ public final class LaunchModel {
                 }
             }
             runPreferences.select(hostID: hostID, harness: harness)
-            Task { @MainActor in
-                self.refreshCwdSuggestions()
-            }
         }
     }
     public var harness: String {
         didSet {
             guard oldValue != harness else { return }
             runPreferences.select(hostID: hostID, harness: harness)
-            Task { @MainActor in
-                self.refreshCwdSuggestions()
-            }
         }
     }
     public var cwd: String = ""
@@ -128,47 +123,57 @@ public final class LaunchModel {
         }
     }
 
-    // MARK: - Snapshot Fetching and Loading
+    // MARK: - Snapshot loading
 
-    /// Fetch snapshot in background to populate cwdSuggestions if unavailable
-    private func fetchSnapshotIfNeeded() async {
-        if snapshot == nil {
-            isFetchingSnapshot = true
-            defer { isFetchingSnapshot = false }
-            
+    /// Fetches the fleet snapshot only when the sheet opened without one —
+    /// the deep-link and cold-start paths that pass `snapshot: nil`.
+    ///
+    /// A snapshot already in hand is authoritative, empty `cwdSuggestions`
+    /// included: the server has no recent sessions to suggest, and asking it
+    /// again cannot change that.
+    public func loadSnapshotIfNeeded() async {
+        guard snapshot == nil else { return }
+        await refreshSnapshot()
+    }
+
+    /// Re-reads `/harness`. Single-flight: a caller arriving while a fetch is
+    /// in flight awaits that one instead of racing a second request, so the
+    /// spinner is never cleared out from under a fetch that is still running.
+    public func refreshSnapshot() async {
+        if let inFlight = fetchTask {
+            await inFlight.value
+            return
+        }
+
+        let task = Task { @MainActor in
             do {
-                let response = try await client.fetchSnapshot()
-                self.snapshot = response
+                let fresh = try await self.client.snapshot()
+                self.adopt(fresh)
+                self.snapshotError = nil
             } catch {
-                // Silently fail - UI will show errors via launchError
+                self.snapshotError = Self.errorMessage(for: error)
             }
         }
-    }
-
-    /// Trigger snapshot re-fetch when host/harness changes to freshen cwd suggestions
-    private func refreshCwdSuggestions() {
-        Task { @MainActor in
-            await fetchSnapshotIfNeeded()
-            
-            // If we have a snapshot but no cwdSuggestions, try to fetch it
-            if let snapshot = self.snapshot,
-               snapshot.cwdSuggestions.isEmpty {
-                Task { await self.fetchSnapshot() }
-            }
-        }
-    }
-
-    /// Manually refresh the snapshot
-    private func fetchSnapshot() async {
+        fetchTask = task
         isFetchingSnapshot = true
-        defer { isFetchingSnapshot = false }
-        
-        do {
-            let response = try await client.fetchSnapshot()
-            self.snapshot = response
-        } catch {
-            // Failed to fetch, keep existing snapshot if any
-        }
+        await task.value
+        fetchTask = nil
+        isFetchingSnapshot = false
+    }
+
+    /// Installs a freshly fetched snapshot and re-derives the defaults `init`
+    /// could not. A sheet that opened before the fleet snapshot arrived starts
+    /// with an empty `hostID`, which keeps Launch disabled forever; a snapshot
+    /// that no longer lists the selected host would do the same. Either way
+    /// the selection is unusable, so it is replaced. A selection the new
+    /// snapshot still offers is the user's and stays put.
+    private func adopt(_ fresh: HarnessSnapshot) {
+        snapshot = fresh
+        guard !availableHosts.contains(where: { $0.id == hostID }) else { return }
+        let firstHost = availableHosts.first
+        hostID = firstHost?.id ?? ""
+        harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
+        runPreferences.select(hostID: hostID, harness: harness)
     }
 
     // MARK: - Private helpers

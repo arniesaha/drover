@@ -72,8 +72,9 @@ struct LaunchView: View {
                         }
                     }
                 }
-                
-                cwdSuggestionsView
+
+                CwdSuggestionsStatus(isFetching: model.isFetchingSnapshot,
+                                     hasSuggestions: !model.cwdSuggestions.isEmpty)
             }
 
             if model.isStructured {
@@ -102,6 +103,16 @@ struct LaunchView: View {
                 }
             }
 
+            if let snapshotError = model.snapshotError {
+                Section {
+                    Text(snapshotError).foregroundStyle(.red)
+                    Button("Retry") {
+                        Task { await model.refreshSnapshot() }
+                    }
+                    .accessibilityIdentifier("launch-snapshot-retry")
+                }
+            }
+
             if let launchError = model.launchError {
                 Section {
                     Text(launchError).foregroundStyle(.red)
@@ -118,7 +129,8 @@ struct LaunchView: View {
                         Text("Launch")
                     }
                 }
-                .disabled(isLaunching || isFetchingSnapshot || model.hostID.isEmpty || model.harness.isEmpty)
+                .disabled(isLaunching || model.isFetchingSnapshot
+                          || model.hostID.isEmpty || model.harness.isEmpty)
                 .accessibilityIdentifier("launch-confirm-button")
             }
         }
@@ -141,33 +153,19 @@ struct LaunchView: View {
             pickerItems = []
             Task { await load(items) }
         }
+        // Opening the sheet without a snapshot (deep link, cold start) is the
+        // only reason to hit `/harness`. Unkeyed: the fleet's hosts and
+        // suggestions do not depend on which harness is selected.
+        .task {
+            await model.loadSnapshotIfNeeded()
+        }
+        // The model catalog, by contrast, is per host+harness and only ever
+        // arrives from the server — `select()` reads the local cache alone, so
+        // without this the model and effort pickers stay empty for any
+        // uncached pair and a launch silently drops both overrides.
         .task(id: "\(model.hostID)\u{1f}\(model.harness)") {
-            await taskForSnapshotLoading()
+            await model.runPreferences.refresh()
         }
-    }
-
-    private var cwdSuggestionsView: some View {
-        if model.isFetchingSnapshot && !model.cwdSuggestions.isEmpty {
-            Spacer(minLength: 30)
-            ProgressView()
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        if model.snapshot == nil && model.cwdSuggestions.isEmpty {
-            Spacer(minLength: 30)
-            ProgressView("Fetching workspace paths...")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        return EmptyView()
-    }
-
-    private var isFetchingSnapshot: Bool {
-        model.isFetchingSnapshot
-    }
-
-    private func taskForSnapshotLoading() async {
-        await model.fetchSnapshot()
     }
 
     private func load(_ items: [PhotosPickerItem]) async {
@@ -188,5 +186,34 @@ struct LaunchView: View {
         guard let sessionID = await model.launch() else { return }
         onLaunched(sessionID, model.isStructured, model.harness)
         dismiss()
+    }
+}
+
+/// The one row under the cwd field that says a fetch is running.
+///
+/// Split out of `LaunchView` so it can be laid out for real in a test: as a
+/// computed property on the view it was a plain (non-`@ViewBuilder`) body that
+/// discarded both branches and returned `EmptyView`, and nothing about reading
+/// it said so.
+struct CwdSuggestionsStatus: View {
+    let isFetching: Bool
+    let hasSuggestions: Bool
+
+    var body: some View {
+        if isFetching {
+            if hasSuggestions {
+                // Cached paths are already on screen and usable; the refresh
+                // does not need to narrate itself.
+                ProgressView()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("cwd-suggestions-refreshing")
+            } else {
+                ProgressView("Fetching workspace paths…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("cwd-suggestions-loading")
+            }
+        }
     }
 }

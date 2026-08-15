@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import DroverKit
 
+/// Thread-safe: `MockURLProtocol.handler` runs off the main actor.
+private final class SnapshotRequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func bump() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
 /// `.serialized`: several tests here mutate the process-global
 /// `MockURLProtocol.handler` — see `ClientTests`' doc comment.
 extension MockNetworkTests {
@@ -233,6 +241,136 @@ private func catalog(
     let sessionID = await model.launch()
     #expect(sessionID == nil)
     #expect(model.launchError == "host offline")
+}
+
+// MARK: - Snapshot loading
+
+/// The sheet can open before the fleet snapshot exists (deep link, cold
+/// start). `init` then has nothing to derive a host from, so the fetch has to
+/// do it — otherwise `hostID` stays empty, Launch stays disabled, and the
+/// feature cannot start a session at all.
+@Test @MainActor func aLateSnapshotDerivesTheDefaultsInitCouldNot() async throws {
+    let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
+    #expect(model.hostID.isEmpty)
+
+    MockURLProtocol.handler = { request in
+        #expect(request.url?.path == "/harness")
+        return (200, snapshotJSON)
+    }
+
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.harness == "claude-code")
+    #expect(model.availableHosts.map(\.id) == ["mac-mini"])
+    #expect(model.cwdSuggestions == ["/Users/arnabmac/jenny/nexus", "/Volumes/M2 1/drover"])
+    #expect(model.runPreferences.hostID == "mac-mini")
+    #expect(model.runPreferences.harness == "claude-code")
+    #expect(model.snapshotError == nil)
+    #expect(model.isFetchingSnapshot == false)
+}
+
+/// The flip side: a refresh is not allowed to move a selection the user made
+/// and the new snapshot still offers.
+@Test @MainActor func aRefreshKeepsAHostTheSnapshotStillOffers() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: multiHostSnapshotJSON)
+    let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.hostID = "nas"
+
+    MockURLProtocol.handler = { _ in (200, multiHostSnapshotJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "nas")
+    #expect(model.harness == "codex")
+}
+
+/// When the selected host is gone from the new snapshot the selection is
+/// unusable for the same reason an empty one is, so it falls back.
+@Test @MainActor func aRefreshThatDropsTheSelectedHostFallsBack() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: multiHostSnapshotJSON)
+    let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.hostID = "studio"
+
+    // `snapshotJSON` lists mac-mini only.
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.harness == "claude-code")
+}
+
+/// A snapshot in hand is authoritative, an empty suggestion list included —
+/// that is a fresh install with no recent sessions, not a stale read. Asking
+/// again cannot change it, and asking again on every answer turned the sheet
+/// into a request storm with Launch pinned disabled.
+@Test @MainActor func anEmptySuggestionListNeverStormsTheServer() async throws {
+    let counter = SnapshotRequestCounter()
+    MockURLProtocol.handler = { _ in
+        counter.bump()
+        return (200, multiHostSnapshotJSON)
+    }
+
+    let snapshot = try HarnessSnapshot.decode(from: multiHostSnapshotJSON)
+    #expect(snapshot.cwdSuggestions.isEmpty)
+    let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+
+    await model.loadSnapshotIfNeeded()
+    // Host and harness changes re-filter the suggestions already in hand;
+    // neither is a reason to re-download the fleet.
+    model.hostID = "nas"
+    model.harness = "shell"
+    try await Task.sleep(for: .milliseconds(50))
+
+    #expect(counter.value == 0)
+    #expect(model.isFetchingSnapshot == false)
+}
+
+/// Two callers overlapping must not each raise and lower the same spinner —
+/// the first to finish used to clear it while the second was still in flight,
+/// re-enabling Launch mid-fetch.
+@Test @MainActor func overlappingRefreshesShareOneRequest() async throws {
+    let counter = SnapshotRequestCounter()
+    MockURLProtocol.handler = { _ in
+        counter.bump()
+        return (200, snapshotJSON)
+    }
+    let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
+
+    async let first: Void = model.refreshSnapshot()
+    async let second: Void = model.loadSnapshotIfNeeded()
+    _ = await (first, second)
+
+    #expect(counter.value == 1)
+    #expect(model.isFetchingSnapshot == false)
+    #expect(model.hostID == "mac-mini")
+}
+
+/// A swallowed failure leaves the sheet with no hosts, no suggestions and
+/// nothing said. `launchError` never covered this — only `launch()` sets it.
+@Test @MainActor func aFailedFetchSaysWhyInsteadOfGoingQuiet() async throws {
+    let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
+    MockURLProtocol.handler = { _ in (401, Data()) }
+
+    await model.refreshSnapshot()
+
+    #expect(model.snapshotError == "token rejected — check Settings")
+    #expect(model.launchError == nil)
+    #expect(model.snapshot == nil)
+    #expect(model.isFetchingSnapshot == false)
+}
+
+/// A retry that works clears the message it replaced.
+@Test @MainActor func aSucceedingRetryClearsTheError() async throws {
+    let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
+    MockURLProtocol.handler = { _ in (401, Data()) }
+    await model.refreshSnapshot()
+    #expect(model.snapshotError != nil)
+
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.snapshotError == nil)
+    #expect(model.hostID == "mac-mini")
 }
 
 }
