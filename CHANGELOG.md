@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Observed cost of zero is no longer rendered as `$0.00` when nothing measured
+  it. Drover computes no prices: `cost_usd` is whatever the harness reported,
+  and subscription-billed usage has none to report, so a fleet running entirely
+  on subscriptions saw a confident zero where the honest answer is that no
+  session reported a cost
+- The analytics screen labels its cost figure `API-billed` and prints cost
+  coverage beside token coverage, matching the cockpit card. It had shown a
+  5%-coverage figure under the label `API cost` with nothing to qualify it
+
 ## [0.3.0] - 2026-08-15
 
 ### Added

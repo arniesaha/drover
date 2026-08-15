@@ -24,12 +24,13 @@ struct CockpitReflowTests {
 
     private static let pageJSON = #"{"limit": 25, "next_cursor": null}"#
 
-    private static func activity(tokens: Int = 63_132_964, costPercent: Double? = 5.0)
-        -> ActivitySummary {
+    private static func activity(
+        tokens: Int = 63_132_964, costUSD: Double = 0.589, costPercent: Double? = 5.0
+    ) -> ActivitySummary {
         let cost = costPercent.map { "\($0)" } ?? "null"
         return decode(ActivitySummary.self, """
         {
-          "totals": {"session_count": 240, "total_tokens": \(tokens), "cost_usd": 0.589,
+          "totals": {"session_count": 240, "total_tokens": \(tokens), "cost_usd": \(costUSD),
                      "cache_read_tokens": 0, "cache_write_tokens": 0, "total_latency_ms": 0},
           "projects": [], "harnesses": [], "hosts": [], "models": [],
           "project_metric": "sessions",
@@ -122,6 +123,28 @@ struct CockpitReflowTests {
         )
 
         #expect(same <= differing)
+    }
+
+    @Test func theUnreportedCostWordingDoesNotGrowTheCard() {
+        // "Not reported" is twice the width of "$0.59" and lands in the same
+        // one-line slot the abbreviated token count is protected by. If it
+        // wrapped, a subscription-billed fleet — the ordinary case for this
+        // metric, see #150 — would see a permanently taller card.
+        let reported = Self.height(
+            ActivitySummarySection(
+                activity: Self.activity(), statusMessage: nil, onOpenAnalytics: {}
+            ),
+            typeSize: .large
+        )
+        let unreported = Self.height(
+            ActivitySummarySection(
+                activity: Self.activity(costUSD: 0, costPercent: 0), statusMessage: nil,
+                onOpenAnalytics: {}
+            ),
+            typeSize: .large
+        )
+
+        #expect(reported == unreported)
     }
 
     // MARK: - Project cards

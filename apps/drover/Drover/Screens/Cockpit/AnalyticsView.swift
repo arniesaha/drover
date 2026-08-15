@@ -161,8 +161,17 @@ struct AnalyticsView: View {
                     metadata: activity.metadata,
                     fallbackCoverage: activity.coverage
                 )
-                // Said once, here, instead of on every row below.
-                Text("\(metadata.freshnessText) · \(metadata.coverageText)")
+                let totals = ActivityTotalsPresentation(
+                    totals: activity.totals, coverage: activity.coverage
+                )
+                // Said once, here, instead of on every row below. Coverage
+                // comes from the totals presentation rather than the aggregate
+                // one because this heading sits above a cost figure and the
+                // aggregate wording only ever names tokens — which is how the
+                // worst-covered number on the screen ended up unqualified
+                // (#150). The distribution rows below show no cost, so their
+                // aggregate wording is left alone.
+                Text("\(metadata.freshnessText) · \(totals.coverageText)")
                     .droverText(.subtitle)
                     .fixedSize(horizontal: false, vertical: true)
                 CockpitCard {
@@ -182,7 +191,15 @@ struct AnalyticsView: View {
                             "Observed sessions"
                         )
                         analyticsMetric(format(activity.totals.totalTokens), "Tokens")
-                        analyticsMetric(currency(activity.totals.costUSD), "API cost")
+                        // This screen prints the figures in full, so it is the
+                        // one place a 5%-coverage cost most looks like a total.
+                        // Same wording and same unmeasured rule as the cockpit
+                        // card, from the same presentation. See #150.
+                        analyticsMetric(
+                            totals.costText,
+                            ActivityTotalsPresentation.costLabel,
+                            accessibilityText: totals.costAccessibilityText
+                        )
                     }
                 }
 
@@ -303,12 +320,18 @@ struct AnalyticsView: View {
         ).text
     }
 
-    private func analyticsMetric(_ value: String, _ label: String) -> some View {
+    private func analyticsMetric(
+        _ value: String, _ label: String, accessibilityText: String? = nil
+    ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(value).droverText(.h2).monospacedDigit()
             Text(label).droverText(.subtitle)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Combined rather than left as two elements: VoiceOver otherwise reads
+        // "Not reported" as a standalone phrase with the label a swipe away.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityText ?? "\(value) \(label)")
     }
 
     private func reload() async {

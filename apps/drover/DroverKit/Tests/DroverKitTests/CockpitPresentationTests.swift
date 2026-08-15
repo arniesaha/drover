@@ -287,6 +287,139 @@ import Testing
     #expect(value.coverageText == "75% token coverage")
 }
 
+// MARK: - Activity totals (#150)
+
+/// The numbers behind the fixtures below are the ones from #150's 7-day
+/// window: 240 sessions, 63,132,964 tokens at 5.8% coverage, and $0.589 of
+/// cost at 5% coverage. `claude-opus-5` carried 62,951,650 of those tokens and
+/// reported $0.0181 against them, because it is subscription-billed and has no
+/// marginal per-token cost to report.
+private func totalsFixture(
+    sessions: Int = 240, costUSD: Double = 0.589,
+    tokenPercent: Double? = 5.8333, costPercent: Double? = 5.0
+) -> ActivitySummary {
+    let token = tokenPercent.map { "\($0)" } ?? "null"
+    let cost = costPercent.map { "\($0)" } ?? "null"
+    // swiftlint:disable:next force_try
+    return try! JSONDecoder().decode(ActivitySummary.self, from: Data("""
+    {"totals":{"session_count":\(sessions),"total_tokens":63132964,"cost_usd":\(costUSD),
+      "cache_read_tokens":0,"cache_write_tokens":0,"total_latency_ms":0},
+     "projects":[],"harnesses":[],"hosts":[],"models":[],
+     "project_metric":"sessions",
+     "coverage":{"source":"drover_observed","token_percent":\(token),
+                 "cost_percent":\(cost)}}
+    """.utf8))
+}
+
+/// Pinned to en_US so the wording is what is under test and not the region of
+/// whatever machine ran `swift test` — see `costWordingFollowsTheReadersRegion`.
+private func totalsPresentation(_ activity: ActivitySummary) -> ActivityTotalsPresentation {
+    ActivityTotalsPresentation(
+        totals: activity.totals, coverage: activity.coverage,
+        locale: Locale(identifier: "en_US")
+    )
+}
+
+@Test func costOfZeroWithNoSessionMeasuringItReadsAsUnreported() {
+    let activity = totalsFixture(costUSD: 0, costPercent: 0)
+
+    let value = totalsPresentation(activity)
+
+    // 240 sessions ran and not one carried a cost_usd. That is the absence of
+    // a measurement, and "$0.00" states the opposite.
+    #expect(value.costIsUnreported)
+    #expect(value.costText == "Not reported")
+    #expect(value.costAccessibilityText == "API-billed cost not reported")
+}
+
+@Test func costOfZeroThatWasActuallyMeasuredStaysAZero() {
+    let activity = totalsFixture(costUSD: 0, costPercent: 100)
+
+    let value = totalsPresentation(activity)
+
+    // Every session reported a cost and every one of them was zero. Free is a
+    // finding; it must not be laundered into "we don't know".
+    #expect(!value.costIsUnreported)
+    #expect(value.costText == "$0.00")
+}
+
+@Test func partialCostKeepsItsFigureAndLeansOnTheCoverageLine() {
+    let value = totalsPresentation(totalsFixture())
+
+    // $0.589 at 5% coverage is a real measurement of a fifth of a twentieth of
+    // the fleet. Suppressing it would discard the one number the API bills
+    // actually produced; the coverage clause is what qualifies it.
+    #expect(!value.costIsUnreported)
+    #expect(value.costText == "$0.59")
+    #expect(value.costAccessibilityText == "$0.59 API-billed cost")
+}
+
+@Test func absentCostCoverageIsTreatedAsUnmeasuredRatherThanFree() {
+    let activity = totalsFixture(costUSD: 0, costPercent: nil)
+
+    let value = totalsPresentation(activity)
+
+    // The server always emits `cost_percent`, so nil means the payload came
+    // from something that did not — an older host, or a truncated response.
+    // Matching `tokensAreUnreported`, an unknown coverage counts as zero:
+    // claiming $0.00 on a payload we cannot check is the worse failure.
+    #expect(value.costIsUnreported)
+}
+
+@Test func costIsNotUnreportedWhenNoSessionRanAtAll() {
+    let activity = totalsFixture(sessions: 0, costUSD: 0, costPercent: 0)
+
+    let value = totalsPresentation(activity)
+
+    // An empty window genuinely cost nothing. Only sessions that definitely
+    // ran make a zero suspicious.
+    #expect(!value.costIsUnreported)
+    #expect(value.costText == "$0.00")
+}
+
+@Test func costWordingFollowsTheReadersRegionAndTheUnreportedCaseDoesNot() {
+    let activity = totalsFixture()
+    let unmeasured = totalsFixture(costUSD: 0, costPercent: 0)
+
+    let abroad = ActivityTotalsPresentation(
+        totals: activity.totals, coverage: activity.coverage,
+        locale: Locale(identifier: "en_GB")
+    )
+    let unreportedAbroad = ActivityTotalsPresentation(
+        totals: unmeasured.totals, coverage: unmeasured.coverage,
+        locale: Locale(identifier: "en_GB")
+    )
+
+    // The figure is in dollars wherever it is read, so outside the US the
+    // formatter disambiguates the symbol. That is the shipped behaviour and
+    // the reason the locale is a parameter rather than ambient state.
+    #expect(abroad.costText == "US$0.59")
+    // The unreported wording is not a number and must not pick up a currency.
+    #expect(unreportedAbroad.costText == "Not reported")
+}
+
+@Test func coverageLineNamesBothFiguresWhenTheyDisagree() {
+    let value = totalsPresentation(totalsFixture())
+
+    #expect(value.coverageText == "5.8% token coverage · 5% cost coverage")
+}
+
+@Test func coverageLineSaysItOnceWhenBothFiguresAgree() {
+    let activity = totalsFixture(tokenPercent: 5.8333, costPercent: 5.8333)
+
+    let value = totalsPresentation(activity)
+
+    #expect(value.coverageText == "5.8% token coverage")
+}
+
+@Test func coverageLineSaysSoWhenTokenCoverageIsUnknown() {
+    let activity = totalsFixture(tokenPercent: nil, costPercent: 5.0)
+
+    let value = totalsPresentation(activity)
+
+    #expect(value.coverageText == "Token coverage unavailable")
+}
+
 @Test func disabledSelectionWaitsForConfirmedRevocationAndCancelRestoresActualBackend() {
     var state = ContentAnalysisSelectionState()
     state.synchronize(enabled: true, backend: .cloud, disclosureAccepted: true)

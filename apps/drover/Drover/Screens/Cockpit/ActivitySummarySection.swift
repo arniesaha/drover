@@ -12,6 +12,9 @@ struct ActivitySummarySection: View {
     @ScaledMetric(relativeTo: .title3) private var metricMinimum: CGFloat = 104
 
     var body: some View {
+        let totals = ActivityTotalsPresentation(
+            totals: activity.totals, coverage: activity.coverage
+        )
         VStack(alignment: .leading, spacing: 10) {
             CockpitSectionHeading(
                 title: "Recent activity", source: "Drover observed", action: onOpenAnalytics
@@ -43,12 +46,17 @@ struct ActivitySummarySection: View {
                         // what those tokens cost", which is false: subscription
                         // usage reports no per-token cost, so this is only the
                         // API-billed slice — and its coverage is far lower than
-                        // the token coverage printed below. See #150.
+                        // the token coverage printed below. The wording, and
+                        // the zero-versus-unmeasured rule behind it, live in
+                        // DroverKit so the analytics screen cannot drift from
+                        // this card again. See #150.
                         ActivityMetric(
-                            value: currency(activity.totals.costUSD), label: "API-billed"
+                            value: totals.costText,
+                            label: ActivityTotalsPresentation.costLabel,
+                            accessibilityText: totals.costAccessibilityText
                         )
                     }
-                    Text(coverageText)
+                    Text(totals.coverageText)
                         .droverText(.subtitle)
                         .fixedSize(horizontal: false, vertical: true)
                     if let statusMessage {
@@ -62,23 +70,6 @@ struct ActivitySummarySection: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("activity-summary-section")
     }
-
-    /// Coverage for both figures, not just tokens.
-    ///
-    /// Cost coverage is routinely far lower than token coverage — 5% against
-    /// 5.8% in the case that prompted this — and printing only the token
-    /// figure left the *less* covered number looking like a total. Only says
-    /// it twice when the two actually differ.
-    private var coverageText: String {
-        guard let tokens = activity.coverage.tokenPercent else {
-            return "Token coverage unavailable"
-        }
-        let tokenText = "\(formatPercent(tokens))% token coverage"
-        guard let cost = activity.coverage.costPercent,
-              formatPercent(cost) != formatPercent(tokens)
-        else { return tokenText }
-        return "\(tokenText) · \(formatPercent(cost))% cost coverage"
-    }
 }
 
 private struct ActivityMetric: View {
@@ -88,6 +79,10 @@ private struct ActivityMetric: View {
     /// glance aid for sighted scanning; it should not be the only form of the
     /// number available.
     var spokenValue: String?
+    /// Replaces the whole spoken phrase, for values that are not a quantity of
+    /// the label: "Not reported API-billed" is not a sentence, and reading the
+    /// cost slot as a number at all is exactly the claim #150 is about.
+    var accessibilityText: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -101,18 +96,10 @@ private struct ActivityMetric: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(spokenValue ?? value) \(label)")
+        .accessibilityLabel(accessibilityText ?? "\(spokenValue ?? value) \(label)")
     }
 }
 
 func format(_ value: Int) -> String {
     value.formatted(.number.grouping(.automatic))
-}
-
-func formatPercent(_ value: Double) -> String {
-    value.formatted(.number.precision(.fractionLength(0...1)))
-}
-
-func currency(_ value: Double) -> String {
-    value.formatted(.currency(code: "USD").precision(.fractionLength(2)))
 }
