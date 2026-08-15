@@ -35,12 +35,16 @@ diagnostics from crashing each other (issue #2):
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import itertools
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -586,12 +590,135 @@ def _snapshot_signature(source: Path) -> tuple[int, int, int, int]:
     )
 
 
+SNAPSHOT_SCRATCH_DIRNAME = ".drover-snapshots"
+
+
+def snapshot_scratch_root(source: Path | str) -> Path:
+    """Where snapshot copies of ``source`` are written: beside ``source``.
+
+    Not the system temp directory, for two reasons that happen to be the same
+    reason. ``clonefile`` only works within a volume, so a snapshot written to
+    a temp dir on a different filesystem silently falls back to the chunked
+    read the clone exists to replace. And these copies are hundreds of
+    megabytes arriving every few minutes -- pointed at the boot volume they
+    filled it and took the hub down, while the store itself sits on a volume
+    with room to spare (#171).
+
+    Landing them beside the store fixes both: the clone engages, which also
+    makes the copy nearly free, because copy-on-write extents cost no space
+    until they diverge.
+    """
+    root = Path(source).parent / SNAPSHOT_SCRATCH_DIRNAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def sweep_orphaned_snapshot_scratch(
+    source: Path | str, *, older_than_seconds: float = 3600.0
+) -> int:
+    """Delete abandoned snapshot directories beside ``source``; return the count.
+
+    ``TemporaryDirectory`` only cleans up when the process exits gracefully, and
+    a hub that is killed -- or restarted by launchd -- does not. Copies from
+    every previous process therefore accumulated indefinitely: 145 directories
+    and 27 GB by the time the volume ran out.
+
+    The age cutoff is what keeps this safe to call while other work is in
+    flight: a directory another process is actively filling has a recent mtime,
+    so only genuinely abandoned ones are swept.
+    """
+    root = Path(source).parent / SNAPSHOT_SCRATCH_DIRNAME
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for child in root.iterdir():
+        try:
+            if not child.is_dir() or child.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed += 1
+    if removed:
+        log.info("swept %d orphaned snapshot director(ies) under %s", removed, root)
+    return removed
+
+
+def _clone_file(source: Path, destination: Path) -> bool:
+    """APFS copy-on-write clone of ``source``, or False if unavailable.
+
+    The point is atomicity, not speed -- though it is also O(1). ``clonefile``
+    captures the file's extents as one operation, so a writer working on the
+    store cannot be observed half way, which a chunked read can and did.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        clonefile = libc.clonefile
+    except (OSError, AttributeError):
+        return False
+    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    clonefile.restype = ctypes.c_int
+    if clonefile(os.fsencode(source), os.fsencode(destination), 0) == 0:
+        return True
+    # Cross-volume and non-APFS both land here (EXDEV / ENOTSUP), and both are
+    # ordinary rather than exceptional -- the caller falls back.
+    log.debug(
+        "clonefile(%s -> %s) unavailable: %s",
+        source,
+        destination,
+        os.strerror(ctypes.get_errno()),
+    )
+    return False
+
+
 def copy_duckdb_store(source: Path, destination: Path) -> None:
-    """Copy a DuckDB store and its WAL when one exists."""
-    shutil.copy2(source, destination)
-    wal = _write_ahead_log(source)
-    if wal.exists():
-        shutil.copy2(wal, _write_ahead_log(destination))
+    """Capture a DuckDB store as a snapshot that always opens.
+
+    Two properties, learned the hard way when a snapshot invalidated the live
+    handle and the hub served nothing while looking healthy (#171):
+
+    **The store is captured atomically.** ``shutil.copy2`` reads in chunks, so
+    copying a store DuckDB is writing into yields a torn file -- the source of
+    "Invalid bitmask for FixedSizeAllocator" and "Could not find node in column
+    segment tree!". An APFS clone takes the extents in one operation instead.
+
+    **The WAL is not carried.** The store and its log are two files captured at
+    two instants, so a copy taking both can only vouch for the pair by luck,
+    and the existence check ahead of it races a checkpoint deleting the file.
+    A store on its own is a valid database as of its last checkpoint, so the
+    cost is staleness rather than corruption -- and a checkpoint first keeps
+    even that small. Stale is a trade a snapshot can make; unopenable is not.
+    """
+    _checkpoint_before_snapshot(source)
+    if not _clone_file(source, destination):
+        # Off-APFS or across volumes. Still no WAL, so the pairing hazard is
+        # gone, but a chunked read can tear on its own -- callers treat a
+        # failed snapshot as a skipped cycle.
+        shutil.copy2(source, destination)
+
+
+def _checkpoint_before_snapshot(source: Path) -> None:
+    """Fold the WAL into the store so the snapshot is not needlessly stale.
+
+    Best effort on purpose. ``CHECKPOINT`` fails while another transaction is
+    open, and that is a normal state for a live hub, not an error worth failing
+    a snapshot over: without it the capture is simply as of the previous
+    checkpoint, which is the trade this function is already making.
+    """
+    if not source.exists():
+        return
+    try:
+        with duckdb_connect_lock(source):
+            con = duckdb.connect(str(source))
+            try:
+                con.execute("CHECKPOINT")
+            finally:
+                con.close()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("checkpoint before snapshot of %s skipped: %s", source, exc)
 
 
 def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
@@ -617,15 +744,17 @@ def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
         directory = _SNAPSHOT_DIRS.get(key)
         if directory is None:
             directory = _SNAPSHOT_DIRS[key] = tempfile.TemporaryDirectory(
-                prefix="drover-control-plane-"
+                prefix="drover-control-plane-", dir=snapshot_scratch_root(source)
             )
         fresh = Path(directory.name) / (
             f"{source.stem}-{next(_SNAPSHOT_SEQUENCE)}{source.suffix}"
         )
         copy_duckdb_store(source, fresh)
-        return _CachedSnapshot(
-            path=fresh, signature=_snapshot_signature(source), busy=True
-        )
+        # Stamped with the signature read *before* the copy, not after. The
+        # bytes describe the store as it was going in, so claiming they match
+        # what it became on the way out is how a copy taken across a change got
+        # served again and again to later readers (#171).
+        return _CachedSnapshot(path=fresh, signature=signature, busy=True)
 
 
 def _release_control_plane_snapshot(source: Path, entry: _CachedSnapshot) -> None:

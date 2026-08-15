@@ -35,6 +35,7 @@ from drover.server.harness.schema import (
 )
 from drover.server.db import (
     copy_duckdb_store,
+    snapshot_scratch_root,
     control_plane_connection,
     control_plane_path,
     open_duckdb_connection,
@@ -2272,7 +2273,9 @@ class MetricsCollector:
         # `threads` is instance-wide, so only a reader with its own instance
         # can raise it without touching the live one. Measured 13.7-14.8s at
         # threads=1 vs 6.6-8.1s here (#78).
-        with tempfile.TemporaryDirectory(prefix="drover-metrics-") as tmp:
+        with tempfile.TemporaryDirectory(
+            prefix="drover-metrics-", dir=snapshot_scratch_root(source)
+        ) as tmp:
             snapshot = Path(tmp) / source.name
             copy_duckdb_store(source, snapshot)
             return quality_snapshot(
@@ -2291,7 +2294,9 @@ class MetricsCollector:
             # Copy for the same isolation reason as _quality_snapshot above.
             # This one is fast on its own (0.23s measured), but it runs in the
             # same refresh and must not add live-instance contention either.
-            with tempfile.TemporaryDirectory(prefix="drover-observatory-") as tmp:
+            with tempfile.TemporaryDirectory(
+                prefix="drover-observatory-", dir=snapshot_scratch_root(source)
+            ) as tmp:
                 snapshot = Path(tmp) / source.name
                 copy_duckdb_store(source, snapshot)
                 return pipeline_observatory_snapshot(

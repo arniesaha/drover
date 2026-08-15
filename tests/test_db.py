@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-import duckdb
+import os
+import sys
+import time
 
+import duckdb
+import pytest
+
+from drover.server import db as db_module
 from drover.server.db import (
     ROLE_DEFAULTS,
+    copy_duckdb_store,
     open_duckdb_connection,
     snapshot_thread_default,
 )
@@ -220,3 +227,158 @@ def test_open_duckdb_connection_honors_summarizer_env_overrides(tmp_path, monkey
         )
     finally:
         con.close()
+
+
+def _wal_from_a_different_database(tmp_path) -> bytes:
+    """A real WAL whose contents do not describe the store we pair it with.
+
+    This is what a torn copy produces: the ``.duckdb`` captured at one instant
+    and the ``.wal`` at another, so the log no longer describes the file beside
+    it. Building it from a genuinely different database is the honest way to
+    get those bytes -- DuckDB skips a WAL of zeros, so a hand-rolled one would
+    prove nothing.
+    """
+    other = tmp_path / "other.duckdb"
+    con = duckdb.connect(str(other))
+    con.execute("CREATE TABLE unrelated (x INTEGER)")
+    con.execute("INSERT INTO unrelated VALUES (1)")
+    # Read it while the connection is open: DuckDB checkpoints on last close,
+    # which would fold the WAL away before we could take it.
+    payload = (tmp_path / "other.duckdb.wal").read_bytes()
+    con.close()
+    return payload
+
+
+def test_the_snapshot_is_not_paired_with_a_wal_it_cannot_vouch_for(tmp_path):
+    """A snapshot carries the store alone, never a separately-captured WAL.
+
+    The store and its WAL are two files taken at two instants, so a copy that
+    carries both can only vouch for the pair by luck. Dropping the WAL costs
+    the rows written since the last checkpoint -- a store on its own is still a
+    valid database as of that checkpoint -- and stale is a trade a metrics
+    snapshot can make. Unopenable is not.
+
+    Note what this deliberately does *not* claim. A mismatched WAL turns out to
+    replay harmlessly, so it is **not** the mechanism behind the allocator and
+    segment-tree failures seen in production; those come from the store itself
+    being read torn while DuckDB writes into it, which the atomic capture
+    answers. This locks the pairing half only.
+    """
+    source = tmp_path / "live.duckdb"
+    con = duckdb.connect(str(source))
+    con.execute("CREATE TABLE t AS SELECT 1 AS a")
+    con.close()
+
+    (tmp_path / "live.duckdb.wal").write_bytes(_wal_from_a_different_database(tmp_path))
+
+    destination = tmp_path / "snap.duckdb"
+    copy_duckdb_store(source, destination)
+
+    assert not (tmp_path / "snap.duckdb.wal").exists()
+
+    snap = duckdb.connect(str(destination))
+    try:
+        assert snap.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+    finally:
+        snap.close()
+
+
+def test_the_store_is_cloned_rather_than_read_in_chunks(tmp_path, monkeypatch):
+    """A chunked read of a live store is the bug; a clone is the fix.
+
+    ``shutil.copy2`` walks the file in chunks, so a store DuckDB is writing
+    into can be captured half way through a page write. Failing the test if
+    that path is taken is the only way to state "do not read this file in
+    chunks" as something CI can check.
+    """
+    if not sys.platform == "darwin":
+        pytest.skip("clonefile is Darwin-only; the fallback has its own test")
+
+    source = tmp_path / "live.duckdb"
+    con = duckdb.connect(str(source))
+    con.execute("CREATE TABLE t AS SELECT 1 AS a")
+    con.close()
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("the live store was read in chunks instead of cloned")
+
+    monkeypatch.setattr(db_module.shutil, "copy2", _refuse)
+
+    copy_duckdb_store(source, tmp_path / "snap.duckdb")
+
+    snap = duckdb.connect(str(tmp_path / "snap.duckdb"))
+    try:
+        assert snap.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+    finally:
+        snap.close()
+
+
+def test_a_store_that_cannot_be_cloned_is_still_captured_without_its_wal(
+    tmp_path, monkeypatch
+):
+    """Cross-volume and non-APFS still have to produce an openable snapshot.
+
+    The fallback keeps the tearing risk a chunked read carries -- there is no
+    way around that off APFS -- but it must not also reintroduce the WAL
+    pairing hazard, which is independent of how the store itself is captured.
+    """
+    monkeypatch.setattr(db_module, "_clone_file", lambda source, destination: False)
+
+    source = tmp_path / "live.duckdb"
+    con = duckdb.connect(str(source))
+    con.execute("CREATE TABLE t AS SELECT 1 AS a")
+    con.close()
+    (tmp_path / "live.duckdb.wal").write_bytes(_wal_from_a_different_database(tmp_path))
+
+    copy_duckdb_store(source, tmp_path / "snap.duckdb")
+
+    assert not (tmp_path / "snap.duckdb.wal").exists()
+    snap = duckdb.connect(str(tmp_path / "snap.duckdb"))
+    try:
+        assert snap.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+    finally:
+        snap.close()
+
+
+def test_snapshot_scratch_sits_beside_the_store_not_in_system_temp(tmp_path):
+    """Snapshots belong on the store's own volume, for two reasons at once.
+
+    ``clonefile`` is same-volume only, so a snapshot written to the system temp
+    dir while the store lives elsewhere silently falls back to a chunked read --
+    the copy the clone exists to replace. Landing beside the store makes the
+    clone engage, which also makes the copy nearly free: copy-on-write extents
+    cost no space until they diverge.
+
+    The system temp dir is on the boot volume here, and these copies are
+    350-950 MB each, arriving every 15-20 minutes. That filled the disk and
+    took the hub down (#171).
+    """
+    root = db_module.snapshot_scratch_root(tmp_path / "live.duckdb")
+
+    assert root.parent == tmp_path
+    assert root.is_dir()
+    assert "/var/folders/" not in str(root)
+
+
+def test_orphaned_snapshot_scratch_is_swept_but_live_work_is_kept(tmp_path):
+    """Cleanup on graceful exit is not enough, as the disk proved.
+
+    A hub killed rather than asked to stop leaves its copies behind, and they
+    accumulated across every restart. The sweep is what makes the leak
+    self-limiting instead of monotonic -- but it has to be able to tell an
+    abandoned directory from one another process is filling right now.
+    """
+    root = db_module.snapshot_scratch_root(tmp_path / "live.duckdb")
+    stale = root / "drover-control-plane-oldone"
+    stale.mkdir()
+    fresh = root / "drover-control-plane-newone"
+    fresh.mkdir()
+    old = time.time() - (6 * 3600)
+    os.utime(stale, (old, old))
+
+    db_module.sweep_orphaned_snapshot_scratch(
+        tmp_path / "live.duckdb", older_than_seconds=3600
+    )
+
+    assert not stale.exists()
+    assert fresh.exists()

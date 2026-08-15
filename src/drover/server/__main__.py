@@ -69,6 +69,7 @@ from drover.server.db import (
     control_plane_path,
     open_duckdb_connection,
     pin_control_plane_connection,
+    sweep_orphaned_snapshot_scratch,
 )
 from drover.server.decisions import derive_decisions
 from drover.server.doctor import audit_lakehouse, format_runtime_audit, runtime_audit
@@ -1680,6 +1681,12 @@ def run(
     # store -- and db.py logs which way it went. The lock split and the
     # separate database in control_plane_connection apply regardless (#95).
     pin_control_plane_connection(cfg.duckdb_path)
+    # Snapshot copies are only cleaned up when a process exits gracefully, and a
+    # hub that is killed or restarted by launchd does not. They accumulated
+    # across every restart until the volume ran out (#171), so startup is where
+    # the previous process's leavings get collected. Anything recent belongs to
+    # a co-resident process still using it and is left alone.
+    sweep_orphaned_snapshot_scratch(cfg.duckdb_path)
 
     # An explicit --metrics-host wins; otherwise the bind comes from
     # [server] metrics_host in config.toml. Keeping it in config matters
