@@ -9,7 +9,14 @@ import Observation
 @Observable
 public final class LaunchModel {
     private let client: DroverClient
-    private let snapshot: HarnessSnapshot?
+    private(set) public var isFetchingSnapshot: Bool = false
+    private(set) public var snapshot: HarnessSnapshot? {
+        didSet {
+            Task { @MainActor in
+                self.refreshCwdSuggestions()
+            }
+        }
+    }
     public let runPreferences: HarnessModelCatalogState
 
     /// Harness names the server can run in a structured (turn-based) mode;
@@ -30,12 +37,18 @@ public final class LaunchModel {
                 }
             }
             runPreferences.select(hostID: hostID, harness: harness)
+            Task { @MainActor in
+                self.refreshCwdSuggestions()
+            }
         }
     }
     public var harness: String {
         didSet {
             guard oldValue != harness else { return }
             runPreferences.select(hostID: hostID, harness: harness)
+            Task { @MainActor in
+                self.refreshCwdSuggestions()
+            }
         }
     }
     public var cwd: String = ""
@@ -112,6 +125,49 @@ public final class LaunchModel {
         } catch {
             launchError = Self.errorMessage(for: error)
             return nil
+        }
+    }
+
+    // MARK: - Snapshot Fetching and Loading
+
+    /// Fetch snapshot in background to populate cwdSuggestions if unavailable
+    private func fetchSnapshotIfNeeded() async {
+        if snapshot == nil {
+            isFetchingSnapshot = true
+            defer { isFetchingSnapshot = false }
+            
+            do {
+                let response = try await client.fetchSnapshot()
+                self.snapshot = response
+            } catch {
+                // Silently fail - UI will show errors via launchError
+            }
+        }
+    }
+
+    /// Trigger snapshot re-fetch when host/harness changes to freshen cwd suggestions
+    private func refreshCwdSuggestions() {
+        Task { @MainActor in
+            await fetchSnapshotIfNeeded()
+            
+            // If we have a snapshot but no cwdSuggestions, try to fetch it
+            if let snapshot = self.snapshot,
+               snapshot.cwdSuggestions.isEmpty {
+                Task { await self.fetchSnapshot() }
+            }
+        }
+    }
+
+    /// Manually refresh the snapshot
+    private func fetchSnapshot() async {
+        isFetchingSnapshot = true
+        defer { isFetchingSnapshot = false }
+        
+        do {
+            let response = try await client.fetchSnapshot()
+            self.snapshot = response
+        } catch {
+            // Failed to fetch, keep existing snapshot if any
         }
     }
 

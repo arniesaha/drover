@@ -72,6 +72,8 @@ struct LaunchView: View {
                         }
                     }
                 }
+                
+                cwdSuggestionsView
             }
 
             if model.isStructured {
@@ -110,13 +112,13 @@ struct LaunchView: View {
                 Button {
                     Task { await launch() }
                 } label: {
-                    if isLaunching {
+                    if isLaunching || model.isFetchingSnapshot {
                         ProgressView()
                     } else {
                         Text("Launch")
                     }
                 }
-                .disabled(isLaunching || model.hostID.isEmpty || model.harness.isEmpty)
+                .disabled(isLaunching || isFetchingSnapshot || model.hostID.isEmpty || model.harness.isEmpty)
                 .accessibilityIdentifier("launch-confirm-button")
             }
         }
@@ -140,8 +142,32 @@ struct LaunchView: View {
             Task { await load(items) }
         }
         .task(id: "\(model.hostID)\u{1f}\(model.harness)") {
-            await model.runPreferences.refresh()
+            await taskForSnapshotLoading()
         }
+    }
+
+    private var cwdSuggestionsView: some View {
+        if model.isFetchingSnapshot && !model.cwdSuggestions.isEmpty {
+            Spacer(minLength: 30)
+            ProgressView()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        if model.snapshot == nil && model.cwdSuggestions.isEmpty {
+            Spacer(minLength: 30)
+            ProgressView("Fetching workspace paths...")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        return EmptyView()
+    }
+
+    private var isFetchingSnapshot: Bool {
+        model.isFetchingSnapshot
+    }
+
+    private func taskForSnapshotLoading() async {
+        await model.fetchSnapshot()
     }
 
     private func load(_ items: [PhotosPickerItem]) async {
