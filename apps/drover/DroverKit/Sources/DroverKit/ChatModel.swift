@@ -145,6 +145,10 @@ public final class ChatModel {
     /// it demonstrably landed, and continuing to offer the same text is an
     /// invitation to send it twice.
     private var unconfirmedTurnText: String?
+    /// Attachments submitted with `unconfirmedTurnText`. An echo proves these
+    /// particular attachments landed, but not attachments the user picked
+    /// while waiting for that proof.
+    private var unconfirmedAttachments: [TurnAttachment] = []
 
     /// request_id -> the prompt still awaiting an answer. Tiny in practice:
     /// a harness blocks on one approval at a time.
@@ -446,6 +450,7 @@ public final class ChatModel {
             pendingAttachments = []
             hint = nil
             unconfirmedTurnText = nil
+            unconfirmedAttachments = []
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // The harness rejects overlapping turns — queue instead of
             // erroring, and dispatch when the turn-complete status arrives.
@@ -461,6 +466,7 @@ public final class ChatModel {
             // transport) so the user can retry without retyping. Whether the
             // hub saw this turn is unknown until it does or does not echo.
             unconfirmedTurnText = text
+            unconfirmedAttachments = images
             applyHint(for: error, action: "send")
         }
     }
@@ -479,10 +485,30 @@ public final class ChatModel {
               message.text == unconfirmed
         else { return }
         unconfirmedTurnText = nil
-        guard composerText.trimmingCharacters(in: .whitespacesAndNewlines) == unconfirmed
-        else { return }
-        composerText = ""
-        pendingAttachments = []
+        let landedAttachments = unconfirmedAttachments
+        unconfirmedAttachments = []
+
+        // A manual retry can be rejected and queued while the original,
+        // ambiguously failed request is still in flight. Once its echo
+        // arrives, that matching queue entry is a confirmed duplicate. Keep
+        // any retry-only attachments available for the next turn instead of
+        // silently dropping them with the cancelled retry.
+        if queuedTurn == unconfirmed {
+            queuedTurn = nil
+            pendingAttachments = queuedAttachments + pendingAttachments
+            queuedAttachments = []
+        }
+
+        // Remove the attachments proved to have landed one at a time so any
+        // attachment selected after the failed send stays in the composer.
+        for attachment in landedAttachments {
+            if let index = pendingAttachments.firstIndex(of: attachment) {
+                pendingAttachments.remove(at: index)
+            }
+        }
+        if composerText.trimmingCharacters(in: .whitespacesAndNewlines) == unconfirmed {
+            composerText = ""
+        }
         hint = nil
     }
 
@@ -573,6 +599,7 @@ public final class ChatModel {
             )
             hint = nil
             unconfirmedTurnText = nil
+            unconfirmedAttachments = []
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // Raced a new turn (e.g. an approval resumed it) — keep waiting
             // for the next turn-complete.
@@ -586,6 +613,7 @@ public final class ChatModel {
             composerText = composerText.isEmpty ? text : "\(text)\n\(composerText)"
             pendingAttachments = images + pendingAttachments
             unconfirmedTurnText = text
+            unconfirmedAttachments = images
             applyHint(for: error, action: "send")
         }
     }

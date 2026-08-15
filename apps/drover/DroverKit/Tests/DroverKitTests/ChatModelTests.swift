@@ -1312,6 +1312,65 @@ struct ChatModelTests {
     #expect(model.composerText.isEmpty)
 }
 
+@Test @MainActor func echoOfLandedQueuedDispatchCancelsMatchingQueuedRetry() async throws {
+    nonisolated(unsafe) var turnPosts = 0
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
+        turnPosts += 1
+        switch turnPosts {
+        case 1, 3:
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        case 2:
+            return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+        default:
+            return (202, Data(#"{"turn_id": "duplicate"}"#.utf8))
+        }
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+
+    // The first 409 queues the turn; the next dispatch looks failed even
+    // though the server has accepted it.
+    model.ingest(.message(.fixture(seq: 9, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await waitUntil { model.composerText == "Yes looks good" }
+
+    // Retrying while the original is still in flight queues the same turn.
+    await model.sendTurn()
+    #expect(model.queuedTurn == "Yes looks good")
+
+    // The original echo proves the queued retry is a duplicate. It must not
+    // be dispatched at the following completion.
+    model.ingest(.message(.fixture(seq: 11, type: .userInput, text: "Yes looks good")))
+    #expect(model.queuedTurn == nil)
+    model.ingest(.message(.fixture(seq: 12, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(turnPosts == 3)
+}
+
+@Test @MainActor func echoOfFailedSendPreservesAttachmentsAddedAfterTheSend() async throws {
+    MockURLProtocol.transportError = URLError(.networkConnectionLost)
+    defer { MockURLProtocol.transportError = nil }
+    let landedAttachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
+    let laterAttachment = TurnAttachment(mediaType: "image/png", data: Data([0x02]))
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    model.pendingAttachments = [landedAttachment]
+    await model.sendTurn()
+
+    // The user can add another attachment while the initial request's result
+    // is unknown. An echo may remove the sent attachment, never the later one.
+    model.pendingAttachments.append(laterAttachment)
+    model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "Yes looks good")))
+
+    #expect(model.composerText.isEmpty)
+    #expect(model.pendingAttachments == [laterAttachment])
+}
+
 }
 
 }  // extension MockNetworkTests
