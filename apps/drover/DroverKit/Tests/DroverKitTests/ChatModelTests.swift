@@ -126,6 +126,11 @@ private func turnComplete(seq: Int) -> HarnessMessage {
     .fixture(seq: seq, type: .status, payload: ["turn_complete": .bool(true)])
 }
 
+private func clientTurnID(in request: URLRequest) -> String {
+    let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+    return body["client_turn_id"] as! String
+}
+
 @MainActor
 private func waitUntil(
     timeout: Duration = .seconds(5), _ condition: () -> Bool
@@ -1230,6 +1235,223 @@ struct ChatModelTests {
     await second.value
     #expect(calls == 1)
     #expect(model.isAnswering == false)
+}
+
+// MARK: - Ambiguous send failures (accepted server-side, lost in transit)
+
+@Test @MainActor func echoOfAnAmbiguouslyFailedSendClearsTheComposer() async throws {
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        turnID = clientTurnID(in: request)
+        return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+    }
+    defer { MockURLProtocol.handler = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    let confirmedTurnID = try #require(turnID)
+    // The response was lost, so the text is held for a manual retry.
+    #expect(model.composerText == "Yes looks good")
+
+    // ...but the hub had accepted the turn after all and streams it back.
+    // The transcript now proves it landed, so continuing to offer the same
+    // text in the composer invites the user to send it a second time.
+    model.ingest(.message(.fixture(
+        seq: 10,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: confirmedTurnID
+    )))
+
+    #expect(model.composerText.isEmpty)
+    #expect(model.hint == nil)
+}
+
+@Test @MainActor func echoOfDifferentTextLeavesAFailedSendInTheComposer() async throws {
+    MockURLProtocol.transportError = URLError(.networkConnectionLost)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+
+    // An unrelated user turn (another device on the same session) says
+    // nothing about ours, so the retry text has to survive it.
+    model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "something else")))
+
+    #expect(model.composerText == "Yes looks good")
+}
+
+@Test @MainActor func matchingTextFromAnotherClientDoesNotConfirmAFailedSend() async throws {
+    nonisolated(unsafe) var localTurnID: String?
+    MockURLProtocol.transportError = nil
+    defer { MockURLProtocol.handler = nil }
+    MockURLProtocol.handler = { request in
+        localTurnID = clientTurnID(in: request)
+        return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    let confirmedTurnID = try #require(localTurnID)
+
+    // A different device can send exactly the same words. Without a turn ID,
+    // that echo is ambiguous and must not clear this client's retry.
+    model.ingest(.message(.fixture(
+        seq: 10,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: "another-device-turn"
+    )))
+    #expect(model.composerText == "Yes looks good")
+
+    model.ingest(.message(.fixture(
+        seq: 11,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: confirmedTurnID
+    )))
+    #expect(model.composerText.isEmpty)
+}
+
+@Test @MainActor func echoArrivingInReconnectHistoryClearsTheComposer() async throws {
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        turnID = clientTurnID(in: request)
+        return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+    }
+    defer { MockURLProtocol.handler = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    let confirmedTurnID = try #require(turnID)
+    #expect(model.composerText == "Yes looks good")
+
+    // Losing the response usually means losing the socket, so the echo most
+    // often arrives in the replay after reconnecting rather than as a live
+    // message. Same proof, so it has to reach the same conclusion.
+    model.ingest(.history([
+        .fixture(
+            seq: 10,
+            type: .userInput,
+            text: "Yes looks good",
+            turnID: confirmedTurnID
+        ),
+    ], decodeIssues: []))
+
+    #expect(model.composerText.isEmpty)
+}
+
+@Test @MainActor func echoAfterAFailedQueuedDispatchClearsTheComposer() async throws {
+    nonisolated(unsafe) var turnPosts = 0
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
+        turnPosts += 1
+        if turnPosts == 1 {
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        }
+        turnID = clientTurnID(in: request)
+        return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    #expect(model.composerText.isEmpty)
+
+    // Turn completes, the queued dispatch goes out and appears to fail, so
+    // the text is handed back to the composer.
+    model.ingest(.message(.fixture(seq: 9, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await waitUntil { model.composerText == "Yes looks good" }
+    let confirmedTurnID = try #require(turnID)
+
+    // That dispatch had in fact landed. Same trap, same rule.
+    model.ingest(.message(.fixture(
+        seq: 11,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: confirmedTurnID
+    )))
+
+    #expect(model.composerText.isEmpty)
+}
+
+@Test @MainActor func echoOfLandedQueuedDispatchCancelsMatchingQueuedRetry() async throws {
+    nonisolated(unsafe) var turnPosts = 0
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "GET" { return (200, sessionJSON()) }
+        turnPosts += 1
+        switch turnPosts {
+        case 1, 3:
+            return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
+        case 2:
+            turnID = clientTurnID(in: request)
+            return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+        default:
+            return (202, Data(#"{"turn_id": "duplicate"}"#.utf8))
+        }
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+
+    // The first 409 queues the turn; the next dispatch looks failed even
+    // though the server has accepted it.
+    model.ingest(.message(.fixture(seq: 9, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await waitUntil { model.composerText == "Yes looks good" }
+    let confirmedTurnID = try #require(turnID)
+
+    // Retrying while the original is still in flight queues the same turn.
+    await model.sendTurn()
+    #expect(model.queuedTurn == "Yes looks good")
+
+    // The original echo proves the queued retry is a duplicate. It must not
+    // be dispatched at the following completion.
+    model.ingest(.message(.fixture(
+        seq: 11,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: confirmedTurnID
+    )))
+    #expect(model.queuedTurn == nil)
+    model.ingest(.message(.fixture(seq: 12, type: .status,
+                                   payload: ["turn_complete": .bool(true),
+                                             "awaiting": .string("input")])))
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(turnPosts == 3)
+}
+
+@Test @MainActor func echoOfFailedSendPreservesAttachmentsAddedAfterTheSend() async throws {
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        turnID = clientTurnID(in: request)
+        return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
+    }
+    defer { MockURLProtocol.handler = nil }
+    let landedAttachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
+    let laterAttachment = TurnAttachment(mediaType: "image/png", data: Data([0x02]))
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    model.pendingAttachments = [landedAttachment]
+    await model.sendTurn()
+    let confirmedTurnID = try #require(turnID)
+
+    // The user can add another attachment while the initial request's result
+    // is unknown. An echo may remove the sent attachment, never the later one.
+    model.pendingAttachments.append(laterAttachment)
+    model.ingest(.message(.fixture(
+        seq: 10,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: confirmedTurnID
+    )))
+
+    #expect(model.composerText.isEmpty)
+    #expect(model.pendingAttachments == [laterAttachment])
 }
 
 }

@@ -255,6 +255,7 @@ class StructuredSessionManager:
         images: list | None = None,
         model: str | None = None,
         thinking_effort: str | None = None,
+        client_turn_id: str | None = None,
     ) -> str:
         entry = self._require_entry(session_id)
         if entry.awaiting == "approval":
@@ -265,7 +266,7 @@ class StructuredSessionManager:
                 if entry.turn_active:
                     raise RuntimeError("turn already in flight")
                 entry.turn_active = True
-        turn_id = f"turn-{uuid4()}"
+        turn_id = client_turn_id or f"turn-{uuid4()}"
         # Dispatch first: Codex/Agy raise RuntimeError here ("turn
         # already in flight" / "driver is closed") when a turn can't be
         # accepted, and we must not record a user_input event for a turn
