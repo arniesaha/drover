@@ -61,8 +61,12 @@ class DeepSeekCatalogAdapter:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     continue
                 model_id = f"{provider}/{row['id']}"
-                reasoning = _reasoning(row.get("reasoning"))
                 try:
+                    # _reasoning() builds a ReasoningOptions, whose validation
+                    # is what rejects an unsupported default effort -- keep it
+                    # inside the guard so one unusable model is skipped rather
+                    # than downgrading the whole host's catalog to stale.
+                    reasoning = _reasoning(row.get("reasoning"))
                     models.append(
                         ModelOption(
                             id=model_id,
@@ -85,11 +89,17 @@ class DeepSeekCatalogAdapter:
                 is_default=True,
                 reasoning=models[0].reasoning,
             )
-        return DiscoveredCatalog(
-            account_scope_material=f"deepseek-harness|{self.api.base_url}",
-            harness_version=harness_version,
-            models=tuple(models),
-        )
+        try:
+            return DiscoveredCatalog(
+                account_scope_material=f"deepseek-harness|{self.api.base_url}",
+                harness_version=harness_version,
+                models=tuple(models),
+            )
+        except ValueError:
+            # A duplicate provider/model pair (or any other record the shared
+            # validation rejects) is a protocol problem with this harness, not
+            # an unclassified crash for the service catch-all to guess at.
+            raise CatalogDiscoveryError("protocol_error") from None
 
 
 def _reasoning(value: object) -> ReasoningOptions | None:
