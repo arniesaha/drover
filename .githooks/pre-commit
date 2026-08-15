@@ -15,8 +15,6 @@ REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
 cd "$REPO_ROOT" || exit 1
 
 AUDIT="scripts/check_public_release.py"
-# A branch that does not carry the audit cannot be held to it.
-[ -f "$AUDIT" ] || exit 0
 
 PYTHON="$REPO_ROOT/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then
@@ -63,7 +61,7 @@ git checkout-index --prefix="$WORK/tree/" --force -- "$AUDIT" || exit 1
 git checkout-index --prefix="$WORK/tree/" --force -z --stdin < "$WORK/staged" || exit 1
 
 if (cd "$WORK/tree" && "$PYTHON" "$WORK/tree/$AUDIT" --root "$WORK/tree" \
-      "${STAGED[@]}") > "$WORK/findings" 2>&1; then
+	      -- "${STAGED[@]}") > "$WORK/findings" 2>&1; then
   exit 0
 fi
 

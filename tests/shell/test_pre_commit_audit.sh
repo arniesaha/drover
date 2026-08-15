@@ -127,6 +127,28 @@ printf 'Run it from your checkout.\n' > "$REPO/docs/overview.md"
 git -C "$REPO" commit -q -m "docs: expand overview" > "$WORK/staged-content.log" 2>&1
 check "the staged content is audited, not the working tree" "$?" "1"
 
+# The hook must materialize the audit script from the index too. An unstaged
+# deletion is not part of this commit and must not suppress a staged finding.
+REPO="$(new_repo unstaged-audit-removal)"
+mkdir -p "$REPO/docs/superpowers"
+printf '# Plan\n' > "$REPO/docs/superpowers/plan.md"
+git -C "$REPO" add docs/superpowers/plan.md
+rm "$REPO/scripts/check_public_release.py"
+git -C "$REPO" commit -q -m "docs: add plan" > "$WORK/unstaged-audit-removal.log" 2>&1
+check "an unstaged audit-script removal does not skip a staged finding" "$?" "1"
+
+# File names can begin with dashes. Without an argument delimiter, argparse
+# exits successfully for `--help` before inspecting the staged plan.
+REPO="$(new_repo option-path)"
+mkdir -p "$REPO/docs/superpowers"
+printf 'A clean note.\n' > "$REPO/--help"
+printf '# Plan\n' > "$REPO/docs/superpowers/plan.md"
+git -C "$REPO" add -- --help docs/superpowers/plan.md
+git -C "$REPO" commit -q -m "docs: add plan" > "$WORK/option-path.log" 2>&1
+check "a dash-prefixed path cannot bypass the staged audit" "$?" "1"
+check "the dash-prefixed path commit still reports the staged finding" \
+  "$(grep -c 'docs/superpowers/plan.md:1: private-planning-path' "$WORK/option-path.log")" "1"
+
 # The mirror image: an unstaged violation is not being committed, so it must
 # not block work that is.
 REPO="$(new_repo unstaged)"
