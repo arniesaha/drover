@@ -197,11 +197,24 @@ jobs:
         # build works, not which supervisor started it.
         pkill -f 'drover-server run' || true
         "$HOME/.drover/runtime/current/bin/drover-server" run &
+
+        # The server binds [server].metrics_host, which install.sh sets to the
+        # address it detected for the phone. Curling loopback regardless is
+        # what made this step fail for v0.2.0 and v0.3.0 against an install
+        # that was working: the server was serving on the LAN address the
+        # config named. Ask the config, the way the CLI now does.
+        # No heredoc: its body would have to start at column 0, which ends the
+        # YAML block scalar this step is written in and makes the whole file
+        # unparseable.
+        HOST="$(sed -n 's/^[[:space:]]*metrics_host[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
+          "$HOME/.drover/config.toml" | head -1)"
+        case "$HOST" in ""|"0.0.0.0"|"::"|"*") HOST="127.0.0.1" ;; esac
+        echo "probing the address the install configured: $HOST"
         for _ in $(seq 1 30); do
-          curl -fsS --max-time 2 http://127.0.0.1:7080/healthz && break
+          curl -fsS --max-time 2 "http://$HOST:7080/healthz" && break
           sleep 2
         done
-        curl -fsS --max-time 5 http://127.0.0.1:7080/healthz
+        curl -fsS --max-time 5 "http://$HOST:7080/healthz"
 
         OUT="$("$HOME/.drover/runtime/current/bin/drover-server" pair)"
         echo "$OUT"

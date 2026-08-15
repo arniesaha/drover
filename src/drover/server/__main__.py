@@ -344,18 +344,40 @@ def _local_api_token(cfg: DroverConfig) -> str:
         ) from exc
 
 
+def _local_api_host(cfg: DroverConfig) -> str:
+    """The address this machine's own hub is listening on.
+
+    Not always loopback. install.sh writes the address it detected for the
+    phone into `[server].metrics_host`, and the server binds exactly that, so
+    on a machine with a LAN address loopback is refused. Assuming 127.0.0.1
+    here made every CLI call report "could not reach drover-server -- is it
+    running?" about a server that was running and serving, and it is what
+    failed the published release's own install verification for v0.2.0 and
+    v0.3.0.
+
+    A wildcard bind does answer on loopback, and loopback is the better
+    choice there: it does not leave the machine and does not depend on which
+    interface happens to be up.
+    """
+
+    host = (cfg.server_metrics_host or "").strip()
+    if not host or host in {"0.0.0.0", "::", "*"}:
+        return "127.0.0.1"
+    return host
+
+
 def _local_api_request(
     cfg: DroverConfig, method: str, path: str, payload: Optional[dict] = None
 ) -> dict:
     """Call the locally running hub.
 
     Pairing codes live in the hub's memory, and this CLI is a different
-    process, so minting has to go over loopback rather than in-process.
+    process, so minting has to go over HTTP rather than in-process.
     """
     import urllib.error
     import urllib.request
 
-    url = f"http://127.0.0.1:{cfg.metrics_http_port}{path}"
+    url = f"http://{_local_api_host(cfg)}:{cfg.metrics_http_port}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("Content-Type", "application/json")
@@ -370,7 +392,8 @@ def _local_api_request(
         ) from exc
     except urllib.error.URLError as exc:
         raise click.ClickException(
-            f"could not reach drover-server on 127.0.0.1:{cfg.metrics_http_port} "
+            f"could not reach drover-server on "
+            f"{_local_api_host(cfg)}:{cfg.metrics_http_port} "
             f"-- is it running? ({exc.reason})"
         ) from exc
 
