@@ -40,6 +40,7 @@ from drover.server.advisory.types import (
     Severity,
 )
 from drover.server.advisory.worker import (
+    OPERATIONAL_SPAN_LOOKBACK,
     AdvisoryWorker,
     ContentAnalysisScheduler,
     ContentAnalysisWorker,
@@ -1694,7 +1695,11 @@ def test_runtime_snapshot_reads_provider_health_without_credentials(
         )
 
     snapshot = load_operational_snapshot(
-        db_path, "deterministic.connector_freshness", "fleet", "scheduled:2"
+        db_path,
+        "deterministic.connector_freshness",
+        "fleet",
+        "scheduled:2",
+        analyzed_at=NOW,
     )
 
     assert snapshot.source_version == "scheduled:2"
@@ -1781,13 +1786,17 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
         )
 
     telemetry = load_operational_snapshot(
-        db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
     )
     routing = load_operational_snapshot(
-        db_path, "deterministic.routing_mismatch", "fleet", "facts:v1"
+        db_path, "deterministic.routing_mismatch", "fleet", "facts:v1", analyzed_at=NOW
     )
     hooks = load_operational_snapshot(
-        db_path, "deterministic.hook_validity", "fleet", "facts:v1"
+        db_path, "deterministic.hook_validity", "fleet", "facts:v1", analyzed_at=NOW
     )
 
     assert len(telemetry.telemetry) == 1
@@ -1806,7 +1815,9 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
 
     findings = {
         analyzer.analyzer_id: analyzer.analyze(
-            load_operational_snapshot(db_path, analyzer.analyzer_id, "fleet", "v1")
+            load_operational_snapshot(
+                db_path, analyzer.analyzer_id, "fleet", "v1", analyzed_at=NOW
+            )
         )
         for analyzer in operational_analyzers()
     }
@@ -1850,7 +1861,11 @@ def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
             [NOW, NOW],
         )
     snapshot = load_operational_snapshot(
-        db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
     )
 
     assert snapshot.telemetry[0].total_sessions == 512
@@ -2022,10 +2037,14 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
         )
 
     telemetry = load_operational_snapshot(
-        db_path, "deterministic.telemetry_coverage", "fleet", "facts:v1"
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
     )
     routing = load_operational_snapshot(
-        db_path, "deterministic.routing_mismatch", "fleet", "facts:v1"
+        db_path, "deterministic.routing_mismatch", "fleet", "facts:v1", analyzed_at=NOW
     )
 
     assert telemetry.telemetry[0].prompt_tokens == 64
@@ -2036,6 +2055,63 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
     assert routing.routing[0].facts_complete is False
     assert operational_analyzers()[2].analyze(telemetry) == []
     assert operational_analyzers()[3].analyze(routing) == []
+
+
+def test_span_lookback_is_measured_from_analyzed_at(db_path: Path) -> None:
+    """The span window is anchored to analyzed_at, never to the wall clock.
+
+    This is what makes a snapshot reproducible: the same store and the same
+    analyzed_at must yield the same facts whenever the query is run. It also
+    keeps the tests in this module honest -- they place their fixtures
+    relative to NOW, so a window measured from the real clock would make every
+    assertion here a function of how long ago NOW was, and they would all
+    start failing on a date rather than on a change.
+    """
+
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("""
+            CREATE TABLE spans_enriched (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR, routing_provider VARCHAR,
+              routing_model VARCHAR, prompt_tokens BIGINT,
+              total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        _control_plane_execute(
+            db_path,
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at
+            ) VALUES ('selected', 'mac-mini', 'codex', 'codex', 'completed',
+                      'gpt-5', ?, ?)
+            """,
+            [NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans_enriched VALUES
+              ('span-1', 'selected', ?, 'openai', 'openai', 'gpt-4',
+               100, 100, 20, 0.1)
+            """,
+            [NOW],
+        )
+
+    def records_at(analyzed_at: datetime) -> int:
+        snapshot = load_operational_snapshot(
+            db_path,
+            "deterministic.telemetry_coverage",
+            "fleet",
+            "facts:v1",
+            analyzed_at=analyzed_at,
+        )
+        return snapshot.telemetry[0].input_span_records if snapshot.telemetry else 0
+
+    assert records_at(NOW) == 1
+    # One second past the lookback and the same span is gone, whatever the
+    # real date happens to be when this runs.
+    assert records_at(NOW + OPERATIONAL_SPAN_LOOKBACK + timedelta(seconds=1)) == 0
 
 
 def test_incomplete_reset_window_facts_cannot_resolve_existing_finding(
@@ -2263,7 +2339,11 @@ def test_reset_window_snapshot_marks_truncation_and_hash_tracks_window_change(
     )
     service.refresh_host(host, fetch=lambda _host: payload("many", 1, 33))
     truncated = load_operational_snapshot(
-        db_path, "deterministic.provider_reset_windows", "fleet", "facts:many"
+        db_path,
+        "deterministic.provider_reset_windows",
+        "fleet",
+        "facts:many",
+        analyzed_at=NOW,
     )
 
     assert changed != first
@@ -2314,7 +2394,11 @@ def test_empty_production_provider_windows_cannot_resolve_reset_finding(
     service._persist_new_snapshots((snapshot,), host_id="mac-mini")
     service._record_snapshot_attempts((snapshot,), attempted_at=NOW)
     loaded = load_operational_snapshot(
-        db_path, "deterministic.provider_reset_windows", "fleet", "empty:v2"
+        db_path,
+        "deterministic.provider_reset_windows",
+        "fleet",
+        "empty:v2",
+        analyzed_at=NOW,
     )
     enqueue_advisory_check(
         db_path,
@@ -2433,7 +2517,11 @@ def test_runtime_snapshot_includes_latest_provider_reset_windows(
     service.refresh_host(host, fetch=lambda _host: payload)
 
     snapshot = load_operational_snapshot(
-        db_path, "deterministic.provider_reset_windows", "fleet", "scheduled:2"
+        db_path,
+        "deterministic.provider_reset_windows",
+        "fleet",
+        "scheduled:2",
+        analyzed_at=NOW,
     )
 
     assert len(snapshot.provider_connections) == 1
@@ -2560,7 +2648,7 @@ def test_check_again_scopes_provider_finding_to_host_and_executes_current_facts(
         duckdb_path=db_path,
         repository=repository,
         snapshot_factory=lambda analyzer_id, target_id, version: load_operational_snapshot(
-            db_path, analyzer_id, target_id, version
+            db_path, analyzer_id, target_id, version, analyzed_at=NOW
         ),
     )
     result = worker.run_once([ConnectorFreshnessAnalyzer()])
