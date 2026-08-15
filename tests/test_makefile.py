@@ -6,6 +6,22 @@ import subprocess
 ROOT = Path(__file__).parents[1]
 
 
+def project_version() -> str:
+    """The version the Makefile will report, read from the file it reads.
+
+    Hardcoding it here meant every release bump broke this test after the
+    fact, in CI, on the release branch itself. The assertion worth making is
+    that `make version` agrees with pyproject.toml, not that either of them
+    says a particular number.
+    """
+
+    match = re.search(
+        r'^version\s*=\s*"([^"]+)"', (ROOT / "pyproject.toml").read_text(), re.MULTILINE
+    )
+    assert match, "pyproject.toml has no version"
+    return match.group(1)
+
+
 def assert_target_renders_valid_shell(target: str) -> None:
     planned = subprocess.run(
         ["make", "-n", target],
@@ -102,7 +118,7 @@ def test_version_target_reads_the_project_version() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "=== Version: 0.2.0 ===" in result.stdout
+    assert f"=== Version: {project_version()} ===" in result.stdout
 
 
 def test_release_tag_rejects_a_command_line_tag_override(tmp_path: Path) -> None:
@@ -128,6 +144,11 @@ def make_release_repo(tmp_path: Path) -> Path:
     shutil.copytree(ROOT / "scripts", repo / "scripts")
     (repo / "docs").mkdir()
     (repo / "docs" / "overview.md").write_text("# Overview\n")
+    # check-release-ready requires the changelog to name the version being
+    # released, so a fixture repo needs one to exercise anything past it.
+    (repo / "CHANGELOG.md").write_text(
+        f"# Changelog\n\n## [{project_version()}] - 2026-01-01\n\n- seed\n"
+    )
     for args in (
         ["git", "init", "-q", "-b", "main"],
         ["git", "config", "user.email", "test@drover.local"],
@@ -159,3 +180,35 @@ def test_release_readiness_allows_an_untagged_head_and_rejects_mismatch(
 
     assert result.returncode != 0
     assert "does not match pyproject.toml" in result.stdout
+
+
+def test_release_readiness_rejects_a_changelog_that_omits_the_version(
+    tmp_path: Path,
+) -> None:
+    # A release whose changelog does not mention it is a release nobody can
+    # read the notes for, and it is the easiest thing to forget when the
+    # version bump itself is a one-line diff.
+    repo = make_release_repo(tmp_path / "no-entry")
+    (repo / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+
+    result = subprocess.run(
+        ["make", "check-release-ready"], cwd=repo, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert "CHANGELOG.md has no" in result.stdout
+
+
+def test_release_readiness_says_what_it_did_not_check(tmp_path: Path) -> None:
+    # The gate passed on a morning when CI on main was red, and read as a
+    # release sign-off because of its name. It cannot run the suite, but it
+    # can decline to imply that it did.
+    repo = make_release_repo(tmp_path / "honest")
+
+    result = subprocess.run(
+        ["make", "check-release-ready"], cwd=repo, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "does not run the" in result.stdout
+    assert "pytest" in result.stdout
