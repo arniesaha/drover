@@ -68,7 +68,7 @@ import Testing
         let gauge = ContextGauge(messages: messages)
         #expect(gauge?.usedTokens == 158_148)
         #expect(gauge?.window == 1_000_000)
-        #expect(gauge?.text == "ctx 158.1K / 1M · 16%")
+        #expect(gauge?.text == "ctx 158.1K / 1M")
     }
 
     @Test func dropsWhenTheSessionCompacts() {
@@ -83,7 +83,7 @@ import Testing
             assistant(seq: 1, input: 16, cacheRead: 1_059_493, cacheCreation: 5_809),
             result(seq: 2, cumulativeCacheRead: 9_024_921, window: 1_000_000),
         ]
-        #expect(ContextGauge(messages: messages)?.text == "ctx 1.1M / 1M · 107%")
+        #expect(ContextGauge(messages: messages)?.text == "ctx 1.1M / 1M")
     }
 
     @Test func omitsTheDenominatorUntilAWindowIsKnown() {
@@ -141,7 +141,7 @@ import Testing
         let gauge = ContextGauge(messages: messages, harness: "codex")
 
         #expect(gauge?.usedTokens == 160_000)
-        #expect(gauge?.text == "ctx 160K / 258.4K · 62%")
+        #expect(gauge?.text == "ctx 160K / 258.4K")
     }
 
     @Test func codexOmitsGaugeWhenNewestCompletionHasNoPreciseContextUsage() {
@@ -200,7 +200,7 @@ import Testing
         ], harness: "codex")
         #expect(gauge?.usedTokens == 0)
         #expect(gauge?.window == 258_400)
-        #expect(gauge?.text == "ctx 0 / 258.4K · 0%")
+        #expect(gauge?.text == "ctx 0 / 258.4K")
     }
 
     @Test func codexWithoutWindowShowsAbsoluteUsage() {
@@ -222,6 +222,6 @@ import Testing
                 contextInput: 1_000_000_000_000_000_000
             ),
         ], harness: "codex")
-        #expect(gauge?.text == "ctx 1000000000000M / 1 · 9223372036854775807%")
+        #expect(gauge?.text == "ctx 1000000000000M / 1")
     }
 }

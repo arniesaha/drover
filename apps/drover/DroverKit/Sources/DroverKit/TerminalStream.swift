@@ -188,9 +188,29 @@ public actor TerminalStream {
 
     /// Wakes a pending reconnect backoff so the next attempt happens now.
     /// Called when the app returns to the foreground — without it, coming
-    /// back to a suspended terminal could wait out a full 30s backoff.
+    /// back to a suspended terminal could wait out a full 30s backoff — and
+    /// by the Retry button on the cold-open failure state.
+    ///
+    /// Cancelling the sleeper is only half of it. A nudge arriving while an
+    /// attempt is in flight has no sleeper to cancel and used to do nothing
+    /// at all, which made Retry a dead control exactly when it was pressed:
+    /// the attempt it landed in then failed into the full backoff the tap was
+    /// meant to avoid. The request is remembered and spent on the next
+    /// backoff instead.
+    ///
+    /// Spent once, deliberately. A standing "do not back off" would turn one
+    /// tap into a reconnect spin against a fleet that is still down.
     public func nudge() {
+        retryRequested = true
         backoffSleeper?.cancel()
+    }
+
+    /// A retry asked for while no backoff was running, waiting to be spent.
+    private var retryRequested = false
+
+    private func consumeRetryRequest() -> Bool {
+        defer { retryRequested = false }
+        return retryRequested
     }
 
     // MARK: - Pump
@@ -202,8 +222,14 @@ public actor TerminalStream {
         while !Task.isCancelled {
             if !firstAttempt {
                 continuation.yield(.connection(false))
-                await backoffSleep(backoff)
-                backoff = min(backoff * 2, .seconds(30))
+                if consumeRetryRequest() {
+                    // Asked for by hand, so the schedule starts over rather
+                    // than resuming a doubling that was already 30s deep.
+                    backoff = reconnectBaseDelay
+                } else {
+                    await backoffSleep(backoff)
+                    backoff = min(backoff * 2, .seconds(30))
+                }
                 if Task.isCancelled { break }
             }
             firstAttempt = false

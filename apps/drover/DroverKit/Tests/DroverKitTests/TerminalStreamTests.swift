@@ -187,4 +187,71 @@ struct TerminalStreamTests {
     #expect(connector.sent[0].contains(TerminalWire.inputFrame("ls\n")))
 }
 
+// -- Retry while an attempt is already running (#170 follow-up) -------------
+//
+// `nudge()` cancelled the backoff sleeper and nothing else, so it only had an
+// effect while the pump happened to be sleeping. Pressed during an attempt
+// there was no sleeper to cancel, and the Retry button the cold-open failure
+// state offers did nothing at all: the user got the spinner back and the
+// same wait they already had.
+
+@Test func retryDuringAnAttemptSkipsTheNextBackoff() async throws {
+    let connector = FakeTerminalConnector([
+        .frames([], thenError: true),        // fails without ever attaching
+        .frames([attachedFrame], thenError: false),
+    ])
+    let stream = TerminalStream(request: URLRequest(url: URL(string: "ws://test.local/t")!),
+                                connector: connector,
+                                reconnectBaseDelay: .seconds(30))
+
+    await stream.nudge()
+
+    // Elapsed time is the whole assertion. "It reconnected eventually" is
+    // true with or without the fix -- the first version of this test passed
+    // in 31.6 seconds, having waited out the very backoff it meant to prove
+    // was skipped.
+    let started = ContinuousClock.now
+    var connected = false
+    for await event in await stream.events() {
+        if case .connection(true) = event { connected = true; break }
+    }
+    let elapsed = ContinuousClock.now - started
+
+    #expect(connected)
+    #expect(connector.connectCount == 2)
+    #expect(elapsed < .seconds(5), "waited \(elapsed) for a retry that should not have slept")
+}
+
+@Test func retryIsSpentOnceRatherThanDisablingBackoffForGood() async throws {
+    // Skipping every later backoff would turn one tap into a reconnect spin
+    // against a fleet that is still down.
+    let connector = FakeTerminalConnector([
+        .frames([], thenError: true),
+        .frames([], thenError: true),
+        .frames([attachedFrame], thenError: false),
+    ])
+    let stream = TerminalStream(request: URLRequest(url: URL(string: "ws://test.local/t")!),
+                                connector: connector,
+                                reconnectBaseDelay: .seconds(30))
+
+    await stream.nudge()
+
+    let started = ContinuousClock.now
+    var failures = 0
+    for await event in await stream.events() {
+        if case .connectFailed = event {
+            failures += 1
+            if failures == 2 { break }
+        }
+    }
+    let elapsed = ContinuousClock.now - started
+
+    // Two failures arrive quickly because the retry skipped the first
+    // backoff. The third attempt is still sleeping when this returns, which
+    // is the point: the request was spent, not stored.
+    #expect(failures == 2)
+    #expect(connector.connectCount == 2)
+    #expect(elapsed < .seconds(5))
+}
+
 }

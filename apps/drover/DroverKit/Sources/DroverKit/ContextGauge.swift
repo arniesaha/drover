@@ -10,11 +10,19 @@ public struct ContextGauge: Sendable, Equatable {
     /// Nil when the newest provider-specific usage payload has no window.
     public let window: Int?
 
+    /// The fraction alone. This sits in the chat screen's subtitle, beside an
+    /// inline navigation title that has to share the same line, and a percent
+    /// derived from the two numbers printed next to it bought nothing for the
+    /// width it took: the title truncated instead ("Validating native
+    /// discovery…"), which is the half a reader cannot reconstruct (#170).
+    ///
+    /// Dropping it also retires the bound this used to need. Turning a ratio
+    /// into an Int had to guard against a window of 1 against a trillion
+    /// tokens overflowing, and the guard existed only for a number that was
+    /// redundant to begin with.
     public var text: String {
         guard let window, window > 0 else { return "ctx \(TokenCount.format(usedTokens))" }
-        let rawPercent = (Double(usedTokens) / Double(window) * 100).rounded()
-        let percent = rawPercent >= Double(Int.max) ? Int.max : Int(rawPercent)
-        return "ctx \(TokenCount.format(usedTokens)) / \(TokenCount.format(window)) · \(percent)%"
+        return "ctx \(TokenCount.format(usedTokens)) / \(TokenCount.format(window))"
     }
 
     public init?(messages: [HarnessMessage], harness: String? = nil) {
