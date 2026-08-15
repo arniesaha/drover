@@ -340,8 +340,8 @@ def test_a_store_that_cannot_be_cloned_is_still_captured_without_its_wal(
         snap.close()
 
 
-def test_snapshot_scratch_sits_beside_the_store_not_in_system_temp(tmp_path):
-    """Snapshots belong on the store's own volume, for two reasons at once.
+def test_snapshot_scratch_sits_beside_the_source_store(tmp_path):
+    """Snapshots use the source store's volume, even when that is a test temp dir.
 
     ``clonefile`` is same-volume only, so a snapshot written to the system temp
     dir while the store lives elsewhere silently falls back to a chunked read --
@@ -349,15 +349,14 @@ def test_snapshot_scratch_sits_beside_the_store_not_in_system_temp(tmp_path):
     clone engage, which also makes the copy nearly free: copy-on-write extents
     cost no space until they diverge.
 
-    The system temp dir is on the boot volume here, and these copies are
-    350-950 MB each, arriving every 15-20 minutes. That filled the disk and
-    took the hub down (#171).
+    Production stores live on the mounted data volume, so this keeps large
+    snapshots off the boot disk. Test stores intentionally live under the
+    system temporary directory, and their scratch root must follow them too.
     """
     root = db_module.snapshot_scratch_root(tmp_path / "live.duckdb")
 
     assert root.parent == tmp_path
     assert root.is_dir()
-    assert "/var/folders/" not in str(root)
 
 
 def test_orphaned_snapshot_scratch_is_swept_but_live_work_is_kept(tmp_path):
