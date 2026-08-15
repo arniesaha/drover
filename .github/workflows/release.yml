@@ -197,11 +197,26 @@ jobs:
         # build works, not which supervisor started it.
         pkill -f 'drover-server run' || true
         "$HOME/.drover/runtime/current/bin/drover-server" run &
+
+        # The server binds [server].metrics_host, which install.sh sets to the
+        # address it detected for the phone. Curling loopback regardless is
+        # what made this step fail for v0.2.0 and v0.3.0 against an install
+        # that was working: the server was serving on the LAN address the
+        # config named. Ask the config, the way the CLI now does.
+        HOST="$(python3 - <<'PY'
+import pathlib, re
+text = pathlib.Path.home().joinpath(".drover/config.toml").read_text()
+match = re.search(r'^\s*metrics_host\s*=\s*"([^"]*)"', text, re.MULTILINE)
+host = (match.group(1) if match else "").strip()
+print("127.0.0.1" if host in ("", "0.0.0.0", "::", "*") else host)
+PY
+)"
+        echo "probing the address the install configured: $HOST"
         for _ in $(seq 1 30); do
-          curl -fsS --max-time 2 http://127.0.0.1:7080/healthz && break
+          curl -fsS --max-time 2 "http://$HOST:7080/healthz" && break
           sleep 2
         done
-        curl -fsS --max-time 5 http://127.0.0.1:7080/healthz
+        curl -fsS --max-time 5 "http://$HOST:7080/healthz"
 
         OUT="$("$HOME/.drover/runtime/current/bin/drover-server" pair)"
         echo "$OUT"
