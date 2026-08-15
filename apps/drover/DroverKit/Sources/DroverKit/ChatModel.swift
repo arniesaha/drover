@@ -138,6 +138,20 @@ public final class ChatModel {
     public private(set) var queuedTurn: String?
     /// Attachments that were on a turn deferred by the same 409.
     private var queuedAttachments: [TurnAttachment] = []
+    /// Text from a send whose outcome is genuinely unknown. A transport
+    /// failure cannot distinguish "the hub never saw it" from "the hub
+    /// accepted it and the response was lost", so the text stays in the
+    /// composer for a manual retry. If the hub then streams the turn back,
+    /// it demonstrably landed, and continuing to offer the same text is an
+    /// invitation to send it twice.
+    private var unconfirmedTurnText: String?
+    /// Client-generated ID for the ambiguous request. Text alone cannot
+    /// distinguish this request from an identical turn sent on another device.
+    private var unconfirmedTurnID: String?
+    /// Attachments submitted with `unconfirmedTurnText`. An echo proves these
+    /// particular attachments landed, but not attachments the user picked
+    /// while waiting for that proof.
+    private var unconfirmedAttachments: [TurnAttachment] = []
 
     /// request_id -> the prompt still awaiting an answer. Tiny in practice:
     /// a harness blocks on one approval at a time.
@@ -304,8 +318,13 @@ public final class ChatModel {
             noteApproval(message)
             refreshRecapAfterTurnComplete(message)
             dispatchQueuedTurnIfComplete(message)
+            confirmUnconfirmedTurn(message)
         case .history(let messages, _):
             mergeHistory(messages)
+            // Losing a response usually means losing the socket too, so the
+            // echo that resolves an unconfirmed send often arrives here
+            // rather than as a live message.
+            messages.forEach(confirmUnconfirmedTurn)
         case .connection(let connected):
             isConnected = connected
             if connected { hasConnectedOnce = true }
@@ -422,17 +441,22 @@ public final class ChatModel {
         isSending = true
         defer { isSending = false }
         let preferences = turnPreferences
+        let clientTurnID = UUID().uuidString
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
                 text: text,
                 images: images,
                 model: preferences.model,
-                thinkingEffort: preferences.thinking
+                thinkingEffort: preferences.thinking,
+                clientTurnID: clientTurnID
             )
             composerText = ""
             pendingAttachments = []
             hint = nil
+            unconfirmedTurnText = nil
+            unconfirmedTurnID = nil
+            unconfirmedAttachments = []
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // The harness rejects overlapping turns — queue instead of
             // erroring, and dispatch when the turn-complete status arrives.
@@ -445,9 +469,56 @@ public final class ChatModel {
             hint = "Queued — sends when the current response finishes."
         } catch {
             // Preserve composerText/attachments on failure (other 409s or
-            // transport) so the user can retry without retyping.
+            // transport) so the user can retry without retyping. Whether the
+            // hub saw this turn is unknown until it does or does not echo.
+            unconfirmedTurnText = text
+            unconfirmedTurnID = clientTurnID
+            unconfirmedAttachments = images
             applyHint(for: error, action: "send")
         }
+    }
+
+    /// The hub echoing a `user_input` with this client's turn ID proves the
+    /// unconfirmed send landed despite the client seeing a failure. Take the
+    /// text back out of the composer: leaving it there reads as "not sent"
+    /// and the obvious next action duplicates the turn.
+    ///
+    /// Only an exact match clears. If the user has typed since, the composer
+    /// holds their words too, and silently discarding those to resolve our
+    /// own ambiguity would be the worse trade.
+    private func confirmUnconfirmedTurn(_ message: HarnessMessage) {
+        guard message.type == .userInput,
+              let unconfirmed = unconfirmedTurnText,
+              let unconfirmedTurnID,
+              message.turnID == unconfirmedTurnID
+        else { return }
+        unconfirmedTurnText = nil
+        self.unconfirmedTurnID = nil
+        let landedAttachments = unconfirmedAttachments
+        unconfirmedAttachments = []
+
+        // A manual retry can be rejected and queued while the original,
+        // ambiguously failed request is still in flight. Once its echo
+        // arrives, that matching queue entry is a confirmed duplicate. Keep
+        // any retry-only attachments available for the next turn instead of
+        // silently dropping them with the cancelled retry.
+        if queuedTurn == unconfirmed {
+            queuedTurn = nil
+            pendingAttachments = queuedAttachments + pendingAttachments
+            queuedAttachments = []
+        }
+
+        // Remove the attachments proved to have landed one at a time so any
+        // attachment selected after the failed send stays in the composer.
+        for attachment in landedAttachments {
+            if let index = pendingAttachments.firstIndex(of: attachment) {
+                pendingAttachments.remove(at: index)
+            }
+        }
+        if composerText.trimmingCharacters(in: .whitespacesAndNewlines) == unconfirmed {
+            composerText = ""
+        }
+        hint = nil
     }
 
     /// Every harness driver marks end-of-turn with a `status` message whose
@@ -527,15 +598,20 @@ public final class ChatModel {
 
     private func sendQueued(_ text: String, images: [TurnAttachment]) async {
         let preferences = turnPreferences
+        let clientTurnID = UUID().uuidString
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
                 text: text,
                 images: images,
                 model: preferences.model,
-                thinkingEffort: preferences.thinking
+                thinkingEffort: preferences.thinking,
+                clientTurnID: clientTurnID
             )
             hint = nil
+            unconfirmedTurnText = nil
+            unconfirmedTurnID = nil
+            unconfirmedAttachments = []
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // Raced a new turn (e.g. an approval resumed it) — keep waiting
             // for the next turn-complete.
@@ -548,6 +624,9 @@ public final class ChatModel {
             // for a manual retry rather than dropping them silently.
             composerText = composerText.isEmpty ? text : "\(text)\n\(composerText)"
             pendingAttachments = images + pendingAttachments
+            unconfirmedTurnText = text
+            unconfirmedTurnID = clientTurnID
+            unconfirmedAttachments = images
             applyHint(for: error, action: "send")
         }
     }

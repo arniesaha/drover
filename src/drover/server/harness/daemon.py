@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, unquote, urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from drover.config import config_home, default_token_file, resolve_api_token_env
 from drover.server.harness.auth import (
@@ -421,6 +421,16 @@ def _optional_identifier(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text.strip() else None
+
+
+def _optional_client_turn_id(value: Any) -> str | None:
+    turn_id = _optional_identifier(value)
+    if turn_id is None:
+        return None
+    try:
+        return str(UUID(turn_id))
+    except ValueError as exc:
+        raise ValueError("client_turn_id must be a UUID") from exc
 
 
 def discover_native_resume_sessions(
@@ -2145,6 +2155,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         model = _optional_identifier(body.get("model"))
         thinking_effort = _optional_identifier(body.get("thinking_effort"))
+        try:
+            client_turn_id = _optional_client_turn_id(body.get("client_turn_id"))
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         harness = self.server.state.structured.harness_for(session_id)
         # Claude owns one persistent process, so later turn preferences cannot
         # affect the running model. Silently ignore overrides from older/direct
@@ -2175,6 +2190,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 images=saved or None,
                 model=model,
                 thinking_effort=thinking_effort,
+                client_turn_id=client_turn_id,
             )
             self.server.state.registry.update_session_preferences(
                 session_id,
