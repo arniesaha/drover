@@ -42,6 +42,12 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     /// Fired on the main actor whenever the connection comes up or drops —
     /// drives the "Reconnecting…" pill.
     var onConnectionChanged: ((Bool) -> Void)?
+    /// Fired on the main actor when an attempt ended without ever attaching,
+    /// with the reason. Separate from `onConnectionChanged(false)`, which also
+    /// fires for a drop after the terminal was live: only a never-attached
+    /// attempt says the session has never been reachable, and only that case
+    /// leaves a black screen with nothing on it to explain itself (#170).
+    var onConnectFailed: ((String) -> Void)?
 
     init(request: URLRequest) {
         stream = TerminalStream(request: request)
@@ -128,6 +134,8 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
             onSessionEnded?()
         case .connection(let up):
             onConnectionChanged?(up)
+        case .connectFailed(let reason):
+            onConnectFailed?(reason)
         }
     }
 

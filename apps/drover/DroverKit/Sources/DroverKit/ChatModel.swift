@@ -21,6 +21,10 @@ public final class ChatModel {
     /// suppress its "reconnecting" indicator during the initial connect
     /// (when there is nothing to *re*-connect to yet).
     public private(set) var hasConnectedOnce = false
+    /// Failed first connects, and the reason for the newest one. Counting
+    /// stops the moment a session attaches: from then on a dropped socket is
+    /// the reconnecting pill's business, over a transcript already on screen.
+    private var coldOpen = ColdOpenTracker()
     public private(set) var hasOlderHistory = false
     public private(set) var isLoadingOlderHistory = false
     /// True while an `approve(_:)` network call is in flight; the UI should
@@ -286,6 +290,25 @@ public final class ChatModel {
         recapRefreshGeneration &+= 1
     }
 
+    /// Why a first connect has not landed, once it has failed often enough to
+    /// owe an explanation — the cold open's third state (#170). Nil during a
+    /// normal first connect however slow, and nil for good once a session has
+    /// attached.
+    public var coldOpenFailure: String? { coldOpen.detail }
+
+    /// Reopens a cold open that gave up.
+    ///
+    /// A full stop/start rather than clearing the message and waiting:
+    /// `MessageStream` keeps its own doubling backoff capped at 30s, so by the
+    /// time a failure has been read and tapped, the next scheduled attempt can
+    /// be most of a minute away. Tearing the pump down and starting a fresh
+    /// one puts the attempt on the user's schedule instead of the backoff's.
+    public func retryConnect() {
+        stop()
+        coldOpen.reset()
+        start()
+    }
+
     @discardableResult
     public func loadOlderHistory() async -> Bool {
         guard hasOlderHistory, !isLoadingOlderHistory else { return false }
@@ -327,7 +350,16 @@ public final class ChatModel {
             messages.forEach(confirmUnconfirmedTurn)
         case .connection(let connected):
             isConnected = connected
-            if connected { hasConnectedOnce = true }
+            if connected {
+                hasConnectedOnce = true
+                coldOpen.reset()
+            }
+        case .connectFailed(let reason):
+            // Only a cold open needs this. After the first attach the pill
+            // already covers a drop, and escalating to a full unreachable
+            // state would hide history the user can still read.
+            guard !hasConnectedOnce else { break }
+            coldOpen.noteFailure(reason)
         case .unauthorized:
             // Terminal: MessageStream has already stopped reconnecting (see
             // its doc comment on `.unauthorized`). Surface a hint instead of

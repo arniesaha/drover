@@ -89,13 +89,25 @@ struct ChatView: View {
                     // ScrollView past its own content. The transcript was
                     // fully populated (189 messages, 63 rows, confirmed on
                     // device) and the screen was blank.
-                    if DroverLoadingMark.shouldShow(
+                    switch ColdOpenTracker.state(
                         hasConnectedOnce: model.hasConnectedOnce,
-                        elapsed: coldOpenIsSlow ? DroverLoadingMark.appearAfter : 0
+                        failure: model.coldOpenFailure,
+                        elapsed: coldOpenIsSlow ? ColdOpenTracker.appearAfter : 0
                     ) {
+                    case .quiet:
+                        EmptyView()
+                    case .connecting:
                         DroverLoadingMarkView()
                             .transition(.opacity)
                             .animation(.easeIn(duration: 0.2), value: coldOpenIsSlow)
+                    case .unreachable(let detail):
+                        // The spinner is replaced, not joined: leaving it up
+                        // beside the message would go on claiming progress
+                        // that is not happening.
+                        ColdOpenFailureView(detail: detail,
+                                            accessibilityID: "chat-cold-open-failed") {
+                            model.retryConnect()
+                        }
                     }
                 }
 
@@ -150,7 +162,7 @@ struct ChatView: View {
         // behind it: `loadSessionMetadata` above suspends, and a timer sharing
         // that task would not tick until it returned.
         .task {
-            try? await Task.sleep(for: .seconds(DroverLoadingMark.appearAfter))
+            try? await Task.sleep(for: .seconds(ColdOpenTracker.appearAfter))
             guard !Task.isCancelled else { return }
             coldOpenIsSlow = true
         }

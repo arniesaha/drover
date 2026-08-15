@@ -56,7 +56,7 @@ struct StreamTests {
         switch event {
         case let .message(message): texts.append(message.text)
         case let .history(messages, _): texts.append(contentsOf: messages.map(\.text))
-        case .connection, .unauthorized: break
+        case .connection, .connectFailed, .unauthorized: break
         }
         if texts.count == 3 { break }
     }
@@ -92,7 +92,7 @@ struct StreamTests {
         case let .connection(up):
             if !up { sawDisconnect = true }
             else if sawDisconnect { sawReconnectUp = true }
-        case .unauthorized: break
+        case .connectFailed, .unauthorized: break
         }
         if got.count == 2, sawReconnectUp { break }
     }
@@ -119,7 +119,7 @@ struct StreamTests {
         switch event {
         case let .message(message): texts.append(message.text)
         case let .history(messages, _): texts.append(contentsOf: messages.map(\.text))
-        case .connection, .unauthorized: break
+        case .connection, .connectFailed, .unauthorized: break
         }
         if texts.count == 3 { break }
     }
@@ -152,13 +152,64 @@ struct StreamTests {
         case let .message(m): texts.append(m.text)
         case let .history(messages, _): texts.append(contentsOf: messages.map(\.text))
         case let .connection(up): connections.append(up)
-        case .unauthorized: break
+        case .connectFailed, .unauthorized: break
         }
         if texts.count == 2, connections.contains(true) { break }
     }
     #expect(texts == ["one", "two"])
     #expect(connections == [false, true])
     #expect(restCalls == 2)
+}
+
+@Test func aFailedCatchUpSaysWhyBeforeItBacksOff() async throws {
+    // The catch below this used to be a bare `continue`: the reason a cold
+    // open could not reach the hub never left the pump, so the screen had a
+    // spinner and nothing else to show (#170). The reason is the client's own
+    // sentence, not URLSession's — the phone's radio being fine says nothing
+    // about whether the fleet answered.
+    nonisolated(unsafe) var restCalls = 0
+    MockURLProtocol.handler = { _ in
+        restCalls += 1
+        if restCalls == 1 {
+            return (500, Data(#"{"error": "boom"}"#.utf8))
+        }
+        return (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
+    }
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: FakeConnector([.frames([], thenError: false)]),
+        reconnectBaseDelay: .milliseconds(10))
+    var failures: [String] = []
+    for await event in await stream.events() {
+        if case let .connectFailed(reason) = event { failures.append(reason) }
+        if case .connection(true) = event { break }
+    }
+    #expect(failures == ["boom"])
+}
+
+/// A drop after the session attached is the reconnecting pill's business, and
+/// the pill has never needed a reason. Emitting one here would put an error
+/// screen over a transcript the user can already read.
+@Test func aDropAfterAttachingStillReportsItselfForTheColdOpenToIgnore() async throws {
+    nonisolated(unsafe) var restCalls = 0
+    MockURLProtocol.handler = { _ in
+        restCalls += 1
+        return (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
+    }
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: FakeConnector([
+            .frames([], thenError: true),
+            .frames([], thenError: false),
+        ]),
+        reconnectBaseDelay: .milliseconds(10))
+    var events: [StreamEvent] = []
+    for await event in await stream.events() {
+        events.append(event)
+        if events.filter({ $0 == .connection(true) }).count == 2 { break }
+    }
+    #expect(!events.contains { if case .connectFailed = $0 { return true } else { return false } },
+            "a socket drop after a healthy catch-up was reported as a failed connect")
 }
 
 @Test func catchUpUnauthorizedEmitsTerminalSignalWithoutSpinning() async throws {
@@ -228,7 +279,7 @@ struct StreamTests {
             batches.append(messages.map(\.seq))
         case let .message(message): live.append(message.seq)
         case .connection(false): catchUpFailed = true
-        case .connection(true), .unauthorized: break
+        case .connection(true), .connectFailed, .unauthorized: break
         }
         if live == [6] || catchUpFailed { break }
     }
@@ -286,7 +337,7 @@ struct StreamTests {
         case let .history(messages, _): batches.append(messages.map(\.seq))
         case let .message(message): live.append(message.seq)
         case .connection(false): drops += 1
-        case .connection(true), .unauthorized: break
+        case .connection(true), .connectFailed, .unauthorized: break
         }
         // One drop is the scripted failure; more means the stream is
         // restarting the cold window instead of resuming it.
@@ -343,7 +394,7 @@ struct StreamTests {
         switch event {
         case let .history(messages, _): batches.append(messages.map(\.seq))
         case .connection(false): drops += 1
-        case .message, .connection(true), .unauthorized: break
+        case .message, .connection(true), .connectFailed, .unauthorized: break
         }
         if !batches.isEmpty || drops > 1 { break }
     }
@@ -388,7 +439,7 @@ struct StreamTests {
         case let .history(messages, _): batch = messages
         case let .message(message): live.append(message.seq)
         case .connection(false): drops += 1
-        case .connection(true), .unauthorized: break
+        case .connection(true), .connectFailed, .unauthorized: break
         }
         // Wait for the live frame, not just the batch: the socket is attached
         // *after* the window is published, so leaving at `.history` would race
@@ -481,7 +532,7 @@ struct StreamTests {
         switch event {
         case let .history(messages, _) where !messages.isEmpty: batch = messages
         case .connection(false): drops += 1
-        case .history, .message, .connection(true), .unauthorized: break
+        case .history, .message, .connection(true), .connectFailed, .unauthorized: break
         }
         if !batch.isEmpty || drops > MessageStream.gapRetryLimit + 2 { break }
     }
@@ -744,7 +795,7 @@ struct StreamTests {
         switch event {
         case let .message(message): delivered.append(message.seq)
         case .connection(false): break
-        case .history, .connection(true), .unauthorized: continue
+        case .history, .connection(true), .connectFailed, .unauthorized: continue
         }
         break
     }

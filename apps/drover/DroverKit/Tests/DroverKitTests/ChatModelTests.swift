@@ -1123,6 +1123,85 @@ struct ChatModelTests {
     #expect(model.hasConnectedOnce == true)    // latches
 }
 
+/// #170: with the fleet unreachable on a cold open, the chat screen showed a
+/// spinner and said nothing — indistinguishable from a hang. The stream was
+/// retrying the whole time and swallowing every reason.
+@Test @MainActor func aColdOpenThatKeepsFailingStopsPretendingItIsSlow() async throws {
+    let model = ChatModel.fixture()
+    #expect(model.coldOpenFailure == nil)
+    model.ingest(.connectFailed("Can't reach the hub"))
+    #expect(model.coldOpenFailure == nil, "one blip is normal")
+    model.ingest(.connectFailed("Can't reach the hub"))
+    #expect(model.coldOpenFailure == "2 attempts · Can't reach the hub")
+}
+
+@Test @MainActor func connectingClearsTheColdOpenFailure() async throws {
+    let model = ChatModel.fixture()
+    model.ingest(.connectFailed("Can't reach the hub"))
+    model.ingest(.connectFailed("Can't reach the hub"))
+    #expect(model.coldOpenFailure != nil)
+    model.ingest(.connection(true))
+    #expect(model.coldOpenFailure == nil)
+}
+
+/// Once the transcript is on screen, a dropped socket is the reconnecting
+/// pill's job. Escalating it to the unreachable state would cover readable
+/// history with an error the user cannot act on any better than waiting.
+@Test @MainActor func failuresAfterTheFirstConnectionStayWithThePill() async throws {
+    let model = ChatModel.fixture()
+    model.ingest(.connection(true))
+    model.ingest(.connection(false))
+    for _ in 0..<5 { model.ingest(.connectFailed("Can't reach the hub")) }
+    #expect(model.coldOpenFailure == nil)
+}
+
+/// Retry has to reopen the socket, not just hide the message. `MessageStream`
+/// keeps its own doubling backoff (capped at 30s), so by the time the failure
+/// has been read and tapped, the next scheduled attempt can be most of a
+/// minute away — a Retry that only cleared state would look broken.
+@Test @MainActor func retryReopensTheStreamRatherThanJustClearingTheMessage() async throws {
+    MockURLProtocol.handler = { _ in
+        (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
+    }
+    let connector = FakeConnector([
+        .frames([], thenError: false),
+        .frames([], thenError: false),
+    ])
+    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+        MessageStream(client: client, sessionID: sessionID, connector: connector,
+                      reconnectBaseDelay: .milliseconds(10))
+    })
+    model.start()
+    try await waitUntil { connector.requests.count == 1 }
+
+    model.retryConnect()
+    try await waitUntil { connector.requests.count == 2 }
+    model.stop()
+}
+
+/// And it has to hand the restraint back its blank slate: a second Retry that
+/// reported failure on its first dropped attempt would make the "one blip is
+/// normal" rule apply exactly once per screen.
+@Test @MainActor func retryClearsTheFailureAndStartsTheRestraintOver() async throws {
+    // 500s forever behind a backoff long enough that the restarted pump
+    // cannot land a failure of its own inside this test.
+    MockURLProtocol.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
+    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+        MessageStream(client: client, sessionID: sessionID,
+                      connector: FakeConnector([.frames([], thenError: false)]),
+                      reconnectBaseDelay: .seconds(60))
+    })
+    model.ingest(.connectFailed("Can't reach the hub"))
+    model.ingest(.connectFailed("Can't reach the hub"))
+    #expect(model.coldOpenFailure != nil)
+
+    model.retryConnect()
+    #expect(model.coldOpenFailure == nil)
+    model.ingest(.connectFailed("Can't reach the hub"))
+    #expect(model.coldOpenFailure == nil, "the restraint did not survive a retry")
+    model.stop()
+}
+
 @Test @MainActor func olderHistoryIsLoadedOnlyAfterExplicitRequest() async throws {
     MockURLProtocol.handler = { request in
         switch request.url?.query {

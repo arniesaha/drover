@@ -39,6 +39,11 @@ struct TerminalScreen: View {
     /// `TerminalStream` emits `.connection(true)` before any drop can.
     @State private var isReconnecting = false
     @State private var hasConnectedOnce = false
+    /// Failed first attaches. A PTY that never attaches shows a black screen,
+    /// which is quieter still than chat's spinner — nothing on it changes to
+    /// suggest anything is being attempted (#170). Chat's copy of this lives
+    /// on `ChatModel`; this screen has no model, so it lives here.
+    @State private var coldOpen = ColdOpenTracker()
     @State private var bridgeHolder = BridgeHolder()
     @State private var showTerminateConfirm = false
     @State private var terminateHint: String?
@@ -67,8 +72,15 @@ struct TerminalScreen: View {
                 holder: bridgeHolder,
                 onSessionEnded: { sessionEnded = true },
                 onConnectionChanged: { up in
-                    if up { hasConnectedOnce = true }
+                    if up {
+                        hasConnectedOnce = true
+                        coldOpen.reset()
+                    }
                     isReconnecting = !up
+                },
+                onConnectFailed: { reason in
+                    guard !hasConnectedOnce else { return }
+                    coldOpen.noteFailure(reason)
                 }
             )
         }
@@ -85,6 +97,18 @@ struct TerminalScreen: View {
         .overlay {
             if sessionEnded {
                 SessionEndedOverlay { dismiss() }
+            } else if !hasConnectedOnce, let detail = coldOpen.detail {
+                // Retry wakes the stream's backoff rather than rebuilding the
+                // socket: `TerminalStream` is already reattaching on a
+                // schedule, and by the time this message has been read and
+                // tapped that schedule can be 30s out. The button's job is to
+                // make the next attempt happen now — the same nudge the
+                // foreground transition below uses, for the same reason.
+                ColdOpenFailureView(detail: detail,
+                                    accessibilityID: "terminal-cold-open-failed") {
+                    coldOpen.reset()
+                    bridgeHolder.bridge?.reconnectNow()
+                }
             }
         }
         // Returning to the foreground: iOS suspended the socket while
@@ -185,6 +209,7 @@ private struct TerminalRepresentable: UIViewRepresentable {
     let holder: BridgeHolder
     let onSessionEnded: () -> Void
     let onConnectionChanged: (Bool) -> Void
+    let onConnectFailed: (String) -> Void
 
     func makeCoordinator() -> TerminalBridge {
         TerminalBridge(request: client.terminalRequest(sessionID: sessionID))
@@ -204,6 +229,7 @@ private struct TerminalRepresentable: UIViewRepresentable {
         view.nativeForegroundColor = UIColor(red: 0.86, green: 0.91, blue: 0.95, alpha: 1.0)
         context.coordinator.onSessionEnded = onSessionEnded
         context.coordinator.onConnectionChanged = onConnectionChanged
+        context.coordinator.onConnectFailed = onConnectFailed
         holder.bridge = context.coordinator
         context.coordinator.attach(view)
         context.coordinator.installNavigationGesture(on: view)
