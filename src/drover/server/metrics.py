@@ -41,6 +41,7 @@ from drover.server.db import (
     open_duckdb_connection,
 )
 from drover.server.jobs import RedisJobStream
+from drover.server.readiness import ReadinessProbe
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
 
@@ -897,6 +898,22 @@ class MetricsCollector:
     _session_locks_guard: threading.Lock = field(
         default_factory=threading.Lock, init=False
     )
+    _readiness: "ReadinessProbe | None" = field(default=None, init=False)
+    _readiness_guard: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def render_readiness(self, *, include_detail: bool = True) -> tuple[int, str]:
+        """Answer ``/readyz``: 200 only while both stores still serve (#175).
+
+        The probe is built once and kept, because it owns the brief cache that
+        stops a hot poller turning readiness into load. ``include_detail`` is
+        false for an unauthenticated caller: the verdict is public, the
+        DuckDB error behind it is not.
+        """
+        with self._readiness_guard:
+            if self._readiness is None:
+                self._readiness = ReadinessProbe(self.duckdb_path)
+            probe = self._readiness
+        return probe.check().as_response(include_detail=include_detail)
 
     def render_prometheus(self) -> str:
         self._refresh_if_needed()

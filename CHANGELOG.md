@@ -76,6 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `/readyz` now probes both DuckDB stores and answers `503`, naming the failing
+  store, when a handle can no longer be queried; it previously answered
+  `200 ok` while every query against an invalidated database failed
 - Reduced timeout spikes on `/harness` endpoints during background scans
 - Fixed session link reconciliation for integration-specific event namespaces
 - Corrected repository attribution for cross-machine path collection
