@@ -7,7 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-15
+
 ### Added
+
+- DeepSeek Harness (`dsh`) as a launchable structured harness, with model
+  catalog, authentication flow, and turn correlation
+- iOS launch sheet reworked: host and harness snapshot loading, working
+  directory suggestions, and model and reasoning-effort preferences carried
+  into a new session
+- `/readyz` readiness endpoint that queries the database handle rather than
+  checking that the process is alive
+- Favorite working directories can name the host they belong to, so a path
+  that exists on one machine is no longer offered for the rest of the fleet
+
+### Changed
+
+- OpenClaw is no longer offered as a session target. It shipped as a default
+  preset with no structured driver, so selecting it produced an internal
+  error. Its telemetry ingestion is unchanged: it remains an observed agent
+- Antigravity turns are no longer capped at five minutes. `agy --print`
+  defaults to a 5m0s deadline, which ended long turns mid-command and reported
+  the result as a completed turn followed by a bare exit code
+
+### Fixed
+
+- DuckDB snapshots are captured atomically. The copy read a live store as
+  three unsynchronized filesystem operations, so a snapshot taken during a
+  write corrupted the handle: the server stayed up, the process looked
+  healthy, and every query failed
+- Snapshot copies are written beside the store rather than into the system
+  temporary directory, and orphans are swept at startup. They had accumulated
+  at roughly one directory every fifteen minutes and filled the boot volume
+- The readiness probe can no longer wedge the server. It waited on the
+  control-plane lock unbounded while holding its own cache lock, so one
+  blocked probe stacked every later request behind it
+- A Codex session no longer dies at argument parsing when the prompt begins
+  with a dash. A prompt written as a markdown bullet list was read as a
+  command-line option and the turn exited before it began
+- A DeepSeek session refuses to launch against a working directory that does
+  not exist, rather than anchoring its sandbox workspace to an unusable root
+- A non-zero harness exit is recorded on the host with the turn and return
+  code, and the app distinguishes a process that failed after completing its
+  turn from one that failed before producing anything
+
+### Added in earlier development
 
 - Fleet management cockpit for iOS app with grouped live sessions by host
 - Context store with Parquet facts and DuckDB derived views
