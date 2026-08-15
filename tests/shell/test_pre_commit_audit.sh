@@ -87,6 +87,27 @@ git -C "$REPO" add docs/roadmap.md
 git -C "$REPO" commit -q -m "docs: roadmap" > "$WORK/roadmap.log" 2>&1
 check "docs/roadmap.md is rejected" "$?" "1"
 
+# Renaming a tracked file into a private planning path publishes a new path
+# without adding file content. The hook must audit the rename destination.
+REPO="$(new_repo renamed-roadmap)"
+git -C "$REPO" mv docs/overview.md docs/roadmap.md
+git -C "$REPO" commit -q -m "docs: rename overview" > "$WORK/rename.log" 2>&1
+check "a rename into docs/roadmap.md is rejected" "$?" "1"
+check "the rename rejection names the private-planning rule" \
+  "$(grep -c 'docs/roadmap.md:1: private-planning-path' "$WORK/rename.log")" "1"
+
+# A type change from a regular file to a symlink publishes the symlink target
+# as content. Audit that blob without dereferencing the target outside the
+# materialized index tree.
+REPO="$(new_repo symlink)"
+rm "$REPO/docs/overview.md"
+ln -s /Users/alice/private/drover "$REPO/docs/overview.md"
+git -C "$REPO" add -A
+git -C "$REPO" commit -q -m "docs: link overview" > "$WORK/symlink.log" 2>&1
+check "a symlink with a private target is rejected" "$?" "1"
+check "the symlink rejection audits its target text" \
+  "$(grep -c 'personal-home-path' "$WORK/symlink.log")" "1"
+
 # Path rules are the cheap half. Content rules have to run too, and against a
 # file that was already tracked.
 REPO="$(new_repo content)"
@@ -131,6 +152,18 @@ REPO="$(new_repo deletion)"
 git -C "$REPO" rm -q docs/overview.md
 git -C "$REPO" commit -q -m "docs: drop overview" > "$WORK/deletion.log" 2>&1
 check "a staged deletion commits" "$?" "0"
+
+# `uv sync --extra dev` creates .venv, so the hook must prefer its supported
+# interpreter over an arbitrary earlier python3 on PATH.
+REPO="$(new_repo project-venv)"
+mkdir -p "$REPO/.venv/bin" "$REPO/test-bin"
+ln -s "$(command -v python3)" "$REPO/.venv/bin/python"
+printf '#!/usr/bin/env bash\nexit 99\n' > "$REPO/test-bin/python3"
+chmod +x "$REPO/test-bin/python3"
+printf 'A clean note.\n' > "$REPO/docs/venv.md"
+git -C "$REPO" add docs/venv.md
+PATH="$REPO/test-bin:$PATH" git -C "$REPO" commit -q -m "docs: use project venv" > "$WORK/venv.log" 2>&1
+check "the hook prefers the project virtual environment" "$?" "0"
 
 # This repository is routinely checked out under a directory with a space in
 # it, and staged paths can contain spaces too.

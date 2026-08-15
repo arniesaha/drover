@@ -18,25 +18,33 @@ AUDIT="scripts/check_public_release.py"
 # A branch that does not carry the audit cannot be held to it.
 [ -f "$AUDIT" ] || exit 0
 
-PYTHON=""
-for candidate in python3 python; do
-  if command -v "$candidate" > /dev/null 2>&1; then
-    PYTHON="$candidate"
-    break
-  fi
-done
+PYTHON="$REPO_ROOT/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON=""
+  for candidate in python3 python; do
+    if command -v "$candidate" > /dev/null 2>&1; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
 if [ -z "$PYTHON" ]; then
-  echo "pre-commit: no python interpreter found, skipping the public release audit" >&2
-  echo "pre-commit: CI will still run it" >&2
-  exit 0
+  echo "pre-commit: Python 3.11+ is required for the public release audit." >&2
+  echo "pre-commit: run 'uv sync --extra dev' or commit deliberately with --no-verify." >&2
+  exit 1
+fi
+if ! "$PYTHON" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; then
+  echo "pre-commit: Python 3.11+ is required for the public release audit." >&2
+  echo "pre-commit: run 'uv sync --extra dev' or commit deliberately with --no-verify." >&2
+  exit 1
 fi
 
 WORK="$(mktemp -d)" || exit 1
 trap 'rm -rf "$WORK"' EXIT
 
-# Added, copied and modified paths. A deletion publishes no content, and its
-# file is gone from disk anyway.
-git diff --cached --name-only -z --diff-filter=ACM > "$WORK/staged" || exit 1
+# Added, copied, modified, renamed, and type-changed paths. A deletion
+# publishes no content, and its file is gone from disk anyway.
+git diff --cached -M --name-only -z --diff-filter=ACMRT > "$WORK/staged" || exit 1
 
 STAGED=()
 while IFS= read -r -d '' path; do
@@ -48,9 +56,13 @@ done < "$WORK/staged"
 # further, and only the staged content becomes the public commit, so reading
 # the working copy can clear a commit that is about to publish a violation.
 mkdir -p "$WORK/tree" || exit 1
+if ! git cat-file -e ":$AUDIT"; then
+  exit 0
+fi
+git checkout-index --prefix="$WORK/tree/" --force -- "$AUDIT" || exit 1
 git checkout-index --prefix="$WORK/tree/" --force -z --stdin < "$WORK/staged" || exit 1
 
-if (cd "$WORK/tree" && "$PYTHON" "$REPO_ROOT/$AUDIT" --root "$WORK/tree" \
+if (cd "$WORK/tree" && "$PYTHON" "$WORK/tree/$AUDIT" --root "$WORK/tree" \
       "${STAGED[@]}") > "$WORK/findings" 2>&1; then
   exit 0
 fi

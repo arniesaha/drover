@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -176,7 +177,14 @@ def check_paths(paths: Sequence[Path], *, root: Path) -> list[Finding]:
             )
 
         try:
-            data = path.read_bytes()
+            # A staged type change can replace a regular file with a symlink.
+            # Audit the link target stored in Git, rather than dereferencing a
+            # path outside the materialized index tree.
+            data = (
+                os.fsencode(os.readlink(path))
+                if path.is_symlink()
+                else path.read_bytes()
+            )
         except (OSError, ValueError):
             continue
         if b"\0" in data:
@@ -272,7 +280,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def _resolve_within(paths: Sequence[Path], root: Path) -> list[Path] | None:
     resolved: list[Path] = []
     for raw in paths:
-        path = raw.resolve()
+        # Resolve `.` and `..` to enforce the lexical root boundary, but do
+        # not follow symlinks: their target is staged content to audit, not a
+        # location we should read from outside the audit tree.
+        path = raw if raw.is_absolute() else Path.cwd() / raw
+        path = Path(os.path.abspath(path))
         try:
             path.relative_to(root)
         except ValueError:

@@ -240,3 +240,16 @@ def test_main_refuses_paths_outside_the_audit_root(tmp_path: Path, capsys) -> No
 
     assert main([str(outside), "--root", str(root)]) == 2
     assert "outside" in capsys.readouterr().out
+
+
+def test_main_audits_a_symlink_target_without_following_it(
+    tmp_path: Path, capsys
+) -> None:
+    path = tmp_path / "docs" / "overview.md"
+    path.parent.mkdir()
+    path.symlink_to("/Users/alice/private/drover")
+
+    assert main([str(path), "--root", str(tmp_path)]) == 1
+
+    output = capsys.readouterr().out
+    assert "docs/overview.md:1: personal-home-path" in output
