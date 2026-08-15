@@ -116,10 +116,7 @@ struct ChatView: View {
             }
 
             if let hint = model.hint {
-                Text(hint)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .padding(.horizontal)
+                ChatHintBanner(hint)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
