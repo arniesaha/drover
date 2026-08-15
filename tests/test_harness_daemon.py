@@ -694,6 +694,7 @@ def test_model_preference_validation_preserves_opaque_identifier_whitespace(
                 "images": None,
                 "model": raw_model,
                 "thinking_effort": raw_effort,
+                "client_turn_id": None,
             },
         )
     ]
@@ -779,7 +780,12 @@ def test_model_preference_validation_discards_claude_turn_overrides(
         (
             "session-1",
             "continue",
-            {"images": None, "model": None, "thinking_effort": None},
+            {
+                "images": None,
+                "model": None,
+                "thinking_effort": None,
+                "client_turn_id": None,
+            },
         )
     ]
 
