@@ -1,6 +1,6 @@
 .PHONY: help docs lint test build clean release status version check-lint check-release-ready pr-setup pr-commit pr-push pr-create release-validate example-one-click-release
 
-VERSION = $(shell grep "^version" pyproject.toml | awk '{print $$2}' | tr -d '"')
+VERSION = $(shell grep "^version" pyproject.toml | awk '{print $$3}' | tr -d '"')
 BUILD_DIR := dist
 
 .DEFAULT_GOAL := help
@@ -12,13 +12,11 @@ help: ## Show this help message
 	@printf '\n'
 
 docs: ## Validate all documentation files
-	@echo "=== Validating Documentation ===" && \
-	test -f README.md && echo "✓ README.md" || exit 1 && \
-	test -f docs/architecture.md && echo "✓ docs/architecture.md" || exit 1 && \
-	test -f docs/context-store.md && echo "✓ docs/context-store.md" || exit 1 && \
-	test -f docs/threat-model.md && echo "✓ docs/threat-model.md" || exit 1 && \
-	test -f docs/mcp-tools.md && echo "✓ docs/mcp-tools.md" || exit 1 && \
-	test -f docs/porting-and-cutover.md && echo "✓ docs/porting-and-cutover.md" || exit 1 && \
+	@echo "=== Validating Documentation ==="; \
+	for doc in README.md $$(find docs -type f -name '*.md' | sort); do \
+		test -f "$$doc" || exit 1; \
+		echo "✓ $$doc"; \
+	done; \
 	echo "✓ All documentation files validated"
 
 check-release-ready: ## Verify repo is ready for release
@@ -38,7 +36,7 @@ check-release-ready: ## Verify repo is ready for release
 
 	@echo "3. Codebase health:" && \
 	if test -f src/drover/__init__.py; then \
-		TODOS=$$(find src/drover -name "*.py" -exec grep -r "TODO\|FIXME\|XXX\|HACK" {} \+ 2>/dev/null | grep -v "^\s*# " || echo "none"); \
+		TODOS=$$(find src/drover -name "*.py" -exec grep -r "TODO\|FIXME\|XXX\|HACK" {} \+ 2>/dev/null | grep -v "^\s*# " || true); \
 		if [ -z "$$TODOS" ]; then echo "  ✓ No TODOs/FIXMEs in codebase"; \
 		else echo "  ⚠ Found issues: $$TODOS"; fi; \
 	fi
@@ -47,15 +45,15 @@ check-release-ready: ## Verify repo is ready for release
 build: ## Build distribution (sdist and wheel)
 	@echo "=== Building Distribution ===" && \
 	mkdir -p $(BUILD_DIR) && \
-	python -m build --sdist --wheel --outdir=$(BUILD_DIR) && \
+	uv build --sdist --wheel --out-dir=$(BUILD_DIR) && \
 	echo "Source dist: $(BUILD_DIR)/drover-$(VERSION).tar.gz" && \
 	ls -lh $(BUILD_DIR)/ && echo "✓ Distribution built"
 
 build-sdist: ## Build source distribution only
-	@echo "=== Building Source Distribution ===" && mkdir -p $(BUILD_DIR) && python -m build --sdist --outdir=$(BUILD_DIR) && echo "✓ $(BUILD_DIR)/drover-$(VERSION).tar.gz"
+	@echo "=== Building Source Distribution ===" && mkdir -p $(BUILD_DIR) && uv build --sdist --out-dir=$(BUILD_DIR) && echo "✓ $(BUILD_DIR)/drover-$(VERSION).tar.gz"
 
 build-wheel: ## Build wheel only
-	@echo "=== Building Wheel Package ===" && mkdir -p $(BUILD_DIR) && python -m build --wheel --outdir=$(BUILD_DIR) && echo "✓ $(BUILD_DIR)/drover-$(VERSION)-*.whl"
+	@echo "=== Building Wheel Package ===" && mkdir -p $(BUILD_DIR) && uv build --wheel --out-dir=$(BUILD_DIR) && echo "✓ $(BUILD_DIR)/drover-$(VERSION)-*.whl"
 
 clean-build: ## Clean build artifacts
 	@echo "=== Cleaning Build Artifacts ===" && rm -rf $(BUILD_DIR) src/drover.egg-info .mypy_cache .pytest_cache build/ && echo "✓ Build cleaned"
@@ -70,17 +68,21 @@ pr-setup: ## Setup files for documentation PR
 	echo "✓ CHANGELOG.md (semantic versioning)" && \
 	echo "✓ SECURITY.md (security policy)" && \
 	echo "✓ CONTRIBUTING.md (contribution guidelines)" && \
-	echo "✓ .github/CODEOWNERS (PR reviewer assignment)" && \
-	echo "✓ README.md (updated badges & links)"
+	echo "✓ .github/CODEOWNERS (PR reviewer assignment)"
 
 pr-commit: ## Create commit ready for documentation PR
-	@git diff --cached > /dev/null 2>&1 && echo "Already committed!" || (git add docs/context-store.md docs/threat-model.md CHANGELOG.md SECURITY.md CONTRIBUTING.md .github/CODEOWNERS README.md && git commit -m "docs: complete public release documentation && echo "✓ Commit created for PR"
+	@git add docs/context-store.md docs/threat-model.md CHANGELOG.md SECURITY.md CONTRIBUTING.md .github/CODEOWNERS Makefile
+	@if git diff --cached --quiet; then echo "No documentation changes are staged."; exit 1; fi
+	@git commit -m "docs: complete public release documentation"
+	@echo "✓ Commit created for PR"
 
 pr-push: ## Push documentation PR branch
-	@echo "=== Pushing Documentation PR ===" && \
-	git checkout -b docs-and-build-for-v0.2.0 -f && \
-	git add docs/context-store.md docs/threat-model.md CHANGELOG.md SECURITY.md CONTRIBUTING.md .github/CODEOWNERS README.md Makefile && \
-	git commit -m "docs: complete public release documentation && git push -u origin docs-and-build-for-v0.2.0 && \
+	@branch="$$(git branch --show-current)"; \
+	if [ "$$branch" != "docs-and-build-for-v0.2.0" ]; then \
+		echo "Run this target from docs-and-build-for-v0.2.0; current branch is $$branch."; \
+		exit 1; \
+	fi; \
+	git push -u origin "$$branch"; \
 	echo "✓ PR pushed: https://github.com/arniesaha/drover/pulls"
 
 pr-create: ## Create GitHub PR (requires gh CLI)
@@ -93,7 +95,7 @@ release-tag: ## Create annotated git tag for release
 
 release-validate: ## Validate release artifacts before publishing
 	@echo "=== Validating Release Artifacts ===" && \
-	test -f $(BUILD_DIR)/drover-$(VERSION).tar.gz && echo "✓ Source dist: $@" || exit 1 && \
+	test -f $(BUILD_DIR)/drover-$(VERSION).tar.gz && echo "✓ Source dist: $(BUILD_DIR)/drover-$(VERSION).tar.gz" || exit 1 && \
 	WHL=$$(ls $(BUILD_DIR)/drover-$(VERSION)-*.whl 2>/dev/null | head -1) && \
 	[ -n "$$WHL" ] && echo "✓ Wheel: $$WHL" || exit 1 && \
 	unzip -p $$WHL drover-$(VERSION).dist-info/METADATA | grep "Version: $(VERSION)" && echo "✓ Metadata verified" && \

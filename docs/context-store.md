@@ -247,13 +247,13 @@ ORDER BY ss.ended_at DESC
 LIMIT 5;
 
 -- Get all files touched by a task
-SELECT DISTINCT task_id, 
+SELECT DISTINCT task_id,
        raw_data->>'$.tool_use_blocks[*].input.file_path' AS file_path
 FROM agent_events
 WHERE task_id = ? AND tool_use_blocks IS NOT NULL;
 
 -- Semantic search by embedding
-SELECT session_id, summary_embedding, 
+SELECT session_id, summary_embedding,
        (1.0 - cosine_similarity(summary_embedding, ?)) as similarity
 FROM session_summaries
 ORDER BY similarity
