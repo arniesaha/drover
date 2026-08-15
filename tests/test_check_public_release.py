@@ -9,6 +9,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 check_paths = MODULE.check_paths
+main = MODULE.main
 
 
 def write_file(root: Path, relative: str, content: str) -> Path:
@@ -198,3 +199,57 @@ def test_check_paths_ignores_public_directory_names_above_repository_root(
     path = write_file(root, "src/notes.md", "Internal note — not public prose.\n")
 
     assert check_paths([path], root=root) == []
+
+
+# The pre-commit hook audits the staged set, which is neither the tracked set
+# nor the working tree, so it hands the script an explicit list of paths.
+
+
+def test_main_audits_only_the_paths_it_is_given(tmp_path: Path) -> None:
+    write_file(tmp_path, "docs/roadmap.md", "# Roadmap\n")
+    clean = write_file(tmp_path, "docs/overview.md", "Drover keeps work local.\n")
+
+    assert main([str(clean), "--root", str(tmp_path)]) == 0
+
+
+def test_main_reports_findings_relative_to_the_given_root(
+    tmp_path: Path, capsys
+) -> None:
+    path = write_file(tmp_path, "docs/superpowers/design.md", "# Design\n")
+
+    assert main([str(path), "--root", str(tmp_path)]) == 1
+
+    output = capsys.readouterr().out
+    assert "docs/superpowers/design.md:1: private-planning-path" in output
+    assert "1 finding(s)" in output
+
+
+def test_main_accepts_paths_relative_to_the_working_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_file(tmp_path, "docs/superpowers/design.md", "# Design\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["docs/superpowers/design.md", "--root", str(tmp_path)]) == 1
+
+
+def test_main_refuses_paths_outside_the_audit_root(tmp_path: Path, capsys) -> None:
+    outside = write_file(tmp_path, "elsewhere/notes.md", "A note.\n")
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    assert main([str(outside), "--root", str(root)]) == 2
+    assert "outside" in capsys.readouterr().out
+
+
+def test_main_audits_a_symlink_target_without_following_it(
+    tmp_path: Path, capsys
+) -> None:
+    path = tmp_path / "docs" / "overview.md"
+    path.parent.mkdir()
+    path.symlink_to("/Users/alice/private/drover")
+
+    assert main([str(path), "--root", str(tmp_path)]) == 1
+
+    output = capsys.readouterr().out
+    assert "docs/overview.md:1: personal-home-path" in output

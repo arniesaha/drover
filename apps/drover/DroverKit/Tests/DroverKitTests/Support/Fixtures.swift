@@ -175,9 +175,16 @@ func client() -> DroverClient {
 extension HarnessMessage {
     static func fixture(
         seq: Int, type: MessageType, text: String = "",
+        turnID: String? = nil,
         payload: [String: JSONValue] = [:]
     ) -> HarnessMessage {
-        HarnessMessage(seq: seq, type: type, text: text, payload: payload)
+        HarnessMessage(
+            seq: seq,
+            type: type,
+            text: text,
+            turnID: turnID,
+            payload: payload
+        )
     }
 }
 

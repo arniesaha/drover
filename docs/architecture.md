@@ -57,7 +57,7 @@ provenance rules.
 
 All central listeners bind to localhost by default. Ports and bind addresses
 are configurable for deliberate private-LAN or private-Tailscale deployments.
-Public-internet exposure is not supported for v0.1.
+Public-internet exposure is not supported for v0.2.
 
 ## Failure And Recovery
 
@@ -79,6 +79,7 @@ emit Drover naming. Compatibility storage is not a second public product name.
 
 ## Security Boundary
 
-All components belong to one trusted operator. A shared bearer token protects
-the central API, but v0.1 does not provide per-host identity, RBAC, SSO, or
-multi-tenant isolation. See [Security](security.md).
+All components belong to one trusted operator. Device and host credentials
+protect the central API, while the legacy shared bearer token remains enabled
+by default for upgrades. Drover v0.2 does not provide host-bound credential
+enforcement, RBAC, SSO, or multi-tenant isolation. See [Security](security.md).

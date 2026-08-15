@@ -222,6 +222,22 @@ def test_send_turn_dispatches_before_recording_and_skips_event_on_failure(
     assert user_input_events[0].payload["text"] == "hello"
 
 
+def test_send_turn_preserves_the_client_turn_id_in_the_echo(monkeypatch, tmp_path):
+    mgr, driver, _registry, on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
+
+    turn_id = mgr.send_turn("sess-1", "hello", client_turn_id=client_turn_id)
+
+    assert turn_id == client_turn_id
+    assert driver.sent_turns == [("hello", client_turn_id)]
+    user_input = next(
+        event for _session_id, event in on_messages if event["type"] == "user_input"
+    )
+    assert user_input["turn_id"] == client_turn_id
+
+
 def test_send_turn_forwards_images_and_records_attachments(monkeypatch, tmp_path):
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path
