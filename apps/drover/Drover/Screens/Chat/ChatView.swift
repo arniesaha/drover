@@ -257,6 +257,15 @@ struct ChatView: View {
                     }
                 }
                 .padding()
+                // An empty transcript has no row to take the width, so this
+                // stack sized to its padding and the ScrollView sized to the
+                // stack. Nothing showed it while the only thing overlaid on a
+                // cold open was a spinner, which is small and centred either
+                // way. The failure state added in #170 is text, and inherited
+                // a container about one character wide: "Can't reach the
+                // Drover server" rendered one letter per line, down the
+                // screen and past the composer.
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             // Scrolling back to read is the other moment you want the
             // keyboard gone, and dragging it away is cheaper than reaching
