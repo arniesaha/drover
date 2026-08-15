@@ -498,6 +498,12 @@ def _resolve_known_versioned_cli(binary: str) -> str | None:
         candidates.sort(key=lambda path: _version_key(path.name), reverse=True)
         return str(candidates[0]) if candidates else None
 
+    if binary == "dsh":
+        installed = Path.home() / ".local/share/deepseek-harness/node_modules/.bin/dsh"
+        if installed.exists() and os.access(installed, os.X_OK):
+            return str(installed)
+        return None
+
     nvm_versions = Path.home() / ".nvm/versions/node"
     if not nvm_versions.is_dir():
         return None
