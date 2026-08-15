@@ -203,14 +203,12 @@ jobs:
         # what made this step fail for v0.2.0 and v0.3.0 against an install
         # that was working: the server was serving on the LAN address the
         # config named. Ask the config, the way the CLI now does.
-        HOST="$(python3 - <<'PY'
-import pathlib, re
-text = pathlib.Path.home().joinpath(".drover/config.toml").read_text()
-match = re.search(r'^\s*metrics_host\s*=\s*"([^"]*)"', text, re.MULTILINE)
-host = (match.group(1) if match else "").strip()
-print("127.0.0.1" if host in ("", "0.0.0.0", "::", "*") else host)
-PY
-)"
+        # No heredoc: its body would have to start at column 0, which ends the
+        # YAML block scalar this step is written in and makes the whole file
+        # unparseable.
+        HOST="$(sed -n 's/^[[:space:]]*metrics_host[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
+          "$HOME/.drover/config.toml" | head -1)"
+        case "$HOST" in ""|"0.0.0.0"|"::"|"*") HOST="127.0.0.1" ;; esac
         echo "probing the address the install configured: $HOST"
         for _ in $(seq 1 30); do
           curl -fsS --max-time 2 "http://$HOST:7080/healthz" && break
