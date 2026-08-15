@@ -152,6 +152,12 @@ regenerated service unit that dropped the flag would silently revert the
 server to loopback, and that failure is invisible until the app stops loading.
 An explicit `--metrics-host` still overrides the config value.
 
+`drover-server` subcommands that talk to a running hub, such as `pair`,
+`pair-host` and `credentials`, call it at this address too. Setting
+`metrics_host` to a single private address rather than a wildcard means
+loopback is not served, so a command assuming `127.0.0.1` would report that the
+server is not running while it is serving normally.
+
 Review [Security](security.md) before changing bind addresses.
 
 OTLP and MCP remain loopback-only unless you also set `--otlp-host` or

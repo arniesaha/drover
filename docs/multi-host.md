@@ -115,6 +115,33 @@ Because v0.3 does not bind a credential to a specific `host-id`, a host
 credential can act as any host. Do not enroll a machine you do not fully
 control. See [Security](security.md).
 
+## Favourite Working Directories
+
+The New Session sheet suggests working directories. Most are drawn from recent
+sessions and already carry the host they ran on, so they are offered only for
+that host. Favourites are set by hand in the hub's `~/.drover/config.toml`:
+
+```toml
+[harness]
+favorite_cwds = [
+  "/srv/shared",
+  {path = "/opt/checkouts/drover", host_id = "mac-mini"},
+  {path = "/var/checkouts/drover", host_id = "nas"},
+]
+```
+
+A bare string is offered on every host. Use it only for a path that genuinely
+exists everywhere, such as a shared mount.
+
+An entry with a `host_id` is offered only on that host. On a fleet whose
+machines have different filesystem layouts this is almost always what you want.
+A macOS path suggested for a Linux host anchors the session to a directory that
+does not exist there, which a sandboxed harness such as DeepSeek Harness
+refuses outright, and which other harnesses start in and then cannot use.
+
+The `host_id` is the identifier the host reports on its heartbeat, shown by the
+validation command below.
+
 ## Validation
 
 From the central machine:
