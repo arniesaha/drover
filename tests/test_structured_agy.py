@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from drover.server.harness.structured.agy import (
+    AGY_PRINT_TIMEOUT,
     AgyDriver,
     default_command,
     resume_command,
@@ -24,6 +26,19 @@ FAKE_AGY = (
     'print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "echo: " + prompt}})); '
     'print(json.dumps({"event": "result", "result": {"conversation_id": "agy-conv-1", "status": "SUCCESS", "usage": {"input_tokens": 100, "output_tokens": 20}}}))'
 )
+
+# agy's own shape when its print deadline fires: a result event carrying
+# status ERROR, an empty stderr, and exit 1. Taken from the transcript of
+# harness session 25205799 on 2026-08-15.
+FAILING_AGY_AFTER_RESULT = (
+    "import json,sys; "
+    'print(json.dumps({"event": "result", "result": {"status": "ERROR", '
+    '"conversation_id": "agy-conv-1"}})); '
+    "sys.exit(1)"
+)
+
+# The other half of the distinction: dead before it produced anything.
+FAILING_AGY_NO_RESULT = "import sys; sys.exit(1)"
 
 SLOW_AGY = (
     "import json,sys,time; args=sys.argv[1:]; "
@@ -141,6 +156,92 @@ def test_argv_does_not_duplicate_caller_supplied_add_dir():
     argv = driver._argv_for("hello")
     assert argv.count("--add-dir") == 1
     assert argv[argv.index("--add-dir") + 1] == "/srv/repo"
+
+
+# -- the print-mode deadline (issue #188) ----------------------------------
+#
+# `agy --print` gives a turn 5m0s by default and then ends it, reporting
+# status ERROR and exiting 1 with nothing on stderr. Three turns died that way
+# on 2026-08-15, each at the five minute mark measured from turn start, with
+# the tool command they were waiting on (`uv run pytest`, a 13 minute suite)
+# never returning a result. A coding turn routinely runs longer than five
+# minutes, so the default is far too short to be left implicit.
+
+
+def test_argv_sets_a_print_timeout_longer_than_agys_default():
+    driver = AgyDriver(["agy"], cwd=None, emit=lambda m: None)
+
+    argv = driver._argv_for("hello")
+
+    assert "--print-timeout" in argv
+    assert argv[argv.index("--print-timeout") + 1] == AGY_PRINT_TIMEOUT
+
+
+def test_argv_keeps_a_caller_supplied_print_timeout():
+    driver = AgyDriver(["agy", "--print-timeout", "30m"], cwd=None, emit=lambda m: None)
+
+    argv = driver._argv_for("hello")
+
+    assert argv.count("--print-timeout") == 1
+    assert argv[argv.index("--print-timeout") + 1] == "30m"
+
+
+# -- reporting a non-zero exit (issue #188) --------------------------------
+#
+# "the turn finished and then the process failed" and "the turn failed" are
+# different things to a user deciding whether the session is worth continuing,
+# and they were reported identically: one error bubble carrying the exit code
+# and nothing else, because agy writes nothing to stderr on the way out.
+
+
+def test_exit_after_a_completed_turn_says_so_and_names_the_status():
+    got: list = []
+    driver = AgyDriver(
+        [sys.executable, "-c", FAILING_AGY_AFTER_RESULT], None, got.append
+    )
+    driver.start()
+    driver.send_turn("hello", turn_id="t1")
+    _wait_for(got, lambda g: any(m.type == "error" for m in g))
+
+    error = next(m for m in got if m.type == "error")
+    assert "after completing the turn" in error.text
+    # agy's own verdict, which it did report and which was being discarded.
+    assert "ERROR" in error.text
+    assert error.payload["returncode"] == 1
+    assert error.payload["after_turn_complete"] is True
+    driver.close()
+
+
+def test_exit_before_any_result_is_still_reported_as_a_failed_turn():
+    got: list = []
+    driver = AgyDriver([sys.executable, "-c", FAILING_AGY_NO_RESULT], None, got.append)
+    driver.start()
+    driver.send_turn("hello", turn_id="t1")
+    _wait_for(got, lambda g: any(m.type == "error" for m in g))
+
+    error = next(m for m in got if m.type == "error")
+    assert "after completing the turn" not in error.text
+    assert error.payload["after_turn_complete"] is False
+    driver.close()
+
+
+def test_non_zero_exit_is_logged_server_side(caplog):
+    got: list = []
+    driver = AgyDriver(
+        [sys.executable, "-c", FAILING_AGY_AFTER_RESULT], None, got.append
+    )
+    driver.start()
+    with caplog.at_level(logging.WARNING, logger="drover.harnessd"):
+        driver.send_turn("hello", turn_id="turn-42")
+        _wait_for(got, lambda g: any(m.type == "error" for m in g))
+
+    # Nothing recorded the exit at all, so a failure the user did not
+    # screenshot left no trace anywhere on the hub.
+    assert any(
+        "agy" in r.message and "turn-42" in r.message and "1" in r.message
+        for r in caplog.records
+    )
+    driver.close()
 
 
 def test_parse_stream_line_tool():
