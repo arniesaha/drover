@@ -25,7 +25,13 @@ diagnostics from crashing each other (issue #2):
    may take that lock, be handed that connection, or open that file;
    ``tests/test_control_plane_isolation.py`` and
    ``tests/test_control_plane_store.py`` enforce every direction.
-4. **Analytical readers see control-plane state through a copy.** Two live
+4. **Handed-out connections are remembered, weakly.** ``/readyz`` has to
+   prove the live DuckDB instance still answers, and the cheapest honest way
+   to do that is to borrow a connection this process already holds rather
+   than open one of its own (issue #175). ``remember_live_connection`` and
+   ``live_connections`` are that register; the references are weak, so
+   nothing here extends a connection's life or holds the file lock.
+5. **Analytical readers see control-plane state through a copy.** Two live
    queries genuinely join across both worlds, and DuckDB refuses to ``ATTACH``
    a file another instance in the process already holds ("Unique file handle
    conflict"). ``attached_control_plane_snapshot`` attaches a private copy of
@@ -45,6 +51,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -186,8 +193,120 @@ _CONTROL_PLANE_FATAL = (
 )
 
 
+#: Analytical connections this process has handed out, held *weakly* per
+#: resolved path. Readiness borrows one of these to prove the live DuckDB
+#: instance still answers (issue #175); nothing else reads it, and a strong
+#: reference here would keep instances -- and DuckDB's exclusive file lock --
+#: alive long after their owner finished with them.
+_LIVE_CONNECTIONS: dict[str, "weakref.WeakSet[duckdb.DuckDBPyConnection]"] = {}
+_LIVE_GUARD = threading.Lock()
+
+#: Empty sets are swept once the table grows past this. The sets empty
+#: themselves, but their *keys* would not: every metrics refresh opens a
+#: snapshot copy under a fresh temporary path, which is a new key each minute
+#: for the life of the process.
+_LIVE_PATHS_SOFT_MAX = 64
+
+#: The last failed open per path, so readiness can tell a store nothing can
+#: open from a store nothing happens to have open. Guarded by ``_LIVE_GUARD``.
+_CONNECT_FAILURES: dict[str, tuple[float, str]] = {}
+
+#: Well past any window a reader would count a failure inside; swept only to
+#: keep the table from growing one key per temporary snapshot path.
+_CONNECT_FAILURE_MAX_AGE_SECONDS = 3600.0
+
+
 def _path_key(duckdb_path: str | Path) -> str:
     return str(Path(duckdb_path).expanduser().resolve())
+
+
+def remember_live_connection(
+    duckdb_path: str | Path, con: duckdb.DuckDBPyConnection
+) -> None:
+    """Record a connection so readiness can borrow the instance behind it.
+
+    Called by ``open_duckdb_connection`` for every analytical open. The set is
+    weak, so an entry disappears with the connection object and no bookkeeping
+    is needed on the close path.
+    """
+    key = _path_key(duckdb_path)
+    with _LIVE_GUARD:
+        handles = _LIVE_CONNECTIONS.get(key)
+        if handles is None:
+            handles = _LIVE_CONNECTIONS[key] = weakref.WeakSet()
+        handles.add(con)
+        # An open that worked retires whatever the last one that failed said.
+        _CONNECT_FAILURES.pop(key, None)
+        if len(_LIVE_CONNECTIONS) > _LIVE_PATHS_SOFT_MAX:
+            for stale in [
+                path
+                for path, entries in _LIVE_CONNECTIONS.items()
+                if path != key and not entries
+            ]:
+                del _LIVE_CONNECTIONS[stale]
+
+
+def live_connections(duckdb_path: str | Path) -> list[duckdb.DuckDBPyConnection]:
+    """Connections to ``duckdb_path`` this process still holds, if any.
+
+    An empty list means the analytical DuckDB *instance* is gone too: it is
+    kept alive by its connections, and DuckDB's instance cache holds only a
+    weak reference. That is why "nothing open" is not a readiness failure --
+    the next connect builds a fresh instance, which cannot be an invalidated
+    one.
+    """
+    key = _path_key(duckdb_path)
+    with _LIVE_GUARD:
+        handles = _LIVE_CONNECTIONS.get(key)
+        return list(handles) if handles else []
+
+
+def live_connection(
+    duckdb_path: str | Path,
+) -> duckdb.DuckDBPyConnection | None:
+    """One connection to ``duckdb_path``, or None when the process holds none."""
+    handles = live_connections(duckdb_path)
+    return handles[0] if handles else None
+
+
+def remember_connect_failure(duckdb_path: str | Path, exc: BaseException) -> None:
+    """Record that a real open of ``duckdb_path`` just failed.
+
+    A store nobody can open leaves nothing for readiness to borrow, so without
+    this a lakehouse too broken to connect to would look exactly like an idle
+    one (issue #175). What is kept here is a real worker's real error, which
+    costs nothing to collect and is more truthful than a probe of our own.
+    """
+    now = time.monotonic()
+    with _LIVE_GUARD:
+        _CONNECT_FAILURES[_path_key(duckdb_path)] = (
+            now,
+            f"{type(exc).__name__}: {exc}",
+        )
+        if len(_CONNECT_FAILURES) > _LIVE_PATHS_SOFT_MAX:
+            # Same sweep as the handle register, for the same reason: one key
+            # per temporary snapshot path would otherwise be kept for the life
+            # of the process. Nothing reads a failure this old.
+            for stale in [
+                path
+                for path, (when, _) in _CONNECT_FAILURES.items()
+                if now - when > _CONNECT_FAILURE_MAX_AGE_SECONDS
+            ]:
+                del _CONNECT_FAILURES[stale]
+
+
+def last_connect_failure(duckdb_path: str | Path) -> tuple[float, str] | None:
+    """The most recent failed open of ``duckdb_path``: (age in seconds, error).
+
+    Cleared by the next open that succeeds, so a store that recovered stops
+    reporting one.
+    """
+    with _LIVE_GUARD:
+        failure = _CONNECT_FAILURES.get(_path_key(duckdb_path))
+    if failure is None:
+        return None
+    when, message = failure
+    return time.monotonic() - when, message
 
 
 def control_plane_path(duckdb_path: str | Path) -> Path:
@@ -450,13 +569,21 @@ def open_duckdb_connection(
             f"Cannot open database {str(duckdb_path)!r} in read-only mode: "
             "database does not exist"
         )
-    with duckdb_connect_lock(duckdb_path):
-        con = duckdb.connect(str(duckdb_path))
     try:
-        _apply_role_settings(con, role, settings_overrides=settings_overrides)
-    except Exception:
-        con.close()
+        with duckdb_connect_lock(duckdb_path):
+            con = duckdb.connect(str(duckdb_path))
+        try:
+            _apply_role_settings(con, role, settings_overrides=settings_overrides)
+        except Exception:
+            con.close()
+            raise
+    except Exception as exc:
+        # Remembered, then re-raised unchanged: callers keep their error, and
+        # readiness gains the one piece of evidence a borrowed handle cannot
+        # give it -- that this store cannot be opened at all (#175).
+        remember_connect_failure(duckdb_path, exc)
         raise
+    remember_live_connection(duckdb_path, con)
     return con
 
 
