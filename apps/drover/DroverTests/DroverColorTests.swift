@@ -129,6 +129,36 @@ struct DroverColorTests {
         }
     }
 
+    /// Send failures are told in prose, so the warning ramp carries body copy
+    /// and owes the full AA floor in both themes. The raw system orange this
+    /// replaced never passed through here at all: measured against the light
+    /// ground it is nowhere near readable, which is how a failed send came to
+    /// be announced in the least legible text on the screen.
+    @Test func theWarningRampClearsBodyCopyFloor() {
+        for scheme in [ColorScheme.dark, .light] {
+            let ground = DroverColor.bg.rgb(for: scheme)
+            let ratio = contrast(DroverColor.warn.rgb(for: scheme), ground)
+            #expect(ratio >= 4.5,
+                    "warn on bg in \(scheme) is \(rounded(ratio)):1, below the 4.5:1 body floor")
+        }
+    }
+
+    /// Locks the specific defect this token answers. The hint used raw
+    /// `systemOrange`, which measures ~8:1 on the dark ground and ~1.8:1 on
+    /// the light one. Dark mode was fine, which is exactly why it survived:
+    /// in light mode a failed send was announced in text close to invisible.
+    @Test func theWarningRampFixesTheLightGroundSystemOrangeCouldNotHold() {
+        let systemOrange: UInt32 = 0xFF_95_00
+        let ground = DroverColor.bg.rgb(for: .light)
+
+        let orange = contrast(systemOrange, ground)
+        #expect(orange < 2.0,
+                "system orange measures \(rounded(orange)):1 on the light ground — if that changed, this test no longer describes the bug")
+
+        let warn = contrast(DroverColor.warn.rgb(for: .light), ground)
+        #expect(warn >= 4.5, "warn on the light ground is \(rounded(warn)):1")
+    }
+
     // MARK: - WCAG helpers
 
     private func contrast(_ a: UInt32, _ b: UInt32) -> Double {
