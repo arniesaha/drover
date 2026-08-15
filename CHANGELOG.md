@@ -63,13 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pairing code scope enforcement (device vs host codes distinct)
 - Agent adoption registry configuration via `DROVER_AGENT_ADOPTION_JSON`
 - Compatibility layer for historical `nexus.*` telemetry (readable, not re-emitted)
-- Default behavior: shared token fallback disabled once all devices paired
+- Default behavior: legacy shared-token fallback remains enabled for upgrade
+  compatibility until an operator disables it
 - Installer now detects existing Drover services and refuses to start (safety check)
 - Default bind addresses: all central listeners default to `127.0.0.1`
 
 ### Deprecated
 
-- Shared bearer token authentication (legacy mode enabled by default, will be disabled v0.2+)
+- Shared bearer token authentication (legacy mode is enabled by default and
+  remains available until an operator disables it)
 - Compatibility job tables: `summarize_jobs`, `brief_jobs`, `embed_jobs`, `span_embed_jobs` (replaced by pipeline ledger)
 
 ### Fixed

@@ -1,4 +1,4 @@
-.PHONY: help docs lint test build clean release status version check-lint check-release-ready pr-setup pr-commit pr-push pr-create release-tag release-validate example-one-click-release
+.PHONY: help docs check-release-ready build build-sdist build-wheel clean-build clean pr-setup pr-commit pr-push pr-create release-tag release-validate example-one-click-release status version
 
 VERSION = $(shell grep "^version" pyproject.toml | awk '{print $$3}' | tr -d '"')
 TAG ?= v$(VERSION)
@@ -15,11 +15,12 @@ help: ## Show this help message
 
 docs: ## Validate all documentation files
 	@echo "=== Validating Documentation ==="; \
-	for doc in README.md $$(find docs -type f -name '*.md' | sort); do \
+	docs="$$(git ls-files -- '*.md')"; \
+	for doc in $$docs; do \
 		test -f "$$doc" || exit 1; \
 		echo "✓ $$doc"; \
 	done; \
-	python3 scripts/check_markdown_links.py README.md docs || exit 1; \
+	python3 scripts/check_markdown_links.py $$docs || exit 1; \
 	echo "✓ All documentation files validated"
 
 check-release-ready: docs ## Verify repo is ready for release
@@ -113,7 +114,7 @@ example-one-click-release: ## Example: Check, package, and prepare for release
 	$(MAKE) check-release-ready && \
 	$(MAKE) build && \
 	$(MAKE) release-validate && \
-	echo "Ready for: make release-upload (requires twine)"
+	echo "Ready to publish the validated artifacts through your chosen release channel."
 
 status: ## Show Git repository status
 	@echo "=== Git Repository Status ===" && git branch --show-current && git log -1 --oneline && git status --short

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -40,6 +41,44 @@ def test_docs_target_validates_tracked_documentation() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_docs_target_checks_root_release_documents(tmp_path: Path) -> None:
+    repo = make_release_repo(tmp_path)
+    (repo / "SECURITY.md").write_text("[broken](missing-security-policy.md)\n")
+    subprocess.run(["git", "add", "SECURITY.md"], cwd=repo, check=True)
+
+    result = subprocess.run(
+        ["make", "docs"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "SECURITY.md:1 -> missing-security-policy.md" in result.stdout
+
+
+def test_phony_targets_are_implemented() -> None:
+    makefile = (ROOT / "Makefile").read_text()
+    phony = re.search(r"^\.PHONY: (.*)$", makefile, re.MULTILINE)
+
+    assert phony is not None
+    targets = set(re.findall(r"^([A-Za-z_-]+):", makefile, re.MULTILINE))
+    assert set(phony.group(1).split()).issubset(targets)
+
+
+def test_one_click_release_does_not_suggest_an_undefined_target() -> None:
+    planned = subprocess.run(
+        ["make", "-n", "example-one-click-release"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "release-upload" not in planned.stdout
+    assert "Ready to publish the validated artifacts" in planned.stdout
 
 
 def test_release_readiness_does_not_report_no_todos_as_a_warning() -> None:
