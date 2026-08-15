@@ -1,12 +1,12 @@
 # Security Threat Model
 
-This document describes the security architecture and threat model for Drover v0.2.
+This document describes the security architecture and threat model for Drover v0.3.
 It complements the technical details in [Security](./security.md) and outlines the
 assumptions, trust boundaries, and threat mitigations that inform the design.
 
 ## Scope
 
-This threat model applies to the Drover v0.2 codebase and its standard deployment
+This threat model applies to the Drover v0.3 codebase and its standard deployment
 configurations:
 
 - `drover-server`: central fleet API and context store
@@ -166,7 +166,7 @@ hosts. No granular credential scoping or per-host identity verification.
 - Compromised Docker images or installation scripts
 
 **Mitigations**:
-- Source distribution only (no official PyPI package as of v0.2)
+- Source distribution only (no official PyPI package as of v0.3)
 - All code on GitHub repository, open source
 - Signed releases (recommended verification by operators)
 - Installer scripts are reviewed before release
@@ -175,7 +175,7 @@ hosts. No granular credential scoping or per-host identity verification.
 **Residual Risk**: Operator must trust the source repository and verification
 processes. No formal third-party security audit or continuous verification.
 
-## Known Limitations (v0.2)
+## Known Limitations (v0.3)
 
 These security features are intentionally not provided:
 
@@ -212,9 +212,9 @@ If you suspect a security incident:
 ## Acknowledgments
 
 This threat model was written to guide Drover's security design. It reflects known
-limitations and intentional design decisions for v0.2. Updates will be made as new
+limitations and intentional design decisions for v0.3. Updates will be made as new
 threats are identified and features are added.
 
 ## Version History
 
-- 0.2 (2026-08-13): Updated for the v0.2.0 release tag
+- 0.2 (2026-08-13): Updated for the v0.3.0 release tag

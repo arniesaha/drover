@@ -111,7 +111,7 @@ resolves it from `--host-token`, `DROVER_API_TOKEN`, or `~/.drover/api_token`.
 Prefer the environment or token file so it does not appear in shell history.
 Turn the setting off once every device and host holds its own credential.
 
-Because v0.2 does not bind a credential to a specific `host-id`, a host
+Because v0.3 does not bind a credential to a specific `host-id`, a host
 credential can act as any host. Do not enroll a machine you do not fully
 control. See [Security](security.md).
 

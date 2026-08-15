@@ -9,11 +9,13 @@
 ## What Drover is
 
 Drover is a local-first cockpit and context store for a personal fleet of CLI
-coding agents. It connects Claude Code, Codex, Antigravity (agy), DeepSeek
-Harness, OpenClaw, and compatible harnesses running on machines you control. A native iOS client lets you inspect
-sessions, answer prompts, send turns, hand work off, and attach to a terminal.
+coding agents. It runs sessions on Claude Code, Codex, Antigravity (agy),
+DeepSeek Harness, and compatible harnesses on machines you control, and ingests
+activity from others, including OpenClaw and Hermes, as context. A native iOS
+client lets you inspect sessions, answer prompts, send turns, hand work off,
+and attach to a terminal.
 
-Drover is self-hosted software for one trusted operator. The supported v0.2
+Drover is self-hosted software for one trusted operator. The supported v0.3
 network boundary is localhost, a private LAN, or a private Tailscale network.
 It does not require a Drover cloud service.
 
@@ -85,7 +87,7 @@ The model and its compatibility boundary are documented in
 ## Supported networking and security
 
 - Supported: localhost, a trusted private LAN, and a private Tailscale network.
-- Not supported for v0.2: Tailscale Funnel or any public-internet exposure.
+- Not supported for v0.3: Tailscale Funnel or any public-internet exposure.
 - Authentication: individually issued device and host bearer credentials; the
   legacy shared token remains available for upgrades until explicitly disabled.
 - Not provided: multi-user isolation, RBAC, SSO, host-bound credential
@@ -122,7 +124,7 @@ device signing, and server configuration.
 
 ## Status and limitations
 
-Drover v0.2 is source-distributed software for technical users operating a
+Drover v0.3 is source-distributed software for technical users operating a
 trusted personal fleet. The Python server and native iOS client are functional,
 but packaging, host-bound credential enforcement, timely background push
 notifications, and broader context interchange standards remain future work.
