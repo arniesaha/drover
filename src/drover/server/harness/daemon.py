@@ -274,12 +274,12 @@ DEFAULT_PRESETS = {
         enabled=False,
         description="Antigravity CLI (agy)",
     ),
-    "openclaw": HarnessPreset(
-        name="openclaw",
-        command=("openclaw",),
-        enabled=False,
-        description="OpenClaw CLI",
-    ),
+    # Retired as a session target: openclaw never had a structured driver, so
+    # offering it here only produced "harness has no structured driver:
+    # openclaw" at launch. It is still an *observed* agent -- the collect
+    # source, parser and metrics stay -- it is simply not driven from Drover.
+    # `test_every_offered_preset_can_actually_be_driven` keeps a driverless
+    # preset from being added back.
 }
 
 
