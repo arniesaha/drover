@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sys
+import time
 
 import duckdb
 import pytest
@@ -336,3 +338,47 @@ def test_a_store_that_cannot_be_cloned_is_still_captured_without_its_wal(
         assert snap.execute("SELECT count(*) FROM t").fetchone()[0] == 1
     finally:
         snap.close()
+
+
+def test_snapshot_scratch_sits_beside_the_store_not_in_system_temp(tmp_path):
+    """Snapshots belong on the store's own volume, for two reasons at once.
+
+    ``clonefile`` is same-volume only, so a snapshot written to the system temp
+    dir while the store lives elsewhere silently falls back to a chunked read --
+    the copy the clone exists to replace. Landing beside the store makes the
+    clone engage, which also makes the copy nearly free: copy-on-write extents
+    cost no space until they diverge.
+
+    The system temp dir is on the boot volume here, and these copies are
+    350-950 MB each, arriving every 15-20 minutes. That filled the disk and
+    took the hub down (#171).
+    """
+    root = db_module.snapshot_scratch_root(tmp_path / "live.duckdb")
+
+    assert root.parent == tmp_path
+    assert root.is_dir()
+    assert "/var/folders/" not in str(root)
+
+
+def test_orphaned_snapshot_scratch_is_swept_but_live_work_is_kept(tmp_path):
+    """Cleanup on graceful exit is not enough, as the disk proved.
+
+    A hub killed rather than asked to stop leaves its copies behind, and they
+    accumulated across every restart. The sweep is what makes the leak
+    self-limiting instead of monotonic -- but it has to be able to tell an
+    abandoned directory from one another process is filling right now.
+    """
+    root = db_module.snapshot_scratch_root(tmp_path / "live.duckdb")
+    stale = root / "drover-control-plane-oldone"
+    stale.mkdir()
+    fresh = root / "drover-control-plane-newone"
+    fresh.mkdir()
+    old = time.time() - (6 * 3600)
+    os.utime(stale, (old, old))
+
+    db_module.sweep_orphaned_snapshot_scratch(
+        tmp_path / "live.duckdb", older_than_seconds=3600
+    )
+
+    assert not stale.exists()
+    assert fresh.exists()

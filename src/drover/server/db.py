@@ -44,6 +44,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -589,6 +590,61 @@ def _snapshot_signature(source: Path) -> tuple[int, int, int, int]:
     )
 
 
+SNAPSHOT_SCRATCH_DIRNAME = ".drover-snapshots"
+
+
+def snapshot_scratch_root(source: Path | str) -> Path:
+    """Where snapshot copies of ``source`` are written: beside ``source``.
+
+    Not the system temp directory, for two reasons that happen to be the same
+    reason. ``clonefile`` only works within a volume, so a snapshot written to
+    a temp dir on a different filesystem silently falls back to the chunked
+    read the clone exists to replace. And these copies are hundreds of
+    megabytes arriving every few minutes -- pointed at the boot volume they
+    filled it and took the hub down, while the store itself sits on a volume
+    with room to spare (#171).
+
+    Landing them beside the store fixes both: the clone engages, which also
+    makes the copy nearly free, because copy-on-write extents cost no space
+    until they diverge.
+    """
+    root = Path(source).parent / SNAPSHOT_SCRATCH_DIRNAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def sweep_orphaned_snapshot_scratch(
+    source: Path | str, *, older_than_seconds: float = 3600.0
+) -> int:
+    """Delete abandoned snapshot directories beside ``source``; return the count.
+
+    ``TemporaryDirectory`` only cleans up when the process exits gracefully, and
+    a hub that is killed -- or restarted by launchd -- does not. Copies from
+    every previous process therefore accumulated indefinitely: 145 directories
+    and 27 GB by the time the volume ran out.
+
+    The age cutoff is what keeps this safe to call while other work is in
+    flight: a directory another process is actively filling has a recent mtime,
+    so only genuinely abandoned ones are swept.
+    """
+    root = Path(source).parent / SNAPSHOT_SCRATCH_DIRNAME
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for child in root.iterdir():
+        try:
+            if not child.is_dir() or child.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed += 1
+    if removed:
+        log.info("swept %d orphaned snapshot director(ies) under %s", removed, root)
+    return removed
+
+
 def _clone_file(source: Path, destination: Path) -> bool:
     """APFS copy-on-write clone of ``source``, or False if unavailable.
 
@@ -688,7 +744,7 @@ def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
         directory = _SNAPSHOT_DIRS.get(key)
         if directory is None:
             directory = _SNAPSHOT_DIRS[key] = tempfile.TemporaryDirectory(
-                prefix="drover-control-plane-"
+                prefix="drover-control-plane-", dir=snapshot_scratch_root(source)
             )
         fresh = Path(directory.name) / (
             f"{source.stem}-{next(_SNAPSHOT_SEQUENCE)}{source.suffix}"
