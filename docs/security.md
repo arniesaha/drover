@@ -1,6 +1,6 @@
 # Security
 
-Drover v0.1 is designed for one trusted operator on machines and networks they
+Drover v0.2 is designed for one trusted operator on machines and networks they
 control. It is not a multi-tenant service.
 
 ## Supported Boundary
@@ -11,7 +11,7 @@ control. It is not a multi-tenant service.
 
 Tailscale Funnel and other public-internet exposure are not supported. The
 relay protocol forwards requests that create and control agent sessions and
-carries bidirectional terminal streams. Drover v0.1 does not bind individual
+carries bidirectional terminal streams. Drover v0.2 does not bind individual
 hosts to individual credentials.
 
 ## Authentication
@@ -80,13 +80,10 @@ permissions you intend them to have.
 
 ## GitHub Actions Runner
 
-The trusted GitHub Actions runner executes code using its existing macOS
-account. Anyone who can change the protected `main` branch or control that
-account is therefore inside the runner's trust domain. Public pull requests
-remain on GitHub-hosted runners; labels alone do not protect the Mac, and
-approving an external workflow does not authorize it there. Follow the
-[trusted GitHub Actions runner runbook](github-actions-runner.md) to install,
-operate, update, and remove the host-owned runner hooks safely.
+Repository workflows run only on GitHub-hosted runners. Do not attach a
+self-hosted runner to this public repository: an unsafe workflow change could
+otherwise execute untrusted code on the machine that holds fleet data and
+operator credentials. See the [GitHub Actions runner model](github-actions-runner.md).
 
 ## Data Handling
 

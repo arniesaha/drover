@@ -13,7 +13,7 @@ coding agents. It connects Claude Code, Codex, Antigravity (agy), OpenClaw, and 
 harnesses running on machines you control. A native iOS client lets you inspect
 sessions, answer prompts, send turns, hand work off, and attach to a terminal.
 
-Drover is self-hosted software for one trusted operator. The supported v0.1
+Drover is self-hosted software for one trusted operator. The supported v0.2
 network boundary is localhost, a private LAN, or a private Tailscale network.
 It does not require a Drover cloud service.
 
@@ -85,10 +85,11 @@ The model and its compatibility boundary are documented in
 ## Supported networking and security
 
 - Supported: localhost, a trusted private LAN, and a private Tailscale network.
-- Not supported for v0.1: Tailscale Funnel or any public-internet exposure.
-- Authentication: one shared bearer token for a single trusted operator.
-- Not provided: multi-user isolation, RBAC, SSO, per-host credentials, or a
-  hosted control plane.
+- Not supported for v0.2: Tailscale Funnel or any public-internet exposure.
+- Authentication: individually issued device and host bearer credentials; the
+  legacy shared token remains available for upgrades until explicitly disabled.
+- Not provided: multi-user isolation, RBAC, SSO, host-bound credential
+  enforcement, or a hosted control plane.
 
 Read [Security](docs/security.md) before exposing a listener beyond localhost,
 and [Multi-Host](docs/multi-host.md) before adding another machine.
@@ -121,9 +122,9 @@ device signing, and server configuration.
 
 ## Status and limitations
 
-Drover v0.1 is source-distributed software for technical users operating a
+Drover v0.2 is source-distributed software for technical users operating a
 trusted personal fleet. The Python server and native iOS client are functional,
-but packaging, host-bound relay credentials, timely background push
+but packaging, host-bound credential enforcement, timely background push
 notifications, and broader context interchange standards remain future work.
 
 See [open issues](https://github.com/arniesaha/drover/issues) for current bugs
