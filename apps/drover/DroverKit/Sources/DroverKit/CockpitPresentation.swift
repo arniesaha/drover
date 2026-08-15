@@ -37,7 +37,7 @@ public struct ObservedAggregatePresentation: Sendable, Equatable {
             ? "Drover observed" : "Observed source unavailable"
         let coverage = metadata?.coverage ?? fallbackCoverage
         coverageText = coverage.tokenPercent.map {
-            "\(Self.number($0))% token coverage"
+            "\(CoveragePercent.text($0))% token coverage"
         } ?? "Token coverage unavailable"
         guard let observedAt = metadata?.observedAt else {
             freshnessText = "Observation time unavailable"
@@ -57,9 +57,94 @@ public struct ObservedAggregatePresentation: Sendable, Equatable {
         let state = metadata?.freshness.rawValue.capitalized ?? "Unknown"
         freshnessText = "\(age) · \(state)"
     }
+}
 
-    private static func number(_ value: Double) -> String {
+/// One rendering of a coverage percentage, so a heading and the card beneath it
+/// can never print the same figure two different ways. Whole numbers lose the
+/// decimal: "5%", not "5.0%".
+enum CoveragePercent {
+    static func text(_ value: Double) -> String {
         value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
+    }
+}
+
+/// The activity totals, worded once for every screen that shows them.
+///
+/// The cockpit card and the analytics screen render the same three figures off
+/// the same payload, and before #150 they disagreed about the third: the card
+/// said "API-billed" with a cost-coverage clause, analytics still said "API
+/// cost" with no coverage at all. Both now read from here.
+public struct ActivityTotalsPresentation: Sendable, Equatable {
+    /// Deliberately not "API cost". Drover computes no prices — there is no
+    /// pricing table anywhere in `src/`; `cost_usd` is whatever the harness
+    /// reported over OTLP, and subscription-billed usage has no marginal
+    /// per-token cost to report. In the 7-day window behind #150 `claude-opus-5`
+    /// carried 62,951,650 tokens (99.7% of the volume) and reported $0.0181
+    /// against them, while `gpt-5.6-sol` reported $0.3591 on 9,122. The total
+    /// is a sum of the API-billed slice, and naming that slice is the point.
+    public static let costLabel = "API-billed"
+
+    /// A currency figure, or the unreported wording. Never both meanings.
+    public let costText: String
+    /// The whole spoken form, label included: VoiceOver must not read the
+    /// unreported case as "zero dollars, API-billed".
+    public let costAccessibilityText: String
+    public let costIsUnreported: Bool
+    /// Coverage for tokens *and* cost, because they are routinely different —
+    /// 5.8% against 5% in the case that prompted #150 — and printing only the
+    /// token figure left the less-covered number looking like a total. Says it
+    /// twice only when the two actually differ.
+    public let coverageText: String
+
+    /// `locale` is injected only so the wording can be asserted: the currency
+    /// style disambiguates against the reader's region, so the same $0.59
+    /// renders "$0.59" in the US and "US$0.59" everywhere else, and the
+    /// `swift test` host is one of the everywhere-elses. The app passes
+    /// nothing and keeps the reader's own formatting.
+    public init(
+        totals: ActivityTotals, coverage: Coverage, locale: Locale = .autoupdatingCurrent
+    ) {
+        let unreported = Self.costIsUnreported(totals: totals, coverage: coverage)
+        let value = Self.currency(totals.costUSD, locale: locale)
+        costIsUnreported = unreported
+        costText = unreported ? "Not reported" : value
+        costAccessibilityText = unreported
+            ? "\(Self.costLabel) cost not reported"
+            : "\(value) \(Self.costLabel) cost"
+        coverageText = Self.coverageText(coverage)
+    }
+
+    /// Zero cost across sessions that definitely ran is not a bill of nothing,
+    /// it is the absence of one — the same distinction tokens got in #145.
+    ///
+    /// `cost_percent` counts the sessions whose `cost_usd` came through
+    /// non-null, so zero there means no session in the window reported a cost
+    /// at all. That is the normal state of a subscription-billed fleet, and
+    /// rendered as `$0.00` it claims the work was free.
+    ///
+    /// A non-zero total is left exactly as it is however low its coverage: the
+    /// $0.59 in #150 is a real measurement of a twentieth of the sessions, and
+    /// the coverage clause beside it is what qualifies it.
+    static func costIsUnreported(totals: ActivityTotals, coverage: Coverage) -> Bool {
+        guard totals.costUSD == 0, totals.sessionCount > 0 else { return false }
+        // A missing percentage counts as zero, as it does for tokens: the
+        // server always emits this field, so its absence means the payload
+        // came from something that did not, and asserting $0.00 against a
+        // payload we cannot check is the worse of the two failures.
+        return (coverage.costPercent ?? 0) == 0
+    }
+
+    static func coverageText(_ coverage: Coverage) -> String {
+        guard let tokens = coverage.tokenPercent else { return "Token coverage unavailable" }
+        let tokenText = "\(CoveragePercent.text(tokens))% token coverage"
+        guard let cost = coverage.costPercent,
+              CoveragePercent.text(cost) != CoveragePercent.text(tokens)
+        else { return tokenText }
+        return "\(tokenText) · \(CoveragePercent.text(cost))% cost coverage"
+    }
+
+    static func currency(_ value: Double, locale: Locale) -> String {
+        value.formatted(.currency(code: "USD").precision(.fractionLength(2)).locale(locale))
     }
 }
 
