@@ -193,6 +193,18 @@ _CONTROL_PLANE_FATAL = (
 )
 
 
+class ControlPlaneBusy(RuntimeError):
+    """A control-plane window was not free inside the caller's budget.
+
+    Issue #181. Raised only for a caller that passed ``timeout=`` to
+    ``control_plane_connection``; everyone else still waits its turn, because
+    for the registry and the recap worker "later" is the right answer and
+    "never mind" is not. It says nothing about the store's health -- the store
+    was never reached -- which is why readiness reports it as ``busy`` rather
+    than as a failure.
+    """
+
+
 #: Analytical connections this process has handed out, held *weakly* per
 #: resolved path. Readiness borrows one of these to prove the live DuckDB
 #: instance still answers (issue #175); nothing else reads it, and a strong
@@ -471,8 +483,35 @@ def _connect_control_plane(duckdb_path: str | Path) -> duckdb.DuckDBPyConnection
 
 
 @contextmanager
+def _held_control_plane_lock(
+    duckdb_path: str | Path, timeout: float | None
+) -> Iterator[None]:
+    """Hold the control-plane lock, optionally giving up rather than waiting.
+
+    ``timeout=None`` is the historical behaviour and stays the default: a
+    control-plane caller that gives up has nothing useful to do instead. A
+    caller that must answer on a deadline -- ``/readyz``, and so far only
+    ``/readyz`` -- passes a budget and gets ``ControlPlaneBusy`` when the
+    window in front of it has not finished (#181).
+    """
+    lock = control_plane_lock(duckdb_path)
+    if timeout is None:
+        lock.acquire()
+    elif not lock.acquire(timeout=max(0.0, timeout)):
+        raise ControlPlaneBusy(
+            f"the control-plane window was still busy after {timeout:.2f}s"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
 def control_plane_connection(
     duckdb_path: str | Path,
+    *,
+    timeout: float | None = None,
 ) -> Iterator[duckdb.DuckDBPyConnection]:
     """Yield the control plane's connection, under the control plane's lock.
 
@@ -513,9 +552,14 @@ def control_plane_connection(
     window opens a connection of its own, still under the control-plane lock,
     and still holds the shared connect lock only across the connect itself
     rather than the whole window.
+
+    ``timeout`` bounds the wait for the window itself and raises
+    ``ControlPlaneBusy`` instead of queueing. It is off by default: waiting is
+    right for every caller that has work to do and wrong only for one that has
+    to answer a monitor now (#181).
     """
     key = _path_key(control_plane_path(duckdb_path))
-    with control_plane_lock(duckdb_path):
+    with _held_control_plane_lock(duckdb_path, timeout):
         with _CONTROL_PLANE_GUARD:
             con = _CONTROL_PLANE_CONNECTIONS.get(key)
         if con is not None:
