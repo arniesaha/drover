@@ -1,6 +1,6 @@
 # Security
 
-Drover v0.2 is designed for one trusted operator on machines and networks they
+Drover v0.3 is designed for one trusted operator on machines and networks they
 control. It is not a multi-tenant service.
 
 ## Supported Boundary
@@ -11,7 +11,7 @@ control. It is not a multi-tenant service.
 
 Tailscale Funnel and other public-internet exposure are not supported. The
 relay protocol forwards requests that create and control agent sessions and
-carries bidirectional terminal streams. Drover v0.2 does not bind individual
+carries bidirectional terminal streams. Drover v0.3 does not bind individual
 hosts to individual credentials.
 
 ## Authentication

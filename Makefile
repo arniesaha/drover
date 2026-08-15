@@ -43,7 +43,23 @@ check-release-ready: docs ## Verify repo is ready for release
 		if [ -z "$$TODOS" ]; then echo "  ✓ No TODOs/FIXMEs in codebase"; \
 		else echo "  ⚠ Found issues: $$TODOS"; fi; \
 	fi
+
+	@echo "4. Nothing private in the tracked tree:"; \
+	python3 scripts/check_public_release.py >/dev/null \
+		|| { echo "  ✗ scripts/check_public_release.py reported findings."; exit 1; }
+	@echo "  ✓ Public release audit clean"
+
+	@echo "5. The changelog names this version:"; \
+	grep -q "^## \[$(VERSION)\]" CHANGELOG.md \
+		|| { echo "  ✗ CHANGELOG.md has no '## [$(VERSION)]' section."; exit 1; }
+	@echo "  ✓ CHANGELOG.md documents $(VERSION)"
+
 	@echo "=== Release Readiness: PASSED ==="
+	@echo
+	@echo "This gate checks the repository, not the build. It does not run the"
+	@echo "test suite: run 'uv run pytest' (needs 'uv sync --extra dev'), or"
+	@echo "read CI on the commit you intend to tag. A release cut over a red"
+	@echo "suite passes this target."
 
 build: ## Build distribution (sdist and wheel)
 	@echo "=== Building Distribution ===" && \
