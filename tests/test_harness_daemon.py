@@ -3972,3 +3972,25 @@ def test_harnessd_refuses_to_start_a_terminal_only_sign_in(tmp_path):
     assert refused.value.code == 409
     assert payload["sign_in"] == "terminal"
     assert status_body["sign_in"] == "terminal"
+
+
+def test_every_offered_preset_can_actually_be_driven():
+    """A preset the hub cannot drive is still offered as a session target.
+
+    ``capabilities()`` advertises presets, and ``HarnessPreset.as_json`` carries
+    no structured-capable flag -- so the app lists every preset in the New
+    Session picker and the gap surfaces only at launch, as the raw internal
+    string ``harness has no structured driver: <name>`` rendered as an error.
+    That is what shipping the openclaw preset with no driver behind it did.
+
+    ``shell`` is the deliberate exception: it is a terminal session driven
+    through the PTY path, never the structured one.
+    """
+    from drover.server.harness.structured.manager import _FACTORIES
+
+    drivable = set(_FACTORIES) | {"shell"}
+    offered = set(DEFAULT_PRESETS)
+
+    assert (
+        offered <= drivable
+    ), f"presets with no structured driver: {sorted(offered - drivable)}"
