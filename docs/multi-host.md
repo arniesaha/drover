@@ -125,8 +125,8 @@ that host. Favourites are set by hand in the hub's `~/.drover/config.toml`:
 [harness]
 favorite_cwds = [
   "/srv/shared",
-  {path = "/Users/me/drover", host_id = "mac-mini"},
-  {path = "/home/me/drover", host_id = "nas"},
+  {path = "/opt/checkouts/drover", host_id = "mac-mini"},
+  {path = "/var/checkouts/drover", host_id = "nas"},
 ]
 ```
 
