@@ -354,6 +354,98 @@ def test_restored_driver_resumes_native_thread_on_first_turn():
     assert argv[-1] == "continue the task"
 
 
+# -- prompts that begin with a dash (issue #186) ----------------------------
+#
+# `codex exec` is a clap CLI, so a bare positional prompt starting with `-`
+# is parsed as an option and the turn dies with "unexpected argument '- '
+# found". A `--` separator immediately before the prompt makes everything
+# after it positional. Verified against codex-cli 0.147.0 on both the
+# initial and the resume path.
+
+BULLET_PROMPT = "- Pull the latest from remote.\n- Look at the open issues."
+
+
+def test_initial_turn_passes_dash_leading_prompt_after_a_separator():
+    driver = CodexDriver(["codex"], None, lambda _message: None)
+
+    argv = driver._argv_for(BULLET_PROMPT)
+
+    assert argv[-2:] == ["--", BULLET_PROMPT]
+
+
+def test_resume_turn_passes_dash_leading_prompt_after_a_separator():
+    driver = CodexDriver(
+        ["codex"], None, lambda _message: None, native_session_id="thread-1"
+    )
+
+    argv = driver._argv_for(BULLET_PROMPT)
+
+    assert argv[1:4] == ["exec", "resume", "thread-1"]
+    assert argv[-2:] == ["--", BULLET_PROMPT]
+
+
+def test_initial_turn_argv_is_otherwise_unchanged_for_an_ordinary_prompt():
+    driver = CodexDriver(["codex"], None, lambda _message: None)
+
+    assert driver._argv_for("list the open issues") == [
+        "codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "danger-full-access",
+        "--",
+        "list the open issues",
+    ]
+
+
+def test_resume_turn_argv_is_otherwise_unchanged_for_an_ordinary_prompt():
+    driver = CodexDriver(
+        ["codex"], None, lambda _message: None, native_session_id="thread-1"
+    )
+
+    assert driver._argv_for("keep going") == [
+        "codex",
+        "exec",
+        "resume",
+        "thread-1",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "sandbox_mode=danger-full-access",
+        "--",
+        "keep going",
+    ]
+
+
+@pytest.mark.parametrize("prompt", ["--", "--help", "--sandbox read-only"])
+def test_double_dash_prompts_are_delivered_intact(prompt):
+    initial = CodexDriver(["codex"], None, lambda _message: None)
+    resumed = CodexDriver(
+        ["codex"], None, lambda _message: None, native_session_id="thread-1"
+    )
+
+    # The separator is added once and the prompt survives verbatim after it,
+    # even when the prompt is itself `--`.
+    assert initial._argv_for(prompt)[-2:] == ["--", prompt]
+    assert resumed._argv_for(prompt)[-2:] == ["--", prompt]
+
+
+def test_model_and_thinking_effort_still_precede_the_separator():
+    driver = CodexDriver(["codex"], None, lambda _message: None)
+
+    argv = driver._argv_for(BULLET_PROMPT, model="gpt-5.6-sol", thinking_effort="high")
+
+    assert argv[:5] == [
+        "codex",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+    ]
+    assert argv[-2:] == ["--", BULLET_PROMPT]
+
+
 # -- parse_line, literal lines from FINDINGS.md / the golden fixtures -------
 
 
