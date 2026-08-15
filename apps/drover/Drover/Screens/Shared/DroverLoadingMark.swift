@@ -1,4 +1,5 @@
 import SwiftUI
+import DroverKit
 
 /// The cold-open indicator: a spinner, shown only once the wait is long
 /// enough to be worth acknowledging.
@@ -18,20 +19,16 @@ import SwiftUI
 /// The delay is the part that carries its weight. Without it a local open,
 /// which lands in tens of milliseconds, flashes a spinner on every session you
 /// touch, and that reads as jank rather than as reassurance.
+///
+/// When to draw it is no longer decided here: `ColdOpenTracker.state` picks
+/// between silence, this spinner and the unreachable state below, and it lives
+/// in DroverKit because both the chat and terminal screens need the same
+/// answer and because a rule about when a screen gives up deserves tests that
+/// do not need a simulator (#170).
 enum DroverLoadingMark {
-    /// Nothing is drawn before this.
-    static let appearAfter: TimeInterval = 0.25
-
     /// Chrome, not text — the base accent is the token tuned for icons,
     /// outlines and interface marks, and it resolves its own ramp.
     static let tint = DroverColor.accent
-
-    /// Cold open only. Reconnects belong to `ReconnectingPill`, which is why
-    /// this is done for good once a session has ever attached.
-    static func shouldShow(hasConnectedOnce: Bool, elapsed: TimeInterval) -> Bool {
-        guard !hasConnectedOnce else { return false }
-        return elapsed >= appearAfter
-    }
 }
 
 /// The cold-open state: a spinner, centred, in the accent.
@@ -45,5 +42,34 @@ struct DroverLoadingMarkView: View {
             .tint(DroverLoadingMark.tint)
             .accessibilityIdentifier("chat.coldOpen.mark")
             .accessibilityLabel("Catching up")
+    }
+}
+
+/// The cold open's third state: the connection is not coming, said out loud.
+///
+/// Shaped after the inbox's own unreachable state (`SessionsView`, same
+/// `ContentUnavailableView`, same title, same Retry) rather than as new
+/// chrome — a phone that cannot reach the fleet should not look like three
+/// different products depending on which screen was open when it happened.
+struct ColdOpenFailureView: View {
+    let detail: String
+    let accessibilityID: String
+    let onRetry: () -> Void
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+        } description: {
+            Text(detail)
+        } actions: {
+            Button("Retry", action: onRetry)
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("\(accessibilityID)-retry")
+        }
+        // Opaque on purpose: this overlays a transcript in chat and a black
+        // SwiftTerm view in terminal, and the second one would otherwise read
+        // as text floating on the shell.
+        .background(DroverColor.bg)
+        .accessibilityIdentifier(accessibilityID)
     }
 }

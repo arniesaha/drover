@@ -78,6 +78,12 @@ public enum TerminalStreamEvent: Sendable, Equatable {
     /// first frame arrives on a (re)connection (it always sends `attached`
     /// the instant it accepts the upgrade).
     case connection(Bool)
+    /// A connection attempt that ended without ever attaching, with the
+    /// reason. Distinct from `.connection(false)`, which also fires for a drop
+    /// after the terminal was live: only an attempt that never saw a frame
+    /// tells you the session has *never* been reachable, which is the one
+    /// case a black screen cannot explain on its own (#170).
+    case connectFailed(String)
 }
 
 // MARK: - TerminalStream
@@ -233,9 +239,23 @@ public actor TerminalStream {
                 // Stream finished without error: server closed cleanly.
                 // Treat as a disconnect and reconnect, same as an error.
                 if Task.isCancelled { break }
+                // A clean close before the daemon's `attached` frame is still
+                // an attempt that never attached — there is no error to name,
+                // so it takes the same line a dropped connection would.
+                if !sawFrame {
+                    continuation.yield(.connectFailed(DroverError.unreachableDescription))
+                }
             } catch {
                 if Task.isCancelled { break }
-                // fall through to reconnect loop
+                // An attempt that never saw a frame never attached, so the
+                // screen has nothing on it to explain the wait. Reported so a
+                // cold open can eventually say so; the reconnect below is
+                // unchanged (#170).
+                if !sawFrame {
+                    continuation.yield(
+                        .connectFailed(DroverError.connectionFailureReason(error))
+                    )
+                }
             }
             outgoing.setSend(nil)
         }

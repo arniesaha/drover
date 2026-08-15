@@ -106,6 +106,49 @@ struct TerminalStreamTests {
     #expect(sawBackUp)
 }
 
+/// The terminal's half of #170. A PTY that never attaches shows a black
+/// screen, which is even quieter than chat's spinner — nothing on it changes
+/// to suggest anything is being attempted.
+@Test func aConnectionThatNeverAttachedSaysWhy() async throws {
+    let connector = FakeTerminalConnector([
+        .frames([], thenError: true),                                 // never attached
+        .frames([attachedFrame, outputFrame("up")], thenError: false),
+    ])
+    let stream = TerminalStream(request: URLRequest(url: URL(string: "ws://test.local/t")!),
+                                connector: connector,
+                                reconnectBaseDelay: .milliseconds(10))
+    var failures: [String] = []
+    for await event in await stream.events() {
+        if case let .connectFailed(reason) = event { failures.append(reason) }
+        if case .output = event { break }
+    }
+    #expect(failures == ["Can't reach the hub"])
+}
+
+/// The daemon keeps the PTY alive across client drops, so a socket that dies
+/// after the terminal was live is a reconnect, not a cold open that failed.
+/// Only an attempt that never saw a frame counts.
+@Test func aDropAfterAttachingIsNotAColdOpenFailure() async throws {
+    let connector = FakeTerminalConnector([
+        .frames([attachedFrame, outputFrame("one")], thenError: true),
+        .frames([attachedFrame, outputFrame("two")], thenError: false),
+    ])
+    let stream = TerminalStream(request: URLRequest(url: URL(string: "ws://test.local/t")!),
+                                connector: connector,
+                                reconnectBaseDelay: .milliseconds(10))
+    var outputs: [String] = []
+    var failures: [String] = []
+    for await event in await stream.events() {
+        switch event {
+        case .output(let text): outputs.append(text)
+        case .connectFailed(let reason): failures.append(reason)
+        default: break
+        }
+        if outputs.count == 2 { break }
+    }
+    #expect(failures.isEmpty)
+}
+
 @Test func lastResizeIsResentOnReconnect() async throws {
     let connector = FakeTerminalConnector([
         .frames([attachedFrame], thenError: true),

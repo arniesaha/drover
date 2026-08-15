@@ -32,6 +32,12 @@ public enum DroverError: Error, Equatable {
 // Without this, `"\(error)"` renders Swift's default reflection of the enum
 // — users were shown literal `transport("cancelled")` in the sessions banner.
 extension DroverError: LocalizedError {
+    /// Named because the cold-open failure state reaches for these same two
+    /// lines from outside this switch (see `connectionFailureReason`), and
+    /// two screens quietly saying it differently is how copy drifts.
+    static let unreachableDescription = "Can't reach the hub"
+    static let malformedDescription = "Unexpected response from the hub"
+
     public var errorDescription: String? {
         switch self {
         case .unauthorized:
@@ -41,12 +47,24 @@ extension DroverError: LocalizedError {
         case .unavailable(let message):
             return message.isEmpty ? "That session is no longer available" : message
         case .transport:
-            return isCancellation ? "Request cancelled" : "Can't reach the hub"
+            return isCancellation ? "Request cancelled" : Self.unreachableDescription
         case .httpStatus(let code, let message):
             return message.isEmpty ? "Server error (\(code))" : message
         case .decoding:
-            return "Unexpected response from the hub"
+            return Self.malformedDescription
         }
+    }
+
+    /// The user-facing reason for a connection attempt that never landed.
+    ///
+    /// Anything that is not already a `DroverError` — a raw `URLError` off a
+    /// WebSocket task, say — collapses to the transport line rather than
+    /// carrying `localizedDescription` through. Foundation's copy talks about
+    /// the phone ("The Internet connection appears to be offline"), and these
+    /// screens have always talked about the hub: the radio being fine says
+    /// nothing about whether the fleet answered.
+    static func connectionFailureReason(_ error: Error) -> String {
+        (error as? DroverError)?.errorDescription ?? unreachableDescription
     }
 }
 

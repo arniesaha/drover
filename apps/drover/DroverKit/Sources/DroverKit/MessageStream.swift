@@ -57,6 +57,15 @@ public enum StreamEvent: Sendable, Equatable {
     case message(HarnessMessage)
     case history([HarnessMessage], decodeIssues: [MessageDecodeIssue])
     case connection(Bool)   // false while reconnecting
+    /// A connect attempt that did not land, with the reason as a whole
+    /// sentence in the client's own vocabulary.
+    ///
+    /// Not terminal, unlike `.unauthorized`: the pump backs off and tries
+    /// again straight after emitting this. It exists because the catch that
+    /// produces it used to be a bare `continue`, so the reason a cold open
+    /// could not reach the hub went nowhere and the screen had a spinner and
+    /// nothing else to show (#170).
+    case connectFailed(String)
     /// Terminal: the token was rejected (401) by either the REST catch-up or
     /// the WebSocket handshake. Unlike a transient drop, this is never
     /// recoverable by retrying with the same token, so the pump stops
@@ -236,6 +245,11 @@ public actor MessageStream {
                 break
             } catch {
                 if Task.isCancelled { break }
+                // Say why before backing off. The retry is unchanged; what is
+                // new is that the reason survives the loop, so a first connect
+                // that keeps failing can eventually be shown as an outage
+                // rather than as an endless spinner (#170).
+                continuation.yield(.connectFailed(Self.failureReason(for: error)))
                 continue
             }
             if Task.isCancelled { break }
@@ -275,6 +289,16 @@ public actor MessageStream {
         }
 
         continuation.finish()
+    }
+
+    /// A `CatchUpError` means the hub answered, just not with something a
+    /// transcript can be assembled from — "can't reach" would be a lie, and
+    /// `sequenceGap` is not a sentence to show anyone. Everything else already
+    /// has the client's own wording.
+    private static func failureReason(for error: Error) -> String {
+        error is CatchUpError
+            ? DroverError.malformedDescription
+            : DroverError.connectionFailureReason(error)
     }
 
     /// Counts consecutive gap failures around the real catch-up, so that a
