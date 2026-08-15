@@ -240,7 +240,17 @@ class StructuredSessionManager:
         )
         with self._entries_lock:
             self._entries[session_id] = entry
-        entry.driver.start()
+        try:
+            entry.driver.start()
+        except Exception:
+            # A launch that never started must not stay listed as live: the
+            # daemon turns this into a 400 and marks the session errored, but
+            # has()/session_ids() would still claim the session for the rest
+            # of the process's life (DeepSeek refuses to start against a cwd
+            # it cannot use as a sandbox workspace root, and the Web RPC
+            # service being down raises here too).
+            self._discard_entry(session_id, entry)
+            raise
 
     def record_recovered(self, session_id: str, native_session_id: str) -> None:
         entry = self._require_entry(session_id)
