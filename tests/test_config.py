@@ -2,7 +2,7 @@
 
 from pathlib import Path
 import pytest
-from drover.config import load_config, default_config
+from drover.config import FavoriteCwd, load_config, default_config
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nexus_config.toml"
 
@@ -107,7 +107,62 @@ def test_loads_harness_favorite_cwds(tmp_path):
         "[harness]\nfavorite_cwds = ['/home/me/dev', '/home/me/projects', '  ']\n"
     )
     cfg = load_config(cfg_file)
-    assert cfg.harness_favorite_cwds == ("/home/me/dev", "/home/me/projects")
+    assert cfg.harness_favorite_cwds == (
+        FavoriteCwd("/home/me/dev", None),
+        FavoriteCwd("/home/me/projects", None),
+    )
+
+
+# -- favourites scoped to a host (issue #187) ------------------------------
+#
+# A bare string keeps its existing meaning, "offer this on every host", so
+# configs written before this change load unchanged. An inline table binds a
+# path to the one host whose filesystem actually has it, which is what a fleet
+# of differently-shaped hosts needs.
+
+
+def test_loads_host_scoped_harness_favorite_cwd(tmp_path):
+    cfg_file = tmp_path / "harness.toml"
+    cfg_file.write_text(
+        "[harness]\n" "favorite_cwds = [{path = '/home/Arnab/dev', host_id = 'nas'}]\n"
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.harness_favorite_cwds == (FavoriteCwd("/home/Arnab/dev", "nas"),)
+
+
+def test_bare_and_host_scoped_favorite_cwds_mix_in_one_list(tmp_path):
+    cfg_file = tmp_path / "harness.toml"
+    cfg_file.write_text(
+        "[harness]\n"
+        "favorite_cwds = [\n"
+        "  '/srv/shared',\n"
+        "  {path = '/Users/arnabmac/drover', host_id = 'mac-mini'},\n"
+        "]\n"
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.harness_favorite_cwds == (
+        FavoriteCwd("/srv/shared", None),
+        FavoriteCwd("/Users/arnabmac/drover", "mac-mini"),
+    )
+
+
+def test_host_scoped_favorite_cwd_with_a_blank_host_applies_everywhere(tmp_path):
+    cfg_file = tmp_path / "harness.toml"
+    cfg_file.write_text(
+        "[harness]\nfavorite_cwds = [{path = '/srv/shared', host_id = '  '}]\n"
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.harness_favorite_cwds == (FavoriteCwd("/srv/shared", None),)
+
+
+def test_favorite_cwd_entries_without_a_path_are_dropped(tmp_path):
+    cfg_file = tmp_path / "harness.toml"
+    cfg_file.write_text(
+        "[harness]\n"
+        "favorite_cwds = [{host_id = 'nas'}, {path = '  ', host_id = 'nas'}]\n"
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.harness_favorite_cwds == ()
 
 
 def test_loads_redis_jobs_config(tmp_path):

@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 import drover.server.harness.registry as registry_module
-from drover.config import AdvisoryContentConfig
+from drover.config import AdvisoryContentConfig, FavoriteCwd
 from drover.schema import bootstrap
 from drover.server import metrics
 from drover.server.advisory.repository import AdvisoryRepository
@@ -1491,6 +1491,60 @@ def test_metrics_collector_harness_cwd_suggestions_are_recent_then_favorites(tmp
     assert {"path": "/home/Arnab/dev", "source": "favorite"} in payload[
         "cwd_suggestions"
     ]
+
+
+# -- favourites scoped to a host (issue #187) ------------------------------
+#
+# The app filters suggestions on `host_id == nil || host_id == selected`, so an
+# untagged favourite is offered for every host. That branch is deliberate --
+# it is what lets a genuinely host-agnostic suggestion through -- so the fix is
+# to let a favourite say which host it belongs to, not to change the filter.
+
+
+def test_metrics_collector_host_scoped_favorite_carries_its_host_id(tmp_path):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+        favorite_cwds=(
+            FavoriteCwd("/home/Arnab/dev", "nas"),
+            FavoriteCwd("/srv/shared", None),
+        ),
+    )
+
+    payload = json.loads(collector.render_harness_json())
+
+    assert {
+        "host_id": "nas",
+        "path": "/home/Arnab/dev",
+        "source": "favorite",
+    } in payload["cwd_suggestions"]
+    # No host_id key at all rather than an explicit null: the app reads a
+    # missing host as "offer everywhere", which is what a bare favourite means.
+    assert {"path": "/srv/shared", "source": "favorite"} in payload["cwd_suggestions"]
+
+
+def test_metrics_collector_keeps_one_path_favorited_on_two_hosts_apart(tmp_path):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+        favorite_cwds=(
+            FavoriteCwd("/opt/work", "nas"),
+            FavoriteCwd("/opt/work", "mac-mini"),
+        ),
+    )
+
+    payload = json.loads(collector.render_harness_json())
+
+    favorites = [s for s in payload["cwd_suggestions"] if s["source"] == "favorite"]
+    assert [s["host_id"] for s in favorites] == ["nas", "mac-mini"]
 
 
 def test_metrics_collector_cwd_suggestions_no_favorites_by_default(tmp_path):
