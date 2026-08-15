@@ -275,6 +275,12 @@ class CodexDriver:
             command.extend(["--model", model])
         if thinking_effort:
             command.extend(["-c", f'model_reasoning_effort="{thinking_effort}"'])
+        # The trailing ``--`` ends option parsing so the prompt stays
+        # positional however it begins. Without it a prompt written as an
+        # ordinary markdown bullet list aborts the turn at arg-parse with
+        # "unexpected argument '- ' found" -- the same clap failure family as
+        # the ``--sandbox`` note below, except the prompt is user content and
+        # cannot be sanitised away.
         if self._thread_id is None:
             return command + [
                 "exec",
@@ -282,6 +288,7 @@ class CodexDriver:
                 "--skip-git-repo-check",
                 "--sandbox",
                 "danger-full-access",
+                "--",
                 text,
             ]
         # ``codex exec resume`` does NOT accept ``--sandbox`` (that flag lives
@@ -296,6 +303,7 @@ class CodexDriver:
             "--skip-git-repo-check",
             "-c",
             "sandbox_mode=danger-full-access",
+            "--",
             text,
         ]
 
