@@ -184,7 +184,7 @@ struct ChatModelTests {
         )]
     )
 
-    #expect(model.headerMetadata == "Codex · ctx 100 / 1K · 10%")
+    #expect(model.headerMetadata == "Codex · ctx 100 / 1K")
 }
 
 @Test @MainActor func turnCompletePollsUntilRecapReachesSourceSequence() async {
