@@ -43,6 +43,15 @@ enum DroverColor {
     /// creeping back into prose.
     static let accentHi = PaletteToken(dark: 0x4F_C7_BB, light: 0x0E_54_50)
     static let accentTint = PaletteToken(dark: 0x11_26_28, light: 0xD8_F0_EC)
+    /// Amber for things that went wrong but are recoverable — a send that
+    /// failed, a turn that queued. Amber rather than red: none of these are
+    /// destructive, and red is spent on terminate.
+    ///
+    /// This exists because the raw system orange it replaced is a dark-mode
+    /// colour. It measures ~8:1 on the dark ground and ~1.8:1 on the light
+    /// one, so light mode announced failures in text nobody could read. Both
+    /// ramps here carry body copy, so both owe the AA floor.
+    static let warn = PaletteToken(dark: 0xED_B0_5A, light: 0x8A_4B_0A)
 
     /// The contract as data, in the design doc's order. Tests walk this so a
     /// token added here without a ramp — or with the two ramps swapped —
@@ -58,6 +67,7 @@ enum DroverColor {
         ("accent", accent),
         ("accentHi", accentHi),
         ("accentTint", accentTint),
+        ("warn", warn),
     ]
 }
 
