@@ -6,6 +6,7 @@ defaults for any missing field so a brand-new install Just Works after
 """
 
 from __future__ import annotations
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 import math
@@ -67,6 +68,42 @@ class AdvisoryContentConfig:
         ):
             if getattr(self, field_name) <= 0:
                 raise ValueError(f"advisory_content.{field_name} must be positive")
+
+
+@dataclass(frozen=True)
+class FavoriteCwd:
+    """A "favorite" working directory offered in the New Session sheet.
+
+    ``host_id`` is the host whose filesystem has this path. ``None`` means
+    "offer it on every host", which is what a bare string in the config file
+    means and is the only shape favorites had before host scoping. On a fleet
+    whose hosts do not share a layout, an unscoped favorite is offered for
+    hosts that have no such directory, and picking one anchors a session to a
+    root that does not exist (see the cwd validation in structured/workspace).
+    """
+
+    path: str
+    host_id: str | None = None
+
+    @classmethod
+    def parse(cls, entry: object) -> "FavoriteCwd | None":
+        """Read one config entry, or ``None`` if it names no path.
+
+        Accepts either a bare string or a table with ``path`` and an optional
+        ``host_id``; anything else is ignored rather than fatal, so one
+        malformed favorite cannot stop the server from starting.
+        """
+        if isinstance(entry, str):
+            path, host_id = entry, ""
+        elif isinstance(entry, Mapping):
+            path = str(entry.get("path", ""))
+            host_id = str(entry.get("host_id", "") or "")
+        else:
+            return None
+        path = path.strip()
+        if not path:
+            return None
+        return cls(path=path, host_id=host_id.strip() or None)
 
 
 @dataclass(frozen=True)
@@ -143,7 +180,8 @@ class DroverConfig:
     update_repo: str
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
-    harness_favorite_cwds: tuple[str, ...]
+    # Each carries the host it belongs to, or None for every host.
+    harness_favorite_cwds: tuple[FavoriteCwd, ...]
     # Provider account freshness. Successful identical observations advance
     # this fetch clock without duplicating immutable quota snapshots.
     provider_freshness_threshold_seconds: float
@@ -344,7 +382,11 @@ def _from_dict(d: dict) -> DroverConfig:
         update_keep_versions=int(d["update"]["keep_versions"]),
         update_repo=str(d["update"]["repo"]),
         harness_favorite_cwds=tuple(
-            str(p) for p in d["harness"]["favorite_cwds"] if str(p).strip()
+            favorite
+            for favorite in (
+                FavoriteCwd.parse(entry) for entry in d["harness"]["favorite_cwds"]
+            )
+            if favorite is not None
         ),
         provider_freshness_threshold_seconds=provider_freshness_threshold_seconds,
         advisory_full_review_interval_seconds=float(

@@ -79,7 +79,9 @@ public final class LaunchModel {
     }
 
     /// Suggestion paths scoped to the selected host — host-tagged entries
-    /// from other hosts are dropped, host-agnostic favorites always pass.
+    /// from other hosts are dropped, untagged ones always pass. A favorite is
+    /// tagged when the config names a host for it and untagged when it does
+    /// not, which is how a path that exists on one host stays off the others.
     /// Mirrors the web client's datalist filtering.
     public var cwdSuggestions: [String] {
         (snapshot?.cwdSuggestions ?? [])

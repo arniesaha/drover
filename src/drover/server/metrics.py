@@ -13,7 +13,9 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+from drover.config import FavoriteCwd
 from urllib.parse import quote, urlencode, urlparse
 
 from drover.server.harness.daemon import (
@@ -597,7 +599,7 @@ def _redis_stream_snapshots(
 
 
 def _harness_cwd_suggestions(
-    sessions: list[Any], favorite_cwds: tuple[str, ...] = ()
+    sessions: list[Any], favorite_cwds: Sequence[FavoriteCwd | str] = ()
 ) -> list[dict[str, str]]:
     suggestions: list[dict[str, str]] = []
     seen: set[tuple[str | None, str]] = set()
@@ -621,8 +623,13 @@ def _harness_cwd_suggestions(
             source="recent session",
             host_id=getattr(session, "host_id", None),
         )
-    for path in favorite_cwds:
-        add(path, source="favorite")
+    for favorite in favorite_cwds:
+        # A bare string is still accepted here (and still means every host):
+        # the config file allows one, and so does anything constructing a
+        # collector directly.
+        if isinstance(favorite, str):
+            favorite = FavoriteCwd(favorite)
+        add(favorite.path, source="favorite", host_id=favorite.host_id)
     return suggestions[:24]
 
 
@@ -864,8 +871,9 @@ class MetricsCollector:
     ttl_seconds: float = 60.0
     api_token: str = ""
     # New Session sheet "favorite" cwd suggestions, from [harness].favorite_cwds
-    # in ~/.drover/config.toml (empty by default — no hardcoded paths).
-    favorite_cwds: tuple[str, ...] = ()
+    # in ~/.drover/config.toml (empty by default — no hardcoded paths). Each
+    # carries the host it belongs to, or None for every host.
+    favorite_cwds: tuple[FavoriteCwd | str, ...] = ()
     # Set by start_metrics_server; owns live hub<->harnessd relay connections.
     relay_manager: "RelayManager | None" = None
     # Separate from ttl_seconds (60s, Prometheus): a fleet view must feel

@@ -217,7 +217,7 @@ func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbol
     #expect(snap.cwdSuggestions[0].path == "/Users/arnabmac/jenny/nexus")
     #expect(snap.cwdSuggestions[0].source == "recent session")
     #expect(snap.cwdSuggestions[0].hostID == "mac-mini")
-    #expect(snap.cwdSuggestions[1].hostID == nil)   // favorites are host-agnostic
+    #expect(snap.cwdSuggestions[1].hostID == nil)   // untagged: offered everywhere
 }
 
 @Test func messagesDecodeLeniently() throws {
