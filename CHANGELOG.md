@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded [Integrations](docs/integrations.md) with agent ID patterns and path mapping
 - Added [Multi-Host](docs/multi-host.md) setup instructions
 
-## [0.2.0] - 2024-12-XX
+## [0.2.0] - 2026-08-13
 
 ### Added
 
@@ -131,18 +131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial security posture: single-operator trust model, token hashing, pairing codes
 - Basic security documentation (Security.md)
 
-## [0.1.0]
-
-### Note
-
-Version 0.1.0 was an internal development version not publicly released. The first
-public release is v0.2.0.
-
 ## Release Notes
 
 ### Version 0.2.0
 
-This is the first public release of Drover, focused on:
+Version 0.2.0 is focused on:
 
 1. **Fleet Cockpit**: Visual management of coding agent sessions from mobile or desktop
 2. **Context Store**: Durable, queryable agent activity with summaries and embeddings
@@ -154,7 +147,6 @@ This is the first public release of Drover, focused on:
 ### Known Limitations
 
 - Single trusted operator only (no multi-tenant)
-- No per-host credentials (all credentials equal)
 - No RBAC or fine-grained permissions
 - Agents execute with full host privileges (no sandboxing)
 - Tailscale Funnel and public exposure not supported
@@ -171,9 +163,9 @@ curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | 
 From token-based deployment:
 
 ```bash
-# Generate new credentials for all devices
-drover-server credentials generate
-# Update all connected devices with new QR codes
+# Pair a device or add a host with a new credential
+drover-server pair
+drover-server pair-host --name <host-id>
 ```
 
 ## Versioning Policy

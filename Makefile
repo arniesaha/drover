@@ -1,6 +1,8 @@
-.PHONY: help docs lint test build clean release status version check-lint check-release-ready pr-setup pr-commit pr-push pr-create release-validate example-one-click-release
+.PHONY: help docs lint test build clean release status version check-lint check-release-ready pr-setup pr-commit pr-push pr-create release-tag release-validate example-one-click-release
 
 VERSION = $(shell grep "^version" pyproject.toml | awk '{print $$3}' | tr -d '"')
+TAG ?= v$(VERSION)
+export TAG
 BUILD_DIR := dist
 
 .DEFAULT_GOAL := help
@@ -17,22 +19,22 @@ docs: ## Validate all documentation files
 		test -f "$$doc" || exit 1; \
 		echo "✓ $$doc"; \
 	done; \
+	python3 scripts/check_markdown_links.py README.md docs || exit 1; \
 	echo "✓ All documentation files validated"
 
-check-release-ready: ## Verify repo is ready for release
-	@echo "=== Checking Release Readiness ===" && \
-	echo "1. Documentation:" && \
-	test -f docs/context-store.md && echo "  ✓ docs/context-store.md" || exit 1 && \
-	test -f docs/threat-model.md && echo "  ✓ docs/threat-model.md" || exit 1 && \
-	test -f CHANGELOG.md && echo "  ✓ CHANGELOG.md" || exit 1 && \
-	test -f SECURITY.md && echo "  ✓ SECURITY.md" || exit 1 && \
-	test -f CONTRIBUTING.md && echo "  ✓ CONTRIBUTING.md" || exit 1 && \
-	test -f .github/CODEOWNERS && echo "  ✓ .github/CODEOWNERS" || exit 1
-
-	@echo "2. Version consistency:" && \
-	VERSION_IN_TOML=$$(grep -m1 "^version" pyproject.toml | cut -d'"' -f2) && \
-	VCS_VERSION=$$(git describe --tags 2>/dev/null | sed 's/^v//' || echo "none") && \
-	echo "  Toml version: $$VERSION_IN_TOML, Git tags: $$VCS_VERSION"
+check-release-ready: docs ## Verify repo is ready for release
+	@echo "=== Checking Release Readiness ==="
+	@echo "1. Documentation: ✓ local links and files validated"
+	@echo "2. Version consistency:"; \
+	tags="$$(git tag --points-at HEAD --list 'v*')"; \
+	if [ -z "$$tags" ]; then \
+		echo "  ✓ Release tag is pending for v$(VERSION)."; \
+	elif [ "$$tags" = "v$(VERSION)" ]; then \
+		echo "  ✓ Head is tagged v$(VERSION)."; \
+	else \
+		echo "  ✗ Release tag '$$tags' does not match pyproject.toml v$(VERSION)."; \
+		exit 1; \
+	fi
 
 	@echo "3. Codebase health:" && \
 	if test -f src/drover/__init__.py; then \
@@ -90,8 +92,13 @@ pr-create: ## Create GitHub PR (requires gh CLI)
 	gh pr create --base main --head docs-and-build-for-v0.2.0 --title "docs: complete public release documentation" --body "Complete documentation suite for Drover v0.2.0 public release"
 
 release-tag: ## Create annotated git tag for release
-	@if [ -z "$(TAG)" ]; then echo "Usage: make release-tag TAG=vX.Y.Z"; exit 1; fi && \
-	git tag -a $(TAG) -m "Drover $(TAG) - public release" && git push origin $(TAG) && echo "✓ Tag $(TAG) created"
+	@if [ "$$TAG" != "v$(VERSION)" ]; then \
+		echo "release-tag derives its tag from pyproject.toml; expected v$(VERSION)."; \
+		exit 1; \
+	fi
+	@git tag -a "$$TAG" -m "Drover $$TAG - public release"
+	@git push origin "$$TAG"
+	@echo "✓ Tag $$TAG created"
 
 release-validate: ## Validate release artifacts before publishing
 	@echo "=== Validating Release Artifacts ===" && \

@@ -1,12 +1,12 @@
 # Security Threat Model
 
-This document describes the security architecture and threat model for Drover v0.1.
+This document describes the security architecture and threat model for Drover v0.2.
 It complements the technical details in [Security](./security.md) and outlines the
 assumptions, trust boundaries, and threat mitigations that inform the design.
 
 ## Scope
 
-This threat model applies to the Drover v0.1 codebase and its standard deployment
+This threat model applies to the Drover v0.2 codebase and its standard deployment
 configurations:
 
 - `drover-server`: central fleet API and context store
@@ -43,8 +43,7 @@ configurations:
 |   Keychain       |                                  |  - fleet state   |
 +------------------+                                  +--------+---------+
                                                             |
-                                                            | mTLS (optional)
-                                                            | or bearer token
+                                                            | bearer token
                                                             v
 +------------------+                                   +----------+-----------+
 | drover-harnessd  |<---------------------------------->| drover-harnessd    |
@@ -76,12 +75,15 @@ configurations:
 **Mitigations**:
 - Tokens are stored hashed on the server (`sha256("drover-cred-v1\0" + token)`), not in plaintext
 - Pairing codes are single-use, time-limited (10 minutes for devices, 15 minutes for hosts)
-- All endpoints require bearer token authentication (after pairing)
+- When authentication is enabled, all routes except `/healthz`, `/readyz`,
+  `/auth/login`, `/auth/pair`, and `/harness/probe` require a bearer token or
+  session cookie
 - Pair endpoint rate-limits: 5 failure attempts per minute
-- Legacy shared token is disabled by default in new installations
+- The legacy shared token is accepted by default for upgrade compatibility and
+  can be disabled after devices and hosts are paired
 
 **Residual Risk**: If `credentials.json` or token file is compromised, attacker gains
-full fleet access until credential is revoked. No revocation granularity per-device.
+full fleet access until the affected credential is revoked.
 
 ### 2. Network Exposure Attacks
 
@@ -161,7 +163,7 @@ hosts. No granular credential scoping or per-host identity verification.
 - Compromised Docker images or installation scripts
 
 **Mitigations**:
-- Source distribution only (no official PyPI package as of v0.1)
+- Source distribution only (no official PyPI package as of v0.2)
 - All code on GitHub repository, open source
 - Signed releases (recommended verification by operators)
 - Installer scripts are reviewed before release
@@ -170,9 +172,9 @@ hosts. No granular credential scoping or per-host identity verification.
 **Residual Risk**: Operator must trust the source repository and verification
 processes. No formal third-party security audit or continuous verification.
 
-## Known Limitations (v0.1)
+## Known Limitations (v0.2)
 
-These security features are intentionally deferred to v0.2+:
+These security features are intentionally not provided:
 
 1. **Multi-tenant isolation**: No support for multiple operators
 2. **Per-host credentials**: All devices can access all hosts with valid token
@@ -207,9 +209,9 @@ If you suspect a security incident:
 ## Acknowledgments
 
 This threat model was written to guide Drover's security design. It reflects known
-limitations and intentional design decisions for v0.1. Updates will be made as new
+limitations and intentional design decisions for v0.2. Updates will be made as new
 threats are identified and features are added.
 
 ## Version History
 
-- 0.1 (2024-12): Initial threat model for Drover v0.1 release
+- 0.2 (2026-08-13): Updated for the v0.2.0 release tag

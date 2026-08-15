@@ -119,36 +119,22 @@ Sign the app with your Apple developer team before running on device.
 
 ### Python
 
-We use the following formatting tools:
+The development extra provides the supported Python tooling:
 
 - **Black**: Code formatting with line length **88**
 - **isort**: Import sorting
-- **ruff**: Fast linting (preferred over flake8)
-
-**Pre-commit hooks** are recommended. Install them with:
-
-```bash
-uv sync --extra dev
-pre-commit install
-```
-
-Pre-commit will run automatically on each commit:
-- Black formatting (format: 88)
-- isort (standard mode)
-- ruff linting
 
 ### Manual Formatting
 
-If you don't use git hooks, format your code before submitting:
+Install the development extra, then format Python before submitting:
 
 ```bash
 # Install development extra
 uv sync --extra dev
 
 # Format code
-uv run ruff format .
+uv run black .
 uv run isort .
-uv run ruff check .
 ```
 
 **Black configuration (line length 88):**
@@ -221,27 +207,19 @@ Closes #123
 ### Running Tests
 
 ```bash
-# All tests
-pytest
+# All Python tests
+uv run pytest
 
-# Specific module
-pytest tests/unit/test_server.py
-
-# With coverage
-pytest --cov=drover --cov-report=term-missing
-
-# Watch mode (re-run on changes)
-pytest -w src --watch
+# A specific module
+uv run pytest tests/test_check_public_release.py
 ```
 
 ### Test Organization
 
 ```
 tests/
-├── unit/              # Unit tests for specific modules
-├── integration/       # Integration tests for components
-├── e2e/              # End-to-end tests
-└── fixtures/         # Test data and mocks
+├── test_*.py          # Python unit and integration coverage
+└── shell/             # Shell workflow checks
 ```
 
 ### Test Standards
@@ -273,11 +251,10 @@ def test_session_lifecycle(sample_session):
 
 ### Before Submitting
 
-1. **Ensure tests pass**: `pytest` on your changes
+1. **Ensure tests pass**: `uv run pytest` on your changes
 2. **Update documentation**: Add docs for new features
 3. **Add CHANGELOG entry**: See below
-4. **Lint your code**: `ruff check .` passes
-5. **Format your code**: `black .` and `isort .`
+4. **Format your code**: `uv run black --check .` and `uv run isort --check-only .`
 
 ### Adding to CHANGELOG.md
 
@@ -305,20 +282,10 @@ Add an entry under `[Unreleased]` in the format matching the category:
 - Security improvement
 ```
 
-### PR Template
+### Pull Request Description
 
-We have a PR template with these sections:
-- Description of changes
-- Testing performed
-- Screenshots (if UI changes)
-- Checklist
-
-Checklist items:
-- [ ] Code follows style guidelines
-- [ ] Tests added/updated
-- [ ] Documentation updated
-- [ ] CHANGELOG.md updated
-- [ ] Breaking changes documented
+Describe the change, the validation you ran, and any user-visible effect.
+Include screenshots for UI changes and call out breaking changes explicitly.
 
 ### Code Review
 
@@ -346,11 +313,8 @@ Checklist items:
 ### Documentation Commands
 
 ```bash
-# Verify markdown links
-mdlinkchecker docs/
-
-# Build and view docs locally (if using docs build tool)
-# cd docs && npm run build
+# Verify local Markdown links and referenced files
+make docs
 ```
 
 ## Security
@@ -360,7 +324,7 @@ mdlinkchecker docs/
 **Do not file security issues as public issues.**
 
 Report security concerns via email:
-- Email: `security@arniesaha.com` (placeholder)
+- Email: `security@arniesaha.com`
 - Include: vulnerability description, impact assessment, steps to reproduce
 - Expect acknowledgement within 72 hours
 
@@ -390,8 +354,7 @@ Maintainers will:
 
 ## Recognition
 
-Contributors are added to the `CONTRIBUTORS.md` file and acknowledged in release notes.
-See the [Changelog](CHANGELOG.md) for contributor attribution.
+The Git history and [Changelog](CHANGELOG.md) acknowledge contributors.
 
 ## Questions?
 

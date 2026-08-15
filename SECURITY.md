@@ -89,7 +89,9 @@ security posture.
 
 ### Authentication
 
-- Bearer token authentication for all API endpoints
+- When authentication is enabled, bearer tokens or session cookies protect all
+  routes except `/healthz`, `/readyz`, `/auth/login`, `/auth/pair`, and
+  `/harness/probe`
 - Per-device and per-host credentials (not shared)
 - Credential hashing: `sha256("drover-cred-v1\0" + token)`
 - Pairing codes with time limits (10 min device, 15 min host)
@@ -98,7 +100,9 @@ security posture.
 ### Network Security
 
 - Default localhost-only bindings
-- TLS-optional for remote connections
+- Built-in central and harness listeners do not configure TLS or mTLS
+- Keep listeners on localhost or a trusted private network; terminate TLS in
+  an external proxy only when you operate and secure that proxy
 - Private network boundary enforcement (no public exposure)
 
 ### Data Security
@@ -148,7 +152,7 @@ We maintain a responsible disclosure program for security vulnerabilities:
 
 ## Compliance
 
-Drover v0.1 is designed for trusted personal use. It does not provide:
+Drover v0.2 is designed for trusted personal use. It does not provide:
 - Multi-tenant isolation
 - SOC 2 or ISO 27001 compliance
 - Enterprise audit logging
@@ -164,4 +168,4 @@ and issue reporting through the proper channels.
 
 ---
 
-_Last updated: 2024-12-XX_
+_Last updated: 2026-08-13_

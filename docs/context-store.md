@@ -275,7 +275,7 @@ LIMIT 5;
 
 ### Observability
 
-`drover-server pipeline_observatory` tracks:
+`drover-server observatory` reports:
 
 - **Latest summaries** - Most recent generation
 - **Latest briefs** - Project briefs generated
@@ -351,14 +351,11 @@ sessions can belong to the same task_id as the task evolves across time.
 # Check lakehouse health
 drover-server quality --deep
 
-# Check pipeline observatory
-drover-server pipeline-observatory
+# Inspect the latest pipeline state
+drover-server observatory
 
-# Check context links
-drover-server context-links
-
-# Check derivation
-drover-server derive-status
+# Audit session consistency
+drover-server audit-sessions
 ```
 
 ### Quality Check Outputs

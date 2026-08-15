@@ -10,8 +10,7 @@
 * @arniesaha
 
 # Documentation
-/docs/*.md @arniesaha
-/docs/*.mdx @arniesaha
+/docs/** @arniesaha
 
 # Security documentation
 /docs/security.md @arniesaha
@@ -19,19 +18,20 @@
 /SECURITY.md @arniesaha
 
 # GitHub-specific files
-/.github/ @arniesaha
-/.github/workflows/* @arniesaha
+/.github/** @arniesaha
 /.github/CODEOWNERS @arniesaha
 
 # Core backend packages
-/drover/pyproject.toml @arniesaha
-/drover/src/drover/* @arniesaha
-/drover/tests/* @arniesaha
+/pyproject.toml @arniesaha
+/src/drover/** @arniesaha
+/tests/** @arniesaha
 
 # Mobile app
-/apps/drover/*.xcodeproj @arniesaha
-/apps/drover/Sources/* @arniesaha
-/apps/drover/Tests/* @arniesaha
+/apps/drover/**/*.xcodeproj/** @arniesaha
+/apps/drover/Drover/** @arniesaha
+/apps/drover/DroverKit/** @arniesaha
+/apps/drover/DroverTests/** @arniesaha
+/apps/drover/DroverUITests/** @arniesaha
 
 # Deployment and infrastructure
 /deploy/* @arniesaha
