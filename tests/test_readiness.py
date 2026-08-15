@@ -11,6 +11,15 @@ process restarts -- but the process stays alive, launchd reports status 0,
 and readiness kept saying healthy. These tests pin the two halves of the fix:
 a hub whose handles answer is ready, and a hub holding a handle that no longer
 answers is not, for either store.
+
+Issue #181 is the other half, learned the hard way: a readiness endpoint that
+can *block* is a readiness endpoint that goes dark. The first shipped probe
+took the control-plane lock with no bound while holding the cache lock, so one
+slow control-plane window wedged ``/readyz`` permanently -- 20s client
+timeouts, no response at all, cleared only by a restart. So the probe is now
+bounded on both counts, and the tests at the bottom of this file are the ones
+that would have caught it: they hold the control-plane lock deliberately and
+require an answer anyway.
 """
 
 from __future__ import annotations
@@ -18,6 +27,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -29,6 +40,7 @@ from drover.schema import bootstrap
 from drover.server.db import (
     close_control_plane_connections,
     control_plane_connection,
+    control_plane_lock,
     control_plane_path,
     live_connection,
     open_duckdb_connection,
@@ -90,6 +102,46 @@ def _serve(duckdb_path: Path):
 def _states(body: str) -> dict[str, str]:
     payload = json.loads(body)
     return {store["store"]: store["state"] for store in payload["stores"]}
+
+
+#: A ceiling for "answered at all". The probe's own budget for the
+#: control-plane lock is a second; five is enough headroom that a failure here
+#: means it blocked rather than that the machine was busy.
+ANSWERED_SECONDS = 5.0
+
+#: A ceiling for "did not queue behind the probe in front of it". Shorter than
+#: the blocked probe's own budget on purpose: a caller that waited this long
+#: was waiting for the *other* caller's probe, which is the wedge.
+UNQUEUED_SECONDS = 0.5
+
+
+def _run_with_deadline(fn, *, timeout: float = ANSWERED_SECONDS):
+    """Run ``fn`` on a worker thread and fail if it does not finish in time.
+
+    A plain call would hang the whole test session when readiness blocks --
+    which is precisely what #181 did in production -- and a hung session reads
+    as an infrastructure problem rather than a failure.
+    """
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - reported on the main thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        pytest.fail(f"readiness blocked for more than {timeout}s")
+    if "error" in box:
+        raise box["error"]  # type: ignore[misc]
+    return box.get("value")
+
+
+def _store_states(report) -> dict[str, str]:
+    return {store.store: store.state for store in report.stores}
 
 
 class _InvalidatedConnection:
@@ -480,3 +532,119 @@ def test_a_failure_is_never_served_from_the_cache(tmp_path):
 
     assert not first.ok
     assert first.checked_at != second.checked_at
+
+
+def test_a_held_control_plane_lock_cannot_wedge_readiness(tmp_path):
+    """The #181 regression: a probe that cannot start must answer anyway.
+
+    ``control_plane_connection`` takes a process-wide lock, and the first
+    version of this probe took it with no bound. On the live hub one slow
+    window was enough: ``/readyz`` stopped answering entirely -- ``curl``
+    reported code 000 at a 20s timeout -- and stayed that way until the
+    process was restarted, while ``/healthz`` kept answering in under a
+    millisecond.
+
+    The lock is held here for real, from another thread, which is exactly the
+    state a ``/harness`` window in flight puts the process in.
+    """
+    duckdb_path = _db(tmp_path)
+    probe = ReadinessProbe(duckdb_path, cache_seconds=0.0)
+
+    with control_plane_lock(duckdb_path):
+        report = _run_with_deadline(probe.check)
+
+    assert _store_states(report)[STORE_CONTROL_PLANE] == STATE_BUSY, report.as_dict()
+    # Busy is not down: a window in flight is the hub working, not failing.
+    assert report.ok
+
+
+def test_a_blocked_probe_does_not_queue_the_next_caller(tmp_path):
+    """One waiting probe must not put every later request behind it.
+
+    This is what turned a transient into a permanent outage: the cache lock
+    was held across the unbounded acquisition, so every subsequent ``/readyz``
+    blocked on it and sat on a server thread until its client gave up. The
+    cache lock protects the cache; it is not there to serialize probes.
+    """
+    duckdb_path = _db(tmp_path)
+    probe = ReadinessProbe(duckdb_path, cache_seconds=0.0)
+
+    with control_plane_lock(duckdb_path):
+        blocked = threading.Thread(target=probe.check, daemon=True)
+        blocked.start()
+        time.sleep(0.05)  # let it reach the acquisition it cannot win
+
+        started = time.monotonic()
+        report = _run_with_deadline(probe.check, timeout=UNQUEUED_SECONDS)
+        waited = time.monotonic() - started
+
+    blocked.join(timeout=ANSWERED_SECONDS)
+
+    assert waited < UNQUEUED_SECONDS
+    assert _store_states(report)[STORE_CONTROL_PLANE] == STATE_BUSY, report.as_dict()
+
+
+def test_an_overrunning_probe_stops_serving_the_last_good_verdict(tmp_path):
+    """A verdict may be reused while a probe runs, but not forever.
+
+    A concurrent caller answers from the last verdict rather than queueing,
+    which is right while the probe in front of it is merely slow. A probe that
+    has overrun its own budget is itself evidence the control plane is not
+    answering, so the reuse stops and the store is reported busy -- which the
+    existing grace window escalates to a failure if it never clears.
+    """
+    duckdb_path = _db(tmp_path)
+    probe = ReadinessProbe(duckdb_path, cache_seconds=0.0, probe_stall_seconds=0.0)
+    assert probe.check().ok  # a good verdict to reuse
+
+    with control_plane_lock(duckdb_path):
+        blocked = threading.Thread(target=probe.check, daemon=True)
+        blocked.start()
+        time.sleep(0.05)
+
+        report = _run_with_deadline(probe.check, timeout=UNQUEUED_SECONDS)
+
+    blocked.join(timeout=ANSWERED_SECONDS)
+
+    assert _store_states(report)[STORE_CONTROL_PLANE] == STATE_BUSY, report.as_dict()
+
+
+def test_readiness_recovers_when_the_control_plane_lock_is_released(tmp_path):
+    """Busy has to be a state readiness comes back from on its own.
+
+    The production failure needed a restart to clear, which is the property
+    that made it an outage rather than a blip.
+    """
+    duckdb_path = _db(tmp_path)
+    probe = ReadinessProbe(duckdb_path, cache_seconds=0.0)
+
+    with control_plane_lock(duckdb_path):
+        busy = _run_with_deadline(probe.check)
+    recovered = _run_with_deadline(probe.check)
+
+    assert _store_states(busy)[STORE_CONTROL_PLANE] == STATE_BUSY
+    assert _store_states(recovered)[STORE_CONTROL_PLANE] == STATE_OK
+    assert recovered.ok
+
+
+def test_a_bounded_probe_still_fails_an_invalidated_control_plane(
+    tmp_path, monkeypatch
+):
+    """Bounding the wait must not soften what #179 detects.
+
+    ``busy`` means "someone else is using the store", and a store that answers
+    with a fatal error is not busy -- it is broken, and has to stay a 503 even
+    though the probe now gives up waiting for the lock.
+    """
+    monkeypatch.setenv("DROVER_CONTROL_PLANE_PIN", "1")
+    duckdb_path = _db(tmp_path)
+    from drover.server.db import pin_control_plane_connection
+
+    assert pin_control_plane_connection(duckdb_path) is True
+    with control_plane_connection(duckdb_path) as pinned:
+        pinned.close()
+
+    report = _run_with_deadline(ReadinessProbe(duckdb_path, cache_seconds=0.0).check)
+
+    assert _store_states(report)[STORE_CONTROL_PLANE] == STATE_FAILED
+    assert not report.ok

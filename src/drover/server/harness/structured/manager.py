@@ -20,7 +20,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.structured import agy, claude, codex
+from drover.server.harness.structured import agy, claude, codex, deepseek
 from drover.server.harness.structured.driver import StructuredMessage
 
 # Each factory is a small builder, not a bare class -- ClaudeDriver needs a
@@ -51,6 +51,12 @@ _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
             native_session_id=native_session_id,
         ),
         agy.default_command,
+    ),
+    "deepseek-harness": (
+        lambda command, cwd, emit, native_session_id: deepseek.DeepSeekDriver(
+            command, cwd, emit, native_session_id=native_session_id
+        ),
+        deepseek.default_command,
     ),
 }
 

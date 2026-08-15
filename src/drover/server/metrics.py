@@ -86,7 +86,9 @@ _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 # delivers the handoff text as the first turn -- strictly more reliable than
 # typing it into a cold PTY (no startup-gate race).
 _STRUCTURED_HANDOFF_HARNESSES = frozenset(_STRUCTURED_DEFAULT_COMMANDS)
-_RECOVERABLE_STRUCTURED_HARNESSES = frozenset({"claude-code", "codex"})
+_RECOVERABLE_STRUCTURED_HARNESSES = frozenset(
+    {"claude-code", "codex", "deepseek-harness"}
+)
 _RECOVERY_UNAVAILABLE = (
     "Session cannot be resumed after the harness restart. "
     "Continue it in a new session."

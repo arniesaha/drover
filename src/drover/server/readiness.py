@@ -54,6 +54,36 @@ connection per window unless the hub pinned one. That is the same window every
 measurement of the real path rather than an extra load source -- and a brief
 cache keeps a hot poller from multiplying it.
 
+**...on a budget, and never queueing.** Issue #181: measuring the real path
+means taking the real lock, and the first version of this probe took it with
+no bound while holding the cache lock. Seventeen minutes after the deploy one
+slow window was enough -- ``/readyz`` stopped answering at all (``curl`` code
+000 at a 20s timeout) while ``/healthz`` answered in 0.97ms, and only a
+restart cleared it, because every later request piled onto the cache lock
+behind the first blocked probe. Two rules keep that from recurring:
+
+* **The window is bounded.** The probe asks for the control-plane lock with a
+  budget and reports the store ``busy`` when it does not get it. ``busy`` is
+  the state this was designed for -- it already means "someone else has the
+  store" and already escalates to a failure if it never clears -- and it
+  cannot be mistaken for the store answering, so #179's detection is intact.
+* **Nothing waits on a probe.** The cache lock is held for the microseconds
+  it takes to read or write the cache and never across a probe. One probe runs
+  at a time; a caller that arrives mid-probe answers from the last verdict
+  rather than queueing, and once that probe has overrun its own budget the
+  reuse stops and the store is reported busy.
+
+Bounding the wait is second best, and it is worth saying why the lock is taken
+at all. The analytical probe borrows a handle the process already holds, so it
+never waits; the equivalent for the control plane would be borrowing the
+pinned connection. That does not work here. Pinning is off by default (it
+holds DuckDB's file lock against a co-resident harnessd), so on the hub this
+regressed there is no pinned handle to borrow -- and where there is one, it is
+a single connection whose entire safety story is that windows serialize on
+that lock, which a probe reaching past it would be the first thing to
+undermine. Unpinned, the probe's real subject is the connect, and a connect
+cannot be done without the window. So: bounded, not lock-free.
+
 **What this cannot see.** It proves the instance answers, not that every block
 in the store is readable: measured against DuckDB 1.5.2, a corrupt data block
 raises ``IOException`` on the scan that reads it *without* invalidating the
@@ -77,6 +107,7 @@ from pathlib import Path
 import duckdb
 
 from drover.server.db import (
+    ControlPlaneBusy,
     control_plane_connection,
     control_plane_path,
     last_connect_failure,
@@ -114,6 +145,23 @@ DEFAULT_CACHE_SECONDS = 2.0
 #: It only becomes an outage when it never clears, so it is reported as
 #: ``busy`` until it has persisted this long.
 DEFAULT_BUSY_GRACE_SECONDS = 30.0
+
+#: How long the probe waits for a control-plane window before calling the
+#: store ``busy`` (#181). Deliberately between the two numbers that bracket it:
+#: a control-plane window is 0.1ms pinned, 3.5ms unpinned against a 279MB file
+#: and 300-500ms per window on the live hub, so a second is roughly twice the
+#: worst window measured -- long enough that ordinary contention is not
+#: reported as busy. And it is an order of magnitude under any client's
+#: patience: the monitor that caught this gave up at 20s, and the whole point
+#: is that ``/readyz`` must answer long before its caller stops listening.
+DEFAULT_CONTROL_PLANE_TIMEOUT_SECONDS = 1.0
+
+#: How long a caller arriving mid-probe keeps answering from the last
+#: control-plane verdict. A probe cannot legitimately take this long -- its own
+#: budget is a second, plus a connect measured in milliseconds -- so a probe
+#: still running is itself evidence the control plane is not answering, and
+#: reusing a green verdict past that point would be the #175 lie again.
+DEFAULT_PROBE_STALL_SECONDS = 5.0
 
 #: How recently a real open must have failed for readiness to still hold it
 #: against the store. Long enough to outlast the gap between the workers that
@@ -225,6 +273,8 @@ class ReadinessProbe:
         cache_seconds: float | None = None,
         busy_grace_seconds: float = DEFAULT_BUSY_GRACE_SECONDS,
         connect_failure_window: float = DEFAULT_CONNECT_FAILURE_WINDOW_SECONDS,
+        control_plane_timeout: float = DEFAULT_CONTROL_PLANE_TIMEOUT_SECONDS,
+        probe_stall_seconds: float = DEFAULT_PROBE_STALL_SECONDS,
         time_source=time.monotonic,
     ) -> None:
         self._duckdb_path = Path(duckdb_path)
@@ -235,8 +285,20 @@ class ReadinessProbe:
         )
         self._busy_grace_seconds = busy_grace_seconds
         self._connect_failure_window = connect_failure_window
+        self._control_plane_timeout = max(0.0, control_plane_timeout)
+        self._probe_stall_seconds = max(0.0, probe_stall_seconds)
         self._time = time_source
+        #: Guards the cache and the in-flight marker, and is never held across
+        #: anything that can block. That it once was is issue #181.
         self._lock = threading.Lock()
+        #: Guards ``_busy_since`` alone, so a probe can classify a store
+        #: without touching the cache lock at all.
+        self._busy_lock = threading.Lock()
+        #: Held by whichever caller is currently probing. Taken without
+        #: blocking: a caller that cannot have it answers from the last
+        #: verdict instead of queueing behind the probe in front of it.
+        self._probe_gate = threading.Lock()
+        self._probe_started_at: float | None = None
         self._cached: ReadinessReport | None = None
         self._cached_until = 0.0
         self._busy_since: dict[str, float] = {}
@@ -245,24 +307,87 @@ class ReadinessProbe:
     def check(self) -> ReadinessReport:
         """Probe both stores, or reuse a verdict from the last couple of seconds.
 
-        Serialized: N pollers arriving together cost one probe, not N. The
-        probe itself is bounded -- a borrowed cursor never waits, and the
-        control-plane window is the same one ``/harness`` takes -- so waiting
-        here is waiting for microseconds to milliseconds.
+        Never blocks on another caller, and never blocks for long on a store.
+        The analytical probe borrows a live handle, so it does not wait at all;
+        the control-plane probe asks for the real ``/harness*`` window with a
+        budget and reports ``busy`` rather than waiting past it (#181). One
+        probe runs at a time -- N pollers arriving together cost one probe, not
+        N -- but the ones that lose that race answer from the last verdict
+        instead of queueing, because a readiness endpoint that can be made to
+        wait is a readiness endpoint that can be made to disappear.
+        """
+        cached = self._fresh_verdict()
+        if cached is not None:
+            return cached
+        now = self._time()
+        analytical = self._probe_analytical(now)
+        if self._probe_gate.acquire(blocking=False):
+            try:
+                with self._lock:
+                    self._probe_started_at = now
+                control_plane = self._probe_control_plane(now)
+                report = ReadinessReport(
+                    stores=(analytical, control_plane), checked_at=time.time()
+                )
+                self._remember(report)
+                return report
+            finally:
+                with self._lock:
+                    self._probe_started_at = None
+                self._probe_gate.release()
+        return ReadinessReport(
+            stores=(analytical, self._control_plane_while_probing(now)),
+            checked_at=time.time(),
+        )
+
+    def _fresh_verdict(self) -> ReadinessReport | None:
+        """The cached verdict, while it is both good and recent enough."""
+        with self._lock:
+            cached = self._cached
+            if cached is not None and cached.ok and self._time() < self._cached_until:
+                return cached
+        return None
+
+    def _remember(self, report: ReadinessReport) -> None:
+        """Cache a verdict, and log the moment it changes.
+
+        Only a real probe gets here. A verdict a caller assembled from the
+        last one while a probe was in flight is fine to answer with and wrong
+        to cache: re-caching reused verdicts under sustained polling would
+        keep extending the life of an observation nothing has re-made.
         """
         with self._lock:
-            now = self._time()
-            cached = self._cached
-            if cached is not None and cached.ok and now < self._cached_until:
-                return cached
-            report = ReadinessReport(
-                stores=(self._probe_analytical(now), self._probe_control_plane(now)),
-                checked_at=time.time(),
-            )
             self._cached = report
-            self._cached_until = now + self._cache_seconds
+            self._cached_until = self._time() + self._cache_seconds
+            changed = self._last_ok is not report.ok
+            self._last_ok = report.ok
+        if changed:
             self._log_transition(report)
-            return report
+
+    def _control_plane_while_probing(self, now: float) -> StoreProbe:
+        """What to say about the control plane when a probe is already running.
+
+        Answering from the last verdict is right while the probe in front is
+        merely slow, and wrong once it has overrun a budget it should never
+        reach: at that point the only honest thing to report is that the store
+        is busy, which the grace window escalates to a failure if it stays
+        that way.
+        """
+        with self._lock:
+            started = self._probe_started_at
+            cached = self._cached
+        elapsed = 0.0 if started is None else max(0.0, now - started)
+        if elapsed < self._probe_stall_seconds and cached is not None:
+            for store in cached.stores:
+                if store.store == STORE_CONTROL_PLANE:
+                    return store
+        return self._classify(
+            STORE_CONTROL_PLANE,
+            f"a readiness probe has been in the control-plane window "
+            f"for {elapsed:.1f}s",
+            lock_conflict=True,
+            now=now,
+        )
 
     def _log_transition(self, report: ReadinessReport) -> None:
         """Say it in the log the first time it changes, and only then.
@@ -270,9 +395,6 @@ class ReadinessProbe:
         The outage left no trace in readiness at all; a line per poll would
         leave too much.
         """
-        if self._last_ok is report.ok:
-            return
-        self._last_ok = report.ok
         if report.ok:
             log.info("readiness recovered: every store answers")
         else:
@@ -321,7 +443,7 @@ class ReadinessProbe:
                     cursor.close()
                 except Exception:  # noqa: BLE001 - teardown is best effort
                     log.debug("failed to close the readiness cursor")
-            self._busy_since.pop(STORE_ANALYTICAL, None)
+            self._clear_busy(STORE_ANALYTICAL)
             return StoreProbe(
                 STORE_ANALYTICAL, STATE_OK, f"{PROBE_SQL} on a live handle"
             )
@@ -364,6 +486,12 @@ class ReadinessProbe:
         ``control_plane_connection`` resolves to the control-plane file and
         holds the control-plane lock, which is the isolation
         ``tests/test_control_plane_isolation.py`` enforces.
+
+        The window is asked for on a budget (#181). Giving up says nothing
+        about the store -- it was never reached -- so it is reported ``busy``,
+        the state that already means "someone else has it" and already goes red
+        if it never clears. A store that *does* answer, with a fatal error, is
+        still a failure: the bound is on waiting, not on believing.
         """
         path = control_plane_path(self._duckdb_path)
         if not path.exists():
@@ -373,12 +501,23 @@ class ReadinessProbe:
                 STORE_CONTROL_PLANE, STATE_ABSENT, f"no control-plane store at {path}"
             )
         try:
-            with control_plane_connection(self._duckdb_path) as con:
+            with control_plane_connection(
+                self._duckdb_path, timeout=self._control_plane_timeout
+            ) as con:
                 con.execute(PROBE_SQL).fetchone()
+        except ControlPlaneBusy as exc:
+            return self._classify(
+                STORE_CONTROL_PLANE, _detail(exc), lock_conflict=True, now=now
+            )
         except Exception as exc:  # noqa: BLE001 - reported, never raised
             return self._failure(STORE_CONTROL_PLANE, exc, now)
-        self._busy_since.pop(STORE_CONTROL_PLANE, None)
+        self._clear_busy(STORE_CONTROL_PLANE)
         return StoreProbe(STORE_CONTROL_PLANE, STATE_OK, f"{PROBE_SQL} on the store")
+
+    def _clear_busy(self, store: str) -> None:
+        """Forget a store's busy clock, because it just answered."""
+        with self._busy_lock:
+            self._busy_since.pop(store, None)
 
     def _failure(self, store: str, exc: BaseException, now: float) -> StoreProbe:
         """Classify a raised failure."""
@@ -389,20 +528,28 @@ class ReadinessProbe:
     def _classify(
         self, store: str, detail: str, *, lock_conflict: bool, now: float
     ) -> StoreProbe:
-        """Report a failure, holding back only on a file-lock collision."""
+        """Report a failure, holding back only while the store is merely held.
+
+        Two collisions land here and both mean "in use, not broken": another
+        *process* owning DuckDB's file lock, and another *thread* still inside
+        the control-plane window this probe gave up waiting for (#181). Neither
+        is evidence about the store's health, and both become an outage the
+        same way -- by never clearing.
+        """
         if not lock_conflict:
-            self._busy_since.pop(store, None)
+            self._clear_busy(store)
             return StoreProbe(store, STATE_FAILED, detail)
-        since = self._busy_since.setdefault(store, now)
-        held_for = now - since
+        with self._busy_lock:
+            since = self._busy_since.setdefault(store, now)
+        held_for = max(0.0, now - since)
         if held_for < self._busy_grace_seconds:
             return StoreProbe(
                 store,
                 STATE_BUSY,
-                f"another process holds the store ({held_for:.0f}s): {detail}",
+                f"the store is held elsewhere ({held_for:.0f}s): {detail}",
             )
         return StoreProbe(
             store,
             STATE_FAILED,
-            f"another process has held the store for {held_for:.0f}s: {detail}",
+            f"the store has been held elsewhere for {held_for:.0f}s: {detail}",
         )

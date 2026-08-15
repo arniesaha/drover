@@ -28,6 +28,27 @@ export DROVER_CLAUDE_CWD_MAP='{ "-srv-projects-agent-tools": "/srv/projects/agen
 exact directories that should be classified as non-project workspace activity.
 All three settings are optional and empty by default.
 
+## DeepSeek Harness
+
+Drover treats DeepSeek Harness as a structured runtime, not as a terminal
+emulation. `drover-harnessd` connects to the loopback Web RPC service, creates
+or resumes its durable native session, forwards prompts and cancellation, and
+normalizes completed assistant messages and tool calls into Drover events.
+The DeepSeek provider/model pair remains intact in Drover's model picker.
+
+Install `dsh` on the harness host and keep its Web profile listening locally
+(the default endpoint is `http://127.0.0.1:3080`). If it uses another local
+address, set:
+
+```bash
+export DROVER_DEEPSEEK_HARNESS_URL=http://127.0.0.1:3080
+```
+
+The Web RPC service is shell- and filesystem-capable. Keep it on loopback;
+Drover is the remote control plane. The adapter does not require or expose the
+browser UI. `DROVER_DEEPSEEK_DEFAULT_MODEL` may select the catalog default as
+`provider/model`, for example `ollama/qwen3.5:35b-a3b`.
+
 ## Adoption Registry
 
 The quality and observatory views can track whether each agent runtime emits

@@ -25,6 +25,8 @@ analytical queries that genuinely join across both worlds.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import duckdb
@@ -34,9 +36,11 @@ from drover.schema import bootstrap
 from drover.server.db import (
     CONTROL_PLANE_TABLES,
     ROLE_DEFAULTS,
+    ControlPlaneBusy,
     attached_control_plane_snapshot,
     close_control_plane_connections,
     control_plane_connection,
+    control_plane_lock,
     control_plane_path,
     control_plane_snapshot,
     open_duckdb_connection,
@@ -474,6 +478,62 @@ def test_the_cockpit_activity_query_still_sees_control_plane_sessions(tmp_path):
 
     assert activity["status"] == "ok", activity
     assert activity["data"]["totals"]["session_count"] == 1
+
+
+def test_a_window_can_be_given_a_budget_instead_of_waiting(tmp_path):
+    """Issue #181. A caller that must answer on a deadline needs a way out.
+
+    ``/readyz`` is the caller: waiting indefinitely for a window turned a slow
+    control-plane read into a permanently dark endpoint. The budget is opt-in,
+    so every existing caller -- the registry, the recap worker, bootstrap --
+    keeps waiting its turn exactly as before.
+    """
+    duckdb_path = _db(tmp_path)
+
+    with control_plane_lock(duckdb_path):
+        started = time.monotonic()
+        with pytest.raises(ControlPlaneBusy):
+            with control_plane_connection(duckdb_path, timeout=0.05) as con:
+                con.execute("SELECT 1").fetchone()
+        waited = time.monotonic() - started
+
+    assert waited < 1.0, f"gave up after {waited:.2f}s, not the 0.05s budget"
+
+
+def test_a_budget_is_only_spent_when_the_window_is_taken(tmp_path):
+    """An uncontended window with a budget must behave like any other window."""
+    duckdb_path = _db(tmp_path)
+
+    with control_plane_connection(duckdb_path, timeout=0.05) as con:
+        assert con.execute("SELECT 1").fetchone()[0] == 1
+
+    # ...and the lock is released again, or the next window would inherit it.
+    assert control_plane_lock(duckdb_path).acquire(timeout=0.5)
+    control_plane_lock(duckdb_path).release()
+
+
+def test_a_bounded_window_that_gives_up_holds_nothing(tmp_path):
+    """A timed-out acquisition must not leave the lock held or half-held."""
+    duckdb_path = _db(tmp_path)
+    holder_inside = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with control_plane_lock(duckdb_path):
+            holder_inside.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert holder_inside.wait(timeout=5)
+    with pytest.raises(ControlPlaneBusy):
+        with control_plane_connection(duckdb_path, timeout=0.05):
+            pass
+    release.set()
+    holder.join(timeout=5)
+
+    with control_plane_connection(duckdb_path) as con:
+        assert con.execute("SELECT 1").fetchone()[0] == 1
 
 
 def test_the_snapshot_is_released_when_the_reader_is_done(tmp_path):
