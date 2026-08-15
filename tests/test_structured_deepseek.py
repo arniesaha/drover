@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +12,28 @@ from drover.server.harness.structured.deepseek import (
     DeepSeekDriver,
     default_command,
 )
+
+
+def _git_init(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    return path
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> str:
+    """A real checkout to anchor the sandbox workspace to.
+
+    DSH derives the session's writable root from the ``cwd`` it is handed, and
+    the driver refuses to launch against a root it cannot stat, so these tests
+    need a directory that actually exists rather than a placeholder string.
+    """
+    return str(_git_init(tmp_path / "checkout"))
 
 
 def _tool_call_event(seq: int, call_id: str, name: str) -> dict:
@@ -163,11 +187,109 @@ def test_default_command() -> None:
     assert default_command("/opt/dsh") == ["/opt/dsh"]
 
 
-def test_turn_uses_native_session_and_maps_events() -> None:
+# -- sandbox workspace anchoring (issue #183) ------------------------------
+#
+# DSH derives the session's writable root from the ``cwd`` passed to
+# ``session.create``. A cwd that is not the checkout the work needs cannot be
+# widened afterwards: every write outside it costs one approval. So the launch
+# refuses a root it cannot stat, and says out loud what the root became.
+
+
+def test_a_missing_cwd_fails_the_launch(tmp_path: Path) -> None:
+    missing = tmp_path / "not-here"
+    api = FakeApi()
+    sink: list = []
+    driver = DeepSeekDriver(["dsh"], str(missing), sink.append, api=api)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        driver.start()
+
+    assert str(missing) in str(excinfo.value)
+    assert api.calls == []
+    assert sink == []
+
+
+def test_a_cwd_that_is_not_a_directory_fails_the_launch(tmp_path: Path) -> None:
+    regular_file = tmp_path / "notes.md"
+    regular_file.write_text("not a directory\n")
+    api = FakeApi()
+    sink: list = []
+    driver = DeepSeekDriver(["dsh"], str(regular_file), sink.append, api=api)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        driver.start()
+
+    assert str(regular_file) in str(excinfo.value)
+    assert "not a directory" in str(excinfo.value)
+    assert api.calls == []
+    assert sink == []
+
+
+def test_start_announces_the_sandbox_workspace(workspace: str) -> None:
+    api = FakeApi()
+    sink: list = []
+    driver = DeepSeekDriver(["dsh"], workspace, sink.append, api=api)
+
+    driver.start()
+
+    anchor = next(
+        message for message in sink if message.payload.get("sandbox_workspace")
+    )
+    assert anchor.type == "status"
+    assert anchor.payload["sandbox_workspace"] == workspace
+    assert anchor.payload["git_work_tree"] is True
+    assert workspace in anchor.text
+    assert "approval" in anchor.text
+    assert not any(message.payload.get("workspace_warning") for message in sink)
+    assert sink[-1].text == "ready"
+    driver.close()
+
+
+def test_a_cwd_outside_a_git_work_tree_starts_with_a_warning(tmp_path: Path) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    api = FakeApi()
+    sink: list = []
+    driver = DeepSeekDriver(["dsh"], str(scratch), sink.append, api=api)
+
+    driver.start()
+
+    warning = next(
+        message for message in sink if message.payload.get("workspace_warning")
+    )
+    assert warning.type == "status"
+    assert warning.payload["workspace_warning"] == "not_a_git_work_tree"
+    assert warning.payload["git_work_tree"] is False
+    assert str(scratch) in warning.text
+    assert any(method == "session.create" for method, _ in api.calls)
+    assert sink[-1].text == "ready"
+    driver.close()
+
+
+def test_the_warning_names_a_nearby_checkout(tmp_path: Path) -> None:
+    """The shape of the incident: the checkout was one level down a sibling."""
+    scratch = tmp_path / "drover"
+    scratch.mkdir()
+    checkout = _git_init(tmp_path / "deepseek" / "drover")
+    api = FakeApi()
+    sink: list = []
+    driver = DeepSeekDriver(["dsh"], str(scratch), sink.append, api=api)
+
+    driver.start()
+
+    warning = next(
+        message for message in sink if message.payload.get("workspace_warning")
+    )
+    assert warning.payload["nearby_repo"] == str(checkout)
+    assert str(checkout) in warning.text
+    driver.close()
+
+
+def test_turn_uses_native_session_and_maps_events(workspace: str) -> None:
     api = FakeApi()
     sink: list = []
     driver = DeepSeekDriver(
-        ["dsh"], "/repo", sink.append, api=api, poll_interval_s=0.01
+        ["dsh"], workspace, sink.append, api=api, poll_interval_s=0.01
     )
     driver.start()
     assert sink[0].payload["native_session_id"] == "session-native-1"
@@ -204,11 +326,11 @@ def test_turn_uses_native_session_and_maps_events() -> None:
     driver.close()
 
 
-def test_resume_does_not_create_another_native_session() -> None:
+def test_resume_does_not_create_another_native_session(workspace: str) -> None:
     api = FakeApi()
     driver = DeepSeekDriver(
         ["dsh"],
-        "/repo",
+        workspace,
         lambda message: None,
         native_session_id="session-existing",
         api=api,
@@ -270,12 +392,12 @@ class ResumedApi:
         raise AssertionError(method)
 
 
-def test_stale_turn_end_does_not_complete_the_following_turn() -> None:
+def test_stale_turn_end_does_not_complete_the_following_turn(workspace: str) -> None:
     api = ResumedApi()
     sink: list = []
     driver = DeepSeekDriver(
         ["dsh"],
-        "/repo",
+        workspace,
         sink.append,
         native_session_id="session-existing",
         api=api,
@@ -323,11 +445,11 @@ class BurstApi(FakeApi):
         return super().call(method, payload)
 
 
-def test_history_longer_than_the_tail_window_is_not_dropped() -> None:
+def test_history_longer_than_the_tail_window_is_not_dropped(workspace: str) -> None:
     api = BurstApi()
     sink: list = []
     driver = DeepSeekDriver(
-        ["dsh"], "/repo", sink.append, api=api, poll_interval_s=0.01
+        ["dsh"], workspace, sink.append, api=api, poll_interval_s=0.01
     )
     driver.start()
 
@@ -372,11 +494,11 @@ class BottomlessApi(FakeApi):
         return super().call(method, payload)
 
 
-def test_history_paging_is_bounded_and_reports_truncation() -> None:
+def test_history_paging_is_bounded_and_reports_truncation(workspace: str) -> None:
     api = BottomlessApi()
     sink: list = []
     driver = DeepSeekDriver(
-        ["dsh"], "/repo", sink.append, api=api, poll_interval_s=0.01
+        ["dsh"], workspace, sink.append, api=api, poll_interval_s=0.01
     )
     driver.start()
 
@@ -442,11 +564,11 @@ class BatchedToolResultApi(FakeApi):
         return super().call(method, payload)
 
 
-def test_batched_tool_results_are_all_surfaced() -> None:
+def test_batched_tool_results_are_all_surfaced(workspace: str) -> None:
     api = BatchedToolResultApi()
     sink: list = []
     driver = DeepSeekDriver(
-        ["dsh"], "/repo", sink.append, api=api, poll_interval_s=0.01
+        ["dsh"], workspace, sink.append, api=api, poll_interval_s=0.01
     )
     driver.start()
 
@@ -470,7 +592,7 @@ def test_batched_tool_results_are_all_surfaced() -> None:
     driver.close()
 
 
-def test_interrupt_does_not_raise_when_the_api_is_unreachable() -> None:
+def test_interrupt_does_not_raise_when_the_api_is_unreachable(workspace: str) -> None:
     class BrokenApi(FakeApi):
         def call(self, method: str, payload: dict) -> dict:
             if method == "session.cancel":
@@ -482,7 +604,7 @@ def test_interrupt_does_not_raise_when_the_api_is_unreachable() -> None:
 
     api = BrokenApi()
     driver = DeepSeekDriver(
-        ["dsh"], "/repo", lambda message: None, api=api, poll_interval_s=0.01
+        ["dsh"], workspace, lambda message: None, api=api, poll_interval_s=0.01
     )
     driver.start()
     driver.send_turn("inspect", "turn-1")
@@ -492,7 +614,7 @@ def test_interrupt_does_not_raise_when_the_api_is_unreachable() -> None:
     driver.close()
 
 
-def test_close_silences_a_poll_still_blocked_in_a_request() -> None:
+def test_close_silences_a_poll_still_blocked_in_a_request(workspace: str) -> None:
     release = threading.Event()
     entered = threading.Event()
 
@@ -506,7 +628,7 @@ def test_close_silences_a_poll_still_blocked_in_a_request() -> None:
     api = SlowApi()
     sink: list = []
     driver = DeepSeekDriver(
-        ["dsh"], "/repo", sink.append, api=api, poll_interval_s=0.01
+        ["dsh"], workspace, sink.append, api=api, poll_interval_s=0.01
     )
     driver.start()
     driver.send_turn("inspect", "turn-1")

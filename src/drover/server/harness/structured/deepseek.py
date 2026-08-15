@@ -31,6 +31,11 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from drover.server.harness.structured.driver import EmitFn, StructuredMessage
+from drover.server.harness.structured.workspace import (
+    probe_workspace,
+    require_workspace_root,
+    workspace_messages,
+)
 
 DEFAULT_API_URL = "http://127.0.0.1:3080"
 
@@ -133,10 +138,19 @@ class DeepSeekDriver:
         self._closed = False
 
     def start(self) -> None:
+        # DSH derives the session's writable root from this cwd (see
+        # structured/workspace.py), and the anchor is fixed for the session's
+        # whole life -- so an unusable root is refused BEFORE session.create,
+        # not reported by a session that already exists with the wrong root.
+        workspace = (
+            require_workspace_root(self.cwd, harness="DeepSeek Harness")
+            if self.cwd
+            else None
+        )
         if self._native_session_id:
             history = self._history(max_messages=1)
         else:
-            payload = {"cwd": self.cwd} if self.cwd else {}
+            payload = {"cwd": workspace} if workspace else {}
             created = self._api.call("session.create", payload)
             native_id = created.get("sessionId")
             if not isinstance(native_id, str) or not native_id:
@@ -144,6 +158,15 @@ class DeepSeekDriver:
             self._native_session_id = native_id
             history = self._history(max_messages=1)
         self._advance_cursor(history)
+        if workspace is not None:
+            # After the session exists: the git probe is for the transcript,
+            # not for the decision, so it must not sit in front of the launch.
+            for message in workspace_messages(
+                probe_workspace(workspace),
+                harness="DeepSeek Harness",
+                payload={"native_session_id": self._native_session_id},
+            ):
+                self._emit(message)
         self._emit(
             StructuredMessage(
                 type="status",

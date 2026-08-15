@@ -694,3 +694,54 @@ def test_emit_retry_succeeds_without_counting_a_drop(monkeypatch, tmp_path):
 
     assert attempts["n"] == 2
     assert daemon_mod.dropped_event_count() == 0
+
+
+def test_a_driver_that_fails_to_start_leaves_no_entry(monkeypatch, tmp_path):
+    """A rejected launch must not leave a live-looking session behind.
+
+    DeepSeek's driver refuses to start against a cwd it cannot stat (the
+    sandbox workspace is derived from it), and the daemon turns that into a
+    400. If the entry stayed in the manager, the failed session would still
+    answer ``has()``/``session_ids()`` as if it were running.
+    """
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.create_session(
+        host_id="test-host",
+        harness="stub",
+        command="stub",
+        session_id="sess-1",
+        status="starting",
+        mode="structured",
+    )
+
+    class _FailingDriver(_StubDriver):
+        def start(self) -> None:
+            raise RuntimeError("cwd does not exist: /nope")
+
+    monkeypatch.setitem(
+        manager_module._FACTORIES,
+        "stub",
+        (
+            lambda command, cwd, emit, native_session_id: _FailingDriver(
+                command, cwd, emit
+            ),
+            lambda: ["stub"],
+        ),
+    )
+
+    mgr = StructuredSessionManager()
+    with pytest.raises(RuntimeError, match="cwd does not exist"):
+        mgr.start(
+            "sess-1",
+            harness="stub",
+            cwd=None,
+            command=None,
+            registry=registry,
+            on_message=lambda sid, evt: None,
+            finalize=lambda sid, rc: None,
+        )
+
+    assert not mgr.has("sess-1")
+    assert mgr.session_ids() == []
