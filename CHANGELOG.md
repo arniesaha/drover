@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Codex session no longer dies at argument parsing when the prompt begins
   with a dash. A prompt written as a markdown bullet list was read as a
   command-line option and the turn exited before it began
+- Opening Chat or Terminal with the fleet unreachable now says so and offers a
+  retry. Both screens showed an indefinite spinner and no message: the
+  reconnecting indicator was gated on having connected at least once, so a
+  first load that never landed could not report anything at all
 - A DeepSeek session refuses to launch against a working directory that does
   not exist, rather than anchoring its sandbox workspace to an unusable root
 - A non-zero harness exit is recorded on the host with the turn and return
