@@ -7,7 +7,59 @@ import dataclasses
 from click.testing import CliRunner
 
 from drover.config import default_config
-from drover.server.__main__ import _advertised_host_port, main
+from drover.server.__main__ import _advertised_host_port, _local_api_host, main
+
+# -- reaching the hub this machine is actually running ---------------------
+#
+# The CLI hardcoded 127.0.0.1 while the server binds `[server].metrics_host`,
+# which install.sh sets to the address it detected for the phone. On any
+# machine with a LAN address that is not loopback, so every subcommand that
+# calls the hub reported "could not reach drover-server -- is it running?"
+# about a server that was running and serving. This failed the published
+# release's own install verification for both v0.2.0 and v0.3.0.
+
+
+def test_local_api_host_uses_the_address_the_server_binds():
+    cfg = dataclasses.replace(default_config(), server_metrics_host="10.1.0.73")
+    assert _local_api_host(cfg) == "10.1.0.73"
+
+
+def test_local_api_host_prefers_loopback_for_a_wildcard_bind():
+    # A wildcard listener answers on loopback, and loopback is the better
+    # choice for a local call: it does not leave the machine and does not
+    # depend on which interface happens to be up.
+    for wildcard in ("0.0.0.0", "::", ""):
+        cfg = dataclasses.replace(default_config(), server_metrics_host=wildcard)
+        assert _local_api_host(cfg) == "127.0.0.1"
+
+
+def test_local_api_request_calls_the_bound_address(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_metrics_host="10.1.0.73", auth_api_token="t"
+    )
+    seen: dict = {}
+
+    class _Response:
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+
+    server_main._local_api_request(cfg, "GET", "/auth/credentials")
+
+    assert seen["url"] == f"http://10.1.0.73:{cfg.metrics_http_port}/auth/credentials"
 
 
 def test_advertised_host_port_prefers_the_configured_url():

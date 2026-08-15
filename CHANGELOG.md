@@ -18,6 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage beside token coverage, matching the cockpit card. It had shown a
   5%-coverage figure under the label `API cost` with nothing to qualify it
 
+## [0.3.1] - 2026-08-15
+
+### Fixed
+
+- `drover-server` subcommands reach the hub at the address it is actually
+  bound to. The CLI assumed loopback while the server binds
+  `[server].metrics_host`, which the installer sets to the address it detected
+  for the phone, so on a machine with a LAN address every command that calls
+  the hub reported "could not reach drover-server, is it running?" about a
+  server that was running and serving
+- The release workflow's install verification probes that same configured
+  address. It had been curling loopback regardless, which is why it failed for
+  v0.2.0 and v0.3.0 against installs that were working
+
 ## [0.3.0] - 2026-08-15
 
 ### Added
