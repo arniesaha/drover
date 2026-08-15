@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import logging
 
 import pytest
 
@@ -181,6 +182,56 @@ def test_first_failure_returns_empty_stale_catalog_and_defaults_stay_valid():
     assert catalog.discovered_at is None
     assert catalog.stale_reason == "not_authenticated"
     service.validate("codex", None, None)
+
+
+def test_discovery_failure_logs_harness_and_safe_stale_reason(caplog):
+    adapter = FakeAdapter()
+    adapter.failure = "timeout"
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": adapter},
+        scope_ids=AccountScopeIDs(secret=b"l" * 32),
+        clock=lambda: NOW,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="drover.model_catalog"):
+        catalog = service.read("codex")
+
+    assert catalog.stale_reason == "timeout"
+    record = next(
+        item
+        for item in caplog.records
+        if item.name == "drover.model_catalog"
+        and item.getMessage()
+        == "model catalog discovery failed harness=codex stale_reason=timeout"
+    )
+    assert record.harness == "codex"
+    assert record.stale_reason == "timeout"
+    assert "person@example.com" not in record.getMessage()
+
+
+def test_unexpected_discovery_failure_logs_no_exception_detail(caplog):
+    class UnexpectedFailureAdapter(FakeAdapter):
+        def discover(self) -> DiscoveredCatalog:
+            raise RuntimeError("gateway-secret tenant@example.com")
+
+    service = ModelCatalogService(
+        host_id="mac-mini",
+        adapters={"codex": UnexpectedFailureAdapter()},
+        scope_ids=AccountScopeIDs(secret=b"l" * 32),
+        clock=lambda: NOW,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="drover.model_catalog"):
+        catalog = service.read("codex")
+
+    assert catalog.stale_reason == "protocol_error"
+    assert (
+        "model catalog discovery failed harness=codex stale_reason=protocol_error"
+        in caplog.text
+    )
+    assert "gateway-secret" not in caplog.text
+    assert "tenant@example.com" not in caplog.text
 
 
 def test_validation_rejects_unknown_model_and_incompatible_effort():
