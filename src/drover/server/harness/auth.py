@@ -502,7 +502,11 @@ def _resolve_known_versioned_cli(binary: str) -> str | None:
         installed = Path.home() / ".local/share/deepseek-harness/node_modules/.bin/dsh"
         if installed.exists() and os.access(installed, os.X_OK):
             return str(installed)
-        return None
+        # No early return: this resolver only runs once `command -v dsh` has
+        # already failed, which is exactly the case where a global npm install
+        # under ~/.nvm/versions/node/*/bin still has to be found by the scan
+        # below. Returning None here would disable the preset -- and with it
+        # the model catalog, since adapters are only built for enabled presets.
 
     nvm_versions = Path.home() / ".nvm/versions/node"
     if not nvm_versions.is_dir():
