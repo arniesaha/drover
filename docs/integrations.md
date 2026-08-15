@@ -49,6 +49,21 @@ Drover is the remote control plane. The adapter does not require or expose the
 browser UI. `DROVER_DEEPSEEK_DEFAULT_MODEL` may select the catalog default as
 `provider/model`, for example `ollama/qwen3.5:35b-a3b`.
 
+### The working directory becomes the sandbox workspace
+
+DeepSeek Harness runs under a `workspace-write` file sandbox whose writable
+root is the working directory the session was launched with. That root is
+fixed for the life of the session: a per-command approval authorizes one
+command, it does not widen the workspace. Launching against a directory that
+is not the checkout the work needs therefore costs one approval prompt per
+write, and the agent cannot stage or push.
+
+Drover refuses to launch a DeepSeek session against a working directory that
+does not exist or is not a directory, and announces the workspace root in the
+transcript at session start. If that root holds no git work tree, the session
+still starts and a warning names a checkout found nearby, if there is one.
+Relaunch the session in the checkout rather than approving each write.
+
 ## Adoption Registry
 
 The quality and observatory views can track whether each agent runtime emits
