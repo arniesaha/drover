@@ -60,6 +60,20 @@ from drover.server.harness.registry import HarnessRegistry
 NOW = datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc)
 
 
+# Most fixtures here sit at NOW and hand it back as `analyzed_at`, which keeps
+# them reproducible: same store, same analyzed_at, same facts, whatever the
+# date is when the suite runs.
+#
+# A few production paths deliberately read the real clock instead -- the Check
+# Again scope probe asks whether facts exist *now*, and taking an analyzed_at
+# from a caller would defeat the question. Fixtures for those have to be
+# current by construction. Pinning them to a date meant they passed until that
+# date fell out of the seven day lookback window, which is exactly what
+# happened at 2026-08-15 18:00 UTC, one wave after the capping test.
+def _current_moment() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(minutes=1)
+
+
 def _control_plane_execute(db_path: Path, sql: str, params: list | None = None) -> None:
     """Write control-plane rows where they live since #95.
 
@@ -2842,6 +2856,7 @@ def test_check_again_is_truthfully_unavailable_without_runtime_or_consent(
 def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
     db_path: Path,
 ) -> None:
+    CURRENT = _current_moment()
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
         con.execute("""
@@ -2864,7 +2879,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
               ('claude-session', 'mac-mini', 'claude', 'claude', 'completed',
                'claude-4', ?, ?)
             """,
-            [NOW, NOW, NOW, NOW],
+            [CURRENT, CURRENT, CURRENT, CURRENT],
         )
         con.execute(
             """
@@ -2874,7 +2889,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
               ('claude-span', 'claude-session', ?, 'anthropic', 'anthropic',
                'claude-3', 100, 100, 0, 0.1)
             """,
-            [NOW, NOW],
+            [CURRENT, CURRENT],
         )
         con.execute(
             """
@@ -2883,7 +2898,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
                    'anthropic', 'anthropic', 'claude-3', 1, 1, 0, 0.01
             FROM range(8200) rows(i)
             """,
-            [NOW],
+            [CURRENT],
         )
         descriptor = {
             "advisory": {
@@ -2923,7 +2938,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
               last_seen_at, updated_at
             ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', ?, ?, ?)
             """,
-            [json.dumps(descriptor), NOW, NOW],
+            [json.dumps(descriptor), CURRENT, CURRENT],
         )
 
     repository = AdvisoryRepository(db_path)
@@ -2939,7 +2954,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
             title="Telemetry coverage is low",
             impact="Metrics are incomplete.",
             remediation=("Repair telemetry, then run Check Again.",),
-            evidence=(FindingEvidence("telemetry:codex", NOW, {"coverage": 0}),),
+            evidence=(FindingEvidence("telemetry:codex", CURRENT, {"coverage": 0}),),
         ),
         FindingCandidate(
             analyzer_id="deterministic.cache_read_efficiency",
@@ -2952,7 +2967,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
             title="Cache efficiency is low",
             impact="Repeated prompts cost more.",
             remediation=("Review prompts, then run Check Again.",),
-            evidence=(FindingEvidence("telemetry:codex", NOW, {"ratio": 0}),),
+            evidence=(FindingEvidence("telemetry:codex", CURRENT, {"ratio": 0}),),
         ),
         FindingCandidate(
             analyzer_id="deterministic.routing_mismatch",
@@ -2965,7 +2980,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
             title="Routing mismatch",
             impact="Requests use an unexpected model.",
             remediation=("Review routing, then run Check Again.",),
-            evidence=(FindingEvidence("routing:codex", NOW, {"count": 1}),),
+            evidence=(FindingEvidence("routing:codex", CURRENT, {"count": 1}),),
         ),
         FindingCandidate(
             analyzer_id="deterministic.hook_validity",
@@ -2978,7 +2993,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
             title="Hook is missing",
             impact="The hook cannot run.",
             remediation=("Restore the hook, then run Check Again.",),
-            evidence=(FindingEvidence("hook:codex", NOW, {"exists": False}),),
+            evidence=(FindingEvidence("hook:codex", CURRENT, {"exists": False}),),
         ),
     )
     findings = [repository.observe(item, run_id="old") for item in candidates]
@@ -3014,21 +3029,21 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
         "deterministic.telemetry_coverage",
         "mac-mini/codex",
         "current",
-        analyzed_at=NOW,
+        analyzed_at=CURRENT,
     )
     scoped_routing = load_operational_snapshot(
         db_path,
         "deterministic.routing_mismatch",
         "mac-mini/codex/openai",
         "current",
-        analyzed_at=NOW,
+        analyzed_at=CURRENT,
     )
     scoped_hooks = load_operational_snapshot(
         db_path,
         "deterministic.hook_validity",
         "mac-mini/codex/pre-tool",
         "current",
-        analyzed_at=NOW,
+        analyzed_at=CURRENT,
     )
     assert [item.target_id for item in scoped_telemetry.telemetry] == ["mac-mini/codex"]
     assert [item.target_id for item in scoped_routing.routing] == [
