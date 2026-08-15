@@ -625,6 +625,7 @@ def test_model_preference_validation_keeps_null_launch_defaults(monkeypatch, tmp
 def test_model_preference_validation_passes_codex_turn_preferences_unchanged(
     tmp_path,
 ):
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
     server, state, base_url = _start_test_server(tmp_path)
     state.model_catalog_service = _FakeModelCatalogService()
     state.structured = _FakeStructuredManager(harness="codex")
@@ -635,6 +636,7 @@ def test_model_preference_validation_passes_codex_turn_preferences_unchanged(
                 "text": "continue",
                 "model": "gpt-5",
                 "thinking_effort": "high",
+                "client_turn_id": client_turn_id,
             },
         )
     finally:
@@ -649,7 +651,12 @@ def test_model_preference_validation_passes_codex_turn_preferences_unchanged(
         (
             "session-1",
             "continue",
-            {"images": None, "model": "gpt-5", "thinking_effort": "high"},
+            {
+                "images": None,
+                "model": "gpt-5",
+                "thinking_effort": "high",
+                "client_turn_id": client_turn_id,
+            },
         )
     ]
 
@@ -726,6 +733,11 @@ def test_model_preference_validation_rejects_turn_before_attachment_or_driver(
     }
     assert state.structured.turns == []
     assert not state.attachments_dir.exists()
+
+
+def test_client_turn_id_requires_a_uuid():
+    with pytest.raises(ValueError, match="client_turn_id must be a UUID"):
+        harness_daemon._optional_client_turn_id("not-a-uuid")
 
 
 def test_model_preference_validation_discards_claude_turn_overrides(

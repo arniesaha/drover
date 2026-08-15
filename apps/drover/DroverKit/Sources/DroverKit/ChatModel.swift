@@ -145,6 +145,9 @@ public final class ChatModel {
     /// it demonstrably landed, and continuing to offer the same text is an
     /// invitation to send it twice.
     private var unconfirmedTurnText: String?
+    /// Client-generated ID for the ambiguous request. Text alone cannot
+    /// distinguish this request from an identical turn sent on another device.
+    private var unconfirmedTurnID: String?
     /// Attachments submitted with `unconfirmedTurnText`. An echo proves these
     /// particular attachments landed, but not attachments the user picked
     /// while waiting for that proof.
@@ -438,18 +441,21 @@ public final class ChatModel {
         isSending = true
         defer { isSending = false }
         let preferences = turnPreferences
+        let clientTurnID = UUID().uuidString
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
                 text: text,
                 images: images,
                 model: preferences.model,
-                thinkingEffort: preferences.thinking
+                thinkingEffort: preferences.thinking,
+                clientTurnID: clientTurnID
             )
             composerText = ""
             pendingAttachments = []
             hint = nil
             unconfirmedTurnText = nil
+            unconfirmedTurnID = nil
             unconfirmedAttachments = []
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // The harness rejects overlapping turns — queue instead of
@@ -466,13 +472,14 @@ public final class ChatModel {
             // transport) so the user can retry without retyping. Whether the
             // hub saw this turn is unknown until it does or does not echo.
             unconfirmedTurnText = text
+            unconfirmedTurnID = clientTurnID
             unconfirmedAttachments = images
             applyHint(for: error, action: "send")
         }
     }
 
-    /// The hub echoing a `user_input` that matches an unconfirmed send is
-    /// proof the turn landed despite the client seeing a failure. Take the
+    /// The hub echoing a `user_input` with this client's turn ID proves the
+    /// unconfirmed send landed despite the client seeing a failure. Take the
     /// text back out of the composer: leaving it there reads as "not sent"
     /// and the obvious next action duplicates the turn.
     ///
@@ -482,9 +489,11 @@ public final class ChatModel {
     private func confirmUnconfirmedTurn(_ message: HarnessMessage) {
         guard message.type == .userInput,
               let unconfirmed = unconfirmedTurnText,
-              message.text == unconfirmed
+              let unconfirmedTurnID,
+              message.turnID == unconfirmedTurnID
         else { return }
         unconfirmedTurnText = nil
+        self.unconfirmedTurnID = nil
         let landedAttachments = unconfirmedAttachments
         unconfirmedAttachments = []
 
@@ -589,16 +598,19 @@ public final class ChatModel {
 
     private func sendQueued(_ text: String, images: [TurnAttachment]) async {
         let preferences = turnPreferences
+        let clientTurnID = UUID().uuidString
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
                 text: text,
                 images: images,
                 model: preferences.model,
-                thinkingEffort: preferences.thinking
+                thinkingEffort: preferences.thinking,
+                clientTurnID: clientTurnID
             )
             hint = nil
             unconfirmedTurnText = nil
+            unconfirmedTurnID = nil
             unconfirmedAttachments = []
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             // Raced a new turn (e.g. an approval resumed it) — keep waiting
@@ -613,6 +625,7 @@ public final class ChatModel {
             composerText = composerText.isEmpty ? text : "\(text)\n\(composerText)"
             pendingAttachments = images + pendingAttachments
             unconfirmedTurnText = text
+            unconfirmedTurnID = clientTurnID
             unconfirmedAttachments = images
             applyHint(for: error, action: "send")
         }

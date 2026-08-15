@@ -371,7 +371,8 @@ public actor DroverClient {
     public func sendTurn(sessionID: String, text: String,
                          images: [TurnAttachment] = [],
                          model: String? = nil,
-                         thinkingEffort: String? = nil) async throws -> String {
+                         thinkingEffort: String? = nil,
+                         clientTurnID: String? = nil) async throws -> String {
         var payload: [String: Any] = ["text": text]
         if !images.isEmpty {
             payload["images"] = images.map {
@@ -380,6 +381,7 @@ public actor DroverClient {
         }
         if let model { payload["model"] = model }
         if let thinkingEffort { payload["thinking_effort"] = thinkingEffort }
+        if let clientTurnID { payload["client_turn_id"] = clientTurnID }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/turns"
         // Image bodies are orders of magnitude larger than any other request
