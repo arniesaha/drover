@@ -780,8 +780,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self._gate(path):
             return
-        if path in {"/healthz", "/readyz"}:
+        if path == "/healthz":
+            # Liveness, and only liveness: the process is running. Everything
+            # about the database belongs to /readyz, so that a restart trigger
+            # keyed on readiness cannot be defeated by the process being up.
             self._send(200, "text/plain; charset=utf-8", "ok\n")
+            return
+        if path == "/readyz":
+            # Answers 503 when a store this hub serves from can no longer be
+            # queried. See drover.server.readiness -- #175, where readiness
+            # said ok for hours while every query failed.
+            status, body = self.collector.render_readiness(
+                include_detail=(
+                    not self.auth.enabled or request_authorized(self.auth, self.headers)
+                )
+            )
+            self._send(status, "application/json", body)
             return
         if path == "/auth/login":
             self._send(200, "text/html; charset=utf-8", load_page("login.html"))

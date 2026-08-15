@@ -78,6 +78,9 @@ configurations:
 - When authentication is enabled, all routes except `/healthz`, `/readyz`,
   `/auth/login`, `/auth/pair`, and `/harness/probe` require a bearer token or
   session cookie
+- `/readyz` reports the ready verdict and which store failed, but withholds the
+  underlying database error (which quotes filesystem paths) unless the caller
+  is authenticated
 - Pair endpoint rate-limits: 5 failure attempts per minute
 - The legacy shared token is accepted by default for upgrade compatibility and
   can be disabled after devices and hosts are paired
