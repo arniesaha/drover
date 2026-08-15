@@ -14,7 +14,10 @@ public final class LaunchModel {
 
     /// Harness names the server can run in a structured (turn-based) mode;
     /// anything else (currently just "shell") only supports a raw PTY.
-    static let structuredCapableHarnesses: Set<String> = ["claude-code", "codex", "agy"]
+    static let structuredCapableHarnesses: Set<String> = [
+        "claude-code", "codex", "agy", "deepseek-harness"
+    ]
+    static let interactiveAuthHarnesses: Set<String> = ["claude-code", "codex", "agy"]
 
     public var hostID: String {
         didSet {
@@ -84,7 +87,7 @@ public final class LaunchModel {
     /// Local snapshots lack auth capability metadata, so only known
     /// interactive providers expose the sign-in flow.
     public var supportsInteractiveAuth: Bool {
-        Self.structuredCapableHarnesses.contains(harness)
+        Self.interactiveAuthHarnesses.contains(harness)
     }
 
     /// Posts `createSession` for the current selection. On success returns

@@ -13,6 +13,7 @@ from .models import (
 from .codex import CodexCatalogAdapter
 from .agy import AgyCatalogAdapter
 from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
+from .deepseek import DeepSeekCatalogAdapter
 from .scope import AccountScopeIDs
 from .service import (
     CatalogAdapter,
@@ -31,6 +32,7 @@ def default_model_catalog_service(
         ("codex", CodexCatalogAdapter, ("app-server", "--stdio")),
         ("claude-code", ClaudeCatalogAdapter, ()),
         ("agy", AgyCatalogAdapter, ()),
+        ("deepseek-harness", DeepSeekCatalogAdapter, ()),
     ):
         preset = presets.get(harness)
         executable = getattr(preset, "executable", None)
@@ -61,5 +63,6 @@ __all__ = [
     "AgyCatalogAdapter",
     "ClaudeCatalogAdapter",
     "ClaudeModelPolicy",
+    "DeepSeekCatalogAdapter",
     "default_model_catalog_service",
 ]

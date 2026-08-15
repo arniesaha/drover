@@ -61,6 +61,7 @@ from drover.server.harness.updater import (
 from drover.server.harness.structured import agy as _structured_agy
 from drover.server.harness.structured import claude as _structured_claude
 from drover.server.harness.structured import codex as _structured_codex
+from drover.server.harness.structured import deepseek as _structured_deepseek
 from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.structured.pusher import EventPusher
 from drover.server.harness.worktree import (
@@ -92,6 +93,7 @@ _STRUCTURED_DEFAULT_COMMANDS: dict[str, Callable[[], list[str]]] = {
     "claude-code": _structured_claude.default_command,
     "codex": _structured_codex.default_command,
     "agy": _structured_agy.default_command,
+    "deepseek-harness": _structured_deepseek.default_command,
 }
 
 # Harnesses whose structured drivers run full-auto with no wire-level
@@ -100,7 +102,7 @@ _STRUCTURED_DEFAULT_COMMANDS: dict[str, Callable[[], list[str]]] = {
 # `git add -A` inside the session can never sweep unrelated in-flight
 # changes from the user's main checkout. Claude keeps its interactive
 # approval flow and runs in place.
-_WORKTREE_HARNESSES = frozenset({"codex", "agy"})
+_WORKTREE_HARNESSES = frozenset({"codex", "agy", "deepseek-harness"})
 
 log = logging.getLogger("drover.harnessd")
 
@@ -280,6 +282,12 @@ DEFAULT_PRESETS = {
     # source, parser and metrics stay -- it is simply not driven from Drover.
     # `test_every_offered_preset_can_actually_be_driven` keeps a driverless
     # preset from being added back.
+    "deepseek-harness": HarnessPreset(
+        name="deepseek-harness",
+        command=("dsh",),
+        enabled=False,
+        description="DeepSeek Harness (local Web RPC)",
+    ),
 }
 
 
@@ -1056,7 +1064,7 @@ def _path_hint(path: Path) -> str:
 # genuinely quiet-but-ready REPL still gets seeded.
 _SEED_SETTLE_S = 0.4
 _SEED_COLD_QUIET_S = 1.5
-_RECOVERY_HARNESSES = {"claude-code", "codex"}
+_RECOVERY_HARNESSES = {"claude-code", "codex", "deepseek-harness"}
 _RECOVERY_UNAVAILABLE = (
     "Session cannot be resumed after the harness restart. "
     "Continue it in a new session."

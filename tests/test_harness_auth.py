@@ -14,6 +14,7 @@ from drover.server.harness.auth import (
     HarnessAuthStatus,
     StaticAuthAdapter,
     TerminalSignInRequired,
+    _resolve_known_versioned_cli,
     default_auth_adapters,
     redact_auth_text,
 )
@@ -1020,3 +1021,31 @@ def test_claude_and_codex_advertise_their_sign_in_modes(monkeypatch, tmp_path):
     assert adapters["codex"].requires_pty is False
     assert adapters["codex"].sign_in == "flow"
     assert adapters["agy"].sign_in == "terminal"
+
+
+def _dsh_in_nvm(tmp_path):
+    nvm_bin = tmp_path / ".nvm/versions/node/v24.13.0/bin"
+    nvm_bin.mkdir(parents=True)
+    dsh = nvm_bin / "dsh"
+    dsh.write_text("#!/usr/bin/env node\n")
+    dsh.chmod(0o755)
+    return dsh
+
+
+def test_nvm_installed_dsh_is_still_discoverable(monkeypatch, tmp_path):
+    """`npm i -g dsh` under nvm must not be hidden by the vendored-install check."""
+    dsh = _dsh_in_nvm(tmp_path)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
+
+    assert _resolve_known_versioned_cli("dsh") == str(dsh)
+
+
+def test_vendored_deepseek_harness_install_wins_over_nvm(monkeypatch, tmp_path):
+    _dsh_in_nvm(tmp_path)
+    vendored = tmp_path / ".local/share/deepseek-harness/node_modules/.bin/dsh"
+    vendored.parent.mkdir(parents=True)
+    vendored.write_text("#!/usr/bin/env node\n")
+    vendored.chmod(0o755)
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
+
+    assert _resolve_known_versioned_cli("dsh") == str(vendored)
