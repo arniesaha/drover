@@ -148,7 +148,31 @@ def begin_attempt(
         job = _make_leasable(ledger, job, job_kind, subject_key, subject_kind)
         if job is None or job.status != JOB_PENDING:
             return None
-        ledger.lease_job(job.job_id, worker_id=worker_id)
+        try:
+            ledger.lease_job(job.job_id, worker_id=worker_id)
+        except duckdb.ConstraintException as exc:
+            # Not transient, and not survivable by retrying: the attempt row
+            # cannot be written, so the job never records an attempt, never
+            # advances attempt_count, and recomputes the same colliding
+            # attempt number on every cycle. #143 caught one job doing this
+            # 916 times in a single log, at WARNING with a traceback, still
+            # firing across restarts and burying real errors.
+            #
+            # Parked rather than retried. Dead-lettered specifically, because
+            # terminal_failed is a reusable status and the next cycle would
+            # requeue this same row; from dead_lettered a fresh job row starts
+            # instead, which is also what clears a poisoned unique-index entry
+            # for the old job_id.
+            log.warning(
+                "ledger shadow parking %s/%s: its attempt could not be "
+                "recorded (%s)",
+                job_kind,
+                subject_key,
+                exc,
+            )
+            ledger.abandon_job(job.job_id, error_message=str(exc))
+            ledger.dead_letter_job(job.job_id)
+            return None
         return job.job_id
     except Exception:  # noqa: BLE001
         log.warning(
