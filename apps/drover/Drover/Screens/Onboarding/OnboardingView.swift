@@ -184,10 +184,7 @@ struct OnboardingView: View {
     private var serverSetupStep: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                ServerSetupContent(
-                    selectedMode: $selectedSetupMode,
-                    knownServerURL: environment.config?.baseURL.absoluteString
-                )
+                ServerSetupContent(selectedMode: $selectedSetupMode)
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.25)) {

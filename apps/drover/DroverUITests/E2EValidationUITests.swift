@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 /// Live end-to-end validation against a real drover-server: onboarding login,
@@ -67,32 +68,46 @@ final class E2EValidationUITests: XCTestCase {
     }
 
     @MainActor
-    func testLoginLaunchChatResumeTerminate() throws {
+    func testLoginLaunchChatResumeTerminate() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
             throw XCTSkip("DROVER_SMOKE_TOKEN not set — live E2E skipped")
         }
         let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
         let cwd = env["DROVER_SMOKE_CWD"] ?? "/private/tmp/drover-e2e"
+        let pairingCode = try await mintDevicePairingCode(
+            serverURL: serverURL,
+            token: token
+        )
 
         let app = XCUIApplication()
+        app.launchEnvironment["DROVER_BASE_URL"] = " "
+        app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchArguments += ["-drover.server.url", " "]
         app.launch()
 
         // ── 1. Onboarding / login ─────────────────────────────────────────
-        let urlField = app.textFields["http://host:7080"]
-        XCTAssertTrue(urlField.waitForExistence(timeout: 10), "onboarding URL field should show")
+        let alreadyHaveServer = app.buttons["onboarding-already-have-server-button"]
+        XCTAssertTrue(alreadyHaveServer.waitForExistence(timeout: 10),
+                      "first launch should show the onboarding welcome screen")
+        alreadyHaveServer.tap()
+
+        let urlField = app.textFields["onboarding-server-url-field"]
+        XCTAssertTrue(urlField.waitForExistence(timeout: 10),
+                      "manual pairing should show the server URL field")
         shoot(app, "01-onboarding")
         urlField.tap()
         urlField.typeText(serverURL)
 
-        let tokenField = app.secureTextFields["API token"]
-        XCTAssertTrue(tokenField.waitForExistence(timeout: 5))
-        tokenField.tap()
-        tokenField.typeText(token)
+        let codeField = app.textFields["onboarding-pairing-code-field"]
+        XCTAssertTrue(codeField.waitForExistence(timeout: 5))
+        codeField.tap()
+        codeField.typeText(pairingCode)
 
-        let saveButton = app.buttons["Test & Save"]
-        XCTAssertTrue(saveButton.isEnabled, "Test & Save should enable once both fields are filled")
-        saveButton.tap()
+        let pairButton = app.buttons["onboarding-pair-submit-button"]
+        XCTAssertTrue(pairButton.isEnabled,
+                      "Pair should enable once the server and code are filled")
+        pairButton.tap()
 
         // Successful configure flips the root to the Sessions list and asks
         // for notification permission. The system alert belongs to
@@ -224,7 +239,7 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "11-back-on-source-chat")
 
         // Hold briefly so external screenshots can catch the final state.
-        Thread.sleep(forTimeInterval: 3)
+        try await Task.sleep(for: .seconds(3))
     }
 
     /// Header-specific fixture: `DROVER_SMOKE_RECAP_SESSION_ID` must name a
@@ -328,6 +343,27 @@ final class E2EValidationUITests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private struct PairingCodeResponse: Decodable {
+        let code: String
+    }
+
+    @MainActor
+    private func mintDevicePairingCode(serverURL: String, token: String) async throws -> String {
+        let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
+        var request = URLRequest(url: baseURL.appendingPathComponent("auth/pair-codes"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["scope": "device", "label": "Drover UI E2E"]
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 201, "hub should mint a device pairing code")
+        return try JSONDecoder().decode(PairingCodeResponse.self, from: data).code
+    }
 
     @MainActor
     private func shoot(_ app: XCUIApplication, _ name: String) {

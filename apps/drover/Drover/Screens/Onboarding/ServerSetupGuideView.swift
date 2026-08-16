@@ -21,7 +21,16 @@ enum ServerSetupMode: String, CaseIterable, Identifiable, Sendable {
         case .hub:
             return "Runs `drover-server` to coordinate sessions, manage credentials, and serve this app."
         case .host:
-            return "Runs `drover-harnessd` on another Mac, Linux box, or NAS to execute agent sessions."
+            return "Runs sessions on an additional machine while the primary hub coordinates them."
+        }
+    }
+
+    var commandTitle: String {
+        switch self {
+        case .hub:
+            return "Install Command"
+        case .host:
+            return "Pairing Command"
         }
     }
 
@@ -30,7 +39,7 @@ enum ServerSetupMode: String, CaseIterable, Identifiable, Sendable {
         case .hub:
             return "curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash"
         case .host:
-            return "curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --join '<hub-url>'"
+            return "drover-server pair-host --name <host-name>"
         }
     }
 
@@ -39,7 +48,16 @@ enum ServerSetupMode: String, CaseIterable, Identifiable, Sendable {
         case .hub:
             return "Copy Command"
         case .host:
-            return "Copy Join Command"
+            return "Copy Pairing Command"
+        }
+    }
+
+    var guidanceText: String {
+        switch self {
+        case .hub:
+            return "Run the command in your terminal on your machine. When it finishes, it will print a pairing QR code."
+        case .host:
+            return "Run this command on the primary hub. Then run the installer command it prints on the additional machine."
         }
     }
 }
@@ -48,7 +66,6 @@ enum ServerSetupMode: String, CaseIterable, Identifiable, Sendable {
 /// Styled strictly with `DroverColor` and `DroverText`.
 struct ServerSetupContent: View {
     @Binding var selectedMode: ServerSetupMode
-    var knownServerURL: String? = nil
 
     @State private var hasCopied = false
 
@@ -99,9 +116,9 @@ struct ServerSetupContent: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // Install Command Card
+            // Command Card
             VStack(alignment: .leading, spacing: 8) {
-                Text("Install Command").droverText(.h3)
+                Text(selectedMode.commandTitle).droverText(.h3)
 
                 Text(commandToDisplay)
                     .font(.system(.subheadline, design: .monospaced))
@@ -168,7 +185,7 @@ struct ServerSetupContent: View {
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(DroverColor.accentHi)
                     .padding(.top, 2)
-                Text("Run the command in your terminal on your machine. When it finishes, it will print a pairing QR code.")
+                Text(selectedMode.guidanceText)
                     .droverText(.nested)
                     .foregroundStyle(DroverColor.muted)
                     .fixedSize(horizontal: false, vertical: true)
@@ -188,10 +205,7 @@ struct ServerSetupContent: View {
     }
 
     private var commandToDisplay: String {
-        if selectedMode == .host, let knownServerURL, !knownServerURL.isEmpty {
-            return "curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --join '\(knownServerURL)'"
-        }
-        return selectedMode.installCommand
+        selectedMode.installCommand
     }
 
     private func copyCommand() {
@@ -211,22 +225,17 @@ struct ServerSetupContent: View {
 /// Standalone sheet for viewing the server setup instructions from Settings or elsewhere.
 struct ServerSetupGuideView: View {
     @Environment(\.dismiss) private var dismiss
-    var knownServerURL: String? = nil
 
     @State private var selectedMode: ServerSetupMode
 
-    init(initialMode: ServerSetupMode = .hub, knownServerURL: String? = nil) {
-        self.knownServerURL = knownServerURL
+    init(initialMode: ServerSetupMode = .hub) {
         _selectedMode = State(initialValue: initialMode)
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                ServerSetupContent(
-                    selectedMode: $selectedMode,
-                    knownServerURL: knownServerURL
-                )
+                ServerSetupContent(selectedMode: $selectedMode)
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)

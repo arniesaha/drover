@@ -29,6 +29,11 @@ final class OnboardingTests: XCTestCase {
             mode.installCommand,
             "curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash"
         )
+        XCTAssertEqual(mode.commandTitle, "Install Command")
+        XCTAssertEqual(
+            mode.guidanceText,
+            "Run the command in your terminal on your machine. When it finishes, it will print a pairing QR code."
+        )
         XCTAssertEqual(mode.copyButtonLabel, "Copy Command")
     }
 
@@ -36,29 +41,30 @@ final class OnboardingTests: XCTestCase {
         let mode = ServerSetupMode.host
         XCTAssertEqual(mode.rawValue, "Worker Host")
         XCTAssertEqual(mode.subtitle, "Additional Machine")
-        XCTAssertEqual(
-            mode.descriptionText,
-            "Runs `drover-harnessd` on another Mac, Linux box, or NAS to execute agent sessions."
-        )
-        XCTAssertEqual(
-            mode.installCommand,
-            "curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --join '<hub-url>'"
-        )
-        XCTAssertEqual(mode.copyButtonLabel, "Copy Join Command")
+        XCTAssertEqual(mode.commandTitle, "Pairing Command")
+        XCTAssertEqual(mode.copyButtonLabel, "Copy Pairing Command")
     }
 
-    func testServerSetupContentCustomKnownURL() {
-        let modeBinding = Binding<ServerSetupMode>.constant(.host)
-        let customURL = "http://192.168.1.50:7080"
-        let content = ServerSetupContent(selectedMode: modeBinding, knownServerURL: customURL)
-        XCTAssertNotNil(content)
+    func testWorkerHostCommandStartsPairingOnPrimaryHub() {
+        XCTAssertEqual(
+            ServerSetupMode.host.installCommand,
+            "drover-server pair-host --name <host-name>"
+        )
+        XCTAssertFalse(ServerSetupMode.host.installCommand.contains("install.sh --join"))
+    }
+
+    func testWorkerHostCopyExplainsWhereEachCommandRuns() {
+        XCTAssertEqual(
+            ServerSetupMode.host.guidanceText,
+            "Run this command on the primary hub. Then run the installer command it prints on the additional machine."
+        )
     }
 
     func testServerSetupGuideViewInstantiates() {
         let guideHub = ServerSetupGuideView(initialMode: .hub)
         XCTAssertNotNil(guideHub)
 
-        let guideHost = ServerSetupGuideView(initialMode: .host, knownServerURL: "http://100.64.0.1:7080")
+        let guideHost = ServerSetupGuideView(initialMode: .host)
         XCTAssertNotNil(guideHost)
     }
 
