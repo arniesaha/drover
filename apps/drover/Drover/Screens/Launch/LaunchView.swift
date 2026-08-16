@@ -33,9 +33,16 @@ struct LaunchView: View {
             Section("Host") {
                 Picker("Host", selection: $model.hostID) {
                     ForEach(model.availableHosts) { host in
-                        Text(host.title)
+                        Text(host.title + statusSuffix(for: host))
                             .tag(host.id)
                     }
+                }
+
+                if let warning = model.hostWarning {
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(DroverColor.warn)
+                        .accessibilityIdentifier("launch-host-warning")
                 }
             }
 
@@ -129,8 +136,7 @@ struct LaunchView: View {
                         Text("Launch")
                     }
                 }
-                .disabled(isLaunching || model.isFetchingSnapshot
-                          || model.hostID.isEmpty || model.harness.isEmpty)
+                .disabled(!model.canLaunch || isLaunching || model.isFetchingSnapshot)
                 .accessibilityIdentifier("launch-confirm-button")
             }
         }
@@ -165,6 +171,14 @@ struct LaunchView: View {
         // uncached pair and a launch silently drops both overrides.
         .task(id: "\(model.hostID)\u{1f}\(model.harness)") {
             await model.runPreferences.refresh()
+        }
+    }
+
+    private func statusSuffix(for host: HostSummary) -> String {
+        switch host.status {
+        case "stale": " (stale)"
+        case "offline": " (offline)"
+        default: ""
         }
     }
 
