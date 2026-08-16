@@ -177,7 +177,7 @@ def _existing_dedup_keys(con, rows: Iterable[dict]) -> set:
     params: list = list(partitions)
     agent_ids = sorted({agent for agents in partitions.values() for agent in agents})
     try:
-        rows = con.execute(
+        existing_rows = con.execute(
             f"""
             WITH bounded_agent_events AS (
               {source_sql}
@@ -189,8 +189,9 @@ def _existing_dedup_keys(con, rows: Iterable[dict]) -> set:
             """,
             [*params, agent_ids],
         ).fetchall()
-        return {r[0] for r in rows}
-    except duckdb.Error:
+        return {r[0] for r in existing_rows}
+    except duckdb.Error as e:
+        log.warning("_existing_dedup_keys failed: %s", e, exc_info=True)
         return set()
 
 

@@ -297,6 +297,8 @@ class Ledger:
                subject_kind, subject_key, payload_hash, status,
                first_seen_at, metadata_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (source_kind, source_key, source_version)
+            DO NOTHING
             """,
             [
                 receipt_id,
@@ -311,8 +313,14 @@ class Ledger:
                 _dumps(metadata),
             ],
         )
-        receipt = self._load_receipt(receipt_id)
-        return ReceiptResult(receipt=receipt, is_duplicate=False)
+        # Regardless of whether we inserted, load the receipt by source identifiers.
+        # If we had a conflict (another thread inserted it), this will return that row.
+        receipt = self._find_receipt(source_kind, source_key, source_version)
+        # Only report as non-duplicate if this receipt_id actually landed in the table.
+        inserted = self._con.execute(
+            "SELECT 1 FROM pipeline_receipts WHERE receipt_id = ?", [receipt_id]
+        ).fetchone() is not None
+        return ReceiptResult(receipt=receipt, is_duplicate=not inserted)
 
     def mark_receipt(
         self, receipt_id: str, status: str, *, last_error: Optional[str] = None
