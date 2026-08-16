@@ -57,6 +57,10 @@ class EventPusher:
         self._queue: SimpleQueue[dict[str, Any]] = SimpleQueue()
         self._queue_len = 0
         self._queue_lock = threading.Lock()
+        # Reconciliation and the live worker share one central projection.
+        # Their requests must not overlap or a replay rebuild can race a live
+        # tail update and overwrite newer derived session state.
+        self._post_lock = threading.Lock()
         self._overflowing = False
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -73,6 +77,30 @@ class EventPusher:
             target=self._run, name="drover-event-pusher", daemon=True
         )
         self._thread.start()
+
+    def is_configured(self) -> bool:
+        return bool(self._central_url and self._token)
+
+    def is_stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def post_batch(self, batch: list[dict[str, Any]]) -> bool:
+        """POST one batch; True only for a 2xx response."""
+        return self._post(batch)
+
+    def reconcile(
+        self,
+        registry: Any,
+        *,
+        host_id: str | None = None,
+        batch_size: int = 100,
+    ) -> int | None:
+        return reconcile_unsent_events(
+            registry,
+            self,
+            host_id=host_id,
+            batch_size=batch_size,
+        )
 
     def push(self, session_id: str, event: dict[str, Any]) -> None:
         del session_id  # event already carries session_id; kept for symmetry
@@ -209,11 +237,12 @@ class EventPusher:
                 "Authorization": f"Bearer {self._token}",
             },
         )
-        try:
-            with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
-                return 200 <= response.status < 300
-        except (OSError, URLError):
-            return False
+        with self._post_lock:
+            try:
+                with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
+                    return 200 <= response.status < 300
+            except (OSError, URLError):
+                return False
 
 
 def _is_flush_now_event(event: dict[str, Any]) -> bool:
@@ -223,3 +252,72 @@ def _is_flush_now_event(event: dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
     return bool(payload.get("turn_complete")) or "exited" in payload
+
+
+def reconcile_unsent_events(
+    registry: Any,
+    pusher: EventPusher | None,
+    *,
+    host_id: str | None = None,
+    batch_size: int = 100,
+) -> int | None:
+    """Offer every durable structured event to central in bounded pages.
+
+    Repairs any event gaps caused by an unexpected harnessd restart
+    (crash, reboot, deploy). Central /harness/events is idempotent on
+    event_id, so re-sending durable events is safe and duplicate-free.
+
+    Returns the number of events offered after a complete pass, or ``None``
+    when the pass could not finish. Failed pages stay only in DuckDB: copying
+    them into EventPusher's bounded in-memory retry buffer would recreate the
+    restart-loss problem this reconciliation path exists to repair.
+    """
+    if pusher is None or not pusher.is_configured():
+        return 0
+    if not hasattr(registry, "list_events_for_reconciliation"):
+        return 0
+    page_size = max(1, int(batch_size))
+    after_created_at = None
+    after_event_id = None
+    reconciled_count = 0
+    while True:
+        if getattr(pusher, "is_stopping", lambda: False)():
+            return None
+        try:
+            events = registry.list_events_for_reconciliation(
+                host_id=host_id,
+                after_created_at=after_created_at,
+                after_event_id=after_event_id,
+                limit=page_size,
+            )
+        except Exception:
+            return None
+        if not events:
+            return reconciled_count
+
+        records: list[dict[str, Any]] = []
+        for event in events:
+            try:
+                payload = event.wire_payload()
+            except Exception:
+                payload = dict(event.payload) if isinstance(event.payload, dict) else {}
+                payload["event_id"] = event.event_id
+                payload["session_id"] = event.session_id
+                if event.seq is not None:
+                    payload["seq"] = event.seq
+            if "type" not in payload or not payload["type"]:
+                payload["type"] = event.event_type
+            if "ts" not in payload and event.created_at is not None:
+                payload["ts"] = event.created_at.isoformat()
+            records.append(payload)
+
+        if getattr(pusher, "is_stopping", lambda: False)():
+            return None
+        if not pusher.post_batch(records):
+            return None
+        reconciled_count += len(records)
+        final_event = events[-1]
+        if final_event.created_at is None:
+            return None
+        after_created_at = final_event.created_at
+        after_event_id = final_event.event_id

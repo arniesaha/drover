@@ -5,16 +5,11 @@ from __future__ import annotations
 import ast
 import base64
 import binascii
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 import hashlib
 import hmac
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
-from pathlib import Path
 import queue
 import re
 import shlex
@@ -22,11 +17,16 @@ import socket
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.error import URLError
-from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
 from drover.config import config_home, default_token_file, resolve_api_token_env
@@ -41,35 +41,28 @@ from drover.server.harness.auth import (
     resolve_executable,
 )
 from drover.server.harness.content_consent import DurableContentConsent
-from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
 from drover.server.harness.events import normalize_harness_event
-from drover.server.harness.models import HarnessEvent
 from drover.server.harness.model_catalog import (
     CatalogSelectionError,
     ModelCatalogService,
     default_model_catalog_service,
 )
+from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
+from drover.server.harness.structured import agy as _structured_agy
+from drover.server.harness.structured import claude as _structured_claude
+from drover.server.harness.structured import codex as _structured_codex
+from drover.server.harness.structured import deepseek as _structured_deepseek
+from drover.server.harness.structured.manager import StructuredSessionManager
+from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.harness.updater import (
     REGISTRATION_DEADLINE_SECONDS,
     HostUpdater,
     default_restarter,
     verify_after_restart,
 )
-from drover.server.harness.structured import agy as _structured_agy
-from drover.server.harness.structured import claude as _structured_claude
-from drover.server.harness.structured import codex as _structured_codex
-from drover.server.harness.structured import deepseek as _structured_deepseek
-from drover.server.harness.structured.manager import StructuredSessionManager
-from drover.server.harness.structured.pusher import EventPusher
-from drover.server.harness.worktree import (
-    SessionWorktree,
-    cleanup_session_worktree,
-    create_session_worktree,
-)
-from drover.server.runtime import RuntimeLayout
 from drover.server.harness.websocket import (
     WebSocketClosed,
     accept_key,
@@ -77,6 +70,13 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
+from drover.server.harness.worktree import (
+    SessionWorktree,
+    cleanup_session_worktree,
+    create_session_worktree,
+)
+from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
+from drover.server.runtime import RuntimeLayout
 
 if TYPE_CHECKING:
     from drover.config import AdvisoryContentConfig, DroverConfig
@@ -1155,6 +1155,16 @@ class HarnessDaemonState:
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
+    pusher: EventPusher | None = None
+    # Startup reconciliation reads from the durable DuckDB ledger. Keep the
+    # pass pending until it reaches the end successfully so a transient hub
+    # outage is retried after the next successful heartbeat.
+    event_reconciliation_pending: bool = True
+    event_reconciliation_lock: threading.Lock = field(default_factory=threading.Lock)
+    event_reconciliation_schedule_lock: threading.Lock = field(
+        default_factory=threading.Lock
+    )
+    event_reconciliation_thread: threading.Thread | None = None
     provider_usage_probe: CodexUsageProbe | None = None
     claude_usage_probe: Any | None = None
     agy_usage_probe: Any | None = None
@@ -3259,10 +3269,58 @@ def _heartbeat_once(state: HarnessDaemonState) -> None:
     # tests `is None` rather than truthiness; the watchdog reads this flag to
     # decide whether a freshly activated version can talk to the hub at all.
     state.registered_at_least_once = True
+    _schedule_event_reconciliation(state)
     updater = getattr(state, "updater", None)
     if updater is not None:
         updater.observe(body)
         updater.maybe_activate()
+
+
+def _reconcile_persisted_events(state: HarnessDaemonState) -> bool:
+    """Complete one durable-ledger replay pass, retrying after hub recovery."""
+    pusher = getattr(state, "pusher", None)
+    if pusher is None:
+        return True
+    if not state.event_reconciliation_pending:
+        return True
+    with state.event_reconciliation_lock:
+        if not state.event_reconciliation_pending:
+            return True
+        result = reconcile_unsent_events(
+            state.registry,
+            pusher,
+            host_id=state.host_id,
+        )
+        if result is None:
+            log.warning("structured event reconciliation deferred until hub recovery")
+            return False
+        state.event_reconciliation_pending = False
+        log.info("structured event reconciliation completed: offered=%d", result)
+        return True
+
+
+def _schedule_event_reconciliation(
+    state: HarnessDaemonState,
+) -> threading.Thread | None:
+    """Wake one background replay worker without delaying heartbeat liveness."""
+    pusher = getattr(state, "pusher", None)
+    if pusher is None or not state.event_reconciliation_pending:
+        return None
+    with state.event_reconciliation_schedule_lock:
+        if not state.event_reconciliation_pending:
+            return None
+        existing = getattr(state, "event_reconciliation_thread", None)
+        if existing is not None and existing.is_alive():
+            return existing
+        thread = threading.Thread(
+            target=_reconcile_persisted_events,
+            args=(state,),
+            name="drover-event-reconciliation",
+            daemon=True,
+        )
+        state.event_reconciliation_thread = thread
+        thread.start()
+        return thread
 
 
 def _rollback_watchdog(
@@ -3398,6 +3456,8 @@ def wire_event_pusher(state: HarnessDaemonState) -> EventPusher | None:
     pusher = EventPusher(state.central_url, state.api_token)
     pusher.start()
     state.push_event = pusher.push
+    state.pusher = pusher
+    _schedule_event_reconciliation(state)
     return pusher
 
 
@@ -3456,15 +3516,18 @@ def run_harnessd(
         layout = RuntimeLayout(config_home())
         state.updater = HostUpdater(state, layout, cfg)
         _start_rollback_watchdog(state, layout)
-    pusher = wire_event_pusher(state)
-    register_daemon_host(state)
-    _heartbeat_once(state)
-    start_remote_heartbeat(state)
     server = create_harness_server(
         listen_host=listen_host,
         listen_port=listen_port,
         state=state,
     )
+    # Bind before any historical replay starts. A large durable ledger must
+    # never hold the daemon socket closed or trip the updater's liveness
+    # watchdog during an otherwise healthy restart.
+    pusher = wire_event_pusher(state)
+    register_daemon_host(state)
+    _heartbeat_once(state)
+    start_remote_heartbeat(state)
     # After create_harness_server, and on its *bound* port: announcing a live
     # relay before the socket is bound gives the hub a window in which every
     # proxied call 502s, and listen_port is 0 whenever the port is ephemeral.

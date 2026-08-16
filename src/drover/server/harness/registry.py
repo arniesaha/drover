@@ -53,6 +53,19 @@ def _now() -> datetime:
 _AWAITING_STATES = ("input", "approval")
 
 
+def _derive_structured_awaiting(
+    *, event_type: str, payload: dict[str, Any], current: str | None
+) -> str | None:
+    """Apply the structured-session awaiting state machine to one event."""
+    if event_type == "approval_prompt":
+        return "approval"
+    if event_type in {"approval_response", "user_input"}:
+        return None
+    if event_type == "status" and payload.get("awaiting") == "input":
+        return "input"
+    return current
+
+
 def _dispatch_awaiting_push(
     *,
     session_id: str,
@@ -893,6 +906,247 @@ class HarnessRegistry:
                 raise
         return len(params)
 
+    def ingest_structured_events(self, records: list[dict[str, Any]]) -> int:
+        """Atomically insert remote structured events and project session state.
+
+        Central replay is idempotent by ``event_id``. Event rows and their
+        derived ``awaiting``/activity/native-session projection share one
+        transaction so a crash can never commit one without the other.
+        """
+        unique: dict[str, dict[str, Any]] = {}
+        for record in records:
+            event_id = str(record.get("event_id") or "").strip()
+            if event_id and event_id not in unique:
+                unique[event_id] = record
+        if not unique:
+            return 0
+
+        notifications: list[tuple[str, str | None, str | None, str | None, str]] = []
+        inserted_count = 0
+        with self._connect() as con:
+            con.execute("BEGIN TRANSACTION")
+            try:
+                placeholders = ", ".join("?" for _ in unique)
+                existing_ids = {
+                    str(row[0])
+                    for row in con.execute(
+                        "SELECT event_id FROM harness_events "
+                        f"WHERE event_id IN ({placeholders})",
+                        list(unique),
+                    ).fetchall()
+                }
+                incoming = [
+                    record
+                    for event_id, record in unique.items()
+                    if event_id not in existing_ids
+                ]
+                if not incoming:
+                    con.execute("COMMIT")
+                    return 0
+
+                session_ids = sorted({str(record["session_id"]) for record in incoming})
+                session_placeholders = ", ".join("?" for _ in session_ids)
+                session_rows = {
+                    str(row["session_id"]): row
+                    for row in _rows(
+                        con,
+                        "SELECT session_id, awaiting, last_activity, "
+                        "native_session_id, harness, cwd "
+                        "FROM harness_sessions "
+                        f"WHERE session_id IN ({session_placeholders})",
+                        session_ids,
+                    )
+                }
+                existing_max = {
+                    str(row["session_id"]): int(row["max_seq"] or 0)
+                    for row in _rows(
+                        con,
+                        "SELECT session_id, COALESCE(MAX(seq), 0) AS max_seq "
+                        "FROM harness_events "
+                        f"WHERE session_id IN ({session_placeholders}) "
+                        "GROUP BY session_id",
+                        session_ids,
+                    )
+                }
+
+                inserted_by_session: dict[str, list[dict[str, Any]]] = {}
+                for record in incoming:
+                    event_id = str(record["event_id"])
+                    session_id = str(record["session_id"])
+                    event_type = str(record["event_type"])
+                    payload = (
+                        dict(record["payload"])
+                        if isinstance(record.get("payload"), dict)
+                        else {}
+                    )
+                    seq = record.get("seq")
+                    if not isinstance(seq, int) or isinstance(seq, bool):
+                        seq = None
+                    created_at = record.get("created_at") or _now()
+                    normalized = normalize_harness_event(
+                        event_type=event_type,
+                        payload=payload,
+                        normalized_source="structured",
+                    )
+                    inserted = con.execute(
+                        """
+                        INSERT INTO harness_events (
+                          event_id, session_id, event_type, normalized_type,
+                          normalized_source, content_preview, payload_json,
+                          created_at, seq
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (event_id) DO NOTHING
+                        RETURNING event_id
+                        """,
+                        [
+                            event_id,
+                            session_id,
+                            event_type,
+                            normalized["normalized_type"],
+                            normalized["normalized_source"],
+                            normalized["content_preview"],
+                            _json_dumps(payload),
+                            created_at,
+                            seq,
+                        ],
+                    ).fetchone()
+                    if inserted is None:
+                        continue
+                    _enqueue_recap_if_completion(
+                        con,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload,
+                        seq=seq,
+                    )
+                    inserted_count += 1
+                    inserted_by_session.setdefault(session_id, []).append(
+                        {
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "payload": payload,
+                            "created_at": created_at,
+                            "seq": seq,
+                        }
+                    )
+
+                for session_id, inserted_events in inserted_by_session.items():
+                    previous = session_rows.get(session_id)
+                    if previous is None:
+                        continue
+                    rebuild = any(
+                        isinstance(event.get("seq"), int)
+                        and event["seq"] <= existing_max.get(session_id, 0)
+                        for event in inserted_events
+                    )
+                    if rebuild:
+                        projection_events = _rows(
+                            con,
+                            "SELECT event_id, event_type, payload_json, "
+                            "created_at, seq FROM harness_events "
+                            "WHERE session_id = ? AND seq IS NOT NULL AND seq > 0 "
+                            "ORDER BY seq, created_at, event_id",
+                            [session_id],
+                        )
+                        awaiting: str | None = None
+                    else:
+                        projection_events = sorted(
+                            inserted_events,
+                            key=lambda event: (
+                                event.get("seq") or 0,
+                                event.get("created_at") or _now(),
+                                event["event_id"],
+                            ),
+                        )
+                        awaiting = previous.get("awaiting")
+
+                    latest_activity: datetime | None = None
+                    native_session_id: str | None = None
+                    for event in projection_events:
+                        raw_payload = event.get("payload")
+                        if raw_payload is None:
+                            try:
+                                raw_payload = json.loads(
+                                    event.get("payload_json") or "{}"
+                                )
+                            except (TypeError, ValueError):
+                                raw_payload = {}
+                        inner_payload = (
+                            raw_payload.get("payload")
+                            if isinstance(raw_payload, dict)
+                            else None
+                        )
+                        if not isinstance(inner_payload, dict):
+                            inner_payload = {}
+                        awaiting = _derive_structured_awaiting(
+                            event_type=str(event["event_type"]),
+                            payload=inner_payload,
+                            current=awaiting,
+                        )
+                        candidate_native_id = inner_payload.get("native_session_id")
+                        if (
+                            isinstance(candidate_native_id, str)
+                            and candidate_native_id.strip()
+                        ):
+                            native_session_id = candidate_native_id.strip()
+                        created_at = event.get("created_at")
+                        if created_at is not None and (
+                            latest_activity is None or created_at > latest_activity
+                        ):
+                            latest_activity = created_at
+
+                    con.execute(
+                        """
+                        UPDATE harness_sessions
+                           SET awaiting = ?,
+                               last_activity = CASE
+                                 WHEN ? IS NULL THEN last_activity
+                                 WHEN last_activity IS NULL OR last_activity < ? THEN ?
+                                 ELSE last_activity
+                               END,
+                               native_session_id = COALESCE(?, native_session_id)
+                         WHERE session_id = ?
+                        """,
+                        [
+                            awaiting,
+                            latest_activity,
+                            latest_activity,
+                            latest_activity,
+                            native_session_id,
+                            session_id,
+                        ],
+                    )
+                    if previous.get("awaiting") != awaiting:
+                        preview = (
+                            self._attention_preview(con, session_id)
+                            if awaiting in _AWAITING_STATES
+                            else ""
+                        )
+                        notifications.append(
+                            (
+                                session_id,
+                                awaiting,
+                                previous.get("harness"),
+                                previous.get("cwd"),
+                                preview,
+                            )
+                        )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+
+        for session_id, awaiting, harness, cwd, preview in notifications:
+            _dispatch_awaiting_push(
+                session_id=session_id,
+                awaiting=awaiting,
+                harness=harness,
+                cwd=cwd,
+                preview=preview,
+            )
+        return inserted_count
+
     def max_event_seq(self, session_id: str) -> int:
         with self._connect() as con:
             row = con.execute(
@@ -1120,3 +1374,69 @@ class HarnessRegistry:
             label = self._TRANSCRIPT_EVENT_ROLES.get(str(row.get("event_type")), "note")
             lines.append(f"[{label}] {text}")
         return "\n".join(lines).strip()
+
+    def list_events_for_reconciliation(
+        self,
+        *,
+        host_id: str | None = None,
+        after_created_at: datetime | None = None,
+        after_event_id: str | None = None,
+        limit: int = 100,
+    ) -> list[HarnessEvent]:
+        """Return one durable page of structured events for reconciliation.
+
+        The cursor is the final ``(created_at, event_id)`` pair from the prior
+        page. No age window or total-row cap is applied: an old interior gap
+        is still a gap, and callers page until the local ledger is exhausted.
+        """
+        page_limit = max(1, int(limit))
+        cursor_event_id = after_event_id or ""
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                """
+                SELECT e.*
+                FROM harness_events e
+                LEFT JOIN harness_sessions s ON e.session_id = s.session_id
+                WHERE (
+                    e.normalized_source = 'structured'
+                    OR s.mode = 'structured'
+                    OR (e.seq IS NOT NULL AND e.normalized_source IS NULL)
+                  )
+                  AND (? IS NULL OR s.host_id IS NULL OR s.host_id = ?)
+                  AND (
+                    ? IS NULL
+                    OR e.created_at > ?
+                    OR (e.created_at = ? AND e.event_id > ?)
+                  )
+                ORDER BY e.created_at ASC, e.event_id ASC
+                LIMIT ?
+                """,
+                [
+                    host_id,
+                    host_id,
+                    after_created_at,
+                    after_created_at,
+                    after_created_at,
+                    cursor_event_id,
+                    page_limit,
+                ],
+            )
+        return [HarnessEvent.from_row(row) for row in rows]
+
+    def reconcile_unsent_events(
+        self,
+        pusher: Any,
+        *,
+        host_id: str | None = None,
+        batch_size: int = 100,
+    ) -> int | None:
+        """Helper to reconcile unsent events to central via pusher."""
+        from drover.server.harness.structured.pusher import reconcile_unsent_events
+
+        return reconcile_unsent_events(
+            self,
+            pusher,
+            host_id=host_id,
+            batch_size=batch_size,
+        )
