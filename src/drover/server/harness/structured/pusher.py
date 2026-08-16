@@ -81,23 +81,16 @@ class EventPusher:
         """POST one batch; True only for a 2xx response."""
         return self._post(batch)
 
-    def retain_batch(self, batch: list[dict[str, Any]]) -> None:
-        """Keep an undelivered batch for the next drain instead of losing it."""
-        self._retain(batch)
-        self._wake.set()
-
     def reconcile(
         self,
         registry: Any,
         *,
-        since_hours: float = 24.0,
         host_id: str | None = None,
         batch_size: int = 100,
-    ) -> int:
+    ) -> int | None:
         return reconcile_unsent_events(
             registry,
             self,
-            since_hours=since_hours,
             host_id=host_id,
             batch_size=batch_size,
         )
@@ -257,61 +250,62 @@ def reconcile_unsent_events(
     registry: Any,
     pusher: EventPusher | None,
     *,
-    since_hours: float = 24.0,
     host_id: str | None = None,
     batch_size: int = 100,
-) -> int:
-    """Push recent structured events from local DuckDB to central.
+) -> int | None:
+    """Offer every durable structured event to central in bounded pages.
 
     Repairs any event gaps caused by an unexpected harnessd restart
     (crash, reboot, deploy). Central /harness/events is idempotent on
-    event_id, so re-sending recent events is safe and duplicate-free.
+    event_id, so re-sending durable events is safe and duplicate-free.
 
-    Returns the number of events reconciled / buffered for delivery.
+    Returns the number of events offered after a complete pass, or ``None``
+    when the pass could not finish. Failed pages stay only in DuckDB: copying
+    them into EventPusher's bounded in-memory retry buffer would recreate the
+    restart-loss problem this reconciliation path exists to repair.
     """
     if pusher is None or not pusher.is_configured():
         return 0
-    if not hasattr(registry, "list_recent_events_for_reconciliation"):
+    if not hasattr(registry, "list_events_for_reconciliation"):
         return 0
-    try:
-        events = registry.list_recent_events_for_reconciliation(
-            since_hours=since_hours,
-            host_id=host_id,
-        )
-    except Exception:
-        return 0
-    if not events:
-        return 0
-
-    records: list[dict[str, Any]] = []
-    for event in events:
-        try:
-            payload = event.wire_payload()
-        except Exception:
-            payload = dict(event.payload) if isinstance(event.payload, dict) else {}
-            payload["event_id"] = event.event_id
-            payload["session_id"] = event.session_id
-            if event.seq is not None:
-                payload["seq"] = event.seq
-        if "type" not in payload or not payload["type"]:
-            payload["type"] = event.event_type
-        if "ts" not in payload and event.created_at is not None:
-            payload["ts"] = event.created_at.isoformat()
-        records.append(payload)
-
-    if not records:
-        return 0
-
+    page_size = max(1, int(batch_size))
+    after_created_at = None
+    after_event_id = None
     reconciled_count = 0
-    for i in range(0, len(records), batch_size):
-        batch = records[i : i + batch_size]
-        if pusher.post_batch(batch):
-            reconciled_count += len(batch)
-        else:
-            # If direct post failed (e.g. central temporarily down),
-            # retain the remaining records in pusher so its worker thread
-            # will retry delivery when central recovers.
-            pusher.retain_batch(records[i:])
-            break
+    while True:
+        try:
+            events = registry.list_events_for_reconciliation(
+                host_id=host_id,
+                after_created_at=after_created_at,
+                after_event_id=after_event_id,
+                limit=page_size,
+            )
+        except Exception:
+            return None
+        if not events:
+            return reconciled_count
 
-    return len(records)
+        records: list[dict[str, Any]] = []
+        for event in events:
+            try:
+                payload = event.wire_payload()
+            except Exception:
+                payload = dict(event.payload) if isinstance(event.payload, dict) else {}
+                payload["event_id"] = event.event_id
+                payload["session_id"] = event.session_id
+                if event.seq is not None:
+                    payload["seq"] = event.seq
+            if "type" not in payload or not payload["type"]:
+                payload["type"] = event.event_type
+            if "ts" not in payload and event.created_at is not None:
+                payload["ts"] = event.created_at.isoformat()
+            records.append(payload)
+
+        if not pusher.post_batch(records):
+            return None
+        reconciled_count += len(records)
+        final_event = events[-1]
+        if final_event.created_at is None:
+            return None
+        after_created_at = final_event.created_at
+        after_event_id = final_event.event_id

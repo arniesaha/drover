@@ -1121,22 +1121,22 @@ class HarnessRegistry:
             lines.append(f"[{label}] {text}")
         return "\n".join(lines).strip()
 
-    def list_recent_events_for_reconciliation(
+    def list_events_for_reconciliation(
         self,
         *,
-        since_hours: float = 24.0,
         host_id: str | None = None,
-        limit: int = 10000,
+        after_created_at: datetime | None = None,
+        after_event_id: str | None = None,
+        limit: int = 100,
     ) -> list[HarnessEvent]:
-        """Query recent structured events for reconciliation to central.
+        """Return one durable page of structured events for reconciliation.
 
-        Returns events created within ``since_hours`` for structured sessions,
-        ordered chronologically by creation time and sequence so they can be
-        replayed safely to central's /harness/events endpoint.
+        The cursor is the final ``(created_at, event_id)`` pair from the prior
+        page. No age window or total-row cap is applied: an old interior gap
+        is still a gap, and callers page until the local ledger is exhausted.
         """
-        from datetime import timedelta
-
-        cutoff = _now() - timedelta(hours=max(0.0, float(since_hours)))
+        page_limit = max(1, int(limit))
+        cursor_event_id = after_event_id or ""
         with self._connect() as con:
             rows = _rows(
                 con,
@@ -1144,17 +1144,29 @@ class HarnessRegistry:
                 SELECT e.*
                 FROM harness_events e
                 LEFT JOIN harness_sessions s ON e.session_id = s.session_id
-                WHERE e.created_at >= ?
-                  AND (
+                WHERE (
                     e.normalized_source = 'structured'
                     OR s.mode = 'structured'
                     OR (e.seq IS NOT NULL AND e.normalized_source IS NULL)
                   )
                   AND (? IS NULL OR s.host_id IS NULL OR s.host_id = ?)
-                ORDER BY e.created_at ASC, COALESCE(e.seq, 0) ASC, e.event_id ASC
+                  AND (
+                    ? IS NULL
+                    OR e.created_at > ?
+                    OR (e.created_at = ? AND e.event_id > ?)
+                  )
+                ORDER BY e.created_at ASC, e.event_id ASC
                 LIMIT ?
                 """,
-                [cutoff, host_id, host_id, limit],
+                [
+                    host_id,
+                    host_id,
+                    after_created_at,
+                    after_created_at,
+                    after_created_at,
+                    cursor_event_id,
+                    page_limit,
+                ],
             )
         return [HarnessEvent.from_row(row) for row in rows]
 
@@ -1162,17 +1174,15 @@ class HarnessRegistry:
         self,
         pusher: Any,
         *,
-        since_hours: float = 24.0,
         host_id: str | None = None,
         batch_size: int = 100,
-    ) -> int:
+    ) -> int | None:
         """Helper to reconcile unsent events to central via pusher."""
         from drover.server.harness.structured.pusher import reconcile_unsent_events
 
         return reconcile_unsent_events(
             self,
             pusher,
-            since_hours=since_hours,
             host_id=host_id,
             batch_size=batch_size,
         )

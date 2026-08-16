@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
 
@@ -293,9 +294,15 @@ def test_pusher_reconcile_unsent_events():
         pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
 
         class _FakeRegistry:
-            def list_recent_events_for_reconciliation(self, **kwargs):
+            def list_events_for_reconciliation(
+                self, *, after_created_at=None, after_event_id=None, **kwargs
+            ):
                 from drover.server.harness.models import HarnessEvent
 
+                del after_event_id, kwargs
+                if after_created_at is not None:
+                    return []
+                created_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
                 return [
                     HarnessEvent(
                         event_id="e1",
@@ -303,6 +310,7 @@ def test_pusher_reconcile_unsent_events():
                         event_type="user_input",
                         payload={"text": "hi", "type": "user_input"},
                         seq=1,
+                        created_at=created_at,
                     ),
                     HarnessEvent(
                         event_id="e2",
@@ -310,6 +318,7 @@ def test_pusher_reconcile_unsent_events():
                         event_type="assistant_output",
                         payload={"text": "hello", "type": "assistant_output"},
                         seq=2,
+                        created_at=created_at + timedelta(seconds=1),
                     ),
                 ]
 

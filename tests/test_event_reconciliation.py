@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
@@ -14,12 +15,14 @@ from drover.schema import bootstrap
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
+    _heartbeat_once,
     create_harness_server,
     register_daemon_host,
     wire_event_pusher,
 )
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.models import HarnessEvent
 from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.metrics import MetricsCollector, start_metrics_server
 from drover.server.web.auth import AuthSettings
@@ -161,7 +164,7 @@ def test_reconcile_unsent_events_unconfigured_pusher(tmp_path):
     assert reconcile_unsent_events(registry, None) == 0
 
 
-def test_reconcile_unsent_events_buffers_when_central_unavailable(tmp_path):
+def test_reconcile_unsent_events_retries_from_durable_ledger_after_recovery(tmp_path):
     server = _start_fake_central()
     try:
         port = server.server_address[1]
@@ -187,22 +190,163 @@ def test_reconcile_unsent_events_buffers_when_central_unavailable(tmp_path):
         )
         pusher.start()
 
-        # Reconcile fails immediate POST and buffers into pusher
+        # A failed pass remains durable without entering the bounded queue.
         reconciled = reconcile_unsent_events(registry, pusher)
-        assert reconciled == 1
-        assert len(pusher._unsent) == 1
+        assert reconciled is None
+        assert pusher._drain() == []
 
-        # Central recovers
+        # A later pass starts from DuckDB again and succeeds.
         _FakeCentralHandler.failing = False
-        assert _wait_until(
-            lambda: any(
-                req.get("body", {}).get("events")
-                and req["body"]["events"][0]["type"] == "user_input"
-                for req in _FakeCentralHandler.requests
-            ),
-            timeout=5.0,
-        )
+        assert reconcile_unsent_events(registry, pusher) == 1
+        delivery_attempts = [
+            req
+            for req in _FakeCentralHandler.requests
+            if req.get("body", {}).get("events")
+            and req["body"]["events"][0]["type"] == "user_input"
+        ]
+        assert len(delivery_attempts) == 2
         pusher.stop()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_failed_reconciliation_stays_in_duckdb_instead_of_the_bounded_retry_buffer(
+    tmp_path,
+):
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        _FakeCentralHandler.failing = True
+        registry = _init_registry(tmp_path)
+        session = registry.create_session(
+            host_id="host-1",
+            harness="claude-code",
+            command="claude",
+            mode="structured",
+        )
+        registry.append_event(
+            session_id=session.session_id,
+            event_type="user_input",
+            payload={"text": "still durable", "type": "user_input"},
+            seq=1,
+            normalized_source="structured",
+        )
+        pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
+
+        result = reconcile_unsent_events(registry, pusher)
+
+        assert result is None
+        assert pusher._drain() == []
+        assert [event.seq for event in registry.list_events(session.session_id)] == [1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_daemon_retries_durable_reconciliation_after_a_successful_heartbeat(tmp_path):
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        _FakeCentralHandler.failing = True
+        registry = _init_registry(tmp_path)
+        session = registry.create_session(
+            host_id="host-1",
+            harness="claude-code",
+            command="claude",
+            mode="structured",
+        )
+        registry.append_event(
+            session_id=session.session_id,
+            event_type="user_input",
+            payload={"text": "retry from DuckDB", "type": "user_input"},
+            seq=1,
+            normalized_source="structured",
+        )
+        state = HarnessDaemonState(
+            host_id="host-1",
+            display_name="Host One",
+            kind="mac",
+            registry=registry,
+            pty=PtySessionManager(),
+            presets=DEFAULT_PRESETS,
+            local_url="http://127.0.0.1:0",
+            api_token="secret-token",
+            central_url=f"http://127.0.0.1:{port}",
+        )
+
+        pusher = wire_event_pusher(state)
+        assert pusher is not None
+        try:
+            assert state.event_reconciliation_pending is True
+            assert pusher._drain() == []
+
+            _FakeCentralHandler.failing = False
+            _heartbeat_once(state)
+
+            assert state.event_reconciliation_pending is False
+            delivered = [
+                request
+                for request in _FakeCentralHandler.requests
+                if request["path"] == "/harness/events"
+                and request["body"].get("events")
+            ]
+            assert len(delivered) == 2
+            assert delivered[-1]["body"]["events"][0]["event_id"] == (
+                registry.list_events(session.session_id)[0].event_id
+            )
+        finally:
+            pusher.stop()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_reconciliation_pages_until_every_durable_event_was_offered():
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        created_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        events = [
+            HarnessEvent(
+                event_id=f"e{seq}",
+                session_id="s1",
+                event_type="assistant_output",
+                payload={"text": str(seq), "type": "assistant_output"},
+                seq=seq,
+                created_at=created_at + timedelta(seconds=seq),
+            )
+            for seq in range(1, 4)
+        ]
+
+        class _PagedRegistry:
+            def list_events_for_reconciliation(
+                self,
+                *,
+                host_id=None,
+                after_created_at=None,
+                after_event_id=None,
+                limit=100,
+            ):
+                del host_id
+                remaining = events
+                if after_created_at is not None:
+                    remaining = [
+                        event
+                        for event in events
+                        if (event.created_at, event.event_id)
+                        > (after_created_at, after_event_id)
+                    ]
+                return remaining[:limit]
+
+        pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
+
+        assert reconcile_unsent_events(_PagedRegistry(), pusher, batch_size=2) == 3
+        assert [
+            event["event_id"]
+            for request in _FakeCentralHandler.requests
+            for event in request["body"]["events"]
+        ] == ["e1", "e2", "e3"]
     finally:
         server.shutdown()
         server.server_close()
@@ -235,7 +379,9 @@ def test_reconcile_helpers_on_registry_and_pusher(tmp_path):
         server.server_close()
 
 
-def test_list_recent_events_filtering(tmp_path):
+def test_list_events_for_reconciliation_filters_host_and_pages_without_age_cutoff(
+    tmp_path,
+):
     registry = _init_registry(tmp_path)
     now = datetime.now(timezone.utc)
     old_time = now - timedelta(hours=48)
@@ -282,23 +428,137 @@ def test_list_recent_events_filtering(tmp_path):
         normalized_source="structured",
     )
 
-    # Default 24h query
-    events_all = registry.list_recent_events_for_reconciliation(since_hours=24)
-    assert len(events_all) == 2
+    events_all = registry.list_events_for_reconciliation()
+    assert len(events_all) == 3
     assert {e.session_id for e in events_all} == {s1.session_id, s2.session_id}
 
-    # Host filtered
-    events_host_a = registry.list_recent_events_for_reconciliation(
-        since_hours=24, host_id="host-a"
-    )
-    assert len(events_host_a) == 1
-    assert events_host_a[0].session_id == s1.session_id
+    events_host_a = registry.list_events_for_reconciliation(host_id="host-a")
+    assert [event.seq for event in events_host_a] == [1, 2]
 
-    # Larger window includes the 48h old event
-    events_older = registry.list_recent_events_for_reconciliation(
-        since_hours=72, host_id="host-a"
+    first_page = registry.list_events_for_reconciliation(host_id="host-a", limit=1)
+    assert [event.seq for event in first_page] == [1]
+    second_page = registry.list_events_for_reconciliation(
+        host_id="host-a",
+        after_created_at=first_page[-1].created_at,
+        after_event_id=first_page[-1].event_id,
+        limit=1,
     )
-    assert len(events_older) == 2
+    assert [event.seq for event in second_page] == [2]
+
+
+def test_default_reconciliation_query_does_not_abandon_old_structured_events(tmp_path):
+    registry = _init_registry(tmp_path)
+    session = registry.create_session(
+        host_id="host-a",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="assistant_output",
+        payload={"text": "older than the old replay window"},
+        seq=1,
+        created_at=datetime.now(timezone.utc) - timedelta(days=7),
+        normalized_source="structured",
+    )
+
+    assert [
+        event.seq for event in registry.list_events_for_reconciliation(host_id="host-a")
+    ] == [1]
+
+
+def test_interior_gap_repair_rebuilds_derived_state_from_the_full_sequence(tmp_path):
+    token = "reconciliation-token"
+    central_db = tmp_path / "central-derived.duckdb"
+    bootstrap(parquet_dir=tmp_path / "central-derived-parquet", duckdb_path=central_db)
+    collector = MetricsCollector(
+        duckdb_path=central_db,
+        incoming_dir=tmp_path / "central-derived-incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    registry = HarnessRegistry(central_db)
+    registry.create_session(
+        host_id="host-a",
+        harness="claude-code",
+        command="claude",
+        session_id="session-with-gap",
+        mode="structured",
+        status="running",
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(enabled=True, api_token=token),
+    )
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(events):
+        request = urllib.request.Request(
+            f"{base_url}/harness/events",
+            data=json.dumps({"events": events}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            assert response.status == 200
+
+    common = {"session_id": "session-with-gap"}
+    try:
+        post(
+            [
+                {
+                    **common,
+                    "event_id": "event-1",
+                    "seq": 1,
+                    "type": "user_input",
+                    "payload": {},
+                    "ts": "2026-08-01T00:00:01+00:00",
+                },
+                {
+                    **common,
+                    "event_id": "event-3",
+                    "seq": 3,
+                    "type": "approval_response",
+                    "payload": {"request_id": "request-1", "decision": "allow"},
+                    "ts": "2026-08-01T00:00:03+00:00",
+                },
+                {
+                    **common,
+                    "event_id": "event-4",
+                    "seq": 4,
+                    "type": "status",
+                    "payload": {"awaiting": "input", "turn_complete": True},
+                    "ts": "2026-08-01T00:00:04+00:00",
+                },
+            ]
+        )
+        before_repair = registry.get_session("session-with-gap")
+        assert before_repair.awaiting == "input"
+
+        post(
+            [
+                {
+                    **common,
+                    "event_id": "event-2",
+                    "seq": 2,
+                    "type": "approval_prompt",
+                    "payload": {"request_id": "request-1"},
+                    "ts": "2026-08-01T00:00:02+00:00",
+                }
+            ]
+        )
+
+        repaired = registry.get_session("session-with-gap")
+        assert repaired.awaiting == "input"
+        assert repaired.last_activity == before_repair.last_activity
+    finally:
+        server.shutdown()
 
 
 def test_e2e_restart_event_reconciliation(tmp_path):

@@ -1156,6 +1156,11 @@ class HarnessDaemonState:
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
     pusher: EventPusher | None = None
+    # Startup reconciliation reads from the durable DuckDB ledger. Keep the
+    # pass pending until it reaches the end successfully so a transient hub
+    # outage is retried after the next successful heartbeat.
+    event_reconciliation_pending: bool = True
+    event_reconciliation_lock: threading.Lock = field(default_factory=threading.Lock)
     provider_usage_probe: CodexUsageProbe | None = None
     claude_usage_probe: Any | None = None
     agy_usage_probe: Any | None = None
@@ -3060,12 +3065,6 @@ def reconcile_structured_sessions(state: HarnessDaemonState) -> None:
             )
         except Exception:
             continue
-    pusher = getattr(state, "pusher", None)
-    if pusher is not None:
-        try:
-            reconcile_unsent_events(state.registry, pusher, host_id=state.host_id)
-        except Exception:
-            pass
 
 
 def _with_claude_plan_label(
@@ -3266,10 +3265,34 @@ def _heartbeat_once(state: HarnessDaemonState) -> None:
     # tests `is None` rather than truthiness; the watchdog reads this flag to
     # decide whether a freshly activated version can talk to the hub at all.
     state.registered_at_least_once = True
+    _reconcile_persisted_events(state)
     updater = getattr(state, "updater", None)
     if updater is not None:
         updater.observe(body)
         updater.maybe_activate()
+
+
+def _reconcile_persisted_events(state: HarnessDaemonState) -> bool:
+    """Complete one durable-ledger replay pass, retrying after hub recovery."""
+    pusher = getattr(state, "pusher", None)
+    if pusher is None:
+        return True
+    if not state.event_reconciliation_pending:
+        return True
+    with state.event_reconciliation_lock:
+        if not state.event_reconciliation_pending:
+            return True
+        result = reconcile_unsent_events(
+            state.registry,
+            pusher,
+            host_id=state.host_id,
+        )
+        if result is None:
+            log.warning("structured event reconciliation deferred until hub recovery")
+            return False
+        state.event_reconciliation_pending = False
+        log.info("structured event reconciliation completed: offered=%d", result)
+        return True
 
 
 def _rollback_watchdog(
@@ -3406,10 +3429,7 @@ def wire_event_pusher(state: HarnessDaemonState) -> EventPusher | None:
     pusher.start()
     state.push_event = pusher.push
     state.pusher = pusher
-    try:
-        reconcile_unsent_events(state.registry, pusher, host_id=state.host_id)
-    except Exception:
-        pass
+    _reconcile_persisted_events(state)
     return pusher
 
 

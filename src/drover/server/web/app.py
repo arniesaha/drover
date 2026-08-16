@@ -1719,11 +1719,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         session_last_activity: dict[str, datetime] = {}
         session_native_ids: dict[str, str] = {}
         touched_sessions: set[str] = set()
+        existing_max_sequences: dict[str, int] = {}
+        sessions_requiring_rebuild: set[str] = set()
         for event in ordered:
             event_id = str(event["event_id"])
             session_id = str(event["session_id"])
             if registry.get_event(event_id) is not None:
                 continue
+            if session_id not in existing_max_sequences:
+                existing_max_sequences[session_id] = registry.max_event_seq(session_id)
+            event_seq = event.get("seq")
+            if (
+                isinstance(event_seq, int)
+                and event_seq <= existing_max_sequences[session_id]
+            ):
+                # A newly inserted event behind the current tail can change
+                # the meaning of later state transitions. Incrementally
+                # applying it here would leave the session at the older
+                # event's state, so rebuild from the ordered ledger below.
+                sessions_requiring_rebuild.add(session_id)
             created_at = _parse_event_timestamp(event.get("ts")) or datetime.now(
                 timezone.utc
             )
@@ -1755,6 +1769,34 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if latest is None or created_at > latest:
                 session_last_activity[session_id] = created_at
         for session_id in touched_sessions:
+            if session_id in sessions_requiring_rebuild:
+                rebuilt_awaiting: str | None = None
+                rebuilt_last_activity: datetime | None = None
+                rebuilt_native_session_id: str | None = None
+                for stored_event in registry.list_events_after(session_id, 0):
+                    wire_payload = stored_event.payload
+                    inner_payload = wire_payload.get("payload")
+                    if not isinstance(inner_payload, dict):
+                        inner_payload = {}
+                    rebuilt_awaiting = _derive_awaiting(
+                        event_type=stored_event.event_type,
+                        payload=inner_payload,
+                        current=rebuilt_awaiting,
+                    )
+                    native_session_id = inner_payload.get("native_session_id")
+                    if isinstance(native_session_id, str) and native_session_id.strip():
+                        rebuilt_native_session_id = native_session_id.strip()
+                    created_at = stored_event.created_at
+                    if created_at is not None and (
+                        rebuilt_last_activity is None
+                        or created_at > rebuilt_last_activity
+                    ):
+                        rebuilt_last_activity = created_at
+                session_awaiting[session_id] = rebuilt_awaiting
+                if rebuilt_last_activity is not None:
+                    session_last_activity[session_id] = rebuilt_last_activity
+                if rebuilt_native_session_id is not None:
+                    session_native_ids[session_id] = rebuilt_native_session_id
             native_session_id = session_native_ids.get(session_id)
             if native_session_id is not None:
                 registry.update_session_native_id(session_id, native_session_id)
