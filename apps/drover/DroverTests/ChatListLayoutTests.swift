@@ -15,14 +15,11 @@ struct ChatListLayoutTests {
     private static let content = "A wrapped list item keeps its text aligned with every other item."
 
     private func height(
-        ordinals: [Int],
+        items: [ListBlock.Item],
         typeSize: DynamicTypeSize,
         width: CGFloat
     ) -> CGFloat {
-        let list = ListBlock(items: ordinals.map {
-            ListBlock.Item(depth: 0, ordinal: $0, content: AttributedString(Self.content))
-        })
-        let view = ListBlockView(list: list)
+        let view = ListBlockView(list: ListBlock(items: items))
             .frame(width: width)
             .dynamicTypeSize(typeSize)
             .droverTint()
@@ -32,6 +29,55 @@ struct ChatListLayoutTests {
         return host.sizeThatFits(
             in: CGSize(width: width, height: .greatestFiniteMagnitude)
         ).height
+    }
+
+    private func height(
+        ordinals: [Int],
+        typeSize: DynamicTypeSize,
+        width: CGFloat
+    ) -> CGFloat {
+        height(
+            items: ordinals.map {
+                ListBlock.Item(
+                    depth: 0, ordinal: $0, content: AttributedString(Self.content)
+                )
+            },
+            typeSize: typeSize,
+            width: width
+        )
+    }
+
+    private func rootGrowth(
+        withNestedRows: Bool,
+        typeSize: DynamicTypeSize,
+        width: CGFloat
+    ) -> CGFloat {
+        let shortRoot = ListBlock.Item(
+            depth: 0, ordinal: 100, content: AttributedString("Root item")
+        )
+        let longRoot = ListBlock.Item(
+            depth: 0,
+            ordinal: 100,
+            content: AttributedString(
+                "Root content wraps independently from nested indentation and marker layout."
+            )
+        )
+        let nestedRows = withNestedRows ? [
+            ListBlock.Item(
+                depth: 1, ordinal: nil, content: AttributedString("Nested bullet")
+            ),
+            ListBlock.Item(
+                depth: 1, ordinal: 10, content: AttributedString("Nested ordered item")
+            ),
+        ] : []
+
+        let shortHeight = height(
+            items: [shortRoot] + nestedRows, typeSize: typeSize, width: width
+        )
+        let longHeight = height(
+            items: [longRoot] + nestedRows, typeSize: typeSize, width: width
+        )
+        return longHeight - shortHeight
     }
 
     @Test func programmaticBottomTargetCannotReuseTheFinalRowIdentity() throws {
@@ -72,5 +118,37 @@ struct ChatListLayoutTests {
         )
 
         #expect(mixed == allWidest, "mixed markers measured \(mixed)pt vs \(allWidest)pt")
+    }
+
+    @Test func nestedBulletAndOrderedRowsDoNotCompressRootRows() {
+        for width: CGFloat in [148, 164, 180, 196, 212] {
+            let isolated = rootGrowth(
+                withNestedRows: false, typeSize: .large, width: width
+            )
+            let mixed = rootGrowth(
+                withNestedRows: true, typeSize: .large, width: width
+            )
+
+            #expect(
+                abs(mixed - isolated) <= 0.5,
+                "at \(width)pt, root growth was \(isolated)pt alone vs \(mixed)pt nested"
+            )
+        }
+    }
+
+    @Test func nestedRowsDoNotCompressRootRowsAtAccessibilityType() {
+        for width: CGFloat in stride(from: 120, through: 300, by: 12).map(CGFloat.init) {
+            let isolated = rootGrowth(
+                withNestedRows: false, typeSize: .accessibility3, width: width
+            )
+            let mixed = rootGrowth(
+                withNestedRows: true, typeSize: .accessibility3, width: width
+            )
+
+            #expect(
+                abs(mixed - isolated) <= 0.5,
+                "at \(width)pt, root growth was \(isolated)pt alone vs \(mixed)pt nested"
+            )
+        }
     }
 }
