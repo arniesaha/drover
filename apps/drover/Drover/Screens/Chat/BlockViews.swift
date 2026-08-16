@@ -122,7 +122,6 @@ struct TableBlockView: View {
 }
 
 /// Bullets and ordered items with drawn markers: a filled accent dot at depth
-/// Bullets and ordered items with drawn markers: a filled accent dot at depth
 /// 1, a hollow ring at depth 2 with clean indentation, tabular mono numerals
 /// with punctuation when ordered.
 struct ListBlockView: View {
@@ -131,14 +130,16 @@ struct ListBlockView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 7) {
             ForEach(Array(list.items.enumerated()), id: \.offset) { index, item in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                GridRow(alignment: .firstTextBaseline) {
                     marker(for: item)
+                        .gridColumnAlignment(.leading)
                     Text(item.content.droverLinks(on: .surface, in: colorScheme))
                         .droverText(item.depth > 0 ? .nested : .body)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .gridColumnAlignment(.leading)
                 }
                 .padding(.leading, CGFloat(item.depth) * 14)
                 .padding(.top, item.depth == 0 && index > 0 && list.items[index - 1].depth > 0 ? 4 : 0)
@@ -151,7 +152,6 @@ struct ListBlockView: View {
         if let ordinal = item.ordinal {
             Text("\(ordinal).")
                 .droverText(.marker)
-                .frame(minWidth: 18, alignment: .leading)
         } else if item.depth == 0 {
             Circle()
                 .fill(DroverColor.accent)

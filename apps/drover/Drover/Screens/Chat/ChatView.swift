@@ -1,6 +1,16 @@
 import SwiftUI
 import DroverKit
 
+/// A view-only ID namespace keeps the post-clearance destination impossible
+/// to confuse with a raw or folded transcript row ID (both are strings).
+enum ChatTranscriptScrollTarget: Hashable {
+    case visualTail
+
+    static func bottomDestination(for items: [TranscriptItem]) -> AnyHashable? {
+        items.isEmpty ? nil : AnyHashable(Self.visualTail)
+    }
+}
+
 struct ChatHeaderContent: View {
     let title: String
     let metadata: String
@@ -186,6 +196,7 @@ struct ChatView: View {
             // there — re-folding here meant a full pass over every message
             // on each scroll-phase change.
             let items = model.items
+            let visualTailID = ChatTranscriptScrollTarget.bottomDestination(for: items)
             ScrollView {
                 // Cold open is bounded to the newest 200 raw messages, which
                 // fold to substantially fewer rows. Keep that bounded tail
@@ -255,10 +266,19 @@ struct ChatView: View {
                         row(for: item, isNewest: item.id == items.last?.id)
                             .id(item.id)
                     }
+
+                    // The ID belongs to the bottom of the clearance, not the
+                    // final transcript row. `scrollTo(..., anchor: .bottom)`
+                    // therefore keeps this 24pt gap visible above the composer.
+                    // VStack contributes 8pt before this final 16pt tail.
+                    if let visualTailID {
+                        Color.clear
+                            .frame(height: 16)
+                            .id(visualTailID)
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
-                .padding(.bottom, 24)
                 // An empty transcript has no row to take the width, so this
                 // stack sized to its padding and the ScrollView sized to the
                 // stack. Nothing showed it while the only thing overlaid on a
@@ -341,10 +361,12 @@ struct ChatView: View {
     private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
         Button {
             cancelPrependScroll()
-            guard let rowID = model.visualTailRowID else { return }
+            guard let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                for: model.items
+            ) else { return }
             withAnimation(.snappy) {
                 isPinnedToBottom = true
-                proxy.scrollTo(rowID, anchor: .bottom)
+                proxy.scrollTo(visualTailID, anchor: .bottom)
             }
             // One unanimated follow-up after layout settles closes any gap
             // left by a tall row changing size during the animated scroll.
@@ -370,18 +392,22 @@ struct ChatView: View {
         pendingScroll = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, isPinnedToBottom,
-                  let rowID = model.visualTailRowID else {
+                  let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                    for: model.items
+                  ) else {
                 pendingScroll = nil
                 return
             }
-            proxy.scrollTo(rowID, anchor: .bottom)
+            proxy.scrollTo(visualTailID, anchor: .bottom)
             // A row can still grow after the first scroll (for example a
             // disclosure or tall diff), so pin once more after layout settles.
             try? await Task.sleep(for: .milliseconds(200))
             pendingScroll = nil
             guard !Task.isCancelled, isPinnedToBottom,
-                  let settledRowID = model.visualTailRowID else { return }
-            proxy.scrollTo(settledRowID, anchor: .bottom)
+                  let settledVisualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                    for: model.items
+                  ) else { return }
+            proxy.scrollTo(settledVisualTailID, anchor: .bottom)
         }
     }
 
