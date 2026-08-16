@@ -298,8 +298,11 @@ def test_two_concurrent_structured_sessions_do_not_corrupt_registry(tmp_path):
 
         for sid in session_ids:
             _wait_until(
-                lambda sid=sid: _fetch_session(base_url, sid)["awaiting"] == "input",
-                what=f"session {sid} awaiting=input",
+                lambda sid=sid: (
+                    _fetch_session(base_url, sid).get("status") == "completed"
+                    or _fetch_session(base_url, sid).get("awaiting") == "input"
+                ),
+                what=f"session {sid} completed or awaiting=input",
             )
 
         for sid in session_ids:

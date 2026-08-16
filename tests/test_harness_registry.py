@@ -1234,3 +1234,112 @@ def test_a_redelivered_event_does_not_overwrite_what_was_stored(tmp_path):
 
     stored = registry.get_event("harness-event-stable")
     assert stored.payload["text"] == "original"
+
+
+def test_ingest_structured_events_mixed_aware_and_naive_timestamps(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.register_host(host_id="mac-mini", display_name="Mac mini", kind="macos")
+    session = registry.create_session(
+        session_id="session-tz-mix",
+        host_id="mac-mini",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+
+    t0_naive = datetime(2026, 8, 16, 10, 0, 0)
+    # Aware +02:00 at 12:30 is 10:30 UTC
+    t1_aware_non_utc = datetime(
+        2026, 8, 16, 12, 30, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+    # Aware UTC at 11:00 UTC
+    t2_aware_utc = datetime(2026, 8, 16, 11, 0, 0, tzinfo=timezone.utc)
+
+    # Ingest a batch containing mixed naive and aware timestamps in the SAME call
+    count = registry.ingest_structured_events(
+        [
+            {
+                "event_id": "ev-1",
+                "session_id": session.session_id,
+                "event_type": "user_input",
+                "payload": {"text": "hello"},
+                "seq": 1,
+                "created_at": t0_naive,
+            },
+            {
+                "event_id": "ev-2",
+                "session_id": session.session_id,
+                "event_type": "assistant_output",
+                "payload": {"text": "mid response"},
+                "seq": 2,
+                "created_at": t1_aware_non_utc,
+            },
+            {
+                "event_id": "ev-3",
+                "session_id": session.session_id,
+                "event_type": "status",
+                "payload": {"turn_complete": True},
+                "seq": 3,
+                "created_at": t2_aware_utc,
+            },
+        ]
+    )
+    assert count == 3
+
+    # Check that session projection updated properly
+    s = registry.get_session(session.session_id)
+    assert s is not None
+    # last_activity should resolve to the correct UTC instant of t2 (11:00:00 UTC)
+    assert registry_module._db_timestamp_to_utc(s.last_activity) == t2_aware_utc
+
+    # Replay all events - must be idempotent and not fail
+    replay_count = registry.ingest_structured_events(
+        [
+            {
+                "event_id": "ev-1",
+                "session_id": session.session_id,
+                "event_type": "user_input",
+                "payload": {"text": "hello"},
+                "seq": 1,
+                "created_at": t0_naive,
+            },
+            {
+                "event_id": "ev-2",
+                "session_id": session.session_id,
+                "event_type": "assistant_output",
+                "payload": {"text": "mid response"},
+                "seq": 2,
+                "created_at": t1_aware_non_utc,
+            },
+            {
+                "event_id": "ev-3",
+                "session_id": session.session_id,
+                "event_type": "status",
+                "payload": {"turn_complete": True},
+                "seq": 3,
+                "created_at": t2_aware_utc,
+            },
+        ]
+    )
+    assert replay_count == 0
+
+    # Also test an interior gap rebuild scenario: an event arriving with seq <= existing max
+    # triggers rebuild querying DuckDB (which yields naive timestamps) mixed with incoming event
+    count3 = registry.ingest_structured_events(
+        [
+            {
+                "event_id": "ev-rebuild",
+                "session_id": session.session_id,
+                "event_type": "status",
+                "payload": {"awaiting": "input"},
+                "seq": 2,
+                "created_at": datetime(2026, 8, 16, 10, 45, 0, tzinfo=timezone.utc),
+            }
+        ]
+    )
+    assert count3 == 1
+    s_rebuild = registry.get_session(session.session_id)
+    assert s_rebuild is not None
+    assert registry_module._db_timestamp_to_utc(s_rebuild.last_activity) == t2_aware_utc
+
+

@@ -727,3 +727,115 @@ def test_e2e_restart_event_reconciliation(tmp_path):
         daemon_server.shutdown()
         daemon_server.server_close()
         central_server.shutdown()
+
+
+def test_e2e_restart_event_reconciliation_mixed_timestamps(tmp_path):
+    """End-to-end: Pre-populated local events with mixed naive and aware timestamps reconcile."""
+    test_token = "e2e-token-tz"
+    auth = AuthSettings(enabled=True, api_token=test_token)
+    auth_headers = {"Authorization": f"Bearer {test_token}"}
+
+    # 1. Start central server
+    central_db = tmp_path / "central.duckdb"
+    bootstrap(parquet_dir=tmp_path / "central-parquet", duckdb_path=central_db)
+    collector = MetricsCollector(
+        duckdb_path=central_db,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    central_server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=auth
+    )
+    central_port = central_server.server_address[1]
+    central_url = f"http://127.0.0.1:{central_port}"
+
+    # 2. Seed daemon DuckDB with events having naive and aware timestamps
+    daemon_db = tmp_path / "daemon.duckdb"
+    bootstrap(parquet_dir=tmp_path / "daemon-parquet", duckdb_path=daemon_db)
+    daemon_registry = HarnessRegistry(daemon_db)
+    session = daemon_registry.create_session(
+        host_id="test-daemon-tz",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+        status="running",
+    )
+    t0_naive = datetime(2026, 8, 16, 10, 0, 0)
+    t1_aware_non_utc = datetime(
+        2026, 8, 16, 12, 30, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+    t2_aware_utc = datetime(2026, 8, 16, 11, 0, 0, tzinfo=timezone.utc)
+
+    daemon_registry.append_event(
+        session_id=session.session_id,
+        event_type="user_input",
+        payload={"text": "turn with naive time", "type": "user_input"},
+        seq=1,
+        created_at=t0_naive,
+        normalized_source="structured",
+    )
+    daemon_registry.append_event(
+        session_id=session.session_id,
+        event_type="assistant_output",
+        payload={"text": "answer with aware non-utc", "type": "assistant_output"},
+        seq=2,
+        created_at=t1_aware_non_utc,
+        normalized_source="structured",
+    )
+    daemon_registry.append_event(
+        session_id=session.session_id,
+        event_type="status",
+        payload={"turn_complete": True, "type": "status"},
+        seq=3,
+        created_at=t2_aware_utc,
+        normalized_source="structured",
+    )
+
+    # 3. Boot daemon: wire_event_pusher & create_harness_server run reconciliation
+    state = HarnessDaemonState(
+        host_id="test-daemon-tz",
+        display_name="Test Daemon TZ",
+        kind="linux",
+        registry=daemon_registry,
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        local_url="http://127.0.0.1:0",
+        api_token=test_token,
+        central_url=central_url,
+    )
+    register_daemon_host(state)
+    pusher = wire_event_pusher(state)
+    daemon_server = create_harness_server(
+        listen_host="127.0.0.1", listen_port=0, state=state
+    )
+    daemon_thread = threading.Thread(target=daemon_server.serve_forever, daemon=True)
+    daemon_thread.start()
+
+    try:
+        # 4. Verify central received all 3 events without error
+        def _get_messages():
+            req = urllib.request.Request(
+                f"{central_url}/harness/sessions/{session.session_id}/messages",
+                headers=auth_headers,
+            )
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))["messages"]
+
+        assert _wait_until(
+            lambda: len(_get_messages()) == 3,
+            timeout=10.0,
+        )
+
+        messages = _get_messages()
+        assert len(messages) == 3
+        assert [m["seq"] for m in messages] == [1, 2, 3]
+        assert messages[0]["text"] == "turn with naive time"
+        assert messages[1]["text"] == "answer with aware non-utc"
+    finally:
+        if pusher is not None:
+            pusher.stop()
+        daemon_server.shutdown()
+        daemon_server.server_close()
+        central_server.shutdown()
+
