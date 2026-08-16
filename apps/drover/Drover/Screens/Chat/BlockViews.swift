@@ -122,32 +122,26 @@ struct TableBlockView: View {
 }
 
 /// Bullets and ordered items with drawn markers: a filled accent dot at depth
-/// 1, a hollow ring at depth 2 behind a hairline indent rule, tabular mono
-/// numerals when ordered. Drawing them rather than keeping the literal "-" or
-/// "1." is what lets structure survive a long wrapped line.
+/// Bullets and ordered items with drawn markers: a filled accent dot at depth
+/// 1, a hollow ring at depth 2 with clean indentation, tabular mono numerals
+/// with punctuation when ordered.
 struct ListBlockView: View {
     let list: ListBlock
 
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(list.items.enumerated()), id: \.offset) { _, item in
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(list.items.enumerated()), id: \.offset) { index, item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    if item.depth > 0 {
-                        Rectangle()
-                            .fill(DroverColor.line)
-                            .frame(width: 1)
-                            .padding(.leading, CGFloat(item.depth - 1) * 12)
-                    }
                     marker(for: item)
-                        .frame(width: 14, alignment: .leading)
                     Text(item.content.droverLinks(on: .surface, in: colorScheme))
                         .droverText(item.depth > 0 ? .nested : .body)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.leading, CGFloat(item.depth) * 6)
+                .padding(.leading, CGFloat(item.depth) * 14)
+                .padding(.top, item.depth == 0 && index > 0 && list.items[index - 1].depth > 0 ? 4 : 0)
             }
         }
     }
@@ -155,11 +149,21 @@ struct ListBlockView: View {
     @ViewBuilder
     private func marker(for item: ListBlock.Item) -> some View {
         if let ordinal = item.ordinal {
-            Text("\(ordinal)").droverText(.marker)
+            Text("\(ordinal).")
+                .droverText(.marker)
+                .frame(minWidth: 18, alignment: .leading)
         } else if item.depth == 0 {
-            Circle().fill(DroverColor.accent).frame(width: 5, height: 5)
+            Circle()
+                .fill(DroverColor.accent)
+                .frame(width: 5, height: 5)
+                .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 3 }
+                .frame(width: 14, alignment: .leading)
         } else {
-            Circle().strokeBorder(DroverColor.accentHi, lineWidth: 1).frame(width: 5, height: 5)
+            Circle()
+                .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+                .frame(width: 5, height: 5)
+                .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 3 }
+                .frame(width: 14, alignment: .leading)
         }
     }
 }

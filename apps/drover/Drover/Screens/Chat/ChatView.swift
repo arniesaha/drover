@@ -256,7 +256,9 @@ struct ChatView: View {
                             .id(item.id)
                     }
                 }
-                .padding()
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 24)
                 // An empty transcript has no row to take the width, so this
                 // stack sized to its padding and the ScrollView sized to the
                 // stack. Nothing showed it while the only thing overlaid on a
@@ -271,12 +273,12 @@ struct ChatView: View {
             // keyboard gone, and dragging it away is cheaper than reaching
             // for the accessory bar's dismiss button.
             .scrollDismissesKeyboard(.interactively)
-            // Pinned means "within 80pt of the end" — close enough that the
+            // Pinned means "within 48pt of the end" — close enough that the
             // user is following the stream, far enough that the last row's
             // own growth doesn't flap the state.
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 geometry.contentOffset.y + geometry.containerSize.height
-                    >= geometry.contentSize.height + geometry.contentInsets.bottom - 80
+                    >= geometry.contentSize.height + geometry.contentInsets.bottom - 48
             } action: { _, isNearBottom in
                 guard isNearBottom != isPinnedToBottom else { return }
                 // Re-pin whenever the bottom is reached, by any means; unpin
@@ -349,15 +351,15 @@ struct ChatView: View {
             scheduleScroll(with: proxy)
         } label: {
             Image(systemName: "arrow.down")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.primary)
-                .padding(12)
-                .background(.regularMaterial, in: Circle())
-                .overlay(Circle().strokeBorder(.secondary.opacity(0.2)))
-                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(DroverColor.accentHi)
+                .padding(10)
+                .background(DroverColor.surface, in: Circle())
+                .overlay(Circle().strokeBorder(DroverColor.accent.opacity(0.4), lineWidth: 1))
+                .shadow(color: .black.opacity(0.3), radius: 6, y: 3)
         }
         .padding(.trailing, 16)
-        .padding(.bottom, 12)
+        .padding(.bottom, 16)
         .transition(.opacity.combined(with: .scale(scale: 0.8)))
         .accessibilityLabel("Scroll to bottom")
         .accessibilityIdentifier("chat-scroll-to-bottom")
