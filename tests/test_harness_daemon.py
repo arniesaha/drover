@@ -3994,3 +3994,74 @@ def test_every_offered_preset_can_actually_be_driven():
     assert (
         offered <= drivable
     ), f"presets with no structured driver: {sorted(offered - drivable)}"
+
+
+def test_a_repeated_handoff_create_returns_the_session_it_already_made(tmp_path):
+    """A retry after a timeout must not leave two sessions.
+
+    The hub gives a create 120s and then stops waiting; the daemon keeps
+    working and may finish. Its reply lands on a closed socket, the hub never
+    registers the session, and the app previously told the user to try again.
+    If that retry created a second session, one handoff would have produced
+    two agents in the same repository.
+
+    Keyed on the source session rather than on a new idempotency token,
+    because a handoff already carries one: `source_session_id` is on the row.
+    """
+
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        payload = {
+            "harness": "claude-code",
+            "mode": "structured",
+            "command": FAKE_STRUCTURED_CLI,
+            "cwd": str(tmp_path),
+            "source_session_id": "harness-source-1",
+            "handoff_mode": "nexus_handoff",
+        }
+
+        first_status, first = _json_request(f"{base_url}/sessions", payload=payload)
+        second_status, second = _json_request(f"{base_url}/sessions", payload=payload)
+
+        assert first_status == 201
+        assert (
+            second["session_id"] == first["session_id"]
+        ), "the retry must adopt the session the first attempt created"
+        assert second.get("deduplicated") is True
+
+        live = [
+            s
+            for s in state.registry.list_sessions()
+            if s.source_session_id == "harness-source-1"
+        ]
+        assert len(live) == 1, f"one handoff, one session; got {len(live)}"
+    finally:
+        _close_structured_sessions(state)
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_handoff_from_a_different_source_still_creates_its_own_session(tmp_path):
+    """The dedupe is keyed, not a global lock on creating sessions."""
+
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        base = {
+            "harness": "claude-code",
+            "mode": "structured",
+            "command": FAKE_STRUCTURED_CLI,
+            "cwd": str(tmp_path),
+            "handoff_mode": "nexus_handoff",
+        }
+        _, first = _json_request(
+            f"{base_url}/sessions", payload={**base, "source_session_id": "src-a"}
+        )
+        _, second = _json_request(
+            f"{base_url}/sessions", payload={**base, "source_session_id": "src-b"}
+        )
+
+        assert first["session_id"] != second["session_id"]
+    finally:
+        _close_structured_sessions(state)
+        server.shutdown()
+        server.server_close()

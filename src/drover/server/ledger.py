@@ -115,7 +115,10 @@ JOB_STATUSES = frozenset(
 )
 
 JOB_TRANSITIONS: dict[str, frozenset[str]] = {
-    JOB_PENDING: frozenset({JOB_LEASED, JOB_CANCELLED}),
+    # terminal_failed from pending is for a job that cannot open an attempt at
+    # all (see Ledger.abandon_job). Without it such a job has no exit and is
+    # re-leased forever, which is #143.
+    JOB_PENDING: frozenset({JOB_LEASED, JOB_CANCELLED, JOB_TERMINAL_FAILED}),
     JOB_LEASED: frozenset(
         {JOB_SUCCEEDED, JOB_RETRY_WAIT, JOB_TERMINAL_FAILED, JOB_CANCELLED}
     ),
@@ -394,26 +397,75 @@ class Ledger:
         """
         job = self._load_job(job_id)
         assert_job_transition(job.status, JOB_LEASED)
-        attempt_no = job.attempt_count + 1
+        # Numbered from the attempts themselves, not from `attempt_count`.
+        # The counter is a denormalisation and it is the field that drifts: in
+        # #143 a job sat at attempt_count = 0 with history against it, so every
+        # lease recomputed attempt_no = 1, collided with UNIQUE(job_id,
+        # attempt_no), and retried forever without max_attempts ever engaging.
+        attempt_no = int(
+            self._con.execute(
+                """
+                SELECT COALESCE(MAX(attempt_no), 0) + 1
+                  FROM pipeline_job_attempts
+                 WHERE job_id = ?
+                """,
+                [job_id],
+            ).fetchone()[0]
+        )
         attempt_id = self._new_id()
         now = self._now()
-        self._con.execute(
-            """
-            INSERT INTO pipeline_job_attempts
-              (attempt_id, job_id, attempt_no, worker_id, started_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [attempt_id, job_id, attempt_no, worker_id, now],
-        )
-        self._set_job_status(
-            job_id,
-            JOB_LEASED,
-            attempt_count=attempt_no,
-            lease_owner=worker_id,
-            lease_expires_at=lease_expires_at,
-            latest_attempt_id=attempt_id,
-        )
+        # One unit: an attempt row the job does not count is precisely the
+        # half-state that cannot be leased again and cannot give up either.
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            self._con.execute(
+                """
+                INSERT INTO pipeline_job_attempts
+                  (attempt_id, job_id, attempt_no, worker_id, started_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [attempt_id, job_id, attempt_no, worker_id, now],
+            )
+            self._set_job_status(
+                job_id,
+                JOB_LEASED,
+                attempt_count=attempt_no,
+                lease_owner=worker_id,
+                lease_expires_at=lease_expires_at,
+                latest_attempt_id=attempt_id,
+            )
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
+        self._con.execute("COMMIT")
         return self._load_attempt(attempt_id)
+
+    def abandon_job(
+        self,
+        job_id: str,
+        *,
+        error_category: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> Job:
+        """Fail a job that could never open an attempt.
+
+        ``fail_job`` closes the live attempt, and a job in this state has none
+        to close: it is ``pending`` and every lease was rejected before an
+        attempt row landed. Without a way out of ``pending`` other than
+        ``leased``, such a job is retried for the life of the process (#143).
+
+        The caller is expected to dead-letter it afterwards. ``terminal_failed``
+        is still a reusable status, so parking there alone would let the next
+        cycle requeue the same poisoned row and resume the loop.
+        """
+
+        job = self._load_job(job_id)
+        assert_job_transition(job.status, JOB_TERMINAL_FAILED)
+        del error_category, error_message  # recorded by the caller's log
+        self._set_job_status(
+            job_id, JOB_TERMINAL_FAILED, lease_owner=None, lease_expires_at=None
+        )
+        return self._load_job(job_id)
 
     def succeed_job(
         self,

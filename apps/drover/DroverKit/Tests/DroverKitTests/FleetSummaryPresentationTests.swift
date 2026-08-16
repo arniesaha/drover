@@ -80,3 +80,60 @@ import Testing
     #expect(summary.headline == nil)
     #expect(summary.fleetLine == "0 hosts live")
 }
+
+
+@Test func fleetSummaryUsesTailscalePresentationOnlyForATransportFailure() throws {
+    let snapshot = try HarnessSnapshot.decode(from: fleetSnapshotJSON)
+
+    let transportFailure = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Can't reach the hub over Tailscale",
+        isTailscaleTransportFailure: true
+    )
+    #expect(transportFailure.isStale == true)
+    #expect(transportFailure.fleetLine == "Can't reach the hub over Tailscale")
+    #expect(transportFailure.needsCount == 1)
+
+    // A Tailscale address does not make another failure a transport failure.
+    let unauthorized = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Token rejected — check Settings",
+        isTailscaleTransportFailure: false
+    )
+    #expect(unauthorized.fleetLine == "Token rejected — check Settings")
+
+    let malformedResponse = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Unexpected response from the hub",
+        isTailscaleTransportFailure: false
+    )
+    #expect(malformedResponse.fleetLine == "Unexpected response from the hub")
+
+    let httpFailure = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Hub is restarting",
+        isTailscaleTransportFailure: false
+    )
+    #expect(httpFailure.fleetLine == "Hub is restarting")
+
+    let repeatedCancellation = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "The first load kept being interrupted before it landed — the hub may be busy.",
+        isTailscaleTransportFailure: false
+    )
+    #expect(repeatedCancellation.fleetLine
+            == "The first load kept being interrupted before it landed — the hub may be busy.")
+
+    let success = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: true,
+        isTailscaleTransportFailure: false
+    )
+    #expect(success.isStale == false)
+    #expect(success.fleetLine == "2 running · 1 finished · 1 host live")
+}

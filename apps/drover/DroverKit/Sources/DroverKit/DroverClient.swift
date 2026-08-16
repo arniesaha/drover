@@ -35,8 +35,9 @@ extension DroverError: LocalizedError {
     /// Named because the cold-open failure state reaches for these same two
     /// lines from outside this switch (see `connectionFailureReason`), and
     /// two screens quietly saying it differently is how copy drifts.
-    static let unreachableDescription = "Can't reach the hub"
-    static let malformedDescription = "Unexpected response from the hub"
+    public static let unreachableDescription = "Can't reach the hub"
+    public static let unreachableTailscaleDescription = "Can't reach the hub over Tailscale"
+    public static let malformedDescription = "Unexpected response from the hub"
 
     public var errorDescription: String? {
         switch self {
@@ -55,6 +56,14 @@ extension DroverError: LocalizedError {
         }
     }
 
+    /// Returns a contextual error description given whether the host is a Tailscale endpoint.
+    public func localizedDescription(isTailscale: Bool) -> String {
+        if case .transport = self, !isCancellation, isTailscale {
+            return Self.unreachableTailscaleDescription
+        }
+        return errorDescription ?? Self.unreachableDescription
+    }
+
     /// The user-facing reason for a connection attempt that never landed.
     ///
     /// Anything that is not already a `DroverError` — a raw `URLError` off a
@@ -63,8 +72,11 @@ extension DroverError: LocalizedError {
     /// the phone ("The Internet connection appears to be offline"), and these
     /// screens have always talked about the hub: the radio being fine says
     /// nothing about whether the fleet answered.
-    static func connectionFailureReason(_ error: Error) -> String {
-        (error as? DroverError)?.errorDescription ?? unreachableDescription
+    public static func connectionFailureReason(_ error: Error, isTailscale: Bool = false) -> String {
+        if let droverError = error as? DroverError {
+            return droverError.localizedDescription(isTailscale: isTailscale)
+        }
+        return isTailscale ? unreachableTailscaleDescription : unreachableDescription
     }
 }
 
@@ -95,7 +107,7 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 /// `NSAllowsArbitraryLoads` in the app's Info.plist).
 public actor DroverClient {
     private static let cockpitRequestTimeout: TimeInterval = 60
-    private let config: ServerConfig
+    public nonisolated let config: ServerConfig
     private let token: String
     private let session: URLSession
 

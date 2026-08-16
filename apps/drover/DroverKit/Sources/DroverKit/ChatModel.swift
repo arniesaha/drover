@@ -798,6 +798,13 @@ public final class ChatModel {
         switch error {
         case DroverError.conflict(let message), DroverError.badRequest(let message):
             hint = message
+        case DroverError.httpStatus(504, _):
+            // The hub stopped waiting; the host did not stop working. A
+            // create can outlive the hub's budget while it cuts a per-session
+            // worktree, and the session may then exist with only the hub's
+            // copy missing. "Try again" is the one instruction that turns
+            // that into two sessions, so this says the opposite.
+            hint = "The host is still working on it — check your sessions before trying again."
         default:
             hint = "Could not \(action) — try again."
         }

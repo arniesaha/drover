@@ -318,3 +318,75 @@ def _artifact_id_of(con: duckdb.DuckDBPyConnection, *, current: bool) -> str:
     return con.execute(
         "SELECT artifact_id FROM pipeline_artifacts WHERE is_current = ?", [current]
     ).fetchone()[0]
+
+
+# --------------------------------------------------------------------------- #
+# A job that cannot open an attempt (#143)                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_lease_numbers_the_attempt_from_history_not_the_counter(
+    ledger: Ledger, con: duckdb.DuckDBPyConnection
+) -> None:
+    """``attempt_count`` is a denormalisation, and it is the field that drifts.
+
+    In #143 a job sat at ``attempt_count = 0`` with an attempt already recorded
+    against it, so every lease recomputed ``attempt_no = 1`` and collided with
+    the unique key forever. The attempts table is the source of truth for how
+    many attempts a job has had, so the next number comes from there.
+    """
+
+    job = ledger.open_job(job_kind="regenerate_project_brief", subject_key="repo").job
+    ledger.lease_job(job.job_id, worker_id="w1")
+    ledger.retry_job(job.job_id, error_message="transient")
+    ledger.requeue_job(job.job_id)
+    # Drift the counter back, exactly the shape the issue observed.
+    con.execute(
+        "UPDATE pipeline_jobs SET attempt_count = 0 WHERE job_id = ?", [job.job_id]
+    )
+
+    attempt = ledger.lease_job(job.job_id, worker_id="w2")
+
+    assert attempt.attempt_no == 2, "a second attempt must not reuse attempt_no 1"
+
+
+def test_a_lease_that_cannot_record_its_attempt_leaves_no_half_state(
+    ledger: Ledger, con: duckdb.DuckDBPyConnection, monkeypatch
+) -> None:
+    """The insert and the status update are one unit or the job desynchronises.
+
+    A failure between them is how a job ends up ``pending`` with an attempt row
+    it does not count, which is the state that retries forever.
+    """
+
+    job = ledger.open_job(job_kind="summarize_session", subject_key="s1").job
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("status write failed")
+
+    monkeypatch.setattr(ledger, "_set_job_status", _boom)
+
+    with pytest.raises(RuntimeError):
+        ledger.lease_job(job.job_id, worker_id="w1")
+
+    rows = con.execute(
+        "SELECT count(*) FROM pipeline_job_attempts WHERE job_id = ?", [job.job_id]
+    ).fetchone()[0]
+    assert rows == 0, "the attempt row must not survive a failed lease"
+    assert ledger.latest_job("summarize_session", "s1").status == "pending"
+
+
+def test_abandoning_a_pending_job_parks_it_for_good(ledger: Ledger) -> None:
+    """A job that cannot be leased at all has to leave the reusable states.
+
+    ``terminal_failed`` is still reusable, so parking there would let the next
+    cycle requeue the same poisoned row and resume the loop. Dead-lettering is
+    what actually ends it, and lets a fresh job row start instead.
+    """
+
+    job = ledger.open_job(job_kind="regenerate_project_brief", subject_key="repo").job
+
+    ledger.abandon_job(job.job_id, error_message="could not open an attempt")
+    parked = ledger.dead_letter_job(job.job_id)
+
+    assert parked.status == "dead_lettered"

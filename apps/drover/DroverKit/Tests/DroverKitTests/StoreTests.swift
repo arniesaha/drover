@@ -246,6 +246,37 @@ struct StoreTests {
     #expect(store.lastError == "host mac-mini is offline")
 }
 
+@Test @MainActor func continueSessionConflictReplacesAStaleTailscaleTransportPresentation() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    await store.refresh()
+
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.isTailscaleTransportFailure)
+
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8)) }
+    let continued = await store.continueSession("harness-1")
+
+    #expect(continued == nil)
+    #expect(store.lastError == "host mac-mini is offline")
+    #expect(store.lastRefreshFailure == nil)
+    #expect(!store.isTailscaleTransportFailure)
+
+    let summary = FleetSummaryPresentation(
+        snapshot: store.snapshot,
+        isReachable: store.isReachable,
+        error: store.lastError,
+        isTailscaleTransportFailure: store.isTailscaleTransportFailure
+    )
+    #expect(summary.fleetLine == "host mac-mini is offline")
+}
+
 @Test @MainActor func continueSessionNonServerFailureGetsGenericError() async throws {
     MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
     let store = SessionStore(client: client())
@@ -558,6 +589,122 @@ struct StoreTests {
     }
     store.stopPolling()
     #expect(store.hasLoadedOnce)
+}
+
+@Test func droverErrorTailscaleDescriptions() {
+    #expect(DroverError.connectionFailureReason(URLError(.cannotConnectToHost), isTailscale: true) == "Can't reach the hub over Tailscale")
+    #expect(DroverError.transport("offline").localizedDescription(isTailscale: true) == "Can't reach the hub over Tailscale")
+    #expect(DroverError.transport(DroverError.cancellationDetail).localizedDescription(isTailscale: true) == "Request cancelled")
+    #expect(DroverError.unauthorized.localizedDescription(isTailscale: true) == "Token rejected — check Settings")
+}
+
+@Test @MainActor func refreshErrorOnTailscaleReflectsTailscaleContext() async throws {
+    let tsConfig = ServerConfig(urlString: "http://100.64.0.1:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    #expect(store.isTailscaleAddress)
+    #expect(store.tailscaleHost == "100.64.0.1")
+
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    defer { MockURLProtocol.transportError = nil }
+
+    await store.refresh()
+
+    let message = try #require(store.lastError)
+    #expect(message == "Can't reach the hub over Tailscale")
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.isTailscaleTransportFailure)
+    #expect(!store.isReachable)
+
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    await store.refresh()
+
+    #expect(store.lastRefreshFailure == nil)
+    #expect(!store.isTailscaleTransportFailure)
+}
+
+@Test @MainActor func tailscaleNonTransportFailuresKeepTheirExactClassificationAndMessage() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .authentication)
+    #expect(store.lastError == "Token rejected — check Settings")
+    #expect(!store.isTailscaleTransportFailure)
+
+    MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .decoding)
+    #expect(store.lastError == "Unexpected response from the hub")
+    #expect(!store.isTailscaleTransportFailure)
+
+    MockURLProtocol.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8)) }
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .http)
+    #expect(store.lastError == "Hub is restarting")
+    #expect(!store.isTailscaleTransportFailure)
+}
+
+@Test @MainActor func repeatedFirstLoadCancellationIsNotATailscaleTransportFailure() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    for _ in 0..<3 { await store.refresh() }
+
+    #expect(store.lastRefreshFailure == .cancellation)
+    #expect(store.lastError == "The first load kept being interrupted before it landed — the hub may be busy.")
+    #expect(!store.isTailscaleTransportFailure)
+}
+
+@Test @MainActor func ignoredCancellationsKeepTheDisplayedFailureClassificationInSync() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    defer { MockURLProtocol.transportError = nil }
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.lastError == "Can't reach the hub over Tailscale")
+    #expect(store.isTailscaleTransportFailure)
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.lastError == "Can't reach the hub over Tailscale")
+    #expect(store.isTailscaleTransportFailure)
+
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.lastError == "Can't reach the hub over Tailscale")
+    #expect(store.isTailscaleTransportFailure)
+
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .cancellation)
+    #expect(store.lastError == "The first load kept being interrupted before it landed — the hub may be busy.")
+    #expect(!store.isTailscaleTransportFailure)
+}
+
+@Test @MainActor func connectingDetailReportsTailscaleUnreachableHub() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    defer { MockURLProtocol.transportError = nil }
+
+    await store.refresh()
+    await store.refresh()
+
+    let detail = try #require(store.connectingDetail)
+    #expect(detail.contains("Can't reach the hub over Tailscale"))
 }
 
 }
