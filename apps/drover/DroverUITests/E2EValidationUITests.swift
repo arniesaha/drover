@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 /// Live end-to-end validation against a real drover-server: onboarding login,
@@ -7,6 +8,35 @@ import XCTest
 /// (`TEST_RUNNER_DROVER_SMOKE_*` on the xcodebuild invocation). Skipped when
 /// no token is provided so the default UI-test scheme stays self-contained.
 final class E2EValidationUITests: XCTestCase {
+
+    private enum SyntheticCleanupError: LocalizedError {
+        case serverUnavailable
+
+        var errorDescription: String? { "synthetic server failure" }
+    }
+
+    private enum E2ECleanupError: LocalizedError {
+        case invalidServerURL
+        case nonHTTPResponse
+        case unexpectedHTTPStatus(operation: String, status: Int)
+        case activeCredentialsRemain(Int)
+        case localResetDidNotReachOnboarding
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidServerURL:
+                "DROVER_SMOKE_URL is not a URL"
+            case .nonHTTPResponse:
+                "hub returned a non-HTTP response"
+            case let .unexpectedHTTPStatus(operation, status):
+                "\(operation) returned HTTP \(status)"
+            case let .activeCredentialsRemain(count):
+                "\(count) E2E device credential(s) remained active"
+            case .localResetDidNotReachOnboarding:
+                "reset relaunch did not return to onboarding"
+            }
+        }
+    }
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -67,32 +97,78 @@ final class E2EValidationUITests: XCTestCase {
     }
 
     @MainActor
-    func testLoginLaunchChatResumeTerminate() throws {
+    func testCleanupCoordinatorAttemptsLocalResetAfterServerFailure() async {
+        var localResetAttempts = 0
+
+        let failures = await attemptCleanupLegs(
+            serverCleanup: {
+                throw SyntheticCleanupError.serverUnavailable
+            },
+            localReset: {
+                localResetAttempts += 1
+            }
+        )
+
+        XCTAssertEqual(localResetAttempts, 1)
+        XCTAssertEqual(failures, ["server cleanup: synthetic server failure"])
+    }
+
+    @MainActor
+    func testLoginLaunchChatResumeTerminate() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let token = env["DROVER_SMOKE_TOKEN"], !token.isEmpty else {
             throw XCTSkip("DROVER_SMOKE_TOKEN not set — live E2E skipped")
         }
         let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
-        let cwd = env["DROVER_SMOKE_CWD"] ?? "/private/tmp/drover-e2e"
+        let cwd = env["DROVER_SMOKE_CWD"] ?? "/private/tmp"
+        let deviceLabel = "Drover UI E2E \(UUID().uuidString)"
+        let preRunCredentials = try await listCredentials(serverURL: serverURL, token: token)
 
         let app = XCUIApplication()
+        addTeardownBlock { @MainActor in
+            await self.cleanUpCredentialedRun(
+                app: app,
+                serverURL: serverURL,
+                token: token,
+                deviceLabel: deviceLabel,
+                preRunCredentialIDs: Set(preRunCredentials.map(\.id))
+            )
+        }
+
+        let pairingCode = try await mintDevicePairingCode(
+            serverURL: serverURL,
+            token: token,
+            label: deviceLabel
+        )
+
+        app.launchEnvironment["DROVER_BASE_URL"] = " "
+        app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchEnvironment["DROVER_UI_TEST_DEVICE_NAME"] = deviceLabel
+        app.launchArguments += ["-drover.server.url", " "]
         app.launch()
 
         // ── 1. Onboarding / login ─────────────────────────────────────────
-        let urlField = app.textFields["http://host:7080"]
-        XCTAssertTrue(urlField.waitForExistence(timeout: 10), "onboarding URL field should show")
+        let alreadyHaveServer = app.buttons["onboarding-already-have-server-button"]
+        XCTAssertTrue(alreadyHaveServer.waitForExistence(timeout: 10),
+                      "first launch should show the onboarding welcome screen")
+        alreadyHaveServer.tap()
+
+        let urlField = app.textFields["onboarding-server-url-field"]
+        XCTAssertTrue(urlField.waitForExistence(timeout: 10),
+                      "manual pairing should show the server URL field")
         shoot(app, "01-onboarding")
         urlField.tap()
         urlField.typeText(serverURL)
 
-        let tokenField = app.secureTextFields["API token"]
-        XCTAssertTrue(tokenField.waitForExistence(timeout: 5))
-        tokenField.tap()
-        tokenField.typeText(token)
+        let codeField = app.textFields["onboarding-pairing-code-field"]
+        XCTAssertTrue(codeField.waitForExistence(timeout: 5))
+        codeField.tap()
+        codeField.typeText(pairingCode)
 
-        let saveButton = app.buttons["Test & Save"]
-        XCTAssertTrue(saveButton.isEnabled, "Test & Save should enable once both fields are filled")
-        saveButton.tap()
+        let pairButton = app.buttons["onboarding-pair-submit-button"]
+        XCTAssertTrue(pairButton.isEnabled,
+                      "Pair should enable once the server and code are filled")
+        pairButton.tap()
 
         // Successful configure flips the root to the Sessions list and asks
         // for notification permission. The system alert belongs to
@@ -142,18 +218,22 @@ final class E2EValidationUITests: XCTestCase {
         cwdField.tap()
         cwdField.typeText(cwd)
 
-        let promptEditor = app.textViews.firstMatch
+        let promptEditor = app.textFields["prompt-input"]
         XCTAssertTrue(promptEditor.waitForExistence(timeout: 5),
                       "structured harness should show the starting-prompt editor")
         promptEditor.tap()
         promptEditor.typeText("Reply with exactly the single word: HORSERADISH")
+        let dismissKeyboard = app.buttons["keyboard-dismiss"]
+        XCTAssertTrue(dismissKeyboard.waitForExistence(timeout: 5))
+        dismissKeyboard.tap()
         shoot(app, "03-launch-sheet")
 
         app.buttons["launch-confirm-button"].tap()
 
         // ── 3. Chat: wait for the model's reply ───────────────────────────
-        let chatBar = app.navigationBars["Chat"]
-        XCTAssertTrue(chatBar.waitForExistence(timeout: 30), "launch should push straight into Chat")
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 30),
+                      "launch should push straight into Chat")
         shoot(app, "04-chat-connected")
 
         let horseradish = app.staticTexts["HORSERADISH"]
@@ -163,12 +243,8 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "05-chat-first-reply")
 
         // ── 4. A follow-up turn through the composer ──────────────────────
-        // TextField(axis: .vertical) may surface as either element type.
-        var composer = app.textFields["Message"]
-        if !composer.waitForExistence(timeout: 5) {
-            composer = app.textViews["Message"]
-            XCTAssertTrue(composer.waitForExistence(timeout: 5))
-        }
+        let composer = app.textFields["prompt-input"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
         composer.tap()
         composer.typeText("How many legs does a spider have? Reply with only the number.")
         let send = app.buttons["composer-send"]
@@ -181,7 +257,7 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "06-chat-second-reply")
 
         // ── 5. Navigate back, find the session in the list, resume it ─────
-        app.navigationBars["Chat"].buttons.firstMatch.tap()
+        app.navigationBars.firstMatch.buttons.firstMatch.tap()
         XCTAssertTrue(launchButton.waitForExistence(timeout: 10))
         shoot(app, "07-sessions-with-live-session")
 
@@ -193,7 +269,7 @@ final class E2EValidationUITests: XCTestCase {
                       "the launched session should appear in a bucket")
         row.tap()
 
-        XCTAssertTrue(chatBar.waitForExistence(timeout: 10), "row should reopen the chat")
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10), "row should reopen the chat")
         XCTAssertTrue(horseradish.waitForExistence(timeout: 60),
                       "reopening the session should replay the transcript")
         shoot(app, "08-chat-resumed")
@@ -218,13 +294,13 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "10-handoff-chat")
 
         // ── 7. Back out; original session is still reachable ──────────────
-        app.navigationBars["Chat"].buttons.firstMatch.tap()
-        XCTAssertTrue(chatBar.waitForExistence(timeout: 10),
+        app.navigationBars.firstMatch.buttons.firstMatch.tap()
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10),
                       "backing out of the handoff chat returns to the source chat")
         shoot(app, "11-back-on-source-chat")
 
         // Hold briefly so external screenshots can catch the final state.
-        Thread.sleep(forTimeInterval: 3)
+        try await Task.sleep(for: .seconds(3))
     }
 
     /// Header-specific fixture: `DROVER_SMOKE_RECAP_SESSION_ID` must name a
@@ -328,6 +404,202 @@ final class E2EValidationUITests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private struct PairingCodeResponse: Decodable {
+        let code: String
+    }
+
+    private struct CredentialListResponse: Decodable {
+        let credentials: [CredentialSummary]
+    }
+
+    private struct CredentialSummary: Decodable {
+        let id: String
+        let scope: String
+        let label: String
+        let revokedAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case scope
+            case label
+            case revokedAt = "revoked_at"
+        }
+    }
+
+    @MainActor
+    private func mintDevicePairingCode(
+        serverURL: String,
+        token: String,
+        label: String
+    ) async throws -> String {
+        let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
+        var request = URLRequest(url: baseURL.appendingPathComponent("auth/pair-codes"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["scope": "device", "label": label]
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 201, "hub should mint a device pairing code")
+        return try JSONDecoder().decode(PairingCodeResponse.self, from: data).code
+    }
+
+    @MainActor
+    private func cleanUpCredentialedRun(
+        app: XCUIApplication,
+        serverURL: String,
+        token: String,
+        deviceLabel: String,
+        preRunCredentialIDs: Set<String>
+    ) async {
+        let failures = await attemptCleanupLegs(
+            serverCleanup: {
+                try await self.cleanUpServerCredential(
+                    serverURL: serverURL,
+                    token: token,
+                    deviceLabel: deviceLabel,
+                    preRunCredentialIDs: preRunCredentialIDs
+                )
+            },
+            localReset: {
+                try self.resetLocalAuthentication(app: app)
+            }
+        )
+        if !failures.isEmpty {
+            XCTFail(
+                "E2E cleanup failed after both legs were attempted: "
+                    + failures.joined(separator: "; ")
+            )
+        }
+    }
+
+    @MainActor
+    private func attemptCleanupLegs(
+        serverCleanup: () async throws -> Void,
+        localReset: () async throws -> Void
+    ) async -> [String] {
+        var failures: [String] = []
+        do {
+            try await serverCleanup()
+        } catch {
+            failures.append("server cleanup: \(error.localizedDescription)")
+        }
+        do {
+            try await localReset()
+        } catch {
+            failures.append("local reset: \(error.localizedDescription)")
+        }
+        return failures
+    }
+
+    @MainActor
+    private func cleanUpServerCredential(
+        serverURL: String,
+        token: String,
+        deviceLabel: String,
+        preRunCredentialIDs: Set<String>
+    ) async throws {
+        let afterRun = try await listCredentials(serverURL: serverURL, token: token)
+        let attributable = afterRun.filter {
+            !preRunCredentialIDs.contains($0.id)
+                && $0.scope == "device"
+                && $0.label == deviceLabel
+                && $0.revokedAt == nil
+        }
+        for credential in attributable {
+            try await revokeCredential(
+                credential.id,
+                serverURL: serverURL,
+                token: token
+            )
+        }
+
+        let afterCleanup = try await listCredentials(serverURL: serverURL, token: token)
+        let remaining = afterCleanup.filter {
+            !preRunCredentialIDs.contains($0.id)
+                && $0.scope == "device"
+                && $0.label == deviceLabel
+                && $0.revokedAt == nil
+        }
+        guard remaining.isEmpty else {
+            throw E2ECleanupError.activeCredentialsRemain(remaining.count)
+        }
+        print(
+            "E2E credential cleanup: pre_run=\(preRunCredentialIDs.count) "
+                + "attributable=\(attributable.count) active_after=\(remaining.count)"
+        )
+    }
+
+    @MainActor
+    private func resetLocalAuthentication(app: XCUIApplication) throws {
+        app.terminate()
+        app.launchEnvironment["DROVER_BASE_URL"] = " "
+        app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchEnvironment["DROVER_UI_TEST_RESET_AUTH"] = "1"
+        app.launchArguments = ["-drover.server.url", " "]
+        app.launch()
+        defer { app.terminate() }
+        guard app.buttons["onboarding-already-have-server-button"]
+            .waitForExistence(timeout: 10)
+        else {
+            throw E2ECleanupError.localResetDidNotReachOnboarding
+        }
+    }
+
+    @MainActor
+    private func listCredentials(
+        serverURL: String,
+        token: String
+    ) async throws -> [CredentialSummary] {
+        guard let baseURL = URL(string: serverURL) else {
+            throw E2ECleanupError.invalidServerURL
+        }
+        var request = URLRequest(url: baseURL.appendingPathComponent("auth/credentials"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw E2ECleanupError.nonHTTPResponse
+        }
+        guard http.statusCode == 200 else {
+            throw E2ECleanupError.unexpectedHTTPStatus(
+                operation: "credential list",
+                status: http.statusCode
+            )
+        }
+        return try JSONDecoder().decode(CredentialListResponse.self, from: data).credentials
+    }
+
+    @MainActor
+    private func revokeCredential(
+        _ credentialID: String,
+        serverURL: String,
+        token: String
+    ) async throws {
+        guard let baseURL = URL(string: serverURL) else {
+            throw E2ECleanupError.invalidServerURL
+        }
+        var request = URLRequest(
+            url: baseURL.appendingPathComponent("auth/credentials/\(credentialID)")
+        )
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw E2ECleanupError.nonHTTPResponse
+        }
+        guard http.statusCode == 204 else {
+            throw E2ECleanupError.unexpectedHTTPStatus(
+                operation: "credential revoke",
+                status: http.statusCode
+            )
+        }
+    }
 
     @MainActor
     private func shoot(_ app: XCUIApplication, _ name: String) {
