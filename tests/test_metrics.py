@@ -5011,3 +5011,102 @@ def test_archived_query_param_is_clamped_not_rejected(tmp_path):
     assert _archived_limit_kwargs({"archived": ["9999"]}) == {
         "archived_limit": MAX_ARCHIVED_SESSION_LIMIT
     }
+
+
+# -- a create that outlives its caller (handoff failure, 2026-08-15) --------
+#
+# A handoff into a worktree harness cuts a per-session git worktree before the
+# daemon can answer. That ran past the hub's 15s proxy budget, so the hub hung
+# up, the daemon finished anyway and died writing its reply:
+#
+#   daemon.py:2135 _create_structured_session -> _write_json
+#   BrokenPipeError: [Errno 32] Broken pipe
+#
+# The app said "Could not hand off -- try again", which is the worst available
+# advice: the session may exist on the host, and only the hub's copy is
+# missing, so retrying can leave two.
+
+
+class _TimingOutConnection:
+    """An HTTPConnection whose request never comes back, like a slow create."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def request(self, *args, **kwargs):
+        raise TimeoutError("timed out")
+
+    def getresponse(self):  # pragma: no cover - never reached
+        raise AssertionError("getresponse must not be called after a timeout")
+
+    def close(self):
+        pass
+
+
+class _RefusingConnection(_TimingOutConnection):
+    def request(self, *args, **kwargs):
+        raise ConnectionRefusedError("connection refused")
+
+
+def _collector_for_proxy(tmp_path):
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    return MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+
+def test_creating_a_session_is_given_longer_than_the_default_budget(tmp_path):
+    collector = _collector_for_proxy(tmp_path)
+    seen: dict = {}
+
+    def _capture(host, path, *, method, payload=None, timeout_s=15, **kwargs):
+        seen["timeout_s"] = timeout_s
+        return 200, "{}"
+
+    collector._harness_request = _capture  # type: ignore[method-assign]
+    collector._harness_host = lambda host_id: type(  # type: ignore[method-assign]
+        "H",
+        (),
+        {
+            "host_id": host_id,
+            "local_url": "http://127.0.0.1:1",
+            "connection_kind": "direct",
+        },
+    )()
+
+    collector.proxy_create_harness_session("mac-mini", {"harness": "agy"})
+
+    assert (
+        seen["timeout_s"] > 15
+    ), "a create cuts a worktree; 15s is the reason handoff failed"
+
+
+def test_a_create_that_outruns_the_hub_is_not_reported_as_unreachable(
+    tmp_path, monkeypatch
+):
+    collector = _collector_for_proxy(tmp_path)
+    monkeypatch.setattr(metrics.http.client, "HTTPConnection", _TimingOutConnection)
+
+    status, body = collector._proxy_harness_request(
+        "http://127.0.0.1:7081/sessions", method="POST", payload={}
+    )
+
+    # 504, not 502: the host answered the phone and is still working. Saying
+    # "unreachable" is what turned this into "try again".
+    assert status == 504, body
+    assert "may still" in body or "may have" in body, body
+
+
+def test_a_refused_connection_is_still_reported_as_unreachable(tmp_path, monkeypatch):
+    collector = _collector_for_proxy(tmp_path)
+    monkeypatch.setattr(metrics.http.client, "HTTPConnection", _RefusingConnection)
+
+    status, _ = collector._proxy_harness_request(
+        "http://127.0.0.1:7081/sessions", method="POST", payload={}
+    )
+
+    assert status == 502, "nothing was started, so the old meaning still holds"
