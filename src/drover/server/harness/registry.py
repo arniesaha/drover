@@ -297,6 +297,7 @@ class HarnessRegistry:
         capabilities: dict[str, Any] | None = None,
         status: str = "online",
         agent_version: str | None = None,
+        update: dict[str, Any] | None = None,
     ) -> HarnessHost:
         now = _now()
         with self._connect() as con:
@@ -305,9 +306,9 @@ class HarnessRegistry:
                 INSERT INTO harness_hosts (
                   host_id, display_name, kind, local_url, tailscale_url,
                   connection_kind, status, capabilities_json, agent_version,
-                  last_seen_at, created_at, updated_at
+                  update_json, last_seen_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host_id) DO UPDATE SET
                   display_name = excluded.display_name,
                   kind = excluded.kind,
@@ -317,6 +318,7 @@ class HarnessRegistry:
                   status = excluded.status,
                   capabilities_json = excluded.capabilities_json,
                   agent_version = excluded.agent_version,
+                  update_json = excluded.update_json,
                   last_seen_at = excluded.last_seen_at,
                   updated_at = excluded.updated_at
                 """,
@@ -330,6 +332,7 @@ class HarnessRegistry:
                     status,
                     _json_dumps(capabilities),
                     agent_version,
+                    _json_dumps(update) if update is not None else None,
                     now,
                     now,
                     now,

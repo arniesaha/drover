@@ -3218,6 +3218,8 @@ def create_harness_server(
 
 def register_daemon_host(state: HarnessDaemonState) -> None:
     try:
+        from drover import __version__ as drover_version
+
         state.registry.register_host(
             host_id=state.host_id,
             display_name=state.display_name,
@@ -3225,6 +3227,12 @@ def register_daemon_host(state: HarnessDaemonState) -> None:
             local_url=state.local_url,
             tailscale_url=state.tailscale_url,
             capabilities=state.capabilities(),
+            agent_version=drover_version,
+            update=(
+                state.updater.status()
+                if getattr(state, "updater", None) is not None
+                else None
+            ),
         )
     except Exception:
         return
@@ -3251,6 +3259,11 @@ def register_daemon_host_remote(state: HarnessDaemonState) -> dict[str, Any] | N
         "capabilities": state.capabilities(),
         # So the hub can see version skew across the fleet without asking.
         "agent_version": drover_version,
+        "update": (
+            state.updater.status()
+            if getattr(state, "updater", None) is not None
+            else None
+        ),
     }
     return _post_central_json(state, "/harness/hosts", payload)
 

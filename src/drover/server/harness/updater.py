@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from drover.config import DroverConfig
@@ -138,6 +139,8 @@ class HostUpdater:
         self._lock = threading.Lock()
         self._pending: str | None = None
         self._blocked = False
+        self._reason: str | None = None
+        self._observed_at: str | None = None
 
     def observe(self, heartbeat_body: dict) -> None:
         """React to what the hub said, downloading if we are behind."""
@@ -151,6 +154,8 @@ class HostUpdater:
             with self._lock:
                 self._pending = None
                 self._blocked = False
+                self._reason = None
+                self._observed_at = None
             return
         with self._lock:
             if self._pending == target:
@@ -158,6 +163,9 @@ class HostUpdater:
                 # hours; re-downloading on every 15s heartbeat would be absurd.
                 return
             self._pending = target
+            self._blocked = False
+            self._reason = None
+            self._observed_at = datetime.now(timezone.utc).isoformat()
 
         raw = (heartbeat_body or {}).get("artifact") or {}
         artifact = ReleaseArtifact(
@@ -171,6 +179,9 @@ class HostUpdater:
             log.warning("could not install %s; will retry on a later heartbeat", target)
             with self._lock:
                 self._pending = None
+                self._blocked = True
+                self._reason = "install_failed"
+                self._observed_at = datetime.now(timezone.utc).isoformat()
 
     def maybe_activate(self) -> bool:
         """Flip and restart, but only if this host is provably idle."""
@@ -182,10 +193,16 @@ class HostUpdater:
             # The installer may have reported success; this is the last gate
             # before the symlink moves.
             log.warning("%s failed its smoke test; refusing to activate", target)
+            with self._lock:
+                self._blocked = True
+                self._reason = "smoke_test"
+                self._observed_at = datetime.now(timezone.utc).isoformat()
             return False
         if not is_quiescent(self._state):
             with self._lock:
                 self._blocked = True
+                self._reason = "not_quiescent"
+                self._observed_at = datetime.now(timezone.utc).isoformat()
             return False
 
         previous = self._layout.active_version() or ""
@@ -195,14 +212,21 @@ class HostUpdater:
         self._layout.flip(target)
         with self._lock:
             self._blocked = False
+            self._reason = None
+            self._observed_at = None
         log.info("activated %s (was %s); restarting", target, previous or "unknown")
         self._restarter()
         return True
 
     def status(self) -> dict:
-        """Surfaced on the heartbeat so the app can show a waiting host."""
+        """Surfaced on the heartbeat so the hub can show a waiting host."""
         with self._lock:
-            return {"pending_version": self._pending, "update_blocked": self._blocked}
+            return {
+                "pending_version": self._pending,
+                "update_blocked": self._blocked,
+                "reason": self._reason,
+                "observed_at": self._observed_at,
+            }
 
 
 def verify_after_restart(layout: RuntimeLayout, *, registered: bool) -> bool:

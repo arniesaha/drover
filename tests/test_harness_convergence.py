@@ -110,8 +110,11 @@ def test_a_busy_host_reports_that_it_is_blocked(tmp_path):
     _, updater = _updater(tmp_path, idle=False)
     updater.observe(_beat("0.1.4"))
     updater.maybe_activate()
-    assert updater.status()["update_blocked"] is True
-    assert updater.status()["pending_version"] == "0.1.4"
+    status = updater.status()
+    assert status["update_blocked"] is True
+    assert status["pending_version"] == "0.1.4"
+    assert status["reason"] == "not_quiescent"
+    assert status["observed_at"] is not None
 
 
 def test_a_failed_install_never_activates(tmp_path):
@@ -119,6 +122,11 @@ def test_a_failed_install_never_activates(tmp_path):
     updater.observe(_beat("0.1.4"))
     assert updater.maybe_activate() is False
     assert layout.active_version() == "0.1.3"
+    status = updater.status()
+    assert status["update_blocked"] is True
+    assert status["reason"] == "install_failed"
+    assert status["pending_version"] is None
+    assert status["observed_at"] is not None
 
 
 def test_installing_is_not_retried_on_every_heartbeat(tmp_path):
@@ -151,6 +159,9 @@ def test_activation_calls_the_restarter(tmp_path):
     updater.observe(_beat("0.1.4"))
     updater.maybe_activate()
     assert calls == [1]
+    status = updater.status()
+    assert status["update_blocked"] is False
+    assert status["reason"] is None
 
 
 def test_a_version_that_fails_its_smoke_test_is_not_activated(tmp_path):
@@ -175,6 +186,11 @@ def test_a_version_that_fails_its_smoke_test_is_not_activated(tmp_path):
     updater.observe(_beat("0.1.4"))
     assert updater.maybe_activate() is False
     assert layout.active_version() == "0.1.3"
+    status = updater.status()
+    assert status["update_blocked"] is True
+    assert status["reason"] == "smoke_test"
+    assert status["pending_version"] == "0.1.4"
+    assert status["observed_at"] is not None
 
 
 # --- watchdog -----------------------------------------------------------------

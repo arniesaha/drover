@@ -30,6 +30,9 @@ class HarnessHost:
     # What the host says it is running. None for a host old enough not to
     # report one, which is ordinary during a rollout rather than an error.
     agent_version: str | None = None
+    # Live update state reported on heartbeat: pending_version, update_blocked,
+    # reason, and observed_at.
+    update: dict[str, Any] | None = None
     last_seen_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -46,6 +49,7 @@ class HarnessHost:
             connection_kind=row.get("connection_kind") or "direct",
             capabilities=_loads_object(row.get("capabilities_json")),
             agent_version=row.get("agent_version"),
+            update=_loads_object(row.get("update_json")) or None,
             last_seen_at=row.get("last_seen_at"),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
