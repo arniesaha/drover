@@ -80,6 +80,20 @@ _HARNESS_STALE_AFTER_SECONDS = 45
 # Presence is now trustworthy within a minute, so a live relay socket is
 # decent evidence the host is really there and worth waiting for.
 RELAY_MIN_TIMEOUT_S = 5.0
+
+# How long the hub waits for a host to create a session.
+#
+# Every other hub->harnessd call reads state and answers in milliseconds. A
+# create is the one that does work: it cuts a per-session worktree, starts a
+# driver, and delivers the first turn before it can reply. Measured on the hub
+# those cost 0.33s, and 3.87s for the whole create-with-prompt, so the 15s
+# default is normally ample -- but a create that overruns it leaves the daemon
+# writing its reply into a closed socket, and the session it made is then
+# known only to the host.
+#
+# Deliberately generous rather than tuned: the cost of waiting is a slow
+# handoff, and the cost of not waiting is a session the hub cannot see.
+CREATE_SESSION_TIMEOUT_S = 120.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
@@ -1159,6 +1173,7 @@ class MetricsCollector:
             "/sessions",
             method="POST",
             payload=payload,
+            timeout_s=CREATE_SESSION_TIMEOUT_S,
         )
         if 200 <= status < 300:
             self._sync_created_harness_session(host_id, payload, body)
@@ -2179,6 +2194,29 @@ class MetricsCollector:
             response = conn.getresponse()
             return response.status, _read_bounded_http_body(
                 response, max_response_bytes=max_response_bytes
+            )
+        except TimeoutError as exc:
+            # Distinct from unreachable, because the host answered and is
+            # still working. A create that overran this budget left the daemon
+            # writing its reply into a closed socket (BrokenPipeError at
+            # daemon.py:2135, after the session existed), and the app told the
+            # user to try again -- the one thing that can leave two sessions
+            # where they asked for one.
+            log.warning(
+                "harness request to %s timed out after %ss; the host may still "
+                "complete it",
+                url,
+                timeout_s,
+            )
+            return _json_response(
+                504,
+                {
+                    "error": (
+                        f"harness host did not answer within {timeout_s:g}s: {exc}. "
+                        "It may still be working, so a session may have been "
+                        "created; check the sessions list before retrying."
+                    )
+                },
             )
         except OSError as exc:
             return _json_response(502, {"error": f"harness host request failed: {exc}"})

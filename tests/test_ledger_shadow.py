@@ -428,3 +428,51 @@ def test_summarizer_worker_shadow_writes_job_and_artifact(tmp_path: Path) -> Non
         )
         == 1
     )
+
+
+def test_a_job_that_cannot_be_leased_is_parked_instead_of_retried(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#143: 916 of 917 warnings in one log were the same job, still firing.
+
+    A unique-key violation on the attempt insert is not transient -- the same
+    job recomputes the same attempt number every cycle and collides again
+    forever, at WARNING with a traceback, burying real errors. Parking it ends
+    the loop and lets the next cycle open a fresh job row.
+    """
+
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=tmp_path / "drover.duckdb")
+    duckdb_path = tmp_path / "drover.duckdb"
+
+    import duckdb as _duckdb
+
+    from drover.server import ledger_shadow
+
+    def _explode(self, job_id, *, worker_id, lease_expires_at=None):
+        raise _duckdb.ConstraintException(
+            'Duplicate key "job_id: x, attempt_no: 1" violates unique constraint.'
+        )
+
+    monkeypatch.setattr(ledger_shadow.Ledger, "lease_job", _explode)
+
+    first = ledger_shadow.begin_attempt(
+        duckdb_path,
+        job_kind="regenerate_project_brief",
+        subject_key="arniesaha/drover",
+        worker_id="w1",
+    )
+
+    assert first is None
+
+    con = _duckdb.connect(str(duckdb_path))
+    try:
+        status = con.execute(
+            "SELECT status FROM pipeline_jobs WHERE job_kind = ?",
+            ["regenerate_project_brief"],
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+    # Dead-lettered, not terminal_failed: terminal_failed is reusable, so the
+    # next cycle would requeue this very row and start the loop again.
+    assert status == "dead_lettered", status

@@ -168,7 +168,9 @@ struct PairingView: View {
         do {
             response = try await DroverClient.pair(
                 payload: payload,
-                deviceName: UIDevice.current.name
+                deviceName: UITestOverrides.pairingDeviceName(
+                    fallback: UIDevice.current.name
+                )
             )
         } catch {
             model.statusMessage = error.localizedDescription

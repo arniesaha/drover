@@ -740,33 +740,55 @@ class HarnessRegistry:
         with self._connect() as con:
             con.execute("BEGIN TRANSACTION")
             try:
-                con.execute(
-                    """
-                    INSERT INTO harness_events (
-                      event_id, session_id, event_type, normalized_type,
-                      normalized_source, content_preview, payload_json, created_at, seq
+                # An event already here is a re-delivery, not an error. The
+                # host daemon retains undelivered batches and re-offers them
+                # (#101), so a delivery whose acknowledgement was lost arrives
+                # again with the same event_id -- and the mirror path's "have
+                # I got this one?" check is a check-then-act that two
+                # concurrent deliveries both pass. That raised 195
+                # duplicate-key tracebacks in a single server log, every one
+                # for an event the hub already held.
+                #
+                # DO NOTHING rather than an upsert: the stored copy is the one
+                # the app has already read, and a replay carries no promise of
+                # identical derived fields.
+                inserted = (
+                    con.execute(
+                        """
+                        INSERT INTO harness_events (
+                          event_id, session_id, event_type, normalized_type,
+                          normalized_source, content_preview, payload_json,
+                          created_at, seq
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (event_id) DO NOTHING
+                        RETURNING event_id
+                        """,
+                        [
+                            event_id,
+                            session_id,
+                            event_type,
+                            normalized["normalized_type"],
+                            normalized["normalized_source"],
+                            normalized["content_preview"],
+                            _json_dumps(payload),
+                            created_at,
+                            seq,
+                        ],
+                    ).fetchone()
+                    is not None
+                )
+                if inserted:
+                    # Only for a genuinely new event: a re-delivered
+                    # completion must not enqueue a second recap for work
+                    # that was already summarised.
+                    _enqueue_recap_if_completion(
+                        con,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload,
+                        seq=seq,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        event_id,
-                        session_id,
-                        event_type,
-                        normalized["normalized_type"],
-                        normalized["normalized_source"],
-                        normalized["content_preview"],
-                        _json_dumps(payload),
-                        created_at,
-                        seq,
-                    ],
-                )
-                _enqueue_recap_if_completion(
-                    con,
-                    session_id=session_id,
-                    event_type=event_type,
-                    payload=payload,
-                    seq=seq,
-                )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -842,6 +864,10 @@ class HarnessRegistry:
                 return 0
             con.execute("BEGIN TRANSACTION")
             try:
+                # Same reasoning as the single-event path above: the SELECT
+                # into `existing` narrows the batch, but it is still a
+                # check-then-act, and two batches carrying the same
+                # re-delivered event both pass it.
                 con.executemany(
                     """
                     INSERT INTO harness_events (
@@ -849,6 +875,7 @@ class HarnessRegistry:
                       normalized_source, content_preview, payload_json, created_at, seq
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (event_id) DO NOTHING
                     """,
                     params,
                 )

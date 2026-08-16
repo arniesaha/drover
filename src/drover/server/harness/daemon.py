@@ -1966,6 +1966,37 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             content_preview=_redact_terminal_text(seed.text),
         )
 
+    def _live_handoff_session(self, source_session_id: str | None, harness: str):
+        """A live session this host already made for that source, if any.
+
+        Only for handoffs: an ordinary launch carries no source, and two
+        launches into the same directory are a thing a user can legitimately
+        want. A handoff is different -- it names the session it continues, and
+        continuing one session twice into two agents is never the intent.
+
+        Bounded to sessions the daemon still considers live. A finished
+        handoff should not stop the user starting another one later from the
+        same source.
+        """
+
+        if not source_session_id:
+            return None
+        try:
+            sessions = self.server.state.registry.list_sessions(
+                host_id=self.server.state.host_id
+            )
+        except Exception:  # noqa: BLE001 - dedupe is best effort, never fatal
+            return None
+        for session in sessions:
+            if (
+                session.source_session_id == source_session_id
+                and session.harness == harness
+                and session.status in {"starting", "running"}
+                and self.server.state.structured.has(session.session_id)
+            ):
+                return session
+        return None
+
     def _create_structured_session(self, body: dict[str, Any]) -> None:
         harness = str(body.get("harness") or "")
         cwd = body.get("cwd")
@@ -2013,6 +2044,34 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 thinking_effort=thinking_effort,
             )
         label_source = command
+        # A handoff already carries its own idempotency key: the session it
+        # came from. The hub stops waiting for a create after
+        # CREATE_SESSION_TIMEOUT_S and cannot tell a slow success from a
+        # failure, so the honest advice to a user is to check rather than
+        # retry -- but a retry still has to be survivable. One handoff means
+        # one session, so a repeat for a source that already has a live
+        # session here adopts it instead of starting a second agent in the
+        # same repository.
+        existing = self._live_handoff_session(
+            _optional_text(body.get("source_session_id")), harness
+        )
+        if existing is not None:
+            self._write_json(
+                {
+                    "session_id": existing.session_id,
+                    "host_id": self.server.state.host_id,
+                    "harness": harness,
+                    "status": existing.status,
+                    "mode": "structured",
+                    "model": existing.model,
+                    "thinking_effort": existing.thinking_effort,
+                    # Named so the caller can tell "made you one" from "you
+                    # already had one", rather than inferring it from ids.
+                    "deduplicated": True,
+                },
+                status=HTTPStatus.OK,
+            )
+            return
         session_id = f"harness-{uuid4()}"
 
         session_cwd = str(cwd) if cwd is not None else None

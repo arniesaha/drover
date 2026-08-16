@@ -1158,3 +1158,79 @@ def test_list_sessions_treats_an_unknown_status_as_live(tmp_path):
 
     ids = [s.session_id for s in reg.list_sessions(archived_limit=1)]
     assert odd in ids
+
+
+# -- a mirrored event arriving twice ---------------------------------------
+#
+# The host daemon retains undelivered event batches and re-offers them (#101),
+# so an event whose delivery succeeded but whose acknowledgement was lost
+# arrives again carrying the same event_id. The hub's mirror path guards with
+# `if registry.get_event(event_id) is not None: continue`, which is a
+# check-then-act: two deliveries in flight together both find nothing and both
+# insert. That produced 195 `Duplicate key "event_id: ..."` tracebacks in one
+# server log, each one an event the hub already had.
+
+
+def test_appending_a_mirrored_event_twice_is_a_no_op(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-mirror",
+        host_id="mac-mini",
+        harness="agy",
+        command="agy",
+    )
+    first = registry.append_event(
+        session_id="harness-session-mirror",
+        event_type="assistant_output",
+        payload={"text": "hello"},
+        event_id="harness-event-fixed",
+        seq=1,
+    )
+
+    second = registry.append_event(
+        session_id="harness-session-mirror",
+        event_type="assistant_output",
+        payload={"text": "hello"},
+        event_id="harness-event-fixed",
+        seq=1,
+    )
+
+    assert second is not None
+    assert second.event_id == first.event_id
+    events = registry.list_events("harness-session-mirror")
+    assert len(events) == 1, f"one event, redelivered; got {len(events)}"
+
+
+def test_a_redelivered_event_does_not_overwrite_what_was_stored(tmp_path):
+    """Re-delivery is a no-op, not a last-writer-wins update.
+
+    The retained copy on the host is the same event, but nothing guarantees a
+    replay carries identical derived fields, and the hub's copy is the one the
+    app has already read.
+    """
+
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-mirror-2",
+        host_id="mac-mini",
+        harness="agy",
+        command="agy",
+    )
+    registry.append_event(
+        session_id="harness-session-mirror-2",
+        event_type="assistant_output",
+        payload={"text": "original"},
+        event_id="harness-event-stable",
+        seq=1,
+    )
+
+    registry.append_event(
+        session_id="harness-session-mirror-2",
+        event_type="assistant_output",
+        payload={"text": "replayed"},
+        event_id="harness-event-stable",
+        seq=1,
+    )
+
+    stored = registry.get_event("harness-event-stable")
+    assert stored.payload["text"] == "original"

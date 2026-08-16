@@ -58,6 +58,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                     .font(.system(size: 22, weight: .regular, design: .default))
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
+                    .accessibilityIdentifier("prompt-input")
                     .focused($isTextFocused)
                     .submitLabel(.send)
                     .onSubmit {
