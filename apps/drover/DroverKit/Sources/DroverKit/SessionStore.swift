@@ -21,10 +21,24 @@ public struct HostGroup: Sendable, Equatable, Identifiable {
 @MainActor
 @Observable
 public final class SessionStore {
+    /// The kind of the most recent failed snapshot refresh. Presentation uses
+    /// this alongside `lastError` so a Tailscale address cannot turn an
+    /// authentication, decoding, HTTP, or cancellation error into a
+    /// connectivity claim.
+    public enum RefreshFailure: Sendable, Equatable {
+        case transport
+        case authentication
+        case decoding
+        case http
+        case cancellation
+        case other
+    }
+
     private let client: DroverClient?
 
     public private(set) var snapshot: HarnessSnapshot?
     public private(set) var lastError: String?
+    public private(set) var lastRefreshFailure: RefreshFailure?
     public private(set) var isReachable: Bool = false
 
     /// True when the underlying client is pointed at a Tailscale endpoint.
@@ -35,6 +49,13 @@ public final class SessionStore {
     /// The host part if the underlying client is pointed at a Tailscale endpoint.
     public var tailscaleHost: String? {
         client?.config.tailscaleHost
+    }
+
+    /// The only condition that merits Tailscale-specific recovery copy.
+    /// Merely being configured with a Tailscale address is not evidence that
+    /// Tailscale caused an authentication, decoding, HTTP, or app cancellation.
+    public var isTailscaleTransportFailure: Bool {
+        isTailscaleAddress && lastRefreshFailure == .transport
     }
 
     /// True once any refresh has succeeded. Lets the UI distinguish
@@ -236,6 +257,7 @@ public final class SessionStore {
             let fresh = try await client.snapshot()
             snapshot = fresh
             lastError = nil
+            lastRefreshFailure = nil
             isReachable = true
             hasLoadedOnce = true
             refreshAttempts = 0
@@ -252,15 +274,17 @@ public final class SessionStore {
             // load stuck behind repeated cancellations indistinguishable from
             // an unreachable hub, and left "Connecting…" with nothing to say.
             if Self.isCancellation(error) {
+                lastRefreshFailure = .cancellation
                 lastRefreshOutcome = Self.cancelledOutcome
                 noteCancelledFirstLoad()
                 return
             }
             cancelledFirstLoads = 0
             isReachable = false
+            lastRefreshFailure = Self.classify(error)
             lastError = Self.errorMessage(
                 for: error,
-                isTailscale: client.config.isTailscaleAddress
+                isTailscale: isTailscaleTransportFailure
             )
             lastRefreshOutcome = lastError
             // Deliberately keep the cached `snapshot` as-is.
@@ -430,5 +454,26 @@ public final class SessionStore {
             return DroverError.unreachableTailscaleDescription
         }
         return (error as NSError).localizedDescription
+    }
+
+    private nonisolated static func classify(_ error: Error) -> RefreshFailure {
+        if let droverError = error as? DroverError {
+            switch droverError {
+            case .transport:
+                return droverError.isCancellation ? .cancellation : .transport
+            case .unauthorized:
+                return .authentication
+            case .decoding:
+                return .decoding
+            case .httpStatus:
+                return .http
+            case .conflict, .badRequest, .unavailable:
+                return .other
+            }
+        }
+        if let urlError = error as? URLError {
+            return urlError.code == .cancelled ? .cancellation : .transport
+        }
+        return .other
     }
 }

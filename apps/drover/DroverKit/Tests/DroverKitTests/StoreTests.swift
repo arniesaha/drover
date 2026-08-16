@@ -582,7 +582,54 @@ struct StoreTests {
 
     let message = try #require(store.lastError)
     #expect(message == "Can't reach the hub over Tailscale")
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.isTailscaleTransportFailure)
     #expect(!store.isReachable)
+
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    await store.refresh()
+
+    #expect(store.lastRefreshFailure == nil)
+    #expect(!store.isTailscaleTransportFailure)
+}
+
+@Test @MainActor func tailscaleNonTransportFailuresKeepTheirExactClassificationAndMessage() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .authentication)
+    #expect(store.lastError == "Token rejected — check Settings")
+    #expect(!store.isTailscaleTransportFailure)
+
+    MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .decoding)
+    #expect(store.lastError == "Unexpected response from the hub")
+    #expect(!store.isTailscaleTransportFailure)
+
+    MockURLProtocol.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8)) }
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .http)
+    #expect(store.lastError == "Hub is restarting")
+    #expect(!store.isTailscaleTransportFailure)
+}
+
+@Test @MainActor func repeatedFirstLoadCancellationIsNotATailscaleTransportFailure() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    defer { MockURLProtocol.transportError = nil }
+    for _ in 0..<3 { await store.refresh() }
+
+    #expect(store.lastRefreshFailure == .cancellation)
+    #expect(store.lastError == "The first load kept being interrupted before it landed — the hub may be busy.")
+    #expect(!store.isTailscaleTransportFailure)
 }
 
 @Test @MainActor func connectingDetailReportsTailscaleUnreachableHub() async throws {
