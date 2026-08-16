@@ -1341,5 +1341,3 @@ def test_ingest_structured_events_mixed_aware_and_naive_timestamps(tmp_path):
     s_rebuild = registry.get_session(session.session_id)
     assert s_rebuild is not None
     assert registry_module._db_timestamp_to_utc(s_rebuild.last_activity) == t2_aware_utc
-
-

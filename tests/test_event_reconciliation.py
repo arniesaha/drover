@@ -838,4 +838,3 @@ def test_e2e_restart_event_reconciliation_mixed_timestamps(tmp_path):
         daemon_server.shutdown()
         daemon_server.server_close()
         central_server.shutdown()
-

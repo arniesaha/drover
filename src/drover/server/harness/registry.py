@@ -108,7 +108,6 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-
 #: Awaiting values that mean the agent is blocked on the user, and therefore
 #: worth a notification. Anything else (including None) is a clear.
 _AWAITING_STATES = ("input", "approval")
@@ -1060,9 +1059,7 @@ class HarnessRegistry:
                     seq = record.get("seq")
                     if not isinstance(seq, int) or isinstance(seq, bool):
                         seq = None
-                    created_at = (
-                        _as_utc_datetime(record.get("created_at")) or _now()
-                    )
+                    created_at = _as_utc_datetime(record.get("created_at")) or _now()
                     normalized = normalize_harness_event(
                         event_type=event_type,
                         payload=payload,
@@ -1144,8 +1141,7 @@ class HarnessRegistry:
                             inserted_events,
                             key=lambda event: (
                                 event.get("seq") or 0,
-                                _as_utc_datetime(event.get("created_at"))
-                                or _now(),
+                                _as_utc_datetime(event.get("created_at")) or _now(),
                                 event["event_id"],
                             ),
                         )
