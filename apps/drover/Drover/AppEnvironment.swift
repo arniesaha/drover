@@ -2,6 +2,32 @@ import Foundation
 import Observation
 import DroverKit
 
+enum UITestOverrides {
+    static func pairingDeviceName(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fallback: String
+    ) -> String {
+#if DEBUG
+        let override = environment["DROVER_UI_TEST_DEVICE_NAME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let override, !override.isEmpty {
+            return override
+        }
+#endif
+        return fallback
+    }
+
+    static func shouldResetAuthentication(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+#if DEBUG
+        environment["DROVER_UI_TEST_RESET_AUTH"] == "1"
+#else
+        false
+#endif
+    }
+}
+
 /// App-wide configuration state: holds the current `DroverClient`/`ServerConfig`
 /// (if any) and the one entry point (`configure`) that validates a candidate
 /// server + token against the live server before persisting anything.
@@ -23,9 +49,17 @@ final class AppEnvironment {
     private let defaults: UserDefaults
     private let tokenStore: TokenStore
 
-    init(defaults: UserDefaults = .standard, tokenStore: TokenStore = TokenStore()) {
+    init(
+        defaults: UserDefaults = .standard,
+        tokenStore: TokenStore = TokenStore(),
+        launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
         self.defaults = defaults
         self.tokenStore = tokenStore
+        if UITestOverrides.shouldResetAuthentication(environment: launchEnvironment) {
+            try? tokenStore.delete()
+            defaults.removeObject(forKey: ServerConfig.defaultsKey)
+        }
         if let built = ClientFactory.make(defaults: defaults, tokenStore: tokenStore) {
             client = built.client
             config = built.config

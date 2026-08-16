@@ -75,14 +75,29 @@ final class E2EValidationUITests: XCTestCase {
         }
         let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
         let cwd = env["DROVER_SMOKE_CWD"] ?? "/private/tmp"
-        let pairingCode = try await mintDevicePairingCode(
-            serverURL: serverURL,
-            token: token
-        )
+        let deviceLabel = "Drover UI E2E \(UUID().uuidString)"
+        let preRunCredentials = try await listCredentials(serverURL: serverURL, token: token)
 
         let app = XCUIApplication()
+        addTeardownBlock { @MainActor in
+            await self.cleanUpCredentialedRun(
+                app: app,
+                serverURL: serverURL,
+                token: token,
+                deviceLabel: deviceLabel,
+                preRunCredentialIDs: Set(preRunCredentials.map(\.id))
+            )
+        }
+
+        let pairingCode = try await mintDevicePairingCode(
+            serverURL: serverURL,
+            token: token,
+            label: deviceLabel
+        )
+
         app.launchEnvironment["DROVER_BASE_URL"] = " "
         app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchEnvironment["DROVER_UI_TEST_DEVICE_NAME"] = deviceLabel
         app.launchArguments += ["-drover.server.url", " "]
         app.launch()
 
@@ -348,21 +363,144 @@ final class E2EValidationUITests: XCTestCase {
         let code: String
     }
 
+    private struct CredentialListResponse: Decodable {
+        let credentials: [CredentialSummary]
+    }
+
+    private struct CredentialSummary: Decodable {
+        let id: String
+        let scope: String
+        let label: String
+        let revokedAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case scope
+            case label
+            case revokedAt = "revoked_at"
+        }
+    }
+
     @MainActor
-    private func mintDevicePairingCode(serverURL: String, token: String) async throws -> String {
+    private func mintDevicePairingCode(
+        serverURL: String,
+        token: String,
+        label: String
+    ) async throws -> String {
         let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
         var request = URLRequest(url: baseURL.appendingPathComponent("auth/pair-codes"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(
-            withJSONObject: ["scope": "device", "label": "Drover UI E2E"]
+            withJSONObject: ["scope": "device", "label": label]
         )
 
         let (data, response) = try await URLSession.shared.data(for: request)
         let http = try XCTUnwrap(response as? HTTPURLResponse)
         XCTAssertEqual(http.statusCode, 201, "hub should mint a device pairing code")
         return try JSONDecoder().decode(PairingCodeResponse.self, from: data).code
+    }
+
+    @MainActor
+    private func cleanUpCredentialedRun(
+        app: XCUIApplication,
+        serverURL: String,
+        token: String,
+        deviceLabel: String,
+        preRunCredentialIDs: Set<String>
+    ) async {
+        do {
+            let afterRun = try await listCredentials(serverURL: serverURL, token: token)
+            let attributable = afterRun.filter {
+                !preRunCredentialIDs.contains($0.id)
+                    && $0.scope == "device"
+                    && $0.label == deviceLabel
+                    && $0.revokedAt == nil
+            }
+            for credential in attributable {
+                try await revokeCredential(
+                    credential.id,
+                    serverURL: serverURL,
+                    token: token
+                )
+            }
+
+            let afterCleanup = try await listCredentials(serverURL: serverURL, token: token)
+            let remaining = afterCleanup.filter {
+                !preRunCredentialIDs.contains($0.id)
+                    && $0.scope == "device"
+                    && $0.label == deviceLabel
+                    && $0.revokedAt == nil
+            }
+            XCTAssertTrue(
+                remaining.isEmpty,
+                "the E2E run must not leave its device credential active"
+            )
+            print(
+                "E2E credential cleanup: pre_run=\(preRunCredentialIDs.count) "
+                    + "attributable=\(attributable.count) active_after=\(remaining.count)"
+            )
+        } catch {
+            XCTFail("E2E server credential cleanup failed: \(error.localizedDescription)")
+        }
+
+        app.terminate()
+        app.launchEnvironment["DROVER_BASE_URL"] = " "
+        app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchEnvironment["DROVER_UI_TEST_RESET_AUTH"] = "1"
+        app.launchArguments = ["-drover.server.url", " "]
+        app.launch()
+        XCTAssertTrue(
+            app.buttons["onboarding-already-have-server-button"].waitForExistence(timeout: 10),
+            "teardown relaunch must clear the app credential and return to onboarding"
+        )
+        app.terminate()
+    }
+
+    @MainActor
+    private func listCredentials(
+        serverURL: String,
+        token: String
+    ) async throws -> [CredentialSummary] {
+        let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
+        var request = URLRequest(url: baseURL.appendingPathComponent("auth/credentials"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        guard http.statusCode == 200 else {
+            throw NSError(
+                domain: "DroverE2ECredentialCleanup",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "credential list returned HTTP \(http.statusCode)"]
+            )
+        }
+        return try JSONDecoder().decode(CredentialListResponse.self, from: data).credentials
+    }
+
+    @MainActor
+    private func revokeCredential(
+        _ credentialID: String,
+        serverURL: String,
+        token: String
+    ) async throws {
+        let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
+        var request = URLRequest(
+            url: baseURL.appendingPathComponent("auth/credentials/\(credentialID)")
+        )
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        guard http.statusCode == 204 else {
+            throw NSError(
+                domain: "DroverE2ECredentialCleanup",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "credential revoke returned HTTP \(http.statusCode)"]
+            )
+        }
     }
 
     @MainActor

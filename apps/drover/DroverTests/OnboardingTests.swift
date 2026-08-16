@@ -91,4 +91,14 @@ final class OnboardingTests: XCTestCase {
         XCTAssertEqual(payload.code, "ABCD-1234")
         XCTAssertEqual(payload.serverURL.absoluteString, "http://192.168.1.100:7080")
     }
+
+    func testUITestDeviceNameOverridesTheSimulatorName() {
+        XCTAssertEqual(
+            UITestOverrides.pairingDeviceName(
+                environment: ["DROVER_UI_TEST_DEVICE_NAME": "Drover UI E2E 1234"],
+                fallback: "iPhone 17 Pro"
+            ),
+            "Drover UI E2E 1234"
+        )
+    }
 }

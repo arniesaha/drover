@@ -19,6 +19,7 @@ final class SignOutTests: XCTestCase {
     /// Builds an isolated environment, runs the body, and always cleans up.
     private func withEnvironment(
         configured: Bool = true,
+        launchEnvironment: [String: String] = ProcessInfo.processInfo.environment,
         _ body: (AppEnvironment, TokenStore, UserDefaults) throws -> Void
     ) rethrows {
         let suiteName = "drover.signout.\(UUID().uuidString)"
@@ -34,7 +35,11 @@ final class SignOutTests: XCTestCase {
             try? store.save("existing-token")
             ServerConfig(urlString: "http://127.0.0.1:7080")!.save(defaults: defaults)
         }
-        let environment = AppEnvironment(defaults: defaults, tokenStore: store)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: store,
+            launchEnvironment: launchEnvironment
+        )
         try body(environment, store, defaults)
     }
 
@@ -98,6 +103,17 @@ final class SignOutTests: XCTestCase {
         withEnvironment(configured: false) { environment, _, _ in
             environment.signOut()
             XCTAssertNil(environment.client)
+        }
+    }
+
+    func testUITestResetLaunchClearsPersistedAuthenticationBeforeLoading() throws {
+        try withEnvironment(
+            launchEnvironment: ["DROVER_UI_TEST_RESET_AUTH": "1"]
+        ) { environment, store, defaults in
+            XCTAssertNil(store.load(), "the UI-test credential must leave Keychain at launch")
+            XCTAssertNil(ServerConfig.load(defaults: defaults))
+            XCTAssertNil(environment.client)
+            XCTAssertNil(environment.config)
         }
     }
 }
