@@ -9,6 +9,35 @@ import XCTest
 /// no token is provided so the default UI-test scheme stays self-contained.
 final class E2EValidationUITests: XCTestCase {
 
+    private enum SyntheticCleanupError: LocalizedError {
+        case serverUnavailable
+
+        var errorDescription: String? { "synthetic server failure" }
+    }
+
+    private enum E2ECleanupError: LocalizedError {
+        case invalidServerURL
+        case nonHTTPResponse
+        case unexpectedHTTPStatus(operation: String, status: Int)
+        case activeCredentialsRemain(Int)
+        case localResetDidNotReachOnboarding
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidServerURL:
+                "DROVER_SMOKE_URL is not a URL"
+            case .nonHTTPResponse:
+                "hub returned a non-HTTP response"
+            case let .unexpectedHTTPStatus(operation, status):
+                "\(operation) returned HTTP \(status)"
+            case let .activeCredentialsRemain(count):
+                "\(count) E2E device credential(s) remained active"
+            case .localResetDidNotReachOnboarding:
+                "reset relaunch did not return to onboarding"
+            }
+        }
+    }
+
     override func setUpWithError() throws {
         continueAfterFailure = false
         // The notification-permission alert (and any save-password prompt)
@@ -65,6 +94,23 @@ final class E2EValidationUITests: XCTestCase {
         XCTAssertLessThanOrEqual(title.frame.maxX, navigationBar.frame.maxX)
         XCTAssertLessThanOrEqual(title.frame.maxX, menu.frame.minX)
         XCTAssertLessThanOrEqual(metadata.frame.maxY, navigationBar.frame.maxY + 1)
+    }
+
+    @MainActor
+    func testCleanupCoordinatorAttemptsLocalResetAfterServerFailure() async {
+        var localResetAttempts = 0
+
+        let failures = await attemptCleanupLegs(
+            serverCleanup: {
+                throw SyntheticCleanupError.serverUnavailable
+            },
+            localReset: {
+                localResetAttempts += 1
+            }
+        )
+
+        XCTAssertEqual(localResetAttempts, 1)
+        XCTAssertEqual(failures, ["server cleanup: synthetic server failure"])
     }
 
     @MainActor
@@ -410,52 +456,98 @@ final class E2EValidationUITests: XCTestCase {
         deviceLabel: String,
         preRunCredentialIDs: Set<String>
     ) async {
-        do {
-            let afterRun = try await listCredentials(serverURL: serverURL, token: token)
-            let attributable = afterRun.filter {
-                !preRunCredentialIDs.contains($0.id)
-                    && $0.scope == "device"
-                    && $0.label == deviceLabel
-                    && $0.revokedAt == nil
-            }
-            for credential in attributable {
-                try await revokeCredential(
-                    credential.id,
+        let failures = await attemptCleanupLegs(
+            serverCleanup: {
+                try await self.cleanUpServerCredential(
                     serverURL: serverURL,
-                    token: token
+                    token: token,
+                    deviceLabel: deviceLabel,
+                    preRunCredentialIDs: preRunCredentialIDs
                 )
+            },
+            localReset: {
+                try self.resetLocalAuthentication(app: app)
             }
+        )
+        if !failures.isEmpty {
+            XCTFail(
+                "E2E cleanup failed after both legs were attempted: "
+                    + failures.joined(separator: "; ")
+            )
+        }
+    }
 
-            let afterCleanup = try await listCredentials(serverURL: serverURL, token: token)
-            let remaining = afterCleanup.filter {
-                !preRunCredentialIDs.contains($0.id)
-                    && $0.scope == "device"
-                    && $0.label == deviceLabel
-                    && $0.revokedAt == nil
-            }
-            XCTAssertTrue(
-                remaining.isEmpty,
-                "the E2E run must not leave its device credential active"
-            )
-            print(
-                "E2E credential cleanup: pre_run=\(preRunCredentialIDs.count) "
-                    + "attributable=\(attributable.count) active_after=\(remaining.count)"
-            )
+    @MainActor
+    private func attemptCleanupLegs(
+        serverCleanup: () async throws -> Void,
+        localReset: () async throws -> Void
+    ) async -> [String] {
+        var failures: [String] = []
+        do {
+            try await serverCleanup()
         } catch {
-            XCTFail("E2E server credential cleanup failed: \(error.localizedDescription)")
+            failures.append("server cleanup: \(error.localizedDescription)")
+        }
+        do {
+            try await localReset()
+        } catch {
+            failures.append("local reset: \(error.localizedDescription)")
+        }
+        return failures
+    }
+
+    @MainActor
+    private func cleanUpServerCredential(
+        serverURL: String,
+        token: String,
+        deviceLabel: String,
+        preRunCredentialIDs: Set<String>
+    ) async throws {
+        let afterRun = try await listCredentials(serverURL: serverURL, token: token)
+        let attributable = afterRun.filter {
+            !preRunCredentialIDs.contains($0.id)
+                && $0.scope == "device"
+                && $0.label == deviceLabel
+                && $0.revokedAt == nil
+        }
+        for credential in attributable {
+            try await revokeCredential(
+                credential.id,
+                serverURL: serverURL,
+                token: token
+            )
         }
 
+        let afterCleanup = try await listCredentials(serverURL: serverURL, token: token)
+        let remaining = afterCleanup.filter {
+            !preRunCredentialIDs.contains($0.id)
+                && $0.scope == "device"
+                && $0.label == deviceLabel
+                && $0.revokedAt == nil
+        }
+        guard remaining.isEmpty else {
+            throw E2ECleanupError.activeCredentialsRemain(remaining.count)
+        }
+        print(
+            "E2E credential cleanup: pre_run=\(preRunCredentialIDs.count) "
+                + "attributable=\(attributable.count) active_after=\(remaining.count)"
+        )
+    }
+
+    @MainActor
+    private func resetLocalAuthentication(app: XCUIApplication) throws {
         app.terminate()
         app.launchEnvironment["DROVER_BASE_URL"] = " "
         app.launchEnvironment["DROVER_TOKEN"] = " "
         app.launchEnvironment["DROVER_UI_TEST_RESET_AUTH"] = "1"
         app.launchArguments = ["-drover.server.url", " "]
         app.launch()
-        XCTAssertTrue(
-            app.buttons["onboarding-already-have-server-button"].waitForExistence(timeout: 10),
-            "teardown relaunch must clear the app credential and return to onboarding"
-        )
-        app.terminate()
+        defer { app.terminate() }
+        guard app.buttons["onboarding-already-have-server-button"]
+            .waitForExistence(timeout: 10)
+        else {
+            throw E2ECleanupError.localResetDidNotReachOnboarding
+        }
     }
 
     @MainActor
@@ -463,17 +555,20 @@ final class E2EValidationUITests: XCTestCase {
         serverURL: String,
         token: String
     ) async throws -> [CredentialSummary] {
-        let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
+        guard let baseURL = URL(string: serverURL) else {
+            throw E2ECleanupError.invalidServerURL
+        }
         var request = URLRequest(url: baseURL.appendingPathComponent("auth/credentials"))
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        guard let http = response as? HTTPURLResponse else {
+            throw E2ECleanupError.nonHTTPResponse
+        }
         guard http.statusCode == 200 else {
-            throw NSError(
-                domain: "DroverE2ECredentialCleanup",
-                code: http.statusCode,
-                userInfo: [NSLocalizedDescriptionKey: "credential list returned HTTP \(http.statusCode)"]
+            throw E2ECleanupError.unexpectedHTTPStatus(
+                operation: "credential list",
+                status: http.statusCode
             )
         }
         return try JSONDecoder().decode(CredentialListResponse.self, from: data).credentials
@@ -485,7 +580,9 @@ final class E2EValidationUITests: XCTestCase {
         serverURL: String,
         token: String
     ) async throws {
-        let baseURL = try XCTUnwrap(URL(string: serverURL), "DROVER_SMOKE_URL must be a URL")
+        guard let baseURL = URL(string: serverURL) else {
+            throw E2ECleanupError.invalidServerURL
+        }
         var request = URLRequest(
             url: baseURL.appendingPathComponent("auth/credentials/\(credentialID)")
         )
@@ -493,12 +590,13 @@ final class E2EValidationUITests: XCTestCase {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         let (_, response) = try await URLSession.shared.data(for: request)
-        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        guard let http = response as? HTTPURLResponse else {
+            throw E2ECleanupError.nonHTTPResponse
+        }
         guard http.statusCode == 204 else {
-            throw NSError(
-                domain: "DroverE2ECredentialCleanup",
-                code: http.statusCode,
-                userInfo: [NSLocalizedDescriptionKey: "credential revoke returned HTTP \(http.statusCode)"]
+            throw E2ECleanupError.unexpectedHTTPStatus(
+                operation: "credential revoke",
+                status: http.statusCode
             )
         }
     }
