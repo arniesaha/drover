@@ -83,8 +83,7 @@ public final class ChatModel {
     }
 
     /// The row updated by the newest raw message. This may sit earlier than
-    /// the visual tail when a tool result attaches to a prior step, so pinned
-    /// scrolling must use `visualTailRowID` instead.
+    /// the final rendered row when a tool result attaches to a prior step.
     public var latestRowID: String? {
         if let rowIDCache, rowIDCache.version == messagesVersion { return rowIDCache.id }
         let id = TranscriptItem.latestRowID(of: messages)
@@ -93,8 +92,8 @@ public final class ChatModel {
     }
 
     /// The bottom-most row in visual transcript order. A newly-arrived raw
-    /// event can update an earlier folded row, so pinned scrolling must use
-    /// this rather than `latestRowID`.
+    /// event can update an earlier folded row, so callers that need the final
+    /// rendered row use this rather than `latestRowID`.
     public var visualTailRowID: String? {
         items.last?.id
     }

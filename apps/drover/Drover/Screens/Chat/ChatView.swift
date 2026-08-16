@@ -1,6 +1,16 @@
 import SwiftUI
 import DroverKit
 
+/// A view-only ID namespace keeps the post-clearance destination impossible
+/// to confuse with a raw or folded transcript row ID (both are strings).
+enum ChatTranscriptScrollTarget: Hashable {
+    case visualTail
+
+    static func bottomDestination(for items: [TranscriptItem]) -> AnyHashable? {
+        items.isEmpty ? nil : AnyHashable(Self.visualTail)
+    }
+}
+
 struct ChatHeaderContent: View {
     let title: String
     let metadata: String
@@ -186,6 +196,7 @@ struct ChatView: View {
             // there — re-folding here meant a full pass over every message
             // on each scroll-phase change.
             let items = model.items
+            let visualTailID = ChatTranscriptScrollTarget.bottomDestination(for: items)
             ScrollView {
                 // Cold open is bounded to the newest 200 raw messages, which
                 // fold to substantially fewer rows. Keep that bounded tail
@@ -255,8 +266,19 @@ struct ChatView: View {
                         row(for: item, isNewest: item.id == items.last?.id)
                             .id(item.id)
                     }
+
+                    // The ID belongs to the bottom of the clearance, not the
+                    // final transcript row. `scrollTo(..., anchor: .bottom)`
+                    // therefore keeps this 24pt gap visible above the composer.
+                    // VStack contributes 8pt before this final 16pt tail.
+                    if let visualTailID {
+                        Color.clear
+                            .frame(height: 16)
+                            .id(visualTailID)
+                    }
                 }
-                .padding()
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
                 // An empty transcript has no row to take the width, so this
                 // stack sized to its padding and the ScrollView sized to the
                 // stack. Nothing showed it while the only thing overlaid on a
@@ -271,12 +293,12 @@ struct ChatView: View {
             // keyboard gone, and dragging it away is cheaper than reaching
             // for the accessory bar's dismiss button.
             .scrollDismissesKeyboard(.interactively)
-            // Pinned means "within 80pt of the end" — close enough that the
+            // Pinned means "within 48pt of the end" — close enough that the
             // user is following the stream, far enough that the last row's
             // own growth doesn't flap the state.
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 geometry.contentOffset.y + geometry.containerSize.height
-                    >= geometry.contentSize.height + geometry.contentInsets.bottom - 80
+                    >= geometry.contentSize.height + geometry.contentInsets.bottom - 48
             } action: { _, isNearBottom in
                 guard isNearBottom != isPinnedToBottom else { return }
                 // Re-pin whenever the bottom is reached, by any means; unpin
@@ -339,25 +361,27 @@ struct ChatView: View {
     private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
         Button {
             cancelPrependScroll()
-            guard let rowID = model.visualTailRowID else { return }
+            guard let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                for: model.items
+            ) else { return }
             withAnimation(.snappy) {
                 isPinnedToBottom = true
-                proxy.scrollTo(rowID, anchor: .bottom)
+                proxy.scrollTo(visualTailID, anchor: .bottom)
             }
             // One unanimated follow-up after layout settles closes any gap
             // left by a tall row changing size during the animated scroll.
             scheduleScroll(with: proxy)
         } label: {
             Image(systemName: "arrow.down")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.primary)
-                .padding(12)
-                .background(.regularMaterial, in: Circle())
-                .overlay(Circle().strokeBorder(.secondary.opacity(0.2)))
-                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(DroverColor.accentHi)
+                .padding(10)
+                .background(DroverColor.surface, in: Circle())
+                .overlay(Circle().strokeBorder(DroverColor.accent.opacity(0.4), lineWidth: 1))
+                .shadow(color: .black.opacity(0.3), radius: 6, y: 3)
         }
         .padding(.trailing, 16)
-        .padding(.bottom, 12)
+        .padding(.bottom, 16)
         .transition(.opacity.combined(with: .scale(scale: 0.8)))
         .accessibilityLabel("Scroll to bottom")
         .accessibilityIdentifier("chat-scroll-to-bottom")
@@ -368,18 +392,22 @@ struct ChatView: View {
         pendingScroll = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, isPinnedToBottom,
-                  let rowID = model.visualTailRowID else {
+                  let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                    for: model.items
+                  ) else {
                 pendingScroll = nil
                 return
             }
-            proxy.scrollTo(rowID, anchor: .bottom)
+            proxy.scrollTo(visualTailID, anchor: .bottom)
             // A row can still grow after the first scroll (for example a
             // disclosure or tall diff), so pin once more after layout settles.
             try? await Task.sleep(for: .milliseconds(200))
             pendingScroll = nil
             guard !Task.isCancelled, isPinnedToBottom,
-                  let settledRowID = model.visualTailRowID else { return }
-            proxy.scrollTo(settledRowID, anchor: .bottom)
+                  let settledVisualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                    for: model.items
+                  ) else { return }
+            proxy.scrollTo(settledVisualTailID, anchor: .bottom)
         }
     }
 

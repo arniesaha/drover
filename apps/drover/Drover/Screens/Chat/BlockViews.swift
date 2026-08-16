@@ -121,45 +121,200 @@ struct TableBlockView: View {
     }
 }
 
+/// Measures the shared marker column before applying each row's indentation, so
+/// nested rows cannot reduce the content width available to root rows.
+private struct ListRowsLayout: Layout {
+    struct Row {
+        let depth: Int
+        let extraTopSpacing: CGFloat
+    }
+
+    let rows: [Row]
+
+    private let markerSpacing: CGFloat = 8
+    private let rowSpacing: CGFloat = 7
+
+    private struct RowMeasurement {
+        let indent: CGFloat
+        let markerProposal: ProposedViewSize
+        let contentProposal: ProposedViewSize
+        let markerYOffset: CGFloat
+        let contentYOffset: CGFloat
+        let height: CGFloat
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        measuredSize(proposal: proposal, subviews: subviews)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard subviews.count == rows.count * 2 else { return }
+
+        let markerWidth = markerColumnWidth(subviews)
+        var y = bounds.minY
+
+        for index in rows.indices {
+            if index > 0 { y += rowSpacing }
+            y += rows[index].extraTopSpacing
+
+            let marker = subviews[index * 2]
+            let content = subviews[index * 2 + 1]
+            let measurement = rowMeasurement(
+                at: index,
+                width: bounds.width,
+                markerWidth: markerWidth,
+                subviews: subviews
+            )
+
+            marker.place(
+                at: CGPoint(
+                    x: bounds.minX + measurement.indent,
+                    y: y + measurement.markerYOffset
+                ),
+                anchor: .topLeading,
+                proposal: measurement.markerProposal
+            )
+            content.place(
+                at: CGPoint(
+                    x: bounds.minX + measurement.indent + markerWidth + markerSpacing,
+                    y: y + measurement.contentYOffset
+                ),
+                anchor: .topLeading,
+                proposal: measurement.contentProposal
+            )
+            y += measurement.height
+        }
+    }
+
+    private func measuredSize(proposal: ProposedViewSize, subviews: Subviews) -> CGSize {
+        guard subviews.count == rows.count * 2 else { return .zero }
+
+        let markerWidth = markerColumnWidth(subviews)
+        let width = proposal.width ?? naturalWidth(
+            markerWidth: markerWidth,
+            subviews: subviews
+        )
+        var height: CGFloat = 0
+
+        for index in rows.indices {
+            if index > 0 { height += rowSpacing }
+            height += rows[index].extraTopSpacing
+            height += rowMeasurement(
+                at: index,
+                width: width,
+                markerWidth: markerWidth,
+                subviews: subviews
+            ).height
+        }
+
+        return CGSize(width: width, height: height)
+    }
+
+    private func rowMeasurement(
+        at index: Int,
+        width: CGFloat,
+        markerWidth: CGFloat,
+        subviews: Subviews
+    ) -> RowMeasurement {
+        let indent = CGFloat(rows[index].depth) * 14
+        let markerProposal = ProposedViewSize(width: markerWidth, height: nil)
+        let contentProposal = ProposedViewSize(
+            width: max(0, width - indent - markerWidth - markerSpacing),
+            height: nil
+        )
+        let markerDimensions = subviews[index * 2].dimensions(in: markerProposal)
+        let contentDimensions = subviews[index * 2 + 1].dimensions(in: contentProposal)
+        let markerBaseline = markerDimensions[VerticalAlignment.firstTextBaseline]
+        let contentBaseline = contentDimensions[VerticalAlignment.firstTextBaseline]
+        let baseline = max(markerBaseline, contentBaseline)
+        let markerYOffset = baseline - markerBaseline
+        let contentYOffset = baseline - contentBaseline
+
+        return RowMeasurement(
+            indent: indent,
+            markerProposal: markerProposal,
+            contentProposal: contentProposal,
+            markerYOffset: markerYOffset,
+            contentYOffset: contentYOffset,
+            height: max(
+                markerYOffset + markerDimensions.height,
+                contentYOffset + contentDimensions.height
+            )
+        )
+    }
+
+    private func markerColumnWidth(_ subviews: Subviews) -> CGFloat {
+        rows.indices.reduce(CGFloat.zero) { width, index in
+            max(width, subviews[index * 2].sizeThatFits(.unspecified).width)
+        }
+    }
+
+    private func naturalWidth(markerWidth: CGFloat, subviews: Subviews) -> CGFloat {
+        rows.indices.reduce(CGFloat.zero) { width, index in
+            let indent = CGFloat(rows[index].depth) * 14
+            let contentWidth = subviews[index * 2 + 1].sizeThatFits(.unspecified).width
+            return max(width, indent + markerWidth + markerSpacing + contentWidth)
+        }
+    }
+}
+
 /// Bullets and ordered items with drawn markers: a filled accent dot at depth
-/// 1, a hollow ring at depth 2 behind a hairline indent rule, tabular mono
-/// numerals when ordered. Drawing them rather than keeping the literal "-" or
-/// "1." is what lets structure survive a long wrapped line.
+/// 1, a hollow ring at depth 2 with clean indentation, tabular mono numerals
+/// with punctuation when ordered.
 struct ListBlockView: View {
     let list: ListBlock
 
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        ListRowsLayout(rows: layoutRows) {
             ForEach(Array(list.items.enumerated()), id: \.offset) { _, item in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    if item.depth > 0 {
-                        Rectangle()
-                            .fill(DroverColor.line)
-                            .frame(width: 1)
-                            .padding(.leading, CGFloat(item.depth - 1) * 12)
-                    }
-                    marker(for: item)
-                        .frame(width: 14, alignment: .leading)
-                    Text(item.content.droverLinks(on: .surface, in: colorScheme))
-                        .droverText(item.depth > 0 ? .nested : .body)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(.leading, CGFloat(item.depth) * 6)
+                marker(for: item)
+                Text(item.content.droverLinks(on: .surface, in: colorScheme))
+                    .droverText(item.depth > 0 ? .nested : .body)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
+        }
+    }
+
+    private var layoutRows: [ListRowsLayout.Row] {
+        list.items.enumerated().map { index, item in
+            ListRowsLayout.Row(
+                depth: item.depth,
+                extraTopSpacing: item.depth == 0
+                    && index > 0
+                    && list.items[index - 1].depth > 0 ? 4 : 0
+            )
         }
     }
 
     @ViewBuilder
     private func marker(for item: ListBlock.Item) -> some View {
         if let ordinal = item.ordinal {
-            Text("\(ordinal)").droverText(.marker)
+            Text("\(ordinal).")
+                .droverText(.marker)
         } else if item.depth == 0 {
-            Circle().fill(DroverColor.accent).frame(width: 5, height: 5)
+            Circle()
+                .fill(DroverColor.accent)
+                .frame(width: 5, height: 5)
+                .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 3 }
+                .frame(width: 14, alignment: .leading)
         } else {
-            Circle().strokeBorder(DroverColor.accentHi, lineWidth: 1).frame(width: 5, height: 5)
+            Circle()
+                .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+                .frame(width: 5, height: 5)
+                .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 3 }
+                .frame(width: 14, alignment: .leading)
         }
     }
 }
