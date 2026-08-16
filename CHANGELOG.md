@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-15
+
+### Fixed
+
+- A handoff or "continue in a new session" no longer reports failure for work
+  the host completed. The hub stopped waiting after 15 seconds and reported
+  the timeout as if the host were unreachable, so the app advised retrying a
+  create that may already have produced a session. A timeout is now reported
+  as such, says the session may exist, and is recorded on the hub
+- Repeating a handoff adopts the session the first attempt created rather than
+  starting a second agent in the same repository
+- A pipeline job that cannot record an attempt is parked instead of retried
+  forever. One job produced 916 of the 917 warnings in a single server log,
+  never advancing and never giving up, because a job that cannot be leased had
+  no other state to move to
+- An event re-delivered by a host is stored once instead of raising a duplicate
+  key error. The host retains undelivered batches and re-offers them, and the
+  hub's guard against that was a check two concurrent deliveries could both
+  pass, which accounted for 195 tracebacks in one server log
+- A completion that arrives twice no longer queues a second recap for work
+  already summarised
+- A failed dedup-key lookup during ingestion says so, rather than silently
+  reporting that nothing in the batch is a duplicate
+- Chat no longer renders its unreachable message one letter per line. An empty
+  transcript sized itself to its padding, and the failure notice inherited a
+  container about one character wide
+- Terminal's Retry acts on a connection attempt that is already running.
+  Previously it only cancelled a pending backoff, so pressing it at the moment
+  it was most likely to be pressed did nothing
+- Observed cost reads `Not reported` rather than `$0.00` when no session in the
+  window reported one, and the Analytics screen labels it API-billed and shows
+  its coverage, as the fleet card already did
+- The session title has room again: its subtitle no longer spends width on a
+  percentage derived from the two numbers printed beside it
+
+### Documentation
+
+- Favourite working directories, including how to scope one to a single host
+- What `[server] metrics_host` means for local `drover-server` commands
+- Architecture diagram regenerated for v0.3
+
 ### Fixed
 
 - Observed cost of zero is no longer rendered as `$0.00` when nothing measured
