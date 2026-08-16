@@ -274,7 +274,6 @@ public final class SessionStore {
             // load stuck behind repeated cancellations indistinguishable from
             // an unreachable hub, and left "Connecting…" with nothing to say.
             if Self.isCancellation(error) {
-                lastRefreshFailure = .cancellation
                 lastRefreshOutcome = Self.cancelledOutcome
                 noteCancelledFirstLoad()
                 return
@@ -309,6 +308,7 @@ public final class SessionStore {
         cancelledFirstLoads += 1
         guard cancelledFirstLoads >= Self.cancelledFirstLoadLimit else { return }
         isReachable = false
+        lastRefreshFailure = .cancellation
         lastError = "The first load kept being interrupted before it landed — the hub may be busy."
     }
 

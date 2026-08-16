@@ -632,6 +632,35 @@ struct StoreTests {
     #expect(!store.isTailscaleTransportFailure)
 }
 
+@Test @MainActor func ignoredCancellationsKeepTheDisplayedFailureClassificationInSync() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    defer { MockURLProtocol.transportError = nil }
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.lastError == "Can't reach the hub over Tailscale")
+    #expect(store.isTailscaleTransportFailure)
+
+    MockURLProtocol.transportError = URLError(.cancelled)
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.lastError == "Can't reach the hub over Tailscale")
+    #expect(store.isTailscaleTransportFailure)
+
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.lastError == "Can't reach the hub over Tailscale")
+    #expect(store.isTailscaleTransportFailure)
+
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .cancellation)
+    #expect(store.lastError == "The first load kept being interrupted before it landed — the hub may be busy.")
+    #expect(!store.isTailscaleTransportFailure)
+}
+
 @Test @MainActor func connectingDetailReportsTailscaleUnreachableHub() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
