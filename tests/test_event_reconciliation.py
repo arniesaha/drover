@@ -12,6 +12,7 @@ from time import monotonic, sleep
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.harness import registry as registry_module
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -278,13 +279,22 @@ def test_daemon_retries_durable_reconciliation_after_a_successful_heartbeat(tmp_
         pusher = wire_event_pusher(state)
         assert pusher is not None
         try:
+            assert _wait_until(
+                lambda: any(
+                    request["path"] == "/harness/events"
+                    for request in _FakeCentralHandler.requests
+                )
+            )
+            first_worker = state.event_reconciliation_thread
+            assert first_worker is not None
+            first_worker.join(timeout=2.0)
             assert state.event_reconciliation_pending is True
             assert pusher._drain() == []
 
             _FakeCentralHandler.failing = False
             _heartbeat_once(state)
 
-            assert state.event_reconciliation_pending is False
+            assert _wait_until(lambda: state.event_reconciliation_pending is False)
             delivered = [
                 request
                 for request in _FakeCentralHandler.requests
@@ -559,6 +569,52 @@ def test_interior_gap_repair_rebuilds_derived_state_from_the_full_sequence(tmp_p
         assert repaired.last_activity == before_repair.last_activity
     finally:
         server.shutdown()
+
+
+def test_remote_ingest_rolls_back_event_when_projection_derivation_fails(
+    tmp_path, monkeypatch
+):
+    registry = _init_registry(tmp_path)
+    session = registry.create_session(
+        host_id="host-a",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+        status="running",
+    )
+    original = registry.get_session(session.session_id)
+
+    def fail_derivation(*_args, **_kwargs):
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(
+        registry_module, "_derive_structured_awaiting", fail_derivation, raising=False
+    )
+
+    with pytest.raises(RuntimeError, match="projection failed"):
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": "atomic-event",
+                    "session_id": session.session_id,
+                    "event_type": "approval_prompt",
+                    "payload": {
+                        "event_id": "atomic-event",
+                        "session_id": session.session_id,
+                        "seq": 1,
+                        "type": "approval_prompt",
+                        "payload": {"request_id": "request-1"},
+                    },
+                    "seq": 1,
+                    "created_at": datetime.now(timezone.utc),
+                }
+            ]
+        )
+
+    assert registry.get_event("atomic-event") is None
+    repaired = registry.get_session(session.session_id)
+    assert repaired.awaiting == original.awaiting
+    assert repaired.last_activity == original.last_activity
 
 
 def test_e2e_restart_event_reconciliation(tmp_path):

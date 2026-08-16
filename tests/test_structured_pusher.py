@@ -117,6 +117,58 @@ def test_pusher_flushes_immediately_on_turn_complete():
     assert {event["event_id"] for event in events} == {"e1", "e2"}
 
 
+def test_pusher_serializes_reconciliation_and_live_posts(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    guard = threading.Lock()
+    calls = 0
+    active = 0
+    max_active = 0
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def blocking_urlopen(_request, *, timeout):
+        del timeout
+        nonlocal calls, active, max_active
+        with guard:
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            call_number = calls
+        if call_number == 1:
+            entered.set()
+            release.wait(timeout=2.0)
+        with guard:
+            active -= 1
+        return _Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", blocking_urlopen)
+    pusher = EventPusher("http://central.invalid", "secret-token")
+    first = threading.Thread(target=lambda: pusher.post_batch([{"event_id": "old"}]))
+    second = threading.Thread(target=lambda: pusher.post_batch([{"event_id": "live"}]))
+
+    first.start()
+    assert entered.wait(timeout=1.0)
+    second.start()
+    sleep(0.1)
+    try:
+        assert calls == 1
+    finally:
+        release.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+    assert calls == 2
+    assert max_active == 1
+
+
 def test_pusher_redelivers_same_events_after_failure_until_success():
     server = _start_fake_central()
     try:

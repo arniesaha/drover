@@ -12,6 +12,8 @@ These tests are about the wire, not the logic on either end of it.
 from __future__ import annotations
 
 import dataclasses
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +69,51 @@ def test_a_successful_beat_records_that_we_reached_the_hub(monkeypatch):
     daemon_module._heartbeat_once(state)
 
     assert state.registered_at_least_once is True
+
+
+def test_a_successful_beat_never_blocks_on_durable_event_reconciliation(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Registry:
+        def list_events_for_reconciliation(self, **_kwargs):
+            entered.set()
+            release.wait(timeout=2.0)
+            return []
+
+    class _Pusher:
+        @staticmethod
+        def is_configured():
+            return True
+
+    state = SimpleNamespace(
+        central_url="http://127.0.0.1:7080",
+        updater=None,
+        registered_at_least_once=False,
+        pusher=_Pusher(),
+        registry=_Registry(),
+        host_id="host-1",
+        event_reconciliation_pending=True,
+        event_reconciliation_lock=threading.Lock(),
+        event_reconciliation_thread=None,
+    )
+    monkeypatch.setattr(daemon_module, "register_daemon_host_remote", lambda _state: {})
+
+    timer = threading.Timer(0.5, release.set)
+    timer.start()
+    try:
+        started = time.monotonic()
+        daemon_module._heartbeat_once(state)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+        assert entered.wait(timeout=1.0)
+    finally:
+        release.set()
+        timer.cancel()
+        thread = state.event_reconciliation_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
 
 
 def test_an_unreachable_hub_leaves_the_registration_flag_alone(monkeypatch):
@@ -152,6 +199,58 @@ def test_run_harnessd_wires_nothing_when_updates_are_disabled(monkeypatch, tmp_p
     state = _run_harnessd_capturing_state(monkeypatch, tmp_path, cfg)
 
     assert state.updater is None
+
+
+def test_run_harnessd_binds_before_it_starts_event_reconciliation(
+    monkeypatch, tmp_path
+):
+    order: list[str] = []
+
+    class _State:
+        api_token = ""
+        host_token = None
+        updater = None
+        registered_at_least_once = False
+        pty = SimpleNamespace(close_all=lambda: None)
+        auth = SimpleNamespace(close_all=lambda: None)
+
+    class _Server:
+        def serve_forever(self):
+            raise RuntimeError("stop")
+
+        def server_close(self):
+            pass
+
+    def bind(**_kwargs):
+        order.append("bound")
+        return _Server()
+
+    def wire(_state):
+        order.append("reconciliation-wired")
+        return None
+
+    monkeypatch.setattr(daemon_module, "HarnessDaemonState", lambda **_kwargs: _State())
+    monkeypatch.setattr(daemon_module, "resolve_daemon_token", lambda _token: "token")
+    monkeypatch.setattr(daemon_module, "create_harness_server", bind)
+    monkeypatch.setattr(daemon_module, "wire_event_pusher", wire)
+    monkeypatch.setattr(daemon_module, "register_daemon_host", lambda _state: None)
+    monkeypatch.setattr(
+        daemon_module, "register_daemon_host_remote", lambda _state: None
+    )
+    monkeypatch.setattr(daemon_module, "start_remote_heartbeat", lambda _state: None)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        daemon_module.run_harnessd(
+            host_id="test-host",
+            display_name="Test Host",
+            kind="mac",
+            duckdb_path=tmp_path / "drover.duckdb",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            cfg=dataclasses.replace(default_config(), update_enabled=False),
+        )
+
+    assert order == ["bound", "reconciliation-wired"]
 
 
 def test_the_harnessd_cli_passes_the_config_through(monkeypatch, tmp_path):

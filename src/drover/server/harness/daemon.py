@@ -1161,6 +1161,7 @@ class HarnessDaemonState:
     # outage is retried after the next successful heartbeat.
     event_reconciliation_pending: bool = True
     event_reconciliation_lock: threading.Lock = field(default_factory=threading.Lock)
+    event_reconciliation_thread: threading.Thread | None = None
     provider_usage_probe: CodexUsageProbe | None = None
     claude_usage_probe: Any | None = None
     agy_usage_probe: Any | None = None
@@ -3265,7 +3266,7 @@ def _heartbeat_once(state: HarnessDaemonState) -> None:
     # tests `is None` rather than truthiness; the watchdog reads this flag to
     # decide whether a freshly activated version can talk to the hub at all.
     state.registered_at_least_once = True
-    _reconcile_persisted_events(state)
+    _schedule_event_reconciliation(state)
     updater = getattr(state, "updater", None)
     if updater is not None:
         updater.observe(body)
@@ -3293,6 +3294,28 @@ def _reconcile_persisted_events(state: HarnessDaemonState) -> bool:
         state.event_reconciliation_pending = False
         log.info("structured event reconciliation completed: offered=%d", result)
         return True
+
+
+def _schedule_event_reconciliation(
+    state: HarnessDaemonState,
+) -> threading.Thread | None:
+    """Wake one background replay worker without delaying heartbeat liveness."""
+    pusher = getattr(state, "pusher", None)
+    if pusher is None or not state.event_reconciliation_pending:
+        return None
+    with state.event_reconciliation_lock:
+        existing = getattr(state, "event_reconciliation_thread", None)
+        if existing is not None and existing.is_alive():
+            return existing
+        thread = threading.Thread(
+            target=_reconcile_persisted_events,
+            args=(state,),
+            name="drover-event-reconciliation",
+            daemon=True,
+        )
+        state.event_reconciliation_thread = thread
+        thread.start()
+        return thread
 
 
 def _rollback_watchdog(
@@ -3429,7 +3452,7 @@ def wire_event_pusher(state: HarnessDaemonState) -> EventPusher | None:
     pusher.start()
     state.push_event = pusher.push
     state.pusher = pusher
-    _reconcile_persisted_events(state)
+    _schedule_event_reconciliation(state)
     return pusher
 
 
@@ -3488,15 +3511,18 @@ def run_harnessd(
         layout = RuntimeLayout(config_home())
         state.updater = HostUpdater(state, layout, cfg)
         _start_rollback_watchdog(state, layout)
-    pusher = wire_event_pusher(state)
-    register_daemon_host(state)
-    _heartbeat_once(state)
-    start_remote_heartbeat(state)
     server = create_harness_server(
         listen_host=listen_host,
         listen_port=listen_port,
         state=state,
     )
+    # Bind before any historical replay starts. A large durable ledger must
+    # never hold the daemon socket closed or trip the updater's liveness
+    # watchdog during an otherwise healthy restart.
+    pusher = wire_event_pusher(state)
+    register_daemon_host(state)
+    _heartbeat_once(state)
+    start_remote_heartbeat(state)
     # After create_harness_server, and on its *bound* port: announcing a live
     # relay before the socket is bound gives the hub a window in which every
     # proxied call 502s, and listen_port is 0 whenever the port is ephemeral.

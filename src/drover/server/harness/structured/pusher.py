@@ -57,6 +57,10 @@ class EventPusher:
         self._queue: SimpleQueue[dict[str, Any]] = SimpleQueue()
         self._queue_len = 0
         self._queue_lock = threading.Lock()
+        # Reconciliation and the live worker share one central projection.
+        # Their requests must not overlap or a replay rebuild can race a live
+        # tail update and overwrite newer derived session state.
+        self._post_lock = threading.Lock()
         self._overflowing = False
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -76,6 +80,9 @@ class EventPusher:
 
     def is_configured(self) -> bool:
         return bool(self._central_url and self._token)
+
+    def is_stopping(self) -> bool:
+        return self._stop.is_set()
 
     def post_batch(self, batch: list[dict[str, Any]]) -> bool:
         """POST one batch; True only for a 2xx response."""
@@ -230,11 +237,12 @@ class EventPusher:
                 "Authorization": f"Bearer {self._token}",
             },
         )
-        try:
-            with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
-                return 200 <= response.status < 300
-        except (OSError, URLError):
-            return False
+        with self._post_lock:
+            try:
+                with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
+                    return 200 <= response.status < 300
+            except (OSError, URLError):
+                return False
 
 
 def _is_flush_now_event(event: dict[str, Any]) -> bool:
@@ -273,6 +281,8 @@ def reconcile_unsent_events(
     after_event_id = None
     reconciled_count = 0
     while True:
+        if getattr(pusher, "is_stopping", lambda: False)():
+            return None
         try:
             events = registry.list_events_for_reconciliation(
                 host_id=host_id,
