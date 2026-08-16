@@ -333,6 +333,7 @@ public final class SessionStore {
             let continued = try await client.continueSession(sessionID: sessionID,
                                                              targetHarness: targetHarness)
             lastError = nil
+            lastRefreshFailure = nil
             return continued
         } catch {
             switch error {
@@ -341,6 +342,7 @@ public final class SessionStore {
             default:
                 lastError = "Couldn't start handoff — is the host online?"
             }
+            lastRefreshFailure = nil
             return nil
         }
     }

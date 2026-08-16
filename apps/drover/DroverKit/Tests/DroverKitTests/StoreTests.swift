@@ -246,6 +246,37 @@ struct StoreTests {
     #expect(store.lastError == "host mac-mini is offline")
 }
 
+@Test @MainActor func continueSessionConflictReplacesAStaleTailscaleTransportPresentation() async throws {
+    let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
+    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let store = SessionStore(client: tsClient)
+
+    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    await store.refresh()
+
+    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    await store.refresh()
+    #expect(store.lastRefreshFailure == .transport)
+    #expect(store.isTailscaleTransportFailure)
+
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8)) }
+    let continued = await store.continueSession("harness-1")
+
+    #expect(continued == nil)
+    #expect(store.lastError == "host mac-mini is offline")
+    #expect(store.lastRefreshFailure == nil)
+    #expect(!store.isTailscaleTransportFailure)
+
+    let summary = FleetSummaryPresentation(
+        snapshot: store.snapshot,
+        isReachable: store.isReachable,
+        error: store.lastError,
+        isTailscaleTransportFailure: store.isTailscaleTransportFailure
+    )
+    #expect(summary.fleetLine == "host mac-mini is offline")
+}
+
 @Test @MainActor func continueSessionNonServerFailureGetsGenericError() async throws {
     MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
     let store = SessionStore(client: client())
