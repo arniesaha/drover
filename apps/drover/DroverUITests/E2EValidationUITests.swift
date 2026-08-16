@@ -74,7 +74,7 @@ final class E2EValidationUITests: XCTestCase {
             throw XCTSkip("DROVER_SMOKE_TOKEN not set — live E2E skipped")
         }
         let serverURL = env["DROVER_SMOKE_URL"] ?? "http://127.0.0.1:7080"
-        let cwd = env["DROVER_SMOKE_CWD"] ?? "/private/tmp/drover-e2e"
+        let cwd = env["DROVER_SMOKE_CWD"] ?? "/private/tmp"
         let pairingCode = try await mintDevicePairingCode(
             serverURL: serverURL,
             token: token
@@ -157,18 +157,22 @@ final class E2EValidationUITests: XCTestCase {
         cwdField.tap()
         cwdField.typeText(cwd)
 
-        let promptEditor = app.textViews.firstMatch
+        let promptEditor = app.textFields["prompt-input"]
         XCTAssertTrue(promptEditor.waitForExistence(timeout: 5),
                       "structured harness should show the starting-prompt editor")
         promptEditor.tap()
         promptEditor.typeText("Reply with exactly the single word: HORSERADISH")
+        let dismissKeyboard = app.buttons["keyboard-dismiss"]
+        XCTAssertTrue(dismissKeyboard.waitForExistence(timeout: 5))
+        dismissKeyboard.tap()
         shoot(app, "03-launch-sheet")
 
         app.buttons["launch-confirm-button"].tap()
 
         // ── 3. Chat: wait for the model's reply ───────────────────────────
-        let chatBar = app.navigationBars["Chat"]
-        XCTAssertTrue(chatBar.waitForExistence(timeout: 30), "launch should push straight into Chat")
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 30),
+                      "launch should push straight into Chat")
         shoot(app, "04-chat-connected")
 
         let horseradish = app.staticTexts["HORSERADISH"]
@@ -178,12 +182,8 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "05-chat-first-reply")
 
         // ── 4. A follow-up turn through the composer ──────────────────────
-        // TextField(axis: .vertical) may surface as either element type.
-        var composer = app.textFields["Message"]
-        if !composer.waitForExistence(timeout: 5) {
-            composer = app.textViews["Message"]
-            XCTAssertTrue(composer.waitForExistence(timeout: 5))
-        }
+        let composer = app.textFields["prompt-input"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
         composer.tap()
         composer.typeText("How many legs does a spider have? Reply with only the number.")
         let send = app.buttons["composer-send"]
@@ -196,7 +196,7 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "06-chat-second-reply")
 
         // ── 5. Navigate back, find the session in the list, resume it ─────
-        app.navigationBars["Chat"].buttons.firstMatch.tap()
+        app.navigationBars.firstMatch.buttons.firstMatch.tap()
         XCTAssertTrue(launchButton.waitForExistence(timeout: 10))
         shoot(app, "07-sessions-with-live-session")
 
@@ -208,7 +208,7 @@ final class E2EValidationUITests: XCTestCase {
                       "the launched session should appear in a bucket")
         row.tap()
 
-        XCTAssertTrue(chatBar.waitForExistence(timeout: 10), "row should reopen the chat")
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10), "row should reopen the chat")
         XCTAssertTrue(horseradish.waitForExistence(timeout: 60),
                       "reopening the session should replay the transcript")
         shoot(app, "08-chat-resumed")
@@ -233,8 +233,8 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "10-handoff-chat")
 
         // ── 7. Back out; original session is still reachable ──────────────
-        app.navigationBars["Chat"].buttons.firstMatch.tap()
-        XCTAssertTrue(chatBar.waitForExistence(timeout: 10),
+        app.navigationBars.firstMatch.buttons.firstMatch.tap()
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10),
                       "backing out of the handoff chat returns to the source chat")
         shoot(app, "11-back-on-source-chat")
 
