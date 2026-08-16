@@ -113,15 +113,29 @@ struct SessionsView: View {
             .overlay {
                 if !store.hasLoadedOnce {
                     if let error = store.lastError {
-                        ContentUnavailableView {
-                            Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
-                        } description: {
-                            Text(error)
-                        } actions: {
-                            Button("Retry") {
-                                Task { await store.refresh() }
+                        if client.config.isTailscaleAddress {
+                            ContentUnavailableView {
+                                Label("Tailscale is not connected", systemImage: "network.badge.shield.half.filled")
+                            } description: {
+                                let host = client.config.tailscaleHost ?? client.config.baseURL.host ?? "Tailscale"
+                                Text("Your Drover hub is configured at a Tailscale address (\(host)). Make sure Tailscale is turned on and connected to your tailnet on this device.")
+                            } actions: {
+                                Button("Retry") {
+                                    Task { await store.refresh() }
+                                }
+                                .buttonStyle(.bordered)
                             }
-                            .buttonStyle(.bordered)
+                        } else {
+                            ContentUnavailableView {
+                                Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+                            } description: {
+                                Text(error)
+                            } actions: {
+                                Button("Retry") {
+                                    Task { await store.refresh() }
+                                }
+                                .buttonStyle(.bordered)
+                            }
                         }
                     } else {
                         // The spinner alone cannot distinguish a hub that is
@@ -235,7 +249,8 @@ struct SessionsView: View {
         FleetSummaryPresentation(
             snapshot: store.snapshot,
             isReachable: store.isReachable,
-            error: store.lastError
+            error: store.lastError,
+            isTailscale: client.config.isTailscaleAddress
         )
     }
 

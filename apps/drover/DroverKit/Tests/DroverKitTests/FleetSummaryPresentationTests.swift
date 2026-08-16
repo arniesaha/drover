@@ -80,3 +80,57 @@ import Testing
     #expect(summary.headline == nil)
     #expect(summary.fleetLine == "0 hosts live")
 }
+
+
+@Test func fleetSummaryReportsTailscaleNotConnectedWhenTailscaleUnreachable() throws {
+    let snapshot = try HarnessSnapshot.decode(from: fleetSnapshotJSON)
+
+    // Unreachable with default error over Tailscale
+    let summary1 = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        isTailscale: true
+    )
+    #expect(summary1.isStale == true)
+    #expect(summary1.fleetLine == "Tailscale not connected")
+    #expect(summary1.needsCount == 1)
+
+    // Unreachable with Tailscale transport error string
+    let summary2 = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Can't reach the hub over Tailscale",
+        isTailscale: true
+    )
+    #expect(summary2.isStale == true)
+    #expect(summary2.fleetLine == "Tailscale not connected")
+
+    // Unreachable with generic unreachable description on Tailscale
+    let summary3 = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Can't reach the hub",
+        isTailscale: true
+    )
+    #expect(summary3.isStale == true)
+    #expect(summary3.fleetLine == "Tailscale not connected")
+
+    // Unreachable with explicit non-transport error (e.g. auth error) preserves error
+    let summary4 = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: false,
+        error: "Token rejected — check Settings",
+        isTailscale: true
+    )
+    #expect(summary4.isStale == true)
+    #expect(summary4.fleetLine == "Token rejected — check Settings")
+
+    // Reachable on Tailscale returns normal live summary
+    let summary5 = FleetSummaryPresentation(
+        snapshot: snapshot,
+        isReachable: true,
+        isTailscale: true
+    )
+    #expect(summary5.isStale == false)
+    #expect(summary5.fleetLine == "2 running · 1 finished · 1 host live")
+}

@@ -19,7 +19,15 @@ public struct FleetSummaryPresentation: Sendable, Equatable {
     /// can render the strip in its offline form and offer a retry.
     public let isStale: Bool
 
-    public init(snapshot: HarnessSnapshot?, isReachable: Bool = true, error: String? = nil) {
+    public static let unreachableLine = "Can't reach the hub"
+    public static let unreachableTailscaleLine = "Tailscale not connected"
+
+    public init(
+        snapshot: HarnessSnapshot?,
+        isReachable: Bool = true,
+        error: String? = nil,
+        isTailscale: Bool = false
+    ) {
         let sessions = snapshot?.sessions ?? []
         let hosts = snapshot?.hosts ?? []
 
@@ -33,7 +41,16 @@ public struct FleetSummaryPresentation: Sendable, Equatable {
             // Deliberately not the raw transport error: the fleet line is a
             // one-line status, and DroverError's localized descriptions are
             // already sentence-shaped for the retry affordance beside it.
-            fleetLine = error ?? "Can't reach the hub"
+            if let error,
+               error != Self.unreachableLine,
+               error != DroverError.unreachableTailscaleDescription,
+               error != Self.unreachableTailscaleLine {
+                fleetLine = error
+            } else if isTailscale {
+                fleetLine = Self.unreachableTailscaleLine
+            } else {
+                fleetLine = error ?? Self.unreachableLine
+            }
             return
         }
 

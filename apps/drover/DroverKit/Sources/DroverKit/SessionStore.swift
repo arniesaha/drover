@@ -27,6 +27,16 @@ public final class SessionStore {
     public private(set) var lastError: String?
     public private(set) var isReachable: Bool = false
 
+    /// True when the underlying client is pointed at a Tailscale endpoint.
+    public var isTailscaleAddress: Bool {
+        client?.config.isTailscaleAddress ?? false
+    }
+
+    /// The host part if the underlying client is pointed at a Tailscale endpoint.
+    public var tailscaleHost: String? {
+        client?.config.tailscaleHost
+    }
+
     /// True once any refresh has succeeded. Lets the UI distinguish
     /// "never loaded" (spinner / retriable error) from "loaded but empty".
     /// Never reset: after first success the list renders last-known state.
@@ -248,7 +258,10 @@ public final class SessionStore {
             }
             cancelledFirstLoads = 0
             isReachable = false
-            lastError = Self.errorMessage(for: error)
+            lastError = Self.errorMessage(
+                for: error,
+                isTailscale: client.config.isTailscaleAddress
+            )
             lastRefreshOutcome = lastError
             // Deliberately keep the cached `snapshot` as-is.
         }
@@ -406,12 +419,15 @@ public final class SessionStore {
         }
     }
 
-    private static func errorMessage(for error: Error) -> String {
+    private static func errorMessage(for error: Error, isTailscale: Bool = false) -> String {
         // DroverError is LocalizedError, so localizedDescription is the human
         // string. The old "\(error)" fallback printed raw enum reflection —
         // that is where the literal `transport("cancelled")` banner came from.
         if let droverError = error as? DroverError {
-            return droverError.localizedDescription
+            return droverError.localizedDescription(isTailscale: isTailscale)
+        }
+        if isTailscale {
+            return DroverError.unreachableTailscaleDescription
         }
         return (error as NSError).localizedDescription
     }
