@@ -177,7 +177,9 @@ def _existing_dedup_keys(con, rows: Iterable[dict]) -> set:
     params: list = list(partitions)
     agent_ids = sorted({agent for agents in partitions.values() for agent in agents})
     try:
-        rows = con.execute(
+        # Not `rows`: that is this function's own parameter, and rebinding it
+        # here made the query result and the incoming batch share a name.
+        existing_rows = con.execute(
             f"""
             WITH bounded_agent_events AS (
               {source_sql}
@@ -189,8 +191,13 @@ def _existing_dedup_keys(con, rows: Iterable[dict]) -> set:
             """,
             [*params, agent_ids],
         ).fetchall()
-        return {r[0] for r in rows}
-    except duckdb.Error:
+        return {r[0] for r in existing_rows}
+    except duckdb.Error as exc:
+        # An empty set here does not mean "nothing is a duplicate", but that is
+        # how the caller reads it: every row looks new and the whole batch is
+        # written again. Losing the reason for that in silence is how a
+        # re-ingest turns into duplicate rows with nothing to explain them.
+        log.warning("dedup-key lookup failed; treating the batch as new: %s", exc)
         return set()
 
 
