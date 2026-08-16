@@ -33,9 +33,16 @@ struct LaunchView: View {
             Section("Host") {
                 Picker("Host", selection: $model.hostID) {
                     ForEach(model.availableHosts) { host in
-                        Text(host.title)
+                        Text(host.title + (host.status == "stale" ? " (stale)" : ""))
                             .tag(host.id)
                     }
+                }
+
+                if let warning = model.hostWarning {
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(DroverColor.warn)
+                        .accessibilityIdentifier("launch-host-warning")
                 }
             }
 
@@ -129,8 +136,7 @@ struct LaunchView: View {
                         Text("Launch")
                     }
                 }
-                .disabled(isLaunching || model.isFetchingSnapshot
-                          || model.hostID.isEmpty || model.harness.isEmpty)
+                .disabled(!model.canLaunch || isLaunching || model.isFetchingSnapshot)
                 .accessibilityIdentifier("launch-confirm-button")
             }
         }
