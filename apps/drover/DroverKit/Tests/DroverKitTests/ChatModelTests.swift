@@ -1078,6 +1078,22 @@ struct ChatModelTests {
     #expect(model.hint == "Could not interrupt — try again.")
 }
 
+// A hub that gave up waiting is not a hub that refused. The host answers the
+// create and then cuts a per-session worktree, which outran the hub's budget
+// on a real handoff: the daemon finished, its reply hit a closed socket, and
+// the app said "try again" for a session that may already exist. Retrying
+// that is how you end up with two.
+@Test @MainActor func aHostStillWorkingIsNotAnInvitationToRetry() async throws {
+    MockURLProtocol.handler = { _ in
+        (504, Data(#"{"error": "harness host did not answer within 120s"}"#.utf8))
+    }
+    let model = ChatModel(client: client(), sessionID: "s1")
+
+    await model.interrupt()
+
+    #expect(model.hint == "The host is still working on it — check your sessions before trying again.")
+}
+
 // MARK: - Stream lifecycle (fix round 1)
 
 /// Regression for the stop()→start() re-entrancy race: a stale
