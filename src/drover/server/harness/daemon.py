@@ -1161,6 +1161,9 @@ class HarnessDaemonState:
     # outage is retried after the next successful heartbeat.
     event_reconciliation_pending: bool = True
     event_reconciliation_lock: threading.Lock = field(default_factory=threading.Lock)
+    event_reconciliation_schedule_lock: threading.Lock = field(
+        default_factory=threading.Lock
+    )
     event_reconciliation_thread: threading.Thread | None = None
     provider_usage_probe: CodexUsageProbe | None = None
     claude_usage_probe: Any | None = None
@@ -3303,7 +3306,9 @@ def _schedule_event_reconciliation(
     pusher = getattr(state, "pusher", None)
     if pusher is None or not state.event_reconciliation_pending:
         return None
-    with state.event_reconciliation_lock:
+    with state.event_reconciliation_schedule_lock:
+        if not state.event_reconciliation_pending:
+            return None
         existing = getattr(state, "event_reconciliation_thread", None)
         if existing is not None and existing.is_alive():
             return existing

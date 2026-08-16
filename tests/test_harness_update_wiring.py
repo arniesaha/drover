@@ -95,6 +95,7 @@ def test_a_successful_beat_never_blocks_on_durable_event_reconciliation(monkeypa
         host_id="host-1",
         event_reconciliation_pending=True,
         event_reconciliation_lock=threading.Lock(),
+        event_reconciliation_schedule_lock=threading.Lock(),
         event_reconciliation_thread=None,
     )
     monkeypatch.setattr(daemon_module, "register_daemon_host_remote", lambda _state: {})
@@ -102,12 +103,15 @@ def test_a_successful_beat_never_blocks_on_durable_event_reconciliation(monkeypa
     timer = threading.Timer(0.5, release.set)
     timer.start()
     try:
+        worker = daemon_module._schedule_event_reconciliation(state)
+        assert worker is not None
+        assert entered.wait(timeout=1.0)
+
         started = time.monotonic()
         daemon_module._heartbeat_once(state)
         elapsed = time.monotonic() - started
 
         assert elapsed < 0.2
-        assert entered.wait(timeout=1.0)
     finally:
         release.set()
         timer.cancel()

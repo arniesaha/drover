@@ -311,6 +311,8 @@ def reconcile_unsent_events(
                 payload["ts"] = event.created_at.isoformat()
             records.append(payload)
 
+        if getattr(pusher, "is_stopping", lambda: False)():
+            return None
         if not pusher.post_batch(records):
             return None
         reconciled_count += len(records)
