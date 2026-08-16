@@ -23,6 +23,7 @@ struct SettingsView: View {
     @State private var statusMessage: String?
     @State private var statusIsError = false
     @State private var showSignOutConfirmation = false
+    @State private var showServerSetupGuide = false
 
     var body: some View {
         ScrollView {
@@ -48,6 +49,37 @@ struct SettingsView: View {
                     }
                 }
                 .accessibilityIdentifier("settings-scan-pairing")
+
+                if environment.client != nil {
+                    Button {
+                        showServerSetupGuide = true
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 15, weight: .medium))
+                            Text("Set Up Another Host").droverText(.h3)
+                            Spacer(minLength: 0)
+                        }
+                        .foregroundStyle(DroverColor.accentHi)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 13)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(DroverColor.line, lineWidth: 1)
+                        }
+                    }
+                    .accessibilityIdentifier("settings-server-setup-guide")
+                    .sheet(isPresented: $showServerSetupGuide) {
+                        NavigationStack {
+                            ServerSetupGuideView(
+                                initialMode: .host,
+                                knownServerURL: environment.config?.baseURL.absoluteString
+                            )
+                        }
+                        .presentationCornerRadius(24)
+                    }
+                }
 
                 field(label: "Server", hint: "Where drover-server is listening.") {
                     TextField("http://host:7080", text: $urlString)

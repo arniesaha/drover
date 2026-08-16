@@ -134,7 +134,7 @@ private struct ChatHeaderFixtureRoot: View {
 }
 #endif
 
-/// Composition root: no client configured → onboarding `SettingsView`;
+/// Composition root: no client configured → onboarding `OnboardingView`;
 /// otherwise a `NavigationStack` over `SessionsView`, whose own header row
 /// carries the theme toggle and the way into Settings (the design puts both
 /// beside the wordmark rather than in a navigation bar, so there is no toolbar
@@ -170,7 +170,7 @@ private struct RootView: View {
                 }
             } else {
                 NavigationStack {
-                    SettingsView(environment: environment)
+                    OnboardingView(environment: environment)
                 }
             }
         }
