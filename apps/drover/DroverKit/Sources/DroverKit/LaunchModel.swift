@@ -62,15 +62,52 @@ public final class LaunchModel {
         self.client = client
         self.snapshot = snapshot
         self.runPreferences = HarnessModelCatalogState(client: client, store: store)
-        let firstHost = (snapshot?.hosts ?? []).first { $0.status == "online" }
+        let hosts = (snapshot?.hosts ?? []).filter { $0.status == "online" || $0.status == "stale" }
+        let firstHost = hosts.first { $0.status == "online" } ?? hosts.first
         self.hostID = firstHost?.id ?? ""
         self.harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
         self.runPreferences.select(hostID: hostID, harness: harness)
     }
 
-    /// Online hosts only — offline hosts can't accept a new session.
+    /// Online and stale hosts, plus the selected host if it just went offline.
+    /// Keeping that one offline row prevents a refresh from silently moving
+    /// the user's selection to a different machine.
     public var availableHosts: [HostSummary] {
-        (snapshot?.hosts ?? []).filter { $0.status == "online" }
+        (snapshot?.hosts ?? []).filter {
+            $0.status == "online" || $0.status == "stale"
+                || ($0.id == hostID && $0.status == "offline")
+        }
+    }
+
+    /// The host matching `hostID` in the snapshot, if present.
+    public var selectedHost: HostSummary? {
+        (snapshot?.hosts ?? []).first { $0.id == hostID }
+    }
+
+    /// True when the selected host is stale (heartbeats stopped).
+    public var isHostStale: Bool {
+        selectedHost?.status == "stale"
+    }
+
+    /// True when the selected host is offline.
+    public var isHostOffline: Bool {
+        selectedHost?.status == "offline"
+    }
+
+    /// A human-facing warning when launching against a stale host.
+    public var hostWarning: String? {
+        if isHostStale {
+            return "Host is stale (heartbeats stopped). Sessions may fail to start."
+        }
+        if isHostOffline {
+            return "Host is offline. Wait for it to reconnect before launching."
+        }
+        return nil
+    }
+
+    /// True when a host and harness are selected and the host is not offline.
+    public var canLaunch: Bool {
+        selectedHost != nil && !hostID.isEmpty && !harness.isEmpty && !isHostOffline
     }
 
     /// The selected host's enabled harnesses, structured-capable ones first.
@@ -175,7 +212,7 @@ public final class LaunchModel {
     private func adopt(_ fresh: HarnessSnapshot) {
         snapshot = fresh
         guard !availableHosts.contains(where: { $0.id == hostID }) else { return }
-        let firstHost = availableHosts.first
+        let firstHost = availableHosts.first { $0.status == "online" } ?? availableHosts.first
         hostID = firstHost?.id ?? ""
         harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
         runPreferences.select(hostID: hostID, harness: harness)

@@ -373,6 +373,174 @@ private func catalog(
     #expect(model.hostID == "mac-mini")
 }
 
+
+@Test @MainActor func availableHostsIncludesOnlineAndStaleHosts() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: fleetSnapshotJSON)
+    let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+
+    // fleetSnapshotJSON contains mac-mini (online), nas (stale), work-laptop (offline)
+    #expect(model.availableHosts.map(\.id) == ["mac-mini", "nas"])
+}
+
+@Test @MainActor func hostSelectionDefaultsToOnlineHostOrStaleHostIfNoOnlineHostsExist() async throws {
+    // 1. When both online and stale hosts exist, online host is preferred even if stale is listed first.
+    let mixedJSON = Data("""
+    {"hosts": [
+      {"host_id": "nas-stale", "status": "stale",
+       "capabilities": {"display_name": "NAS", "harnesses": [{"name": "codex", "enabled": true}]}},
+      {"host_id": "mac-online", "status": "online",
+       "capabilities": {"display_name": "Mac", "harnesses": [{"name": "claude-code", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    let mixedSnapshot = try HarnessSnapshot.decode(from: mixedJSON)
+    let mixedModel = LaunchModel(client: client(), snapshot: mixedSnapshot, store: testStore())
+    #expect(mixedModel.hostID == "mac-online")
+    #expect(mixedModel.harness == "claude-code")
+
+    // 2. When only stale and offline hosts exist, fall back to first stale host.
+    let staleOnlyJSON = Data("""
+    {"hosts": [
+      {"host_id": "laptop-offline", "status": "offline",
+       "capabilities": {"display_name": "Laptop", "harnesses": [{"name": "codex", "enabled": true}]}},
+      {"host_id": "nas-stale", "status": "stale",
+       "capabilities": {"display_name": "NAS", "harnesses": [{"name": "shell", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    let staleOnlySnapshot = try HarnessSnapshot.decode(from: staleOnlyJSON)
+    let staleModel = LaunchModel(client: client(), snapshot: staleOnlySnapshot, store: testStore())
+    #expect(staleModel.hostID == "nas-stale")
+    #expect(staleModel.harness == "shell")
+
+    // 3. When only offline hosts exist, hostID is empty.
+    let offlineOnlyJSON = Data("""
+    {"hosts": [
+      {"host_id": "laptop-offline", "status": "offline",
+       "capabilities": {"display_name": "Laptop", "harnesses": [{"name": "codex", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    let offlineOnlySnapshot = try HarnessSnapshot.decode(from: offlineOnlyJSON)
+    let offlineModel = LaunchModel(client: client(), snapshot: offlineOnlySnapshot, store: testStore())
+    #expect(offlineModel.hostID == "")
+    #expect(offlineModel.harness == "")
+    #expect(offlineModel.availableHosts.isEmpty)
+}
+
+@Test @MainActor func hostTransitionFromOnlineToStaleKeepsSelectedHostID() async throws {
+    let initialJSON = Data("""
+    {"hosts": [
+      {"host_id": "mac-mini", "status": "online",
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+      {"host_id": "studio", "status": "online",
+       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "claude-code", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    let initialSnapshot = try HarnessSnapshot.decode(from: initialJSON)
+    let model = LaunchModel(client: client(), snapshot: initialSnapshot, store: testStore())
+    #expect(model.hostID == "mac-mini")
+    #expect(model.isHostStale == false)
+
+    // mac-mini becomes stale while studio remains online. Selection should NOT jump to studio.
+    let refreshedJSON = Data("""
+    {"hosts": [
+      {"host_id": "mac-mini", "status": "stale",
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+      {"host_id": "studio", "status": "online",
+       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "claude-code", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    MockURLProtocol.handler = { _ in (200, refreshedJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.isHostStale == true)
+    #expect(model.hostWarning == "Host is stale (heartbeats stopped). Sessions may fail to start.")
+}
+
+@Test @MainActor func selectedHostGoingOfflineStaysVisibleAndRecoversInPlace() async throws {
+    let initialJSON = Data("""
+    {"hosts": [
+      {"host_id": "mac-mini", "status": "online",
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+      {"host_id": "studio", "status": "online",
+       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "codex", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    let model = LaunchModel(
+        client: client(),
+        snapshot: try HarnessSnapshot.decode(from: initialJSON),
+        store: testStore()
+    )
+    #expect(model.hostID == "mac-mini")
+    #expect(model.harness == "claude-code")
+
+    let offlineJSON = Data("""
+    {"hosts": [
+      {"host_id": "mac-mini", "status": "offline",
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+      {"host_id": "studio", "status": "online",
+       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "codex", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    MockURLProtocol.handler = { _ in (200, offlineJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.harness == "claude-code")
+    #expect(model.availableHosts.map(\.id) == ["mac-mini", "studio"])
+    #expect(model.isHostOffline)
+    #expect(model.hostWarning == "Host is offline. Wait for it to reconnect before launching.")
+    #expect(model.canLaunch == false)
+
+    MockURLProtocol.handler = { _ in (200, initialJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.isHostOffline == false)
+    #expect(model.hostWarning == nil)
+    #expect(model.canLaunch)
+}
+
+@Test @MainActor func staleOfflineAndCanLaunchProperties() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: fleetSnapshotJSON)
+    let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+
+    // Default selection: mac-mini (online)
+    #expect(model.hostID == "mac-mini")
+    #expect(model.selectedHost?.id == "mac-mini")
+    #expect(model.isHostStale == false)
+    #expect(model.isHostOffline == false)
+    #expect(model.hostWarning == nil)
+    #expect(model.canLaunch == true)
+
+    // Stale selection: nas
+    model.hostID = "nas"
+    #expect(model.selectedHost?.id == "nas")
+    #expect(model.isHostStale == true)
+    #expect(model.isHostOffline == false)
+    #expect(model.hostWarning == "Host is stale (heartbeats stopped). Sessions may fail to start.")
+    #expect(model.canLaunch == true)
+
+    // Offline host selection: work-laptop
+    model.hostID = "work-laptop"
+    #expect(model.selectedHost?.id == "work-laptop")
+    #expect(model.isHostStale == false)
+    #expect(model.isHostOffline == true)
+    #expect(model.hostWarning == "Host is offline. Wait for it to reconnect before launching.")
+    #expect(model.canLaunch == false)
+
+    // Empty hostID / harness
+    model.hostID = ""
+    #expect(model.selectedHost == nil)
+    #expect(model.isHostStale == false)
+    #expect(model.isHostOffline == false)
+    #expect(model.hostWarning == nil)
+    #expect(model.canLaunch == false)
+
+    model.hostID = "mac-mini"
+    model.harness = ""
+    #expect(model.canLaunch == false)
+}
+
 }
 
 }  // extension MockNetworkTests
