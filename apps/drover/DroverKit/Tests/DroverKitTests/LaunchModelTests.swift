@@ -456,6 +456,50 @@ private func catalog(
     #expect(model.hostWarning == "Host is stale (heartbeats stopped). Sessions may fail to start.")
 }
 
+@Test @MainActor func selectedHostGoingOfflineStaysVisibleAndRecoversInPlace() async throws {
+    let initialJSON = Data("""
+    {"hosts": [
+      {"host_id": "mac-mini", "status": "online",
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+      {"host_id": "studio", "status": "online",
+       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "codex", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    let model = LaunchModel(
+        client: client(),
+        snapshot: try HarnessSnapshot.decode(from: initialJSON),
+        store: testStore()
+    )
+    #expect(model.hostID == "mac-mini")
+    #expect(model.harness == "claude-code")
+
+    let offlineJSON = Data("""
+    {"hosts": [
+      {"host_id": "mac-mini", "status": "offline",
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+      {"host_id": "studio", "status": "online",
+       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "codex", "enabled": true}]}}
+    ], "sessions": [], "cwd_suggestions": []}
+    """.utf8)
+    MockURLProtocol.handler = { _ in (200, offlineJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.harness == "claude-code")
+    #expect(model.availableHosts.map(\.id) == ["mac-mini", "studio"])
+    #expect(model.isHostOffline)
+    #expect(model.hostWarning == "Host is offline. Wait for it to reconnect before launching.")
+    #expect(model.canLaunch == false)
+
+    MockURLProtocol.handler = { _ in (200, initialJSON) }
+    await model.refreshSnapshot()
+
+    #expect(model.hostID == "mac-mini")
+    #expect(model.isHostOffline == false)
+    #expect(model.hostWarning == nil)
+    #expect(model.canLaunch)
+}
+
 @Test @MainActor func staleOfflineAndCanLaunchProperties() async throws {
     let snapshot = try HarnessSnapshot.decode(from: fleetSnapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
@@ -481,7 +525,7 @@ private func catalog(
     #expect(model.selectedHost?.id == "work-laptop")
     #expect(model.isHostStale == false)
     #expect(model.isHostOffline == true)
-    #expect(model.hostWarning == nil)
+    #expect(model.hostWarning == "Host is offline. Wait for it to reconnect before launching.")
     #expect(model.canLaunch == false)
 
     // Empty hostID / harness

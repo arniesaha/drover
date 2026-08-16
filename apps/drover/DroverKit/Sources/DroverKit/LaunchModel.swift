@@ -69,9 +69,14 @@ public final class LaunchModel {
         self.runPreferences.select(hostID: hostID, harness: harness)
     }
 
-    /// Online and stale hosts — offline hosts can't accept a new session.
+    /// Online and stale hosts, plus the selected host if it just went offline.
+    /// Keeping that one offline row prevents a refresh from silently moving
+    /// the user's selection to a different machine.
     public var availableHosts: [HostSummary] {
-        (snapshot?.hosts ?? []).filter { $0.status == "online" || $0.status == "stale" }
+        (snapshot?.hosts ?? []).filter {
+            $0.status == "online" || $0.status == "stale"
+                || ($0.id == hostID && $0.status == "offline")
+        }
     }
 
     /// The host matching `hostID` in the snapshot, if present.
@@ -94,12 +99,15 @@ public final class LaunchModel {
         if isHostStale {
             return "Host is stale (heartbeats stopped). Sessions may fail to start."
         }
+        if isHostOffline {
+            return "Host is offline. Wait for it to reconnect before launching."
+        }
         return nil
     }
 
     /// True when a host and harness are selected and the host is not offline.
     public var canLaunch: Bool {
-        !hostID.isEmpty && !harness.isEmpty && !isHostOffline
+        selectedHost != nil && !hostID.isEmpty && !harness.isEmpty && !isHostOffline
     }
 
     /// The selected host's enabled harnesses, structured-capable ones first.
