@@ -5,16 +5,11 @@ from __future__ import annotations
 import ast
 import base64
 import binascii
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 import hashlib
 import hmac
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
-from pathlib import Path
 import queue
 import re
 import shlex
@@ -22,11 +17,16 @@ import socket
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.error import URLError
-from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
 from drover.config import config_home, default_token_file, resolve_api_token_env
@@ -41,35 +41,28 @@ from drover.server.harness.auth import (
     resolve_executable,
 )
 from drover.server.harness.content_consent import DurableContentConsent
-from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
 from drover.server.harness.events import normalize_harness_event
-from drover.server.harness.models import HarnessEvent
 from drover.server.harness.model_catalog import (
     CatalogSelectionError,
     ModelCatalogService,
     default_model_catalog_service,
 )
+from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
+from drover.server.harness.structured import agy as _structured_agy
+from drover.server.harness.structured import claude as _structured_claude
+from drover.server.harness.structured import codex as _structured_codex
+from drover.server.harness.structured import deepseek as _structured_deepseek
+from drover.server.harness.structured.manager import StructuredSessionManager
+from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.harness.updater import (
     REGISTRATION_DEADLINE_SECONDS,
     HostUpdater,
     default_restarter,
     verify_after_restart,
 )
-from drover.server.harness.structured import agy as _structured_agy
-from drover.server.harness.structured import claude as _structured_claude
-from drover.server.harness.structured import codex as _structured_codex
-from drover.server.harness.structured import deepseek as _structured_deepseek
-from drover.server.harness.structured.manager import StructuredSessionManager
-from drover.server.harness.structured.pusher import EventPusher
-from drover.server.harness.worktree import (
-    SessionWorktree,
-    cleanup_session_worktree,
-    create_session_worktree,
-)
-from drover.server.runtime import RuntimeLayout
 from drover.server.harness.websocket import (
     WebSocketClosed,
     accept_key,
@@ -77,6 +70,13 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
+from drover.server.harness.worktree import (
+    SessionWorktree,
+    cleanup_session_worktree,
+    create_session_worktree,
+)
+from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
+from drover.server.runtime import RuntimeLayout
 
 if TYPE_CHECKING:
     from drover.config import AdvisoryContentConfig, DroverConfig
@@ -1155,6 +1155,7 @@ class HarnessDaemonState:
     # and token are configured; otherwise structured sessions still work
     # locally and events simply aren't pushed anywhere.
     push_event: Callable[[str, dict[str, Any]], None] = lambda session_id, event: None
+    pusher: EventPusher | None = None
     provider_usage_probe: CodexUsageProbe | None = None
     claude_usage_probe: Any | None = None
     agy_usage_probe: Any | None = None
@@ -3059,6 +3060,12 @@ def reconcile_structured_sessions(state: HarnessDaemonState) -> None:
             )
         except Exception:
             continue
+    pusher = getattr(state, "pusher", None)
+    if pusher is not None:
+        try:
+            reconcile_unsent_events(state.registry, pusher, host_id=state.host_id)
+        except Exception:
+            pass
 
 
 def _with_claude_plan_label(
@@ -3398,6 +3405,11 @@ def wire_event_pusher(state: HarnessDaemonState) -> EventPusher | None:
     pusher = EventPusher(state.central_url, state.api_token)
     pusher.start()
     state.push_event = pusher.push
+    state.pusher = pusher
+    try:
+        reconcile_unsent_events(state.registry, pusher, host_id=state.host_id)
+    except Exception:
+        pass
     return pusher
 
 

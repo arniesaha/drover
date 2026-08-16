@@ -1120,3 +1120,59 @@ class HarnessRegistry:
             label = self._TRANSCRIPT_EVENT_ROLES.get(str(row.get("event_type")), "note")
             lines.append(f"[{label}] {text}")
         return "\n".join(lines).strip()
+
+    def list_recent_events_for_reconciliation(
+        self,
+        *,
+        since_hours: float = 24.0,
+        host_id: str | None = None,
+        limit: int = 10000,
+    ) -> list[HarnessEvent]:
+        """Query recent structured events for reconciliation to central.
+
+        Returns events created within ``since_hours`` for structured sessions,
+        ordered chronologically by creation time and sequence so they can be
+        replayed safely to central's /harness/events endpoint.
+        """
+        from datetime import timedelta
+
+        cutoff = _now() - timedelta(hours=max(0.0, float(since_hours)))
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                """
+                SELECT e.*
+                FROM harness_events e
+                LEFT JOIN harness_sessions s ON e.session_id = s.session_id
+                WHERE e.created_at >= ?
+                  AND (
+                    e.normalized_source = 'structured'
+                    OR s.mode = 'structured'
+                    OR (e.seq IS NOT NULL AND e.normalized_source IS NULL)
+                  )
+                  AND (? IS NULL OR s.host_id IS NULL OR s.host_id = ?)
+                ORDER BY e.created_at ASC, COALESCE(e.seq, 0) ASC, e.event_id ASC
+                LIMIT ?
+                """,
+                [cutoff, host_id, host_id, limit],
+            )
+        return [HarnessEvent.from_row(row) for row in rows]
+
+    def reconcile_unsent_events(
+        self,
+        pusher: Any,
+        *,
+        since_hours: float = 24.0,
+        host_id: str | None = None,
+        batch_size: int = 100,
+    ) -> int:
+        """Helper to reconcile unsent events to central via pusher."""
+        from drover.server.harness.structured.pusher import reconcile_unsent_events
+
+        return reconcile_unsent_events(
+            self,
+            pusher,
+            since_hours=since_hours,
+            host_id=host_id,
+            batch_size=batch_size,
+        )

@@ -10,7 +10,7 @@ from drover.server.harness.daemon import (
     undelivered_event_count,
 )
 from drover.server.harness.structured import pusher as pusher_module
-from drover.server.harness.structured.pusher import EventPusher
+from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 
 
 class _FakeCentralHandler(BaseHTTPRequestHandler):
@@ -284,3 +284,41 @@ def test_pusher_counts_events_it_can_never_deliver(capfd):
 
     assert undelivered_event_count() == 2
     reset_undelivered_event_count()
+
+
+def test_pusher_reconcile_unsent_events():
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
+
+        class _FakeRegistry:
+            def list_recent_events_for_reconciliation(self, **kwargs):
+                from drover.server.harness.models import HarnessEvent
+
+                return [
+                    HarnessEvent(
+                        event_id="e1",
+                        session_id="s1",
+                        event_type="user_input",
+                        payload={"text": "hi", "type": "user_input"},
+                        seq=1,
+                    ),
+                    HarnessEvent(
+                        event_id="e2",
+                        session_id="s1",
+                        event_type="assistant_output",
+                        payload={"text": "hello", "type": "assistant_output"},
+                        seq=2,
+                    ),
+                ]
+
+        count = reconcile_unsent_events(_FakeRegistry(), pusher)
+        assert count == 2
+        assert len(_FakeCentralHandler.requests) == 1
+        request = _FakeCentralHandler.requests[0]
+        assert request["path"] == "/harness/events"
+        assert [e["event_id"] for e in request["body"]["events"]] == ["e1", "e2"]
+    finally:
+        server.shutdown()
+        server.server_close()

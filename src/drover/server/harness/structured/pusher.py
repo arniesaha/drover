@@ -74,6 +74,34 @@ class EventPusher:
         )
         self._thread.start()
 
+    def is_configured(self) -> bool:
+        return bool(self._central_url and self._token)
+
+    def post_batch(self, batch: list[dict[str, Any]]) -> bool:
+        """POST one batch; True only for a 2xx response."""
+        return self._post(batch)
+
+    def retain_batch(self, batch: list[dict[str, Any]]) -> None:
+        """Keep an undelivered batch for the next drain instead of losing it."""
+        self._retain(batch)
+        self._wake.set()
+
+    def reconcile(
+        self,
+        registry: Any,
+        *,
+        since_hours: float = 24.0,
+        host_id: str | None = None,
+        batch_size: int = 100,
+    ) -> int:
+        return reconcile_unsent_events(
+            registry,
+            self,
+            since_hours=since_hours,
+            host_id=host_id,
+            batch_size=batch_size,
+        )
+
     def push(self, session_id: str, event: dict[str, Any]) -> None:
         del session_id  # event already carries session_id; kept for symmetry
         with self._queue_lock:
@@ -223,3 +251,67 @@ def _is_flush_now_event(event: dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
     return bool(payload.get("turn_complete")) or "exited" in payload
+
+
+def reconcile_unsent_events(
+    registry: Any,
+    pusher: EventPusher | None,
+    *,
+    since_hours: float = 24.0,
+    host_id: str | None = None,
+    batch_size: int = 100,
+) -> int:
+    """Push recent structured events from local DuckDB to central.
+
+    Repairs any event gaps caused by an unexpected harnessd restart
+    (crash, reboot, deploy). Central /harness/events is idempotent on
+    event_id, so re-sending recent events is safe and duplicate-free.
+
+    Returns the number of events reconciled / buffered for delivery.
+    """
+    if pusher is None or not pusher.is_configured():
+        return 0
+    if not hasattr(registry, "list_recent_events_for_reconciliation"):
+        return 0
+    try:
+        events = registry.list_recent_events_for_reconciliation(
+            since_hours=since_hours,
+            host_id=host_id,
+        )
+    except Exception:
+        return 0
+    if not events:
+        return 0
+
+    records: list[dict[str, Any]] = []
+    for event in events:
+        try:
+            payload = event.wire_payload()
+        except Exception:
+            payload = dict(event.payload) if isinstance(event.payload, dict) else {}
+            payload["event_id"] = event.event_id
+            payload["session_id"] = event.session_id
+            if event.seq is not None:
+                payload["seq"] = event.seq
+        if "type" not in payload or not payload["type"]:
+            payload["type"] = event.event_type
+        if "ts" not in payload and event.created_at is not None:
+            payload["ts"] = event.created_at.isoformat()
+        records.append(payload)
+
+    if not records:
+        return 0
+
+    reconciled_count = 0
+    for i in range(0, len(records), batch_size):
+        batch = records[i : i + batch_size]
+        if pusher.post_batch(batch):
+            reconciled_count += len(batch)
+        else:
+            # If direct post failed (e.g. central temporarily down),
+            # retain the remaining records in pusher so its worker thread
+            # will retry delivery when central recovers.
+            pusher.retain_batch(records[i:])
+            break
+
+    return len(records)
