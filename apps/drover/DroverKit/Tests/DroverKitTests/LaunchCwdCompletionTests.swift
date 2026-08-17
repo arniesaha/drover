@@ -271,6 +271,22 @@ private func testStore() -> HarnessModelCatalogStore {
     #expect(model.isCompletionHostUnreachable)
 }
 
+/// A host running an older release returns 404 for completion endpoints.
+/// This means completion is unsupported on that host version, not that
+/// the host is unreachable. The hint stays quiet and saved paths show.
+@Test @MainActor func anUnsupportedHostLeavesTheUnreachableHintUnset() async throws {
+    MockURLProtocol.handler = { _ in (404, Data(#"{"error": "not found"}"#.utf8)) }
+    let model = try model()
+
+    model.cwd = "/home/arnab/d"
+    await model.settleCompletion()
+
+    #expect(model.liveCompletions.isEmpty)
+    #expect(model.isCompletionHostUnreachable == false)
+    #expect(model.cwdSuggestionsHint == nil)
+    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover"])
+}
+
 /// A host that answered "nothing here" is not unreachable — it answered.
 @Test @MainActor func aSuccessfulEmptyResultLeavesTheHintUnset() async throws {
     MockURLProtocol.handler = { _ in
