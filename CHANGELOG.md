@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-08-16
+
+### Added
+
+- The working directory field completes against the selected host as you type.
+  A partial path lists the directories that actually exist there, debounced so
+  a keystroke does not cost a request, and the paths the app already knew
+  about (favourites, recent working directories) rank above the live ones
+  rather than being replaced by them
+- A host can activate an update in place instead of flipping the runtime
+  symlink, for a service manager that cannot exec a newly created
+  environment. Off by default: every host keeps the symlink flip, which is
+  safer, unless `update.activation` says otherwise
+
+### Fixed
+
+- A favourite working directory is no longer offered on hosts where it does
+  not exist. An untagged favourite meant "every host", which is not a claim an
+  absolute path can honour, so directories present on one machine were
+  suggested on all of them. The app now asks each host which of them are real
+
 ## [0.3.3] - 2026-08-16
 
 ### Fixed
