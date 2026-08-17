@@ -16,6 +16,7 @@ from drover.server.harness.schema import (
     bootstrap_harness_tables,
     migrate_legacy_harness_event_sequences,
 )
+from drover.server.metrics import _wire_datetime
 
 
 def _registry(tmp_path):
@@ -1237,7 +1238,7 @@ def test_a_redelivered_event_does_not_overwrite_what_was_stored(tmp_path):
 
 
 def test_ingest_structured_events_mixed_aware_and_naive_timestamps(tmp_path):
-    registry, _ = _registry(tmp_path)
+    registry, db_path = _registry(tmp_path)
     registry.register_host(host_id="mac-mini", display_name="Mac mini", kind="macos")
     session = registry.create_session(
         session_id="session-tz-mix",
@@ -1286,11 +1287,39 @@ def test_ingest_structured_events_mixed_aware_and_naive_timestamps(tmp_path):
     )
     assert count == 3
 
+    # Absolute reference, not a round-trip. Reading back with the same helper
+    # that wrote would still pass if both were wrong by the same offset, so
+    # assert the raw wall-clock the DuckDB TIMESTAMP column actually holds.
+    # Aware datetimes are stored as *process-local* wall time with the offset
+    # dropped; naive inbound values mean UTC and are converted the same way.
+    def _expected_column_value(instant: datetime) -> datetime:
+        return instant.astimezone().replace(tzinfo=None)
+
+    expected_utc = {
+        "ev-1": t0_naive.replace(tzinfo=timezone.utc),  # naive inbound == UTC
+        "ev-2": datetime(2026, 8, 16, 10, 30, 0, tzinfo=timezone.utc),
+        "ev-3": t2_aware_utc,
+    }
+    with duckdb.connect(str(db_path)) as con:
+        stored = dict(
+            con.execute(
+                "SELECT event_id, created_at FROM harness_events "
+                "WHERE session_id = ? ORDER BY seq",
+                [session.session_id],
+            ).fetchall()
+        )
+    assert stored == {
+        event_id: _expected_column_value(instant)
+        for event_id, instant in expected_utc.items()
+    }
+
     # Check that session projection updated properly
     s = registry.get_session(session.session_id)
     assert s is not None
     # last_activity should resolve to the correct UTC instant of t2 (11:00:00 UTC)
     assert registry_module._db_timestamp_to_utc(s.last_activity) == t2_aware_utc
+    # ...and the client-facing contract (metrics._wire_datetime) must agree.
+    assert _wire_datetime(s.last_activity) == t2_aware_utc.isoformat()
 
     # Replay all events - must be idempotent and not fail
     replay_count = registry.ingest_structured_events(
