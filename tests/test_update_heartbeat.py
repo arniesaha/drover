@@ -43,6 +43,9 @@ class _State:
         self.host_token = "secret"
         self.relay = False
         self.content_consent = None
+        # Mirrors HarnessDaemonState.updater, a declared field that is None
+        # when [update] is off -- not an optional attribute.
+        self.updater = None
 
     def capabilities(self):
         return {}

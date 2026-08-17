@@ -1,13 +1,18 @@
 """Host update state is reported to the hub so refused versions are visible.
 
 Issue #205: HarnessUpdater.status() was previously dead code. Now it tracks:
-- pending_version
+- pending_version -- what we are waiting to activate, if anything
+- blocked_version -- what a refusal is about; a failed install clears
+  pending_version so the next beat retries, and "blocked, on nothing" is
+  not something an operator can act on
 - update_blocked
 - reason (e.g. 'smoke_test', 'not_quiescent', 'install_failed')
-- observed_at (ISO timestamp)
+- observed_at (ISO timestamp) -- when the current refusal began, not when it
+  was last re-checked, so "refusing for half an hour" is answerable
 
 This state is carried on the heartbeat to the central hub, persisted in
-harness_hosts.update_json, and surfaced in the fleet APIs.
+harness_hosts.update_json, and surfaced in the fleet APIs. update_json is a
+single JSON blob column, so adding a key inside it needs no migration.
 """
 
 from __future__ import annotations
@@ -19,12 +24,15 @@ from types import SimpleNamespace
 import duckdb
 import pytest
 
+from drover.config import default_config
 from drover.schema import bootstrap
 from drover.server.harness import daemon as daemon_module
 from drover.server.harness.models import HarnessHost
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import bootstrap_harness_tables
+from drover.server.harness.updater import HostUpdater
 from drover.server.metrics import MetricsCollector
+from drover.server.runtime import RuntimeLayout
 
 
 def _registry(tmp_path):
@@ -232,6 +240,7 @@ def test_register_daemon_host_remote_includes_updater_status(monkeypatch):
         def status(self):
             return {
                 "pending_version": "0.3.0",
+                "blocked_version": "0.3.0",
                 "update_blocked": True,
                 "reason": "smoke_test",
                 "observed_at": "2026-08-16T15:00:00+00:00",
@@ -253,7 +262,167 @@ def test_register_daemon_host_remote_includes_updater_status(monkeypatch):
     assert res == {"status": "ok"}
     assert sent_payload["update"] == {
         "pending_version": "0.3.0",
+        "blocked_version": "0.3.0",
         "update_blocked": True,
         "reason": "smoke_test",
         "observed_at": "2026-08-16T15:00:00+00:00",
+    }
+
+
+def test_a_host_with_updates_switched_off_reports_no_update_state(monkeypatch):
+    """[update] off leaves `updater` None, and that must not be an error."""
+    sent_payload = {}
+    monkeypatch.setattr(
+        daemon_module,
+        "_post_central_json",
+        lambda state, path, payload: sent_payload.update(payload) or {"status": "ok"},
+    )
+    state = SimpleNamespace(
+        central_url="http://127.0.0.1:7080",
+        host_id="test-daemon",
+        display_name="Test Daemon",
+        kind="macos",
+        local_url="http://127.0.0.1:0",
+        tailscale_url=None,
+        relay=False,
+        capabilities=lambda: {"pty": True},
+        updater=None,
+    )
+
+    assert daemon_module.register_daemon_host_remote(state) == {"status": "ok"}
+    assert sent_payload["update"] is None
+
+
+# --- the real updater on the real heartbeat path ------------------------------
+#
+# The tests above drive a fake updater, so they pin the wiring but cannot
+# catch a mismatch between what HostUpdater.status() returns and what the
+# registration payload, the registry and the hub model do with it. These use
+# the real class end to end, which is exactly the gap that let an added key
+# break test_daemon_can_register_host_with_central_server unnoticed.
+
+
+def _installed(layout, version):
+    binary = layout.version_dir(version) / "bin" / "drover-server"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+
+def _idle_state():
+    return SimpleNamespace(
+        structured=SimpleNamespace(session_ids=lambda: [], is_alive=lambda s: False),
+        pty=SimpleNamespace(list_sessions=lambda: ["t1"]),  # busy: never activates
+    )
+
+
+def _real_updater(tmp_path):
+    layout = RuntimeLayout(tmp_path / "home")
+    _installed(layout, "0.1.3")
+    layout.flip("0.1.3")
+
+    def install_broken(lay, artifact, **kwargs):
+        binary = lay.version_dir(artifact.version) / "bin" / "drover-server"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        binary.chmod(0o755)
+        return True
+
+    return HostUpdater(
+        _idle_state(),
+        layout,
+        default_config(),
+        installer=install_broken,
+        restarter=lambda: None,
+    )
+
+
+def test_a_real_refusal_reaches_the_hub_row_through_one_heartbeat(
+    tmp_path, monkeypatch
+):
+    """A real HostUpdater's status, registered by the real hub endpoint."""
+    collector = _collector(tmp_path)
+    updater = _real_updater(tmp_path)
+    state = SimpleNamespace(
+        central_url="http://127.0.0.1:7080",
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        local_url="http://127.0.0.1:7081",
+        tailscale_url=None,
+        relay=False,
+        capabilities=lambda: {"pty": True},
+        updater=updater,
+        registered_at_least_once=False,
+        pusher=None,
+    )
+
+    # The hub answers each beat with the target it is publishing; the daemon
+    # hands the body straight back to the updater.
+    published: dict = {"target_version": "0.1.4"}
+
+    def fake_post(_state, _path, payload):
+        collector.register_harness_host(payload)
+        return dict(published)
+
+    monkeypatch.setattr(daemon_module, "_post_central_json", fake_post)
+
+    daemon_module._heartbeat_once(state)  # beat 1: installs, fails smoke test
+    daemon_module._heartbeat_once(state)  # beat 2: reports the refusal
+
+    stored = HarnessRegistry(tmp_path / "drover.duckdb").get_host("mac-mini")
+    assert stored is not None
+    assert stored.update is not None
+    assert stored.update["update_blocked"] is True
+    assert stored.update["reason"] == "smoke_test"
+    assert stored.update["pending_version"] == "0.1.4"
+    assert stored.update["blocked_version"] == "0.1.4"
+    refused_at = stored.update["observed_at"]
+    assert refused_at is not None
+
+    # Beats keep arriving; the refusal must not look newer each time.
+    daemon_module._heartbeat_once(state)
+    stored = HarnessRegistry(tmp_path / "drover.duckdb").get_host("mac-mini")
+    assert stored.update["observed_at"] == refused_at
+
+    # The operator pulls the bad release. The retraction is seen on the beat
+    # after it is published (a beat registers before it reads the reply), and
+    # reported on the one after that -- not latched until a daemon restart,
+    # which is what used to happen.
+    published.clear()
+    daemon_module._heartbeat_once(state)  # sees the retraction, clears state
+    daemon_module._heartbeat_once(state)  # reports the cleared state
+
+    stored = HarnessRegistry(tmp_path / "drover.duckdb").get_host("mac-mini")
+    assert stored.update == {
+        "pending_version": None,
+        "blocked_version": None,
+        "update_blocked": False,
+        "reason": None,
+        "observed_at": None,
+    }
+
+
+def test_the_status_shape_the_daemon_sends_is_the_shape_the_model_reads(tmp_path):
+    """Every key HostUpdater emits survives to HarnessHost.update, unchanged."""
+    registry = _registry(tmp_path)
+    updater = _real_updater(tmp_path)
+    updater.observe({"target_version": "0.1.4", "artifact": {}})
+    updater.maybe_activate()
+    status = updater.status()
+
+    registry.register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        update=status,
+    )
+
+    assert registry.get_host("mac-mini").update == status
+    assert set(status) == {
+        "pending_version",
+        "blocked_version",
+        "update_blocked",
+        "reason",
+        "observed_at",
     }
