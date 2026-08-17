@@ -2472,9 +2472,17 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _augment_pty_session_json(self, session: Any) -> dict[str, Any]:
+    def _augment_pty_session_json(
+        self,
+        session: Any,
+        registry_rows: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         data = _pty_session_json(session)
-        registry_session = self._safe_get_session(session.session_id)
+        registry_session = (
+            None if registry_rows is None else registry_rows.get(session.session_id)
+        )
+        if registry_session is None:
+            registry_session = self._safe_get_session(session.session_id)
         if registry_session is not None:
             data["mode"] = registry_session.mode or "pty"
             data["awaiting"] = registry_session.awaiting
@@ -2497,47 +2505,55 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         registry_session = self._safe_get_session(session_id)
         if registry_session is None:
             return None
-        return {
-            "session_id": registry_session.session_id,
-            "command": registry_session.command,
-            "cwd": registry_session.cwd,
-            "pid": None,
-            "status": registry_session.status,
-            "mode": registry_session.mode or "structured",
-            "awaiting": registry_session.awaiting,
-            "model": registry_session.model,
-            "thinking_effort": registry_session.thinking_effort,
-            "last_activity": (
-                registry_session.last_activity.isoformat()
-                if registry_session.last_activity
-                else None
-            ),
-        }
+        return _structured_session_row_json(registry_session)
 
     def _list_sessions(self) -> None:
         self._reconcile_exited_sessions()
         pty_sessions = self.server.state.pty.list_sessions()
-        sessions = [self._augment_pty_session_json(session) for session in pty_sessions]
         pty_ids = {session.session_id for session in pty_sessions}
+        # One registry window for the whole listing. list_sessions() already
+        # returns the complete rows, and re-fetching each id with get_session()
+        # opened another window per session -- harnessd deliberately does not
+        # pin the control-plane connection (see server/db.py), so every window
+        # is a full DuckDB instance create/teardown costing 300-500ms on the
+        # live hub. A 114-session host spent ~45s in GET /sessions doing 115 of
+        # them; this does 1.
+        registry_rows: dict[str, Any] = {}
+        try:
+            registry_rows = {
+                row.session_id: row
+                for row in self.server.state.registry.list_sessions(
+                    host_id=self.server.state.host_id
+                )
+            }
+        except Exception:
+            registry_rows = {}
+        sessions = [
+            self._augment_pty_session_json(session, registry_rows)
+            for session in pty_sessions
+        ]
         # Union the live in-memory manager with the registry's own view of
         # structured sessions for this host: a session reconciled (or
         # otherwise finalized) after a restart has no manager entry anymore,
         # but its registry row -- now e.g. "errored" -- should still show up
         # here rather than silently disappearing from the listing.
         structured_ids = set(self.server.state.structured.session_ids())
-        try:
-            structured_ids.update(
-                session.session_id
-                for session in self.server.state.registry.list_sessions(
-                    host_id=self.server.state.host_id
-                )
-                if session.mode == "structured"
-            )
-        except Exception:
-            pass
+        structured_ids.update(
+            session_id
+            for session_id, row in registry_rows.items()
+            if row.mode == "structured"
+        )
         for session_id in structured_ids:
             if session_id in pty_ids:
                 continue
+            row = registry_rows.get(session_id)
+            if row is not None:
+                sessions.append(_structured_session_row_json(row))
+                continue
+            # Manager-only ids: a live structured session whose row the
+            # host-scoped listing did not return (or an empty map because the
+            # listing failed). Bounded by the live session count, not by the
+            # archive, so a per-id lookup here stays cheap.
             structured_json = self._structured_session_json(session_id)
             if structured_json is not None:
                 sessions.append(structured_json)
@@ -3585,6 +3601,30 @@ def _pty_session_json(session) -> dict[str, Any]:
         "cwd": str(session.cwd) if session.cwd else None,
         "pid": session.pid,
         "status": "running",
+    }
+
+
+def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
+    """The single definition of a structured session's listing shape.
+
+    Both the per-id lookup and the batched listing format rows through here so
+    the two paths cannot drift.
+    """
+    return {
+        "session_id": registry_session.session_id,
+        "command": registry_session.command,
+        "cwd": registry_session.cwd,
+        "pid": None,
+        "status": registry_session.status,
+        "mode": registry_session.mode or "structured",
+        "awaiting": registry_session.awaiting,
+        "model": registry_session.model,
+        "thinking_effort": registry_session.thinking_effort,
+        "last_activity": (
+            registry_session.last_activity.isoformat()
+            if registry_session.last_activity
+            else None
+        ),
     }
 
 

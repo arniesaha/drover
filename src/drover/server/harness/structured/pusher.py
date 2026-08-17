@@ -272,6 +272,10 @@ def reconcile_unsent_events(
     them into EventPusher's bounded in-memory retry buffer would recreate the
     restart-loss problem this reconciliation path exists to repair.
     """
+    # Imported lazily: registry pulls this module in at call time, so a
+    # module-level import here would close the cycle.
+    from drover.server.harness.registry import _db_timestamp_to_utc
+
     if pusher is None or not pusher.is_configured():
         return 0
     if not hasattr(registry, "list_events_for_reconciliation"):
@@ -308,7 +312,11 @@ def reconcile_unsent_events(
             if "type" not in payload or not payload["type"]:
                 payload["type"] = event.event_type
             if "ts" not in payload and event.created_at is not None:
-                payload["ts"] = event.created_at.isoformat()
+                # `created_at` comes straight out of a DuckDB TIMESTAMP column,
+                # so it is naive *local* wall time. Send an offset-carrying ISO
+                # string: the hub parses a naive `ts` as UTC, which would move
+                # every reconciled event by one UTC offset.
+                payload["ts"] = _db_timestamp_to_utc(event.created_at).isoformat()
             records.append(payload)
 
         if getattr(pusher, "is_stopping", lambda: False)():

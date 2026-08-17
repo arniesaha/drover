@@ -45,12 +45,18 @@ ARCHIVED_SESSION_STATUSES: tuple[str, ...] = (
 
 
 def _as_utc_datetime(value: Any) -> datetime | None:
-    """Normalize any datetime/timestamp representation to a UTC-aware datetime.
+    """Normalize an *inbound* timestamp to a UTC-aware datetime.
 
     The control plane uses UTC-aware datetimes across session activity and event
     projection. Incoming event timestamps (which may be ISO strings, timezone-aware
-    datetimes, or historical timezone-naive datetimes) are normalized to UTC-aware
-    datetimes before sorting, comparison, and SQL binding.
+    datetimes, or timezone-naive datetimes) are normalized to UTC-aware datetimes
+    before sorting, comparison, and SQL binding.
+
+    Direction matters, and the two directions disagree. This helper is for values
+    arriving from a *caller* (wire payloads, API arguments), where a naive value
+    means UTC. Values read back out of a DuckDB TIMESTAMP column are naive
+    *process-local* wall time instead -- see the storage note on
+    ``_db_timestamp_to_utc`` -- so never route a column value through here.
     """
     if value is None:
         return None
@@ -75,8 +81,20 @@ def _as_utc_datetime(value: Any) -> datetime | None:
 def _db_timestamp_to_utc(value: Any) -> datetime | None:
     """Restore UTC timezone from a DuckDB TIMESTAMP column value.
 
-    DuckDB TIMESTAMP columns round-trip aware datetimes as naive local wall time.
-    Attach the process timezone before normalizing back to UTC.
+    Every timestamp column in ``schema.py`` is ``TIMESTAMP``, never
+    ``TIMESTAMPTZ``. Binding an aware datetime converts it to *process-local*
+    wall time and discards the offset; binding a naive datetime stores it
+    verbatim. So a naive datetime read back out of one of those columns means
+    process-local, not UTC::
+
+        aware 20:00+00:00  ->  stored as 13:00   (in PDT)
+        naive 20:00        ->  stored as 20:00
+
+    This helper therefore assumes naive == process-local and attaches the
+    process timezone before normalizing to UTC. That is the opposite assumption
+    from ``_as_utc_datetime`` above, which handles inbound values where naive
+    means UTC. ``drover.server.metrics._wire_datetime`` makes the same
+    process-local assumption for the client-facing read path.
     """
     if value is None:
         return None
@@ -88,7 +106,21 @@ def _db_timestamp_to_utc(value: Any) -> datetime | None:
 
 
 def _as_db_timestamp(value: Any) -> datetime | None:
-    """Normalize a cursor datetime to the format suitable for DuckDB TIMESTAMP comparison."""
+    """Coerce a ``list_events_for_reconciliation`` cursor to a comparable value.
+
+    For the only shape the sole caller ever passes -- ``datetime | None``, taken
+    from a previous page's ``created_at`` -- this is deliberately a passthrough.
+    The cursor is compared against ``harness_events.created_at``, a naive
+    process-local ``TIMESTAMP``, and the value came out of that same column, so
+    it is already in the column's own frame. Converting it to UTC here would
+    shift the cursor by one UTC offset and silently skip or repeat a page.
+
+    Only the string branch does real work, and note that it is the mirror image
+    of ``_as_utc_datetime``'s: this one keeps a naive string naive and keeps an
+    aware string aware, rather than forcing UTC. A future caller passing an
+    aware value would therefore get an aware datetime bound against a naive
+    column -- convert it with ``.astimezone().replace(tzinfo=None)`` first.
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -106,7 +138,6 @@ def _as_db_timestamp(value: Any) -> datetime | None:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
 
 
 #: Awaiting values that mean the agent is blocked on the user, and therefore
@@ -642,21 +673,6 @@ class HarnessRegistry:
                     session_id,
                 ],
             )
-            # A completed session must not notify the operator that it is still
-            # waiting for them.
-            if status in ARCHIVED_SESSION_STATUSES:
-                con.execute(
-                    "UPDATE harness_sessions SET awaiting = NULL WHERE session_id = ?",
-                    [session_id],
-                )
-            if status == "running":
-                # Clear any lingering native resume label so the session starts
-                # fresh with its own turn counter.
-                con.execute(
-                    "UPDATE harness_sessions SET native_resume_label = NULL "
-                    "WHERE session_id = ?",
-                    [session_id],
-                )
         session = self.get_session(session_id)
         if session is None:
             raise KeyError(f"unknown harness session {session_id!r}")
@@ -1063,9 +1079,7 @@ class HarnessRegistry:
                     seq = record.get("seq")
                     if not isinstance(seq, int) or isinstance(seq, bool):
                         seq = None
-                    created_at = (
-                        _as_utc_datetime(record.get("created_at")) or _now()
-                    )
+                    created_at = _as_utc_datetime(record.get("created_at")) or _now()
                     normalized = normalize_harness_event(
                         event_type=event_type,
                         payload=payload,
@@ -1147,8 +1161,7 @@ class HarnessRegistry:
                             inserted_events,
                             key=lambda event: (
                                 event.get("seq") or 0,
-                                _as_utc_datetime(event.get("created_at"))
-                                or _now(),
+                                _as_utc_datetime(event.get("created_at")) or _now(),
                                 event["event_id"],
                             ),
                         )
