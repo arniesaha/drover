@@ -33,9 +33,9 @@ from typing import Any, Callable, Optional
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
-from drover.server.jobs import Delivery
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
+from drover.server.jobs import Delivery
 from drover.server.ledger import ArtifactSpec, Ledger
 from drover.server.summarizer.backends import (
     BackendError,

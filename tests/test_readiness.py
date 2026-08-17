@@ -47,7 +47,6 @@ from drover.server.db import (
     remember_live_connection,
 )
 from drover.server.metrics import MetricsCollector, start_metrics_server
-from drover.server.web.auth import AuthSettings
 from drover.server.readiness import (
     STATE_ABSENT,
     STATE_BUSY,
@@ -58,6 +57,7 @@ from drover.server.readiness import (
     STORE_CONTROL_PLANE,
     ReadinessProbe,
 )
+from drover.server.web.auth import AuthSettings
 
 
 @pytest.fixture(autouse=True)

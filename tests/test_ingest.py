@@ -1,12 +1,14 @@
 """Tests for src/drover/server/ingest.py."""
 
-from pathlib import Path
 import json
+from pathlib import Path
+
 import duckdb
 import pytest
+
 from drover.schema import bootstrap
 from drover.server import ingest as ingest_mod
-from drover.server.ingest import ingest_file, IngestStats
+from drover.server.ingest import IngestStats, ingest_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "incoming" / "sample_agent_events.jsonl"
 

@@ -1,6 +1,6 @@
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "check_markdown_links.py"
 

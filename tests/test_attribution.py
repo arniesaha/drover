@@ -4,8 +4,8 @@ import subprocess
 from pathlib import Path
 
 from drover.attribution import (
-    _cwd_from_raw,
     GENERAL_WORKSPACE_ACTIVITY_TYPE,
+    _cwd_from_raw,
     classify_cwd_activity,
     derive_repo_attribution,
     enrich_raw_repo_attribution,

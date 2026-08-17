@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from drover.config import default_config
+from drover.server.runtime import RuntimeLayout
 from drover.server.updates import (
     LOCK_NAME,
     MANIFEST_NAME,
@@ -19,7 +20,6 @@ from drover.server.updates import (
     fetch_latest_release,
     install_version,
 )
-from drover.server.runtime import RuntimeLayout
 
 
 class _Response(io.BytesIO):

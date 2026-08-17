@@ -18,9 +18,9 @@ from __future__ import annotations
 import threading
 
 import duckdb
-from drover.schema import bootstrap
 import pytest
 
+from drover.schema import bootstrap
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.structured import manager as manager_module
 from drover.server.harness.structured.driver import StructuredMessage

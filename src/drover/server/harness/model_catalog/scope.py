@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-from pathlib import Path
 import secrets
 import tempfile
+from pathlib import Path
 
 _SECRET_SIZE = 32
 _DEFAULT_SECRET_PATH = Path.home() / ".drover" / "model-catalog-scope.key"

@@ -69,3 +69,7 @@ tmp_path_retention_policy = "failed"
 [tool.black]
 line-length = 88
 target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 88

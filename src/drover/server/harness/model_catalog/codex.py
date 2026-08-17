@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from drover.server.providers.codex_app_server import (
@@ -15,7 +15,7 @@ from drover.server.providers.codex_app_server import (
 )
 
 from .agy import _run_bounded
-from .models import DiscoveredCatalog, MAX_MODELS, ModelOption, ReasoningOptions
+from .models import MAX_MODELS, DiscoveredCatalog, ModelOption, ReasoningOptions
 from .service import CatalogDiscoveryError
 
 _CACHE_FILES = ("models_cache.json", "config.toml", "auth.json")
