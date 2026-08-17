@@ -228,3 +228,33 @@ where they are.
 Version skew is expected during a rollout and is not an error. The hub keeps
 serving hosts that have not converged yet, and a host waiting for quiesce is
 fully functional the whole time.
+
+### Hosts that cannot exec a new venv
+
+One host per fleet may need the other activation mode. On macOS, a venv on an
+external volume runs under a privacy grant that the system keys to the
+executable, so a freshly created venv is a different executable and has no
+grant. The service then dies at interpreter startup with `PermissionError:
+[Errno 1] Operation not permitted` while reading its own `pyvenv.cfg`, which
+looks like a file permission problem and is not one.
+
+Such a host can activate by installing the new version into the venv it
+already has, leaving the executable path and the interpreter untouched:
+
+```toml
+[update]
+activation = "in_place"
+in_place_venv = "~/.drover-venv"
+```
+
+The default is `activation = "symlink"`, which is what every Linux host should
+keep: nothing is upgraded in place, so rollback stays a rename. Name the venv
+explicitly. There is no default path, because guessing one is how the wrong
+environment gets overwritten, and an unrecognised `activation` value falls
+back to `symlink` rather than stopping the daemon.
+
+In-place hosts still install every version beside the old one, still smoke
+test it there, and still wait for quiesce. The `current` symlink is still
+flipped, but on these hosts it is a record of what is active rather than the
+path the services run from. Rollback reinstalls the previous version's cached
+wheel, which is why `keep_versions` must stay at 2 or more.
