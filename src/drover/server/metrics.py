@@ -1130,6 +1130,8 @@ class MetricsCollector:
         agent_version = (
             raw_version.strip() or None if isinstance(raw_version, str) else None
         )
+        raw_update = payload.get("update")
+        update = raw_update if isinstance(raw_update, dict) else None
         try:
             registry = HarnessRegistry(self.duckdb_path)
             host = registry.register_host(
@@ -1142,6 +1144,7 @@ class MetricsCollector:
                 status=status,
                 capabilities=capabilities,
                 agent_version=agent_version,
+                update=update,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)

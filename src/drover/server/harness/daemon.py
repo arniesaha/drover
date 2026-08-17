@@ -3232,8 +3232,21 @@ def create_harness_server(
     return HarnessHTTPServer((listen_host, listen_port), HarnessRequestHandler, state)
 
 
+def _updater_status(state: HarnessDaemonState) -> dict[str, Any] | None:
+    """This host's update state, or None when [update] is switched off.
+
+    `updater` is a declared field, not an optional attribute: it is None
+    whenever the config kill switch is off, and that is the only case this
+    guards. A missing attribute should raise, not silently disable reporting.
+    """
+    updater = state.updater
+    return updater.status() if updater is not None else None
+
+
 def register_daemon_host(state: HarnessDaemonState) -> None:
     try:
+        from drover import __version__ as drover_version
+
         state.registry.register_host(
             host_id=state.host_id,
             display_name=state.display_name,
@@ -3241,6 +3254,8 @@ def register_daemon_host(state: HarnessDaemonState) -> None:
             local_url=state.local_url,
             tailscale_url=state.tailscale_url,
             capabilities=state.capabilities(),
+            agent_version=drover_version,
+            update=_updater_status(state),
         )
     except Exception:
         return
@@ -3267,6 +3282,7 @@ def register_daemon_host_remote(state: HarnessDaemonState) -> dict[str, Any] | N
         "capabilities": state.capabilities(),
         # So the hub can see version skew across the fleet without asking.
         "agent_version": drover_version,
+        "update": _updater_status(state),
     }
     return _post_central_json(state, "/harness/hosts", payload)
 
@@ -3286,7 +3302,7 @@ def _heartbeat_once(state: HarnessDaemonState) -> None:
     # decide whether a freshly activated version can talk to the hub at all.
     state.registered_at_least_once = True
     _schedule_event_reconciliation(state)
-    updater = getattr(state, "updater", None)
+    updater = state.updater
     if updater is not None:
         updater.observe(body)
         updater.maybe_activate()

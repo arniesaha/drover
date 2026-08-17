@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from drover.config import DroverConfig
@@ -138,19 +139,74 @@ class HostUpdater:
         self._lock = threading.Lock()
         self._pending: str | None = None
         self._blocked = False
+        self._reason: str | None = None
+        # The version the refusal is *about*. Usually the same as _pending, but
+        # a failed install clears _pending so the next beat retries, and
+        # "blocked, on nothing" tells an operator nothing at all.
+        self._blocked_version: str | None = None
+        self._observed_at: str | None = None
+
+    # -- state transitions -----------------------------------------------
+    # Every write to the reported state goes through one of these, so the
+    # invariants (compare-and-set against the current target, and stamping
+    # observed_at only on a real transition) hold in one place.
+
+    def _clear_locked(self) -> None:
+        self._pending = None
+        self._blocked = False
+        self._reason = None
+        self._blocked_version = None
+        self._observed_at = None
+
+    def _record_refusal(
+        self, target: str, reason: str, *, clear_pending: bool = False
+    ) -> None:
+        """Latch a refusal against `target`, keeping when it began.
+
+        `observed_at` is stamped only when the refusal actually changes.
+        Restamping it every fifteen-second beat -- which is what this used to
+        do -- makes a host that has been refusing for half an hour
+        indistinguishable from one that started refusing a moment ago, which
+        is the exact question the report exists to answer.
+        """
+        with self._lock:
+            if self._pending != target:
+                # The target moved while we were running the checks (a smoke
+                # test is a subprocess). Whoever moved it decided later than
+                # we did, so their state stands.
+                return
+            unchanged = (
+                self._blocked
+                and self._reason == reason
+                and self._blocked_version == target
+            )
+            if not unchanged:
+                self._observed_at = datetime.now(timezone.utc).isoformat()
+            self._blocked = True
+            self._reason = reason
+            self._blocked_version = target
+            if clear_pending:
+                self._pending = None
 
     def observe(self, heartbeat_body: dict) -> None:
         """React to what the hub said, downloading if we are behind."""
         target = str((heartbeat_body or {}).get("target_version") or "")
         if not target:
+            # The hub has no target: either it never had one, or an operator
+            # pulled a bad release in response to this very host refusing it.
+            # Either way there is nothing left to refuse, and holding the old
+            # refusal would report a version nobody is asking for until the
+            # daemon restarts. Clearing _pending also stops maybe_activate
+            # spawning a smoke-test subprocess on every beat forever.
+            with self._lock:
+                self._clear_locked()
             return
         active = self._layout.active_version()
         if active and compare_versions(target, active) <= 0:
             # Already there, or the hub is asking for something older, which
             # is never automatic.
             with self._lock:
-                self._pending = None
-                self._blocked = False
+                self._clear_locked()
             return
         with self._lock:
             if self._pending == target:
@@ -158,6 +214,14 @@ class HostUpdater:
                 # hours; re-downloading on every 15s heartbeat would be absurd.
                 return
             self._pending = target
+            if self._blocked_version != target:
+                # A genuinely different version: whatever we refused before is
+                # history. Retrying an install of the *same* version keeps the
+                # existing refusal (and its timestamp) until we know better.
+                self._blocked = False
+                self._reason = None
+                self._blocked_version = None
+                self._observed_at = datetime.now(timezone.utc).isoformat()
 
         raw = (heartbeat_body or {}).get("artifact") or {}
         artifact = ReleaseArtifact(
@@ -169,8 +233,18 @@ class HostUpdater:
         )
         if not self._installer(self._layout, artifact):
             log.warning("could not install %s; will retry on a later heartbeat", target)
-            with self._lock:
-                self._pending = None
+            # _pending is cleared so the next beat retries the download; the
+            # refusal keeps the version so the hub can say which one failed.
+            self._record_refusal(target, "install_failed", clear_pending=True)
+            return
+        with self._lock:
+            if self._pending == target and self._reason == "install_failed":
+                # An earlier attempt at this same version failed; it just
+                # succeeded, so the recorded failure is stale.
+                self._blocked = False
+                self._reason = None
+                self._blocked_version = None
+                self._observed_at = datetime.now(timezone.utc).isoformat()
 
     def maybe_activate(self) -> bool:
         """Flip and restart, but only if this host is provably idle."""
@@ -182,10 +256,10 @@ class HostUpdater:
             # The installer may have reported success; this is the last gate
             # before the symlink moves.
             log.warning("%s failed its smoke test; refusing to activate", target)
+            self._record_refusal(target, "smoke_test")
             return False
         if not is_quiescent(self._state):
-            with self._lock:
-                self._blocked = True
+            self._record_refusal(target, "not_quiescent")
             return False
 
         previous = self._layout.active_version() or ""
@@ -194,15 +268,22 @@ class HostUpdater:
         self._layout.write_marker(previous, target)
         self._layout.flip(target)
         with self._lock:
-            self._blocked = False
+            if self._pending == target:
+                self._clear_locked()
         log.info("activated %s (was %s); restarting", target, previous or "unknown")
         self._restarter()
         return True
 
     def status(self) -> dict:
-        """Surfaced on the heartbeat so the app can show a waiting host."""
+        """Surfaced on the heartbeat so the hub can show a waiting host."""
         with self._lock:
-            return {"pending_version": self._pending, "update_blocked": self._blocked}
+            return {
+                "pending_version": self._pending,
+                "blocked_version": self._blocked_version,
+                "update_blocked": self._blocked,
+                "reason": self._reason,
+                "observed_at": self._observed_at,
+            }
 
 
 def verify_after_restart(layout: RuntimeLayout, *, registered: bool) -> bool:

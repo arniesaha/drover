@@ -86,6 +86,8 @@ def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
         host_token = None
         pty = _Closer("pty")
         auth = _Closer("auth")
+        # A declared field on HarnessDaemonState, None when [update] is off.
+        updater = None
 
     class _Server:
         def serve_forever(self):
@@ -839,26 +841,30 @@ def test_daemon_can_register_host_with_central_server(tmp_path):
         central.shutdown()
         central.server_close()
 
-    assert _CentralRegistrationHandler.payloads == [
-        {
-            "path": "/harness/hosts",
-            "authorization": "Bearer secret",
-            "body": {
-                # Sent so the hub can see version skew across the fleet.
-                # Compared against the symbol rather than a literal, so a
-                # version bump does not break this assertion.
-                "agent_version": drover.__version__,
-                "capabilities": state.capabilities(),
-                "connection_kind": "direct",
-                "display_name": "NAS",
-                "host_id": "nas",
-                "kind": "linux",
-                "local_url": "http://192.168.1.70:7081",
-                "status": "online",
-                "tailscale_url": None,
-            },
-        }
-    ]
+    assert len(_CentralRegistrationHandler.payloads) == 1
+    sent = _CentralRegistrationHandler.payloads[0]
+    assert sent["path"] == "/harness/hosts"
+    assert sent["authorization"] == "Bearer secret"
+    expected = {
+        # Sent so the hub can see version skew across the fleet.
+        # Compared against the symbol rather than a literal, so a
+        # version bump does not break this assertion.
+        "agent_version": drover.__version__,
+        "capabilities": state.capabilities(),
+        "connection_kind": "direct",
+        "display_name": "NAS",
+        "host_id": "nas",
+        "kind": "linux",
+        "local_url": "http://192.168.1.70:7081",
+        "status": "online",
+        "tailscale_url": None,
+    }
+    # A subset rather than exact equality: this test is about identity and
+    # addressing, and every field added to the registration payload since has
+    # broken it for reasons it does not care about.
+    assert {key: sent["body"].get(key) for key in expected} == expected
+    # No updater on this state ([update] off), so there is nothing to report.
+    assert sent["body"]["update"] is None
 
 
 def test_reconnecting_daemon_reconciles_revoked_consent_from_registration(tmp_path):
