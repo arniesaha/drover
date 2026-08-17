@@ -2,9 +2,9 @@
 
 from pathlib import Path
 
+from drover.config import default_config
 from drover.schema import bootstrap
 from drover.server.__main__ import _redis_job_stream_config, _seed_redis_job_streams
-from drover.config import default_config
 from drover.server.db import open_duckdb_connection
 
 

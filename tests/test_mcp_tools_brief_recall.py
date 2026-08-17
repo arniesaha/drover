@@ -12,8 +12,8 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.mcp.tools import (
-    drover_project_brief,
     drover_project_activity,
+    drover_project_brief,
     drover_recall,
     drover_recent_sessions,
 )

@@ -6,12 +6,13 @@ defaults for any missing field so a brand-new install Just Works after
 """
 
 from __future__ import annotations
-from collections.abc import Mapping
-from dataclasses import dataclass, field
-from pathlib import Path
+
 import logging
 import math
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
 
 log = logging.getLogger("drover.config")
 

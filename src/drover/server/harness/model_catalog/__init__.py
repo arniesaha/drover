@@ -2,6 +2,10 @@
 
 from typing import Any, Mapping
 
+from .agy import AgyCatalogAdapter
+from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
+from .codex import CodexCatalogAdapter
+from .deepseek import DeepSeekCatalogAdapter
 from .models import (
     MAX_CATALOG_WIRE_BYTES,
     CatalogEnvelope,
@@ -10,10 +14,6 @@ from .models import (
     ReasoningOptions,
     catalog_wire_bytes,
 )
-from .codex import CodexCatalogAdapter
-from .agy import AgyCatalogAdapter
-from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
-from .deepseek import DeepSeekCatalogAdapter
 from .scope import AccountScopeIDs
 from .service import (
     CatalogAdapter,

@@ -8,12 +8,12 @@ render rather than surfacing as an error.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import http.client
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4

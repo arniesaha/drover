@@ -22,9 +22,9 @@ from drover.server.harness.daemon import (
     register_daemon_host,
     wire_event_pusher,
 )
+from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.models import HarnessEvent
 from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.metrics import (
     MetricsCollector,

@@ -13,7 +13,7 @@ from drover.server.harness.structured.deepseek import (
     version,
 )
 
-from .models import DiscoveredCatalog, MAX_MODELS, ModelOption, ReasoningOptions
+from .models import MAX_MODELS, DiscoveredCatalog, ModelOption, ReasoningOptions
 from .service import CatalogDiscoveryError
 
 

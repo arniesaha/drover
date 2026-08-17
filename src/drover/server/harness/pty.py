@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import select
 import shlex
 import signal
 import subprocess
 from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
 
 
