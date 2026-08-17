@@ -393,7 +393,16 @@ public final class LaunchModel {
             // A request the next keystroke tore down is not a failed one.
             if let droverError = error as? DroverError, droverError.isCancellation { return }
             liveCompletions = []
-            isCompletionHostUnreachable = true
+            // A 404 means the host does not support path completion (older release),
+            // which is distinct from being unreachable (502, 504, transport failure).
+            // When unsupported, we keep the unreachable hint quiet and let saved paths show.
+            if case DroverError.unavailable = error {
+                isCompletionHostUnreachable = false
+            } else if case DroverError.httpStatus(let code, _) = error, code == 404 {
+                isCompletionHostUnreachable = false
+            } else {
+                isCompletionHostUnreachable = true
+            }
         }
     }
 
