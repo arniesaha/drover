@@ -2396,6 +2396,153 @@ def test_harnessd_lists_and_gets_live_sessions(tmp_path):
         server.server_close()
 
 
+def _expected_structured_json(row) -> dict:
+    return {
+        "session_id": row.session_id,
+        "command": row.command,
+        "cwd": row.cwd,
+        "pid": None,
+        "status": row.status,
+        "mode": row.mode or "structured",
+        "awaiting": row.awaiting,
+        "model": row.model,
+        "thinking_effort": row.thinking_effort,
+        "last_activity": (row.last_activity.isoformat() if row.last_activity else None),
+    }
+
+
+def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path):
+    # The listing has three sources that must all survive the batched
+    # registry read: live PTY sessions, structured rows the host-scoped
+    # registry listing returns, and ids only the in-memory manager knows
+    # about (whose rows the host listing does not return).
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _, created = _json_request(
+            f"{base_url}/sessions",
+            payload={"harness": "shell", "cwd": str(tmp_path)},
+        )
+        pty_id = created["session_id"]
+
+        for index in range(3):
+            state.registry.create_session(
+                host_id="test-host",
+                harness="claude-code",
+                command="claude",
+                session_id=f"structured-{index}",
+                status="terminated",
+                cwd=str(tmp_path),
+                mode="structured",
+                model="opus",
+                thinking_effort="high",
+            )
+        state.registry.register_host(
+            host_id="other-host", display_name="Other", kind="linux"
+        )
+        state.registry.create_session(
+            host_id="other-host",
+            harness="claude-code",
+            command="claude",
+            session_id="manager-only",
+            status="running",
+            cwd=str(tmp_path),
+            mode="structured",
+        )
+        state.structured.session_ids = lambda: ["manager-only"]  # type: ignore[method-assign]
+
+        status, inventory = _json_request(f"{base_url}/sessions")
+        assert status == 200
+        assert inventory["host_id"] == "test-host"
+        by_id = {item["session_id"]: item for item in inventory["sessions"]}
+        assert set(by_id) == {
+            pty_id,
+            "structured-0",
+            "structured-1",
+            "structured-2",
+            "manager-only",
+        }
+
+        pty_row = state.registry.get_session(pty_id)
+        assert by_id[pty_id]["pid"] == created["pid"]
+        assert by_id[pty_id]["status"] == "running"
+        assert by_id[pty_id]["mode"] == (pty_row.mode or "pty")
+        assert by_id[pty_id]["awaiting"] == pty_row.awaiting
+        assert by_id[pty_id]["model"] == pty_row.model
+        assert by_id[pty_id]["thinking_effort"] == pty_row.thinking_effort
+
+        for session_id in ("structured-0", "structured-1", "structured-2"):
+            expected = _expected_structured_json(state.registry.get_session(session_id))
+            assert by_id[session_id] == expected
+            assert expected["status"] == "terminated"
+
+        # The manager-only id still resolves through the per-id lookup.
+        assert by_id["manager-only"] == _expected_structured_json(
+            state.registry.get_session("manager-only")
+        )
+        assert by_id["manager-only"]["status"] == "running"
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_listing_registry_lookups_do_not_scale_with_session_count(tmp_path):
+    # Regression: GET /sessions used to re-fetch every structured row with
+    # its own registry.get_session() after list_sessions() had already
+    # returned the complete rows. Each of those is a separate control-plane
+    # connection window (300-500ms on the live hub), so a 114-session host
+    # spent ~45s per request. The lookup count must be flat in the number of
+    # sessions.
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        registry = state.registry
+        real_get_session = registry.get_session
+        real_list_sessions = registry.list_sessions
+        calls = {"get_session": 0, "list_sessions": 0}
+
+        def counting_get_session(session_id):
+            calls["get_session"] += 1
+            return real_get_session(session_id)
+
+        def counting_list_sessions(**kwargs):
+            calls["list_sessions"] += 1
+            return real_list_sessions(**kwargs)
+
+        registry.get_session = counting_get_session  # type: ignore[method-assign]
+        registry.list_sessions = counting_list_sessions  # type: ignore[method-assign]
+
+        def seed(start, count):
+            for index in range(start, start + count):
+                registry.create_session(
+                    host_id="test-host",
+                    harness="claude-code",
+                    command="claude",
+                    session_id=f"structured-{index}",
+                    status="terminated",
+                    mode="structured",
+                )
+
+        def measure(expected_sessions):
+            calls["get_session"] = 0
+            calls["list_sessions"] = 0
+            _, inventory = _json_request(f"{base_url}/sessions")
+            assert len(inventory["sessions"]) == expected_sessions
+            return dict(calls)
+
+        seed(0, 3)
+        small = measure(3)
+        seed(3, 20)
+        large = measure(23)
+
+        assert small == large, f"lookups scaled with session count: {small} -> {large}"
+        assert large["list_sessions"] == 1
+        assert large["get_session"] == 0
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_harnessd_reconciles_exited_sessions_out_of_live_inventory(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     state.presets = {
