@@ -13,9 +13,9 @@ from typing import Iterable, Optional
 
 import click
 
+from drover.collect import tempo_relay
 from drover.collect.cursor import CursorLocked, CursorStore
 from drover.collect.shipper import ShipError, ship_staging
-from drover.collect import tempo_relay
 from drover.collect.sources import (
     ClaudeCodeSource,
     ClaudeMacMiniSource,

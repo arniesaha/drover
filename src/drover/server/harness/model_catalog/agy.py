@@ -5,14 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import selectors
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Sequence
 
-from .models import DiscoveredCatalog, MAX_MODELS, ModelOption
+from .models import MAX_MODELS, DiscoveredCatalog, ModelOption
 from .service import CatalogDiscoveryError
 
 _MAX_OUTPUT_BYTES = 256 * 1024

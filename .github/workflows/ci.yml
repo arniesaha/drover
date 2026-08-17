@@ -68,6 +68,21 @@ jobs:
         git config --global user.email "ci@drover.local"
         git config --global user.name "Drover CI"
 
+    - name: Check imports with isort
+      if: steps.scope.outputs.python == 'true'
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+          BASE_SHA="$(git rev-parse HEAD~1)"
+        fi
+        PY_FILES="$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA"...HEAD -- 'src/**/*.py' 'tests/*.py' 'tests/**/*.py')"
+        if [ -z "$PY_FILES" ]; then
+          echo "No changed Python files to import-check."
+        else
+          echo "$PY_FILES" | xargs isort --check-only
+        fi
+
     - name: Check formatting with Black
       if: steps.scope.outputs.python == 'true'
       env:

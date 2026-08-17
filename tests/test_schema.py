@@ -8,8 +8,9 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
 from drover.event_identity import canonical_agent_events_cte
-from drover.schema import bootstrap, EXPECTED_TABLES, EXPECTED_VIEWS
+from drover.schema import EXPECTED_TABLES, EXPECTED_VIEWS, bootstrap
 
 
 @pytest.fixture

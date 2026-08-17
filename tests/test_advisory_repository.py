@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime, timezone
 import json
 import os
 import stat
 import threading
+from dataclasses import replace
+from datetime import datetime, timezone
 
 import duckdb
 import pytest
 
 from drover.config import load_config
 from drover.schema import bootstrap
-from drover.server.advisory.jobs import enqueue_advisory_check
 from drover.server.advisory import service as advisory_service_module
+from drover.server.advisory.jobs import enqueue_advisory_check
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.service import (
     InsightFilters,

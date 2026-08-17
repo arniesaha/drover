@@ -29,13 +29,13 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
 )
 
+from drover.attribution import derive_repo_attribution
 from drover.event_identity import canonical_agent_events_cte
 from drover.parsers import parse_agentweave_trace
-from drover.server.parquet_io import atomic_write_table
-from drover.attribution import derive_repo_attribution
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
 from drover.server.otlp.proto_adapter import otlp_request_to_trace_dict
+from drover.server.parquet_io import atomic_write_table
 from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.otlp.ingest")

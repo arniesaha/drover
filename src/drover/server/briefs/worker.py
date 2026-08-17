@@ -21,10 +21,10 @@ from typing import Any, Optional
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
-from drover.server.jobs import Delivery
 from drover.server import ledger_shadow
-from drover.server.db import open_duckdb_connection
 from drover.server.briefs.prompt import build_brief_prompt
+from drover.server.db import open_duckdb_connection
+from drover.server.jobs import Delivery
 from drover.server.summarizer.backends import (
     BackendError,
     BackendReadinessError,

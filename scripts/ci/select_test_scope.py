@@ -8,10 +8,10 @@ paths avoid runtime suites, and any unrecognised path runs the Python gate.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import json
-from pathlib import Path
 import subprocess
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Iterable
 
 
