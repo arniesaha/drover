@@ -44,6 +44,98 @@ ARCHIVED_SESSION_STATUSES: tuple[str, ...] = (
 )
 
 
+def _as_utc_datetime(value: Any) -> datetime | None:
+    """Normalize an *inbound* timestamp to a UTC-aware datetime.
+
+    The control plane uses UTC-aware datetimes across session activity and event
+    projection. Incoming event timestamps (which may be ISO strings, timezone-aware
+    datetimes, or timezone-naive datetimes) are normalized to UTC-aware datetimes
+    before sorting, comparison, and SQL binding.
+
+    Direction matters, and the two directions disagree. This helper is for values
+    arriving from a *caller* (wire payloads, API arguments), where a naive value
+    means UTC. Values read back out of a DuckDB TIMESTAMP column are naive
+    *process-local* wall time instead -- see the storage note on
+    ``_db_timestamp_to_utc`` -- so never route a column value through here.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _db_timestamp_to_utc(value: Any) -> datetime | None:
+    """Restore UTC timezone from a DuckDB TIMESTAMP column value.
+
+    Every timestamp column in ``schema.py`` is ``TIMESTAMP``, never
+    ``TIMESTAMPTZ``. Binding an aware datetime converts it to *process-local*
+    wall time and discards the offset; binding a naive datetime stores it
+    verbatim. So a naive datetime read back out of one of those columns means
+    process-local, not UTC::
+
+        aware 20:00+00:00  ->  stored as 13:00   (in PDT)
+        naive 20:00        ->  stored as 20:00
+
+    This helper therefore assumes naive == process-local and attaches the
+    process timezone before normalizing to UTC. That is the opposite assumption
+    from ``_as_utc_datetime`` above, which handles inbound values where naive
+    means UTC. ``drover.server.metrics._wire_datetime`` makes the same
+    process-local assumption for the client-facing read path.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.astimezone().astimezone(timezone.utc)
+        return value.astimezone(timezone.utc)
+    return _as_utc_datetime(value)
+
+
+def _as_db_timestamp(value: Any) -> datetime | None:
+    """Coerce a ``list_events_for_reconciliation`` cursor to a comparable value.
+
+    For the only shape the sole caller ever passes -- ``datetime | None``, taken
+    from a previous page's ``created_at`` -- this is deliberately a passthrough.
+    The cursor is compared against ``harness_events.created_at``, a naive
+    process-local ``TIMESTAMP``, and the value came out of that same column, so
+    it is already in the column's own frame. Converting it to UTC here would
+    shift the cursor by one UTC offset and silently skip or repeat a page.
+
+    Only the string branch does real work, and note that it is the mirror image
+    of ``_as_utc_datetime``'s: this one keeps a naive string naive and keeps an
+    aware string aware, rather than forcing UTC. A future caller passing an
+    aware value would therefore get an aware datetime bound against a naive
+    column -- convert it with ``.astimezone().replace(tzinfo=None)`` first.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            return datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -396,7 +488,7 @@ class HarnessRegistry:
         thinking_effort: str | None = None,
     ) -> HarnessSession:
         now = _now()
-        started_at = started_at or now
+        started_at = _as_utc_datetime(started_at) or now
         session_id = session_id or f"harness-{uuid4()}"
         with self._connect() as con:
             con.execute("BEGIN TRANSACTION")
@@ -557,6 +649,7 @@ class HarnessRegistry:
         summary_session_id: str | None = None,
     ) -> HarnessSession:
         now = _now()
+        ended_at = _as_utc_datetime(ended_at)
         with self._connect() as con:
             con.execute(
                 """
@@ -612,7 +705,7 @@ class HarnessRegistry:
         awaiting: str | None,
         last_activity: datetime | None = None,
     ) -> None:
-        stamp = last_activity or _now()
+        stamp = _as_utc_datetime(last_activity) or _now()
         with self._connect() as con:
             # Read the prior value inside the same window as the write: this
             # is the one chokepoint both the local emit() path and the remote
@@ -741,7 +834,7 @@ class HarnessRegistry:
         seq: int | None = None,
     ) -> HarnessEvent:
         event_id = event_id or f"harness-event-{uuid4()}"
-        created_at = created_at or _now()
+        created_at = _as_utc_datetime(created_at) or _now()
         normalized = normalize_harness_event(
             event_type=event_type,
             payload=payload,
@@ -859,6 +952,7 @@ class HarnessRegistry:
                 seq = record.get("seq")
                 if not isinstance(seq, int) or isinstance(seq, bool):
                     seq = None
+                created_at = _as_utc_datetime(record.get("created_at")) or _now()
                 params.append(
                     [
                         event_id,
@@ -868,7 +962,7 @@ class HarnessRegistry:
                         normalized["normalized_source"],
                         normalized["content_preview"],
                         _json_dumps(record.get("payload")),
-                        record.get("created_at") or _now(),
+                        created_at,
                         seq,
                     ]
                 )
@@ -982,7 +1076,7 @@ class HarnessRegistry:
                     seq = record.get("seq")
                     if not isinstance(seq, int) or isinstance(seq, bool):
                         seq = None
-                    created_at = record.get("created_at") or _now()
+                    created_at = _as_utc_datetime(record.get("created_at")) or _now()
                     normalized = normalize_harness_event(
                         event_type=event_type,
                         payload=payload,
@@ -1041,7 +1135,7 @@ class HarnessRegistry:
                         for event in inserted_events
                     )
                     if rebuild:
-                        projection_events = _rows(
+                        raw_projection_events = _rows(
                             con,
                             "SELECT event_id, event_type, payload_json, "
                             "created_at, seq FROM harness_events "
@@ -1049,13 +1143,22 @@ class HarnessRegistry:
                             "ORDER BY seq, created_at, event_id",
                             [session_id],
                         )
+                        projection_events = [
+                            {
+                                **event,
+                                "created_at": _db_timestamp_to_utc(
+                                    event.get("created_at")
+                                ),
+                            }
+                            for event in raw_projection_events
+                        ]
                         awaiting: str | None = None
                     else:
                         projection_events = sorted(
                             inserted_events,
                             key=lambda event: (
                                 event.get("seq") or 0,
-                                event.get("created_at") or _now(),
+                                _as_utc_datetime(event.get("created_at")) or _now(),
                                 event["event_id"],
                             ),
                         )
@@ -1090,7 +1193,7 @@ class HarnessRegistry:
                             and candidate_native_id.strip()
                         ):
                             native_session_id = candidate_native_id.strip()
-                        created_at = event.get("created_at")
+                        created_at = _as_utc_datetime(event.get("created_at"))
                         if created_at is not None and (
                             latest_activity is None or created_at > latest_activity
                         ):
@@ -1391,6 +1494,7 @@ class HarnessRegistry:
         """
         page_limit = max(1, int(limit))
         cursor_event_id = after_event_id or ""
+        after_created_at = _as_db_timestamp(after_created_at)
         with self._connect() as con:
             rows = _rows(
                 con,

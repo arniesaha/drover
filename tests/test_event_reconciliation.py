@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
 
+import duckdb
 import pytest
 
 from drover.schema import bootstrap
@@ -25,7 +26,11 @@ from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
-from drover.server.metrics import MetricsCollector, start_metrics_server
+from drover.server.metrics import (
+    MetricsCollector,
+    _parse_event_timestamp,
+    start_metrics_server,
+)
 from drover.server.web.auth import AuthSettings
 
 
@@ -389,6 +394,113 @@ def test_reconcile_helpers_on_registry_and_pusher(tmp_path):
         server.server_close()
 
 
+def _hub_instant(wire_ts: str) -> datetime:
+    """The UTC instant the hub derives from a wire `ts`, by its own code path.
+
+    ``web/app.py`` parses ``ts`` with ``metrics._parse_event_timestamp`` and
+    hands the result to ``ingest_structured_events``, which runs it through
+    ``registry._as_utc_datetime`` -- and that reads a *naive* value as UTC.
+    """
+    return registry_module._as_utc_datetime(_parse_event_timestamp(wire_ts))
+
+
+def test_reconciled_wire_timestamps_carry_an_offset_not_local_wall_time(tmp_path):
+    """The `ts` a reconciled event ships must name the instant it was written.
+
+    ``harness_events.created_at`` is a DuckDB ``TIMESTAMP``, so it holds naive
+    *process-local* wall time. The hub parses a naive ``ts`` as UTC, so sending
+    the column value verbatim moves every reconciled event by one UTC offset
+    (-7h in PDT). Send an offset-carrying ISO string instead.
+    """
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        registry = _init_registry(tmp_path)
+        session = registry.create_session(
+            host_id="host-tz",
+            harness="claude-code",
+            command="claude",
+            mode="structured",
+        )
+        written = datetime(2026, 8, 16, 20, 0, 0, tzinfo=timezone.utc)
+        # No "ts" key in the payload: this is the shape of session.started,
+        # session.exited, transcript.gap, terminal.initial_input and every
+        # legacy row, i.e. the events that depend on the fallback below.
+        registry.append_event(
+            session_id=session.session_id,
+            event_type="session.started",
+            payload={"type": "session.started"},
+            seq=1,
+            created_at=written,
+            normalized_source="structured",
+        )
+
+        pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
+        assert reconcile_unsent_events(registry, pusher) == 1
+        wire_ts = _FakeCentralHandler.requests[0]["body"]["events"][0]["ts"]
+
+        parsed = datetime.fromisoformat(wire_ts)
+        assert (
+            parsed.tzinfo is not None
+        ), f"naive wire ts {wire_ts!r} will be read as UTC by the hub"
+        assert parsed == written
+        # And the hub's own parse of that string must land on the same instant.
+        assert _hub_instant(wire_ts) == written
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_reconciliation_reads_legacy_naive_rows_written_by_old_code(tmp_path):
+    """Migration case: a row old code wrote naively, read back by new code.
+
+    Before this normalization work, rows landed in ``harness_events`` as bare
+    local wall time with ``normalized_source`` NULL. Those rows are matched by
+    ``list_events_for_reconciliation``'s legacy clause and must still reconcile
+    to the instant they represent.
+    """
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        registry = _init_registry(tmp_path)
+        session = registry.create_session(
+            session_id="legacy-session",
+            host_id="host-legacy",
+            harness="claude-code",
+            command="claude",
+            mode="structured",
+        )
+        written = datetime(2026, 6, 1, 17, 30, 0, tzinfo=timezone.utc)
+        legacy_column_value = written.astimezone().replace(tzinfo=None)
+        with duckdb.connect(str(registry.control_plane_path)) as con:
+            con.execute(
+                "INSERT INTO harness_events("
+                "event_id,session_id,event_type,normalized_source,"
+                "payload_json,created_at,seq) VALUES (?,?,?,NULL,?,?,?)",
+                [
+                    "legacy-ev-1",
+                    session.session_id,
+                    "assistant_output",
+                    '{"text":"legacy answer","type":"assistant_output"}',
+                    legacy_column_value,
+                    1,
+                ],
+            )
+
+        # New code reading the legacy row resolves it to the right instant.
+        event = registry.list_events_after(session.session_id, 0)[0]
+        assert event.created_at == legacy_column_value  # still naive on the way out
+        assert registry_module._db_timestamp_to_utc(event.created_at) == written
+
+        pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
+        assert reconcile_unsent_events(registry, pusher) == 1
+        wire_ts = _FakeCentralHandler.requests[0]["body"]["events"][0]["ts"]
+        assert _hub_instant(wire_ts) == written
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_list_events_for_reconciliation_filters_host_and_pages_without_age_cutoff(
     tmp_path,
 ):
@@ -721,6 +833,137 @@ def test_e2e_restart_event_reconciliation(tmp_path):
         # 5. Verify local session was marked errored (orphaned on restart)
         local_session = daemon_registry.get_session(session.session_id)
         assert local_session.status == "errored"
+    finally:
+        if pusher is not None:
+            pusher.stop()
+        daemon_server.shutdown()
+        daemon_server.server_close()
+        central_server.shutdown()
+
+
+def test_e2e_restart_event_reconciliation_mixed_timestamps(tmp_path):
+    """End-to-end: Pre-populated local events with mixed naive and aware timestamps reconcile."""
+    test_token = "e2e-token-tz"
+    auth = AuthSettings(enabled=True, api_token=test_token)
+    auth_headers = {"Authorization": f"Bearer {test_token}"}
+
+    # 1. Start central server
+    central_db = tmp_path / "central.duckdb"
+    bootstrap(parquet_dir=tmp_path / "central-parquet", duckdb_path=central_db)
+    collector = MetricsCollector(
+        duckdb_path=central_db,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    central_server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=auth
+    )
+    central_port = central_server.server_address[1]
+    central_url = f"http://127.0.0.1:{central_port}"
+
+    # 2. Seed daemon DuckDB with events having naive and aware timestamps
+    daemon_db = tmp_path / "daemon.duckdb"
+    bootstrap(parquet_dir=tmp_path / "daemon-parquet", duckdb_path=daemon_db)
+    daemon_registry = HarnessRegistry(daemon_db)
+    session = daemon_registry.create_session(
+        host_id="test-daemon-tz",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+        status="running",
+    )
+    t0_naive = datetime(2026, 8, 16, 10, 0, 0)
+    t1_aware_non_utc = datetime(
+        2026, 8, 16, 12, 30, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+    t2_aware_utc = datetime(2026, 8, 16, 11, 0, 0, tzinfo=timezone.utc)
+
+    daemon_registry.append_event(
+        session_id=session.session_id,
+        event_type="user_input",
+        payload={"text": "turn with naive time", "type": "user_input"},
+        seq=1,
+        created_at=t0_naive,
+        normalized_source="structured",
+    )
+    daemon_registry.append_event(
+        session_id=session.session_id,
+        event_type="assistant_output",
+        payload={"text": "answer with aware non-utc", "type": "assistant_output"},
+        seq=2,
+        created_at=t1_aware_non_utc,
+        normalized_source="structured",
+    )
+    daemon_registry.append_event(
+        session_id=session.session_id,
+        event_type="status",
+        payload={"turn_complete": True, "type": "status"},
+        seq=3,
+        created_at=t2_aware_utc,
+        normalized_source="structured",
+    )
+
+    # 3. Boot daemon: wire_event_pusher & create_harness_server run reconciliation
+    state = HarnessDaemonState(
+        host_id="test-daemon-tz",
+        display_name="Test Daemon TZ",
+        kind="linux",
+        registry=daemon_registry,
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        local_url="http://127.0.0.1:0",
+        api_token=test_token,
+        central_url=central_url,
+    )
+    register_daemon_host(state)
+    pusher = wire_event_pusher(state)
+    daemon_server = create_harness_server(
+        listen_host="127.0.0.1", listen_port=0, state=state
+    )
+    daemon_thread = threading.Thread(target=daemon_server.serve_forever, daemon=True)
+    daemon_thread.start()
+
+    try:
+        # 4. Verify central received all 3 events without error
+        def _get_messages():
+            req = urllib.request.Request(
+                f"{central_url}/harness/sessions/{session.session_id}/messages",
+                headers=auth_headers,
+            )
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))["messages"]
+
+        assert _wait_until(
+            lambda: len(_get_messages()) == 3,
+            timeout=10.0,
+        )
+
+        messages = _get_messages()
+        assert len(messages) == 3
+        assert [m["seq"] for m in messages] == [1, 2, 3]
+        assert messages[0]["text"] == "turn with naive time"
+        assert messages[1]["text"] == "answer with aware non-utc"
+
+        # The instants must survive the round trip. Without this, the whole
+        # reconciliation path could shift every event by one UTC offset and the
+        # seq/text assertions above would still pass. A naive inbound value
+        # means UTC (see registry._as_utc_datetime), so t0 is 10:00Z; t1 is
+        # 12:30+02:00 == 10:30Z; t2 is already 11:00Z.
+        expected_instants = [
+            t0_naive.replace(tzinfo=timezone.utc),
+            datetime(2026, 8, 16, 10, 30, 0, tzinfo=timezone.utc),
+            t2_aware_utc,
+        ]
+        # a) the wire `ts` central was handed, read the way central reads it
+        assert [_hub_instant(m["ts"]) for m in messages] == expected_instants
+        # b) and what central actually persisted, read back through the
+        #    process-local column convention
+        central_registry = HarnessRegistry(central_db)
+        stored = central_registry.list_events_after(session.session_id, 0)
+        assert [
+            registry_module._db_timestamp_to_utc(event.created_at) for event in stored
+        ] == expected_instants
     finally:
         if pusher is not None:
             pusher.stop()
