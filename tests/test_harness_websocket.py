@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import urllib.request
 from time import monotonic
 from time import sleep as time_sleep
-import urllib.request
 
 import pytest
 

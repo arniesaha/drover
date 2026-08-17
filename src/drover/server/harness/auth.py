@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-from contextlib import suppress
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+import codecs
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import signal
 import subprocess
 import threading
 import time
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator, Protocol, Sequence
 from uuid import uuid4
-
-import codecs
 
 from .pty import make_controlling_tty_preexec, resize_pty
 

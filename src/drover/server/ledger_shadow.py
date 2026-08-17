@@ -25,7 +25,6 @@ from typing import Any, Mapping, Optional
 import duckdb
 
 from drover.server.db import open_duckdb_connection
-
 from drover.server.ledger import (
     JOB_PENDING,
     JOB_RETRY_WAIT,

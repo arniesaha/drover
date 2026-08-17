@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from drover.schema import bootstrap
 from drover.server.harness.registry import HarnessRegistry

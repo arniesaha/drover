@@ -1,25 +1,25 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import gzip
 import hashlib
 import json
 import logging
-from pathlib import Path
-import base64
-import gzip
 import os
-import duckdb
 import shutil
 import socket
 import threading
-from time import monotonic
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from time import monotonic
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import duckdb
 import pytest
 
 import drover.server.harness.registry as registry_module
@@ -37,13 +37,13 @@ from drover.server.advisory.types import (
 )
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.db import control_plane_path
+from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
     create_harness_server,
     register_daemon_host,
 )
-from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry

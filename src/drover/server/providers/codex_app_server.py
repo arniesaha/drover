@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from queue import Empty, Full, Queue
 import subprocess
 import threading
+from queue import Empty, Full, Queue
 from time import monotonic
 from typing import Any, Mapping, Sequence
 

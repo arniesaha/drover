@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
 import threading
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import duckdb
 import pytest
 
-from drover.config import default_config, load_config
-from drover.config import AdvisoryContentConfig
+from drover.config import AdvisoryContentConfig, default_config, load_config
 from drover.schema import bootstrap
+from drover.server.__main__ import _create_content_analysis_worker
 from drover.server.advisory.analyzers import (
     AnalysisSnapshot,
     ProviderConnectionObservation,
@@ -22,6 +22,7 @@ from drover.server.advisory.analyzers import (
     TelemetryAggregate,
 )
 from drover.server.advisory.analyzers.connectors import ConnectorFreshnessAnalyzer
+from drover.server.advisory.content_targets import BundledTarget, ContentBundle
 from drover.server.advisory.jobs import (
     AdvisoryScheduler,
     enqueue_advisory_check,
@@ -45,17 +46,15 @@ from drover.server.advisory.worker import (
     ContentAnalysisScheduler,
     ContentAnalysisWorker,
     load_operational_snapshot,
-    operational_snapshot_source_version,
     operational_analyzers,
+    operational_snapshot_source_version,
 )
-from drover.server.advisory.content_targets import BundledTarget, ContentBundle
 from drover.server.cockpit.service import ProviderRefreshLoop
+from drover.server.db import control_plane_path
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.ledger import Ledger
 from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import ProviderAccountSnapshot
-from drover.server.__main__ import _create_content_analysis_worker
-from drover.server.db import control_plane_path
-from drover.server.harness.registry import HarnessRegistry
 
 NOW = datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc)
 

@@ -8,12 +8,12 @@ an ASGI server dependency.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
 import hashlib
 import json
 import os
 import socket
 import struct
+from dataclasses import dataclass
 from typing import Any
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

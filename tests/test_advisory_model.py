@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import threading
+from datetime import datetime, timezone
 
 import pytest
 
@@ -15,13 +15,13 @@ from drover.server.advisory.content_targets import (
     ContentBundle,
 )
 from drover.server.advisory.model_analyzer import (
-    build_configured_analysis_backend,
     ModelConfigurationAnalyzer,
     ModelFindingError,
+    build_configured_analysis_backend,
     select_analysis_backend,
 )
-from drover.server.advisory.types import AnalyzerClass, Confidence
 from drover.server.advisory.service import InsightsService
+from drover.server.advisory.types import AnalyzerClass, Confidence
 from drover.server.advisory.worker import _ConsentFencedBackend
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig

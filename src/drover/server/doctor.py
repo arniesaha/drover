@@ -16,8 +16,6 @@ from typing import Optional
 
 import duckdb
 
-from drover.server.db import open_duckdb_connection
-
 from drover.attribution import (
     GENERAL_WORKSPACE_ACTIVITY_TYPE,
     configured_general_workspace_roots,
@@ -27,6 +25,7 @@ from drover.event_identity import (
     canonical_agent_events_cte,
     scan_agent_events_once,
 )
+from drover.server.db import open_duckdb_connection
 from drover.server.summarizer.retry import classify_summarize_error
 from drover.session_audit import audit_session_consistency
 

@@ -7,8 +7,6 @@ is the thin HTTP shim around it.
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import gzip
 import json
 import logging
@@ -16,13 +14,19 @@ import queue
 import socket
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, unquote_to_bytes, urlparse
 
-from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
-from drover.server.harness.relay_protocol import RelayProtocolError, parse_frame
+from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.relay_protocol import (
+    RELAY_CONTROL_FRAME_BYTES,
+    RelayProtocolError,
+    parse_frame,
+)
 from drover.server.harness.websocket import (
     OPCODE_CLOSE,
     OPCODE_PING,
@@ -38,7 +42,6 @@ from drover.server.harness.websocket import (
     send_frame,
     send_json,
 )
-from drover.server.harness.relay_protocol import RELAY_CONTROL_FRAME_BYTES
 from drover.server.web.auth import (
     DISABLED,
     AuthSettings,

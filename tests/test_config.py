@@ -1,8 +1,10 @@
 """Tests for src/drover/config.py."""
 
 from pathlib import Path
+
 import pytest
-from drover.config import FavoriteCwd, load_config, default_config
+
+from drover.config import FavoriteCwd, default_config, load_config
 
 FIXTURE = Path(__file__).parent / "fixtures" / "nexus_config.toml"
 
