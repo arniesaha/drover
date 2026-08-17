@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from datetime import datetime
 import logging
-from pathlib import Path
 import secrets
 import threading
 import time
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from drover.server.cockpit.analytics import (
@@ -350,7 +350,9 @@ class ProviderRefreshLoop:
             if not host_id:
                 continue
             status = str(getattr(host, "status", "online") or "").lower()
-            if status != "online":
+            is_stale_fn = getattr(host, "is_stale", None)
+            is_stale = is_stale_fn() if callable(is_stale_fn) else False
+            if status != "online" or is_stale:
                 try:
                     self.provider_usage.mark_host_unavailable(
                         host_id, error_category="host_offline"

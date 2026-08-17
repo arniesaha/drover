@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
 import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -54,6 +54,30 @@ class HarnessHost:
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
         )
+
+    def is_stale(
+        self,
+        *,
+        stale_after_seconds: float = 45.0,
+        now: datetime | None = None,
+    ) -> bool:
+        """True when a direct host has not reported a heartbeat within the stale window."""
+        if self.connection_kind == "relay":
+            return False
+        if self.last_seen_at is None:
+            return False
+        if now is None:
+            now = (
+                datetime.now(timezone.utc)
+                if self.last_seen_at.tzinfo is not None
+                else datetime.now()
+            )
+        elif self.last_seen_at.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        elif self.last_seen_at.tzinfo is None and now.tzinfo is not None:
+            now = now.astimezone(timezone.utc).replace(tzinfo=None)
+        age = (now - self.last_seen_at).total_seconds()
+        return age > stale_after_seconds
 
 
 @dataclass(frozen=True)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import http.client
 import json
@@ -12,40 +10,41 @@ import socket
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
-
-from drover.config import FavoriteCwd
 from urllib.parse import quote, urlencode, urlparse
 
+from drover.config import FavoriteCwd
+from drover.server.db import (
+    control_plane_connection,
+    control_plane_path,
+    copy_duckdb_store,
+    open_duckdb_connection,
+    snapshot_scratch_root,
+)
 from drover.server.harness.daemon import (
     _STRUCTURED_DEFAULT_COMMANDS,
     native_transcript_for_session,
 )
-from drover.server.harness.recap_jobs import LiveRecap
-from drover.server.harness.recap_prompt import drop_user_subject
-from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.model_catalog import (
     MAX_CATALOG_WIRE_BYTES,
     CatalogEnvelope,
     catalog_wire_bytes,
 )
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
+from drover.server.harness.recap_jobs import LiveRecap
+from drover.server.harness.recap_prompt import drop_user_subject
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
 )
-from drover.server.db import (
-    copy_duckdb_store,
-    snapshot_scratch_root,
-    control_plane_connection,
-    control_plane_path,
-    open_duckdb_connection,
-)
 from drover.server.jobs import RedisJobStream
-from drover.server.readiness import ReadinessProbe
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
+from drover.server.readiness import ReadinessProbe
 
 if TYPE_CHECKING:
     from drover.server.advisory.service import InsightFilters, InsightsService
@@ -2202,6 +2201,7 @@ class MetricsCollector:
                 payload=payload,
                 timeout_s=timeout_s,
                 max_response_bytes=max_response_bytes,
+                host_id=getattr(host, "host_id", None),
             )
         return _json_response(
             502, {"error": f"harness host has no reachable endpoint: {host.host_id}"}
@@ -2215,6 +2215,7 @@ class MetricsCollector:
         payload: Mapping[str, Any] | None = None,
         timeout_s: float = 15,
         max_response_bytes: int | None = None,
+        host_id: str | None = None,
     ) -> tuple[int, str]:
         body = json.dumps(dict(payload or {}), sort_keys=True)
         parsed = urlparse(url)
@@ -2246,10 +2247,11 @@ class MetricsCollector:
             # daemon.py:2135, after the session existed), and the app told the
             # user to try again -- the one thing that can leave two sessions
             # where they asked for one.
+            target_label = f"{host_id} ({url})" if host_id else url
             log.warning(
                 "harness request to %s timed out after %ss; the host may still "
                 "complete it",
-                url,
+                target_label,
                 timeout_s,
             )
             return _json_response(
@@ -2420,6 +2422,6 @@ class MetricsCollector:
             return {"error": str(exc)}
 
 
-from drover.server.web.app import (
+from drover.server.web.app import (  # noqa: E402,F401 - compat re-export
     start_metrics_server,
-)  # noqa: E402,F401 - compat re-export
+)

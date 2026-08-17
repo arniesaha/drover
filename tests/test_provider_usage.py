@@ -1,21 +1,21 @@
 """Contracts for normalized provider account usage."""
 
-from datetime import datetime, timedelta, timezone
 import logging
-from pathlib import Path
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import duckdb
 import pytest
 
-from drover.schema import bootstrap
 from drover.config import load_config
-from drover.server.providers.codex import CodexUsageProbe
+from drover.schema import bootstrap
 from drover.server.cockpit.analytics import AnalyticsFilters
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
+from drover.server.providers.codex import CodexUsageProbe
 from drover.server.providers.inventory import detect_provider_accounts
 from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import (
@@ -793,6 +793,122 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
     assert recovered.status == "ok"
     assert recovered.error_category is None
     assert refreshes == ["mac-mini", "mac-mini"]
+
+
+def test_provider_refresh_loop_skips_stale_host(tmp_path):
+    from drover.server.harness.models import HarnessHost
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+    service = ProviderUsageService(
+        duckdb_path=tmp_path / "drover.duckdb",
+        parquet_dir=tmp_path / "parquet",
+    )
+    now = datetime.now(timezone.utc)
+    fresh_host = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=now,
+    )
+    stale_host = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=now - timedelta(seconds=120),
+    )
+    current_host = [fresh_host]
+
+    class _Registry:
+        def list_hosts(self):
+            return [current_host[0]]
+
+    refreshes = []
+    monotonic_clock = [0.0]
+    payload = {
+        **GOOD_PAYLOAD,
+        "accounts": [
+            {
+                **GOOD_PAYLOAD["accounts"][0],
+                "host_id": "gpu-pc",
+                "observed_at": now.isoformat(),
+                "windows": [
+                    {
+                        "window_kind": "primary",
+                        "window_label": "5 hours",
+                        "reset_at": (now + timedelta(hours=5)).isoformat(),
+                        "used_percent": 12.5,
+                        "used_tokens": 125,
+                        "limit_tokens": 1000,
+                    }
+                ],
+            }
+        ],
+    }
+    loop = ProviderRefreshLoop(
+        provider_usage=service,
+        registry=_Registry(),
+        shutdown_event=threading.Event(),
+        interval_seconds=300,
+        clock=lambda: monotonic_clock[0],
+        fetch=lambda item: refreshes.append(item.host_id) or payload,
+    )
+
+    # Initial run when host is fresh - probes and succeeds
+    loop.run_once()
+    assert refreshes == ["gpu-pc"]
+    assert service.latest_accounts()[0].status == "ok"
+
+    # Host becomes stale - refresh loop skips probe and marks offline
+    current_host[0] = stale_host
+    monotonic_clock[0] = 10.0
+    loop.run_once()
+    assert refreshes == ["gpu-pc"]  # No second probe!
+    accounts = service.latest_accounts()
+    assert len(accounts) == 1
+    assert accounts[0].status == "stale"
+    assert accounts[0].error_category == "host_offline"
+
+
+def test_harness_host_is_stale_behavior():
+    from drover.server.harness.models import HarnessHost
+
+    now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+    fresh_time = now - timedelta(seconds=10)
+    old_time = now - timedelta(seconds=120)
+
+    fresh_host = HarnessHost(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=fresh_time,
+    )
+    stale_host = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=old_time,
+    )
+    relay_host = HarnessHost(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        status="online",
+        connection_kind="relay",
+        last_seen_at=old_time,
+    )
+
+    assert fresh_host.is_stale(now=now) is False
+    assert stale_host.is_stale(now=now) is True
+    # Relay hosts don't rely on last_seen_at for staleness
+    assert relay_host.is_stale(now=now) is False
 
 
 @pytest.mark.parametrize(("toml_value", "expected"), [("900", 900.0), ("900.5", 900.5)])
