@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-16
+
+### Fixed
+
+- Listing a host's sessions no longer costs a second per session. The daemon
+  read every session row in one query, discarded them, then re-read each row
+  one at a time, and each of those reads built a fresh DuckDB instance,
+  extensions and all. On a host with 114 sessions that was 115 instance
+  constructions per request and `GET /sessions` took 42 to 55 seconds. It now
+  takes about 15 milliseconds
+- Starting a session no longer times out while a listing is in flight. Creates
+  compete for the same control-plane lock, so they queued behind the listing
+  above and overran the hub's 120 second budget, leaving the app showing a
+  handoff that never resolved for work the host had in fact started
+- A reconciled event reaches the hub with the instant it actually happened.
+  Timestamps read back from a DuckDB `TIMESTAMP` column are naive local wall
+  time, and the wire carried them without an offset, so the hub read them as
+  UTC and moved every reconciled event by one UTC offset. The hub is
+  idempotent on event id, so a shifted event was never corrected afterwards
+- A session keeps the label recording what it was resumed from. It was cleared
+  moments after every session started, so the app had nothing to show
+- Structured session events are reconciled from DuckDB after a harnessd
+  restart, durably and without blocking the liveness path
+- The launch picker shows stale hosts as stale rather than hiding them, and
+  keeps the selected host while the app is offline
+
+### Added
+
+- A host reports why it refused a self-update: which version, the reason
+  (failed smoke test, not quiescent, failed install), and when the refusal
+  began. A release that no host will accept was previously visible only by
+  reading each host's log on each host
+- A refusal clears when the release that caused it is withdrawn, so pulling a
+  bad release is enough to clear the fleet rather than leaving every host
+  reporting a version nobody is offering any more
+
 ## [0.3.2] - 2026-08-15
 
 ### Fixed
