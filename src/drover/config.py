@@ -9,8 +9,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+import logging
 import math
 import os
+
+log = logging.getLogger("drover.config")
+
+# How a host activates a version it has downloaded. See `update_activation`.
+ACTIVATION_SYMLINK = "symlink"
+ACTIVATION_IN_PLACE = "in_place"
+ACTIVATION_MODES = (ACTIVATION_SYMLINK, ACTIVATION_IN_PLACE)
 
 try:
     import tomllib  # Python 3.11+
@@ -178,6 +186,16 @@ class DroverConfig:
     update_quiesce_timeout_hours: int
     update_keep_versions: int
     update_repo: str
+    # How a host puts a downloaded version into service. "symlink" flips
+    # runtime/current at the new venv and restarts, which is what every Linux
+    # host does and is strictly safer. "in_place" installs the new version
+    # into an existing venv instead, for the one host that cannot exec a new
+    # one: macOS keys its TCC grant for the external volume to the executable,
+    # so a new venv there dies at interpreter startup with EPERM reading its
+    # own pyvenv.cfg. Opt-in, and the venv must be named explicitly --
+    # guessing one is how the wrong environment gets overwritten.
+    update_activation: str
+    update_in_place_venv: str
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     # Each carries the host it belongs to, or None for every host.
@@ -273,6 +291,8 @@ _DEFAULTS = {
         "quiesce_timeout_hours": 6,
         "keep_versions": 2,
         "repo": "arniesaha/drover",
+        "activation": ACTIVATION_SYMLINK,
+        "in_place_venv": "",
     },
     "harness": {
         "favorite_cwds": [],
@@ -306,6 +326,22 @@ _DEFAULTS = {
         "excerpt_max_chars": 320,
     },
 }
+
+
+def _activation_mode(raw) -> str:
+    """Normalise `update.activation`, falling back rather than raising.
+
+    A typo here must never stop the daemon starting: the fallback is the
+    default every host has always used, so the cost of getting it wrong is an
+    update that activates the ordinary way, not a host that is down.
+    """
+    mode = str(raw or "").strip()
+    if mode in ACTIVATION_MODES:
+        return mode
+    log.warning(
+        "unknown update.activation %r; falling back to %r", mode, ACTIVATION_SYMLINK
+    )
+    return ACTIVATION_SYMLINK
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -381,6 +417,8 @@ def _from_dict(d: dict) -> DroverConfig:
         update_quiesce_timeout_hours=int(d["update"]["quiesce_timeout_hours"]),
         update_keep_versions=int(d["update"]["keep_versions"]),
         update_repo=str(d["update"]["repo"]),
+        update_activation=_activation_mode(d["update"]["activation"]),
+        update_in_place_venv=str(d["update"]["in_place_venv"]).strip(),
         harness_favorite_cwds=tuple(
             favorite
             for favorite in (

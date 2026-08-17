@@ -202,23 +202,98 @@ def _install_into(
             ],
             ["uv", "pip", "install", "--python", str(python), "--no-deps", str(wheel)],
         ]
-        for command in steps:
-            try:
-                result = runner(
-                    command,
-                    capture_output=True,
-                    timeout=INSTALL_TIMEOUT_SECONDS,
-                    check=False,
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("install step failed: %s", " ".join(command))
-                return False
-            if getattr(result, "returncode", 1) != 0:
-                log.error("install step returned nonzero: %s", " ".join(command))
-                return False
+        if not _run_steps(steps, runner=runner):
+            return False
+
+        # Cached only now, not straight after verification: `uv venv` refuses a
+        # target directory that already exists, so writing the cache inside it
+        # any earlier would make every install fail on its own cache. These are
+        # still the verified bytes; nothing is fetched twice.
+        layout.cache_artifact(artifact.version, wheel, lock)
 
     # uv succeeding is not the same as the result being runnable.
     if not layout.smoke_test(artifact.version):
         log.error("%s installed but failed its smoke test", artifact.version)
         return False
+    return True
+
+
+def _run_steps(steps: list[list[str]], *, runner) -> bool:
+    for command in steps:
+        try:
+            result = runner(
+                command,
+                capture_output=True,
+                timeout=INSTALL_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("install step failed: %s", " ".join(command))
+            return False
+        if getattr(result, "returncode", 1) != 0:
+            log.error("install step returned nonzero: %s", " ".join(command))
+            return False
+    return True
+
+
+def install_cached_into_venv(
+    layout: RuntimeLayout,
+    version: str,
+    venv: Path | str,
+    *,
+    runner=subprocess.run,
+) -> bool:
+    """Install a version's cached wheel INTO an existing venv. Returns success.
+
+    This is the opposite of everything else in this module, and deliberately
+    so. It exists for a host that cannot exec a new venv at all: the macOS hub
+    holds a TCC grant keyed to the executable, so a freshly created venv on the
+    external volume dies at interpreter startup with EPERM reading its own
+    ``pyvenv.cfg``. Keeping the executable path and the interpreter exactly
+    where they are is the only activation that survives, which means the new
+    version has to be installed over the old one.
+
+    Nothing is downloaded here. The wheel and lock were verified against the
+    release manifest at install time and cached with the version; if they are
+    missing this refuses rather than reaching for the network, because
+    activation runs when the host has finally gone idle and that is the worst
+    possible moment to start something that can hang.
+    """
+    cached = layout.cached_artifact(version)
+    if cached is None:
+        log.error("%s has no cached artifact; refusing to install it in place", version)
+        return False
+    python = Path(venv) / "bin" / "python"
+    if not python.exists():
+        # Guessing an interpreter is how the wrong venv gets overwritten.
+        log.error("%s is not an interpreter we can install into", python)
+        return False
+
+    steps = [
+        # Mirrors _install_into exactly, minus the `uv venv`: same hash-pinned
+        # dependencies, same already-verified wheel with --no-deps.
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--require-hashes",
+            "-r",
+            str(cached.lock),
+        ],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--no-deps",
+            str(cached.wheel),
+        ],
+    ]
+    if not _run_steps(steps, runner=runner):
+        log.error("could not install %s into %s", version, venv)
+        return False
+    log.info("installed %s into %s in place", version, venv)
     return True

@@ -360,3 +360,92 @@ def test_a_failed_install_does_not_count_as_an_installed_version(tmp_path):
         is False
     )
     assert artifact.version not in layout.installed_versions()
+
+
+# --- cached artifacts ---------------------------------------------------------
+
+
+def _installing_runner(tmp_path, version="0.1.4"):
+    """A uv stand-in that leaves behind what a real install would."""
+
+    class _Ok:
+        returncode = 0
+
+    def runner(cmd, **kwargs):
+        if cmd[:2] == ["uv", "venv"]:
+            binary = RuntimeLayout(tmp_path).executable("drover-server", version)
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+        return _Ok()
+
+    return runner
+
+
+def test_install_caches_the_verified_wheel_and_lock_with_the_version(tmp_path):
+    """Each version carries its own rollback material.
+
+    An in-place host activates by installing a wheel into the venv it already
+    has, and it does that when it finally goes idle -- which may be hours after
+    the download, and must not reach for the network again. Keeping the
+    artifacts inside the version tree also means the existing keep=2 prune
+    policy retains the previous version's wheel for free, instead of a
+    separate cache with a lifetime of its own to get wrong.
+    """
+    artifact, payload, lock = _artifact()
+    layout = RuntimeLayout(tmp_path)
+
+    assert install_version(
+        layout,
+        artifact,
+        runner=_installing_runner(tmp_path),
+        opener=_download_opener(payload, lock),
+    )
+
+    cached = layout.cached_artifact("0.1.4")
+    assert cached is not None
+    assert cached.wheel.name == WHEEL
+    assert cached.wheel.read_bytes() == payload, "the verified bytes, not a re-fetch"
+    assert cached.lock.read_bytes() == lock
+
+
+def test_a_pruned_version_takes_its_cached_artifacts_with_it(tmp_path):
+    """The cache has no lifetime of its own; it is part of the version tree."""
+    artifact, payload, lock = _artifact()
+    layout = RuntimeLayout(tmp_path)
+    install_version(
+        layout,
+        artifact,
+        runner=_installing_runner(tmp_path),
+        opener=_download_opener(payload, lock),
+    )
+    artifact_dir = layout.artifact_dir("0.1.4")
+    assert artifact_dir.is_dir()
+
+    for version in ("0.1.5", "0.1.6"):
+        binary = layout.executable("drover-server", version)
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    layout.flip("0.1.6")
+
+    assert "0.1.4" in layout.prune(keep=2)
+    assert not artifact_dir.exists()
+    assert layout.cached_artifact("0.1.4") is None
+
+
+def test_cached_artifacts_do_not_read_as_an_installed_version(tmp_path):
+    """`installed_versions` lists directories; the cache must not join them."""
+    artifact, payload, lock = _artifact()
+    layout = RuntimeLayout(tmp_path)
+    install_version(
+        layout,
+        artifact,
+        runner=_installing_runner(tmp_path),
+        opener=_download_opener(payload, lock),
+    )
+    assert layout.installed_versions() == ["0.1.4"]
+
+
+def test_a_version_with_no_cache_reads_as_absent_rather_than_raising(tmp_path):
+    layout = RuntimeLayout(tmp_path)
+    assert layout.cached_artifact("9.9.9") is None

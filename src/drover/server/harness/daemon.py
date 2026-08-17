@@ -29,7 +29,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
-from drover.config import config_home, default_token_file, resolve_api_token_env
+from drover.config import (
+    ACTIVATION_SYMLINK,
+    config_home,
+    default_token_file,
+    resolve_api_token_env,
+)
 from drover.server.harness.auth import (
     AuthFlowInputError,
     AuthFlowLaunchError,
@@ -61,6 +66,7 @@ from drover.server.harness.updater import (
     REGISTRATION_DEADLINE_SECONDS,
     HostUpdater,
     default_restarter,
+    resolve_activation,
     verify_after_restart,
 )
 from drover.server.harness.websocket import (
@@ -3362,6 +3368,8 @@ def _rollback_watchdog(
     deadline_seconds: float = REGISTRATION_DEADLINE_SECONDS,
     sleep=time.sleep,
     restarter=default_restarter,
+    activation: str = ACTIVATION_SYMLINK,
+    in_place_venv: str = "",
 ) -> None:
     """Undo a flip whose new version cannot reach the hub.
 
@@ -3371,7 +3379,12 @@ def _rollback_watchdog(
     deadline = monotonic() + deadline_seconds
     while monotonic() < deadline and not state.registered_at_least_once:
         sleep(2)
-    if verify_after_restart(layout, registered=state.registered_at_least_once):
+    if verify_after_restart(
+        layout,
+        registered=state.registered_at_least_once,
+        activation=activation,
+        in_place_venv=in_place_venv,
+    ):
         return
     # The symlink now points back at the previous version, but this process is
     # still the new one. The service manager owns the restart; asking it to
@@ -3380,11 +3393,16 @@ def _rollback_watchdog(
 
 
 def _start_rollback_watchdog(
-    state: HarnessDaemonState, layout: RuntimeLayout
+    state: HarnessDaemonState,
+    layout: RuntimeLayout,
+    *,
+    activation: str = ACTIVATION_SYMLINK,
+    in_place_venv: str = "",
 ) -> threading.Thread:
     thread = threading.Thread(
         target=_rollback_watchdog,
         args=(state, layout),
+        kwargs={"activation": activation, "in_place_venv": in_place_venv},
         name="drover-harnessd-watchdog",
         daemon=True,
     )
@@ -3547,7 +3565,12 @@ def run_harnessd(
         # the state itself to ask whether this host is idle.
         layout = RuntimeLayout(config_home())
         state.updater = HostUpdater(state, layout, cfg)
-        _start_rollback_watchdog(state, layout)
+        # Resolved once, here, so the watchdog and the updater cannot disagree
+        # about how this host activates.
+        activation, in_place_venv = resolve_activation(cfg)
+        _start_rollback_watchdog(
+            state, layout, activation=activation, in_place_venv=in_place_venv
+        )
     server = create_harness_server(
         listen_host=listen_host,
         listen_port=listen_port,
