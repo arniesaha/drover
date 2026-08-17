@@ -17,9 +17,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from drover.config import DroverConfig
+from drover.config import ACTIVATION_IN_PLACE, ACTIVATION_SYMLINK, DroverConfig
 from drover.server.runtime import RuntimeLayout, compare_versions
-from drover.server.updates import ReleaseArtifact, install_version
+from drover.server.updates import (
+    ReleaseArtifact,
+    install_cached_into_venv,
+    install_version,
+)
 
 log = logging.getLogger("drover.harnessd.update")
 
@@ -114,6 +118,33 @@ def default_restarter() -> None:
         subprocess.run(["systemctl", "--user", "restart", unit], check=False)
 
 
+def resolve_activation(cfg) -> tuple[str, str]:
+    """The activation mode this host will actually use, and its venv.
+
+    In-place activation with no venv configured is a misconfiguration, not an
+    instruction to go looking for one: the whole point of naming it explicitly
+    is that the wrong guess overwrites an environment nobody asked us to
+    touch. Fall back to the symlink every other host uses and say so.
+
+    The venv is expanded here, once, so everything downstream sees the same
+    absolute path. A daemon started by launchd or systemd does not run a
+    shell, and an unexpanded `~` would become a directory of that name.
+    """
+    mode = str(getattr(cfg, "update_activation", "") or ACTIVATION_SYMLINK).strip()
+    venv = str(getattr(cfg, "update_in_place_venv", "") or "").strip()
+    if venv:
+        venv = os.path.expanduser(venv)
+    if mode == ACTIVATION_IN_PLACE and not venv:
+        log.warning(
+            "update.activation is in_place but update.in_place_venv is empty; "
+            "activating by symlink instead"
+        )
+        return ACTIVATION_SYMLINK, ""
+    if mode != ACTIVATION_IN_PLACE:
+        return ACTIVATION_SYMLINK, ""
+    return ACTIVATION_IN_PLACE, venv
+
+
 class HostUpdater:
     """Install as soon as we hear about a version; activate only when idle.
 
@@ -130,12 +161,15 @@ class HostUpdater:
         *,
         installer=install_version,
         restarter=default_restarter,
+        in_place_installer=install_cached_into_venv,
     ) -> None:
         self._state = state
         self._layout = layout
         self._cfg = cfg
         self._installer = installer
         self._restarter = restarter
+        self._in_place_installer = in_place_installer
+        self._activation, self._in_place_venv = resolve_activation(cfg)
         self._lock = threading.Lock()
         self._pending: str | None = None
         self._blocked = False
@@ -266,6 +300,29 @@ class HostUpdater:
         # Marker first: if the flip or the restart goes wrong, the next start
         # needs to know what to fall back to.
         self._layout.write_marker(previous, target)
+
+        if self._activation == ACTIVATION_IN_PLACE:
+            if not self._in_place_installer(self._layout, target, self._in_place_venv):
+                # Nothing is flipped and nothing is restarted: this host stays
+                # on the version it is running. The marker is deliberately
+                # left behind -- if the venv was mangled partway through, the
+                # next start that fails to register repairs it by reinstalling
+                # `previous`, and an ordinary start just clears it.
+                log.error(
+                    "could not install %s into %s; staying on %s",
+                    target,
+                    self._in_place_venv,
+                    previous or "unknown",
+                )
+                self._record_refusal(target, "install_failed")
+                return False
+
+        # In in_place mode the symlink is no longer what the services exec --
+        # they exec the venv we just installed into. It is flipped anyway
+        # because it is the *record* of what is active, and active_version(),
+        # the hub's target comparison and prune() all read it. A host that
+        # skipped this would reinstall the same version on every heartbeat and
+        # prune the wrong trees.
         self._layout.flip(target)
         with self._lock:
             if self._pending == target:
@@ -286,12 +343,25 @@ class HostUpdater:
             }
 
 
-def verify_after_restart(layout: RuntimeLayout, *, registered: bool) -> bool:
+def verify_after_restart(
+    layout: RuntimeLayout,
+    *,
+    registered: bool,
+    activation: str = ACTIVATION_SYMLINK,
+    in_place_venv: str = "",
+    in_place_installer=install_cached_into_venv,
+) -> bool:
     """Undo a flip whose new version could not reach the hub.
 
     Without this, a bad release on a machine reachable only through an
     awkward SSH path is a physical trip. With it, the machine repairs itself
     in ninety seconds.
+
+    The activation mode is passed in rather than read from global config, so
+    the rollback path can be exercised in both modes without a config file.
+    In in_place mode a flip undoes nothing on its own -- the venv still holds
+    the version that could not register -- so rolling back means installing
+    the previous version's cached wheel back over it.
     """
     marker = layout.read_marker()
     if marker is None:
@@ -309,6 +379,20 @@ def verify_after_restart(layout: RuntimeLayout, *, registered: bool) -> bool:
         previous or "unknown",
     )
     if previous:
+        if activation == ACTIVATION_IN_PLACE and not in_place_installer(
+            layout, previous, in_place_venv
+        ):
+            # The venv still holds `target`, so flipping the record back would
+            # only make active_version() disagree with what is installed, and
+            # every later decision reads that record.
+            log.error(
+                "could not reinstall %s into %s; the record still says %s",
+                previous,
+                in_place_venv,
+                target,
+            )
+            layout.clear_marker()
+            return False
         layout.flip(previous)
     else:
         # Flipping to "" would point current at nothing and leave the host
