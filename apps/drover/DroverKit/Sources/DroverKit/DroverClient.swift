@@ -107,6 +107,10 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 /// `NSAllowsArbitraryLoads` in the app's Info.plist).
 public actor DroverClient {
     private static let cockpitRequestTimeout: TimeInterval = 60
+    /// Filesystem lookups run while someone types, so they get a shorter
+    /// budget than the 15s default: the host itself gives up after 3s, and
+    /// anything longer than this is the hub or the network, not the listing.
+    private static let pathRequestTimeout: TimeInterval = 10
     public nonisolated let config: ServerConfig
     private let token: String
     private let session: URLSession
@@ -298,6 +302,34 @@ public actor DroverClient {
         ])
         let data = try await request(url: url, method: "GET", body: nil)
         return try decode(HarnessModelCatalog.self, from: data)
+    }
+
+    /// Asks a host which directories the half-typed `path` could become.
+    ///
+    /// A parent that does not exist is not an error — see `PathCompletion`.
+    /// A host that cannot be reached is, and surfaces as `DroverError`.
+    public func completePath(hostID: String, path: String) async throws -> PathCompletion {
+        let basePath = "/harness/hosts/\(encodePathComponent(hostID))/fs/complete"
+        let url = try queryURL(path: basePath, items: [("path", path)])
+        let data = try await request(
+            url: url, method: "GET", body: nil, timeout: Self.pathRequestTimeout
+        )
+        return try decode(PathCompletion.self, from: data)
+    }
+
+    /// Which of `paths` exist on the host *and* are directories.
+    ///
+    /// One round trip for the whole batch: the launch sheet checks every
+    /// untagged favorite at once when its host changes, and a request per
+    /// favorite would be a burst on every switch.
+    public func pathsExist(hostID: String, paths: [String]) async throws -> [String: Bool] {
+        let requestPath = "/harness/hosts/\(encodePathComponent(hostID))/fs/exists"
+        let body = try JSONSerialization.data(withJSONObject: ["paths": paths])
+        let data = try await request(
+            path: requestPath, method: "POST", body: body,
+            timeout: Self.pathRequestTimeout
+        )
+        return try decode(PathExistsResponse.self, from: data).exists
     }
 
     public func startAuthFlow(hostID: String, harness: String) async throws -> HarnessAuthFlow {

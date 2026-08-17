@@ -20,6 +20,29 @@ public final class LaunchModel {
     private var fetchTask: Task<Void, Never>?
     public let runPreferences: HarnessModelCatalogState
 
+    // MARK: Working-directory completion state
+
+    /// How long typing must pause before the host is asked to complete it.
+    /// Injectable so tests need not spend the real interval per keystroke.
+    private let completionDebounce: Duration
+    /// Directories the selected host offered for the current text.
+    public private(set) var liveCompletions: [String] = []
+    /// True once a completion request failed outright (504/502/transport).
+    /// Not set for a host that answered with an empty list.
+    public private(set) var isCompletionHostUnreachable = false
+    /// Bumped by every keystroke and host change. A response carrying an old
+    /// value is stale by definition and is dropped: cancellation usually
+    /// beats it, but a response already in flight when `cancel()` lands would
+    /// otherwise overwrite newer results.
+    private var completionGeneration = 0
+    private var completionTask: Task<Void, Never>?
+    /// Untagged suggestion path -> does it exist on `hostID`. Absent means
+    /// "not asked yet", and absent shows the path — a broken network must
+    /// leave the list as it was, not empty it.
+    private var untaggedExistence: [String: Bool] = [:]
+    private var existenceTask: Task<Void, Never>?
+    private var existenceTaskHostID: String?
+
     /// Harness names the server can run in a structured (turn-based) mode;
     /// anything else (currently just "shell") only supports a raw PTY.
     static let structuredCapableHarnesses: Set<String> = [
@@ -30,6 +53,10 @@ public final class LaunchModel {
     public var hostID: String {
         didSet {
             guard oldValue != hostID else { return }
+            // Everything the old host answered about its filesystem is now
+            // wrong: which favorites exist there, and which directories the
+            // typed text could complete to.
+            hostDidChangeForSuggestions()
             let newHarnesses = harnesses(forHostID: hostID)
             // Keep the user's pick when the new host also offers it; only
             // reset to the new host's default when it's no longer valid.
@@ -49,7 +76,14 @@ public final class LaunchModel {
             runPreferences.select(hostID: hostID, harness: harness)
         }
     }
-    public var cwd: String = ""
+    /// The typed working directory. Every change reschedules the debounced
+    /// completion request — see `scheduleCompletion()`.
+    public var cwd: String = "" {
+        didSet {
+            guard oldValue != cwd else { return }
+            scheduleCompletion()
+        }
+    }
     public var prompt: String = ""
     public var promptAttachments: [TurnAttachment] = []
     public private(set) var launchError: String?
@@ -57,10 +91,12 @@ public final class LaunchModel {
     public init(
         client: DroverClient,
         snapshot: HarnessSnapshot?,
-        store: HarnessModelCatalogStore = HarnessModelCatalogStore()
+        store: HarnessModelCatalogStore = HarnessModelCatalogStore(),
+        completionDebounce: Duration = .milliseconds(250)
     ) {
         self.client = client
         self.snapshot = snapshot
+        self.completionDebounce = completionDebounce
         self.runPreferences = HarnessModelCatalogState(client: client, store: store)
         let hosts = (snapshot?.hosts ?? []).filter { $0.status == "online" || $0.status == "stale" }
         let firstHost = hosts.first { $0.status == "online" } ?? hosts.first
@@ -115,15 +151,48 @@ public final class LaunchModel {
         Self.ordered(harnesses(forHostID: hostID))
     }
 
-    /// Suggestion paths scoped to the selected host — host-tagged entries
-    /// from other hosts are dropped, untagged ones always pass. A favorite is
-    /// tagged when the config names a host for it and untagged when it does
-    /// not, which is how a path that exists on one host stays off the others.
-    /// Mirrors the web client's datalist filtering.
+    /// What the suggestions menu shows: curated paths first, then whatever
+    /// the host's filesystem completed the typed text to, deduplicated by
+    /// exact path.
+    ///
+    /// Curated entries lead because they are the directories this fleet
+    /// actually works in; a sibling on disk that happens to sort earlier is
+    /// not a better guess than one the user launched from last week. A
+    /// directory that is both keeps the curated position and appears once.
     public var cwdSuggestions: [String] {
-        (snapshot?.cwdSuggestions ?? [])
-            .filter { $0.hostID == nil || $0.hostID == hostID }
+        var seen = Set<String>()
+        var merged: [String] = []
+        for path in curatedSuggestions + liveCompletions where seen.insert(path).inserted {
+            merged.append(path)
+        }
+        return merged
+    }
+
+    /// Favorites and recent working directories for the selected host,
+    /// narrowed to those the typed text is a prefix of.
+    ///
+    /// Host-tagged entries are scoped by their tag. Untagged ones — a
+    /// favorite the config named no host for — used to pass on every host,
+    /// which is how a NAS path ended up offered on a Linux laptop where it
+    /// does not exist. They now pass only until `verifyCuratedSuggestions()`
+    /// hears back that the selected host does not have them; a path the host
+    /// was never asked about, or could not be asked about, still shows.
+    public var curatedSuggestions: [String] {
+        let typed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (snapshot?.cwdSuggestions ?? [])
+            .filter { suggestion in
+                if let taggedHostID = suggestion.hostID { return taggedHostID == hostID }
+                return untaggedExistence[suggestion.path] != false
+            }
             .map(\.path)
+            .filter { typed.isEmpty || $0.lowercased().hasPrefix(typed.lowercased()) }
+    }
+
+    /// The one line under the field explaining why live completion is quiet.
+    /// Nil while a request is merely in flight, and nil for a host that
+    /// answered with no matches — an empty answer is an answer.
+    public var cwdSuggestionsHint: String? {
+        isCompletionHostUnreachable ? "Can't reach the host — showing saved paths only" : nil
     }
 
     /// False only for "shell" — every other harness runs in structured mode.
@@ -216,6 +285,116 @@ public final class LaunchModel {
         hostID = firstHost?.id ?? ""
         harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
         runPreferences.select(hostID: hostID, harness: harness)
+    }
+
+    // MARK: - Working-directory completion
+
+    /// Asks the selected host, once, which untagged suggestions it actually
+    /// has, and drops the ones it does not. Call it when the sheet appears
+    /// and whenever the host changes.
+    ///
+    /// Host-tagged suggestions need no round trip — the server already knows
+    /// where it saw them. Only the untagged ones are ambiguous, and they go
+    /// in a single batched request rather than one call per favorite.
+    ///
+    /// A failed check leaves every untagged path visible. Showing a path that
+    /// turns out not to exist costs the user one failed launch; hiding the
+    /// only path they use because the network blinked costs them the feature.
+    public func verifyCuratedSuggestions() async {
+        let host = hostID
+        guard !host.isEmpty else { return }
+        if let inFlight = existenceTask, existenceTaskHostID == host {
+            await inFlight.value
+            return
+        }
+
+        let paths = untaggedSuggestionPaths
+        guard !paths.isEmpty else { return }
+
+        let task = Task { @MainActor in
+            do {
+                let exists = try await self.client.pathsExist(hostID: host, paths: paths)
+                guard host == self.hostID else { return }
+                self.untaggedExistence = exists
+            } catch {
+                guard host == self.hostID else { return }
+                self.untaggedExistence = [:]
+            }
+        }
+        existenceTask = task
+        existenceTaskHostID = host
+        await task.value
+        if existenceTaskHostID == host {
+            existenceTask = nil
+            existenceTaskHostID = nil
+        }
+    }
+
+    /// Awaits the debounced completion currently scheduled, if any. Tests
+    /// use this instead of racing a wall clock.
+    func settleCompletion() async {
+        await completionTask?.value
+    }
+
+    private var untaggedSuggestionPaths: [String] {
+        var seen = Set<String>()
+        return (snapshot?.cwdSuggestions ?? [])
+            .filter { $0.hostID == nil }
+            .map(\.path)
+            .filter { seen.insert($0).inserted }
+    }
+
+    private func hostDidChangeForSuggestions() {
+        untaggedExistence = [:]
+        liveCompletions = []
+        isCompletionHostUnreachable = false
+        scheduleCompletion()
+    }
+
+    /// Supersedes any pending or in-flight completion and, unless the field
+    /// is empty, schedules a fresh one a debounce interval from now.
+    ///
+    /// An empty field is answered locally: the curated list is the whole
+    /// answer, and there is nothing to complete.
+    private func scheduleCompletion() {
+        completionTask?.cancel()
+        completionGeneration &+= 1
+        let generation = completionGeneration
+        let typed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = hostID
+
+        guard !typed.isEmpty, !host.isEmpty else {
+            completionTask = nil
+            liveCompletions = []
+            isCompletionHostUnreachable = false
+            return
+        }
+
+        let debounce = completionDebounce
+        completionTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: debounce)
+            } catch {
+                return  // superseded before the pause elapsed
+            }
+            guard let self, generation == self.completionGeneration else { return }
+            await self.fetchCompletions(path: typed, hostID: host, generation: generation)
+        }
+    }
+
+    private func fetchCompletions(path: String, hostID host: String, generation: Int) async {
+        do {
+            let completion = try await client.completePath(hostID: host, path: path)
+            guard generation == completionGeneration, host == hostID else { return }
+            liveCompletions = completion.entries.map(\.path)
+            isCompletionHostUnreachable = false
+        } catch {
+            guard generation == completionGeneration, host == hostID else { return }
+            // A request the next keystroke tore down is not a failed one.
+            if let droverError = error as? DroverError, droverError.isCancellation { return }
+            liveCompletions = []
+            isCompletionHostUnreachable = true
+        }
     }
 
     // MARK: - Private helpers

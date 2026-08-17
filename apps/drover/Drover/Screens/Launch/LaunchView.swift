@@ -82,6 +82,13 @@ struct LaunchView: View {
 
                 CwdSuggestionsStatus(isFetching: model.isFetchingSnapshot,
                                      hasSuggestions: !model.cwdSuggestions.isEmpty)
+
+                if let hint = model.cwdSuggestionsHint {
+                    Label(hint, systemImage: "wifi.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("cwd-suggestions-unreachable")
+                }
             }
 
             if model.isStructured {
@@ -164,6 +171,12 @@ struct LaunchView: View {
         // suggestions do not depend on which harness is selected.
         .task {
             await model.loadSnapshotIfNeeded()
+        }
+        // Untagged favorites carry no host, so only the host itself can say
+        // whether they exist there. One batched check per host, re-run when
+        // the picker moves — not per keystroke, and not per favorite.
+        .task(id: model.hostID) {
+            await model.verifyCuratedSuggestions()
         }
         // The model catalog, by contrast, is per host+harness and only ever
         // arrives from the server — `select()` reads the local cache alone, so
