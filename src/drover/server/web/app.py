@@ -884,6 +884,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             self._send(status, "application/json", body)
             return
+        if path.startswith("/harness/hosts/") and path.endswith("/fs/complete"):
+            host_id = unquote(
+                path.removeprefix("/harness/hosts/")
+                .removesuffix("/fs/complete")
+                .strip("/")
+            )
+            if not host_id:
+                self._send(400, "application/json", '{"error": "missing host_id"}\n')
+                return
+            typed = parse_qs(parsed.query).get("path") or [""]
+            status, body = self.collector.proxy_harness_fs_complete(host_id, typed[-1])
+            self._send(status, "application/json", body)
+            return
         if path.startswith("/harness/hosts/") and path.endswith("/native-sessions"):
             host_id = unquote(
                 path.removeprefix("/harness/hosts/")
@@ -1134,6 +1147,26 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 payload=payload,
             )
             self._send(status, "application/json", body)
+            return
+        if path.startswith("/harness/hosts/") and path.endswith("/fs/exists"):
+            host_id = unquote(
+                path.removeprefix("/harness/hosts/")
+                .removesuffix("/fs/exists")
+                .strip("/")
+            )
+            if not host_id:
+                self._send(400, "application/json", '{"error": "missing host_id"}\n')
+                return
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be valid JSON"}\n',
+                )
+                return
+            status, payload = self.collector.proxy_harness_fs_exists(host_id, body)
+            self._send(status, "application/json", payload)
             return
         if path.startswith("/harness/hosts/") and path.endswith("/sessions"):
             host_id = unquote(
