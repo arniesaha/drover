@@ -18,14 +18,14 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import click
-import drover
 import duckdb
 
+import drover
 from drover.agent_aliases import canonicalize
 from drover.config import (
     AdvisoryContentConfig,
-    config_home,
     DroverConfig,
+    config_home,
     default_config,
     default_config_path,
     default_token_file,
@@ -95,14 +95,14 @@ from drover.server.otlp.receiver import OTLPReceiver
 from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
+from drover.server.runtime import RuntimeLayout
 from drover.server.session_graph import format_ascii, format_dot, session_graph_payload
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.summarizer.diagnostics import summarize_backend_auth
 from drover.server.summarizer.retry import retry_errored_jobs
 from drover.server.summarizer.worker import SummarizerWorker
-from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
-from drover.server.runtime import RuntimeLayout
 from drover.server.update_planner import UpdatePlanner
+from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
 from drover.server.web.auth import load_auth
 from drover.server.web.pairing import PairingCodes
 from drover.server.web.qr import pairing_url, qr_lines

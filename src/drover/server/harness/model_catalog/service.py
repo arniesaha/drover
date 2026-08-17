@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-import logging
 from threading import RLock
 from typing import Callable, Mapping, Protocol
 
-from .models import CatalogEnvelope, DiscoveredCatalog, STALE_REASONS
+from .models import STALE_REASONS, CatalogEnvelope, DiscoveredCatalog
 from .scope import AccountScopeIDs
 
 log = logging.getLogger("drover.model_catalog")

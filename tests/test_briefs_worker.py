@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -12,12 +12,12 @@ import pyarrow.parquet as pq
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.jobs import JobStream
 from drover.server.briefs.worker import (
     BriefWorker,
     enqueue_brief,
     enqueue_briefs_for_active_projects,
 )
+from drover.server.jobs import JobStream
 from drover.server.summarizer.backends import BackendReadinessError
 
 

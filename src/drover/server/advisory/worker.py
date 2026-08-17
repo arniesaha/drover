@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
-from pathlib import Path
 import threading
 import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from drover.config import AdvisoryContentConfig
-
 from drover.server.advisory.analyzers import (
     MAX_SNAPSHOT_RECORDS,
     AnalysisSnapshot,
@@ -34,24 +33,24 @@ from drover.server.advisory.analyzers.telemetry import (
     CacheReadEfficiencyAnalyzer,
     TelemetryCoverageAnalyzer,
 )
+from drover.server.advisory.content_targets import (
+    ContentBundle,
+    validate_content_bundle,
+)
 from drover.server.advisory.jobs import (
     ADVISORY_ARTIFACT_KIND,
     ADVISORY_JOB_KIND,
     AdvisoryScheduler,
     enqueue_advisory_check,
 )
-from drover.server.advisory.repository import AdvisoryRepository
-from drover.server.advisory.content_targets import (
-    ContentBundle,
-    validate_content_bundle,
-)
 from drover.server.advisory.model_analyzer import (
+    MODEL_ANALYZER_ID,
     AnalysisBackend,
     AnalysisConsentRevoked,
-    MODEL_ANALYZER_ID,
     ModelConfigurationAnalyzer,
     ModelFindingError,
 )
+from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.types import FindingCandidate
 from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
 from drover.server.ledger import ArtifactSpec, Job, Ledger

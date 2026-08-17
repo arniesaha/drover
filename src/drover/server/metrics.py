@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import http.client
 import json
@@ -12,40 +10,41 @@ import socket
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
-
-from drover.config import FavoriteCwd
 from urllib.parse import quote, urlencode, urlparse
 
+from drover.config import FavoriteCwd
+from drover.server.db import (
+    control_plane_connection,
+    control_plane_path,
+    copy_duckdb_store,
+    open_duckdb_connection,
+    snapshot_scratch_root,
+)
 from drover.server.harness.daemon import (
     _STRUCTURED_DEFAULT_COMMANDS,
     native_transcript_for_session,
 )
-from drover.server.harness.recap_jobs import LiveRecap
-from drover.server.harness.recap_prompt import drop_user_subject
-from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.model_catalog import (
     MAX_CATALOG_WIRE_BYTES,
     CatalogEnvelope,
     catalog_wire_bytes,
 )
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
+from drover.server.harness.recap_jobs import LiveRecap
+from drover.server.harness.recap_prompt import drop_user_subject
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
 )
-from drover.server.db import (
-    copy_duckdb_store,
-    snapshot_scratch_root,
-    control_plane_connection,
-    control_plane_path,
-    open_duckdb_connection,
-)
 from drover.server.jobs import RedisJobStream
-from drover.server.readiness import ReadinessProbe
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
+from drover.server.readiness import ReadinessProbe
 
 if TYPE_CHECKING:
     from drover.server.advisory.service import InsightFilters, InsightsService
@@ -2420,6 +2419,6 @@ class MetricsCollector:
             return {"error": str(exc)}
 
 
-from drover.server.web.app import (
+from drover.server.web.app import (  # noqa: E402,F401 - compat re-export
     start_metrics_server,
-)  # noqa: E402,F401 - compat re-export
+)

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
 import re
 import shutil
+from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlencode
@@ -22,7 +22,7 @@ from drover.server.providers.claude_credentials import (
 )
 
 from .agy import _run_bounded
-from .models import DiscoveredCatalog, MAX_MODELS, ModelOption, ReasoningOptions
+from .models import MAX_MODELS, DiscoveredCatalog, ModelOption, ReasoningOptions
 from .service import CatalogDiscoveryError
 
 _DEFAULT_BASE_URL = "https://api.anthropic.com"

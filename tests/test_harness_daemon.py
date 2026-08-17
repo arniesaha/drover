@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 import base64
-import drover
-from dataclasses import replace
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
 import subprocess
@@ -15,22 +11,27 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import replace
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from click.testing import CliRunner
 import pytest
+from click.testing import CliRunner
 
+import drover
 from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
-from drover.server.harness.cli import main as harnessd_cli
-from drover.server.harness import daemon as harness_daemon
+from drover.server.__main__ import main
 from drover.server.harness import cli as harness_cli
+from drover.server.harness import daemon as harness_daemon
 from drover.server.harness import model_catalog
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
     StaticAuthAdapter,
 )
-from drover.server.__main__ import main
+from drover.server.harness.cli import main as harnessd_cli
+from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -44,7 +45,6 @@ from drover.server.harness.daemon import (
     resolve_harness_presets,
     wire_event_pusher,
 )
-from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.model_catalog import (
     CatalogEnvelope,
     CatalogSelectionError,

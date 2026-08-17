@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import http.client
 import http.server
 import json
 import threading
+from datetime import datetime, timezone
 
 import pytest
 
