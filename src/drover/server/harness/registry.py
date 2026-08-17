@@ -151,7 +151,7 @@ def _derive_structured_awaiting(
     """Apply the structured-session awaiting state machine to one event."""
     if event_type == "approval_prompt":
         return "approval"
-    if event_type in {"approval_response", "user_input"}:
+    if event_type in {"approval_response", "user_input", "session.exited"}:
         return None
     if event_type == "status" and payload.get("awaiting") == "input":
         return "input"
@@ -715,34 +715,45 @@ class HarnessRegistry:
             # /harness/events ingest path funnel through, so a transition seen
             # here is seen exactly once however the event arrived.
             previous = con.execute(
-                "SELECT awaiting, harness, cwd FROM harness_sessions "
+                "SELECT awaiting, harness, cwd, status FROM harness_sessions "
                 "WHERE session_id = ?",
                 [session_id],
             ).fetchone()
+            status = str(previous[3] or "") if previous is not None else ""
+            effective_awaiting = (
+                None if status in ARCHIVED_SESSION_STATUSES else awaiting
+            )
             con.execute(
-                "UPDATE harness_sessions SET awaiting = ?, last_activity = ? "
-                "WHERE session_id = ?",
+                """
+                UPDATE harness_sessions
+                   SET awaiting = CASE
+                         WHEN status IN ('completed', 'terminated', 'errored', 'failed') THEN NULL
+                         ELSE ?
+                       END,
+                       last_activity = ?
+                 WHERE session_id = ?
+                """,
                 [awaiting, stamp, session_id],
             )
             # Only a real change notifies. A harness that re-emits "still
             # awaiting input" every few seconds must not produce a banner every
             # few seconds, and that dedup belongs here rather than in the
             # sender: the state machine is what knows the difference.
-            changed = previous is not None and previous[0] != awaiting
+            changed = previous is not None and previous[0] != effective_awaiting
             # Read what the agent last said while the window is still open,
             # rather than paying a second serialized _connect() for it. Only
             # for a transition that will actually alert -- a clear costs
             # nothing extra.
             preview = (
                 self._attention_preview(con, session_id)
-                if changed and awaiting in _AWAITING_STATES
+                if changed and effective_awaiting in _AWAITING_STATES
                 else ""
             )
         if not changed:
             return
         _dispatch_awaiting_push(
             session_id=session_id,
-            awaiting=awaiting,
+            awaiting=effective_awaiting,
             harness=previous[1],
             cwd=previous[2],
             preview=preview,
@@ -1048,7 +1059,7 @@ class HarnessRegistry:
                     for row in _rows(
                         con,
                         "SELECT session_id, awaiting, last_activity, "
-                        "native_session_id, harness, cwd "
+                        "native_session_id, harness, cwd, status "
                         "FROM harness_sessions "
                         f"WHERE session_id IN ({session_placeholders})",
                         session_ids,
@@ -1202,10 +1213,17 @@ class HarnessRegistry:
                         ):
                             latest_activity = created_at
 
+                    status = str(previous.get("status") or "")
+                    effective_awaiting = (
+                        None if status in ARCHIVED_SESSION_STATUSES else awaiting
+                    )
                     con.execute(
                         """
                         UPDATE harness_sessions
-                           SET awaiting = ?,
+                           SET awaiting = CASE
+                                 WHEN status IN ('completed', 'terminated', 'errored', 'failed') THEN NULL
+                                 ELSE ?
+                               END,
                                last_activity = CASE
                                  WHEN ? IS NULL THEN last_activity
                                  WHEN last_activity IS NULL OR last_activity < ? THEN ?
@@ -1223,16 +1241,16 @@ class HarnessRegistry:
                             session_id,
                         ],
                     )
-                    if previous.get("awaiting") != awaiting:
+                    if previous.get("awaiting") != effective_awaiting:
                         preview = (
                             self._attention_preview(con, session_id)
-                            if awaiting in _AWAITING_STATES
+                            if effective_awaiting in _AWAITING_STATES
                             else ""
                         )
                         notifications.append(
                             (
                                 session_id,
-                                awaiting,
+                                effective_awaiting,
                                 previous.get("harness"),
                                 previous.get("cwd"),
                                 preview,
