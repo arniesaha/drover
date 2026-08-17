@@ -94,6 +94,17 @@ RELAY_MIN_TIMEOUT_S = 5.0
 # Deliberately generous rather than tuned: the cost of waiting is a slow
 # handoff, and the cost of not waiting is a session the hub cannot see.
 CREATE_SESSION_TIMEOUT_S = 120.0
+
+# How long the hub waits for a host to complete a typed path.
+#
+# The opposite trade to a create: this fires on every keystroke in the working
+# directory field, and the reply is a single `os.scandir` on the host. Waiting
+# is worthless here -- a completion that arrives after the next keystroke is
+# already stale -- so an unreachable or wedged host must fail fast enough that
+# the field can show an inline hint and the user can keep typing. Explicitly
+# not CREATE_SESSION_TIMEOUT_S: 120s of held connection per keystroke is how a
+# suggestion list turns into an outage.
+FS_COMPLETE_TIMEOUT_S = 3.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
@@ -1498,6 +1509,36 @@ class MetricsCollector:
             path,
             method="GET",
             payload={},
+        )
+
+    def proxy_harness_fs_complete(
+        self, host_id: str, path_text: str
+    ) -> tuple[int, str]:
+        """Proxy one keystroke's worth of path completion to a host."""
+        host = self._harness_host(host_id)
+        if host is None:
+            return _json_response(404, {"error": f"unknown harness host: {host_id}"})
+        return self._harness_request(
+            host,
+            "/fs/complete?" + urlencode({"path": path_text}),
+            method="GET",
+            payload={},
+            timeout_s=FS_COMPLETE_TIMEOUT_S,
+        )
+
+    def proxy_harness_fs_exists(
+        self, host_id: str, payload: Mapping[str, Any]
+    ) -> tuple[int, str]:
+        """Proxy a bounded "are these still directories?" batch to a host."""
+        host = self._harness_host(host_id)
+        if host is None:
+            return _json_response(404, {"error": f"unknown harness host: {host_id}"})
+        return self._harness_request(
+            host,
+            "/fs/exists",
+            method="POST",
+            payload=payload,
+            timeout_s=FS_COMPLETE_TIMEOUT_S,
         )
 
     def proxy_harness_model_catalog(
