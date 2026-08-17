@@ -8,18 +8,44 @@ rename away.
 Service units point at ``runtime/current``, never at a version directory, so
 activating a version is a symlink flip and a restart rather than a unit
 rewrite.
+
+One host cannot work that way. A macOS hub whose venv lives on an external
+volume holds a TCC grant keyed to the executable, and a new venv is a new
+executable, so flipping to it loses the grant and the service dies reading its
+own ``pyvenv.cfg``. Such a host opts into installing into the venv it already
+has (see ``update_activation`` in the config), which is why each version tree
+also caches the artifacts it was built from: that is the material an in-place
+activation, and its rollback, install from.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("drover.runtime")
 
 MARKER_FILENAME = "pending_verification.json"
 SMOKE_TIMEOUT_SECONDS = 30
+
+# Where a version keeps the artifacts it was built from. Inside the version
+# tree on purpose: `prune` already drops whole version directories, so the
+# cache inherits that lifetime rather than needing one of its own to get wrong.
+ARTIFACT_DIRNAME = ".artifact"
+ARTIFACT_MANIFEST = "artifact.json"
+
+
+@dataclass(frozen=True)
+class CachedArtifact:
+    """The verified wheel and lock a version was installed from."""
+
+    wheel: Path
+    lock: Path
 
 
 def _version_key(version: str) -> tuple[int, ...]:
@@ -60,6 +86,51 @@ class RuntimeLayout:
 
     def version_dir(self, version: str) -> Path:
         return self.root / version
+
+    def artifact_dir(self, version: str) -> Path:
+        return self.version_dir(version) / ARTIFACT_DIRNAME
+
+    def cache_artifact(self, version: str, wheel: Path, lock: Path) -> bool:
+        """Keep the verified wheel and lock beside the version they built.
+
+        Best effort: a host that activates by flipping a symlink never reads
+        these, so failing to cache must not fail an otherwise good install.
+        """
+        directory = self.artifact_dir(version)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(wheel, directory / Path(wheel).name)
+            shutil.copy2(lock, directory / Path(lock).name)
+            (directory / ARTIFACT_MANIFEST).write_text(
+                json.dumps({"wheel": Path(wheel).name, "lock": Path(lock).name}),
+                encoding="utf-8",
+            )
+        except OSError:
+            log.warning("could not cache the artifacts for %s", version, exc_info=True)
+            return False
+        return True
+
+    def cached_artifact(self, version: str) -> CachedArtifact | None:
+        """The artifacts ``version`` was installed from, or None.
+
+        None covers a version installed before this cache existed as well as a
+        half-written one, and both mean the same thing to a caller: there is
+        nothing here it may install.
+        """
+        directory = self.artifact_dir(version)
+        try:
+            raw = json.loads(
+                (directory / ARTIFACT_MANIFEST).read_text(encoding="utf-8")
+            )
+            # `.name` because these are filenames, not paths: nothing in the
+            # manifest gets to point outside the directory it lives in.
+            wheel = directory / Path(str(raw["wheel"])).name
+            lock = directory / Path(str(raw["lock"])).name
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if not wheel.is_file() or not lock.is_file():
+            return None
+        return CachedArtifact(wheel=wheel, lock=lock)
 
     def executable(self, name: str, version: str | None = None) -> Path:
         base = self.current if version is None else self.version_dir(version)
