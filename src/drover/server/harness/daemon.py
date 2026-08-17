@@ -141,6 +141,13 @@ MAX_ADVISORY_BUNDLE_REQUEST_BYTES = 128 * 1024
 # typed wholesale into a live terminal.
 _MAX_AUTH_INPUT_CHARS = 4096
 
+# Path completion answers one request per keystroke, so both limits exist to
+# bound the wire, not to enforce policy: a suggestion list longer than this is
+# unusable on a phone anyway, and /Users on a shared box or a node_modules
+# tree would otherwise ship thousands of names for a single character typed.
+FS_COMPLETE_MAX_ENTRIES = 50
+FS_EXISTS_MAX_PATHS = 64
+
 
 def save_turn_attachments(
     attachments_dir: Path, session_id: str, images: list
@@ -1260,6 +1267,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/providers/usage":
             self._provider_usage()
             return
+        if parsed.path == "/fs/complete":
+            self._fs_complete(parsed.query)
+            return
         if parsed.path == "/native-sessions":
             self._list_native_sessions(parsed.query)
             return
@@ -1302,6 +1312,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         if auth_route and auth_route[2] == "input":
             self._auth_input(auth_route[0], auth_route[1] or "")
+            return
+        if parsed.path == "/fs/exists":
+            self._fs_exists()
             return
         if parsed.path == "/advisory/content-bundle":
             self._advisory_content_bundle()
@@ -1354,6 +1367,21 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._interrupt_session(session_id)
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _fs_complete(self, query: str) -> None:
+        """Complete a working directory against this host's real filesystem.
+
+        Deliberately unrestricted: a harness session on this host already runs
+        with the host user's full read access, so completing anywhere they can
+        read exposes no capability the caller does not already have. Confining
+        it to ``$HOME`` would only make the field lie about what is reachable.
+        """
+        values = parse_qs(query).get("path") or [""]
+        self._write_json(_complete_directories(values[-1]))
+
+    def _fs_exists(self) -> None:
+        body = self._read_json() or {}
+        self._write_json({"exists": _directories_exist(body.get("paths"))})
 
     def _auth_status(self, harness: str) -> None:
         try:
@@ -3188,6 +3216,107 @@ def _provider_window_json(window: ProviderUsageWindow) -> dict[str, Any]:
         "starts_at": window.starts_at.isoformat() if window.starts_at else None,
         "resets_at": window.resets_at.isoformat() if window.resets_at else None,
     }
+
+
+def _split_completion_path(typed: str) -> tuple[str, str]:
+    """Split typed text into the directory to list and the prefix to match.
+
+    ``/Users/arn`` -> ``("/Users", "arn")``; a trailing slash means the whole
+    string is the parent and there is no partial yet (``/Users/`` ->
+    ``("/Users", "")``). A leading ``~`` expands to the host user's home first,
+    so ``~/Dev`` completes against their real home rather than a literal
+    directory called ``~``.
+    """
+    if typed.startswith("~"):
+        typed = os.path.expanduser(typed)
+    if not typed:
+        typed = "/"
+    head, separator, partial = typed.rpartition("/")
+    if not separator:
+        # No separator at all: complete against the daemon's own cwd.
+        return ".", partial
+    return head or "/", partial
+
+
+def _complete_directories(typed: str) -> dict[str, Any]:
+    """List matching child directories of the typed path's parent.
+
+    Filesystem-only by construction: one ``os.scandir`` and nothing else. This
+    answers a request per keystroke, so it must never reach the registry,
+    DuckDB, or the control-plane lock -- the ``_list_sessions`` N+1 that opened
+    115 DuckDB instances per call took ``GET /sessions`` to 42-55s and starved
+    session creation, and a per-keystroke equivalent would be far worse.
+
+    A parent that is missing, is a file, or cannot be read is a *normal* state
+    while someone types, not a failure: the payload keeps its shape with an
+    empty list and an ``error`` hint the client may ignore.
+    """
+    parent, partial = _split_completion_path(typed)
+    needle = partial.lower()
+    names: list[str] = []
+    error: str | None = None
+    try:
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") and not partial.startswith("."):
+                    continue
+                if not name.lower().startswith(needle):
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                names.append(name)
+    except PermissionError:
+        error = "permission_denied"
+    except (FileNotFoundError, NotADirectoryError):
+        error = "not_found"
+    except OSError:
+        error = "not_found"
+
+    names.sort(key=lambda value: (value.lower(), value))
+    truncated = len(names) > FS_COMPLETE_MAX_ENTRIES
+    if truncated:
+        names = names[:FS_COMPLETE_MAX_ENTRIES]
+    payload: dict[str, Any] = {
+        "parent": parent,
+        "entries": [
+            {"name": name, "path": os.path.join(parent, name)} for name in names
+        ],
+        "truncated": truncated,
+    }
+    if error is not None:
+        payload["error"] = error
+    return payload
+
+
+def _directories_exist(paths: Any) -> dict[str, bool]:
+    """Answer "is this a directory?" for a bounded batch, never raising.
+
+    Keys are the caller's original strings, byte for byte, however the path had
+    to be normalized to answer. The client matches by exact string, so a key it
+    did not ask for reads as "not answered" -- which fails safe (the path stays
+    visible) but silently switches stale-path filtering off with no error
+    anywhere.
+    """
+    if not isinstance(paths, list):
+        return {}
+    result: dict[str, bool] = {}
+    for candidate in paths[:FS_EXISTS_MAX_PATHS]:
+        if not isinstance(candidate, str):
+            continue
+        try:
+            expanded = (
+                os.path.expanduser(candidate)
+                if candidate.startswith("~")
+                else candidate
+            )
+            result[candidate] = os.path.isdir(expanded)
+        except Exception:  # noqa: BLE001 - a bad path is False, never a 500
+            result[candidate] = False
+    return result
 
 
 def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:

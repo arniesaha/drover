@@ -5110,3 +5110,194 @@ def test_a_refused_connection_is_still_reported_as_unreachable(tmp_path, monkeyp
     )
 
     assert status == 502, "nothing was started, so the old meaning still holds"
+
+
+def _stub_direct_host(host_id: str):
+    return type(
+        "H",
+        (),
+        {
+            "host_id": host_id,
+            "local_url": "http://127.0.0.1:1",
+            "connection_kind": "direct",
+        },
+    )()
+
+
+def test_fs_complete_proxy_forwards_the_typed_path_on_a_short_budget(tmp_path):
+    collector = _collector_for_proxy(tmp_path)
+    seen: dict = {}
+
+    def _capture(host, path, *, method, payload=None, timeout_s=15, **kwargs):
+        seen.update({"path": path, "method": method, "timeout_s": timeout_s})
+        return 200, '{"entries": [], "parent": "/Users", "truncated": false}'
+
+    collector._harness_request = _capture  # type: ignore[method-assign]
+    collector._harness_host = _stub_direct_host  # type: ignore[method-assign]
+
+    status, body = collector.proxy_harness_fs_complete("mac-mini", "/Users/arn")
+
+    assert status == 200
+    assert json.loads(body)["parent"] == "/Users"
+    assert seen["method"] == "GET"
+    assert seen["path"] == "/fs/complete?path=%2FUsers%2Farn"
+    # A keystroke cannot wait on the create budget; the user is typing.
+    assert seen["timeout_s"] == metrics.FS_COMPLETE_TIMEOUT_S == 3.0
+    assert seen["timeout_s"] != metrics.CREATE_SESSION_TIMEOUT_S
+
+
+def test_fs_exists_proxy_forwards_the_body_on_the_same_short_budget(tmp_path):
+    collector = _collector_for_proxy(tmp_path)
+    seen: dict = {}
+
+    def _capture(host, path, *, method, payload=None, timeout_s=15, **kwargs):
+        seen.update(
+            {
+                "path": path,
+                "method": method,
+                "timeout_s": timeout_s,
+                "payload": dict(payload or {}),
+            }
+        )
+        return 200, '{"exists": {"/a": true}}'
+
+    collector._harness_request = _capture  # type: ignore[method-assign]
+    collector._harness_host = _stub_direct_host  # type: ignore[method-assign]
+
+    status, body = collector.proxy_harness_fs_exists("mac-mini", {"paths": ["/a"]})
+
+    assert status == 200
+    assert json.loads(body)["exists"] == {"/a": True}
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/fs/exists"
+    assert seen["payload"] == {"paths": ["/a"]}
+    assert seen["timeout_s"] == metrics.FS_COMPLETE_TIMEOUT_S
+
+
+def test_fs_proxies_report_an_unknown_host_rather_than_dialing(tmp_path):
+    collector = _collector_for_proxy(tmp_path)
+
+    status, body = collector.proxy_harness_fs_complete("ghost", "/")
+    assert status == 404, body
+    status, body = collector.proxy_harness_fs_exists("ghost", {"paths": []})
+    assert status == 404, body
+
+
+def test_a_slow_host_fails_completion_fast_instead_of_hanging_the_field(
+    tmp_path, monkeypatch
+):
+    collector = _collector_for_proxy(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="mini",
+        display_name="Mini",
+        kind="macos",
+        local_url="http://127.0.0.1:7081",
+    )
+    monkeypatch.setattr(metrics.http.client, "HTTPConnection", _TimingOutConnection)
+
+    status, body = collector.proxy_harness_fs_complete("mini", "/Users/arn")
+
+    # 504 with the short budget named in it, so the client can show an inline
+    # hint rather than sitting on a 120s create-shaped wait.
+    assert status == 504, body
+    assert "3s" in body, body
+
+
+class _FakeFsHandler(BaseHTTPRequestHandler):
+    requests: list[dict] = []
+
+    def _reply(self, payload: dict) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.__class__.requests.append({"path": self.path, "body": None})
+        if self.path.startswith("/fs/complete"):
+            self._reply(
+                {
+                    "parent": "/Users",
+                    "entries": [{"name": "arn", "path": "/Users/arn"}],
+                    "truncated": False,
+                }
+            )
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+        self.__class__.requests.append({"path": self.path, "body": body})
+        if self.path == "/fs/exists":
+            self._reply({"exists": {"/tmp": True, "/nope": False}})
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args) -> None:  # noqa: A003
+        return
+
+
+@contextmanager
+def _hub_over_fake_fs_host(tmp_path):
+    _FakeFsHandler.requests = []
+    harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeFsHandler)
+    metrics.threading.Thread(target=harness_server.serve_forever, daemon=True).start()
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    HarnessRegistry(duckdb_path).register_host(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        local_url=f"http://127.0.0.1:{harness_server.server_address[1]}",
+    )
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        harness_server.shutdown()
+        harness_server.server_close()
+
+
+def test_metrics_http_server_proxies_fs_completion(tmp_path):
+    with _hub_over_fake_fs_host(tmp_path) as hub:
+        with _authed_get(
+            f"{hub}/harness/hosts/mac-mini/fs/complete?path=%2FUsers%2Far"
+        ) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+
+    assert payload["parent"] == "/Users"
+    assert payload["entries"][0]["path"] == "/Users/arn"
+    assert _FakeFsHandler.requests[0]["path"] == "/fs/complete?path=%2FUsers%2Far"
+
+
+def test_metrics_http_server_proxies_fs_exists(tmp_path):
+    with _hub_over_fake_fs_host(tmp_path) as hub:
+        request = Request(
+            f"{hub}/harness/hosts/mac-mini/fs/exists",
+            data=json.dumps({"paths": ["/tmp", "/nope"]}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", **_AUTH_HEADERS},
+        )
+        with urlopen(request, timeout=5) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+
+    assert payload["exists"] == {"/tmp": True, "/nope": False}
+    assert _FakeFsHandler.requests[0]["path"] == "/fs/exists"
+    assert json.loads(_FakeFsHandler.requests[0]["body"]) == {
+        "paths": ["/tmp", "/nope"]
+    }
