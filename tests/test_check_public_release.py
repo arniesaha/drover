@@ -1,6 +1,6 @@
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "check_public_release.py"
 SPEC = importlib.util.spec_from_file_location("check_public_release", SCRIPT_PATH)

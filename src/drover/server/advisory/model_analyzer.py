@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import json
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
 from drover.server.advisory.content_targets import ContentBundle
 from drover.server.advisory.prompt import SYSTEM_PROMPT, build_analysis_request
 from drover.server.advisory.types import (
+    MAX_REMEDIATION_STEP_CHARS,
+    MAX_REMEDIATION_STEPS,
     AnalyzerClass,
     Confidence,
     FindingCandidate,
     FindingEvidence,
-    MAX_REMEDIATION_STEP_CHARS,
-    MAX_REMEDIATION_STEPS,
     Severity,
 )
 

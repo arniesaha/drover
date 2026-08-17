@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 import time
+from pathlib import Path
 from typing import Callable, Iterable
 
 from drover.server.db import open_duckdb_connection

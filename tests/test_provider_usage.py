@@ -1,21 +1,21 @@
 """Contracts for normalized provider account usage."""
 
-from datetime import datetime, timedelta, timezone
 import logging
-from pathlib import Path
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import duckdb
 import pytest
 
-from drover.schema import bootstrap
 from drover.config import load_config
-from drover.server.providers.codex import CodexUsageProbe
+from drover.schema import bootstrap
 from drover.server.cockpit.analytics import AnalyticsFilters
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
+from drover.server.providers.codex import CodexUsageProbe
 from drover.server.providers.inventory import detect_provider_accounts
 from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import (

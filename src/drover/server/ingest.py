@@ -12,6 +12,7 @@ Idempotent: re-ingesting the same file produces zero new rows.
 """
 
 from __future__ import annotations
+
 import json
 import logging
 import uuid
@@ -25,13 +26,13 @@ import pyarrow.parquet as pq
 
 from drover.attribution import enrich_raw_repo_attribution
 from drover.dedup import make_dedup_key
+from drover.models import AgentEvent
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
 from drover.server.parquet_io import atomic_write_table
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.rollup import rollup_tasks
 from drover.task_id import compute_task_id
-from drover.models import AgentEvent
 
 log = logging.getLogger("drover.ingest")
 

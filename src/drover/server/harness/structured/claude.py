@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
+from pathlib import Path
 from typing import Any
 
 from drover.server.harness.structured.driver import ProcessDriver, StructuredMessage

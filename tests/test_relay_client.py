@@ -10,6 +10,7 @@ import time
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.harness import relay_client
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -18,7 +19,6 @@ from drover.server.harness.daemon import (
 )
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness import relay_client
 from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.relay_protocol import close_frame, open_frame, req_frame
 from drover.server.harness.websocket import (

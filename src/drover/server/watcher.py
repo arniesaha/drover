@@ -9,6 +9,7 @@ After ingest, file is moved to:
 """
 
 from __future__ import annotations
+
 import json
 import logging
 import shutil
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 
 import duckdb
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from drover.server.db import open_duckdb_connection

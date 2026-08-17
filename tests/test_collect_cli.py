@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from drover.collect.__main__ import _build_sources, main as collect_main
+from drover.collect.__main__ import _build_sources
+from drover.collect.__main__ import main as collect_main
 
 FIXTURES = Path(__file__).parent / "fixtures" / "collect"
 
