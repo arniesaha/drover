@@ -294,6 +294,21 @@ Include screenshots for UI changes and call out breaking changes explicitly.
 - Address all review comments or provide rationale
 - Squash commits before merge unless review discussion warrants keeping them
 
+### Branch Hygiene
+
+- The head branch of a merged pull request is deleted automatically. GitHub's
+  `delete_branch_on_merge` is enabled on this repository, so a merge leaves
+  nothing behind and nobody has to remember to tidy up. Twenty-three stale
+  branches had accumulated before it was turned on.
+- Deleting a branch never loses the work: its commits are in `main` by
+  definition, and the release tags mark every published version.
+- Local branches are yours to manage. `git fetch --prune` drops the remote
+  tracking refs, and `git branch -d <name>` refuses anything not merged, so it
+  is safe to run in bulk.
+- Do not delete a branch a worktree still has checked out. `git worktree list`
+  shows which those are. Harness sessions hold their own `drover/harness-*`
+  branches for as long as the session exists, so leave those to the daemon.
+
 ## Documentation
 
 ### Where to Add Documentation
