@@ -215,3 +215,60 @@ def test_clearing_awaiting_does_not_pay_for_a_preview(registry, sender):
     # text no notification will ever show.
     assert sender.sent[-1].awaiting is None
     assert sender.sent[-1].preview == ""
+
+
+def test_archived_session_ingest_does_not_resurrect_awaiting_or_fire_push(
+    registry, sender
+):
+    registry.update_session_status("sess-1", "completed")
+    sender.sent.clear()
+
+    # Ingest late events that would otherwise trigger an awaiting transition
+    registry.ingest_structured_events(
+        [
+            {
+                "event_id": "evt-prompt",
+                "session_id": "sess-1",
+                "event_type": "approval_prompt",
+                "payload": {"prompt": "Allow rm -rf?"},
+                "created_at": datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc),
+                "seq": 1,
+            }
+        ]
+    )
+
+    session = registry.get_session("sess-1")
+    assert session.status == "completed"
+    assert session.awaiting is None
+    assert len(sender.sent) == 0
+
+
+def test_update_session_activity_on_archived_session_does_not_set_awaiting(
+    registry, sender
+):
+    registry.update_session_status("sess-1", "terminated")
+    sender.sent.clear()
+
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    session = registry.get_session("sess-1")
+    assert session.status == "terminated"
+    assert session.awaiting is None
+    assert len(sender.sent) == 0
+
+
+def test_derive_structured_awaiting_clears_on_session_exited(registry, sender):
+    from drover.server.harness.registry import _derive_structured_awaiting
+
+    assert (
+        _derive_structured_awaiting(
+            event_type="approval_prompt", payload={}, current=None
+        )
+        == "approval"
+    )
+    assert (
+        _derive_structured_awaiting(
+            event_type="session.exited", payload={}, current="approval"
+        )
+        is None
+    )
