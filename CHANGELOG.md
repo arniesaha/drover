@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.4] - 2026-08-16
+## [0.3.5] - 2026-08-17
+
+### Fixed
+
+- A finished session no longer says it is waiting for you. A batch of events
+  arriving late, which is exactly what a daemon restart produces, could set
+  `awaiting` on a session that had already completed and send a notification
+  about work that was over. The guard now sits on the writes that set it,
+  rather than on the status change, because a late write is the whole problem
+- A host that has stopped answering is no longer probed for provider capacity
+  every few minutes. Each attempt blocked for ten seconds and logged a warning
+  naming an address rather than a host, which had already sent one
+  investigation after the wrong machine. Probing resumes on its own as soon as
+  the host heartbeats again
+- The working directory field no longer reports a healthy host as unreachable
+  when it is simply running an older release that has no completion endpoint
+
+### Changed
+
+- Import order is configured and checked in CI, so it stops disagreeing with
+  the formatter
 
 ### Added
 
