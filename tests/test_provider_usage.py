@@ -15,6 +15,7 @@ from drover.config import load_config
 from drover.schema import bootstrap
 from drover.server.cockpit.analytics import AnalyticsFilters
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
+from drover.server.harness.models import HarnessHost
 from drover.server.providers.codex import CodexUsageProbe
 from drover.server.providers.inventory import detect_provider_accounts
 from drover.server.providers.service import ProviderUsageService
@@ -761,11 +762,27 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
         clock=lambda: datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc),
         freshness_threshold_seconds=300,
     )
-    host = SimpleNamespace(**vars(provider_host), status="online")
+
+    # A real HarnessHost, not a namespace double: the refresh loop calls
+    # is_stale() on whatever the registry yields, and the registry only ever
+    # yields these. last_seen_at stays fresh so this test isolates status.
+    def _host(status):
+        return HarnessHost(
+            host_id=provider_host.host_id,
+            display_name="Mac Mini",
+            kind="macos",
+            status=status,
+            connection_kind="direct",
+            local_url=provider_host.local_url,
+            tailscale_url=provider_host.tailscale_url,
+            last_seen_at=datetime.now(timezone.utc),
+        )
+
+    current = [_host("online")]
 
     class _Registry:
         def list_hosts(self):
-            return [host]
+            return [current[0]]
 
     refreshes = []
     monotonic_clock = [0.0]
@@ -779,11 +796,11 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
     )
 
     loop.run_once()
-    host.status = "offline"
+    current[0] = _host("offline")
     monotonic_clock[0] = 10
     loop.run_once()
     offline = service.latest_accounts()[0]
-    host.status = "online"
+    current[0] = _host("online")
     monotonic_clock[0] = 20
     loop.run_once()
     recovered = service.latest_accounts()[0]
@@ -793,6 +810,173 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
     assert recovered.status == "ok"
     assert recovered.error_category is None
     assert refreshes == ["mac-mini", "mac-mini"]
+
+
+def test_provider_refresh_loop_skips_stale_host(tmp_path):
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+    service = ProviderUsageService(
+        duckdb_path=tmp_path / "drover.duckdb",
+        parquet_dir=tmp_path / "parquet",
+    )
+    now = datetime.now(timezone.utc)
+    fresh_host = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=now,
+    )
+    stale_host = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=now - timedelta(seconds=120),
+    )
+    current_host = [fresh_host]
+
+    class _Registry:
+        def list_hosts(self):
+            return [current_host[0]]
+
+    refreshes = []
+    monotonic_clock = [0.0]
+    payload = {
+        **GOOD_PAYLOAD,
+        "accounts": [
+            {
+                **GOOD_PAYLOAD["accounts"][0],
+                "host_id": "gpu-pc",
+                "observed_at": now.isoformat(),
+                "windows": [
+                    {
+                        "window_kind": "primary",
+                        "window_label": "5 hours",
+                        "reset_at": (now + timedelta(hours=5)).isoformat(),
+                        "used_percent": 12.5,
+                        "used_tokens": 125,
+                        "limit_tokens": 1000,
+                    }
+                ],
+            }
+        ],
+    }
+    loop = ProviderRefreshLoop(
+        provider_usage=service,
+        registry=_Registry(),
+        shutdown_event=threading.Event(),
+        interval_seconds=300,
+        clock=lambda: monotonic_clock[0],
+        fetch=lambda item: refreshes.append(item.host_id) or payload,
+    )
+
+    # Initial run when host is fresh - probes and succeeds
+    loop.run_once()
+    assert refreshes == ["gpu-pc"]
+    assert service.latest_accounts()[0].status == "ok"
+
+    # Host becomes stale - refresh loop skips probe and marks offline
+    current_host[0] = stale_host
+    monotonic_clock[0] = 10.0
+    loop.run_once()
+    assert refreshes == ["gpu-pc"]  # No second probe!
+    accounts = service.latest_accounts()
+    assert len(accounts) == 1
+    assert accounts[0].status == "stale"
+    assert accounts[0].error_category == "host_offline"
+
+    # Host heartbeats again -- probing has to resume on its own. Nothing in the
+    # hub clears the skip, so if the fresh last_seen_at did not re-enable the
+    # probe the host would stay dark forever with no error anywhere to show it.
+    current_host[0] = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=datetime.now(timezone.utc),
+    )
+    monotonic_clock[0] = 20.0
+    loop.run_once()
+    assert refreshes == ["gpu-pc", "gpu-pc"]
+    recovered = service.latest_accounts()
+    assert len(recovered) == 1
+    assert recovered[0].status == "ok"
+    assert recovered[0].error_category is None
+
+
+def test_harness_host_is_stale_behavior():
+    now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+    fresh_time = now - timedelta(seconds=10)
+    old_time = now - timedelta(seconds=120)
+
+    fresh_host = HarnessHost(
+        host_id="mac-mini",
+        display_name="Mac Mini",
+        kind="macos",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=fresh_time,
+    )
+    stale_host = HarnessHost(
+        host_id="gpu-pc",
+        display_name="GPU PC",
+        kind="linux",
+        status="online",
+        connection_kind="direct",
+        last_seen_at=old_time,
+    )
+    relay_host = HarnessHost(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        status="online",
+        connection_kind="relay",
+        last_seen_at=old_time,
+    )
+
+    assert fresh_host.is_stale(now=now) is False
+    assert stale_host.is_stale(now=now) is True
+    # Relay hosts don't rely on last_seen_at for staleness
+    assert relay_host.is_stale(now=now) is False
+
+
+def test_is_stale_handles_naive_db_timestamps_against_an_aware_now():
+    """A naive last_seen_at is process-local, so an aware `now` must convert to local.
+
+    DuckDB stores last_seen_at as TIMESTAMP, never TIMESTAMPTZ, so it reads back
+    naive *local* (see registry._db_timestamp_to_utc). Normalizing an aware `now`
+    to naive UTC instead shifts the comparison by the hub's UTC offset: west of
+    UTC every direct host reports stale seconds after heartbeating, which takes
+    all provider capacity dark; east of UTC nothing is ever stale. The other
+    is_stale tests only pass aware/aware, which cannot catch either direction.
+    """
+
+    def _host(last_seen):
+        return HarnessHost(
+            host_id="gpu-pc",
+            display_name="GPU PC",
+            kind="linux",
+            status="online",
+            connection_kind="direct",
+            last_seen_at=last_seen,
+        )
+
+    local_now = datetime.now()
+    aware_now = datetime.now(timezone.utc)
+
+    just_heartbeat = _host(local_now - timedelta(seconds=5))
+    long_gone = _host(local_now - timedelta(seconds=600))
+
+    # The default (now=None) path is the one production takes today.
+    assert just_heartbeat.is_stale() is False
+    assert long_gone.is_stale() is True
+
+    # An explicit aware `now` has to agree with it, whatever the hub's offset.
+    assert just_heartbeat.is_stale(now=aware_now) is False
+    assert long_gone.is_stale(now=aware_now) is True
 
 
 @pytest.mark.parametrize(("toml_value", "expected"), [("900", 900.0), ("900.5", 900.5)])

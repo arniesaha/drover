@@ -34,6 +34,7 @@ from drover.server.harness.model_catalog import (
     catalog_wire_bytes,
 )
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
+from drover.server.harness.models import HARNESS_STALE_AFTER_SECONDS
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import HarnessRegistry
@@ -63,7 +64,6 @@ MAX_ARCHIVED_SESSION_LIMIT = 100
 #: no cap at all), so the collector default can apply only to the former.
 _UNSET_ARCHIVED_LIMIT: Any = object()
 
-_HARNESS_STALE_AFTER_SECONDS = 45
 
 # Floor on any hub->harnessd budget that rides a relay connection.
 #
@@ -817,9 +817,9 @@ def _harness_host_dict(
             age_s = (datetime.now() - last_seen_at).total_seconds()
         else:
             age_s = (datetime.now(timezone.utc) - last_seen_at).total_seconds()
-        if age_s > _HARNESS_STALE_AFTER_SECONDS and item.get("status") == "online":
+        if age_s > HARNESS_STALE_AFTER_SECONDS and item.get("status") == "online":
             item["status"] = "stale"
-            item["stale_after_seconds"] = _HARNESS_STALE_AFTER_SECONDS
+            item["stale_after_seconds"] = HARNESS_STALE_AFTER_SECONDS
     return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
 
 
@@ -2201,6 +2201,7 @@ class MetricsCollector:
                 payload=payload,
                 timeout_s=timeout_s,
                 max_response_bytes=max_response_bytes,
+                host_id=getattr(host, "host_id", None),
             )
         return _json_response(
             502, {"error": f"harness host has no reachable endpoint: {host.host_id}"}
@@ -2214,6 +2215,7 @@ class MetricsCollector:
         payload: Mapping[str, Any] | None = None,
         timeout_s: float = 15,
         max_response_bytes: int | None = None,
+        host_id: str | None = None,
     ) -> tuple[int, str]:
         body = json.dumps(dict(payload or {}), sort_keys=True)
         parsed = urlparse(url)
@@ -2223,6 +2225,11 @@ class MetricsCollector:
         if parsed.query:
             path = f"{path}?{parsed.query}"
         port = parsed.port or 80
+        # A bare URL names a tailnet address, which reads as a machine but is
+        # not one the reader can map back to a host (issue #222 -- it sent an
+        # investigation after the wrong box). Every failure here says which
+        # host it was talking to.
+        target_label = f"{host_id} ({url})" if host_id else url
         try:
             conn = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout_s)
             headers = {"Content-Type": "application/json"}
@@ -2248,7 +2255,7 @@ class MetricsCollector:
             log.warning(
                 "harness request to %s timed out after %ss; the host may still "
                 "complete it",
-                url,
+                target_label,
                 timeout_s,
             )
             return _json_response(
@@ -2264,7 +2271,7 @@ class MetricsCollector:
         except OSError as exc:
             return _json_response(502, {"error": f"harness host request failed: {exc}"})
         except Exception as exc:  # noqa: BLE001
-            log.warning("failed to proxy harness request to %s: %s", url, exc)
+            log.warning("failed to proxy harness request to %s: %s", target_label, exc)
             return _json_response(502, {"error": str(exc)})
         finally:
             try:

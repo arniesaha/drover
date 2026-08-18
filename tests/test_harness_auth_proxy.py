@@ -255,7 +255,9 @@ def test_proxy_harness_auth_builds_quoted_upstream_paths(tmp_path):
     )
     calls = []
 
-    def fake_proxy(url, *, method, payload, timeout_s=15, max_response_bytes=None):
+    def fake_proxy(
+        url, *, method, payload, timeout_s=15, max_response_bytes=None, host_id=None
+    ):
         calls.append((method, url, payload, max_response_bytes))
         return 200, json.dumps({"state": "waiting_for_user"})
 
