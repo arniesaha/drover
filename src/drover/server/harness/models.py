@@ -7,6 +7,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+#: How long a direct host may go without a heartbeat before it counts as stale.
+#:
+#: One definition, two readers: the provider refresh loop uses it to skip
+#: probing hosts that are not answering, and the fleet payload uses it to mark
+#: a host stale for display. They have to agree -- tuning one alone would leave
+#: the hub still dialling a host the app already shows as stale, or the reverse.
+HARNESS_STALE_AFTER_SECONDS = 45
+
 
 def _loads_object(value: str | None) -> dict[str, Any]:
     if not value:
@@ -58,10 +66,19 @@ class HarnessHost:
     def is_stale(
         self,
         *,
-        stale_after_seconds: float = 45.0,
+        stale_after_seconds: float = HARNESS_STALE_AFTER_SECONDS,
         now: datetime | None = None,
     ) -> bool:
-        """True when a direct host has not reported a heartbeat within the stale window."""
+        """True when a direct host has not reported a heartbeat within the stale window.
+
+        ``last_seen_at`` normally arrives straight off a DuckDB ``TIMESTAMP``
+        column, and a naive value out of one of those is process-*local* wall
+        time, never UTC -- the same convention spelled out on
+        ``registry._db_timestamp_to_utc``. So an aware ``now`` has to be
+        converted to local before it can be compared against it; converting to
+        naive UTC instead shifts the comparison by the process's UTC offset and
+        reports a host that heartbeat seconds ago as stale.
+        """
         if self.connection_kind == "relay":
             return False
         if self.last_seen_at is None:
@@ -75,7 +92,7 @@ class HarnessHost:
         elif self.last_seen_at.tzinfo is not None and now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         elif self.last_seen_at.tzinfo is None and now.tzinfo is not None:
-            now = now.astimezone(timezone.utc).replace(tzinfo=None)
+            now = now.astimezone().replace(tzinfo=None)
         age = (now - self.last_seen_at).total_seconds()
         return age > stale_after_seconds
 

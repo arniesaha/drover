@@ -44,6 +44,7 @@ from drover.server.harness.daemon import (
     create_harness_server,
     register_daemon_host,
 )
+from drover.server.harness.models import HarnessHost
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
@@ -1234,7 +1235,18 @@ def test_provider_refresh_loop_only_refreshes_online_hosts_once_per_interval():
     class _Registry:
         def list_hosts(self, *, status=None):
             assert status is None
-            return [type("Host", (), {"host_id": "mac-mini"})()]
+            # A real HarnessHost: the loop calls is_stale() on whatever the
+            # registry yields. last_seen_at=None means "never reported", which
+            # is not staleness, so this stays a pure once-per-interval test.
+            return [
+                HarnessHost(
+                    host_id="mac-mini",
+                    display_name="Mac Mini",
+                    kind="macos",
+                    status="online",
+                    connection_kind="direct",
+                )
+            ]
 
     class _ProviderUsage:
         def refresh_host(self, host):

@@ -350,9 +350,10 @@ class ProviderRefreshLoop:
             if not host_id:
                 continue
             status = str(getattr(host, "status", "online") or "").lower()
-            is_stale_fn = getattr(host, "is_stale", None)
-            is_stale = is_stale_fn() if callable(is_stale_fn) else False
-            if status != "online" or is_stale:
+            # The registry always yields HarnessHost, so call it directly: a
+            # getattr probe defaulting to "not stale" would let a rename
+            # silently turn the whole skip off with every test still green.
+            if status != "online" or host.is_stale():
                 try:
                     self.provider_usage.mark_host_unavailable(
                         host_id, error_category="host_offline"

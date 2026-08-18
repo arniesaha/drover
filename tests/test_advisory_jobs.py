@@ -51,6 +51,7 @@ from drover.server.advisory.worker import (
 )
 from drover.server.cockpit.service import ProviderRefreshLoop
 from drover.server.db import control_plane_path
+from drover.server.harness.models import HarnessHost
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.ledger import Ledger
 from drover.server.providers.service import ProviderUsageService
@@ -2559,7 +2560,18 @@ def test_provider_refresh_notifies_only_for_material_operational_change() -> Non
 
     class _Registry:
         def list_hosts(self):
-            return [type("Host", (), {"host_id": "mac-mini"})()]
+            # A real HarnessHost: the refresh loop calls is_stale() on whatever
+            # the registry yields. last_seen_at=None means "never reported",
+            # which is not staleness, so this stays a pure notification test.
+            return [
+                HarnessHost(
+                    host_id="mac-mini",
+                    display_name="Mac Mini",
+                    kind="macos",
+                    status="online",
+                    connection_kind="direct",
+                )
+            ]
 
     class _ProviderUsage:
         def refresh_host(self, host):
