@@ -535,12 +535,22 @@ def executable_path_prefix(executable: str) -> str | None:
     return None
 
 
+# A shebang is the first line of a file, and kernels cap it well below this
+# (Linux at BINPRM_BUF_SIZE, 128 bytes). Reading further to look for one is
+# what drover#238 was: harness CLIs resolve to hundreds of megabytes of Mach-O,
+# and this probe runs on every HarnessDaemonState construction.
+_SHEBANG_PROBE_BYTES = 256
+
+
 def _uses_env_node(path: Path) -> bool:
     try:
-        first_line = path.read_text(errors="ignore").splitlines()[0]
-    except (IndexError, OSError):
+        with path.open("rb") as handle:
+            head = handle.read(_SHEBANG_PROBE_BYTES)
+    except OSError:
         return False
-    return first_line.startswith("#!") and "env node" in first_line
+    if not head.startswith(b"#!"):
+        return False
+    return b"env node" in head.split(b"\n", 1)[0]
 
 
 def _latest_nvm_node_bin() -> str | None:
