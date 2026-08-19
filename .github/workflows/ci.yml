@@ -108,7 +108,11 @@ jobs:
 
     - name: Run tests with pytest
       if: steps.scope.outputs.python == 'true'
-      run: pytest tests/
+      # -n auto, not a fixed worker count. The suite spends most of its wall
+      # clock waiting rather than computing, so it scales past the core count,
+      # and `auto` picks the right number on a runner without pinning this file
+      # to one machine shape.
+      run: pytest tests/ -n auto
 
     # The installer is shell, so pytest alone leaves it unguarded. Every
     # suite runs against stubs and temp directories and never touches the

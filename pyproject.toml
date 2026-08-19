@@ -47,6 +47,10 @@ drover-dogfood-smoke = "drover.server.dogfood_smoke:main"
 [project.optional-dependencies]
 dev = [
     "pytest",
+    # The suite is dominated by wait, not compute: after the drover#238 fix it
+    # runs at 42% CPU. Worker count is measured, not derived from core count;
+    # see roadmap operations/2026-08-18-test-suite-cost-baseline.md.
+    "pytest-xdist",
     "black",
     "isort"
 ]
