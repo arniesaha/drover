@@ -4,10 +4,12 @@ import json
 import shlex
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
 from drover.server.harness.auth import (
+    _SHEBANG_PROBE_BYTES,
     AuthFlowLaunchError,
     AuthFlowManager,
     CommandAuthAdapter,
@@ -15,6 +17,7 @@ from drover.server.harness.auth import (
     StaticAuthAdapter,
     TerminalSignInRequired,
     _resolve_known_versioned_cli,
+    _uses_env_node,
     default_auth_adapters,
     redact_auth_text,
 )
@@ -1049,3 +1052,71 @@ def test_vendored_deepseek_harness_install_wins_over_nvm(monkeypatch, tmp_path):
     monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
 
     assert _resolve_known_versioned_cli("dsh") == str(vendored)
+
+
+def test_env_node_probe_reads_a_real_script(tmp_path):
+    script = tmp_path / "cli"
+    script.write_text("#!/usr/bin/env node\nconsole.log(1)\n")
+
+    assert _uses_env_node(script) is True
+
+
+def test_env_node_probe_rejects_another_interpreter(tmp_path):
+    script = tmp_path / "cli"
+    script.write_text('#!/bin/sh\nexec node "$@"\n')
+
+    assert _uses_env_node(script) is False
+
+
+def test_env_node_probe_rejects_a_binary_that_is_not_a_script(tmp_path):
+    binary = tmp_path / "cli"
+    binary.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 4096)
+
+    assert _uses_env_node(binary) is False
+
+
+def test_env_node_probe_stops_at_the_shebang_limit(tmp_path):
+    """A shebang is the first line, and kernels cap it far below this limit
+    (Linux at 127 bytes). A file whose "env node" only appears past the probe
+    window is not a node script, and reading far enough to find it is the
+    defect: harness CLIs are hundreds of megabytes, and this runs on every
+    HarnessDaemonState construction. See drover#238.
+    """
+    padded = tmp_path / "cli"
+    padded.write_bytes(b"#!" + b"x" * (_SHEBANG_PROBE_BYTES * 2) + b"env node\n")
+
+    assert _uses_env_node(padded) is False
+
+
+def test_env_node_probe_does_not_read_the_whole_file(tmp_path, monkeypatch):
+    """Correctness alone cannot catch a full read, so count the bytes."""
+    binary = tmp_path / "cli"
+    binary.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * (4 * 1024 * 1024))
+
+    read_sizes: list[int] = []
+    real_open = Path.open
+
+    class _CountingHandle:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, size=-1):
+            chunk = self._handle.read(size)
+            read_sizes.append(len(chunk))
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._handle.close()
+            return False
+
+    def counting_open(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        return _CountingHandle(handle) if self == binary else handle
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    assert _uses_env_node(binary) is False
+    assert sum(read_sizes) <= _SHEBANG_PROBE_BYTES
