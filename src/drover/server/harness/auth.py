@@ -655,6 +655,20 @@ class _AuthFlow:
     lock: threading.Lock = field(default_factory=threading.Lock)
     completed_at: float | None = None
     cleanup_scheduled: bool = False
+    # Set the moment this flow reaches a terminal state. `_expire_flow` waits
+    # on it instead of sleeping out `timeout_s`, so a flow that finishes early
+    # releases its thread instead of parking one for ten minutes (drover#243).
+    terminal: threading.Event = field(default_factory=threading.Event)
+
+    def mark_terminal(self, state: str) -> None:
+        """Enter a terminal state and wake whatever is waiting on this flow.
+
+        Every terminal assignment goes through here. Setting `state` directly
+        would leave the expiry thread asleep, which is the bug this exists to
+        prevent from coming back.
+        """
+        self.state = state
+        self.terminal.set()
 
     def snapshot(self) -> HarnessAuthFlowSnapshot:
         with self.lock:
@@ -693,6 +707,9 @@ class AuthFlowManager:
         self._flows_by_id: dict[str, _AuthFlow] = {}
         self._active_flow_ids: dict[str, str] = {}
         self._lock = threading.Lock()
+        # Released by close_all so retention threads stop waiting out their
+        # window against a manager that is going away.
+        self._closed = threading.Event()
 
     def status(self, harness: str) -> dict[str, Any]:
         with self._lock:
@@ -785,7 +802,7 @@ class AuthFlowManager:
         flow = self._flow(harness, flow_id)
         with flow.lock:
             if flow.state not in _TERMINAL_FLOW_STATES:
-                flow.state = "cancelled"
+                flow.mark_terminal("cancelled")
                 flow.completed_at = time.time()
                 flow.message = "authentication flow cancelled"
                 self._stop_process(flow.process, flow.pgid)
@@ -793,12 +810,13 @@ class AuthFlowManager:
         return flow.snapshot().as_json()
 
     def close_all(self) -> None:
+        self._closed.set()
         with self._lock:
             flows = list(self._flows_by_id.values())
         for flow in flows:
             with flow.lock:
                 if flow.state not in _TERMINAL_FLOW_STATES:
-                    flow.state = "cancelled"
+                    flow.mark_terminal("cancelled")
                     flow.completed_at = time.time()
                     flow.message = "authentication flow closed"
                     self._schedule_discard_locked(flow)
@@ -880,7 +898,10 @@ class AuthFlowManager:
             return
 
     def _discard_flow_after_retention(self, flow_id: str) -> None:
-        time.sleep(max(self._retention_s, 0))
+        if self._closed.wait(max(self._retention_s, 0)):
+            # The manager is shutting down and the whole flow table goes with
+            # it, so there is nothing left to garbage collect.
+            return
         with self._lock:
             flow = self._flows_by_id.get(flow_id)
             if flow is None:
@@ -951,7 +972,7 @@ class AuthFlowManager:
             with flow.lock:
                 if flow.state in _TERMINAL_FLOW_STATES:
                     return
-                flow.state = "failed"
+                flow.mark_terminal("failed")
                 flow.completed_at = time.time()
                 flow.last_error = "authentication output read failed"
                 self._stop_process(flow.process, flow.pgid)
@@ -978,9 +999,9 @@ class AuthFlowManager:
                 and status is not None
                 and status.state == "authenticated"
             ):
-                flow.state = "authenticated"
+                flow.mark_terminal("authenticated")
             elif return_code == 0 and status is not None:
-                flow.state = "failed"
+                flow.mark_terminal("failed")
                 diagnostic = (
                     f"authentication status is {status.state} after successful login"
                 )
@@ -988,7 +1009,7 @@ class AuthFlowManager:
                     diagnostic += f": {status.detail}"
                 flow.last_error = redact_auth_text(diagnostic)
             else:
-                flow.state = "failed"
+                flow.mark_terminal("failed")
                 flow.last_error = (
                     f"authentication process exited with code {return_code}"
                 )
@@ -996,12 +1017,15 @@ class AuthFlowManager:
 
     def _expire_flow(self, flow: _AuthFlow) -> None:
         remaining_s = max(flow.started_at + flow.timeout_s - time.time(), 0)
-        time.sleep(remaining_s)
+        if flow.terminal.wait(remaining_s):
+            # Finished on its own. Nothing to expire, and no reason to hold a
+            # thread for the rest of the window.
+            return
 
         with flow.lock:
             if flow.state in _TERMINAL_FLOW_STATES:
                 return
-            flow.state = "expired"
+            flow.mark_terminal("expired")
             flow.completed_at = time.time()
             flow.last_error = "authentication flow expired"
             self._stop_process(flow.process, flow.pgid)
