@@ -207,12 +207,20 @@ Closes #123
 ### Running Tests
 
 ```bash
-# All Python tests
-uv run pytest
+# All Python tests, in parallel
+uv run pytest -n auto
 
-# A specific module
+# A specific module, serially, so output is not interleaved
 uv run pytest tests/test_check_public_release.py
 ```
+
+`-n auto` is not in `addopts`, so a bare `pytest` still runs serially. That is
+deliberate: `-x`, `--pdb`, and `-s` all behave badly under `pytest-xdist`, and a
+single-file run does not earn the worker startup cost. Use `-n auto` when you
+want the whole suite, and leave it off when you are debugging one test.
+
+On the reference host, the full suite takes about 42 seconds with `-n auto`
+against about 5 minutes serially.
 
 ### Test Organization
 
