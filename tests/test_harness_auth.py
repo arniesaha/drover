@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1120,3 +1121,61 @@ def test_env_node_probe_does_not_read_the_whole_file(tmp_path, monkeypatch):
 
     assert _uses_env_node(binary) is False
     assert sum(read_sizes) <= _SHEBANG_PROBE_BYTES
+
+
+def test_completed_flow_releases_its_threads_without_waiting_for_timeout():
+    """A flow that finishes should not park threads until `timeout_s`.
+
+    `_expire_flow` and `_discard_flow_after_retention` used to sleep out the
+    full window whatever the flow did, so a process that ran N flows carried
+    2N sleeping threads for ten minutes. The suite showed it plainly: thread
+    count climbed from 1 to 49 across this file alone. See drover#243.
+    """
+    adapter = StaticAuthAdapter(
+        "codex", start_command=[sys.executable, "-c", "print('ok')"]
+    )
+    manager = AuthFlowManager({"codex": adapter}, timeout_s=600, retention_s=600)
+    before = threading.active_count()
+
+    terminal = {"authenticated", "failed", "expired", "cancelled"}
+    for _ in range(5):
+        started = manager.start("codex")
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if manager.snapshot("codex", started["flow_id"])["state"] in terminal:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("flow never reached a terminal state")
+        manager.close_all()
+
+    deadline = time.time() + 5.0
+    while threading.active_count() > before and time.time() < deadline:
+        time.sleep(0.02)
+
+    assert threading.active_count() == before, [
+        t.name for t in threading.enumerate() if t is not threading.main_thread()
+    ]
+
+
+def test_a_flow_that_never_completes_is_still_expired_at_its_timeout():
+    """The wait replaces a sleep; it must not replace the expiry itself."""
+    adapter = StaticAuthAdapter(
+        "codex",
+        start_command=[sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    manager = AuthFlowManager({"codex": adapter}, timeout_s=0.2, retention_s=600)
+    started = manager.start("codex")
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        snapshot = manager.snapshot("codex", started["flow_id"])
+        if snapshot["state"] == "expired":
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(
+            f"flow never expired: {manager.snapshot('codex', started['flow_id'])}"
+        )
+
+    manager.close_all()
