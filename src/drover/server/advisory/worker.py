@@ -1200,7 +1200,17 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
         raw_span_candidates AS (
           SELECT s.span_id, s.session_id, s.start_time, s.total_tokens,
                  s.prompt_tokens, s.cost_usd, s.cache_read_tokens
-          FROM spans_enriched s
+          -- `spans`, not `spans_enriched`: this reads only span-native
+          -- columns, and the enrichment exists solely to coalesce
+          -- repo_owner/repo_name/branch. Producing those costs two DISTINCT
+          -- scans of every span plus two joins over every agent_event, and
+          -- the predicate below cannot be pushed through them -- so the whole
+          -- history was enriched and then thrown away on each cycle. It was
+          -- the dominant allocator on the hub: 206 of ~289 out-of-memory
+          -- failures were inside these two loaders (#246). `spans` is the
+          -- relation documented for exactly this: broad analytics that must
+          -- not join agent_events implicitly.
+          FROM spans s
           JOIN bounded_sessions h USING (session_id)
           WHERE s.start_time >= ? AND s.start_time <= ?
           ORDER BY s.start_time DESC NULLS LAST, s.span_id
@@ -1340,7 +1350,17 @@ def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
         raw_span_candidates AS (
           SELECT s.span_id, s.session_id, s.start_time, s.routing_provider,
                  s.llm_provider, s.routing_model
-          FROM spans_enriched s
+          -- `spans`, not `spans_enriched`: this reads only span-native
+          -- columns, and the enrichment exists solely to coalesce
+          -- repo_owner/repo_name/branch. Producing those costs two DISTINCT
+          -- scans of every span plus two joins over every agent_event, and
+          -- the predicate below cannot be pushed through them -- so the whole
+          -- history was enriched and then thrown away on each cycle. It was
+          -- the dominant allocator on the hub: 206 of ~289 out-of-memory
+          -- failures were inside these two loaders (#246). `spans` is the
+          -- relation documented for exactly this: broad analytics that must
+          -- not join agent_events implicitly.
+          FROM spans s
           JOIN bounded_sessions h USING (session_id)
           WHERE s.start_time >= ? AND s.start_time <= ?
           ORDER BY s.start_time DESC NULLS LAST, s.span_id
