@@ -157,6 +157,38 @@ class CockpitService:
             log.warning("failed to render provider capacity: %s", exc)
             return _section("error", data=[], coverage=None)
 
+    def _last_good_activity(self, cache_key: dict[str, Any]) -> dict[str, Any] | None:
+        """The last section we computed for these filters, marked stale.
+
+        Every path that cannot produce a fresh answer used to return `error`
+        with `data=None`, which the app draws as empty charts -- and because a
+        held slot outlives a client retry, the next poll returned the same
+        thing and the blank state sustained itself (observed on a phone,
+        2026-08-19).
+
+        A section computed a minute ago is not nothing. `stale` is a status
+        the client already understands, and the envelope carries the original
+        `observed_at`, so the age travels with the data rather than being
+        implied by its absence.
+        """
+
+        with self._activity_lock:
+            return self._last_good_activity_locked(cache_key)
+
+    def _last_good_activity_locked(
+        self, cache_key: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """As above, for callers already holding ``_activity_lock``."""
+
+        cached = self._activity_cache
+        if cached is None or cached[0] != cache_key:
+            return None
+        section = dict(cached[1])
+        if section.get("data") is None:
+            return None
+        section["status"] = "stale"
+        return section
+
     def _activity(self, filters: AnalyticsFilters) -> dict[str, Any]:
         cache_key = asdict(filters)
         now = time.monotonic()
@@ -172,6 +204,9 @@ class CockpitService:
                 # Still cooling off from a query that blew its budget. Running
                 # it again would just re-saturate the database for another
                 # budget's worth of everyone else's latency.
+                cooling = self._last_good_activity_locked(cache_key)
+                if cooling is not None:
+                    return cooling
                 return _section("error", data=None, coverage=None)
 
         if not self._activity_slot.acquire(blocking=False):
@@ -179,7 +214,10 @@ class CockpitService:
             # stack a second multi-minute query on the same database: the 30s
             # client poll did exactly that, and the pile-up blocked every other
             # endpoint on the server, not just this section.
-            log.warning("activity query still in flight; skipping this attempt")
+            log.warning("activity query still in flight; serving the last good answer")
+            stale = self._last_good_activity(cache_key)
+            if stale is not None:
+                return stale
             return _section("error", data=None, coverage=None)
         try:
             result = self._activity_within_budget(filters)
@@ -199,6 +237,9 @@ class CockpitService:
             log.warning("failed to render observed activity: %s", exc)
             with self._activity_lock:
                 self._activity_quiet_until = time.monotonic() + ACTIVITY_BACKOFF_SECONDS
+            stale = self._last_good_activity(cache_key)
+            if stale is not None:
+                return stale
             return _section("error", data=None, coverage=None)
 
     def _activity_within_budget(self, filters: AnalyticsFilters) -> ActivityAnalytics:
