@@ -102,7 +102,11 @@ from drover.server.summarizer.diagnostics import summarize_backend_auth
 from drover.server.summarizer.retry import retry_errored_jobs
 from drover.server.summarizer.worker import SummarizerWorker
 from drover.server.update_planner import UpdatePlanner
-from drover.server.watcher import IncomingWatcher, ingest_incoming_file_once
+from drover.server.watcher import (
+    IncomingWatcher,
+    ingest_incoming_file_once,
+    sweep_processed,
+)
 from drover.server.web.auth import load_auth
 from drover.server.web.pairing import PairingCodes
 from drover.server.web.qr import pairing_url, qr_lines
@@ -1747,6 +1751,9 @@ def run(
         parquet_dir=cfg.parquet_dir,
         duckdb_path=cfg.duckdb_path,
         summarize_job_stream=job_streams.get("summarize"),
+        # The setting has existed since the beginning; until now nothing read
+        # it, and the audit copies grew without bound (9.7GB on this hub).
+        retention_days=cfg.processed_retention_days,
     )
     watcher.start()
 
@@ -2146,6 +2153,76 @@ def run(
         # worker by design, and a restart would otherwise race the database
         # lock against its own predecessor.
         close_control_plane_connections()
+
+
+@main.command()
+@click.option(
+    "--apply",
+    "apply_sweep",
+    is_flag=True,
+    help="Reclaim the processed spool now. Never touches anything else.",
+)
+@click.pass_context
+def reclaim(ctx: click.Context, apply_sweep: bool) -> None:
+    """Report reclaimable disk, and optionally sweep the processed spool.
+
+    Two kinds of space live under the Drover home and they are not the same
+    kind of thing. The processed spool is Drover's own audit copies, governed
+    by `processed_retention_days`, and Drover sweeps it. Everything else here
+    belongs to whoever made it -- build output, test scratch, hand-made
+    backups -- and is only reported, because deleting an operator's files
+    because they are large is not a decision this command gets to make.
+    """
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    home = cfg.incoming_dir.parent
+
+    reclaimable_files = 0
+    reclaimable_bytes = 0
+    if cfg.processed_retention_days > 0:
+        cutoff = time.time() - cfg.processed_retention_days * 86400
+        for path in Path(cfg.incoming_dir).glob("*/.processed/*"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.is_file() and stat.st_mtime < cutoff:
+                reclaimable_files += 1
+                reclaimable_bytes += stat.st_size
+
+    click.echo("Drover-owned (governed by processed_retention_days):")
+    click.echo(
+        f"  processed spool   {reclaimable_bytes / 1_073_741_824:8.2f} GB "
+        f"in {reclaimable_files} file(s) older than {cfg.processed_retention_days}d"
+    )
+
+    if apply_sweep:
+        result = sweep_processed(
+            cfg.incoming_dir, retention_days=cfg.processed_retention_days
+        )
+        click.echo(
+            f"  reclaimed         {result.bytes / 1_073_741_824:8.2f} GB "
+            f"in {result.files} file(s)"
+        )
+
+    click.echo("\nOwned by you (reported only, never deleted):")
+    for name in ("worktrees", "DerivedData", "backups"):
+        target = home / name
+        if target.exists():
+            click.echo(f"  {name:17} {_dir_size(target) / 1_073_741_824:8.2f} GB")
+    for target in sorted(home.glob("pytest-*")) + sorted(home.glob("parquet-backup-*")):
+        click.echo(f"  {target.name:17} {_dir_size(target) / 1_073_741_824:8.2f} GB")
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 @main.command()
