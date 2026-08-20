@@ -1,6 +1,7 @@
 """Tests for src/drover/server/watcher.py."""
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -507,3 +508,84 @@ def test_handler_leaves_file_in_place_when_duckdb_lock_retries_exhaust(
     assert not (host_dir / ".processed" / "openclaw.jsonl").exists()
     assert "leaving file in place" in caplog.text
     assert "runtime-audit" in caplog.text
+
+
+# -- retention on the processed spool ---------------------------------------
+#
+# `processed_retention_days` has been in the config, in DroverConfig and in the
+# documented example since the beginning, and nothing has ever enforced it. On
+# the hub that meant 9.7GB of incoming, of which 8.6GB was 6,692 audit copies
+# older than the seven days the operator had asked for. A policy nobody
+# implements is worse than no policy: it is written down, so it is trusted.
+
+
+def test_sweep_removes_processed_files_past_the_retention_window(tmp_path):
+    from drover.server.watcher import sweep_processed
+
+    incoming = tmp_path / "incoming"
+    processed = incoming / "nas-claude" / ".processed"
+    processed.mkdir(parents=True)
+
+    old = processed / "old.jsonl"
+    old.write_text('{"a": 1}\n')
+    recent = processed / "recent.jsonl"
+    recent.write_text('{"a": 2}\n')
+
+    eight_days = time.time() - 8 * 86400
+    os.utime(old, (eight_days, eight_days))
+
+    removed = sweep_processed(incoming, retention_days=7)
+
+    assert not old.exists(), "an audit copy past the window should be reclaimed"
+    assert recent.exists(), "a copy inside the window must be kept"
+    assert removed.files == 1
+    assert removed.bytes > 0
+
+
+def test_sweep_never_touches_anything_awaiting_ingestion(tmp_path):
+    """Only `.processed` is audit. Everything else is data that has not landed.
+
+    The watcher moves a file into `.processed` only after ingest *and* job
+    enqueue succeed, so that directory is the one place where deleting cannot
+    lose anything. A file sitting in the spool is still waiting to be read.
+    """
+
+    from drover.server.watcher import sweep_processed
+
+    incoming = tmp_path / "incoming"
+    host = incoming / "nas-claude"
+    (host / ".processed").mkdir(parents=True)
+    pending = host / "pending.jsonl"
+    pending.write_text('{"a": 1}\n')
+    eight_days = time.time() - 8 * 86400
+    os.utime(pending, (eight_days, eight_days))
+
+    removed = sweep_processed(incoming, retention_days=7)
+
+    assert pending.exists(), "an un-ingested file must never be swept"
+    assert removed.files == 0
+
+
+def test_sweep_of_zero_days_is_a_no_op_rather_than_deleting_everything(tmp_path):
+    """A misread config must not become an erase.
+
+    Zero is the value an operator reaches for meaning "do not keep any", and
+    it is also what an unset or malformed setting parses to. Treating it as
+    "delete the entire audit trail" makes the failure mode of a typo
+    unrecoverable, so it is declined instead.
+    """
+
+    from drover.server.watcher import sweep_processed
+
+    incoming = tmp_path / "incoming"
+    processed = incoming / "nas-claude" / ".processed"
+    processed.mkdir(parents=True)
+    old = processed / "old.jsonl"
+    old.write_text('{"a": 1}\n')
+    eight_days = time.time() - 8 * 86400
+    os.utime(old, (eight_days, eight_days))
+
+    removed = sweep_processed(incoming, retention_days=0)
+
+    assert old.exists()
+    assert removed.files == 0

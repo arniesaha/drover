@@ -15,6 +15,7 @@ import logging
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
@@ -222,6 +223,74 @@ def ingest_incoming_file_once(
     handler._maybe_ingest(path)
 
 
+#: One pass a day: the window is measured in days, so anything finer just
+#: walks the tree for nothing.
+_SWEEP_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    """What one retention pass reclaimed."""
+
+    files: int = 0
+    bytes: int = 0
+
+
+def sweep_processed(incoming_dir: Path, *, retention_days: int) -> SweepResult:
+    """Reclaim audit copies older than ``retention_days``.
+
+    `processed_retention_days` has been in the config, in `DroverConfig` and in
+    the documented example config since the beginning, and nothing enforced it.
+    On the hub that came to 9.7GB of incoming, 8.6GB of which was 6,692 audit
+    copies older than the seven days the operator had asked for. A policy
+    nobody implements is worse than no policy, because it is written down and
+    therefore trusted.
+
+    Only `.processed` is swept. The watcher moves a file there after ingest
+    *and* job enqueue have both succeeded, which makes it the one directory
+    where deleting cannot lose anything; a file still sitting in the spool is
+    waiting to be read and is never touched.
+
+    Zero (or negative) declines rather than deleting everything. Zero is what
+    an operator reaches for meaning "keep nothing", and equally what a
+    malformed setting parses to -- and the failure mode of a typo should not
+    be an erased audit trail.
+    """
+
+    if retention_days <= 0:
+        return SweepResult()
+    incoming = Path(incoming_dir)
+    if not incoming.exists():
+        return SweepResult()
+
+    cutoff = time.time() - retention_days * 86400
+    files = 0
+    freed = 0
+    for path in incoming.glob("*/.processed/*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+            if stat.st_mtime >= cutoff:
+                continue
+            path.unlink()
+        except OSError as exc:
+            # One unreadable or already-gone file must not stop the pass:
+            # the next one may be the large one.
+            log.debug("could not reclaim %s: %s", path, exc)
+            continue
+        files += 1
+        freed += stat.st_size
+    if files:
+        log.info(
+            "reclaimed %d processed file(s), %.1f MB, older than %d day(s)",
+            files,
+            freed / 1_048_576,
+            retention_days,
+        )
+    return SweepResult(files=files, bytes=freed)
+
+
 class IncomingWatcher:
     """Run a watchdog observer over <incoming_dir> and ingest JSONL files."""
 
@@ -233,8 +302,12 @@ class IncomingWatcher:
         duckdb_path: Path,
         shadow_publisher: ShadowPublisher | None = None,
         summarize_job_stream: object | None = None,
+        retention_days: int = 0,
     ):
         self._incoming = Path(incoming_dir)
+        self._retention_days = int(retention_days)
+        self._sweeper: threading.Thread | None = None
+        self._stopping = threading.Event()
         self._parquet_dir = Path(parquet_dir)
         self._duckdb_path = Path(duckdb_path)
         self._observer: Observer | None = None
@@ -255,8 +328,34 @@ class IncomingWatcher:
         observer.start()
         self._observer = observer
         log.info("watcher started on %s", self._incoming)
+        self._start_sweeper()
+
+    def _start_sweeper(self) -> None:
+        """Sweep once at startup, then daily.
+
+        At startup because a hub that has been down for a week comes back with
+        a week of audit copies to reclaim, and daily because the window is
+        measured in days: anything finer would just walk the tree for nothing.
+        """
+
+        if self._retention_days <= 0:
+            return
+
+        def loop() -> None:
+            while not self._stopping.is_set():
+                try:
+                    sweep_processed(self._incoming, retention_days=self._retention_days)
+                except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                    log.warning("processed sweep failed: %s", exc)
+                self._stopping.wait(_SWEEP_INTERVAL_SECONDS)
+
+        self._sweeper = threading.Thread(
+            target=loop, name="drover-processed-sweep", daemon=True
+        )
+        self._sweeper.start()
 
     def stop(self) -> None:
+        self._stopping.set()
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
