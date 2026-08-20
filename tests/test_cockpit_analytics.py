@@ -1550,3 +1550,64 @@ def test_a_query_that_blew_its_budget_is_not_retried_immediately(monkeypatch):
         f"scan was started {calls['n']} times; a blown budget must back off "
         "before trying again"
     )
+
+
+def test_a_busy_slot_serves_the_last_good_activity_instead_of_nothing(
+    monkeypatch, low_coverage_analytics_db
+):
+    """Blank charts on the phone, observed 2026-08-19.
+
+    The overview takes seconds against a real store. A client that gives up
+    and retries -- or simply polls -- arrives while the first query is still
+    unwinding, finds the slot held, and the section came back `error` with
+    `data=None`. The app then has nothing to draw, so every chart empties, and
+    the next poll does the same: the state sustains itself.
+
+    A section computed a minute ago is not nothing. Serving it, marked stale,
+    is both more useful and more honest than an error, and the envelope
+    already carries `observed_at` so its age travels with it.
+    """
+    from drover.server.cockpit import service as service_module
+
+    monkeypatch.setattr(service_module, "ACTIVITY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(service_module, "ACTIVITY_CACHE_TTL_SECONDS", 0.0)
+
+    release = threading.Event()
+    calls = {"n": 0}
+    real = service_module.activity_analytics
+
+    def _activity(con, filters, *, cursor_codec=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(con, filters, cursor_codec=cursor_codec)
+        release.wait(10)
+        return None
+
+    monkeypatch.setattr(service_module, "activity_analytics", _activity)
+    svc = service_module.CockpitService(
+        duckdb_path=None,
+        provider_usage=SimpleNamespace(latest_accounts=lambda: []),
+        connect=lambda: low_coverage_analytics_db,
+    )
+
+    first = svc.overview(AnalyticsFilters(days=7))
+    assert first["activity"]["status"] == "ok"
+    assert first["activity"]["data"] is not None
+
+    # The cache is past its TTL, so this starts a fresh query, and it hangs.
+    threading.Thread(
+        target=lambda: svc.overview(AnalyticsFilters(days=7)), daemon=True
+    ).start()
+    deadline = time.monotonic() + 5
+    while calls["n"] < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    # This one arrives while that query is still unwinding: the slot is held.
+    blocked = svc.overview(AnalyticsFilters(days=7))
+    release.set()
+
+    assert (
+        blocked["activity"]["data"] is not None
+    ), "a held slot must not blank the charts when a recent answer exists"
+    assert blocked["activity"]["status"] == "stale"
+    assert blocked["activity"]["data"] == first["activity"]["data"]
