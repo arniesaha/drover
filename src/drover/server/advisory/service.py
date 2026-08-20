@@ -8,6 +8,9 @@ import os
 import re
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -166,6 +169,17 @@ class InsightFilters:
             raise InvalidInsightRequest(f"limit must be between 1 and {MAX_PAGE_SIZE}")
 
 
+#: How long the Check Again scope probe may run before the action is reported
+#: unavailable. Unbounded it ran past two minutes on the hub and starved every
+#: other endpoint while it did (#251).
+CHECK_SCOPE_BUDGET_SECONDS = 5.0
+
+#: How long a resolved scope is reused. Long enough that drawing one list
+#: costs one snapshot per distinct scope rather than one per row; short enough
+#: that a scope which becomes checkable is not held unavailable for long.
+CHECK_SCOPE_CACHE_TTL_SECONDS = 30.0
+
+
 class InsightsService:
     """Serialize bounded findings and delegate lifecycle persistence."""
 
@@ -179,6 +193,8 @@ class InsightsService:
         self.duckdb_path = Path(duckdb_path)
         self.config_path = Path(config_path or default_config_path()).expanduser()
         self.repository = AdvisoryRepository(self.duckdb_path)
+        self._scope_cache: dict[tuple, tuple[float, Any]] = {}
+        self._scope_lock = threading.Lock()
         consent_path = self.config_path.with_name(
             f".{self.config_path.name}.content-consent.json"
         )
@@ -702,9 +718,73 @@ class InsightsService:
             force=True,
         )
 
+    def _check_scope_cached(self, finding: Finding) -> tuple[str, str]:
+        """`_check_scope`, memoised per scope and bounded in time.
+
+        Two separate problems, one seam.
+
+        Rendering a list calls `_check_action` per finding, and for an
+        operational analyzer that means a full `load_operational_snapshot`.
+        Findings share scopes -- 21 telemetry findings on this hub sat on a
+        handful of targets -- so the same snapshot was recomputed for each
+        row. The cost of drawing a list should not scale with the number of
+        rows times the cost of the most expensive query in the system.
+
+        And the probe had no deadline. Unbounded it ran past two minutes,
+        during which /insights stopped answering entirely and /harness went
+        from milliseconds to 11.8s, while /healthz kept replying in 0.5ms.
+        The cockpit's activity query learned this already and carries a
+        budget, a single-flight slot and a cooldown (#91, PR #76); this path
+        was written without them.
+        """
+
+        key = (finding.analyzer_id, finding.target_id, finding.target_type)
+        now = time.monotonic()
+        with self._scope_lock:
+            hit = self._scope_cache.get(key)
+            if hit is not None and now - hit[0] < CHECK_SCOPE_CACHE_TTL_SECONDS:
+                if isinstance(hit[1], Exception):
+                    raise hit[1]
+                return hit[1]
+
+        # Not a `with` block: the executor's context manager joins its worker
+        # on exit, so the budget would expire and then the caller would wait
+        # out the whole query anyway. Shutting down without waiting is what
+        # makes the deadline real; the abandoned probe finishes into a result
+        # nobody reads, exactly as the cockpit's abandoned activity query does.
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            scope = pool.submit(self._check_scope, finding).result(
+                timeout=CHECK_SCOPE_BUDGET_SECONDS
+            )
+        except FuturesTimeout as exc:
+            # Deliberately not cached: a slow probe is a statement about how
+            # busy the store is right now, not about this finding, and
+            # remembering it would keep the action unavailable long after the
+            # pressure passed.
+            log.warning(
+                "check-again scope probe for %s exceeded %.1fs; reporting "
+                "the action unavailable",
+                finding.finding_id,
+                CHECK_SCOPE_BUDGET_SECONDS,
+            )
+            raise InvalidInsightTransition(
+                "Check Again is temporarily unavailable while the store is busy."
+            ) from exc
+        except InvalidInsightTransition as exc:
+            with self._scope_lock:
+                self._scope_cache[key] = (now, exc)
+            raise
+        finally:
+            pool.shutdown(wait=False)
+
+        with self._scope_lock:
+            self._scope_cache[key] = (now, scope)
+        return scope
+
     def _check_action(self, finding: Finding) -> dict[str, Any]:
         try:
-            self._check_scope(finding)
+            self._check_scope_cached(finding)
         except InvalidInsightTransition as exc:
             return {"available": False, "reason": str(exc)}
         except Exception:
