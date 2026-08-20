@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from drover.server.advisory.jobs import (
 )
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.service import (
+    InsightFilters,
     InsightsService,
     InvalidInsightTransition,
 )
@@ -3130,3 +3132,113 @@ def test_runtime_facts_do_not_depend_on_the_enrichment_view(db_path: Path) -> No
 
     assert telemetry.telemetry[0].input_span_records == 1
     assert routing.routing[0].decision_count == 1
+
+
+# -- the cost of asking whether Check Again is available (#251) -------------
+#
+# Opening a finding calls `_check_action`, and for an operational analyzer
+# that means a full `load_operational_snapshot` -- the most expensive query in
+# the system -- with no deadline and no memory. Unbounded it ran past two
+# minutes on the hub: /insights stopped answering entirely, /harness went from
+# milliseconds to 11.8s, and /healthz kept replying in 0.5ms throughout.
+#
+# Note it is the detail view and the check itself that pay this, not the list.
+# `list_insights` does not attach actions and never probes.
+
+
+def _telemetry_finding(repository, rule_id: str, run_id: str):
+    return repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id=rule_id,
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Telemetry coverage is low",
+            impact="Metrics are incomplete.",
+            remediation=("Repair telemetry.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref=f"telemetry:{rule_id}",
+                    observed_at=NOW,
+                    fields={"coverage": 0},
+                ),
+            ),
+            content_hash=rule_id,
+        ),
+        run_id=run_id,
+    )
+
+
+def test_repeated_views_of_a_scope_cost_one_snapshot(
+    db_path: Path, monkeypatch
+) -> None:
+    """Opening findings that share a scope must not re-run the query each time.
+
+    Four findings on one target, opened in turn, previously meant four
+    snapshots. They resolve to the same scope, so one answer serves them all
+    for as long as it is fresh.
+    """
+
+    from drover.server.advisory import service as service_module
+    from drover.server.advisory import worker as worker_module
+
+    repository = AdvisoryRepository(db_path)
+    findings = [
+        _telemetry_finding(repository, f"telemetry.low_coverage.{i}", f"run-{i}")
+        for i in range(4)
+    ]
+
+    calls = {"n": 0}
+    real = worker_module.load_operational_snapshot
+
+    def _counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    # Imported inside `_check_scope`, so the source module is the seam.
+    monkeypatch.setattr(worker_module, "load_operational_snapshot", _counting)
+
+    service = service_module.InsightsService(db_path)
+    for finding in findings:
+        service.get_insight(finding.finding_id)
+
+    assert calls["n"] >= 1, "the probe must actually run, or this proves nothing"
+    assert calls["n"] == 1, f"four findings on one scope cost {calls['n']} snapshots"
+
+
+def test_a_scope_probe_that_overruns_reports_unavailable_rather_than_hanging(
+    db_path: Path, monkeypatch
+) -> None:
+    """A budget, as the cockpit's activity query already has.
+
+    Unbounded, this ran past two minutes and starved every other endpoint
+    while it did. Reporting the action unavailable is a worse answer than the
+    truth and a far better one than an unusable fleet.
+    """
+
+    from drover.server.advisory import service as service_module
+    from drover.server.advisory import worker as worker_module
+
+    monkeypatch.setattr(service_module, "CHECK_SCOPE_BUDGET_SECONDS", 0.2)
+
+    def _slow(*args, **kwargs):
+        time.sleep(5)
+        raise AssertionError("the budget should have cut this off")
+
+    monkeypatch.setattr(worker_module, "load_operational_snapshot", _slow)
+
+    repository = AdvisoryRepository(db_path)
+    finding = _telemetry_finding(repository, "telemetry.low_coverage", "run-slow")
+
+    service = service_module.InsightsService(db_path)
+    started = time.monotonic()
+    detail = service.get_insight(finding.finding_id)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3, f"the probe ran for {elapsed:.1f}s despite its budget"
+    action = detail["actions"]["check_again"]
+    assert action["available"] is False
+    assert "unavailable" in action["reason"].lower()
