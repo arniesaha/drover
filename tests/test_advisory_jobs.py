@@ -1738,8 +1738,9 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
 ) -> None:
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               llm_provider VARCHAR,
               routing_provider VARCHAR, routing_model VARCHAR,
@@ -1763,7 +1764,7 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
         )
         con.execute(
             """
-            INSERT INTO spans_enriched VALUES
+            INSERT INTO spans VALUES
               ('span-1', 's1', ?, 'openai', 'openai', 'gpt-4', 20000, 21000, 0, 1.5)
             """,
             [NOW],
@@ -1855,8 +1856,9 @@ def test_operational_fact_hash_coalesces_unchanged_rows(db_path: Path) -> None:
 def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               prompt_tokens BIGINT, total_tokens BIGINT,
               cache_read_tokens BIGINT, cost_usd DOUBLE
@@ -1891,8 +1893,9 @@ def test_runtime_snapshot_bounds_sessions_inside_the_seven_day_window(
 ) -> None:
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               llm_provider VARCHAR, routing_provider VARCHAR,
               routing_model VARCHAR, prompt_tokens BIGINT,
@@ -1926,7 +1929,7 @@ def test_runtime_snapshot_bounds_sessions_inside_the_seven_day_window(
         )
         con.execute(
             """
-            INSERT INTO spans_enriched VALUES
+            INSERT INTO spans VALUES
               ('recent-span', 'recent', ?, 'openai', 'openai', 'gpt-4',
                100, 100, 20, 0.1)
             """,
@@ -1959,8 +1962,9 @@ def test_runtime_snapshot_uses_latest_session_activity_including_ended_at(
 ) -> None:
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               llm_provider VARCHAR, routing_provider VARCHAR,
               routing_model VARCHAR, prompt_tokens BIGINT,
@@ -1984,7 +1988,7 @@ def test_runtime_snapshot_uses_latest_session_activity_including_ended_at(
         )
         con.execute(
             """
-            INSERT INTO spans_enriched VALUES
+            INSERT INTO spans VALUES
               ('recent-span', 'recently-ended', ?, 'openai', 'openai', 'gpt-4',
                100, 100, 20, 0.1),
               ('old-span', 'fully-old', ? - INTERVAL 8 DAY, 'openai', 'openai',
@@ -2021,8 +2025,9 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
 ) -> None:
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               llm_provider VARCHAR, routing_provider VARCHAR,
               routing_model VARCHAR, prompt_tokens BIGINT,
@@ -2042,7 +2047,7 @@ def test_runtime_snapshot_caps_latest_spans_per_selected_session(
         )
         con.execute(
             """
-            INSERT INTO spans_enriched
+            INSERT INTO spans
             SELECT 'span-' || i, 'selected', ? - i * INTERVAL 1 SECOND,
                    'openai', 'openai', 'gpt-4', 1, 1, 0, 0.1
             FROM range(9000) rows(i)
@@ -2084,8 +2089,9 @@ def test_span_lookback_is_measured_from_analyzed_at(db_path: Path) -> None:
 
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               llm_provider VARCHAR, routing_provider VARCHAR,
               routing_model VARCHAR, prompt_tokens BIGINT,
@@ -2105,7 +2111,7 @@ def test_span_lookback_is_measured_from_analyzed_at(db_path: Path) -> None:
         )
         con.execute(
             """
-            INSERT INTO spans_enriched VALUES
+            INSERT INTO spans VALUES
               ('span-1', 'selected', ?, 'openai', 'openai', 'gpt-4',
                100, 100, 20, 0.1)
             """,
@@ -2870,8 +2876,9 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
     CURRENT = _current_moment()
     with duckdb.connect(str(db_path)) as con:
         con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
         con.execute("""
-            CREATE TABLE spans_enriched (
+            CREATE TABLE spans (
               span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
               llm_provider VARCHAR, routing_provider VARCHAR,
               routing_model VARCHAR, prompt_tokens BIGINT,
@@ -2894,7 +2901,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
         )
         con.execute(
             """
-            INSERT INTO spans_enriched VALUES
+            INSERT INTO spans VALUES
               ('codex-span', 'codex-session', ?, 'openai', 'openai', 'gpt-4',
                100, 100, 0, 0.1),
               ('claude-span', 'claude-session', ?, 'anthropic', 'anthropic',
@@ -2904,7 +2911,7 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
         )
         con.execute(
             """
-            INSERT INTO spans_enriched
+            INSERT INTO spans
             SELECT 'bulk-' || lpad(i::VARCHAR, 5, '0'), 'claude-session', ?,
                    'anthropic', 'anthropic', 'claude-3', 1, 1, 0, 0.01
             FROM range(8200) rows(i)
@@ -3064,3 +3071,62 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
         f"{item.host_id}/{item.harness_id}/{item.hook_id}"
         for item in scoped_hooks.hooks
     ] == ["mac-mini/codex/pre-tool"]
+
+
+def test_runtime_facts_do_not_depend_on_the_enrichment_view(db_path: Path) -> None:
+    """The loaders read span-native columns, so the enrichment must be optional.
+
+    `spans_enriched` exists to coalesce repo_owner/repo_name/branch, and
+    producing those costs two DISTINCT scans of every span plus two joins over
+    every agent_event. None of the columns these loaders select come from it.
+    Dropping it entirely is the cheapest way to prove they do not touch it, and
+    it fails loudly if someone points them back at the view.
+    """
+
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
+        con.execute("""
+            CREATE TABLE spans (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              llm_provider VARCHAR, routing_provider VARCHAR,
+              routing_model VARCHAR, prompt_tokens BIGINT,
+              total_tokens BIGINT, cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        _control_plane_execute(
+            db_path,
+            """
+            INSERT INTO harness_sessions (
+              session_id, host_id, harness, command, status, model,
+              started_at, updated_at
+            ) VALUES ('s1', 'mac-mini', 'codex', 'codex', 'completed',
+                      'gpt-5', ?, ?)
+            """,
+            [NOW, NOW],
+        )
+        con.execute(
+            """
+            INSERT INTO spans VALUES
+              ('span-1', 's1', ?, 'openai', 'openai', 'gpt-4', 10, 20, 0, 0.5)
+            """,
+            [NOW],
+        )
+
+    telemetry = load_operational_snapshot(
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+    routing = load_operational_snapshot(
+        db_path,
+        "deterministic.routing_mismatch",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+
+    assert telemetry.telemetry[0].input_span_records == 1
+    assert routing.routing[0].decision_count == 1
