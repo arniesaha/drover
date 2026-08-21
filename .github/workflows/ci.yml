@@ -108,11 +108,21 @@ jobs:
 
     - name: Run tests with pytest
       if: steps.scope.outputs.python == 'true'
-      # -n auto, not a fixed worker count. The suite spends most of its wall
-      # clock waiting rather than computing, so it scales past the core count,
-      # and `auto` picks the right number on a runner without pinning this file
-      # to one machine shape.
-      run: pytest tests/ -n auto
+      env:
+        # A loaded runner needs more patience than an idle laptop. Waits scale
+        # by this; a wait that succeeds still returns as soon as its predicate
+        # is true, so the larger ceiling costs time only when something is
+        # genuinely broken. See tests/_timeouts.py and drover#250.
+        DROVER_TEST_TIMEOUT_SCALE: "4"
+      # Two workers, not `auto`. `auto` counts cores, and this runner has 4 --
+      # but these tests spawn their own subprocesses and HTTP servers, so four
+      # workers put roughly three times that many processes on four vCPUs and
+      # every worker's children compete with every other worker's tests.
+      # Measured across 40 CI runs: `-n auto` cut median wall clock from 9.6 to
+      # 4.0 minutes and raised the failure rate from 8% to 27%, with one run
+      # stretching to 35 minutes. Two keeps most of the speedup and leaves the
+      # runner room for the children. Revisit with numbers, not intuition.
+      run: pytest tests/ -n 2
 
     # The installer is shell, so pytest alone leaves it unguarded. Every
     # suite runs against stubs and temp directories and never touches the

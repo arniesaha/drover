@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from _timeouts import scale_timeout
 from click.testing import CliRunner
 
 import drover
@@ -199,16 +200,40 @@ def _raw_request(url: str, *, method: str = "GET", payload: dict | None = None):
     return urllib.request.urlopen(request, timeout=5)
 
 
-def _wait_until(predicate, timeout: float = 15) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_until(predicate, timeout: float = 15, *, what: str = "condition") -> None:
+    """Poll ``predicate`` until it is true, or fail saying why it never was.
+
+    Two problems with the version this replaces, both of which drover#250 hit.
+
+    It swallowed every exception and raised a bare "condition was not met
+    before timeout", so a predicate that raised on every attempt looked
+    identical to one that merely ran out of time -- and because the assertions
+    after a wait fall together, the report read like a real breakage rather
+    than an expired deadline. ``test_structured_e2e`` already solved this for
+    itself under drover#90; this is that solution, moved here.
+
+    It also used ``time.time()``, which can step backwards under NTP
+    correction and silently extend or truncate the wait.
+    """
+    ceiling = scale_timeout(timeout)
+    deadline = time.monotonic() + ceiling
+    last_error: Exception | None = None
+    last_value: object = None
+    while time.monotonic() < deadline:
         try:
-            if predicate():
+            last_value = predicate()
+            if last_value:
                 return
-        except Exception:
-            pass
+            last_error = None
+        except Exception as exc:  # noqa: BLE001 - reported below
+            last_error = exc
         time.sleep(0.1)
-    raise AssertionError("condition was not met before timeout")
+    detail = (
+        f"last call raised {type(last_error).__name__}: {last_error}"
+        if last_error is not None
+        else f"last value was {last_value!r}"
+    )
+    raise AssertionError(f"{what} was not met within {ceiling}s; {detail}")
 
 
 def _fetch_session(base_url: str, session_id: str) -> dict:
