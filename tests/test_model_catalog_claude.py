@@ -8,6 +8,7 @@ import threading
 import time
 
 import pytest
+from _timeouts import scale_timeout
 
 from drover.server.harness.model_catalog import CatalogDiscoveryError
 from drover.server.harness.model_catalog.claude import (
@@ -782,15 +783,24 @@ def test_version_reader_terminates_at_output_bound(claude_credentials, tmp_path)
             _page({"id": "claude-sonnet-5", "display_name": "Sonnet 5"}),
         ),
         settings_paths=(),
+        # Far above what the output bound needs, so the two ways this can end
+        # are separated by seconds rather than by a coin flip. The category
+        # cannot tell them apart: `_version` relabels every exception from the
+        # reader as protocol_error, so a timeout and a breached output bound
+        # both arrive as protocol_error and only the clock distinguishes them.
         env={},
-        timeout_s=2,
+        timeout_s=30,
     )
     started = time.monotonic()
 
     with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
         adapter.discover()
 
-    assert time.monotonic() - started < 1
+    # Reading 256KB off a pipe is legitimately slower on a loaded machine --
+    # this took 1.95s under `-n auto` and tripped a hardcoded 1s bound
+    # (drover#250). What the test actually proves is that the output bound
+    # fired and the 30s timeout did not, so assert with room for the machine.
+    assert time.monotonic() - started < scale_timeout(5)
 
 
 def test_cache_identity_tracks_configuration_but_not_api_key(tmp_path):

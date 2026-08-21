@@ -16,6 +16,8 @@ import threading
 import time
 import urllib.request
 
+from _timeouts import scale_timeout
+
 from drover.schema import bootstrap
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
@@ -109,6 +111,7 @@ def _wait_until(predicate, timeout: float = 30, *, what: str = "condition") -> N
     Also monotonic: ``time.time()`` can step backwards under NTP correction
     and silently extend or truncate the wait.
     """
+    timeout = scale_timeout(timeout)
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     last_value: object = None
