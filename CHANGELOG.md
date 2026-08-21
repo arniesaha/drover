@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-08-20
+
+### Fixed
+
+- The hub no longer exhausts its memory budget building advisory snapshots.
+  The two loaders behind the operational snapshot read `spans_enriched`, a
+  view that coalesces three repository columns by running two `DISTINCT`
+  scans over every span and two joins over every agent event. Neither loader
+  selects any of those three columns, so the whole enrichment was computed
+  and discarded on every advisory cycle, and the seven-day predicate could
+  not be pushed through it to bound the work. They now read `spans`, the
+  relation documented for broad analytics that must not join agent events.
+  Measured against the live 129,399-span store at one thread, the routing
+  loader fell from 2211 MB peak to 297 MB, and the telemetry loader from
+  1773 MB to 224 MB, with identical results. On a 2 GB instance-wide budget
+  the routing loader alone had been enough to hit the ceiling, which is what
+  took chats and charts down on 2026-08-19
+- Refreshing an insight no longer runs an unbounded scope probe. The probe
+  had no time budget and was repeated on every poll, so several could stack
+  up and starve every other endpoint on the hub. It now runs under a budget
+  and its result is briefly remembered instead of recomputed
+- A cockpit section whose query fails now shows the last good data it had,
+  marked stale, rather than blanking to an empty chart. An empty chart and a
+  chart with no data yet looked identical, which is why a server-side
+  failure read to the user as "nothing is loading"
+- An authentication flow no longer parks two threads for ten minutes. Every
+  sign-in leaked a pair of threads that stayed alive until they timed out,
+  whether or not the flow had already finished
+- Checking a file for a shebang no longer reads the whole executable. A
+  large binary on the path cost its full size in memory to answer a question
+  about its first two bytes
+
+### Added
+
+- The watcher enforces `processed_retention_days` on the processed spool,
+  which was configured but never applied, and a new `drover-server reclaim`
+  reports what else on the host is large without deleting any of it
+
+### Changed
+
+- The Python test suite runs in parallel
+
 ## [0.3.5] - 2026-08-17
 
 ### Fixed
