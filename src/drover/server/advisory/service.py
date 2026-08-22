@@ -9,7 +9,7 @@ import re
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -179,6 +179,15 @@ CHECK_SCOPE_BUDGET_SECONDS = 5.0
 #: that a scope which becomes checkable is not held unavailable for long.
 CHECK_SCOPE_CACHE_TTL_SECONDS = 30.0
 
+#: A transient failed probe should not be retried by every phone refresh. It
+#: is deliberately much shorter than a successful scope result.
+CHECK_SCOPE_FAILURE_CACHE_SECONDS = 5.0
+
+#: Scope identities are durable finding dimensions and can accumulate over a
+#: long-running server. Expiry controls reuse, not storage, so cap the cache as
+#: well as pruning expired entries.
+CHECK_SCOPE_CACHE_MAX_ENTRIES = 128
+
 
 class InsightsService:
     """Serialize bounded findings and delegate lifecycle persistence."""
@@ -195,6 +204,12 @@ class InsightsService:
         self.repository = AdvisoryRepository(self.duckdb_path)
         self._scope_cache: dict[tuple, tuple[float, Any]] = {}
         self._scope_lock = threading.Lock()
+        # One expensive scope probe globally, shared by every caller asking
+        # for the same key. A different scope fails fast while it is running;
+        # there is intentionally no unbounded executor queue behind the HTTP
+        # request path.
+        self._scope_inflight: tuple[tuple, Future[tuple[str, str]]] | None = None
+        self._scope_connection: Any | None = None
         consent_path = self.config_path.with_name(
             f".{self.config_path.name}.content-consent.json"
         )
@@ -740,28 +755,51 @@ class InsightsService:
 
         key = (finding.analyzer_id, finding.target_id, finding.target_type)
         now = time.monotonic()
+        start: tuple[Future[tuple[str, str]], threading.Thread] | None = None
         with self._scope_lock:
+            self._prune_scope_cache_locked(now)
             hit = self._scope_cache.get(key)
-            if hit is not None and now - hit[0] < CHECK_SCOPE_CACHE_TTL_SECONDS:
+            if hit is not None:
                 if isinstance(hit[1], Exception):
                     raise hit[1]
                 return hit[1]
-
-        # Not a `with` block: the executor's context manager joins its worker
-        # on exit, so the budget would expire and then the caller would wait
-        # out the whole query anyway. Shutting down without waiting is what
-        # makes the deadline real; the abandoned probe finishes into a result
-        # nobody reads, exactly as the cockpit's abandoned activity query does.
-        pool = ThreadPoolExecutor(max_workers=1)
+            if self._scope_inflight is not None:
+                inflight_key, future = self._scope_inflight
+                if inflight_key != key:
+                    raise InvalidInsightTransition(
+                        "Check Again is temporarily unavailable while another "
+                        "scope is being inspected."
+                    )
+            else:
+                future = Future()
+                self._scope_inflight = (key, future)
+                worker = threading.Thread(
+                    target=self._run_scope_probe,
+                    args=(key, finding, future),
+                    name="insight-scope-probe",
+                    daemon=True,
+                )
+                start = (future, worker)
+        if start is not None:
+            start[1].start()
         try:
-            scope = pool.submit(self._check_scope, finding).result(
-                timeout=CHECK_SCOPE_BUDGET_SECONDS
-            )
+            return future.result(timeout=CHECK_SCOPE_BUDGET_SECONDS)
         except FuturesTimeout as exc:
-            # Deliberately not cached: a slow probe is a statement about how
-            # busy the store is right now, not about this finding, and
-            # remembering it would keep the action unavailable long after the
-            # pressure passed.
+            # Returning on a deadline is not enough: without an interrupt the
+            # query keeps its buffers and the next finding can start another
+            # one. Keep this Future registered until its worker really exits,
+            # and ask DuckDB to release the query now.
+            with self._scope_lock:
+                connection = (
+                    self._scope_connection
+                    if self._scope_inflight == (key, future)
+                    else None
+                )
+            if connection is not None:
+                try:
+                    connection.interrupt()
+                except Exception:  # noqa: BLE001 - timeout still returns
+                    log.debug("failed to interrupt timed-out scope probe")
             log.warning(
                 "check-again scope probe for %s exceeded %.1fs; reporting "
                 "the action unavailable",
@@ -771,16 +809,67 @@ class InsightsService:
             raise InvalidInsightTransition(
                 "Check Again is temporarily unavailable while the store is busy."
             ) from exc
-        except InvalidInsightTransition as exc:
+
+    def _run_scope_probe(
+        self,
+        key: tuple,
+        finding: Finding,
+        future: Future[tuple[str, str]],
+    ) -> None:
+        """Finish one probe, publish its cache entry, and release the slot."""
+
+        try:
+            value: Any = self._check_scope(finding)
+            ttl = CHECK_SCOPE_CACHE_TTL_SECONDS
+        except Exception as exc:  # noqa: BLE001 - delivered through Future
+            value = exc
+            ttl = (
+                CHECK_SCOPE_CACHE_TTL_SECONDS
+                if isinstance(exc, InvalidInsightTransition)
+                else CHECK_SCOPE_FAILURE_CACHE_SECONDS
+            )
+        except BaseException as exc:
+            # Process-control exceptions belong to the thread that raised
+            # them. Release the slot and deliver the exception to any waiter,
+            # but never make it a reusable application result.
             with self._scope_lock:
-                self._scope_cache[key] = (now, exc)
-            raise
-        finally:
-            pool.shutdown(wait=False)
+                if self._scope_inflight == (key, future):
+                    self._scope_inflight = None
+                    self._scope_connection = None
+            future.set_exception(exc)
+            return
+        with self._scope_lock:
+            if self._scope_inflight == (key, future):
+                self._scope_inflight = None
+                self._scope_connection = None
+            self._store_scope_cache_locked(key, value, time.monotonic() + ttl)
+        if isinstance(value, BaseException):
+            future.set_exception(value)
+        else:
+            future.set_result(value)
+
+    def _observe_scope_connection(self, connection: Any | None) -> None:
+        """Publish the current probe connection for timeout interruption."""
 
         with self._scope_lock:
-            self._scope_cache[key] = (now, scope)
-        return scope
+            if self._scope_inflight is not None:
+                self._scope_connection = connection
+
+    def _prune_scope_cache_locked(self, now: float) -> None:
+        for stale in [
+            key
+            for key, (expires_at, _) in self._scope_cache.items()
+            if expires_at <= now
+        ]:
+            del self._scope_cache[stale]
+
+    def _store_scope_cache_locked(
+        self, key: tuple, value: Any, expires_at: float
+    ) -> None:
+        self._scope_cache.pop(key, None)
+        while len(self._scope_cache) >= CHECK_SCOPE_CACHE_MAX_ENTRIES:
+            del self._scope_cache[next(iter(self._scope_cache))]
+        self._scope_cache[key] = (expires_at, value)
 
     def _check_action(self, finding: Finding) -> dict[str, Any]:
         try:
@@ -861,6 +950,7 @@ class InsightsService:
                 finding.analyzer_id,
                 finding.target_id,
                 "operational-facts:scope-probe",
+                connection_observer=self._observe_scope_connection,
             )
             facts = (
                 snapshot.hooks
