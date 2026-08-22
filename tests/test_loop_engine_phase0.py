@@ -185,7 +185,7 @@ def _driver(tmp_path: Path, api, *, check, kind="project", caps=None):
         goal=_goal(check, tmp_path, kind=kind),
         host_id="test-host",
         harness="claude",
-        caps=caps or Caps(max_iterations=3, max_spend_usd=5.0),
+        caps=caps or Caps(max_iterations=3, max_tokens=2_000_000),
         sleep=lambda _s: None,
     )
 
@@ -230,22 +230,36 @@ def test_the_iteration_cap_is_enforced_by_the_driver(tmp_path: Path) -> None:
     assert api.terminated == ["sess-1", "sess-2", "sess-3"]
 
 
-def test_the_spend_cap_is_read_from_the_ledger_not_from_memory(tmp_path: Path) -> None:
-    """A cap held in a variable resets when the driver restarts."""
+def test_the_token_cap_is_read_from_the_ledger_not_from_memory(tmp_path: Path) -> None:
+    """A cap held in a variable resets when the driver restarts.
+
+    Tokens rather than dollars: Drover prices nothing, so a USD cap could only
+    be a number this driver invented. The old one read `cost_usd`, which
+    nothing populates -- it ran inert through three live runs (drover#17).
+    """
     from loop_engine.driver import Caps
 
     ledger = ScratchLedger(tmp_path / "scratch.duckdb")
-    ledger.append(Iteration(goal_id="g1", ordinal=1, started_at=_NOW, cost_usd=9.99))
+    ledger.append(
+        Iteration(
+            goal_id="g1",
+            ordinal=1,
+            started_at=_NOW,
+            prompt_tokens=900_000,
+            completion_tokens=200_000,
+        )
+    )
 
     driver = _driver(
         tmp_path,
         _FakeApi(),
         check=(sys.executable, "-c", "raise SystemExit(1)"),
-        caps=Caps(max_iterations=10, max_spend_usd=5.0),
+        caps=Caps(max_iterations=10, max_tokens=1_000_000),
     )
     outcomes = driver.run()
 
     assert outcomes == []
+    assert ledger.tokens_used("g1") == 1_100_000
 
 
 def test_a_harness_that_will_not_start_still_records_an_iteration(
@@ -391,3 +405,72 @@ def test_session_creation_gets_its_own_generous_timeout() -> None:
 
     assert api.create_timeout_s > api.timeout_s
     assert api.create_timeout_s >= 120
+
+
+def test_usage_reads_all_three_real_provider_shapes() -> None:
+    """The shapes are taken from a live store, not from documentation.
+
+    deepseek uses camelCase, codex adds reasoning tokens that are billed
+    output, and claude-code nests cache fields alongside the totals.
+    """
+    from loop_engine.usage import from_events
+
+    claude = from_events(
+        [{"seq": 1, "payload": {"usage": {"input_tokens": 2, "output_tokens": 121}}}]
+    )
+    codex = from_events(
+        [
+            {
+                "seq": 1,
+                "payload": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "cached_input_tokens": 90,
+                    }
+                },
+            }
+        ]
+    )
+    deepseek = from_events(
+        [{"seq": 1, "payload": {"usage": {"inputTokens": 32761, "outputTokens": 251}}}]
+    )
+
+    assert (claude.prompt_tokens, claude.completion_tokens) == (2, 121)
+    assert (codex.prompt_tokens, codex.completion_tokens) == (100, 25)
+    assert (deepseek.prompt_tokens, deepseek.completion_tokens) == (32761, 251)
+
+
+def test_usage_counts_one_sample_per_seq() -> None:
+    """`harness_events` holds two rows per seq for about half of all events.
+
+    Measured on the live store: 52,155 of 60,165 seq groups have exactly two
+    rows, and they always differ in payload or type (drover#270). Without this
+    the total is roughly double.
+    """
+    from loop_engine.usage import from_events
+
+    usage = from_events(
+        [
+            {"seq": 6, "payload": {"usage": {"input_tokens": 2, "output_tokens": 121}}},
+            {"seq": 6, "payload": {"usage": {"input_tokens": 2, "output_tokens": 121}}},
+        ]
+    )
+
+    assert usage.samples == 1
+    assert usage.total == 123
+
+
+def test_no_usage_observed_is_not_the_same_as_zero_tokens() -> None:
+    """A cap must be able to tell "nothing reported" from "nothing spent"."""
+    from loop_engine.usage import from_events
+
+    assert from_events([{"seq": 1, "payload": {}}]).observed is False
+    assert from_events([]).observed is False
+    assert (
+        from_events(
+            [{"seq": 1, "payload": {"usage": {"input_tokens": 0, "output_tokens": 0}}}]
+        ).observed
+        is True
+    )
