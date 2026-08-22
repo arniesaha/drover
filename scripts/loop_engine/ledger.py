@@ -149,8 +149,34 @@ class ScratchLedger:
             con.close()
         return int(row[0]) + 1 if row and row[0] is not None else 1
 
+    def tokens_used(self, goal_id: str) -> int:
+        """Tokens this goal has spent so far, for the driver's hard cap.
+
+        Tokens rather than dollars, because tokens are observed and dollars
+        would be estimated. Drover does not price tokens anywhere: `cost_usd`
+        on `spans` is carried from whatever produced the span, never computed,
+        so a USD cap on harness sessions could only be invented. See drover#17.
+        """
+        con = duckdb.connect(str(self.path))
+        try:
+            row = con.execute(
+                "SELECT coalesce(sum(coalesce(prompt_tokens, 0) "
+                "+ coalesce(completion_tokens, 0)), 0) FROM goal_iterations "
+                "WHERE goal_id = ?",
+                [goal_id],
+            ).fetchone()
+        finally:
+            con.close()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def spend_usd(self, goal_id: str) -> float:
-        """What this goal has cost so far, for the driver's hard cap."""
+        """Kept, and deliberately unused by the cap.
+
+        `cost_usd` stays a column so a producer that does supply cost has
+        somewhere to put it. Nothing populates it today, which is exactly why
+        the cap does not read it: a cap reading a column nobody writes is not a
+        cap, and the driver ran with one for its first three live runs.
+        """
         con = duckdb.connect(str(self.path))
         try:
             row = con.execute(

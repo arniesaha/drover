@@ -31,6 +31,7 @@ from .api import HarnessApi, HarnessApiError
 from .brief import render
 from .goals import Goal
 from .ledger import Iteration, ScratchLedger, utcnow
+from .usage import Usage, from_events
 
 log = logging.getLogger("loop_engine.driver")
 
@@ -50,7 +51,11 @@ class Caps:
     """
 
     max_iterations: int = 10
-    max_spend_usd: float = 5.0
+    #: Tokens, not dollars. Drover prices nothing, so a USD cap could only be
+    #: estimated; this one is read off the session's own events. It is a bound
+    #: rather than an accounting and errs upward, because a cap that
+    #: overcounts stops early and one that undercounts never stops.
+    max_tokens: int = 2_000_000
 
 
 @dataclass
@@ -120,6 +125,18 @@ class LoopDriver:
             self._sleep(self._poll)
         return "turn timed out"
 
+    def _usage(self, session_id: str) -> Usage:
+        """What this session reported spending, as a bound.
+
+        Read from the session's own events rather than from a rollup, because
+        the rollup does not exist yet (drover#17) and is blocked on the event
+        model (drover#270).
+        """
+        try:
+            return from_events(self._api.messages(session_id))
+        except HarnessApiError:
+            return Usage()
+
     def _claimed_outcome(self, session_id: str) -> str:
         """The last thing the agent said, kept as a *claim* and nothing more.
 
@@ -152,6 +169,7 @@ class LoopDriver:
         stopped = None
         fatal = False
         unobserved = False
+        usage = Usage()
         try:
             session = self._api.create_session(
                 self._host_id,
@@ -163,6 +181,7 @@ class LoopDriver:
             self._active_session_id = session_id or None
             stopped = self._wait_for_turn(session_id)
             claimed = self._claimed_outcome(session_id)
+            usage = self._usage(session_id)
         except HarnessApiError as exc:
             # A harness that will not start is an iteration that happened and
             # produced nothing, which is worth a row: a run whose sessions all
@@ -192,6 +211,8 @@ class LoopDriver:
                 verification_exit=verification.exit_code,
                 verification_tail=tail,
                 claimed_outcome=claimed or None,
+                prompt_tokens=usage.prompt_tokens if usage.observed else None,
+                completion_tokens=(usage.completion_tokens if usage.observed else None),
                 note=stopped,
             )
         )
@@ -214,9 +235,9 @@ class LoopDriver:
             if ordinal > self._caps.max_iterations:
                 log.info("iteration cap reached (%d)", self._caps.max_iterations)
                 break
-            spent = self._ledger.spend_usd(self._goal.goal_id)
-            if spent >= self._caps.max_spend_usd:
-                log.info("spend cap reached (%.2f USD)", spent)
+            spent = self._ledger.tokens_used(self._goal.goal_id)
+            if spent >= self._caps.max_tokens:
+                log.info("token cap reached (%d of %d)", spent, self._caps.max_tokens)
                 break
 
             outcome = self.run_iteration(ordinal)
