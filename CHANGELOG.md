@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-08-21
+
+### Fixed
+
+- Check Again scope probes are globally single-flight. One probe runs at a
+  time, same-scope callers share its result, a different scope fails fast, and
+  the DuckDB connection is interrupted when the five-second budget expires.
+  PR #252 bounded the caller's wait but let the worker run on, so repeated
+  views of a scope could stack concurrent snapshots. The result cache is now
+  capped at 128 entries, with a shorter cooldown for transient failures.
+- harnessd's terminal audit mirror no longer uses an unbounded queue. It is
+  bounded at 2,048 records with 128-record batches, counts overflow into
+  `drover_harness_dropped_events_total`, and writes `transcript.gap` markers
+  so dropped audit records are visible rather than silent.
+
+### Changed
+
+- The cockpit `session_facts` query builds its session-key set once and joins
+  the three sources, replacing three `UNION ALL` branches with correlated
+  `NOT EXISTS` de-duplication. This is a simplification: benchmarking against
+  a copy of a production store showed no significant change in either time or
+  peak memory for the 7-day or 30-day window. The cost localized in #260 is
+  not the union shape and #260 remains open.
+
 ## [0.3.6] - 2026-08-20
 
 ### Fixed
