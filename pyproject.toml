@@ -62,7 +62,10 @@ redis = [
 drover = ["prompts/*.md", "server/web/static/*.html"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# `scripts` is here for the Loop Engine Phase 0 driver, which decision D4 puts
+# deliberately outside the package: it speaks to Drover over the public harness
+# API rather than importing the server. Its tests still need to import it.
+pythonpath = ["src", "scripts"]
 testpaths = ["tests"]
 # Passing tests stop leaving their tmp_path behind. The harness suites write a
 # DuckDB per test, so the default ("all", kept for the last 3 runs) reached
