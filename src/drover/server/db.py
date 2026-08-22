@@ -453,6 +453,25 @@ def close_control_plane_connections() -> None:
             log.debug("failed to close the control-plane connection for %s", key)
 
 
+#: A control-plane connect collides only with another process's *window*, and
+#: those are milliseconds long (the pin that would remove them is off by
+#: default, see `pin_control_plane_connection`). Retrying briefly turns a
+#: dropped heartbeat into a slightly slower one. Measured live: 48 collisions,
+#: each surfacing as an HTTP 500 from `/harness/hosts` and losing that poll.
+_CONTROL_PLANE_LOCK_ATTEMPTS = 4
+_CONTROL_PLANE_LOCK_BACKOFF_SECONDS = 0.05
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    """Whether this is another process holding the file, not a broken store.
+
+    Only the collision is worth retrying. A missing or corrupt database is a
+    condition the caller needs reported now, not after a delay.
+    """
+
+    return "could not set lock" in str(exc).lower()
+
+
 def _connect_control_plane(duckdb_path: str | Path) -> duckdb.DuckDBPyConnection:
     """Open one control-plane connection, serialized against other connects.
 
@@ -473,7 +492,15 @@ def _connect_control_plane(duckdb_path: str | Path) -> duckdb.DuckDBPyConnection
     """
     duckdb_path = control_plane_path(duckdb_path)
     with duckdb_connect_lock(duckdb_path):
-        con = duckdb.connect(str(duckdb_path))
+        for attempt in range(_CONTROL_PLANE_LOCK_ATTEMPTS):
+            try:
+                con = duckdb.connect(str(duckdb_path))
+                break
+            except duckdb.IOException as exc:
+                last = attempt == _CONTROL_PLANE_LOCK_ATTEMPTS - 1
+                if last or not _is_lock_conflict(exc):
+                    raise
+                time.sleep(_CONTROL_PLANE_LOCK_BACKOFF_SECONDS * (attempt + 1))
     try:
         _apply_role_settings(con, "control_plane")
     except Exception:
