@@ -49,7 +49,9 @@ def _current_branch(repo: Path) -> str:
 # agy, deepseek-harness. "claude" is not one of them.
 @click.option("--harness", default="claude-code", show_default=True)
 @click.option("--max-iterations", default=10, show_default=True)
-@click.option("--max-spend-usd", default=5.0, show_default=True)
+# Tokens, not dollars: Drover prices nothing, so a USD cap would
+# be a number this driver made up. See drover#17.
+@click.option("--max-tokens", default=2_000_000, show_default=True)
 @click.option(
     "--scratch",
     type=click.Path(path_type=Path),
@@ -64,7 +66,7 @@ def main(
     token: str,
     harness: str,
     max_iterations: int,
-    max_spend_usd: float,
+    max_tokens: int,
     scratch: Path,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -83,13 +85,13 @@ def main(
         goal=goal,
         host_id=host_id,
         harness=harness,
-        caps=Caps(max_iterations=max_iterations, max_spend_usd=max_spend_usd),
+        caps=Caps(max_iterations=max_iterations, max_tokens=max_tokens),
     )
 
     click.echo(f"goal   {goal.goal_id} ({goal.kind})")
     click.echo(f"check  {' '.join(goal.check)}")
     click.echo(f"branch {branch}")
-    click.echo(f"caps   {max_iterations} iterations, {max_spend_usd} USD")
+    click.echo(f"caps   {max_iterations} iterations, {max_tokens:,} tokens")
     click.echo("")
 
     # A killed driver used to leave its session running. On the first live run
