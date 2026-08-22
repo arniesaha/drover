@@ -1,6 +1,7 @@
 """Tests for src/drover/schema.py."""
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -990,3 +991,99 @@ def test_openclaw_span_links_handles_span_only_and_native_only_inputs(tmp_lakeho
 
     assert span_rows == [("span-only", None, "unmatched", "none")]
     assert native_event_count == 1
+
+
+def _legacy_receipts_table(duckdb_path: Path) -> None:
+    """The pre-#256 shape: source_version nullable, so the fence is inert."""
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute("DROP TABLE IF EXISTS pipeline_receipts")
+        con.execute("""
+            CREATE TABLE pipeline_receipts (
+              receipt_id      VARCHAR PRIMARY KEY,
+              source_kind     VARCHAR NOT NULL,
+              source_key      VARCHAR NOT NULL,
+              source_version  VARCHAR,
+              subject_kind    VARCHAR,
+              subject_key     VARCHAR,
+              payload_hash    VARCHAR,
+              status          VARCHAR NOT NULL,
+              first_seen_at   TIMESTAMPTZ DEFAULT now(),
+              applied_at      TIMESTAMPTZ,
+              last_error      VARCHAR,
+              metadata_json   VARCHAR,
+              UNIQUE (source_kind, source_key, source_version)
+            )
+            """)
+    finally:
+        con.close()
+
+
+def test_bootstrap_gives_an_existing_store_a_fence_that_fences(tmp_path: Path) -> None:
+    """A store created before #256 is migrated onto the sentinel in place."""
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+    _legacy_receipts_table(duckdb_path)
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO pipeline_receipts (receipt_id, source_kind, source_key, "
+            "source_version, status) VALUES ('r1','agent_event','sess-1',NULL,'observed')"
+        )
+    finally:
+        con.close()
+
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert (
+            con.execute(
+                "SELECT source_version FROM pipeline_receipts WHERE receipt_id = 'r1'"
+            ).fetchone()[0]
+            == ""
+        )
+        with pytest.raises(duckdb.ConstraintException):
+            con.execute(
+                "INSERT INTO pipeline_receipts (receipt_id, source_kind, source_key, "
+                "source_version, status) VALUES ('r2','agent_event','sess-1','','observed')"
+            )
+    finally:
+        con.close()
+
+
+def test_bootstrap_defers_the_fence_rather_than_orphaning_a_job(
+    tmp_path: Path, caplog
+) -> None:
+    """A store that already holds duplicates keeps them, and says so.
+
+    Two rows that collide under the sentinel are duplicates the old fence let
+    through, and either may be the target of a job's `caused_by_receipt_id`.
+    Deleting one to force the migration would orphan that job, so bootstrap
+    leaves the store alone and stays survivable.
+    """
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+    _legacy_receipts_table(duckdb_path)
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        for receipt_id in ("r1", "r2"):
+            con.execute(
+                "INSERT INTO pipeline_receipts (receipt_id, source_kind, source_key, "
+                f"source_version, status) VALUES ('{receipt_id}','agent_event','dup',NULL,'observed')"
+            )
+    finally:
+        con.close()
+
+    with caplog.at_level(logging.WARNING, logger="drover.schema"):
+        bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+
+    assert "pipeline_receipts fence not applied" in caplog.text
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute("SELECT count(*) FROM pipeline_receipts").fetchone()[0] == 2
+    finally:
+        con.close()

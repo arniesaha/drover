@@ -390,3 +390,61 @@ def test_abandoning_a_pending_job_parks_it_for_good(ledger: Ledger) -> None:
     parked = ledger.dead_letter_job(job.job_id)
 
     assert parked.status == "dead_lettered"
+
+
+def test_the_database_fences_a_duplicate_the_read_before_write_missed(
+    con: duckdb.DuckDBPyConnection, ledger: Ledger
+) -> None:
+    """The constraint must fence, not just `_find_receipt`.
+
+    `record_receipt` reads before it writes, so two concurrent ingests can both
+    miss and both insert. Nothing underneath objected: the fence is
+    ``UNIQUE (source_kind, source_key, source_version)`` and `source_version`
+    was nullable, and SQL treats NULLs as distinct. That left the 99% of rows
+    which never set a version unconstrained (drover#256).
+
+    Insert underneath the API, which is what a racing ingest effectively does.
+    """
+    ledger.record_receipt(source_kind="agent_event", source_key="sess-1")
+
+    with pytest.raises(duckdb.ConstraintException):
+        con.execute("""
+            INSERT INTO pipeline_receipts
+              (receipt_id, source_kind, source_key, source_version, status)
+            VALUES ('racing-insert', 'agent_event', 'sess-1', NULL, 'observed')
+            """)
+
+
+def test_an_absent_version_is_stored_as_a_sentinel_and_read_back_as_absent(
+    con: duckdb.DuckDBPyConnection, ledger: Ledger
+) -> None:
+    """The sentinel is a storage detail; callers still pass and see None."""
+    result = ledger.record_receipt(source_kind="agent_event", source_key="sess-2")
+
+    assert result.receipt.source_version is None
+    stored = con.execute(
+        "SELECT source_version FROM pipeline_receipts WHERE source_key = 'sess-2'"
+    ).fetchone()[0]
+    assert stored == ""
+
+    again = ledger.record_receipt(source_kind="agent_event", source_key="sess-2")
+    assert again.is_duplicate is True
+    assert again.receipt.receipt_id == result.receipt.receipt_id
+
+
+def test_a_version_that_is_set_still_discriminates(ledger: Ledger) -> None:
+    """Distinct versions of one source key remain distinct source units."""
+    first = ledger.record_receipt(
+        source_kind="advisory_target_snapshot",
+        source_key="target-1",
+        source_version="v1",
+    )
+    second = ledger.record_receipt(
+        source_kind="advisory_target_snapshot",
+        source_key="target-1",
+        source_version="v2",
+    )
+
+    assert second.is_duplicate is False
+    assert second.receipt.receipt_id != first.receipt.receipt_id
+    assert second.receipt.source_version == "v2"
