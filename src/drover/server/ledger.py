@@ -186,6 +186,12 @@ def _assert_transition(
 # --------------------------------------------------------------------------- #
 
 
+#: Stored in place of a missing ``source_version``. A UNIQUE constraint does not
+#: constrain NULLs, so the fence on ``pipeline_receipts`` needs a real value to
+#: bite (#256). Storage-only: it is normalised away on the way out.
+_ABSENT_VERSION = ""
+
+
 @dataclass(frozen=True)
 class Receipt:
     receipt_id: str
@@ -288,7 +294,11 @@ class Ledger:
         row (and therefore no new downstream job) is created. Otherwise a fresh
         ``observed`` receipt is inserted.
         """
-        existing = self._find_receipt(source_kind, source_key, source_version)
+        # The schema stores '' rather than NULL so the unique constraint fences
+        # (#256). Callers still pass and receive None; the sentinel does not
+        # leave this module.
+        stored_version = source_version or _ABSENT_VERSION
+        existing = self._find_receipt(source_kind, source_key, stored_version)
         if existing is not None:
             return ReceiptResult(receipt=existing, is_duplicate=True)
 
@@ -305,7 +315,7 @@ class Ledger:
                 receipt_id,
                 source_kind,
                 source_key,
-                source_version,
+                stored_version,
                 subject_kind,
                 subject_key,
                 payload_hash,
@@ -802,26 +812,23 @@ class Ledger:
         )
 
     def _find_receipt(
-        self, source_kind: str, source_key: str, source_version: Optional[str]
+        self, source_kind: str, source_key: str, source_version: str
     ) -> Optional[Receipt]:
-        # NULL source_version must match NULL (SQL ``= NULL`` never matches), so
-        # branch on it explicitly.
-        if source_version is None:
-            row = self._con.execute(
-                """
-                SELECT receipt_id FROM pipeline_receipts
-                 WHERE source_kind = ? AND source_key = ? AND source_version IS NULL
-                """,
-                [source_kind, source_key],
-            ).fetchone()
-        else:
-            row = self._con.execute(
-                """
-                SELECT receipt_id FROM pipeline_receipts
-                 WHERE source_kind = ? AND source_key = ? AND source_version = ?
-                """,
-                [source_kind, source_key, source_version],
-            ).fetchone()
+        """Look a receipt up by its fence triple.
+
+        Takes the stored form, so an absent version is '' rather than None and
+        this is a plain equality match. The version that branched on NULL is
+        gone with the nullable column (#256): it was the only thing standing
+        between a racing pair of ingests and two receipts for one source unit,
+        and being the only thing is what made it a check-then-act.
+        """
+        row = self._con.execute(
+            """
+            SELECT receipt_id FROM pipeline_receipts
+             WHERE source_kind = ? AND source_key = ? AND source_version = ?
+            """,
+            [source_kind, source_key, source_version],
+        ).fetchone()
         return self._load_receipt(row[0]) if row is not None else None
 
     def _find_reusable_job(self, job_kind: str, subject_key: str) -> Optional[Job]:
@@ -861,7 +868,14 @@ class Ledger:
         ).fetchone()
         if row is None:
             raise KeyError(f"receipt {receipt_id!r} not found")
-        return Receipt(*row)
+        receipt_id_, source_kind, source_key, source_version, *rest = row
+        return Receipt(
+            receipt_id_,
+            source_kind,
+            source_key,
+            source_version or None,
+            *rest,
+        )
 
     def _load_job(self, job_id: str) -> Job:
         row = self._con.execute(

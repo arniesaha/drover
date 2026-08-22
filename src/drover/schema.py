@@ -404,7 +404,10 @@ CREATE TABLE IF NOT EXISTS pipeline_receipts (
   receipt_id      VARCHAR PRIMARY KEY,
   source_kind     VARCHAR NOT NULL,   -- agent_event_batch | otlp_span | session_close | brief_refresh_request | embed_request | ...
   source_key      VARCHAR NOT NULL,   -- natural durable identity of the source unit
-  source_version  VARCHAR,            -- optional upstream version/offset/hash discriminator
+  -- Empty string, never NULL. SQL treats NULLs as distinct in a UNIQUE, so a
+  -- nullable column here left the fence below inert for every source kind that
+  -- does not set a version -- which was 99% of the table (#256).
+  source_version  VARCHAR NOT NULL DEFAULT '',  -- upstream version/offset/hash, '' when absent
   subject_kind    VARCHAR,            -- session | span | project | task | batch
   subject_key     VARCHAR,
   payload_hash    VARCHAR,
@@ -1478,6 +1481,55 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
     )
 
 
+def _fence_receipt_versions(con: duckdb.DuckDBPyConnection) -> None:
+    """Give `pipeline_receipts` a fence that actually fences. Idempotent.
+
+    Stores created before #256 have a nullable `source_version`, which left
+    ``UNIQUE (source_kind, source_key, source_version)`` constraining only the
+    one source kind that populates it. Rewriting the NULLs to the sentinel
+    makes the existing constraint bite; the NOT NULL keeps it that way.
+
+    Deferred rather than forced when the rewrite would collide. Two rows that
+    are duplicates under the sentinel are duplicates that the old fence let
+    through, and each may already have spawned a job that points at it through
+    `caused_by_receipt_id`. Silently deleting one would orphan that job, so a
+    store in that state keeps its old behaviour and says so. `bootstrap` must
+    stay survivable: the same precedent is set by `migrate_control_plane_tables`.
+    """
+    columns = {
+        row[1]: row
+        for row in con.execute("PRAGMA table_info('pipeline_receipts')").fetchall()
+    }
+    column = columns.get("source_version")
+    if column is None or column[3]:  # notnull flag already set
+        return
+
+    collisions = con.execute("""
+        SELECT count(*) FROM (
+            SELECT source_kind, source_key
+              FROM pipeline_receipts
+             WHERE source_version IS NULL
+             GROUP BY source_kind, source_key
+            HAVING count(*) > 1
+        )
+        """).fetchone()[0]
+    if collisions:
+        log.warning(
+            "pipeline_receipts fence not applied: %d (source_kind, source_key) "
+            "groups already hold duplicate NULL-version receipts, and removing "
+            "one could orphan a job that references it",
+            collisions,
+        )
+        return
+
+    con.execute(
+        "UPDATE pipeline_receipts SET source_version = '' WHERE source_version IS NULL"
+    )
+    con.execute(
+        "ALTER TABLE pipeline_receipts ALTER COLUMN source_version SET NOT NULL"
+    )
+
+
 def _ensure_table_columns(
     con: duckdb.DuckDBPyConnection, table: str, columns: dict[str, str]
 ) -> None:
@@ -1626,6 +1678,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_CURATED_CONTEXT_RECORDS_DDL)
         con.execute(_CURATED_CONTEXT_PROVENANCE_DDL)
         con.execute(_PIPELINE_RECEIPTS_DDL)
+        _fence_receipt_versions(con)
         con.execute(_PIPELINE_JOBS_DDL)
         con.execute(_PIPELINE_JOB_ATTEMPTS_DDL)
         con.execute(_PIPELINE_ARTIFACTS_DDL)
