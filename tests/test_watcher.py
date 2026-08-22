@@ -4,13 +4,14 @@ import json
 import os
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.watcher import IncomingWatcher, _Handler
+from drover.server.watcher import IncomingWatcher, _Handler, sweep_receipts
 
 
 @pytest.fixture
@@ -520,7 +521,7 @@ def test_handler_leaves_file_in_place_when_duckdb_lock_retries_exhaust(
 
 
 def test_sweep_removes_processed_files_past_the_retention_window(tmp_path):
-    from drover.server.watcher import sweep_processed
+    from drover.server.watcher import sweep_processed, sweep_receipts
 
     incoming = tmp_path / "incoming"
     processed = incoming / "nas-claude" / ".processed"
@@ -550,7 +551,7 @@ def test_sweep_never_touches_anything_awaiting_ingestion(tmp_path):
     lose anything. A file sitting in the spool is still waiting to be read.
     """
 
-    from drover.server.watcher import sweep_processed
+    from drover.server.watcher import sweep_processed, sweep_receipts
 
     incoming = tmp_path / "incoming"
     host = incoming / "nas-claude"
@@ -575,7 +576,7 @@ def test_sweep_of_zero_days_is_a_no_op_rather_than_deleting_everything(tmp_path)
     unrecoverable, so it is declined instead.
     """
 
-    from drover.server.watcher import sweep_processed
+    from drover.server.watcher import sweep_processed, sweep_receipts
 
     incoming = tmp_path / "incoming"
     processed = incoming / "nas-claude" / ".processed"
@@ -589,3 +590,98 @@ def test_sweep_of_zero_days_is_a_no_op_rather_than_deleting_everything(tmp_path)
 
     assert old.exists()
     assert removed.files == 0
+
+
+def _seeded_receipt_store(tmp_path: Path):
+    """A store holding receipts of every kind, old and new."""
+    from drover.schema import bootstrap
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    recent = datetime.now(timezone.utc)
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        rows = [
+            ("old-agent", "agent_event", "k1", old),
+            ("old-span", "otlp_span", "k2", old),
+            ("new-agent", "agent_event", "k3", recent),
+            ("old-advisory", "advisory_target_snapshot", "k4", old),
+            ("old-referenced", "agent_event", "k5", old),
+            ("old-unknown-kind", "session_close", "k6", old),
+        ]
+        for receipt_id, kind, key, seen in rows:
+            con.execute(
+                "INSERT INTO pipeline_receipts (receipt_id, source_kind, source_key, "
+                "source_version, status, first_seen_at) VALUES (?, ?, ?, '', 'observed', ?)",
+                [receipt_id, kind, key, seen],
+            )
+        con.execute(
+            "INSERT INTO pipeline_jobs (job_id, job_kind, subject_key, status, "
+            "attempt_count, max_attempts, caused_by_receipt_id) "
+            "VALUES ('j1', 'summarize', 'k5', 'pending', 0, 3, 'old-referenced')"
+        )
+    finally:
+        con.close()
+    return duckdb_path
+
+
+def _receipt_ids(duckdb_path: Path) -> set:
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        return {
+            r[0]
+            for r in con.execute("SELECT receipt_id FROM pipeline_receipts").fetchall()
+        }
+    finally:
+        con.close()
+
+
+def test_receipt_sweep_reclaims_only_the_kinds_nothing_reads(tmp_path: Path) -> None:
+    """`agent_event` and `otlp_span` receipts are written and never read.
+
+    Their authoritative dedup is the Parquet partition, consulted by ingest
+    before the receipt is written at all, so removing one does not make its
+    source unit reprocessable. Every other kind is kept: the list is an
+    allow-list precisely so a new `source_kind` defaults to being retained.
+    """
+    duckdb_path = _seeded_receipt_store(tmp_path)
+
+    result = sweep_receipts(duckdb_path, retention_days=7)
+
+    assert result.receipts == 2
+    assert _receipt_ids(duckdb_path) == {
+        "new-agent",
+        "old-advisory",
+        "old-referenced",
+        "old-unknown-kind",
+    }
+
+
+def test_receipt_sweep_keeps_anything_a_job_still_points_at(tmp_path: Path) -> None:
+    """A receipt named by `caused_by_receipt_id` is load-bearing whatever its kind.
+
+    The advisory worker joins jobs to receipts through that column. Deleting
+    the receipt would not fail loudly; it would make the join return nothing.
+    """
+    duckdb_path = _seeded_receipt_store(tmp_path)
+
+    sweep_receipts(duckdb_path, retention_days=7)
+
+    assert "old-referenced" in _receipt_ids(duckdb_path)
+
+
+def test_receipt_sweep_declines_rather_than_deleting_everything(tmp_path: Path) -> None:
+    """Zero means keep, the same as `processed_retention_days`.
+
+    Zero is what an operator reaches for meaning "keep nothing", and equally
+    what a malformed setting parses to. The failure mode of a typo must not be
+    an erased ledger.
+    """
+    duckdb_path = _seeded_receipt_store(tmp_path)
+    before = _receipt_ids(duckdb_path)
+
+    assert sweep_receipts(duckdb_path, retention_days=0).receipts == 0
+    assert sweep_receipts(duckdb_path, retention_days=-1).receipts == 0
+    assert _receipt_ids(duckdb_path) == before
