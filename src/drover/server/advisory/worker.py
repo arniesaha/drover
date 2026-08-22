@@ -992,12 +992,22 @@ def load_operational_snapshot(
     source_version: str,
     *,
     analyzed_at: datetime | None = None,
+    connection_observer: Callable[[Any | None], None] | None = None,
 ) -> AnalysisSnapshot:
-    """Build analyzer-scoped bounded facts from normalized runtime state."""
+    """Build analyzer-scoped bounded facts from normalized runtime state.
+
+    ``connection_observer`` is a narrow cancellation seam for callers that
+    enforce a wall-clock budget. It receives the live connection before any
+    fact query starts and ``None`` before that connection is closed, allowing
+    another thread to call DuckDB's thread-safe ``interrupt()`` without taking
+    ownership of connection teardown. Ordinary workers leave it unset.
+    """
 
     analyzed_at = analyzed_at or datetime.now(timezone.utc)
     con = open_duckdb_connection(Path(duckdb_path), read_only=True, role="diagnostic")
     try:
+        if connection_observer is not None:
+            connection_observer(con)
         providers: tuple[ProviderConnectionObservation, ...] = ()
         telemetry: tuple[TelemetryAggregate, ...] = ()
         routing: tuple[RoutingAggregate, ...] = ()
@@ -1026,7 +1036,11 @@ def load_operational_snapshot(
             else:
                 raise ValueError(f"unsupported operational analyzer: {analyzer_id}")
     finally:
-        con.close()
+        try:
+            if connection_observer is not None:
+                connection_observer(None)
+        finally:
+            con.close()
     return AnalysisSnapshot(
         source_version=source_version,
         analyzed_at=analyzed_at,

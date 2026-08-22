@@ -644,10 +644,31 @@ def _session_facts_sql(
                SELECT 1 FROM session_base s WHERE s.session_id = hs.session_id
              )
         ),
+        session_ids AS (
+          -- Each source is already unique by session_id. Build the small key
+          -- set once, then join the three sources once. The previous shape
+          -- expressed this as three UNION ALL branches with correlated
+          -- NOT EXISTS de-duplication; on the production 30-day window that
+          -- final merge consumed 23.7 of 26.8 seconds despite receiving only
+          -- 117, 153 and 6,715 input rows (#260).
+          SELECT session_id FROM harness_base
+          UNION
+          SELECT session_id FROM span_sessions
+          UNION
+          SELECT session_id FROM session_base
+          WHERE NOT is_claude_mem_observer
+        ),
         session_facts AS (
           SELECT
-            hs.session_id,
-            COALESCE(hs.started_at, ss.started_at) AS started_at,
+            ids.session_id,
+            CASE
+              -- Preserve the historical precedence exactly: an event-only
+              -- started_at does not fill a registered session whose harness
+              -- and span timestamps are both absent.
+              WHEN hs.session_id IS NOT NULL
+                THEN COALESCE(hs.started_at, ss.started_at)
+              ELSE COALESCE(ss.started_at, sb.started_at)
+            END AS started_at,
             COALESCE(
               GREATEST(
                 hs.updated_at, hs.ended_at, hs.started_at,
@@ -678,50 +699,10 @@ def _session_facts_sql(
             COALESCE(ss.has_cost, FALSE) AS has_cost,
             COALESCE(ss.has_cache, FALSE) AS has_cache,
             COALESCE(ss.has_latency, FALSE) AS has_latency
-          FROM harness_base hs
+          FROM session_ids ids
+          LEFT JOIN harness_base hs USING (session_id)
           LEFT JOIN span_sessions ss USING (session_id)
           LEFT JOIN session_base sb USING (session_id)
-
-          UNION ALL
-
-          SELECT
-            ss.session_id, ss.started_at,
-            COALESCE(
-              GREATEST(ss.latest_activity_at, sb.ended_at, sb.started_at),
-              ss.latest_activity_at, sb.ended_at, sb.started_at
-            ) AS latest_activity_at,
-            NULL AS host_id, ss.harness,
-            ss.provider, ss.model, ss.project_key,
-            ss.total_tokens, ss.cost_usd, ss.cache_read_tokens,
-            ss.cache_write_tokens, ss.total_latency_ms, ss.has_tokens,
-            ss.has_cost, ss.has_cache, ss.has_latency
-          FROM span_sessions ss
-          LEFT JOIN session_base sb USING (session_id)
-          WHERE NOT EXISTS (
-            SELECT 1 FROM harness_base hs WHERE hs.session_id = ss.session_id
-          )
-
-          UNION ALL
-
-          SELECT
-            s.session_id, s.started_at,
-            COALESCE(
-              GREATEST(s.ended_at, s.started_at), s.ended_at, s.started_at
-            ) AS latest_activity_at,
-            NULL AS host_id, NULL AS harness,
-            NULL AS provider, NULL AS model, s.project_key,
-            NULL AS total_tokens, NULL AS cost_usd,
-            NULL AS cache_read_tokens, NULL AS cache_write_tokens,
-            NULL AS total_latency_ms, FALSE AS has_tokens, FALSE AS has_cost,
-            FALSE AS has_cache, FALSE AS has_latency
-          FROM session_base s
-          WHERE NOT EXISTS (
-            SELECT 1 FROM harness_base hs WHERE hs.session_id = s.session_id
-          )
-            AND NOT EXISTS (
-              SELECT 1 FROM span_sessions ss WHERE ss.session_id = s.session_id
-            )
-            AND NOT s.is_claude_mem_observer
         ),
         filtered_sessions AS (
           SELECT * FROM session_facts WHERE {filter_sql}

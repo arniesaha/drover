@@ -148,6 +148,12 @@ _MAX_AUTH_INPUT_CHARS = 4096
 FS_COMPLETE_MAX_ENTRIES = 50
 FS_EXISTS_MAX_PATHS = 64
 
+# Terminal audit records must never turn a slow registry into an unbounded
+# heap. These mirror the central proxy's limits without importing web.app
+# (which imports this module for metrics and would create a cycle).
+TERMINAL_MIRROR_QUEUE_MAX = 2048
+TERMINAL_MIRROR_BATCH_MAX = 128
+
 
 def save_turn_attachments(
     attachments_dir: Path, session_id: str, images: list
@@ -3817,27 +3823,50 @@ class _TerminalMirror:
 
     def __init__(self, registry: HarnessRegistry) -> None:
         self._registry = registry
-        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._queue: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue(
+            maxsize=TERMINAL_MIRROR_QUEUE_MAX
+        )
         self._closing = threading.Event()
+        self._drop_lock = threading.Lock()
+        self._gap_counts: dict[str, int] = {}
+        self._overflow_dropped = 0
         self._thread = threading.Thread(
             target=self._run, name="terminal-mirror", daemon=True
         )
         self._thread.start()
 
     def record_event(self, record: dict[str, Any]) -> None:
-        self._queue.put(("event", record))
+        if self._closing.is_set():
+            self._note_overflow(record)
+            return
+        try:
+            self._queue.put_nowait(("event", record))
+        except queue.Full:
+            self._note_overflow(record)
 
     def stop(self, timeout_s: float = 5.0) -> None:
         """Flush queued records and stop the worker (bounded wait)."""
         self._closing.set()
-        self._queue.put(None)  # wake the worker if it's blocked on get()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # The worker wakes on its bounded get and observes `_closing`
+            # after draining. Blocking here would move registry backpressure
+            # onto terminal teardown.
+            pass
         self._thread.join(timeout=timeout_s)
 
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._closing.is_set() and self._queue.empty():
+                    self._flush_gap_markers()
+                    return
+                continue
             batch = [] if item is None else [item]
-            while True:
+            while len(batch) < TERMINAL_MIRROR_BATCH_MAX:
                 try:
                     extra = self._queue.get_nowait()
                 except queue.Empty:
@@ -3845,8 +3874,41 @@ class _TerminalMirror:
                 if extra is not None:
                     batch.append(extra)
             self._flush(batch)
+            self._flush_gap_markers()
             if self._closing.is_set() and self._queue.empty():
+                self._flush_gap_markers()
                 return
+
+    def _note_overflow(self, record: dict[str, Any]) -> None:
+        record_dropped_events()
+        with self._drop_lock:
+            self._overflow_dropped += 1
+            session_id = str(record.get("session_id") or "").strip()
+            if session_id:
+                self._gap_counts[session_id] = self._gap_counts.get(session_id, 0) + 1
+            dropped = self._overflow_dropped
+        if dropped == 1 or dropped % 1000 == 0:
+            log.warning(
+                "terminal mirror dropped %d event(s): registry writer behind",
+                dropped,
+            )
+
+    def _flush_gap_markers(self) -> None:
+        with self._drop_lock:
+            pending, self._gap_counts = self._gap_counts, {}
+        for session_id, count in pending.items():
+            try:
+                self._registry.append_event(
+                    session_id=session_id,
+                    event_type="transcript.gap",
+                    payload={"dropped": count},
+                    normalized_type="status",
+                )
+            except Exception:
+                with self._drop_lock:
+                    self._gap_counts[session_id] = (
+                        self._gap_counts.get(session_id, 0) + count
+                    )
 
     def _flush(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         events = [record for kind, record in batch if kind == "event"]

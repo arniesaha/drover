@@ -948,3 +948,39 @@ def test_mirror_retry_succeeds_without_counting_a_drop():
 
     assert attempts["n"] == 2
     assert daemon_mod.dropped_event_count() == 0
+
+
+def test_terminal_mirror_bounds_backlog_and_records_overflow_gap():
+    """A blocked registry must cost history, never unbounded process memory."""
+
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_dropped_event_count()
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    gaps = []
+
+    class BlockedRegistry:
+        def append_events_if_new(self, records):
+            writer_entered.set()
+            assert release_writer.wait(3)
+            return len(records)
+
+        def append_event(self, **kwargs):
+            gaps.append(kwargs)
+
+    mirror = daemon_mod._TerminalMirror(BlockedRegistry())
+    mirror.record_event({"event_id": "first", "session_id": "s1"})
+    assert writer_entered.wait(1)
+
+    overflow = 7
+    for index in range(daemon_mod.TERMINAL_MIRROR_QUEUE_MAX + overflow):
+        mirror.record_event({"event_id": f"e-{index}", "session_id": "s1"})
+
+    assert mirror._queue.qsize() == daemon_mod.TERMINAL_MIRROR_QUEUE_MAX
+    assert daemon_mod.dropped_event_count() == overflow
+
+    release_writer.set()
+    mirror.stop()
+
+    assert sum(item["payload"]["dropped"] for item in gaps) == overflow

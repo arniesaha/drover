@@ -3242,3 +3242,105 @@ def test_a_scope_probe_that_overruns_reports_unavailable_rather_than_hanging(
     action = detail["actions"]["check_again"]
     assert action["available"] is False
     assert "unavailable" in action["reason"].lower()
+
+
+def test_timed_out_views_share_one_inflight_scope_probe(
+    db_path: Path, monkeypatch
+) -> None:
+    """A timeout must not turn repeated views into concurrent snapshots."""
+
+    from drover.server.advisory import service as service_module
+
+    monkeypatch.setattr(service_module, "CHECK_SCOPE_BUDGET_SECONDS", 0.05)
+    repository = AdvisoryRepository(db_path)
+    findings = [
+        _telemetry_finding(repository, f"telemetry.timeout.{i}", f"run-{i}")
+        for i in range(4)
+    ]
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    service = service_module.InsightsService(db_path)
+
+    def _slow(_finding):
+        calls["n"] += 1
+        entered.set()
+        release.wait(2)
+        return ("mac-mini/codex", "facts:v1")
+
+    monkeypatch.setattr(service, "_check_scope", _slow)
+    try:
+        for finding in findings:
+            action = service.get_insight(finding.finding_id)["actions"]["check_again"]
+            assert action["available"] is False
+        assert entered.is_set()
+        assert calls["n"] == 1
+    finally:
+        release.set()
+
+
+def test_timed_out_scope_probe_interrupts_its_duckdb_connection(
+    db_path: Path, monkeypatch
+) -> None:
+    from drover.server.advisory import service as service_module
+    from drover.server.advisory import worker as worker_module
+
+    monkeypatch.setattr(service_module, "CHECK_SCOPE_BUDGET_SECONDS", 0.05)
+    interrupted = threading.Event()
+
+    class FakeConnection:
+        def interrupt(self):
+            interrupted.set()
+
+    def _blocked(*args, connection_observer=None, **kwargs):
+        assert connection_observer is not None
+        connection_observer(FakeConnection())
+        try:
+            interrupted.wait(2)
+            raise RuntimeError("query interrupted")
+        finally:
+            connection_observer(None)
+
+    monkeypatch.setattr(worker_module, "load_operational_snapshot", _blocked)
+    repository = AdvisoryRepository(db_path)
+    finding = _telemetry_finding(repository, "telemetry.interrupt", "run-interrupt")
+
+    detail = service_module.InsightsService(db_path).get_insight(finding.finding_id)
+
+    assert detail["actions"]["check_again"]["available"] is False
+    assert interrupted.wait(1), "the timed-out DuckDB connection was not interrupted"
+
+
+def test_scope_cache_prunes_and_caps_distinct_targets(
+    db_path: Path, monkeypatch
+) -> None:
+    from drover.server.advisory import service as service_module
+
+    monkeypatch.setattr(service_module, "CHECK_SCOPE_CACHE_MAX_ENTRIES", 3)
+    service = service_module.InsightsService(db_path)
+    stale_key = ("stale", "target", "type")
+    service._scope_cache[stale_key] = (time.monotonic() - 1, ("old", "facts:v0"))
+    monkeypatch.setattr(
+        service,
+        "_check_scope",
+        lambda finding: (finding.target_id, "facts:v1"),
+    )
+
+    for index in range(6):
+        finding = type(
+            "Scope",
+            (),
+            {
+                "analyzer_id": "deterministic.telemetry_coverage",
+                "target_id": f"host-{index}/codex",
+                "target_type": "telemetry_source",
+                "finding_id": str(index),
+            },
+        )()
+        assert service._check_scope_cached(finding) == (
+            f"host-{index}/codex",
+            "facts:v1",
+        )
+
+    assert len(service._scope_cache) == 3
+    assert stale_key not in service._scope_cache
