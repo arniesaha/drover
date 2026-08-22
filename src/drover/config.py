@@ -7,12 +7,14 @@ defaults for any missing field so a brand-new install Just Works after
 
 from __future__ import annotations
 
+import _thread
 import logging
 import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("drover.config")
 
@@ -454,12 +456,82 @@ def default_config() -> DroverConfig:
     return _from_dict(_DEFAULTS)
 
 
+class ConfigUnreadable(RuntimeError):
+    """The config path is present but could not be read.
+
+    Distinct from ``FileNotFoundError``, which means "not configured yet".
+    This means "configured, and the bytes did not arrive" -- an unmounted or
+    permission-gated data volume, which is the case that used to hang.
+    """
+
+
+#: How long a local config read may take before we call it a failure. This is
+#: a file on local storage; seconds here are already generous. #265: every
+#: daemon blocked forever inside this ``open()`` when macOS stopped letting
+#: launchd-spawned processes read the external volume holding ``~/.drover``.
+#: They stayed alive at three file descriptors with no CPU and no log line, so
+#: ``KeepAlive`` never fired and health checks read "running". Failing is what
+#: makes the supervisor useful.
+CONFIG_READ_TIMEOUT_SECONDS = 5.0
+
+
+def read_config_text(
+    path: Path, timeout_seconds: float = CONFIG_READ_TIMEOUT_SECONDS
+) -> str:
+    """Read ``path`` as text, or raise rather than block indefinitely.
+
+    An ``open()`` stuck in the kernel cannot be cancelled, so the only thing
+    the caller can do is stop waiting and let the process exit to be
+    restarted. That makes the reader inherently abandonable, and ``_thread``
+    rather than ``threading`` is the honest way to express it: the raw thread
+    is never registered with ``threading``, so nothing can join it, and it
+    cannot hold up interpreter shutdown. It also keeps a config read from
+    depending on ``threading`` module state, which callers and tests do
+    legitimately replace.
+
+    ``exists()`` runs on that thread too. It is a ``stat``, and a ``stat`` can
+    hang for the same reason an ``open()`` can, so testing it up front would
+    only move the hang one line earlier. In the live case ``stat`` was
+    permitted while ``open`` was not, which is exactly why the launch agent's
+    own ``until [ -d ... ]`` guard passed and told us nothing.
+    """
+
+    path = Path(path)
+    outcome: dict[str, Any] = {}
+    finished = _thread.allocate_lock()
+    finished.acquire()
+
+    def _read() -> None:
+        try:
+            if not path.exists():
+                raise FileNotFoundError(f"config file not found: {path}")
+            outcome["text"] = path.read_text()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            outcome["error"] = exc
+        finally:
+            finished.release()
+
+    _thread.start_new_thread(_read, ())
+
+    if not finished.acquire(True, timeout_seconds):
+        raise ConfigUnreadable(
+            f"could not read {path} within {timeout_seconds:g}s. The volume "
+            "holding it may be unmounted, or this process may lack permission "
+            "to read it. A process started from a terminal can succeed where a "
+            "service-managed one does not; that difference is a permission "
+            "grant, not a fault in drover."
+        )
+    error = outcome.get("error")
+    if isinstance(error, FileNotFoundError):
+        raise error
+    if error is not None:
+        raise ConfigUnreadable(f"could not read {path}: {error}") from error
+    return outcome["text"]
+
+
 def load_config(path: Path) -> DroverConfig:
     """Load config from a TOML file, falling back to defaults for missing keys."""
     path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"config file not found: {path}")
-    with path.open("rb") as f:
-        loaded = tomllib.load(f)
+    loaded = tomllib.loads(read_config_text(path))
     merged = _merge(_DEFAULTS, loaded)
     return _from_dict(merged)
