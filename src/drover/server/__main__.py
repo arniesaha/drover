@@ -1754,6 +1754,7 @@ def run(
         # The setting has existed since the beginning; until now nothing read
         # it, and the audit copies grew without bound (9.7GB on this hub).
         retention_days=cfg.processed_retention_days,
+        receipt_retention_days=cfg.receipt_retention_days,
     )
     watcher.start()
 

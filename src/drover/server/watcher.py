@@ -16,6 +16,7 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -291,6 +292,85 @@ def sweep_processed(incoming_dir: Path, *, retention_days: int) -> SweepResult:
     return SweepResult(files=files, bytes=freed)
 
 
+#: Receipt kinds a sweep may reclaim. An allow-list, not a deny-list, so a new
+#: `source_kind` -- the Loop Engine's work units, say -- is retained until
+#: somebody argues otherwise here.
+#:
+#: Both of these are written by `ledger_shadow` and read by nothing. Ingest
+#: dedupes against the Parquet partition (`_existing_dedup_keys`) *before* the
+#: receipt is written, so removing one cannot make its source unit
+#: reprocessable. `advisory_target_snapshot` is absent deliberately: the
+#: advisory path reads it by `source_kind`, and it is 0.9% of the table anyway.
+SWEEPABLE_RECEIPT_KINDS = ("agent_event", "otlp_span")
+
+
+@dataclass(frozen=True)
+class ReceiptSweepResult:
+    """What one receipt retention pass removed."""
+
+    receipts: int = 0
+
+
+def sweep_receipts(duckdb_path: Path, *, retention_days: int) -> ReceiptSweepResult:
+    """Reclaim shadow receipts older than ``retention_days``.
+
+    `pipeline_receipts` had no delete path of any kind: 1.87M rows over two
+    months, 60k to 140k a day, and no downward pressure (#255). Store size is
+    an input to every analytical query's cost, so this grew the number #247 is
+    measured against, quietly, every day.
+
+    Two safety properties, rather than a size target:
+
+    * only kinds in `SWEEPABLE_RECEIPT_KINDS`, which nothing reads; and
+    * never a receipt some job still names through `caused_by_receipt_id`.
+      The advisory worker joins jobs to receipts through that column, and a
+      deleted receipt would not fail loudly -- the join would simply return
+      nothing.
+
+    Zero (or negative) declines rather than deleting everything, matching
+    `sweep_processed`: zero is what an operator reaches for meaning "keep
+    nothing", and equally what a malformed setting parses to.
+
+    **This does not shrink the file.** DuckDB does not return space on DELETE
+    without a rewrite, so the row count falls and `drover.duckdb` stays the
+    size it was until something compacts it. Said plainly here because a
+    retention pass that looks like a no-op invites someone to raise the
+    setting until it appears to work.
+    """
+
+    if retention_days <= 0:
+        return ReceiptSweepResult()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    placeholders = ", ".join("?" for _ in SWEEPABLE_RECEIPT_KINDS)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        removed = con.execute(
+            f"""
+            DELETE FROM pipeline_receipts
+             WHERE source_kind IN ({placeholders})
+               AND first_seen_at < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM pipeline_jobs j
+                    WHERE j.caused_by_receipt_id = pipeline_receipts.receipt_id
+               )
+            """,
+            [*SWEEPABLE_RECEIPT_KINDS, cutoff],
+        ).fetchone()
+    finally:
+        con.close()
+
+    count = int(removed[0]) if removed and removed[0] is not None else 0
+    if count:
+        log.info(
+            "reclaimed %d shadow receipt(s) older than %d day(s); the file does "
+            "not shrink until it is compacted",
+            count,
+            retention_days,
+        )
+    return ReceiptSweepResult(receipts=count)
+
+
 class IncomingWatcher:
     """Run a watchdog observer over <incoming_dir> and ingest JSONL files."""
 
@@ -303,9 +383,11 @@ class IncomingWatcher:
         shadow_publisher: ShadowPublisher | None = None,
         summarize_job_stream: object | None = None,
         retention_days: int = 0,
+        receipt_retention_days: int = 0,
     ):
         self._incoming = Path(incoming_dir)
         self._retention_days = int(retention_days)
+        self._receipt_retention_days = int(receipt_retention_days)
         self._sweeper: threading.Thread | None = None
         self._stopping = threading.Event()
         self._parquet_dir = Path(parquet_dir)
@@ -338,7 +420,7 @@ class IncomingWatcher:
         measured in days: anything finer would just walk the tree for nothing.
         """
 
-        if self._retention_days <= 0:
+        if self._retention_days <= 0 and self._receipt_retention_days <= 0:
             return
 
         def loop() -> None:
@@ -347,6 +429,13 @@ class IncomingWatcher:
                     sweep_processed(self._incoming, retention_days=self._retention_days)
                 except Exception as exc:  # noqa: BLE001 - never kill the watcher
                     log.warning("processed sweep failed: %s", exc)
+                try:
+                    sweep_receipts(
+                        self._duckdb_path,
+                        retention_days=self._receipt_retention_days,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                    log.warning("receipt sweep failed: %s", exc)
                 self._stopping.wait(_SWEEP_INTERVAL_SECONDS)
 
         self._sweeper = threading.Thread(
