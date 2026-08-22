@@ -1839,6 +1839,30 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        # Idempotency gate, before anything is spawned (drover#268). A caller
+        # whose create timed out cannot otherwise tell whether it was served,
+        # and retrying blind puts a second live agent on the same working
+        # tree. The registry dedupes too, but only after a process exists --
+        # this has to come first or the retry costs a process either way.
+        client_session_id = _optional_text(body.get("client_session_id"))
+        if client_session_id:
+            existing = self.server.state.registry.session_by_client_id(
+                client_session_id
+            )
+            if existing is not None:
+                self._write_json(
+                    {
+                        "session_id": existing.session_id,
+                        "host_id": existing.host_id,
+                        "harness": existing.harness,
+                        "status": existing.status,
+                        "client_session_id": client_session_id,
+                        "deduplicated": True,
+                    },
+                    status=HTTPStatus.OK,
+                )
+                return
+
         mode = str(body.get("mode") or "pty")
         if mode == "structured":
             self._create_structured_session(body)
@@ -1889,6 +1913,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 native_resume_label=_native_resume_label(body.get("native_resume")),
                 source_session_id=_optional_text(body.get("source_session_id")),
                 handoff_mode=_optional_text(body.get("handoff_mode")),
+                client_session_id=client_session_id,
             )
             session_id = session.session_id
             registry_created = True
@@ -2048,6 +2073,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         return None
 
     def _create_structured_session(self, body: dict[str, Any]) -> None:
+        # Already gated in `_create_session`; re-read so this stays correct if
+        # it is ever called directly.
+        client_session_id = _optional_text(body.get("client_session_id"))
         harness = str(body.get("harness") or "")
         cwd = body.get("cwd")
         if cwd is not None and not Path(str(cwd)).expanduser().is_dir():
@@ -2152,6 +2180,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 permission_mode=permission_mode,
                 model=model,
                 thinking_effort=thinking_effort,
+                client_session_id=client_session_id,
             )
             session_id = session.session_id
             registry_created = True

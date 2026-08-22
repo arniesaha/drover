@@ -489,7 +489,16 @@ class HarnessRegistry:
         permission_mode: str | None = None,
         model: str | None = None,
         thinking_effort: str | None = None,
+        client_session_id: str | None = None,
     ) -> HarnessSession:
+        # Read before writing so the ordinary repeat is a cheap lookup, and
+        # catch the constraint below so the concurrent one is still correct.
+        # The read alone would be a check-then-act, which is what drover#256
+        # was about; the index is what actually decides.
+        if client_session_id:
+            existing = self.session_by_client_id(client_session_id)
+            if existing is not None:
+                return existing
         now = _now()
         started_at = _as_utc_datetime(started_at) or now
         session_id = session_id or f"harness-{uuid4()}"
@@ -503,9 +512,9 @@ class HarnessRegistry:
                       command, status, started_at, updated_at, native_session_id,
                       native_resume_label, source_session_id, handoff_mode, mode,
                       permission_mode, model, thinking_effort,
-                      recap_reconcile_needed
+                      recap_reconcile_needed, client_session_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         session_id,
@@ -528,9 +537,21 @@ class HarnessRegistry:
                         model,
                         thinking_effort,
                         _supports_live_recaps(mode, harness),
+                        client_session_id,
                     ],
                 )
                 con.execute("COMMIT")
+            except duckdb.ConstraintException:
+                # Another caller got there between the lookup above and this
+                # insert. That is the case the index exists for: re-read and
+                # hand back their session rather than failing a request that
+                # asked for exactly this.
+                con.execute("ROLLBACK")
+                if client_session_id:
+                    existing = self.session_by_client_id(client_session_id)
+                    if existing is not None:
+                        return existing
+                raise
             except Exception:
                 con.execute("ROLLBACK")
                 raise
@@ -550,6 +571,18 @@ class HarnessRegistry:
         if session is None:
             raise RuntimeError(f"failed to create harness session {session_id!r}")
         return session
+
+    def session_by_client_id(self, client_session_id: str) -> HarnessSession | None:
+        """Find a session by the key its creator supplied, if any."""
+        if not client_session_id:
+            return None
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                "SELECT * FROM harness_sessions WHERE client_session_id = ?",
+                [client_session_id],
+            )
+        return HarnessSession.from_row(rows[0]) if rows else None
 
     def get_session(self, session_id: str) -> HarnessSession | None:
         with self._connect() as con:

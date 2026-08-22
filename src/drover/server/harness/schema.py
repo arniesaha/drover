@@ -158,6 +158,11 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         },
     )
     con.execute(_HARNESS_SESSIONS_DDL)
+    # Drop the client-key index before migrating columns and recreate it after.
+    # DuckDB refuses to drop a column when an index depends on any column after
+    # it, so an index left in place turns every later column migration on this
+    # table into a catalog error. Cheap to rebuild; expensive to discover.
+    con.execute("DROP INDEX IF EXISTS harness_sessions_client_key")
     _ensure_harness_columns(
         con,
         "harness_sessions",
@@ -173,7 +178,21 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "model": "VARCHAR",
             "thinking_effort": "VARCHAR",
             "recap_reconcile_needed": "BOOLEAN DEFAULT FALSE",
+            "client_session_id": "VARCHAR",
         },
+    )
+    # A caller-supplied idempotency key, so a create whose response was lost
+    # can be resolved by asking rather than by guessing (drover#268).
+    #
+    # NULLs are distinct in a unique index, and here that is exactly right:
+    # only sessions that opt in by supplying a key are fenced, and the many
+    # that do not coexist untouched. drover#256 was the same SQL semantics
+    # being wrong, because that fence was meant to cover every row and a
+    # nullable column meant it covered almost none. The difference is intent,
+    # not the rule.
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS harness_sessions_client_key "
+        "ON harness_sessions (client_session_id)"
     )
     con.execute(_HARNESS_EVENTS_DDL)
     _ensure_harness_columns(

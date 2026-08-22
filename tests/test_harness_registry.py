@@ -60,6 +60,11 @@ def test_bootstrap_adds_recap_reconcile_marker_to_existing_sessions(tmp_path):
             for row in con.execute("PRAGMA table_info('harness_sessions')").fetchall()
         }
         if "recap_reconcile_needed" in columns:
+            # A store old enough to lack this column also predates the
+            # client-key index, and DuckDB will not drop a column that an index
+            # depends on positionally. Drop both to build a faithful old store.
+            con.execute("DROP INDEX IF EXISTS harness_sessions_client_key")
+            con.execute("ALTER TABLE harness_sessions DROP COLUMN client_session_id")
             con.execute(
                 "ALTER TABLE harness_sessions DROP COLUMN recap_reconcile_needed"
             )
@@ -74,6 +79,7 @@ def test_bootstrap_adds_recap_reconcile_marker_to_existing_sessions(tmp_path):
             for row in con.execute("PRAGMA table_info('harness_sessions')").fetchall()
         }
         assert "recap_reconcile_needed" in columns
+        assert "client_session_id" in columns
         assert con.execute(
             "SELECT recap_reconcile_needed FROM harness_sessions "
             "WHERE session_id = 'existing-session'"
@@ -1370,3 +1376,90 @@ def test_ingest_structured_events_mixed_aware_and_naive_timestamps(tmp_path):
     s_rebuild = registry.get_session(session.session_id)
     assert s_rebuild is not None
     assert registry_module._db_timestamp_to_utc(s_rebuild.last_activity) == t2_aware_utc
+
+
+def test_a_repeat_create_with_the_same_client_key_is_a_lookup(tmp_path):
+    """A create the caller could not confirm must not make a second session.
+
+    A timed-out POST may well have been served. Without a key the caller
+    cannot ask, so it either retries -- putting two live agents on one working
+    tree -- or abandons one that is still running and still spending quota.
+    Both are wrong, which is drover#268.
+    """
+    registry, _ = _registry(tmp_path)
+
+    first = registry.create_session(
+        host_id="h1",
+        harness="claude-code",
+        command="claude",
+        cwd="/tmp/x",
+        client_session_id="loop-goal-a-iter-1",
+    )
+    second = registry.create_session(
+        host_id="h1",
+        harness="claude-code",
+        command="claude",
+        cwd="/tmp/x",
+        client_session_id="loop-goal-a-iter-1",
+    )
+
+    assert second.session_id == first.session_id
+    assert len(registry.list_sessions()) == 1
+
+
+def test_sessions_without_a_client_key_are_unaffected(tmp_path):
+    """NULL keys stay distinct, and here that is the point.
+
+    drover#256 was the same SQL semantics being wrong: a fence meant to cover
+    every row could not, because the column was nullable. Here only keyed rows
+    are meant to be fenced, so keyless sessions coexisting is the behaviour
+    being relied on rather than a hole.
+    """
+    registry, _ = _registry(tmp_path)
+
+    registry.create_session(host_id="h1", harness="shell", command="zsh")
+    registry.create_session(host_id="h1", harness="shell", command="zsh")
+
+    assert len(registry.list_sessions()) == 2
+
+
+def test_a_session_can_be_found_by_its_client_key(tmp_path):
+    registry, _ = _registry(tmp_path)
+    created = registry.create_session(
+        host_id="h1",
+        harness="codex",
+        command="codex",
+        client_session_id="k1",
+    )
+
+    found = registry.session_by_client_id("k1")
+
+    assert found is not None and found.session_id == created.session_id
+    assert registry.session_by_client_id("nope") is None
+
+
+def test_the_database_rejects_a_duplicate_key_the_lookup_missed(tmp_path):
+    """The index fences, not just the read-before-write.
+
+    `create_session` looks the key up first, which two concurrent callers can
+    both miss. That is exactly the check-then-act drover#256 was about, so the
+    constraint has to be real underneath it.
+    """
+    registry, store = _registry(tmp_path)
+    registry.create_session(
+        host_id="h1",
+        harness="codex",
+        command="codex",
+        client_session_id="k1",
+    )
+
+    con = duckdb.connect(str(store))
+    try:
+        with pytest.raises(duckdb.ConstraintException):
+            con.execute(
+                "INSERT INTO harness_sessions (session_id, host_id, harness, command, "
+                "status, client_session_id) VALUES ('racing', 'h1', 'codex', 'codex', "
+                "'created', 'k1')"
+            )
+    finally:
+        con.close()

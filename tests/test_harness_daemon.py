@@ -4243,3 +4243,55 @@ def test_a_handoff_from_a_different_source_still_creates_its_own_session(tmp_pat
         _close_structured_sessions(state)
         server.shutdown()
         server.server_close()
+
+
+def test_a_repeat_create_with_a_client_key_does_not_spawn_a_second_session(tmp_path):
+    """The gate has to sit in front of the spawn, not behind it.
+
+    A caller whose create timed out cannot tell whether it was served. Without
+    a key it either retries -- putting a second live agent on one working tree
+    -- or abandons one that is still running and still spending quota. The
+    registry dedupes as well, but only once a process exists, so a retry would
+    cost a process either way. See drover#268.
+    """
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        body = {
+            "harness": "shell",
+            "command": ["/bin/sh", "-c", "sleep 30"],
+            "cwd": str(tmp_path),
+            "client_session_id": "loop-goal-a-iter-1",
+        }
+        first_status, first = _json_request(f"{base_url}/sessions", payload=body)
+        second_status, second = _json_request(f"{base_url}/sessions", payload=body)
+
+        assert first_status == 201
+        assert second_status == 200
+        assert second["session_id"] == first["session_id"]
+        assert second["deduplicated"] is True
+        assert len(state.registry.list_sessions()) == 1
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_creates_without_a_client_key_are_still_independent(tmp_path):
+    """Only callers that opt in are fenced; everything else is untouched."""
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        body = {
+            "harness": "shell",
+            "command": ["/bin/sh", "-c", "sleep 30"],
+            "cwd": str(tmp_path),
+        }
+        first_status, first = _json_request(f"{base_url}/sessions", payload=body)
+        second_status, second = _json_request(f"{base_url}/sessions", payload=body)
+
+        assert first_status == second_status == 201
+        assert first["session_id"] != second["session_id"]
+        assert len(state.registry.list_sessions()) == 2
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
