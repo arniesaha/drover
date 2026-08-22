@@ -164,6 +164,9 @@ class _FakeApi:
         return {"session_id": f"sess-{self._n}"}
 
     def session(self, session_id):
+        # Flat, because this fake stands in for HarnessApi, whose contract is
+        # "give me the session row". Unwrapping the server's envelope is the
+        # client's job and is covered separately, against the real shape.
         return {"status": "running", "awaiting": "input"}
 
     def messages(self, session_id):
@@ -304,3 +307,87 @@ def test_goal_a_checks_with_the_interpreter_the_driver_is_running_under(
     this module's own code documents as "check command not found".
     """
     assert goal_a(tmp_path).check[0] == sys.executable
+
+
+def test_the_client_unwraps_the_session_envelope() -> None:
+    """`GET /harness/sessions/{id}` answers with an envelope, not the row.
+
+    The list endpoint returns sessions flat and this one nests them under
+    "session", which is what made the difference easy to miss. The driver
+    polled the envelope for `status` and `awaiting`, got None for both, and sat
+    there until its 30-minute turn timeout while the agent had already
+    finished. Only a live run found it: the fake above returned the flat shape
+    the client assumed, so the tests confirmed the assumption rather than the
+    API.
+    """
+    from loop_engine.api import HarnessApi
+
+    envelope = {
+        "session": {"session_id": "s1", "status": "running", "awaiting": "input"},
+        "host": {"host_id": "mac-mini"},
+        "events": [],
+        "native_transcript": None,
+    }
+
+    class _Stub(HarnessApi):
+        def _call(self, method, path, payload=None):
+            return 200, envelope
+
+    row = _Stub(base_url="http://hub", token="t").session("s1")
+
+    assert row["status"] == "running"
+    assert row["awaiting"] == "input"
+
+
+def test_the_client_tolerates_a_flat_session_response() -> None:
+    """Older hosts, and the list endpoint's shape, must not break the poll."""
+    from loop_engine.api import HarnessApi
+
+    class _Stub(HarnessApi):
+        def _call(self, method, path, payload=None):
+            return 200, {"session_id": "s1", "status": "running", "awaiting": "input"}
+
+    assert _Stub(base_url="http://hub", token="t").session("s1")["awaiting"] == "input"
+
+
+def test_a_pass_the_loop_did_not_cause_is_not_recorded_as_success(
+    tmp_path: Path,
+) -> None:
+    """The check can pass for reasons this iteration knows nothing about.
+
+    On the first live run it did exactly that: a session orphaned by an earlier
+    killed driver was still editing the tree, and the next iteration read its
+    work as its own success. The ledger held "session=None, harness error" and
+    "goal met" at the same time. Verification is ground truth for *whether* the
+    goal is met; it says nothing about which iteration met it.
+    """
+    from loop_engine.api import HarnessApiError
+
+    class _Unreachable(_FakeApi):
+        def create_session(self, host_id, *, harness, cwd, command=None, prompt=None):
+            raise HarnessApiError("POST /harness/hosts/h/sessions: timed out")
+
+    outcomes = _driver(
+        tmp_path,
+        _Unreachable(),
+        check=(sys.executable, "-c", "raise SystemExit(0)"),
+    ).run()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].met is True
+    assert outcomes[0].unobserved is True
+
+
+def test_session_creation_gets_its_own_generous_timeout() -> None:
+    """A create spawns a CLI behind the request; 30s is not enough.
+
+    Two creates timed out on a loaded hub while the sessions were made and the
+    agents ran anyway, which is worse than a slow create: the driver then holds
+    no id for a session that is already working.
+    """
+    from loop_engine.api import HarnessApi
+
+    api = HarnessApi(base_url="http://hub", token="t")
+
+    assert api.create_timeout_s > api.timeout_s
+    assert api.create_timeout_s >= 120

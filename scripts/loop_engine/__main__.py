@@ -10,6 +10,7 @@ agent is merely told about is a rule that holds until it decides otherwise.
 from __future__ import annotations
 
 import logging
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -44,7 +45,9 @@ def _current_branch(repo: Path) -> str:
 )
 @click.option("--hub", default="http://127.0.0.1:7080", show_default=True)
 @click.option("--token", envvar="DROVER_API_TOKEN", required=True)
-@click.option("--harness", default="claude", show_default=True)
+# The fleet's preset names, not the vendor's: shell, claude-code, codex,
+# agy, deepseek-harness. "claude" is not one of them.
+@click.option("--harness", default="claude-code", show_default=True)
 @click.option("--max-iterations", default=10, show_default=True)
 @click.option("--max-spend-usd", default=5.0, show_default=True)
 @click.option(
@@ -88,6 +91,20 @@ def main(
     click.echo(f"branch {branch}")
     click.echo(f"caps   {max_iterations} iterations, {max_spend_usd} USD")
     click.echo("")
+
+    # A killed driver used to leave its session running. On the first live run
+    # I stopped the driver with the agent mid-turn; the session kept working
+    # for fifteen minutes, edited the tree, and a later iteration read the
+    # result as its own success. Reap on the way out, however we leave.
+    def _reap(signum, _frame):  # pragma: no cover - signal path
+        session_id = getattr(driver, "_active_session_id", None)
+        if session_id:
+            click.echo(f"\nterminating {session_id}", err=True)
+            driver._api.terminate(session_id)
+        raise SystemExit(130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _reap)
 
     outcomes = driver.run()
     met = any(o.met for o in outcomes)

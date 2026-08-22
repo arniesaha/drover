@@ -61,6 +61,13 @@ class IterationOutcome:
     session_id: Optional[str]
     stopped_reason: Optional[str] = None
     fatal: bool = False
+    #: True when the session never started, or started and was lost. The check
+    #: may still pass -- and on the first live run it did, because an orphaned
+    #: session from an earlier run was still editing the tree. Verification is
+    #: ground truth for *whether* the goal is met; it says nothing about which
+    #: iteration met it, and a loop that conflates the two records a pass it
+    #: cannot account for.
+    unobserved: bool = False
 
 
 class LoopDriver:
@@ -86,6 +93,10 @@ class LoopDriver:
         self._poll = poll_interval_s
         self._turn_timeout = turn_timeout_s
         self._sleep = sleep
+        #: The session currently in flight, so a signal handler can reap it.
+        #: Without this a stopped driver leaves an agent running against the
+        #: same tree the next iteration verifies.
+        self._active_session_id: Optional[str] = None
 
     # -- one turn ---------------------------------------------------------- #
 
@@ -140,6 +151,7 @@ class LoopDriver:
         claimed = ""
         stopped = None
         fatal = False
+        unobserved = False
         try:
             session = self._api.create_session(
                 self._host_id,
@@ -148,6 +160,7 @@ class LoopDriver:
                 prompt=brief,
             )
             session_id = str(session.get("session_id") or session.get("id") or "")
+            self._active_session_id = session_id or None
             stopped = self._wait_for_turn(session_id)
             claimed = self._claimed_outcome(session_id)
         except HarnessApiError as exc:
@@ -156,10 +169,12 @@ class LoopDriver:
             # failed to launch must not look like a run that found nothing.
             stopped = f"harness error: {exc}"
             fatal = getattr(exc, "fatal", False)
+            unobserved = True
             log.warning("iteration %d could not run: %s", ordinal, exc)
         finally:
             if session_id:
                 self._api.terminate(session_id)
+            self._active_session_id = None
 
         verification = self._goal.verify()
         tail = (verification.stdout + verification.stderr).strip()[-4000:]
@@ -187,6 +202,7 @@ class LoopDriver:
             session_id=session_id or None,
             stopped_reason=stopped,
             fatal=fatal,
+            unobserved=unobserved,
         )
 
     # -- the loop ---------------------------------------------------------- #
@@ -216,6 +232,19 @@ class LoopDriver:
                 log.error(
                     "stopping: %s. This will fail the same way next iteration.",
                     outcome.stopped_reason,
+                )
+                break
+
+            if outcome.unobserved and outcome.met:
+                # The check passes and this iteration cannot take credit for
+                # it. Stopping here would record a success with no session, no
+                # claim and no diff behind it; continuing would keep spending
+                # against a goal that is already met. Neither is right, so say
+                # so and stop rather than pick one quietly.
+                log.error(
+                    "iteration %d: check passes but its session never ran. "
+                    "Something changed the tree that this loop did not observe.",
+                    outcome.ordinal,
                 )
                 break
 

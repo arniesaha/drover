@@ -91,19 +91,34 @@ def goal_a(repo_root: Path) -> Goal:
         goal_id="goal-a-providers-mypy",
         kind="project",
         summary=(
-            "Make `mypy --ignore-missing-imports src/drover/server/providers/` "
-            "exit clean, without weakening the checks or adding blanket ignores."
+            "Make the providers package type-check clean: fix the errors mypy "
+            "reports in src/drover/server/providers/ itself. Do not weaken the "
+            "check, add blanket ignores, or silence an error you have not "
+            "understood."
         ),
-        # `sys.executable`, not "python". The first accidental run of this
+        # Two flags carry the whole point of this goal.
+        #
+        # `sys.executable`, not "python": the first accidental run of this
         # driver recorded ten iterations at exit 127 -- the code this module
         # uses for "check command not found" -- because the `python` on PATH
         # was not the interpreter the driver was running under and had no
-        # mypy. The instrumentation caught it, which is the point of Goal A.
+        # mypy.
+        #
+        # `--follow-imports=silent`, because without it this is not a bounded
+        # goal at all. Measured on 2026-08-22: following imports reports 42
+        # errors across 13 files, reaching into harness/daemon.py (3,945 lines)
+        # and harness/registry.py. Bounded to the package it is 5 errors in 3
+        # files. R1 chose this goal *because* it is small; the unbounded form
+        # is the multi-week project R1 rejected, wearing a short command.
+        #
+        # This scopes the check, it does not weaken it: types from imported
+        # modules are still used, their errors are just not this goal's.
         check=(
             sys.executable,
             "-m",
             "mypy",
             "--ignore-missing-imports",
+            "--follow-imports=silent",
             "src/drover/server/providers/",
         ),
         cwd=repo_root,

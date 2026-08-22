@@ -44,6 +44,13 @@ class HarnessApi:
     base_url: str
     token: str
     timeout_s: float = 30.0
+    #: Creating a structured session spawns a CLI behind the request, so this
+    #: cannot share the ordinary timeout. `tests/test_structured_e2e.py` says
+    #: the same thing about its own client. A 30s ceiling timed out twice on a
+    #: loaded hub while the session was created and the agent ran anyway --
+    #: which is worse than a slow create, because the driver then had no id for
+    #: a session that was already working.
+    create_timeout_s: float = 300.0
 
     def _call(
         self,
@@ -57,8 +64,11 @@ class HarnessApi:
         if data is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        timeout = (
+            self.create_timeout_s if path.endswith("/sessions") else self.timeout_s
+        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read().decode()
                 return response.status, json.loads(body) if body else None
         except urllib.error.HTTPError as exc:
@@ -68,6 +78,8 @@ class HarnessApi:
             except json.JSONDecodeError:
                 return exc.code, {"error": body[:400]}
         except OSError as exc:
+            # Deliberately not fatal, and deliberately not "it did not happen".
+            # A timed-out POST may well have been served; see `orphan_risk`.
             raise HarnessApiError(f"{method} {path}: {exc}") from exc
 
     def create_session(
@@ -101,10 +113,26 @@ class HarnessApi:
         return payload
 
     def session(self, session_id: str) -> dict[str, Any]:
+        """The session row, unwrapped.
+
+        ``GET /harness/sessions/{id}`` answers with an envelope --
+        ``{"session", "host", "events", "native_transcript"}`` -- not with the
+        session itself. The list endpoint returns the rows flat, which is what
+        made the difference easy to miss: the driver polled the envelope for
+        ``status`` and ``awaiting``, got None for both on every poll, and sat
+        there until its 30-minute turn timeout while the agent had long since
+        finished. Found on the first live run, and only there: the fake in the
+        tests returned the flat shape this code assumed, so the tests
+        confirmed the assumption rather than the API.
+        """
         status, payload = self._call("GET", f"/harness/sessions/{session_id}")
         if status != 200 or not isinstance(payload, dict):
-            raise HarnessApiError(f"session returned {status}: {payload}")
-        return payload
+            raise HarnessApiError(
+                f"session returned {status}: {payload}",
+                fatal=status in _PERMANENT_STATUSES,
+            )
+        session = payload.get("session")
+        return session if isinstance(session, dict) else payload
 
     def messages(self, session_id: str) -> list[dict[str, Any]]:
         status, payload = self._call("GET", f"/harness/sessions/{session_id}/messages")
