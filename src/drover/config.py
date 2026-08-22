@@ -123,6 +123,7 @@ class DroverConfig:
     parquet_dir: Path
     duckdb_path: Path
     processed_retention_days: int
+    receipt_retention_days: int
     otlp_grpc_port: int
     mcp_http_port: int
     metrics_http_port: int
@@ -226,6 +227,11 @@ _DEFAULTS = {
         "parquet_dir": str(config_home() / "parquet"),
         "duckdb_path": str(config_home() / "drover.duckdb"),
         "processed_retention_days": 7,
+        # Shadow receipts only (agent_event, otlp_span): written by
+        # ledger_shadow and read by nothing, with Parquet carrying the
+        # authoritative dedup. Seven days to match the spool above, which is
+        # the window an operator already has in mind for this store. See #255.
+        "receipt_retention_days": 7,
     },
     "server": {
         "otlp_grpc_port": 4317,
@@ -375,6 +381,7 @@ def _from_dict(d: dict) -> DroverConfig:
         parquet_dir=Path(d["paths"]["parquet_dir"]),
         duckdb_path=Path(d["paths"]["duckdb_path"]),
         processed_retention_days=int(d["paths"]["processed_retention_days"]),
+        receipt_retention_days=int(d["paths"].get("receipt_retention_days", 7)),
         otlp_grpc_port=int(d["server"]["otlp_grpc_port"]),
         mcp_http_port=int(d["server"]["mcp_http_port"]),
         metrics_http_port=int(d["server"]["metrics_http_port"]),
