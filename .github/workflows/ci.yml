@@ -70,34 +70,24 @@ jobs:
 
     - name: Check imports with isort
       if: steps.scope.outputs.python == 'true'
-      env:
-        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-      run: |
-        if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-          BASE_SHA="$(git rev-parse HEAD~1)"
-        fi
-        PY_FILES="$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA"...HEAD -- 'src/**/*.py' 'tests/*.py' 'tests/**/*.py')"
-        if [ -z "$PY_FILES" ]; then
-          echo "No changed Python files to import-check."
-        else
-          echo "$PY_FILES" | xargs isort --check-only
-        fi
-
+      # Every tracked Python file, not just the changed ones. The changed-file
+      # globs covered `src/**` and `tests/**` and nothing else, so `scripts/`
+      # was never checked -- which is how an unformatted file sat on main
+      # unnoticed, and how the Loop Engine driver under `scripts/loop_engine/`
+      # would have gone unchecked too. `git ls-files` is the same tracked-only
+      # basis `check_public_release.py` already uses, so generated and
+      # gitignored trees such as `docs/internal/` stay out of scope.
+      run: git ls-files '*.py' -z | xargs -0 isort --check-only
     - name: Check formatting with Black
       if: steps.scope.outputs.python == 'true'
-      env:
-        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-      run: |
-        if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-          BASE_SHA="$(git rev-parse HEAD~1)"
-        fi
-        PY_FILES="$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA"...HEAD -- 'src/**/*.py' 'tests/*.py' 'tests/**/*.py')"
-        if [ -z "$PY_FILES" ]; then
-          echo "No changed Python files to format-check."
-        else
-          echo "$PY_FILES" | xargs black --check
-        fi
-
+      # Every tracked Python file, not just the changed ones. The changed-file
+      # globs covered `src/**` and `tests/**` and nothing else, so `scripts/`
+      # was never checked -- which is how an unformatted file sat on main
+      # unnoticed, and how the Loop Engine driver under `scripts/loop_engine/`
+      # would have gone unchecked too. `git ls-files` is the same tracked-only
+      # basis `check_public_release.py` already uses, so generated and
+      # gitignored trees such as `docs/internal/` stay out of scope.
+      run: git ls-files '*.py' -z | xargs -0 black --check
     - name: Run lightweight checks
       if: steps.scope.outputs.python != 'true'
       env:
