@@ -67,7 +67,11 @@ class _Entry:
         self.harness = harness
         self.seq = 0
         self.awaiting: str | None = None
-        self.lock = threading.Lock()
+        # Reentrant: `answer_permission` holds this across dispatch *and* the
+        # emit that records the decision, and `emit` acquires it too. A plain
+        # Lock would deadlock on that re-entry; a different thread still
+        # blocks, which is the whole point.
+        self.lock = threading.RLock()
         self.turn_lock = threading.Lock()
         self.turn_active = False
         self.emit: Callable[[StructuredMessage], None] | None = None
@@ -334,22 +338,34 @@ class StructuredSessionManager:
         self, session_id: str, request_id: str, decision: str, note: str | None
     ) -> None:
         entry = self._require_entry(session_id)
-        # Dispatch first: Codex/Agy always raise RuntimeError here (no
-        # wire-level approval channel), and we must not record a phantom
-        # approval_response event for a driver that rejected it.
-        entry.driver.answer_permission(request_id, decision, note)
-        entry.driver.emit(
-            StructuredMessage(
-                type="approval_response",
-                role="user",
-                text=decision,
-                payload={
-                    "request_id": request_id,
-                    "decision": decision,
-                    "note": note,
-                },
+        # Dispatch and record under one lock hold.
+        #
+        # Dispatch still comes first: Codex/Agy/DeepSeek always raise here (no
+        # wire-level approval channel), and a driver that rejected the decision
+        # must not leave a phantom approval_response behind.
+        #
+        # What changed is the lock. Releasing it between the two let the CLI
+        # produce its next output while the approval_response was still
+        # unrecorded, and `emit` assigns sequence numbers under this lock -- so
+        # the driver's stdout-pump thread could take the lower seq and a
+        # transcript could show the assistant acting before the approval that
+        # allowed it (drover#273). Holding it across both closes that window
+        # without reordering anything: the pump waits, and the failure case
+        # still records nothing because the raise happens before the emit.
+        with entry.lock:
+            entry.driver.answer_permission(request_id, decision, note)
+            entry.driver.emit(
+                StructuredMessage(
+                    type="approval_response",
+                    role="user",
+                    text=decision,
+                    payload={
+                        "request_id": request_id,
+                        "decision": decision,
+                        "note": note,
+                    },
+                )
             )
-        )
 
     def interrupt(self, session_id: str) -> None:
         self._require_entry(session_id).driver.interrupt()

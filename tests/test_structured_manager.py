@@ -16,6 +16,7 @@ timing-sensitive subprocess E2E tests:
 from __future__ import annotations
 
 import threading
+import time
 
 import duckdb
 import pytest
@@ -745,3 +746,63 @@ def test_a_driver_that_fails_to_start_leaves_no_entry(monkeypatch, tmp_path):
 
     assert not mgr.has("sess-1")
     assert mgr.session_ids() == []
+
+
+def test_an_approval_is_recorded_before_output_the_cli_produces_after_it(
+    monkeypatch, tmp_path
+):
+    """The pump must not take a sequence number between dispatch and record.
+
+    `answer_permission` dispatches the decision and then records it. Releasing
+    the lock between the two let the CLI produce its next output first: `emit`
+    assigns sequence numbers under `entry.lock`, and the driver's stdout-pump
+    thread races the HTTP thread for it. When the pump won, the transcript
+    showed the assistant acting before the approval that allowed it, and
+    `test_structured_session_events_reach_central` saw the two events swapped
+    (drover#273).
+
+    Here the driver behaves like a fast CLI: answering the permission kicks off
+    a thread that emits output immediately. Without one lock hold across both,
+    that thread wins.
+    """
+    mgr, driver, registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+
+    def _answer(request_id, decision, note=None):
+        del request_id, decision, note
+        started = threading.Event()
+
+        def _pump():
+            started.set()
+            driver.emit(
+                StructuredMessage(
+                    type="assistant_output",
+                    role="assistant",
+                    text="done",
+                    payload={},
+                )
+            )
+
+        thread = threading.Thread(target=_pump, daemon=True)
+        thread.start()
+        started.wait(timeout=2)
+        # Long enough that an unlocked pump would certainly have taken a seq.
+        time.sleep(0.2)
+
+    driver.answer_permission = _answer
+    mgr.answer_permission("sess-1", "req-1", "allow", None)
+
+    for _ in range(50):
+        events = registry.list_events("sess-1")
+        if any(e.event_type == "assistant_output" for e in events):
+            break
+        time.sleep(0.05)
+
+    ordered = sorted(
+        (e for e in registry.list_events("sess-1") if e.seq is not None),
+        key=lambda e: e.seq,
+    )
+    types = [e.event_type for e in ordered]
+    assert "approval_response" in types and "assistant_output" in types
+    assert types.index("approval_response") < types.index("assistant_output"), types
