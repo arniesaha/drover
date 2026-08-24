@@ -9,6 +9,7 @@ Requires Pillow and the macOS system fonts (Avenir Next, Menlo).
 
     python3 scripts/make_architecture_diagram.py [output.png]
 """
+
 import sys
 from pathlib import Path
 
@@ -17,26 +18,36 @@ from PIL import Image, ImageDraw, ImageFont
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "docs" / "drover-architecture.png"
 
-S = 2                      # supersample factor
+S = 2  # supersample factor
 W, H = 1536, 1024
 
 AVENIR = "/System/Library/Fonts/Avenir Next.ttc"
 MENLO = "/System/Library/Fonts/Menlo.ttc"
 BOLD, DEMI, MEDIUM, REG = 0, 2, 5, 7
 
-BG        = (246, 248, 249)
-INK       = (15, 23, 42)
-MUTED     = (100, 116, 139)
-FAINT     = (148, 163, 184)
-CARD      = (255, 255, 255)
+BG = (246, 248, 249)
+INK = (15, 23, 42)
+MUTED = (100, 116, 139)
+FAINT = (148, 163, 184)
+CARD = (255, 255, 255)
 CARD_EDGE = (216, 226, 231)
 
-TEAL_BG, TEAL_EDGE, TEAL_INK, TEAL = (233, 246, 244), (178, 221, 216), (13, 124, 113), (14, 159, 142)
-AMB_BG, AMB_EDGE, AMB_INK, AMBER = (252, 246, 236), (238, 216, 179), (177, 95, 10), (224, 123, 57)
+TEAL_BG, TEAL_EDGE, TEAL_INK, TEAL = (
+    (233, 246, 244),
+    (178, 221, 216),
+    (13, 124, 113),
+    (14, 159, 142),
+)
+AMB_BG, AMB_EDGE, AMB_INK, AMBER = (
+    (252, 246, 236),
+    (238, 216, 179),
+    (177, 95, 10),
+    (224, 123, 57),
+)
 TINT_TEAL = (230, 244, 241)
-TINT_AMB  = (251, 238, 218)
+TINT_AMB = (251, 238, 218)
 TINT_BLUE = (238, 243, 247)
-DARK      = (11, 18, 32)
+DARK = (11, 18, 32)
 
 _fc = {}
 
@@ -44,7 +55,9 @@ _fc = {}
 def F(size, idx=REG, mono=False):
     key = (size, idx, mono)
     if key not in _fc:
-        _fc[key] = ImageFont.truetype(MENLO if mono else AVENIR, size * S, index=0 if mono else idx)
+        _fc[key] = ImageFont.truetype(
+            MENLO if mono else AVENIR, size * S, index=0 if mono else idx
+        )
     return _fc[key]
 
 
@@ -96,17 +109,36 @@ def arrow(x0, y0, x1, y1, color, wid=2, dash=False, head=7):
         n = max(1, int(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5 / 10))
         for i in range(n):
             t0, t1 = i / n, i / n + 0.55 / n
-            d.line([(x0 + (x1 - x0) * t0) * S, (y0 + (y1 - y0) * t0) * S,
-                    (x0 + (x1 - x0) * t1) * S, (y0 + (y1 - y0) * t1) * S], fill=color, width=wid * S)
+            d.line(
+                [
+                    (x0 + (x1 - x0) * t0) * S,
+                    (y0 + (y1 - y0) * t0) * S,
+                    (x0 + (x1 - x0) * t1) * S,
+                    (y0 + (y1 - y0) * t1) * S,
+                ],
+                fill=color,
+                width=wid * S,
+            )
     else:
         d.line([x0 * S, y0 * S, x1 * S, y1 * S], fill=color, width=wid * S)
     dx, dy = x1 - x0, y1 - y0
     ln = max((dx * dx + dy * dy) ** 0.5, 0.001)
     ux, uy = dx / ln, dy / ln
     px, py = -uy, ux
-    d.polygon([(x1 * S, y1 * S),
-               ((x1 - ux * head + px * head * 0.52) * S, (y1 - uy * head + py * head * 0.52) * S),
-               ((x1 - ux * head - px * head * 0.52) * S, (y1 - uy * head - py * head * 0.52) * S)], fill=color)
+    d.polygon(
+        [
+            (x1 * S, y1 * S),
+            (
+                (x1 - ux * head + px * head * 0.52) * S,
+                (y1 - uy * head + py * head * 0.52) * S,
+            ),
+            (
+                (x1 - ux * head - px * head * 0.52) * S,
+                (y1 - uy * head - py * head * 0.52) * S,
+            ),
+        ],
+        fill=color,
+    )
 
 
 def pill(cx, cy, s, size=12, fill=CARD, edge=CARD_EDGE, ink=INK, padx=12, h=26):
@@ -117,7 +149,14 @@ def pill(cx, cy, s, size=12, fill=CARD, edge=CARD_EDGE, ink=INK, padx=12, h=26):
 
 # ── header ────────────────────────────────────────────────────────────────────
 T(44, 20, "Drover architecture", 33, BOLD)
-T(46, 64, "Private command plane + durable context plane for coding agents", 15, REG, MUTED)
+T(
+    46,
+    64,
+    "Private command plane + durable context plane for coding agents",
+    15,
+    REG,
+    MUTED,
+)
 
 # ── trust boundary strip ──────────────────────────────────────────────────────
 box(44, 98, 1492, 148)
@@ -127,12 +166,26 @@ for xd in (438, 742, 1042):
     d.line([xd * S, 110 * S, xd * S, 136 * S], fill=(228, 234, 238), width=1 * S)
 T(468, 116, "localhost / private LAN / Tailscale only", 13, REG, MUTED)
 T(772, 116, "No public-internet exposure in v0.3", 13, REG, MUTED)
-T(1072, 116, "Device + host credentials  ·  no RBAC / multi-tenant isolation", 13, REG, MUTED)
+T(
+    1072,
+    116,
+    "Device + host credentials  ·  no RBAC / multi-tenant isolation",
+    13,
+    REG,
+    MUTED,
+)
 
 # ── command plane ─────────────────────────────────────────────────────────────
 box(44, 170, 1492, 524, TEAL_BG, TEAL_EDGE, r=14)
 T(74, 186, "COMMAND PLANE  ·  LIVE CONTROL", 15, BOLD, TEAL_INK, track=0.7)
-T(74, 212, "Interactive session control, routing, streaming events, and terminal I/O", 13, REG, (91, 124, 120))
+T(
+    74,
+    212,
+    "Interactive session control, routing, streaming events, and terminal I/O",
+    13,
+    REG,
+    (91, 124, 120),
+)
 
 # operator clients
 box(74, 242, 322, 480)
@@ -156,7 +209,14 @@ T(734, 312, "Fleet registry", 15, DEMI)
 T(734, 338, "host state + session routing", 11, REG, (71, 85, 105))
 box(498, 384, 940, 456, TINT_TEAL, (206, 232, 228), r=9)
 T(514, 396, "Command coordinator", 15, DEMI)
-T(514, 422, "Routes operations; does not execute remote commands itself.", 11, REG, (71, 85, 105))
+T(
+    514,
+    422,
+    "Routes operations; does not execute remote commands itself.",
+    11,
+    REG,
+    (71, 85, 105),
+)
 
 # harness hosts
 box(1040, 242, 1462, 480)
@@ -164,8 +224,22 @@ T(1064, 262, "Harness hosts", 17, DEMI)
 T(1438, 266, "1..N MACHINES", 11, BOLD, MUTED, anchor="ra", track=0.4)
 box(1064, 300, 1438, 380, TINT_TEAL, (206, 232, 228), r=9)
 T(1080, 310, "drover-harnessd", 15, DEMI)
-T(1080, 334, "Claude Code · Codex · Antigravity (agy) · DeepSeek Harness", 11, REG, (71, 85, 105))
-T(1080, 353, "session lifecycle · structured adapters · PTY/tmux · terminal stream", 10.5, REG, (100, 116, 139))
+T(
+    1080,
+    334,
+    "Claude Code · Codex · Antigravity (agy) · DeepSeek Harness",
+    11,
+    REG,
+    (71, 85, 105),
+)
+T(
+    1080,
+    353,
+    "session lifecycle · structured adapters · PTY/tmux · terminal stream",
+    10.5,
+    REG,
+    (100, 116, 139),
+)
 box(1064, 392, 1246, 456, TINT_BLUE, (223, 232, 238), r=9)
 T(1080, 404, "Direct host", 14, DEMI)
 T(1080, 426, "private inbound", 11, REG, MUTED)
@@ -184,7 +258,15 @@ T(1001, 408, "dial-out", 11, REG, MUTED, anchor="ma")
 # authority callout
 box(1104, 486, 1462, 534, DARK, DARK, r=10)
 T(1283, 494, "Host daemon is authoritative for", 12, DEMI, (255, 255, 255), anchor="ma")
-T(1283, 512, "local processes + filesystem access", 12, DEMI, (255, 255, 255), anchor="ma")
+T(
+    1283,
+    512,
+    "local processes + filesystem access",
+    12,
+    DEMI,
+    (255, 255, 255),
+    anchor="ma",
+)
 
 # ── cross-plane flows ─────────────────────────────────────────────────────────
 arrow(744, 526, 744, 596, FAINT, dash=True)
@@ -195,7 +277,14 @@ pill(1250, 562, "agent events + spans")
 # ── context plane ─────────────────────────────────────────────────────────────
 box(44, 596, 1492, 964, AMB_BG, AMB_EDGE, r=14)
 T(74, 612, "CONTEXT PLANE  ·  DURABLE MEMORY", 15, BOLD, AMB_INK, track=0.7)
-T(74, 638, "Capture  ·  normalize  ·  preserve  ·  derive  ·  recall", 13, REG, (146, 110, 61))
+T(
+    74,
+    638,
+    "Capture  ·  normalize  ·  preserve  ·  derive  ·  recall",
+    13,
+    REG,
+    (146, 110, 61),
+)
 
 # activity sources
 box(74, 668, 340, 930)
@@ -214,8 +303,14 @@ T(98, 900, "Agent events, spans, PR events, routing.", 11, REG, MUTED)
 # ingest
 box(400, 690, 604, 866)
 T(424, 708, "Ingest", 17, DEMI)
-for i, line in enumerate(["Normalize identifiers", "Attribute repository context",
-                          "Deduplicate records", "Write durable facts"]):
+for i, line in enumerate(
+    [
+        "Normalize identifiers",
+        "Attribute repository context",
+        "Deduplicate records",
+        "Write durable facts",
+    ]
+):
     T(424, 748 + i * 28, line, 12.5, REG, (71, 85, 105))
 
 # redis
@@ -229,13 +324,35 @@ T(692, 686, "Local data boundary", 17, DEMI)
 T(1068, 690, "~/.drover/", 11, REG, MUTED, anchor="ra", mono=True)
 box(692, 724, 1068, 802, TINT_AMB, (240, 220, 187), r=9)
 T(708, 734, "Parquet facts", 15, DEMI)
-T(708, 758, "agent_events · spans · pr_events · routing", 11, REG, (120, 88, 45), mono=True)
+T(
+    708,
+    758,
+    "agent_events · spans · pr_events · routing",
+    11,
+    REG,
+    (120, 88, 45),
+    mono=True,
+)
 T(708, 779, "Append-oriented durable system of record", 11, REG, (146, 110, 61))
 arrow(880, 806, 880, 826, AMBER)
 box(692, 832, 1068, 910, TINT_BLUE, (223, 232, 238), r=9)
 T(708, 842, "DuckDB", 15, DEMI)
-T(708, 866, "normalized views · operational state · pipeline ledger", 11, REG, (71, 85, 105))
-T(708, 886, "harness hosts/sessions/events/tasks + derived serving state", 11, REG, (100, 116, 139))
+T(
+    708,
+    866,
+    "normalized views · operational state · pipeline ledger",
+    11,
+    REG,
+    (71, 85, 105),
+)
+T(
+    708,
+    886,
+    "harness hosts/sessions/events/tasks + derived serving state",
+    11,
+    REG,
+    (100, 116, 139),
+)
 
 # derive + retrieve
 box(1152, 668, 1462, 930)
@@ -259,14 +376,26 @@ arrow(1070, 890, 1148, 862, FAINT, dash=True)
 # ── legend ────────────────────────────────────────────────────────────────────
 d.line([44 * S, 982 * S, 1492 * S, 982 * S], fill=(226, 232, 236), width=1 * S)
 lx = 60
-for color, label, dash in ((TEAL, "live control / routing", False),
-                           (AMBER, "telemetry / context flow", False),
-                           (FAINT, "optional / derived coordination", True)):
+for color, label, dash in (
+    (TEAL, "live control / routing", False),
+    (AMBER, "telemetry / context flow", False),
+    (FAINT, "optional / derived coordination", True),
+):
     arrow(lx, 1002, lx + 46, 1002, color, dash=dash, head=6)
     T(lx + 58, 994, label, 12, REG, MUTED)
     lx += 58 + TW(label, 12, REG) + 46
-d.line([(lx - 24) * S, 990 * S, (lx - 24) * S, 1014 * S], fill=(226, 232, 236), width=1 * S)
-T(1492, 994, "The host daemon owns execution. Parquet owns durable facts.", 12, REG, MUTED, anchor="ra")
+d.line(
+    [(lx - 24) * S, 990 * S, (lx - 24) * S, 1014 * S], fill=(226, 232, 236), width=1 * S
+)
+T(
+    1492,
+    994,
+    "The host daemon owns execution. Parquet owns durable facts.",
+    12,
+    REG,
+    MUTED,
+    anchor="ra",
+)
 
 out = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_OUT
 out.parent.mkdir(parents=True, exist_ok=True)
