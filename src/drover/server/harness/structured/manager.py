@@ -200,6 +200,17 @@ class StructuredSessionManager:
                             seq=seq,
                             harness=harness,
                             normalized_source="structured",
+                            # Store under the id that was pushed to central,
+                            # not a fresh one. Without this the host keeps a
+                            # different id than the hub holds for the same
+                            # event, and `reconcile_unsent_events` -- which
+                            # replays from this table via
+                            # `HarnessEvent.wire_payload`, stamping the row's
+                            # own id -- offers central an id it has never seen.
+                            # Central inserts it, and one event becomes two
+                            # rows that differ only by identifier. That was
+                            # 46% of all stored events (drover#270).
+                            event_id=message.event_id,
                         )
                         registry.update_session_activity(session_id, awaiting=awaiting)
                         recorded = True

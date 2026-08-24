@@ -16,9 +16,11 @@ import threading
 import time
 import urllib.request
 
+import duckdb
 from _timeouts import scale_timeout
 
 from drover.schema import bootstrap
+from drover.server.db import control_plane_path
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -27,7 +29,7 @@ from drover.server.harness.daemon import (
 )
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.structured.pusher import EventPusher
+from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.metrics import MetricsCollector, start_metrics_server
 from drover.server.web.auth import AuthSettings
 
@@ -329,3 +331,154 @@ def test_two_concurrent_structured_sessions_do_not_corrupt_registry(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def _duplicate_seqs(duckdb_path) -> list[tuple]:
+    """(seq, rows) for every sequence number stored more than once."""
+    con = duckdb.connect(str(control_plane_path(duckdb_path)), read_only=True)
+    try:
+        con.execute("SET enable_progress_bar=false")
+        return con.execute("""
+            SELECT seq, count(*) FROM harness_events
+             WHERE seq IS NOT NULL GROUP BY seq HAVING count(*) > 1 ORDER BY seq
+            """).fetchall()
+    finally:
+        con.close()
+
+
+def test_a_mirrored_event_is_stored_once(tmp_path):
+    """One row per event on central, not two.
+
+    Measured on the live hub: 52,155 sequence numbers hold two rows each, 46%
+    of all events, and the pairs are byte-identical apart from the `event_id`
+    each insert carried -- same `created_at` to the microsecond, so not two
+    deliveries. `ON CONFLICT (event_id) DO NOTHING` cannot see them, because
+    the second copy arrives under a different id (drover#270).
+
+    It is specific to the structured pipeline: 51,986 duplicated pairs there
+    against 12 for terminal events.
+
+    The existing end-to-end test asserts the shape of `/messages`, which is a
+    read path. This asserts the table, which is where the duplication lives.
+    """
+    central_server, central_url = _start_central(tmp_path)
+    daemon_server, state, pusher, base_url = _start_daemon(
+        tmp_path, name="daemon", central_url=central_url
+    )
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "prompt": "list files",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+
+        _wait_until(
+            lambda: _fetch_session(base_url, sid)["awaiting"] == "approval",
+            what="session awaiting=approval",
+        )
+        _json_request(
+            f"{base_url}/sessions/{sid}/permission",
+            payload={"request_id": "req-1", "decision": "allow"},
+        )
+        _wait_until(
+            lambda: _fetch_session(base_url, sid)["awaiting"] == "input",
+            what="session awaiting=input",
+        )
+
+        def _mirrored() -> int:
+            with _authed_get(
+                f"{central_url}/harness/sessions/{sid}/messages"
+            ) as response:
+                return len(json.loads(response.read())["messages"])
+
+        _wait_until(lambda: _mirrored() == 5, what="central mirrored 5 messages")
+
+        assert _duplicate_seqs(tmp_path / "central.duckdb") == []
+    finally:
+        if pusher is not None:
+            pusher.stop()
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        daemon_server.shutdown()
+        daemon_server.server_close()
+        central_server.shutdown()
+        central_server.server_close()
+
+
+def test_reconciliation_does_not_store_a_second_copy(tmp_path):
+    """Re-sending durable events must be idempotent, as its docstring claims.
+
+    `reconcile_unsent_events` says "Central /harness/events is idempotent on
+    event_id, so re-sending durable events is safe and duplicate-free". That
+    holds only if the id the host stored is the id central already has.
+
+    It was not. `manager.emit` recorded the local row without an `event_id`, so
+    the host minted a fresh one, while the copy pushed to central carried the
+    message's own id. `HarnessEvent.wire_payload` then stamps the host's row id
+    onto the replay, so central saw an id it had never seen and inserted a
+    second row.
+
+    On the live hub that is 52,155 duplicated sequence numbers, 46% of all
+    events, byte-identical apart from the id each insert carried (drover#270).
+    """
+    central_server, central_url = _start_central(tmp_path)
+    daemon_server, state, pusher, base_url = _start_daemon(
+        tmp_path, name="daemon", central_url=central_url
+    )
+    try:
+        status, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "prompt": "list files",
+                "command": FAKE_STRUCTURED_CLI,
+                "cwd": str(tmp_path),
+            },
+        )
+        assert status == 201
+        sid = body["session_id"]
+
+        _wait_until(
+            lambda: _fetch_session(base_url, sid)["awaiting"] == "approval",
+            what="session awaiting=approval",
+        )
+        _json_request(
+            f"{base_url}/sessions/{sid}/permission",
+            payload={"request_id": "req-1", "decision": "allow"},
+        )
+        _wait_until(
+            lambda: _fetch_session(base_url, sid)["awaiting"] == "input",
+            what="session awaiting=input",
+        )
+
+        def _mirrored() -> int:
+            with _authed_get(
+                f"{central_url}/harness/sessions/{sid}/messages"
+            ) as response:
+                return len(json.loads(response.read())["messages"])
+
+        _wait_until(lambda: _mirrored() == 5, what="central mirrored 5 messages")
+
+        # What a harnessd restart does: offer every durable event again.
+        offered = reconcile_unsent_events(state.registry, pusher, host_id=state.host_id)
+        assert offered and offered >= 5
+        _wait_until(lambda: _mirrored() == 5, what="still 5 messages after replay")
+
+        assert _duplicate_seqs(tmp_path / "central.duckdb") == []
+    finally:
+        if pusher is not None:
+            pusher.stop()
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        daemon_server.shutdown()
+        daemon_server.server_close()
+        central_server.shutdown()
+        central_server.server_close()
