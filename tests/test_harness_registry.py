@@ -13,7 +13,9 @@ from drover.schema import bootstrap
 from drover.server.db import control_plane_path
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
+    audit_duplicate_harness_events,
     bootstrap_harness_tables,
+    migrate_duplicate_harness_events,
     migrate_legacy_harness_event_sequences,
 )
 from drover.server.metrics import _wire_datetime
@@ -1461,5 +1463,117 @@ def test_the_database_rejects_a_duplicate_key_the_lookup_missed(tmp_path):
                 "status, client_session_id) VALUES ('racing', 'h1', 'codex', 'codex', "
                 "'created', 'k1')"
             )
+    finally:
+        con.close()
+
+
+def _event(con, event_id, seq, event_type, body, *, ts="2026-08-01 10:00:00"):
+    payload = dict(body)
+    payload["event_id"] = event_id
+    con.execute(
+        "INSERT INTO harness_events (event_id, session_id, event_type, "
+        "payload_json, created_at, seq) VALUES (?, 's1', ?, ?, ?, ?)",
+        [event_id, event_type, json.dumps(payload), ts, seq],
+    )
+
+
+def _events_store(tmp_path):
+    con = duckdb.connect(str(tmp_path / "events.duckdb"))
+    bootstrap_harness_tables(con)
+    con.execute(
+        "INSERT INTO harness_sessions (session_id, host_id, harness, command, "
+        "status) VALUES ('s1','h','claude-code','c','running')"
+    )
+    return con
+
+
+def test_dedupe_collapses_a_replayed_event(tmp_path):
+    """Two rows for one event, differing only by the id each insert carried.
+
+    That is what a replay produced while the host and hub disagreed on an
+    event's identifier (drover#270).
+    """
+    con = _events_store(tmp_path)
+    try:
+        _event(con, "a1", 1, "user_input", {"text": "hi"})
+        _event(con, "a2", 1, "user_input", {"text": "hi"})
+
+        audit = audit_duplicate_harness_events(con)
+        assert (audit.collapsible_groups, audit.removable_rows) == (1, 1)
+
+        result = migrate_duplicate_harness_events(con)
+
+        assert (result.collapsed_groups, result.removed_rows) == (1, 1)
+        assert con.execute("SELECT count(*) FROM harness_events").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_dedupe_keeps_the_copy_wire_payload_would_produce(tmp_path):
+    """A replay is slimmer than the original push, and that is the one to keep.
+
+    `HarnessEvent.wire_payload` strips `aggregated_output` on the way out, so
+    the two rows differ by that field as well as by their ids. It is dead
+    weight the adapter stopped writing -- 992KB across 236 tool results on one
+    live session -- so the slim copy is both canonical and cheaper.
+    """
+    con = _events_store(tmp_path)
+    try:
+        _event(
+            con,
+            "b1",
+            2,
+            "tool_result",
+            {"payload": {"aggregated_output": "lots and lots", "command": "ls"}},
+        )
+        _event(con, "b2", 2, "tool_result", {"payload": {"command": "ls"}})
+
+        migrate_duplicate_harness_events(con)
+
+        rows = con.execute(
+            "SELECT event_id, payload_json FROM harness_events"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "b2"
+        assert "aggregated_output" not in rows[0][1]
+    finally:
+        con.close()
+
+
+def test_dedupe_leaves_two_different_events_that_share_a_seq(tmp_path):
+    """Not every pair on one sequence number is a duplicate.
+
+    On the live hub 30 groups hold genuinely different events at `seq = 1` --
+    `session.started` beside `terminal.output`, or `session.reconciled` 45
+    minutes later. A dedupe that removed one of those would delete history.
+    """
+    con = _events_store(tmp_path)
+    try:
+        _event(con, "c1", 3, "session.started", {"x": 1}, ts="2026-08-01 10:00:00")
+        _event(con, "c2", 3, "terminal.output", {"x": 2}, ts="2026-08-01 10:05:00")
+
+        audit = audit_duplicate_harness_events(con)
+        result = migrate_duplicate_harness_events(con)
+
+        assert audit.collapsible_groups == 0
+        assert audit.divergent_groups == 1
+        assert result.removed_rows == 0
+        assert con.execute("SELECT count(*) FROM harness_events").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_dedupe_is_idempotent_and_reads_nothing_when_clean(tmp_path):
+    con = _events_store(tmp_path)
+    try:
+        _event(con, "a1", 1, "user_input", {"text": "hi"})
+        _event(con, "a2", 1, "user_input", {"text": "hi"})
+
+        first = migrate_duplicate_harness_events(con)
+        second = migrate_duplicate_harness_events(con)
+
+        assert first.removed_rows == 1
+        assert second.removed_rows == 0
+        assert audit_duplicate_harness_events(con).duplicate_groups == 0
     finally:
         con.close()
