@@ -1493,3 +1493,47 @@ def test_version_matches_the_packaged_version():
     # so only assert equality when the package metadata is present and real.
     if drover.__version__ != "0.0.0":
         assert drover.__version__ == declared
+
+
+def test_duplicate_event_audit_does_not_write_to_the_store(tmp_path):
+    """An audit must not touch a store the hub is serving from.
+
+    It used to call `bootstrap_harness_tables`, which drops and recreates the
+    client-key index around its column migrations. That takes a write lock, so
+    asking "what would this remove?" contended with the running server and
+    mutated the store the operator was only asking about.
+    """
+    from drover.schema import bootstrap
+    from drover.server.__main__ import _duplicate_events_payload
+    from drover.server.db import control_plane_path
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    store = control_plane_path(duckdb_path)
+    before = (store.stat().st_size, store.stat().st_mtime_ns)
+
+    payload = _duplicate_events_payload(duckdb_path, apply=False)
+
+    assert payload["applied"] is False
+    assert payload["duplicate_groups"] == 0
+    assert (store.stat().st_size, store.stat().st_mtime_ns) == before
+
+
+def test_duplicate_event_audit_reads_a_store_opened_read_only(tmp_path):
+    """A second reader must be able to audit while one is already attached."""
+    import duckdb as _duckdb
+
+    from drover.schema import bootstrap
+    from drover.server.__main__ import _duplicate_events_payload
+    from drover.server.db import control_plane_path
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+
+    reader = _duckdb.connect(str(control_plane_path(duckdb_path)), read_only=True)
+    try:
+        payload = _duplicate_events_payload(duckdb_path, apply=False)
+    finally:
+        reader.close()
+
+    assert payload["collapsible_groups"] == 0

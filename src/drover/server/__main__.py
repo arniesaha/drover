@@ -84,7 +84,6 @@ from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_duplicate_harness_events,
-    bootstrap_harness_tables,
     migrate_duplicate_harness_events,
 )
 from drover.server.jobs import RedisJobStream, RedisJobStreamConfig
@@ -920,9 +919,15 @@ def _duplicate_events_payload(db_path: Path, *, apply: bool) -> dict[str, Any]:
     the sequence commands use, because harness events live there.
     """
     store = control_plane_path(db_path)
-    con = duckdb.connect(str(store))
+    # Read-only for an audit, and no bootstrap either way.
+    #
+    # `bootstrap_harness_tables` writes: it drops and recreates the client-key
+    # index around its column migrations. Calling it from an audit would take a
+    # write lock on a store the hub is serving from, and would mutate a store
+    # the operator was only asking about. The tables already exist on any store
+    # worth auditing; if they do not, the query says so.
+    con = duckdb.connect(str(store), read_only=not apply)
     try:
-        bootstrap_harness_tables(con)
         if apply:
             result = migrate_duplicate_harness_events(con)
             payload: dict[str, Any] = {
