@@ -101,7 +101,9 @@ def _authed_get(url: str):
     return urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT)
 
 
-def _wait_until(predicate, timeout: float = 30, *, what: str = "condition") -> None:
+def _wait_until(
+    predicate, timeout: float = 30, *, what: str = "condition", describe=None
+) -> None:
     """Poll ``predicate`` until it is true, or fail with WHY it never was.
 
     The old version swallowed every exception and raised a bare "condition
@@ -131,6 +133,15 @@ def _wait_until(predicate, timeout: float = 30, *, what: str = "condition") -> N
         if last_error is not None
         else f"last value was {last_value!r}"
     )
+    # `describe` reports the actual state, not the verdict. A predicate that
+    # compares a whole list answers False whether four of five items arrived or
+    # none did, and those are different defects. drover#273 sat on "last value
+    # was False" through three CI failures for want of this.
+    if describe is not None:
+        try:
+            detail = f"{detail}; observed {describe()}"
+        except Exception as exc:  # noqa: BLE001 - diagnosis must not add failures
+            detail = f"{detail}; describe() raised {type(exc).__name__}: {exc}"
     raise AssertionError(f"{what} was not met within {timeout}s; {detail}")
 
 
@@ -240,9 +251,25 @@ def test_structured_session_events_reach_central(tmp_path):
             ) as response:
                 return json.loads(response.read())["messages"]
 
+        def _observed() -> str:
+            """What actually reached central, and how far the session got."""
+            try:
+                arrived = [m["type"] for m in _messages()]
+            except Exception as exc:  # noqa: BLE001
+                return f"messages unreadable: {type(exc).__name__}: {exc}"
+            missing = [t for t in expected_types if t not in arrived]
+            pairs = [(m.get("seq"), m["type"]) for m in _messages()]
+            listing = _fetch_session(base_url, sid)
+            return (
+                f"arrived={arrived} missing={missing} by_seq={pairs} "
+                f"session_status={listing.get('status')!r} "
+                f"awaiting={listing.get('awaiting')!r}"
+            )
+
         _wait_until(
             lambda: [m["type"] for m in _messages()] == expected_types,
             what=f"central mirrored {expected_types}",
+            describe=_observed,
         )
 
         messages = _messages()
