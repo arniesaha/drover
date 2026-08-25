@@ -82,6 +82,11 @@ from drover.server.embeddings.worker import (
 )
 from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.schema import (
+    audit_duplicate_harness_events,
+    bootstrap_harness_tables,
+    migrate_duplicate_harness_events,
+)
 from drover.server.jobs import RedisJobStream, RedisJobStreamConfig
 from drover.server.mcp import tools as mcp_tools
 from drover.server.mcp.server import build_mcp_server
@@ -906,6 +911,98 @@ def _emit_sequence_command_result(
         click.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
     if payload["mixed_sessions"]:
         ctx.exit(1)
+
+
+def _duplicate_events_payload(db_path: Path, *, apply: bool) -> dict[str, Any]:
+    """Audit, and optionally collapse, duplicate harness events.
+
+    Opens the control-plane store beside the given path, the same resolution
+    the sequence commands use, because harness events live there.
+    """
+    store = control_plane_path(db_path)
+    con = duckdb.connect(str(store))
+    try:
+        bootstrap_harness_tables(con)
+        if apply:
+            result = migrate_duplicate_harness_events(con)
+            payload: dict[str, Any] = {
+                "collapsed_groups": result.collapsed_groups,
+                "removed_rows": result.removed_rows,
+                "divergent_groups": result.divergent_groups,
+            }
+        else:
+            audit = audit_duplicate_harness_events(con)
+            payload = {
+                "duplicate_groups": audit.duplicate_groups,
+                "collapsible_groups": audit.collapsible_groups,
+                "removable_rows": audit.removable_rows,
+                "divergent_groups": audit.divergent_groups,
+                "divergent_examples": [
+                    f"{session_id}#{seq}"
+                    for session_id, seq in audit.divergent_examples
+                ],
+            }
+    finally:
+        con.close()
+    return {"database": str(store), **payload, "applied": apply}
+
+
+@harness_cmd.command(name="audit-duplicate-events")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help=(
+        "Exact DuckDB path to audit. Either the lakehouse path or the "
+        "control-plane store beside it; harness events live in the latter."
+    ),
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def harness_audit_duplicate_events_cmd(db_path: Path, as_json: bool) -> None:
+    """Report duplicate harness events without mutating the database."""
+    payload = _duplicate_events_payload(db_path, apply=False)
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True))
+    else:
+        click.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
+
+
+@harness_cmd.command(name="dedupe-events")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help=(
+        "Exact DuckDB path to deduplicate. Either the lakehouse path or the "
+        "control-plane store beside it; harness events live in the latter."
+    ),
+)
+@click.option(
+    "--apply",
+    "apply",
+    is_flag=True,
+    help=(
+        "Actually delete. Without it this reports what would go, which is the "
+        "same output as audit-duplicate-events."
+    ),
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def harness_dedupe_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None:
+    """Collapse duplicate harness events. Deliberately not run at bootstrap.
+
+    Removing tens of thousands of rows from a live control-plane store is not
+    something a service start should do on its own, so this is a command an
+    operator runs, having first taken a backup. Deduplication is idempotent, so
+    running it twice is safe; running it never is also safe, because the events
+    it removes are copies.
+    """
+    payload = _duplicate_events_payload(db_path, apply=apply)
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True))
+    else:
+        click.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
 
 
 @harness_cmd.command(name="audit-sequences")
