@@ -39,6 +39,9 @@ class ProviderUsageWindow:
         _require_timezone_aware(self.resets_at, "resets_at")
 
 
+ProviderStatus = Literal["ok", "usage_unavailable", "stale", "error"]
+
+
 @dataclass(frozen=True)
 class ProviderAccountSnapshot:
     snapshot_id: str
@@ -47,7 +50,7 @@ class ProviderAccountSnapshot:
     account_label: str
     plan_label: str | None
     host_id: str
-    status: Literal["ok", "usage_unavailable", "stale", "error"]
+    status: ProviderStatus
     observed_at: datetime
     windows: tuple[ProviderUsageWindow, ...]
     source: str

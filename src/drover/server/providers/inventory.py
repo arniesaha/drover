@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
+UsageStatus = Literal["supported", "usage_unavailable"]
+
 
 @dataclass(frozen=True)
 class DetectedProvider:
@@ -13,10 +15,10 @@ class DetectedProvider:
     host_id: str
     harnesses: tuple[str, ...]
     plan_label: str | None
-    usage_status: Literal["supported", "usage_unavailable"]
+    usage_status: UsageStatus
 
 
-_PROVIDER_HARNESSES = (
+_PROVIDER_HARNESSES: tuple[tuple[str, str, str, UsageStatus], ...] = (
     ("codex", "openai", "Codex", "supported"),
     ("claude-code", "anthropic", "Claude Code", "supported"),
     ("agy", "google", "Antigravity", "usage_unavailable"),

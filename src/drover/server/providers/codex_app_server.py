@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import subprocess
 import threading
 from queue import Empty, Full, Queue
 from time import monotonic
-from typing import Any, Mapping, Sequence
+from typing import IO, Any, Mapping, Sequence
 
 log = logging.getLogger(__name__)
 _PROCESS_STOP_TIMEOUT_S = 0.5
@@ -94,6 +95,10 @@ class CodexAppServerSession:
         self._process = process
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise CodexAppServerError("process_error")
+        # The reader needs the raw byte stream underneath the text wrapper so it
+        # can cap a line by bytes; text mode always hands back a TextIOWrapper.
+        if not isinstance(process.stdout, io.TextIOWrapper):
+            raise CodexAppServerError("process_error")
         self._reader = _stdout_reader(process.stdout.buffer, self._lines)
         self._stderr_reader = _stderr_reader(process.stderr, self._stderr_parts)
 
@@ -166,7 +171,7 @@ class CodexAppServerSession:
             log.debug("codex app-server cleanup failed", exc_info=True)
 
 
-def _stdout_reader(stream, lines: Queue[object]) -> threading.Thread:
+def _stdout_reader(stream: IO[bytes], lines: Queue[object]) -> threading.Thread:
     def read_lines() -> None:
         try:
             while True:

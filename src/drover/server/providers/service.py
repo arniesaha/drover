@@ -19,6 +19,7 @@ from drover.server.db import open_duckdb_connection
 from drover.server.parquet_io import atomic_write_table
 from drover.server.providers.types import (
     ProviderAccountSnapshot,
+    ProviderStatus,
     ProviderUsageWindow,
     provider_snapshot_table,
 )
@@ -267,9 +268,10 @@ class ProviderUsageService:
             )
             connection = connections.get(key)
             provider_observed_at = base.observed_at
+            last_success_at = connection.get("last_success_at") if connection else None
             effective_observed_at = (
-                connection.get("last_success_at")
-                if connection and connection.get("last_success_at") is not None
+                last_success_at
+                if isinstance(last_success_at, datetime)
                 else base.observed_at
             )
             freshness_age_seconds = max(
@@ -282,7 +284,9 @@ class ProviderUsageService:
                 freshness_age_seconds=freshness_age_seconds,
             )
             if connection and _connection_failed(connection):
-                status = "stale" if base.status in _SUCCESS_STATUSES else "error"
+                status: ProviderStatus = (
+                    "stale" if base.status in _SUCCESS_STATUSES else "error"
+                )
                 base = replace(
                     base,
                     status=status,
