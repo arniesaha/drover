@@ -15,6 +15,7 @@ import duckdb
 from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
+from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.model_catalog import CatalogEnvelope
 from drover.server.harness.models import (
     HarnessEvent,
@@ -584,6 +585,18 @@ class HarnessRegistry:
             )
         return HarnessSession.from_row(rows[0]) if rows else None
 
+    def get_event_by_dedup_key(self, dedup_key: str) -> HarnessEvent | None:
+        """Find an event by its identity rather than by an insert's identifier."""
+        if not dedup_key:
+            return None
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                "SELECT * FROM harness_events WHERE dedup_key = ?",
+                [dedup_key],
+            )
+        return HarnessEvent.from_row(rows[0]) if rows else None
+
     def get_session(self, session_id: str) -> HarnessSession | None:
         with self._connect() as con:
             rows = _rows(
@@ -890,6 +903,13 @@ class HarnessRegistry:
             normalized_source=normalized_source,
             content_preview=content_preview,
         )
+        dedup_key = harness_event_identity(
+            session_id=session_id,
+            seq=seq,
+            event_type=event_type,
+            created_at=created_at,
+            payload=payload,
+        )
         with self._connect() as con:
             con.execute("BEGIN TRANSACTION")
             try:
@@ -911,10 +931,10 @@ class HarnessRegistry:
                         INSERT INTO harness_events (
                           event_id, session_id, event_type, normalized_type,
                           normalized_source, content_preview, payload_json,
-                          created_at, seq
+                          created_at, seq, dedup_key
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (event_id) DO NOTHING
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT DO NOTHING
                         RETURNING event_id
                         """,
                         [
@@ -927,6 +947,7 @@ class HarnessRegistry:
                             _json_dumps(payload),
                             created_at,
                             seq,
+                            dedup_key,
                         ],
                     ).fetchone()
                     is not None
@@ -947,6 +968,13 @@ class HarnessRegistry:
                 con.execute("ROLLBACK")
                 raise
         event = self.get_event(event_id)
+        if event is None:
+            # The insert was a no-op because this event is already stored under
+            # a different identifier -- a replay after a harnessd restart, which
+            # `wire_payload` stamps with the host's row id (drover#280). Return
+            # the copy that is already here; the caller asked for the event to
+            # be recorded, and it is.
+            event = self.get_event_by_dedup_key(dedup_key)
         if event is None:
             raise RuntimeError(f"failed to append harness event {event_id!r}")
         return event
@@ -1011,6 +1039,13 @@ class HarnessRegistry:
                         _json_dumps(record.get("payload")),
                         created_at,
                         seq,
+                        harness_event_identity(
+                            session_id=record["session_id"],
+                            seq=seq,
+                            event_type=record["event_type"],
+                            created_at=created_at,
+                            payload=record.get("payload"),
+                        ),
                     ]
                 )
                 inserted_records.append((record, seq))
@@ -1026,10 +1061,10 @@ class HarnessRegistry:
                     """
                     INSERT INTO harness_events (
                       event_id, session_id, event_type, normalized_type,
-                      normalized_source, content_preview, payload_json, created_at, seq
+                      normalized_source, content_preview, payload_json, created_at, seq, dedup_key
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (event_id) DO NOTHING
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT DO NOTHING
                     """,
                     params,
                 )
@@ -1134,10 +1169,10 @@ class HarnessRegistry:
                         INSERT INTO harness_events (
                           event_id, session_id, event_type, normalized_type,
                           normalized_source, content_preview, payload_json,
-                          created_at, seq
+                          created_at, seq, dedup_key
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (event_id) DO NOTHING
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT DO NOTHING
                         RETURNING event_id
                         """,
                         [
@@ -1150,6 +1185,13 @@ class HarnessRegistry:
                             _json_dumps(payload),
                             created_at,
                             seq,
+                            harness_event_identity(
+                                session_id=session_id,
+                                seq=seq,
+                                event_type=event_type,
+                                created_at=created_at,
+                                payload=payload,
+                            ),
                         ],
                     ).fetchone()
                     if inserted is None:
