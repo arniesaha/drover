@@ -1655,3 +1655,53 @@ def test_two_different_events_on_one_seq_are_still_distinct(tmp_path):
     )
 
     assert len(registry.list_events("s1")) == 2
+
+
+def test_the_migration_stamps_every_survivor_so_a_replay_cannot_return(tmp_path):
+    """Collapsing without backfilling achieves nothing.
+
+    On the live hub the cleanup removed 52,503 rows and the next harnessd
+    restart put 37,708 back, because an unstamped row cannot collide with the
+    replay that follows it (drover#280).
+    """
+    registry, store = _registry(tmp_path)
+    registry.create_session(
+        host_id="h1",
+        harness="claude-code",
+        command="c",
+        session_id="s1",
+        mode="structured",
+    )
+    when = datetime(2026, 8, 17, 14, 0, 46, tzinfo=timezone.utc)
+
+    con = duckdb.connect(str(store))
+    try:
+        # Two rows as the pre-fix code left them: same event, no dedup_key.
+        for event_id in ("old-original", "old-replay"):
+            con.execute(
+                "INSERT INTO harness_events (event_id, session_id, event_type, "
+                "payload_json, created_at, seq) VALUES (?, 's1', 'assistant_output', ?, ?, 6)",
+                [event_id, json.dumps({"event_id": event_id, "text": "hi"}), when],
+            )
+        assert con.execute("SELECT count(*) FROM harness_events").fetchone()[0] == 2
+
+        migrate_duplicate_harness_events(con)
+
+        rows = con.execute("SELECT event_id, dedup_key FROM harness_events").fetchall()
+        assert len(rows) == 1
+        assert rows[0][1], "the survivor must carry an identity"
+    finally:
+        con.close()
+
+    # Now the replay the restart would send. It must not be stored.
+    registry.append_event(
+        session_id="s1",
+        event_type="assistant_output",
+        seq=6,
+        payload={"event_id": "harness-event-fresh", "text": "hi"},
+        event_id="harness-event-fresh",
+        created_at=when,
+        normalized_source="structured",
+    )
+
+    assert len(registry.list_events("s1")) == 1

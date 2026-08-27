@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import duckdb
+
+from drover.server.harness.identity import harness_event_identity
 
 HARNESS_TABLES = (
     "harness_hosts",
@@ -239,51 +242,90 @@ def audit_duplicate_harness_events(
 
 
 def migrate_duplicate_harness_events(
-    con: duckdb.DuckDBPyConnection,
+    con: duckdb.DuckDBPyConnection, *, batch_sessions: int = 25
 ) -> DuplicateEventMigration:
-    """Collapse each duplicate group to one row. Idempotent.
+    """Collapse duplicate events and stamp every survivor with its identity.
 
-    Keeps the copy `wire_payload` would produce -- the one without
-    `aggregated_output` -- because that is the form the system already converges
-    on, and because the field is dead weight the adapter stopped writing. Ties
-    break on the smallest `event_id` so a re-run is a no-op rather than a
-    reshuffle.
+    Both halves matter, and the second is what makes the first hold. Removing
+    duplicates from the hub achieved nothing on its own: the next harnessd
+    restart re-offered every durable event under the ids the host holds, and an
+    unstamped row cannot collide, so 37,708 of them came straight back
+    (drover#280). A row without a `dedup_key` is a row the fence cannot see.
 
-    Nothing outside `harness_events` references `event_id`, so removing the
-    extra row of a pair is referentially safe.
+    Identity comes from `harness_event_identity`, the same function the insert
+    paths use. Deriving it twice -- once in SQL for the migration, once in
+    Python at runtime -- is how the two quietly stop agreeing.
+
+    Works a few sessions at a time so a 700MB store does not have to be held in
+    memory at once.
     """
-    audit = audit_duplicate_harness_events(con)
-    if not audit.collapsible_groups:
-        return DuplicateEventMigration(0, 0, audit.divergent_groups)
+    session_ids = [
+        str(row[0])
+        for row in con.execute(
+            "SELECT DISTINCT session_id FROM harness_events ORDER BY session_id"
+        ).fetchall()
+    ]
+    collapsed_groups = 0
+    removed_rows = 0
+    divergent = audit_duplicate_harness_events(con).divergent_groups
 
-    con.execute("BEGIN TRANSACTION")
-    try:
-        removed = con.execute(f"""
-            DELETE FROM harness_events
-             WHERE event_id IN (
-                WITH collapsible AS ({_duplicate_groups_sql(" WHERE bodies = 1 AND types = 1 AND stamps = 1")}),
-                ranked AS (
-                    SELECT e.event_id,
-                           row_number() OVER (
-                               PARTITION BY e.session_id, e.seq
-                               ORDER BY length(e.payload_json), e.event_id
-                           ) AS rank
-                      FROM harness_events e
-                      JOIN collapsible c
-                        ON c.session_id = e.session_id AND c.seq = e.seq
+    for start in range(0, len(session_ids), max(1, batch_sessions)):
+        batch = session_ids[start : start + max(1, batch_sessions)]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = con.execute(
+            f"""
+            SELECT event_id, session_id, seq, event_type, created_at, payload_json
+              FROM harness_events
+             WHERE session_id IN ({placeholders})
+             ORDER BY session_id, seq, length(payload_json), event_id
+            """,
+            batch,
+        ).fetchall()
+
+        keepers: dict[str, str] = {}
+        doomed: list[str] = []
+        for event_id, session_id, seq, event_type, created_at, payload_json in rows:
+            try:
+                payload = json.loads(payload_json) if payload_json else {}
+            except (TypeError, ValueError):
+                payload = {}
+            identity = harness_event_identity(
+                session_id=session_id,
+                seq=seq,
+                event_type=event_type,
+                created_at=created_at,
+                payload=payload,
+            )
+            if identity in keepers:
+                # Ordered by payload length then id, so the first row seen is
+                # the copy `wire_payload` produces and the rest are replays.
+                doomed.append(str(event_id))
+            else:
+                keepers[identity] = str(event_id)
+
+        con.execute("BEGIN TRANSACTION")
+        try:
+            if doomed:
+                marks = ", ".join("?" for _ in doomed)
+                con.execute(
+                    f"DELETE FROM harness_events WHERE event_id IN ({marks})", doomed
                 )
-                SELECT event_id FROM ranked WHERE rank > 1
-             )
-            RETURNING event_id
-            """).fetchall()
-        con.execute("COMMIT")
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
+                collapsed_groups += len(doomed)
+                removed_rows += len(doomed)
+            for identity, event_id in keepers.items():
+                con.execute(
+                    "UPDATE harness_events SET dedup_key = ? WHERE event_id = ?",
+                    [identity, event_id],
+                )
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
     return DuplicateEventMigration(
-        collapsed_groups=audit.collapsible_groups,
-        removed_rows=len(removed),
-        divergent_groups=audit.divergent_groups,
+        collapsed_groups=collapsed_groups,
+        removed_rows=removed_rows,
+        divergent_groups=divergent,
     )
 
 

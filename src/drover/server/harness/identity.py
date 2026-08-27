@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 #: Stripped before hashing: `wire_payload` removes it on the way out, so a
@@ -43,6 +44,24 @@ def _strip(value: Any) -> Any:
     return value
 
 
+def _canonical_timestamp(value: Any) -> str:
+    """One spelling of an instant, whichever side of the store it came from.
+
+    `harness_events.created_at` is a `TIMESTAMP`, never `TIMESTAMPTZ`. Binding
+    an aware datetime converts it to *process-local* wall time and drops the
+    offset, so a value read back out is naive local while the value going in is
+    aware UTC. `registry._db_timestamp_to_utc` documents the same trap.
+
+    Without this the insert path and the backfill hash different strings for one
+    event -- 14:00:46+00:00 against 07:00:46 -- and the fence never matches, so
+    a replay is stored again and the migration achieves nothing.
+    """
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.astimezone()
+        return aware.astimezone(timezone.utc).isoformat()
+    return "" if value is None else str(value)
+
+
 def harness_event_identity(
     *,
     session_id: Optional[str],
@@ -64,7 +83,7 @@ def harness_event_identity(
             session_id or "",
             "" if seq is None else str(int(seq)),
             event_type or "",
-            "" if created_at is None else str(created_at),
+            _canonical_timestamp(created_at),
             body,
         ]
     )
