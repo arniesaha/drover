@@ -1577,3 +1577,81 @@ def test_dedupe_is_idempotent_and_reads_nothing_when_clean(tmp_path):
         assert audit_duplicate_harness_events(con).duplicate_groups == 0
     finally:
         con.close()
+
+
+def test_a_replay_under_a_fresh_id_is_not_stored_twice(tmp_path):
+    """The fence has to be the event, not the identifier an insert minted.
+
+    `reconcile_unsent_events` re-offers durable events after a harnessd
+    restart, and reads them through `HarnessEvent.wire_payload`, which stamps
+    the row's own id. While the fence was `ON CONFLICT (event_id)`, central saw
+    an id it had never held and inserted a second copy -- so a restart put back
+    every row a dedupe had just removed, 40,678 of them on the live hub
+    (drover#280).
+    """
+    registry, store = _registry(tmp_path)
+    registry.create_session(
+        host_id="h1",
+        harness="claude-code",
+        command="c",
+        session_id="s1",
+        mode="structured",
+    )
+    when = datetime(2026, 8, 17, 14, 0, 46, 728390, tzinfo=timezone.utc)
+
+    registry.append_event(
+        session_id="s1",
+        event_type="assistant_output",
+        seq=6,
+        payload={"event_id": "harness-event-original", "text": "hi"},
+        event_id="harness-event-original",
+        created_at=when,
+        normalized_source="structured",
+    )
+    # The replay: same event, the id the host happens to hold for it.
+    registry.append_event(
+        session_id="s1",
+        event_type="assistant_output",
+        seq=6,
+        payload={"event_id": "harness-event-replay", "text": "hi"},
+        event_id="harness-event-replay",
+        created_at=when,
+        normalized_source="structured",
+    )
+
+    events = registry.list_events("s1")
+    assert len(events) == 1, [e.event_id for e in events]
+
+
+def test_two_different_events_on_one_seq_are_still_distinct(tmp_path):
+    """The identity must not over-collapse.
+
+    Thirty sessions on the live hub hold genuinely different events at
+    `seq = 1` -- `session.started` beside `terminal.output` (drover#277). A
+    fence keyed on the sequence number alone would delete one of them.
+    """
+    registry, store = _registry(tmp_path)
+    registry.create_session(
+        host_id="h1",
+        harness="claude-code",
+        command="c",
+        session_id="s1",
+        mode="structured",
+    )
+
+    registry.append_event(
+        session_id="s1",
+        event_type="session.started",
+        seq=1,
+        payload={"a": 1},
+        created_at=datetime(2026, 7, 11, 18, 52, 24, tzinfo=timezone.utc),
+    )
+    registry.append_event(
+        session_id="s1",
+        event_type="terminal.output",
+        seq=1,
+        payload={"a": 2},
+        created_at=datetime(2026, 7, 11, 18, 52, 25, tzinfo=timezone.utc),
+    )
+
+    assert len(registry.list_events("s1")) == 2

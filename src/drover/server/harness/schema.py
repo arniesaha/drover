@@ -338,6 +338,9 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         "ON harness_sessions (client_session_id)"
     )
     con.execute(_HARNESS_EVENTS_DDL)
+    # Dropped before the column migration below and recreated after, because
+    # DuckDB refuses to drop a column an index depends on positionally.
+    con.execute("DROP INDEX IF EXISTS harness_events_dedup_key")
     _ensure_harness_columns(
         con,
         "harness_events",
@@ -346,7 +349,21 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "normalized_source": "VARCHAR",
             "content_preview": "VARCHAR",
             "seq": "INTEGER",
+            "dedup_key": "VARCHAR",
         },
+    )
+    # The fence that actually identifies an event. `event_id` is minted per
+    # insert, so a replay arriving under a fresh one never conflicted and every
+    # harnessd restart re-inserted the whole history (drover#280).
+    #
+    # NULLs stay distinct here on purpose: rows written before this column
+    # existed have none, and they must not collide with each other. That makes
+    # backfilling part of the migration rather than optional -- an unbackfilled
+    # row is still unfenced.
+    con.execute("DROP INDEX IF EXISTS harness_events_dedup_key")
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS harness_events_dedup_key "
+        "ON harness_events (dedup_key)"
     )
     migrate_legacy_harness_event_sequences(con)
     # Dropped, not migrated: every row duplicated a terminal.output event
