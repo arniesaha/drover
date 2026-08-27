@@ -18,6 +18,29 @@ from typing import Any, Mapping, Sequence
 _MAX_TAIL_CHARS = 2000
 
 
+def _artifact_note(row: Mapping[str, Any]) -> str:
+    """What git says about the work this iteration claimed to leave behind.
+
+    A claim and its commit are recorded separately (decision D1), so they can
+    disagree. When they do, say so here rather than letting the claim stand
+    unqualified -- the agent is better placed than the loop to decide what a
+    missing artifact means.
+    """
+    base = (row.get("base_ref") or "").strip()
+    head = (row.get("diff_ref") or "").strip()
+    if not head:
+        # Written before refs were recorded. Nothing truthful to add.
+        return ""
+    if base and head == base:
+        return "It committed nothing, so nothing of it is in the tree."
+    if row.get("artifact_present") is False:
+        return (
+            f"Its commit {head[:7]} is not in this tree, so that work is not "
+            "present however the claim reads."
+        )
+    return ""
+
+
 def render(
     *,
     goal_summary: str,
@@ -80,6 +103,9 @@ def render(
             lines.append(f"- Iteration {row.get('ordinal')}: {verdict}.")
             if claimed:
                 lines.append(f"  It reported: {claimed}")
+            note = _artifact_note(row)
+            if note:
+                lines.append(f"  {note}")
         lines.append("")
         tail = (history[-1].get("verification_tail") or "").strip()
         if tail:
