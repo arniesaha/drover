@@ -412,6 +412,10 @@ def test_usage_reads_all_three_real_provider_shapes() -> None:
 
     deepseek uses camelCase, codex adds reasoning tokens that are billed
     output, and claude-code nests cache fields alongside the totals.
+
+    `prompt_tokens` is every class billed as input, not `input_tokens` alone:
+    codex's 90 cached input tokens are charged, and for claude-code the cache
+    fields carry essentially all of the volume (drover#17).
     """
     from loop_engine.usage import from_events
 
@@ -438,7 +442,7 @@ def test_usage_reads_all_three_real_provider_shapes() -> None:
     )
 
     assert (claude.prompt_tokens, claude.completion_tokens) == (2, 121)
-    assert (codex.prompt_tokens, codex.completion_tokens) == (100, 25)
+    assert (codex.prompt_tokens, codex.completion_tokens) == (190, 25)
     assert (deepseek.prompt_tokens, deepseek.completion_tokens) == (32761, 251)
 
 

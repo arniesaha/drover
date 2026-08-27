@@ -134,7 +134,7 @@ class LoopDriver:
         model (drover#270).
         """
         try:
-            return from_events(self._api.messages(session_id))
+            return from_events(self._api.messages(session_id), self._harness)
         except HarnessApiError:
             return Usage()
 
