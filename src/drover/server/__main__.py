@@ -35,7 +35,7 @@ from drover.config import (
 from drover.schema import (
     EXPECTED_TABLES,
     bootstrap,
-    prune_legacy_harness_events,
+    prune_legacy_control_plane_tables,
 )
 from drover.server import ledger_shadow
 from drover.server.advisory.content_targets import content_bundle_from_payload
@@ -1021,7 +1021,7 @@ def harness_dedupe_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None
         click.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
 
 
-@harness_cmd.command(name="prune-legacy-events")
+@harness_cmd.command(name="prune-legacy-tables")
 @click.option(
     "--db",
     "db_path",
@@ -1036,21 +1036,21 @@ def harness_dedupe_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None
     "--apply",
     "apply",
     is_flag=True,
-    help="Actually drop the pre-split table. Without it this only reports.",
+    help="Actually drop the complete tables. Without it this only reports.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
-def harness_prune_legacy_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None:
-    """Drop the pre-split harness event copy once the control plane holds it all.
+def harness_prune_legacy_tables_cmd(db_path: Path, apply: bool, as_json: bool) -> None:
+    """Drop pre-split control-plane copies once the control plane holds them.
 
     The control-plane split left the old tables in the analytical store as a
-    cheap rollback. That copy is also where drover#280 resurrects deleted
-    events from on every start, so once the control plane demonstrably holds
-    every row -- tested on identity, not event_id -- this removes it. Refuses
-    to drop while anything is still missing.
+    cheap rollback. That copy is also where drover#280 resurrects deleted rows
+    from on every start, so once the control plane demonstrably holds a table
+    -- tested on identity for harness_events, on the primary key for the rest
+    -- this removes it. A table with anything still missing is left alone.
     """
     con = duckdb.connect(str(db_path), read_only=not apply)
     try:
-        payload = prune_legacy_harness_events(con, db_path, apply=apply)
+        payload = prune_legacy_control_plane_tables(con, db_path, apply=apply)
     finally:
         con.close()
     if as_json:

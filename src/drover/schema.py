@@ -1710,64 +1710,99 @@ def _copy_harness_events_by_identity(
     return len(params)
 
 
-def prune_legacy_harness_events(
+def _scalar_int(con: duckdb.DuckDBPyConnection, sql: str) -> int:
+    """First column of the first row, as an int. `fetchone` is Optional."""
+    row = con.execute(sql).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _harness_events_gap(con: duckdb.DuckDBPyConnection, alias: str) -> tuple[int, int]:
+    """Rows in the pre-split harness event copy, and how many are not held.
+
+    "Not held" is tested on identity, not `event_id`: collapsing a duplicate
+    group deletes event_ids whose content survives under another one, and those
+    rows are present, not missing.
+    """
+    dst_columns = _column_names(con, f"{alias}.{HARNESS_EVENTS_TABLE}")
+    src_columns = _column_names(con, f"main.{HARNESS_EVENTS_TABLE}")
+    if "dedup_key" not in dst_columns:
+        # No identity column means no way to prove the copy is redundant, so
+        # report everything as missing and let the caller keep it.
+        total = _scalar_int(con, f"SELECT count(*) FROM main.{HARNESS_EVENTS_TABLE}")
+        return total, total
+    shared = [name for name in dst_columns if name in src_columns]
+    rows = con.execute(
+        f"SELECT {', '.join(shared)} FROM main.{HARNESS_EVENTS_TABLE}"
+    ).fetchall()
+    at = {name: position for position, name in enumerate(shared)}
+    identities = [_identity_for_row(row, at) for row in rows]
+    missing = set(identities) - _existing_identities(con, alias, identities)
+    return len(rows), len(missing)
+
+
+def prune_legacy_control_plane_tables(
     con: duckdb.DuckDBPyConnection, duckdb_path: Path, *, apply: bool = False
 ) -> dict[str, Any]:
-    """Drop the pre-split harness event copy once the control plane holds it all.
+    """Drop pre-split copies the control plane already holds.
 
-    The pre-split tables are kept as a cheap rollback for the control-plane
-    split. That copy is also what drover#280 resurrects deleted events from, so
-    once the control plane demonstrably holds every one of its rows it is pure
-    liability. "Holds" is tested on identity, not `event_id`: collapsing a
-    duplicate group deletes event_ids whose content survives under another one,
-    and those rows are present, not missing.
+    The control-plane split left the old tables in the analytical store as a
+    cheap rollback. That copy is also what `migrate_control_plane_tables`
+    resurrects deleted rows from on every start (drover#280), so once the
+    control plane demonstrably holds every row the copy is pure liability.
 
-    Reports without dropping unless `apply`, and refuses to drop while anything
-    is still missing.
+    Completeness is tested per table: on identity for `harness_events`, whose
+    primary key is not its identity, and on the primary key for the rest.
+    A table with anything still missing is left exactly where it is.
+
+    Reports without dropping unless `apply`.
     """
     registry_path = control_plane_path(duckdb_path)
     report: dict[str, Any] = {
         "database": str(duckdb_path),
         "control_plane": str(registry_path),
-        "present": False,
-        "legacy_rows": 0,
-        "missing": 0,
-        "dropped": False,
+        "tables": {},
     }
-    found = con.execute(
-        "SELECT count(*) FROM information_schema.tables "
-        f"WHERE table_name = '{HARNESS_EVENTS_TABLE}' "
-        "AND table_type = 'BASE TABLE'"
-    ).fetchone()
-    present = bool(found[0]) if found else False
+    # Read before attaching, so the attached catalog cannot widen this.
+    present = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_type = 'BASE TABLE'"
+        ).fetchall()
+    } & set(CONTROL_PLANE_TABLES)
     if not present:
         return report
-    report["present"] = True
 
     alias = "drover_control_plane_prune"
     con.execute(f"ATTACH {sql_path_literal(registry_path)} AS {alias} (READ_ONLY)")
     try:
-        dst_columns = _column_names(con, f"{alias}.{HARNESS_EVENTS_TABLE}")
-        if "dedup_key" not in dst_columns:
-            # No identity column means no way to prove the copy is redundant.
-            return report
-        src_columns = _column_names(con, f"main.{HARNESS_EVENTS_TABLE}")
-        shared = [name for name in dst_columns if name in src_columns]
-        projection = ", ".join(shared)
-        rows = con.execute(
-            f"SELECT {projection} FROM main.{HARNESS_EVENTS_TABLE}"
-        ).fetchall()
-        report["legacy_rows"] = len(rows)
-        at = {name: position for position, name in enumerate(shared)}
-        identities = [_identity_for_row(row, at) for row in rows]
-        missing = set(identities) - _existing_identities(con, alias, identities)
-        report["missing"] = len(missing)
+        for table in CONTROL_PLANE_TABLES:
+            if table not in present:
+                continue
+            if table == HARNESS_EVENTS_TABLE:
+                rows, missing = _harness_events_gap(con, alias)
+            else:
+                key = CONTROL_PLANE_PRIMARY_KEYS[table]
+                rows = _scalar_int(con, f"SELECT count(*) FROM main.{table}")
+                missing = _scalar_int(
+                    con,
+                    f"SELECT count(*) FROM main.{table} src "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+                    f"WHERE dst.{key} = src.{key})",
+                )
+            report["tables"][table] = {
+                "rows": rows,
+                "missing": missing,
+                "dropped": False,
+            }
     finally:
         con.execute(f"DETACH {alias}")
 
-    if apply and not report["missing"]:
-        con.execute(f"DROP TABLE main.{HARNESS_EVENTS_TABLE}")
-        report["dropped"] = True
+    if apply:
+        for table, entry in report["tables"].items():
+            if not entry["missing"]:
+                con.execute(f"DROP TABLE main.{table}")
+                entry["dropped"] = True
     return report
 
 
