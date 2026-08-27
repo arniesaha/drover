@@ -15,8 +15,10 @@ Layout:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -29,6 +31,7 @@ from drover.server.db import (
     control_plane_path,
     sql_path_literal,
 )
+from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
 
 log = logging.getLogger("drover.schema")
@@ -1559,6 +1562,215 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
     return registry_path
 
 
+HARNESS_EVENTS_TABLE = "harness_events"
+
+#: Kept well under DuckDB's parameter ceiling; the list is only ever as long as
+#: the number of pre-split rows the control plane is missing, which is zero on
+#: a hub that has finished migrating.
+_IDENTITY_LOOKUP_CHUNK = 500
+
+
+def _copy_by_primary_key(
+    con: duckdb.DuckDBPyConnection, *, alias: str, table: str, duckdb_path: Path
+) -> int:
+    """Copy rows the destination is missing, keyed on the table's primary key."""
+    key = CONTROL_PLANE_PRIMARY_KEYS[table]
+    missing_sql = (
+        f"SELECT count(*) FROM main.{table} src "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+        f"WHERE dst.{key} = src.{key})"
+    )
+    pending = int(con.execute(missing_sql).fetchone()[0])
+    if pending:
+        con.execute(
+            f"INSERT INTO {alias}.{table} BY NAME "
+            f"SELECT src.* FROM main.{table} src "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+            f"WHERE dst.{key} = src.{key})"
+        )
+        remaining = int(con.execute(missing_sql).fetchone()[0])
+        if remaining:
+            raise RuntimeError(
+                f"control-plane migration left {remaining} {table} row(s) "
+                f"behind in {duckdb_path}"
+            )
+    return pending
+
+
+def _column_names(con: duckdb.DuckDBPyConnection, qualified: str) -> list[str]:
+    return [str(row[0]) for row in con.execute(f"DESCRIBE {qualified}").fetchall()]
+
+
+def _existing_identities(
+    con: duckdb.DuckDBPyConnection, alias: str, identities: list[str]
+) -> set[str]:
+    """Which of `identities` the control plane already holds."""
+    found: set[str] = set()
+    unique = list(dict.fromkeys(identities))
+    for start in range(0, len(unique), _IDENTITY_LOOKUP_CHUNK):
+        chunk = unique[start : start + _IDENTITY_LOOKUP_CHUNK]
+        placeholders = ", ".join("?" for _ in chunk)
+        found.update(
+            str(row[0])
+            for row in con.execute(
+                f"SELECT dedup_key FROM {alias}.{HARNESS_EVENTS_TABLE} "
+                f"WHERE dedup_key IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        )
+    return found
+
+
+def _identity_for_row(row: tuple, at: dict[str, int]) -> str:
+    """Identity of one pre-split harness event row.
+
+    A pre-split table has no `seq` column; the events that predate it were
+    inserted with a NULL seq on the control-plane side too, so both sides hash
+    the same absent value.
+    """
+    raw_payload = row[at["payload_json"]]
+    try:
+        payload = json.loads(raw_payload) if raw_payload else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return harness_event_identity(
+        session_id=row[at["session_id"]],
+        seq=row[at["seq"]] if "seq" in at else None,
+        event_type=row[at["event_type"]],
+        created_at=row[at["created_at"]],
+        payload=payload if isinstance(payload, dict) else {},
+    )
+
+
+def _copy_harness_events_by_identity(
+    con: duckdb.DuckDBPyConnection, *, alias: str, duckdb_path: Path
+) -> int:
+    """Copy pre-split harness events, keyed on identity rather than `event_id`.
+
+    `event_id` is this table's primary key but not its identity. Collapsing a
+    duplicate group (drover#280) deletes event_ids whose content survives under
+    a different one, so a primary-key copy resurrects them on the next start --
+    and because a pre-split table has no `dedup_key` column, `INSERT ... BY
+    NAME` leaves the identity NULL, which the unique index cannot reject
+    (DuckDB treats NULLs as distinct). Identity is therefore computed here, and
+    both the presence test and the insert use it.
+
+    Falls back to the primary-key copy on a control plane that predates
+    `dedup_key`: such a store has no identity index to protect.
+    """
+    dst_columns = _column_names(con, f"{alias}.{HARNESS_EVENTS_TABLE}")
+    if "dedup_key" not in dst_columns:
+        return _copy_by_primary_key(
+            con, alias=alias, table=HARNESS_EVENTS_TABLE, duckdb_path=duckdb_path
+        )
+
+    src_columns = _column_names(con, f"main.{HARNESS_EVENTS_TABLE}")
+    shared = [
+        name for name in dst_columns if name in src_columns and name != "dedup_key"
+    ]
+    projection = ", ".join(f"src.{name}" for name in shared)
+    rows = con.execute(
+        f"SELECT {projection} FROM main.{HARNESS_EVENTS_TABLE} src "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{HARNESS_EVENTS_TABLE} dst "
+        f"WHERE dst.event_id = src.event_id)"
+    ).fetchall()
+    if not rows:
+        return 0
+
+    at = {name: position for position, name in enumerate(shared)}
+    candidates = [(_identity_for_row(row, at), row) for row in rows]
+
+    identities = [identity for identity, _ in candidates]
+    seen = _existing_identities(con, alias, identities)
+    params = []
+    for identity, row in candidates:
+        if identity in seen:
+            continue
+        seen.add(identity)
+        params.append([*row, identity])
+
+    if params:
+        placeholders = ", ".join("?" for _ in range(len(shared) + 1))
+        con.executemany(
+            f"INSERT INTO {alias}.{HARNESS_EVENTS_TABLE} "
+            f"({', '.join(shared)}, dedup_key) VALUES ({placeholders}) "
+            "ON CONFLICT DO NOTHING",
+            params,
+        )
+
+    # Same contract as the primary-key path: nothing the source holds may be
+    # missing afterwards. Verified on identity, because that is what "the
+    # control plane already has this event" now means.
+    remaining = set(identities) - _existing_identities(con, alias, identities)
+    if remaining:
+        raise RuntimeError(
+            f"control-plane migration left {len(remaining)} "
+            f"{HARNESS_EVENTS_TABLE} row(s) behind in {duckdb_path}"
+        )
+    return len(params)
+
+
+def prune_legacy_harness_events(
+    con: duckdb.DuckDBPyConnection, duckdb_path: Path, *, apply: bool = False
+) -> dict[str, Any]:
+    """Drop the pre-split harness event copy once the control plane holds it all.
+
+    The pre-split tables are kept as a cheap rollback for the control-plane
+    split. That copy is also what drover#280 resurrects deleted events from, so
+    once the control plane demonstrably holds every one of its rows it is pure
+    liability. "Holds" is tested on identity, not `event_id`: collapsing a
+    duplicate group deletes event_ids whose content survives under another one,
+    and those rows are present, not missing.
+
+    Reports without dropping unless `apply`, and refuses to drop while anything
+    is still missing.
+    """
+    registry_path = control_plane_path(duckdb_path)
+    report: dict[str, Any] = {
+        "database": str(duckdb_path),
+        "control_plane": str(registry_path),
+        "present": False,
+        "legacy_rows": 0,
+        "missing": 0,
+        "dropped": False,
+    }
+    found = con.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        f"WHERE table_name = '{HARNESS_EVENTS_TABLE}' "
+        "AND table_type = 'BASE TABLE'"
+    ).fetchone()
+    present = bool(found[0]) if found else False
+    if not present:
+        return report
+    report["present"] = True
+
+    alias = "drover_control_plane_prune"
+    con.execute(f"ATTACH {sql_path_literal(registry_path)} AS {alias} (READ_ONLY)")
+    try:
+        dst_columns = _column_names(con, f"{alias}.{HARNESS_EVENTS_TABLE}")
+        if "dedup_key" not in dst_columns:
+            # No identity column means no way to prove the copy is redundant.
+            return report
+        src_columns = _column_names(con, f"main.{HARNESS_EVENTS_TABLE}")
+        shared = [name for name in dst_columns if name in src_columns]
+        projection = ", ".join(shared)
+        rows = con.execute(
+            f"SELECT {projection} FROM main.{HARNESS_EVENTS_TABLE}"
+        ).fetchall()
+        report["legacy_rows"] = len(rows)
+        at = {name: position for position, name in enumerate(shared)}
+        identities = [_identity_for_row(row, at) for row in rows]
+        missing = set(identities) - _existing_identities(con, alias, identities)
+        report["missing"] = len(missing)
+    finally:
+        con.execute(f"DETACH {alias}")
+
+    if apply and not report["missing"]:
+        con.execute(f"DROP TABLE main.{HARNESS_EVENTS_TABLE}")
+        report["dropped"] = True
+    return report
+
+
 def migrate_control_plane_tables(
     con: duckdb.DuckDBPyConnection, duckdb_path: Path
 ) -> dict[str, int]:
@@ -1617,27 +1829,14 @@ def migrate_control_plane_tables(
         for table in CONTROL_PLANE_TABLES:
             if table not in legacy:
                 continue
-            key = CONTROL_PLANE_PRIMARY_KEYS[table]
-            missing_sql = (
-                f"SELECT count(*) FROM main.{table} src "
-                f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
-                f"WHERE dst.{key} = src.{key})"
-            )
-            pending = int(con.execute(missing_sql).fetchone()[0])
-            if pending:
-                con.execute(
-                    f"INSERT INTO {alias}.{table} BY NAME "
-                    f"SELECT src.* FROM main.{table} src "
-                    f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
-                    f"WHERE dst.{key} = src.{key})"
+            if table == HARNESS_EVENTS_TABLE:
+                copied[table] = _copy_harness_events_by_identity(
+                    con, alias=alias, duckdb_path=duckdb_path
                 )
-                remaining = int(con.execute(missing_sql).fetchone()[0])
-                if remaining:
-                    raise RuntimeError(
-                        f"control-plane migration left {remaining} {table} row(s) "
-                        f"behind in {duckdb_path}"
-                    )
-            copied[table] = pending
+                continue
+            copied[table] = _copy_by_primary_key(
+                con, alias=alias, table=table, duckdb_path=duckdb_path
+            )
     finally:
         con.execute(f"DETACH {alias}")
     if any(copied.values()):
