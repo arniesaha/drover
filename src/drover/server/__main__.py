@@ -32,7 +32,11 @@ from drover.config import (
     load_config,
     resolve_api_token_env,
 )
-from drover.schema import EXPECTED_TABLES, bootstrap
+from drover.schema import (
+    EXPECTED_TABLES,
+    bootstrap,
+    prune_legacy_harness_events,
+)
 from drover.server import ledger_shadow
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
@@ -1011,6 +1015,44 @@ def harness_dedupe_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None
     it removes are copies.
     """
     payload = _duplicate_events_payload(db_path, apply=apply)
+    if as_json:
+        click.echo(json.dumps(payload, sort_keys=True))
+    else:
+        click.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
+
+
+@harness_cmd.command(name="prune-legacy-events")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help=(
+        "The lakehouse path -- the pre-split copy lives in the analytical "
+        "store, not the control-plane store beside it."
+    ),
+)
+@click.option(
+    "--apply",
+    "apply",
+    is_flag=True,
+    help="Actually drop the pre-split table. Without it this only reports.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def harness_prune_legacy_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None:
+    """Drop the pre-split harness event copy once the control plane holds it all.
+
+    The control-plane split left the old tables in the analytical store as a
+    cheap rollback. That copy is also where drover#280 resurrects deleted
+    events from on every start, so once the control plane demonstrably holds
+    every row -- tested on identity, not event_id -- this removes it. Refuses
+    to drop while anything is still missing.
+    """
+    con = duckdb.connect(str(db_path), read_only=not apply)
+    try:
+        payload = prune_legacy_harness_events(con, db_path, apply=apply)
+    finally:
+        con.close()
     if as_json:
         click.echo(json.dumps(payload, sort_keys=True))
     else:
