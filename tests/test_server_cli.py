@@ -1537,3 +1537,40 @@ def test_duplicate_event_audit_reads_a_store_opened_read_only(tmp_path):
         reader.close()
 
     assert payload["collapsible_groups"] == 0
+
+
+def test_dedupe_apply_creates_the_identity_column_it_writes(tmp_path):
+    """The migration writes `dedup_key`, so the column must exist first.
+
+    Making the audit read-only (#279) removed the bootstrap from both paths,
+    including the one that needs it. The migration then failed on any store
+    predating the column -- which is every store it exists to fix.
+    """
+    import duckdb as _duckdb
+
+    from drover.schema import bootstrap
+    from drover.server.__main__ import _duplicate_events_payload
+    from drover.server.db import control_plane_path
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    store = control_plane_path(duckdb_path)
+
+    con = _duckdb.connect(str(store))
+    try:
+        con.execute("DROP INDEX IF EXISTS harness_events_dedup_key")
+        con.execute("ALTER TABLE harness_events DROP COLUMN dedup_key")
+    finally:
+        con.close()
+
+    payload = _duplicate_events_payload(duckdb_path, apply=True)
+
+    assert payload["applied"] is True
+    con = _duckdb.connect(str(store), read_only=True)
+    try:
+        columns = {
+            r[1] for r in con.execute("PRAGMA table_info('harness_events')").fetchall()
+        }
+    finally:
+        con.close()
+    assert "dedup_key" in columns
