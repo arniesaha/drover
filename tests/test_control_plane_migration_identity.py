@@ -16,7 +16,10 @@ import json
 
 import duckdb
 
-from drover.schema import migrate_control_plane_tables, prune_legacy_harness_events
+from drover.schema import (
+    migrate_control_plane_tables,
+    prune_legacy_control_plane_tables,
+)
 from drover.server.db import control_plane_path
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
@@ -190,12 +193,12 @@ def test_the_pre_split_copy_is_kept_while_the_control_plane_is_missing_a_row(tmp
             ["kept", "genuinely-missing"],
             created_at={"genuinely-missing": _CREATED_AT + dt.timedelta(seconds=5)},
         )
-        report = prune_legacy_harness_events(con, analytical, apply=True)
+        report = prune_legacy_control_plane_tables(con, analytical, apply=True)
     finally:
         con.close()
 
-    assert report["missing"] == 1
-    assert report["dropped"] is False
+    assert report["tables"]["harness_events"]["missing"] == 1
+    assert report["tables"]["harness_events"]["dropped"] is False
     assert _legacy_table_exists(analytical), "dropped a copy still holding rows"
 
 
@@ -209,13 +212,13 @@ def test_the_pre_split_copy_is_dropped_once_every_row_is_in_the_control_plane(tm
         # Both pre-split rows carry the identity the control plane kept, which
         # is the drover#280 shape: one survivor, one collapsed duplicate.
         _seed_legacy(con, ["kept", "dropped"])
-        report = prune_legacy_harness_events(con, analytical, apply=True)
+        report = prune_legacy_control_plane_tables(con, analytical, apply=True)
     finally:
         con.close()
 
-    assert report["legacy_rows"] == 2
-    assert report["missing"] == 0
-    assert report["dropped"] is True
+    assert report["tables"]["harness_events"]["rows"] == 2
+    assert report["tables"]["harness_events"]["missing"] == 0
+    assert report["tables"]["harness_events"]["dropped"] is True
     assert not _legacy_table_exists(analytical)
 
 
@@ -232,10 +235,10 @@ def test_the_prune_reports_without_dropping_unless_asked(tmp_path):
 
     con = duckdb.connect(str(analytical), read_only=True)
     try:
-        report = prune_legacy_harness_events(con, analytical, apply=False)
+        report = prune_legacy_control_plane_tables(con, analytical, apply=False)
     finally:
         con.close()
 
-    assert report["missing"] == 0
-    assert report["dropped"] is False
+    assert report["tables"]["harness_events"]["missing"] == 0
+    assert report["tables"]["harness_events"]["dropped"] is False
     assert _legacy_table_exists(analytical)
