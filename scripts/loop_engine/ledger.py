@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS goal_iterations (
   verification_tail  VARCHAR,
   claimed_outcome    VARCHAR,
   diff_ref           VARCHAR,
+  -- The commit this iteration started from. Paired with `diff_ref` it says
+  -- whether the session left anything behind, and lets the next brief check
+  -- that what it left is still in the tree. Without the pair, a claim can
+  -- outlive its artifact silently, which is what the first live run hit.
+  base_ref           VARCHAR,
   prompt_tokens      BIGINT,
   completion_tokens  BIGINT,
   cost_usd           DOUBLE,
@@ -71,6 +76,7 @@ class Iteration:
     verification_tail: Optional[str] = None
     claimed_outcome: Optional[str] = None
     diff_ref: Optional[str] = None
+    base_ref: Optional[str] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     cost_usd: Optional[float] = None
@@ -87,6 +93,12 @@ class ScratchLedger:
         con = duckdb.connect(str(self.path))
         try:
             con.execute(_SCHEMA)
+            # `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a
+            # ledger written before `base_ref` needs the column added.
+            con.execute(
+                "ALTER TABLE goal_iterations ADD COLUMN IF NOT EXISTS "
+                "base_ref VARCHAR"
+            )
         finally:
             con.close()
 
@@ -100,8 +112,12 @@ class ScratchLedger:
         try:
             con.execute(
                 """
-                INSERT OR REPLACE INTO goal_iterations VALUES
-                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO goal_iterations (
+                  goal_id, ordinal, started_at, ended_at, host_id, session_id,
+                  harness, brief_rendered, verification_cmd, verification_exit,
+                  verification_tail, claimed_outcome, diff_ref, base_ref,
+                  prompt_tokens, completion_tokens, cost_usd, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     iteration.goal_id,
@@ -117,6 +133,7 @@ class ScratchLedger:
                     iteration.verification_tail,
                     iteration.claimed_outcome,
                     iteration.diff_ref,
+                    iteration.base_ref,
                     iteration.prompt_tokens,
                     iteration.completion_tokens,
                     iteration.cost_usd,

@@ -25,12 +25,13 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .api import HarnessApi, HarnessApiError
 from .brief import render
 from .goals import Goal
 from .ledger import Iteration, ScratchLedger, utcnow
+from .tree import head_commit, is_reachable
 from .usage import Usage, from_events
 
 log = logging.getLogger("loop_engine.driver")
@@ -154,8 +155,23 @@ class LoopDriver:
                 return str(message.get("text") or message.get("content") or "")[:4000]
         return ""
 
+    def _annotated_history(self) -> list[dict[str, Any]]:
+        """History, with git asked whether each claim's artifact is still here.
+
+        Decision D1 keeps claims and artifacts in different places, so they can
+        disagree. The brief says when they do; this is where the question gets
+        asked, because only the driver knows which tree the goal is about.
+        """
+        rows = self._ledger.history(self._goal.goal_id)
+        for row in rows:
+            head = (row.get("diff_ref") or "").strip()
+            base = (row.get("base_ref") or "").strip()
+            if head and head != base:
+                row["artifact_present"] = is_reachable(self._goal.cwd, head)
+        return rows
+
     def run_iteration(self, ordinal: int) -> IterationOutcome:
-        history = self._ledger.history(self._goal.goal_id)
+        history = self._annotated_history()
         brief = render(
             goal_summary=self._goal.summary,
             goal_kind=self._goal.kind,
@@ -164,6 +180,9 @@ class LoopDriver:
             max_iterations=self._caps.max_iterations,
         )
         started = utcnow()
+        # Read before the session runs: what it leaves behind is only
+        # identifiable against where it started.
+        base_ref = head_commit(self._goal.cwd)
         session_id: Optional[str] = None
         claimed = ""
         stopped = None
@@ -211,6 +230,8 @@ class LoopDriver:
                 verification_exit=verification.exit_code,
                 verification_tail=tail,
                 claimed_outcome=claimed or None,
+                diff_ref=head_commit(self._goal.cwd),
+                base_ref=base_ref,
                 prompt_tokens=usage.prompt_tokens if usage.observed else None,
                 completion_tokens=(usage.completion_tokens if usage.observed else None),
                 note=stopped,
