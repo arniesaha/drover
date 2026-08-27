@@ -84,6 +84,7 @@ from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_duplicate_harness_events,
+    bootstrap_harness_tables,
     migrate_duplicate_harness_events,
 )
 from drover.server.jobs import RedisJobStream, RedisJobStreamConfig
@@ -929,6 +930,12 @@ def _duplicate_events_payload(db_path: Path, *, apply: bool) -> dict[str, Any]:
     con = duckdb.connect(str(store), read_only=not apply)
     try:
         if apply:
+            # The migration writes `dedup_key`, so the column has to exist.
+            # #279 removed this call from both paths to make the audit
+            # read-only, and took it off the apply path too -- which left the
+            # migration failing on a store that predates the column, which is
+            # every store it is meant to fix.
+            bootstrap_harness_tables(con)
             result = migrate_duplicate_harness_events(con)
             payload: dict[str, Any] = {
                 "collapsed_groups": result.collapsed_groups,
