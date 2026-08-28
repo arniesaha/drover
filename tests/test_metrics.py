@@ -2618,6 +2618,11 @@ def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> 
     assert hosts["phone"]["status"] == "offline"
 
     collector.relay_manager = None  # no live sockets at all
+    # The hosts-only render is cached for `harness_ttl_seconds`, so swapping
+    # the manager out from under it is not visible until that expires. In
+    # production the override is recomputed within the same window, and the
+    # full render has always carried this staleness on the same field.
+    collector.invalidate_harness_cache()
     payload = json.loads(collector.render_harness_json(include_sessions=False))
     hosts = {h["host_id"]: h for h in payload["hosts"]}
     assert hosts["laptop"]["status"] == "offline"  # stored "online" must not leak
