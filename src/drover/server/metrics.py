@@ -924,8 +924,14 @@ class MetricsCollector:
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
     _cached_until: float = field(default=0.0, init=False)
-    _harness_cached_json: str | None = field(default=None, init=False)
-    _harness_cached_until: float = field(default=0.0, init=False)
+    #: Rendered harness snapshots by variant, each with its expiry. Keyed
+    #: because `/harness/hosts` asks for `include_sessions=False` and was
+    #: therefore never cached -- while being the endpoint the fleet actually
+    #: polls. Bounded: only the default archived cap is cached, so the key
+    #: space is the two booleans and no client can grow it.
+    _harness_cache: dict[tuple[bool, bool], tuple[float, str]] = field(
+        default_factory=dict, init=False
+    )
     _refreshing: bool = field(default=False, init=False)
     _refresh_guard: threading.Lock = field(default_factory=threading.Lock, init=False)
     _session_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False)
@@ -969,22 +975,34 @@ class MetricsCollector:
         # A caller asking for a non-default archived cap counts as partial for
         # the same reason -- serving it the cached default would silently hand
         # back 20 sessions to someone who asked for 100.
+        # A caller-supplied archived cap is not cached: serving it the cached
+        # default would silently hand back the default number of sessions to
+        # someone who asked for 100, and caching per cap would let any client
+        # grow the dictionary without bound.
         default_cap = archived_limit is _UNSET_ARCHIVED_LIMIT
-        full = include_hosts and include_sessions and default_cap
+        key = (include_hosts, include_sessions)
         now = time.monotonic()
-        if full and self._harness_cached_json is not None:
-            if now < self._harness_cached_until:
-                return self._harness_cached_json
+        if default_cap:
+            entry = self._harness_cache.get(key)
+            if entry is not None and now < entry[0]:
+                return entry[1]
         snapshot = self.harness_snapshot(
             include_hosts=include_hosts,
             include_sessions=include_sessions,
             archived_limit=archived_limit,
         )
         rendered = json.dumps(snapshot, sort_keys=True, default=str) + "\n"
-        if full:
-            self._harness_cached_json = rendered
-            self._harness_cached_until = now + self.harness_ttl_seconds
+        if default_cap:
+            self._harness_cache[key] = (now + self.harness_ttl_seconds, rendered)
         return rendered
+
+    def invalidate_harness_cache(self) -> None:
+        """Drop every rendered variant.
+
+        All of them, not just the full render: a stale hosts-only answer is
+        exactly as wrong as a stale full one, and it is the one being polled.
+        """
+        self._harness_cache.clear()
 
     def render_harness_session_json(self, session_id: str) -> tuple[int, str]:
         snapshot = self.harness_session_snapshot(session_id)
@@ -1445,8 +1463,7 @@ class MetricsCollector:
                     session_id,
                     exc,
                 )
-            self._harness_cached_json = None
-            self._harness_cached_until = 0.0
+            self.invalidate_harness_cache()
             status, body = self._harness_request(
                 host,
                 f"/sessions/{session_id}/{action}",
