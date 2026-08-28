@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 log = logging.getLogger("drover.config")
 
@@ -81,6 +82,75 @@ class AdvisoryContentConfig:
                 raise ValueError(f"advisory_content.{field_name} must be positive")
 
 
+@dataclass(frozen=True, slots=True)
+class ArchiveConfig:
+    """Validated local Pond HTTP boundary for optional archive recall."""
+
+    enabled: bool
+    base_url: str
+    timeout_seconds: float
+    search_limit: int
+    context_before: int
+    context_after: int
+    max_context_chars: int
+    max_response_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("archive.enabled must be a boolean")
+        if type(self.base_url) is not str:
+            raise ValueError("archive.base_url must be a string")
+
+        if self.base_url:
+            try:
+                parsed = urlsplit(self.base_url)
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError("archive.base_url must be a valid URL") from exc
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in {"", "/"}
+                or (port is not None and not 0 <= port <= 65535)
+            ):
+                raise ValueError("archive.base_url must be a loopback HTTP root URL")
+            if parsed.path == "/":
+                object.__setattr__(self, "base_url", self.base_url[:-1])
+        elif self.enabled:
+            raise ValueError(
+                "archive.base_url is required when archive.enabled is true"
+            )
+
+        if type(self.timeout_seconds) not in (int, float):
+            raise ValueError("archive.timeout_seconds must be a finite number")
+        if (
+            not math.isfinite(self.timeout_seconds)
+            or not 0.1 <= self.timeout_seconds <= 10.0
+        ):
+            raise ValueError("archive.timeout_seconds must be between 0.1 and 10.0")
+        object.__setattr__(self, "timeout_seconds", float(self.timeout_seconds))
+
+        bounds = {
+            "search_limit": (1, 20),
+            "context_before": (0, 10),
+            "context_after": (0, 10),
+            "max_context_chars": (1_000, 100_000),
+            "max_response_bytes": (1_024, 2_097_152),
+        }
+        for field_name, (minimum, maximum) in bounds.items():
+            value = getattr(self, field_name)
+            if type(value) is not int:
+                raise ValueError(f"archive.{field_name} must be an integer")
+            if not minimum <= value <= maximum:
+                raise ValueError(
+                    f"archive.{field_name} must be between {minimum} and {maximum}"
+                )
+
+
 @dataclass(frozen=True)
 class FavoriteCwd:
     """A "favorite" working directory offered in the New Session sheet.
@@ -129,6 +199,7 @@ class DroverConfig:
     metrics_http_port: int
     agent_id: str
     principal_id: str
+    archive: ArchiveConfig
     # Summarizer backend knobs (all optional — sensible fallbacks via env)
     summarizer_backend_policy: str
     summarizer_api_model: str
@@ -250,6 +321,16 @@ _DEFAULTS = {
     "agent": {
         "agent_id": "unknown-agent",
         "principal_id": "unknown",
+    },
+    "archive": {
+        "enabled": False,
+        "base_url": "",
+        "timeout_seconds": 3.0,
+        "search_limit": 5,
+        "context_before": 2,
+        "context_after": 2,
+        "max_context_chars": 24_000,
+        "max_response_bytes": 1_048_576,
     },
     "summarizer": {
         # harness: summarize through the claude-code CLI already installed and
@@ -391,6 +472,7 @@ def _from_dict(d: dict) -> DroverConfig:
     e = d["embeddings"]
     r = d["redis_shadow"]
     j = d["redis_jobs"]
+    archive = d["archive"]
     content = d["advisory_content"]
     provider_freshness_threshold = d["provider"]["freshness_threshold_seconds"]
     if (
@@ -413,6 +495,16 @@ def _from_dict(d: dict) -> DroverConfig:
         metrics_http_port=int(d["server"]["metrics_http_port"]),
         agent_id=d["agent"]["agent_id"],
         principal_id=d["agent"]["principal_id"],
+        archive=ArchiveConfig(
+            enabled=archive["enabled"],
+            base_url=archive["base_url"],
+            timeout_seconds=archive["timeout_seconds"],
+            search_limit=archive["search_limit"],
+            context_before=archive["context_before"],
+            context_after=archive["context_after"],
+            max_context_chars=archive["max_context_chars"],
+            max_response_bytes=archive["max_response_bytes"],
+        ),
         summarizer_backend_policy=s["backend_policy"],
         summarizer_api_model=s["api_model"],
         summarizer_harness_model=s["harness_model"],

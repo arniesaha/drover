@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 import pytest
 from click.testing import CliRunner
 
-from drover.config import default_config
+from drover.config import default_config, load_config
 from drover.schema import bootstrap
 from drover.server import __main__ as server_main
 from drover.server.__main__ import (
@@ -424,6 +424,9 @@ def test_cli_init_writes_default_config(tmp_path):
     assert '-claude"' not in text
     assert "192.168." not in text
     assert "10.10." not in text
+    cfg = load_config(target)
+    assert cfg.archive.enabled is False
+    assert cfg.archive.base_url == ""
 
 
 def test_run_help_uses_loopback_bind_defaults():

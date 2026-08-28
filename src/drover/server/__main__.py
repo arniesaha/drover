@@ -255,6 +255,18 @@ api_token = ""
 agent_id     = "{default_agent_id}"
 principal_id = "unknown"
 
+[archive]
+# Optional local Pond recall. This remains disabled until explicitly configured
+# with a loopback-only HTTP URL.
+enabled = false
+base_url = ""
+timeout_seconds = 3.0
+search_limit = 5
+context_before = 2
+context_after = 2
+max_context_chars = 24000
+max_response_bytes = 1048576
+
 [provider]
 # Provider fetches run every five minutes. Retain provider-reported quota facts,
 # but label them stale when no successful fetch has completed within this age.
