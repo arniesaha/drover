@@ -110,7 +110,15 @@ def _in_place_cfg(venv: Path):
     )
 
 
-def _updater(tmp_path, *, cfg, in_place_installer=None, idle=True, restarts=None):
+def _updater(
+    tmp_path,
+    *,
+    cfg,
+    in_place_installer=None,
+    idle=True,
+    restarts=None,
+    sibling_restarter=None,
+):
     layout = RuntimeLayout(tmp_path / "home")
     _installed(layout, "0.1.3")
     layout.flip("0.1.3")
@@ -122,6 +130,8 @@ def _updater(tmp_path, *, cfg, in_place_installer=None, idle=True, restarts=None
     kwargs = {}
     if in_place_installer is not None:
         kwargs["in_place_installer"] = in_place_installer
+    if sibling_restarter is not None:
+        kwargs["sibling_restarter"] = sibling_restarter
     return layout, HostUpdater(
         _state(idle=idle),
         layout,
@@ -134,6 +144,11 @@ def _updater(tmp_path, *, cfg, in_place_installer=None, idle=True, restarts=None
 
 def _refuse(*args, **kwargs):
     raise AssertionError("symlink mode must never install in place")
+
+
+def _installs(*args, **kwargs):
+    """A stand-in for the real in-place install, which shells out to uv."""
+    return True
 
 
 # --- the default path is untouched -------------------------------------------
@@ -569,3 +584,150 @@ def test_a_venv_we_cannot_stat_is_reported_as_a_grant_problem(
         )
     assert "privacy grant" in caplog.text
     assert "has no interpreter" not in caplog.text
+# --- services that share the venv (#226) -------------------------------------
+
+
+def _restart_recorder():
+    """One log for both restarts, so ordering between them is assertable."""
+    events: list = []
+    return (
+        events,
+        (lambda units: events.append(("siblings", tuple(units)))),
+        (lambda: events.append(("self", ()))),
+    )
+
+
+def test_in_place_activation_restarts_the_services_sharing_the_venv(tmp_path):
+    """The hub's server execs the same venv; installing in place rewrites it."""
+    venv = _venv(tmp_path)
+    cfg = replace(_in_place_cfg(venv), update_restart_units=("com.drover.server",))
+    events, siblings, myself = _restart_recorder()
+    layout, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=_installs,
+        restarts=myself,
+        sibling_restarter=siblings,
+    )
+
+    updater.observe(_beat("0.1.4"))
+    assert updater.maybe_activate() is True
+    assert events == [("siblings", ("com.drover.server",)), ("self", ())]
+
+
+def test_siblings_restart_before_this_process_does(tmp_path):
+    """Ordering is the whole point: restarting ourselves ends the process.
+
+    Anything sequenced after `self` would never run, so a sibling list that
+    was handled afterwards would silently do nothing.
+    """
+    venv = _venv(tmp_path)
+    cfg = replace(
+        _in_place_cfg(venv),
+        update_restart_units=("com.drover.server", "com.drover.collect"),
+    )
+    events, siblings, myself = _restart_recorder()
+    _, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=_installs,
+        restarts=myself,
+        sibling_restarter=siblings,
+    )
+
+    updater.observe(_beat("0.1.4"))
+    assert updater.maybe_activate() is True
+    assert [name for name, _ in events] == ["siblings", "self"]
+    assert events[0][1] == ("com.drover.server", "com.drover.collect")
+
+
+def test_symlink_activation_never_restarts_siblings(tmp_path):
+    """A symlink flip does not touch a running venv, so nothing else is owed one."""
+    cfg = replace(default_config(), update_restart_units=("com.drover.server",))
+    events, siblings, myself = _restart_recorder()
+    _, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=_refuse,
+        restarts=myself,
+        sibling_restarter=siblings,
+    )
+
+    updater.observe(_beat("0.1.4"))
+    assert updater.maybe_activate() is True
+    assert events == [("self", ())]
+
+
+def test_in_place_activation_with_no_configured_siblings_restarts_only_itself(tmp_path):
+    """Every host but the hub shares its venv with nothing."""
+    venv = _venv(tmp_path)
+    events, siblings, myself = _restart_recorder()
+    _, updater = _updater(
+        tmp_path,
+        cfg=_in_place_cfg(venv),
+        in_place_installer=_installs,
+        restarts=myself,
+        sibling_restarter=siblings,
+    )
+
+    updater.observe(_beat("0.1.4"))
+    assert updater.maybe_activate() is True
+    assert events == [("self", ())]
+
+
+def test_a_failed_install_restarts_nothing_at_all(tmp_path):
+    """No install, no rewritten venv, so no service is running mixed files."""
+    venv = _venv(tmp_path)
+    cfg = replace(_in_place_cfg(venv), update_restart_units=("com.drover.server",))
+    events, siblings, myself = _restart_recorder()
+    _, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=lambda *a, **k: False,
+        restarts=myself,
+        sibling_restarter=siblings,
+    )
+
+    updater.observe(_beat("0.1.4"))
+    assert updater.maybe_activate() is False
+    assert events == []
+
+
+def test_a_sibling_that_will_not_restart_does_not_strand_this_process(tmp_path):
+    """The venv is already rewritten; refusing to restart ourselves too is worse."""
+    venv = _venv(tmp_path)
+    cfg = replace(_in_place_cfg(venv), update_restart_units=("com.drover.server",))
+    restarted_self = []
+
+    def explode(units):
+        raise OSError("launchctl is not on PATH")
+
+    layout, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=_installs,
+        restarts=lambda: restarted_self.append(1),
+        sibling_restarter=explode,
+    )
+
+    updater.observe(_beat("0.1.4"))
+    assert updater.maybe_activate() is True
+    assert layout.active_version() == "0.1.4"
+    assert restarted_self == [1]
+
+
+def test_restart_units_round_trip_through_config(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[update]\n"
+        'activation = "in_place"\n'
+        'in_place_venv = "~/.drover-venv"\n'
+        'restart_units = ["com.drover.server", "", "  com.drover.collect  "]\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.update_restart_units == ("com.drover.server", "com.drover.collect")
+
+
+def test_restart_units_default_to_nothing(tmp_path):
+    assert default_config().update_restart_units == ()
