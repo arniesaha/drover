@@ -1,6 +1,7 @@
 """Stable, dependency-free contracts for archive recall."""
 
 from dataclasses import FrozenInstanceError, fields
+import weakref
 
 import pytest
 
@@ -26,9 +27,7 @@ from drover.server.archive import (
 
 
 def _part() -> ArchivePartSummary:
-    return ArchivePartSummary(
-        part_id="part-1", part_type="text", provenance="conversational"
-    )
+    return ArchivePartSummary(kind="text", label="prompt", call_id=None)
 
 
 def _message() -> ArchiveMessage:
@@ -66,7 +65,6 @@ def test_search_and_neighborhood_collections_are_normalized_to_tuples():
         matched_total=1,
         searchable_in_scope=1,
         has_more=False,
-        result_set_freshness="2026-08-28T12:00:00Z",
     )
     neighborhood = ArchiveMessageNeighborhood(
         session=ArchiveSession(
@@ -92,7 +90,7 @@ def test_search_and_neighborhood_collections_are_normalized_to_tuples():
 def test_session_archive_is_runtime_checkable_and_has_synchronous_operations():
     class FakeArchive:
         def search(self, request):
-            return ArchiveSearchResult((), 0, 0, False, None)
+            return ArchiveSearchResult((), 0, 0, False)
 
         def get_message(self, request):
             raise NotImplementedError
@@ -100,16 +98,31 @@ def test_session_archive_is_runtime_checkable_and_has_synchronous_operations():
     assert isinstance(FakeArchive(), SessionArchive)
 
 
+def test_archive_values_are_slotted_and_weak_referenceable():
+    value = _hit()
+
+    assert not hasattr(value, "__dict__")
+    assert weakref.ref(value)() is value
+
+
+def test_part_summary_preserves_complete_upstream_shape_without_synthesis():
+    summary = ArchivePartSummary(kind="tool_call", label="shell", call_id="call-1")
+
+    assert summary.kind == "tool_call"
+    assert summary.label == "shell"
+    assert summary.call_id == "call-1"
+
+
 def test_archive_values_are_frozen():
     values = [
-        ArchivePartSummary("part-1", "text", "conversational"),
+        ArchivePartSummary("text", "prompt", None),
         _message(),
         ArchiveSession(
             "session-1", "arniesaha/drover", "codex", "2026-08-28T11:00:00Z"
         ),
         _hit(),
         ArchiveSearchRequest("retry state machine"),
-        ArchiveSearchResult((), 0, 0, False, None),
+        ArchiveSearchResult((), 0, 0, False),
         ArchiveMessageRequest("message-1"),
         ArchiveMessageNeighborhood(
             ArchiveSession(

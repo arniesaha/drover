@@ -8,9 +8,9 @@ from typing import Protocol, runtime_checkable
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class ArchivePartSummary:
-    part_id: str
-    part_type: str
-    provenance: str
+    kind: str
+    label: str | None = None
+    call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -69,7 +69,6 @@ class ArchiveSearchResult:
     matched_total: int
     searchable_in_scope: int
     has_more: bool
-    result_set_freshness: str | None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hits", tuple(self.hits))
