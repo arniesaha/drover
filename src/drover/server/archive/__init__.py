@@ -10,6 +10,7 @@ from drover.server.archive.errors import (
     ArchiveTimeout,
     ArchiveUnavailable,
 )
+from drover.server.archive.pond import PondArchiveClient
 from drover.server.archive.types import (
     ArchiveMessage,
     ArchiveMessageNeighborhood,
@@ -29,6 +30,7 @@ __all__ = [
     "ArchiveMessageNeighborhood",
     "ArchiveMessageRequest",
     "ArchivePartSummary",
+    "PondArchiveClient",
     "ArchiveProtocolError",
     "ArchiveRequestRejected",
     "ArchiveResponseTooLarge",
