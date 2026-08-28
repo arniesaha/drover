@@ -1,16 +1,17 @@
 """Stable, dependency-free contracts for archive recall."""
 
-from dataclasses import FrozenInstanceError, fields
 import weakref
+from dataclasses import FrozenInstanceError, fields
+from typing import get_type_hints
 
 import pytest
 
 from drover.server.archive import (
+    ArchiveDisabled,
+    ArchiveError,
     ArchiveMessage,
     ArchiveMessageNeighborhood,
     ArchiveMessageRequest,
-    ArchiveDisabled,
-    ArchiveError,
     ArchivePartSummary,
     ArchiveProtocolError,
     ArchiveRequestRejected,
@@ -27,7 +28,7 @@ from drover.server.archive import (
 
 
 def _part() -> ArchivePartSummary:
-    return ArchivePartSummary(kind="text", label="prompt", call_id=None)
+    return ArchivePartSummary(kind="file", label="prompt.txt", call_id=None)
 
 
 def _message() -> ArchiveMessage:
@@ -113,9 +114,27 @@ def test_part_summary_preserves_complete_upstream_shape_without_synthesis():
     assert summary.call_id == "call-1"
 
 
+def test_archive_message_text_models_absent_target_conversational_text():
+    assert get_type_hints(ArchiveMessage)["text"] == str | None
+
+    message = _message()
+    without_text = ArchiveMessage(
+        message_id=message.message_id,
+        session_id=message.session_id,
+        project=message.project,
+        source_agent=message.source_agent,
+        role=message.role,
+        timestamp=message.timestamp,
+        text=None,
+        parts=message.parts,
+    )
+
+    assert without_text.text is None
+
+
 def test_archive_values_are_frozen():
     values = [
-        ArchivePartSummary("text", "prompt", None),
+        ArchivePartSummary("file", "prompt.txt", None),
         _message(),
         ArchiveSession(
             "session-1", "arniesaha/drover", "codex", "2026-08-28T11:00:00Z"

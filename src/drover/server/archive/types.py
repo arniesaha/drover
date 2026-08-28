@@ -21,7 +21,7 @@ class ArchiveMessage:
     source_agent: str
     role: str
     timestamp: str
-    text: str
+    text: str | None
     parts: tuple[ArchivePartSummary, ...] = ()
 
     def __post_init__(self) -> None:

@@ -17,6 +17,8 @@ from typing import Callable
 
 import pytest
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from drover.config import ArchiveConfig
 from drover.server.archive import (
@@ -191,11 +193,9 @@ def _search_response() -> dict[str, object]:
                         "text": "retry state machine",
                         "score": 0.98,
                         "parts_summary": [
-                            {"kind": "text", "label": "prompt"},
                             {
-                                "kind": "tool_call",
-                                "label": "shell",
-                                "call_id": "call-11",
+                                "kind": "file",
+                                "label": "retry-plan.md",
                             },
                         ],
                     },
@@ -205,7 +205,6 @@ def _search_response() -> dict[str, object]:
                         "timestamp": "2026-08-28T12:02:00Z",
                         "text": "transitioned to retrying",
                         "score": 0.81,
-                        "parts_summary": [{"kind": "text"}],
                     },
                 ],
             },
@@ -222,9 +221,6 @@ def _search_response() -> dict[str, object]:
                         "timestamp": "2026-08-27T09:30:00Z",
                         "text": "state-machine policy",
                         "score": 0.67,
-                        "parts_summary": [
-                            {"kind": "tool_result", "call_id": "call-20"}
-                        ],
                     }
                 ],
             },
@@ -248,11 +244,6 @@ def _message_response() -> dict[str, object]:
             "id": "message-11",
             "role": "user",
             "timestamp": "2026-08-28T12:01:00Z",
-            "text": "retry state machine",
-            "parts_summary": [
-                {"kind": "text", "label": "prompt"},
-                {"kind": "tool_call", "call_id": "call-11"},
-            ],
         },
         "target_parts": [
             {"type": "text", "text": "retry state machine"},
@@ -271,7 +262,9 @@ def _message_response() -> dict[str, object]:
                 "role": "assistant",
                 "timestamp": "2026-08-28T12:02:00Z",
                 "text": "transitioned to retrying",
-                "parts_summary": [{"kind": "text"}],
+                "parts_summary": [
+                    {"kind": "tool_call", "label": "shell", "call_id": "call-12"}
+                ],
             },
         ],
         "context_before": 1,
@@ -323,12 +316,7 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
                 timestamp="2026-08-28T12:01:00Z",
                 text="retry state machine",
                 score=0.98,
-                parts_summary=(
-                    ArchivePartSummary(kind="text", label="prompt"),
-                    ArchivePartSummary(
-                        kind="tool_call", label="shell", call_id="call-11"
-                    ),
-                ),
+                parts_summary=(ArchivePartSummary(kind="file", label="retry-plan.md"),),
             ),
             ArchiveSearchHit(
                 rank=2,
@@ -340,7 +328,7 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
                 timestamp="2026-08-28T12:02:00Z",
                 text="transitioned to retrying",
                 score=0.81,
-                parts_summary=(ArchivePartSummary(kind="text"),),
+                parts_summary=(),
             ),
             ArchiveSearchHit(
                 rank=3,
@@ -352,9 +340,7 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
                 timestamp="2026-08-27T09:30:00Z",
                 text="state-machine policy",
                 score=0.67,
-                parts_summary=(
-                    ArchivePartSummary(kind="tool_result", call_id="call-20"),
-                ),
+                parts_summary=(),
             ),
         ),
         matched_total=3,
@@ -401,11 +387,8 @@ def test_get_message_posts_exact_contract_and_normalizes_without_raw_parts(
             source_agent="codex",
             role="user",
             timestamp="2026-08-28T12:01:00Z",
-            text="retry state machine",
-            parts=(
-                ArchivePartSummary(kind="text", label="prompt"),
-                ArchivePartSummary(kind="tool_call", call_id="call-11"),
-            ),
+            text=None,
+            parts=(),
         ),
         siblings=(
             ArchiveMessage(
@@ -425,7 +408,11 @@ def test_get_message_posts_exact_contract_and_normalizes_without_raw_parts(
                 role="assistant",
                 timestamp="2026-08-28T12:02:00Z",
                 text="transitioned to retrying",
-                parts=(ArchivePartSummary(kind="text"),),
+                parts=(
+                    ArchivePartSummary(
+                        kind="tool_call", label="shell", call_id="call-12"
+                    ),
+                ),
             ),
         ),
         target_part_count=2,
@@ -513,9 +500,8 @@ def test_boolean_numeric_fields_are_protocol_errors(pond_server, operation, muta
         lambda body: body["session"].pop("id"),
         lambda body: body["target"].pop("id"),
         lambda body: body["siblings"][0].pop("id"),
-        lambda body: body["target"].pop("text"),
         lambda body: body["siblings"][0].pop("content"),
-        lambda body: body["target"].update(content="duplicate"),
+        lambda body: body["target"].update(text="one", content="duplicate"),
     ],
 )
 def test_get_message_rejects_missing_identifiers_or_ambiguous_content(
@@ -729,6 +715,153 @@ def test_default_session_ignores_proxy_environment(pond_server, monkeypatch):
 
     assert result.matched_total == 3
     assert len(pond_server.requests) == 1
+
+
+def test_injected_session_has_proxy_and_retry_configuration_neutralized(pond_server):
+    _enqueue_json(pond_server, _search_response())
+    injected = requests.Session()
+    injected.trust_env = True
+    injected.proxies = {"http": "http://127.0.0.1:1"}
+    host, port = pond_server.server_address
+    server_prefix = f"http://{host}:{port}/"
+    injected.mount(
+        server_prefix,
+        HTTPAdapter(
+            max_retries=Retry(
+                total=7,
+                connect=6,
+                read=5,
+                redirect=4,
+                status=3,
+            )
+        ),
+    )
+
+    result = PondArchiveClient(_config(pond_server), session=injected).search(
+        ArchiveSearchRequest("query")
+    )
+
+    retries = injected.get_adapter(server_prefix).max_retries
+    assert result.matched_total == 3
+    assert injected.trust_env is False
+    assert injected.proxies == {}
+    assert retries.total == 0
+    assert retries.connect == 0
+    assert retries.read == 0
+    assert retries.redirect == 0
+    assert retries.status == 0
+
+
+def test_v0163_get_message_target_body_is_only_in_target_parts(pond_server):
+    body = {
+        "session": {
+            "id": "session-literal",
+            "source_agent": "codex",
+            "project": "arniesaha/drover",
+            "created_at": "2026-08-28T11:00:00Z",
+        },
+        "scope": "message",
+        "target": {
+            "id": "message-literal",
+            "role": "assistant",
+            "timestamp": "2026-08-28T12:01:00Z",
+        },
+        "target_parts": [
+            {
+                "id": "part-1",
+                "ordinal": 0,
+                "provenance": "conversational",
+                "type": "text",
+                "text": "body lives here",
+            }
+        ],
+        "target_parts_remaining": 0,
+        "siblings": [
+            {
+                "id": "message-before",
+                "role": "user",
+                "timestamp": "2026-08-28T12:00:00Z",
+                "text": "hydrate this sibling",
+                "parts_summary": [{"kind": "file", "label": "input.txt"}],
+            }
+        ],
+        "context_before": 1,
+        "context_after": 0,
+    }
+    _enqueue_json(pond_server, body)
+
+    result = PondArchiveClient(_config(pond_server)).get_message(
+        ArchiveMessageRequest("message-literal", context_before=1)
+    )
+
+    assert result.target.text is None
+    assert result.target.parts == ()
+    assert result.target_part_count == 1
+    assert result.siblings[0].text == "hydrate this sibling"
+    assert result.siblings[0].parts == (
+        ArchivePartSummary(kind="file", label="input.txt"),
+    )
+
+
+@pytest.mark.parametrize(
+    "parts_summary",
+    [
+        [{"kind": "text"}],
+        [{"kind": "reasoning"}],
+        [{"kind": "future_kind"}],
+        [{"kind": "file", "label": "input.txt", "call_id": "impossible"}],
+        [{"kind": "tool_approval_request"}],
+        [{"kind": "tool_approval_request", "label": "approval-1", "call_id": "x"}],
+        [{"kind": "tool_approval_response"}],
+        [
+            {
+                "kind": "tool_approval_response",
+                "label": "approval-1 (approved)",
+                "call_id": "impossible",
+            }
+        ],
+    ],
+)
+def test_v0163_rejects_invalid_part_summary_shapes(pond_server, parts_summary):
+    body = _search_response()
+    body["sessions"][0]["matches"][0]["parts_summary"] = parts_summary
+    _enqueue_json(pond_server, body)
+
+    with pytest.raises(ArchiveProtocolError):
+        PondArchiveClient(_config(pond_server)).search(ArchiveSearchRequest("query"))
+
+
+def test_search_rejects_non_empty_parts_summary_for_non_user_hit(pond_server):
+    body = _search_response()
+    body["sessions"][0]["matches"][1]["parts_summary"] = [
+        {"kind": "tool_call", "label": "shell", "call_id": "call-12"}
+    ]
+    _enqueue_json(pond_server, body)
+
+    with pytest.raises(ArchiveProtocolError):
+        PondArchiveClient(_config(pond_server)).search(ArchiveSearchRequest("query"))
+
+
+def test_huge_integer_score_is_a_typed_protocol_error_with_diagnostic(
+    pond_server, caplog
+):
+    body = _search_response()
+    body["sessions"][0]["matches"][0]["score"] = 10**4_000
+    _enqueue_json(pond_server, body)
+
+    with caplog.at_level(logging.INFO, logger="drover.server.archive.pond"):
+        with pytest.raises(ArchiveProtocolError):
+            PondArchiveClient(_config(pond_server)).search(
+                ArchiveSearchRequest("query")
+            )
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "drover.server.archive.pond"
+    ]
+    assert len(records) == 1
+    assert "category=protocol_error" in records[0].getMessage()
 
 
 def test_diagnostic_is_single_sanitized_record_with_transport_measurements(

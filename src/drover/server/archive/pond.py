@@ -9,7 +9,9 @@ import time
 from typing import Any, cast
 
 import requests
+from requests.adapters import HTTPAdapter
 from urllib3.exceptions import ReadTimeoutError
+from urllib3.util.retry import Retry
 
 from drover.config import ArchiveConfig
 from drover.server.archive.errors import (
@@ -36,6 +38,17 @@ _LOG = logging.getLogger(__name__)
 _PROTOCOL_VERSION = 1
 _NAMESPACE = "local"
 _STREAM_CHUNK_BYTES = 65_536
+_SUMMARY_KINDS = frozenset(
+    {
+        "file",
+        "tool_call",
+        "tool_result",
+        "tool_approval_request",
+        "tool_approval_response",
+    }
+)
+_SUMMARY_CALL_ID_KINDS = frozenset({"tool_call", "tool_result"})
+_SUMMARY_APPROVAL_KINDS = frozenset({"tool_approval_request", "tool_approval_response"})
 
 
 class PondArchiveClient:
@@ -47,7 +60,11 @@ class PondArchiveClient:
         self._config = config
         if session is None:
             session = requests.Session()
-            session.trust_env = False
+        session.trust_env = False
+        session.proxies.clear()
+        session.adapters.clear()
+        session.mount("http://", _zero_retry_adapter())
+        session.mount("https://", _zero_retry_adapter())
         self._session = session
 
     def search(self, request: ArchiveSearchRequest) -> ArchiveSearchResult:
@@ -188,6 +205,10 @@ def _normalize_search(value: object) -> ArchiveSearchResult:
         _required_integer(session, "matched_message_count")
         for match_value in _required_list(session, "matches"):
             match = _required_mapping(match_value)
+            role = _required_string(match, "role")
+            parts_summary = _parts_summary(match)
+            if role != "user" and parts_summary:
+                raise ArchiveProtocolError()
             hits.append(
                 ArchiveSearchHit(
                     rank=len(hits) + 1,
@@ -195,11 +216,11 @@ def _normalize_search(value: object) -> ArchiveSearchResult:
                     session_id=session_id,
                     project=project,
                     source_agent=source_agent,
-                    role=_required_string(match, "role"),
+                    role=role,
                     timestamp=_required_string(match, "timestamp"),
                     text=_required_string(match, "text"),
                     score=_required_number(match, "score"),
-                    parts_summary=_parts_summary(match),
+                    parts_summary=parts_summary,
                 )
             )
     return ArchiveSearchResult(
@@ -221,7 +242,9 @@ def _normalize_message(value: object) -> ArchiveMessageNeighborhood:
         project=_required_string(session_value, "project"),
         created_at=_required_string(session_value, "created_at"),
     )
-    target = _message_view(_required_value(root, "target"), session)
+    target = _message_view(
+        _required_value(root, "target"), session, allow_absent_text=True
+    )
     siblings = tuple(
         _message_view(item, session) for item in _required_list(root, "siblings")
     )
@@ -237,13 +260,24 @@ def _normalize_message(value: object) -> ArchiveMessageNeighborhood:
     )
 
 
-def _message_view(value: object, session: ArchiveSession) -> ArchiveMessage:
+def _message_view(
+    value: object,
+    session: ArchiveSession,
+    *,
+    allow_absent_text: bool = False,
+) -> ArchiveMessage:
     view = _required_mapping(value)
     has_text = "text" in view
     has_content = "content" in view
-    if has_text == has_content:
+    if has_text and has_content:
         raise ArchiveProtocolError()
-    content_key = "text" if has_text else "content"
+    if not has_text and not has_content:
+        if not allow_absent_text:
+            raise ArchiveProtocolError()
+        text = None
+    else:
+        content_key = "text" if has_text else "content"
+        text = _required_string(view, content_key)
     return ArchiveMessage(
         message_id=_required_string(view, "id", identifier=True),
         session_id=session.session_id,
@@ -251,7 +285,7 @@ def _message_view(value: object, session: ArchiveSession) -> ArchiveMessage:
         source_agent=session.source_agent,
         role=_required_string(view, "role"),
         timestamp=_required_string(view, "timestamp"),
-        text=_required_string(view, content_key),
+        text=text,
         parts=_parts_summary(view),
     )
 
@@ -263,11 +297,20 @@ def _parts_summary(container: dict[str, Any]) -> tuple[ArchivePartSummary, ...]:
     parts: list[ArchivePartSummary] = []
     for value in values:
         part = _required_mapping(value)
+        kind = _required_string(part, "kind")
+        if kind not in _SUMMARY_KINDS:
+            raise ArchiveProtocolError()
+        label = _optional_string(part, "label")
+        call_id = _optional_string(part, "call_id")
+        if kind in _SUMMARY_APPROVAL_KINDS and not label:
+            raise ArchiveProtocolError()
+        if call_id is not None and kind not in _SUMMARY_CALL_ID_KINDS:
+            raise ArchiveProtocolError()
         parts.append(
             ArchivePartSummary(
-                kind=_required_string(part, "kind"),
-                label=_optional_string(part, "label"),
-                call_id=_optional_string(part, "call_id"),
+                kind=kind,
+                label=label,
+                call_id=call_id,
             )
         )
     return tuple(parts)
@@ -319,9 +362,15 @@ def _required_integer(container: dict[str, Any], key: str) -> int:
 
 def _required_number(container: dict[str, Any], key: str) -> float:
     value = _required_value(container, key)
-    if type(value) not in (int, float) or not math.isfinite(value):
+    if type(value) not in (int, float):
         raise ArchiveProtocolError()
-    return float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        raise ArchiveProtocolError() from None
+    if not math.isfinite(number):
+        raise ArchiveProtocolError()
+    return number
 
 
 def _required_boolean(container: dict[str, Any], key: str) -> bool:
@@ -329,3 +378,15 @@ def _required_boolean(container: dict[str, Any], key: str) -> bool:
     if type(value) is not bool:
         raise ArchiveProtocolError()
     return value
+
+
+def _zero_retry_adapter() -> HTTPAdapter:
+    return HTTPAdapter(
+        max_retries=Retry(
+            total=0,
+            connect=0,
+            read=0,
+            redirect=0,
+            status=0,
+        )
+    )
