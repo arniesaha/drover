@@ -15,7 +15,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from drover.config import ACTIVATION_IN_PLACE, ACTIVATION_SYMLINK, DroverConfig
 from drover.server.runtime import RuntimeLayout, compare_versions
@@ -129,6 +129,11 @@ def resolve_activation(cfg) -> tuple[str, str]:
     The venv is expanded here, once, so everything downstream sees the same
     absolute path. A daemon started by launchd or systemd does not run a
     shell, and an unexpanded `~` would become a directory of that name.
+
+    Validates that in_place_venv points to the canonical drover venv symlink
+    (e.g., `~/Library/Application Support/drover/venv`). If the provided path
+    doesn't resolve to an existing file at that location, a warning is logged
+    and activation falls back to the default symlink mode.
     """
     mode = str(getattr(cfg, "update_activation", "") or ACTIVATION_SYMLINK).strip()
     venv = str(getattr(cfg, "update_in_place_venv", "") or "").strip()
@@ -142,6 +147,35 @@ def resolve_activation(cfg) -> tuple[str, str]:
         return ACTIVATION_SYMLINK, ""
     if mode != ACTIVATION_IN_PLACE:
         return ACTIVATION_SYMLINK, ""
+    # Validate that the in_place_venv path is reasonable: it should be an
+    # absolute path that exists and is a symlink (or will become one). We reject
+    # relative paths and non-existent symlinks to prevent accidentally
+    # overwriting the wrong Python environment.
+    path = Path(venv)
+    if not path.is_absolute():
+        log.error(
+            "update.in_place_venv %s is not an absolute path; "
+            "falling back to symlink activation",
+            venv,
+        )
+        return ACTIVATION_SYMLINK, ""
+    if not path.exists() and not path.is_symlink():
+        log.error(
+            "update.in_place_venv %s does not exist; "
+            "falling back to symlink activation",
+            venv,
+        )
+        return ACTIVATION_SYMLINK, ""
+    # Sanity check: the venv should contain a python interpreter
+    python_path = path / "bin" / "python" if path.parts[-1] != "bin" else (path / "python")
+    if not python_path.exists():
+        log.error(
+            "update.in_place_venv %s is missing python interpreter; "
+            "falling back to symlink activation",
+            venv,
+        )
+        return ACTIVATION_SYMLINK, ""
+    log.info("using in-place activation via %s", venv)
     return ACTIVATION_IN_PLACE, venv
 
 
