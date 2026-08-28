@@ -69,6 +69,12 @@ PING_INTERVAL_S = 20.0
 # eventually. Any inbound frame counts, so a busy connection re-stamps
 # constantly and only a genuinely mute peer runs the clock down.
 SILENCE_TIMEOUT_S = 3 * PING_INTERVAL_S
+"""Duration of silence that triggers relay teardown.
+
+Must be > PING_INTERVAL_S so the hub doesn't tear down a spoke that's briefly
+throttled or slow to respond. The factor of 3 gives 3 ping round-trips worth of
+grace. This is configured via monkeypatch in tests.
+"""
 # Budget for grabbing the write lock when the caller has no deadline of its own.
 WRITE_TIMEOUT_S = 10.0
 # The reader's budget. It skips the pong rather than stall: a dropped pong is
