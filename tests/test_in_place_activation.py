@@ -34,6 +34,7 @@ from drover.server.harness.updater import (
     HostUpdater,
     resolve_activation,
     verify_after_restart,
+    warn_if_in_place_venv_is_unusable,
 )
 from drover.server.runtime import RuntimeLayout
 from drover.server.updates import LOCK_NAME, install_cached_into_venv
@@ -489,3 +490,56 @@ def test_activation_mode_round_trips_through_config(tmp_path):
     cfg = load_config(path)
     assert cfg.update_activation == ACTIVATION_IN_PLACE
     assert cfg.update_in_place_venv == "~/.drover-venv"
+
+
+def _venv_with_interpreter(root: Path) -> Path:
+    """A venv shaped the way `install_cached_into_venv` looks for one."""
+    python = root / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("", encoding="utf-8")
+    return root
+
+
+def test_startup_warns_when_the_in_place_venv_has_no_interpreter(tmp_path, caplog):
+    """The typo is worth catching now, not when the host finally goes idle."""
+    missing = tmp_path / "not-a-venv"
+    with caplog.at_level("WARNING"):
+        assert (
+            warn_if_in_place_venv_is_unusable(ACTIVATION_IN_PLACE, str(missing))
+            is False
+        )
+    assert str(missing) in caplog.text
+
+
+def test_startup_is_quiet_for_a_real_venv(tmp_path, caplog):
+    venv = _venv_with_interpreter(tmp_path / ".drover-venv")
+    with caplog.at_level("WARNING"):
+        assert warn_if_in_place_venv_is_unusable(ACTIVATION_IN_PLACE, str(venv)) is True
+    assert caplog.text == ""
+
+
+def test_startup_check_ignores_symlink_hosts(tmp_path, caplog):
+    """Symlink activation never touches the venv, so its path is irrelevant."""
+    with caplog.at_level("WARNING"):
+        assert warn_if_in_place_venv_is_unusable(ACTIVATION_SYMLINK, "") is True
+        assert (
+            warn_if_in_place_venv_is_unusable(
+                ACTIVATION_SYMLINK, str(tmp_path / "nope")
+            )
+            is True
+        )
+    assert caplog.text == ""
+
+
+def test_the_startup_check_does_not_change_the_resolved_mode(tmp_path):
+    """It reports; it does not decide. A named-but-absent venv stays in_place.
+
+    Falling back to symlink here would be worse than the misconfiguration: on
+    the hub the symlink path is the one that cannot work at all.
+    """
+    cfg = replace(
+        default_config(),
+        update_activation=ACTIVATION_IN_PLACE,
+        update_in_place_venv=str(tmp_path / "absent"),
+    )
+    assert resolve_activation(cfg) == (ACTIVATION_IN_PLACE, str(tmp_path / "absent"))

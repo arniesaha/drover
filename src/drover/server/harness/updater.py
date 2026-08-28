@@ -145,6 +145,35 @@ def resolve_activation(cfg) -> tuple[str, str]:
     return ACTIVATION_IN_PLACE, venv
 
 
+def warn_if_in_place_venv_is_unusable(activation: str, venv: str) -> bool:
+    """Say at startup what would otherwise only surface hours later.
+
+    `resolve_activation` deliberately never touches the filesystem: it resolves
+    configuration, and a host may legitimately be configured before the venv it
+    names exists. The install is already guarded where it matters --
+    `install_cached_into_venv` refuses a path with no interpreter under it and
+    the host stays on the version it is running -- so this changes no decision
+    and is not a second gate.
+
+    What it buys is timing. Activation waits for the host to go idle, which can
+    be hours, so a typo in `in_place_venv` sits undetected until the worst
+    possible moment to discover it. One stat at startup turns that into a log
+    line while somebody is still watching. Returns whether the venv looks usable.
+    """
+    if activation != ACTIVATION_IN_PLACE or not venv:
+        return True
+    python = Path(venv) / "bin" / "python"
+    if python.exists():
+        return True
+    log.warning(
+        "update.in_place_venv %s has no interpreter at %s; in-place activation "
+        "will refuse and this host will stay on its current version",
+        venv,
+        python,
+    )
+    return False
+
+
 class HostUpdater:
     """Install as soon as we hear about a version; activate only when idle.
 

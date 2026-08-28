@@ -68,6 +68,7 @@ from drover.server.harness.updater import (
     default_restarter,
     resolve_activation,
     verify_after_restart,
+    warn_if_in_place_venv_is_unusable,
 )
 from drover.server.harness.websocket import (
     WebSocketClosed,
@@ -3732,6 +3733,7 @@ def run_harnessd(
         # Resolved once, here, so the watchdog and the updater cannot disagree
         # about how this host activates.
         activation, in_place_venv = resolve_activation(cfg)
+        warn_if_in_place_venv_is_unusable(activation, in_place_venv)
         _start_rollback_watchdog(
             state, layout, activation=activation, in_place_venv=in_place_venv
         )
