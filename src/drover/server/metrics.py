@@ -663,6 +663,16 @@ def _harness_endpoint(host: Any) -> str:
     ).rstrip("/")
 
 
+def _relay_silence_reason(relay: Any, host_id: str) -> str:
+    """Say which kind of silence this is, so the refusal is actionable."""
+    if relay is None or not relay.is_live(host_id):
+        return "no relay connection is attached"
+    silent_for = relay.silent_for(host_id)
+    if silent_for is None:
+        return "the spoke attached but has never sent a frame"
+    return f"the spoke has sent no frames for {silent_for:.0f}s"
+
+
 def _json_response(status: int, payload: Mapping[str, Any]) -> tuple[int, str]:
     return status, json.dumps(dict(payload), sort_keys=True, default=str) + "\n"
 
@@ -805,11 +815,18 @@ def _harness_host_dict(
     item = dict(host.__dict__)
     if item.get("connection_kind") == "relay":
         # A relay host has no daemon-reported heartbeat to trust -- the hub's
-        # own live socket is ground truth, so it always wins over whatever
-        # status happens to be stored in the row (never leak a stale
-        # "online" once the socket has dropped, and vice versa).
-        is_live = relay_manager.is_live(host.host_id) if relay_manager else False
-        item["status"] = "online" if is_live else "offline"
+        # own socket is ground truth, so it always wins over whatever status
+        # happens to be stored in the row (never leak a stale "online" once
+        # the socket has dropped, and vice versa).
+        #
+        # Attachment is not the test, though. A spoke can attach and then send
+        # nothing, and because it reconnects the moment the silence watchdog
+        # drops it, `is_live` reads true almost continuously for a host that
+        # has been mute for an hour. Ask whether it is talking back instead.
+        responsive = (
+            relay_manager.is_responsive(host.host_id) if relay_manager else False
+        )
+        item["status"] = "online" if responsive else "offline"
         return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
     last_seen_at = getattr(host, "last_seen_at", None)
     if last_seen_at is not None:
@@ -1199,6 +1216,20 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             return _json_response(404, {"error": f"unknown harness host: {host_id}"})
+        # A silent spoke accepts nothing. Creating anyway produced the worst
+        # possible outcome for the phone: a session row that says `running`,
+        # records zero events, and reports no error anywhere, because the
+        # create was delivered to a socket the host was not reading.
+        if getattr(host, "connection_kind", "direct") == "relay":
+            relay = self.relay_manager
+            if relay is None or not relay.is_responsive(host_id):
+                return _json_response(
+                    502,
+                    {
+                        "error": f"relay host is not responding: {host_id}",
+                        "reason": _relay_silence_reason(relay, host_id),
+                    },
+                )
         status, body = self._harness_request(
             host,
             "/sessions",

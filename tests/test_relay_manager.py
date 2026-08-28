@@ -34,6 +34,13 @@ def _attach(manager: RelayManager, host_id: str = "laptop", *, framed: bool = Fa
     return spoke_side
 
 
+def _drain_ping(spoke: socket.socket) -> bytes:
+    """Read the ping the hub sends on attach and return its payload."""
+    frame = recv_frame(spoke)
+    assert frame.opcode == OPCODE_PING
+    return frame.payload
+
+
 def _spoke_recv(spoke: socket.socket) -> dict:
     while True:
         frame = client_recv_json(spoke)
@@ -157,13 +164,19 @@ def test_bounded_request_rejects_raw_body_from_frame_header_before_payload_read(
 
     assert status == 502
     assert "connection lost" in body
-    assert observed_caps == [64 * 1024, 4096]
+    # The hub pings on attach (#231) and the spoke pongs, so an unbounded
+    # control read precedes the pair this test is about: the header stage
+    # capped at 64k, then the body stage at the caller's limit.
+    assert observed_caps[-2:] == [64 * 1024, 4096]
     thread.join(timeout=5)
 
 
 def test_bounded_request_requires_negotiated_framed_response_capability() -> None:
     manager = RelayManager()
     spoke = _attach(manager)
+    # The hub proves the link on attach (#231); that ping is not the request.
+    spoke.settimeout(5)
+    _drain_ping(spoke)
     spoke.settimeout(0.2)
 
     status, body = manager.request(
@@ -393,9 +406,12 @@ def test_attach_replaces_previous_connection() -> None:
     manager.attach("laptop", second_hub)
 
     # attach() tears the old connection down synchronously, so the old spoke
-    # sees EOF immediately - no polling, no sleeping.
+    # reaches EOF immediately - no polling, no sleeping. Read to it rather than
+    # asserting on the first byte: the hub pings on attach (#231), so a ping
+    # may already be sitting in the buffer ahead of the close.
     first_spoke.settimeout(5)
-    assert first_spoke.recv(1) == b""
+    while first_spoke.recv(4096) != b"":
+        pass
     assert manager.is_live("laptop")
     assert manager.live_host_ids() == {"laptop"}
 
@@ -554,15 +570,19 @@ def test_a_mute_spoke_flips_offline(monkeypatch) -> None:
 
 def test_a_ponging_spoke_stays_live_past_the_silence_timeout(monkeypatch) -> None:
     """The watchdog must not tear down a healthy but idle connection."""
+    # A wide gap between the two: the point is that ping/pong keeps the
+    # connection alive, not how tight the budget can be cut. At 0.2s this test
+    # failed roughly three runs in ten, because one descheduled pong on a busy
+    # machine was enough to spend the whole silence budget.
     monkeypatch.setattr(relay_manager, "PING_INTERVAL_S", 0.05)
-    monkeypatch.setattr(relay_manager, "SILENCE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(relay_manager, "SILENCE_TIMEOUT_S", 0.5)
     manager = RelayManager()
     spoke = _attach(manager)
     stop = threading.Event()
 
     def spoke_loop() -> None:
         # client_recv_json answers each ping with a pong; no data ever flows.
-        spoke.settimeout(0.1)
+        spoke.settimeout(0.05)
         while not stop.is_set():
             try:
                 client_recv_json(spoke)
@@ -605,3 +625,79 @@ def test_channel_queue_drops_oldest_instead_of_growing() -> None:
     assert channel._dropped == 50
     # Oldest dropped, newest kept: the first surviving message is not n=0.
     assert channel.recv(timeout_s=5) == {"n": 50}
+
+
+# --- an attached socket is not a working host (#231) -------------------------
+
+
+def test_an_attached_spoke_that_never_speaks_is_not_responsive() -> None:
+    """The #231 case: work-laptop attached, sent nothing, still read online."""
+    manager = RelayManager()
+    spoke = _attach(manager)  # keep a reference: a GC'd spoke closes the socket
+    try:
+        assert manager.is_live("laptop") is True
+        assert manager.is_responsive("laptop") is False
+        assert manager.silent_for("laptop") is None
+    finally:
+        spoke.close()
+
+
+def test_a_spoke_that_answers_the_ping_is_responsive() -> None:
+    """One frame back is all it takes, and the hub pings on attach to get it."""
+    manager = RelayManager()
+    spoke = _attach(manager)
+    try:
+        payload = _drain_ping(spoke)
+        client_send_frame(spoke, OPCODE_PONG, payload)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not manager.is_responsive("laptop"):
+            time.sleep(0.01)
+        assert manager.is_responsive("laptop") is True
+        assert manager.silent_for("laptop") is not None
+    finally:
+        spoke.close()
+
+
+def test_the_hub_pings_immediately_rather_than_after_an_interval(monkeypatch) -> None:
+    """Otherwise a healthy spoke reads offline for up to PING_INTERVAL_S."""
+    monkeypatch.setattr(relay_manager, "PING_INTERVAL_S", 30.0)
+    manager = RelayManager()
+    spoke = _attach(manager)
+    try:
+        spoke.settimeout(5)
+        _drain_ping(spoke)
+    finally:
+        spoke.close()
+
+
+def test_responsiveness_lapses_before_the_watchdog_tears_down(monkeypatch) -> None:
+    """Closes the window between going silent and the watchdog's next pass.
+
+    The teardown check only runs every PING_INTERVAL_S, so a connection can sit
+    over the silence budget and still be attached. Presence must not call that
+    online.
+    """
+    monkeypatch.setattr(relay_manager, "PING_INTERVAL_S", 30.0)
+    monkeypatch.setattr(relay_manager, "SILENCE_TIMEOUT_S", 0.2)
+    manager = RelayManager()
+    spoke = _attach(manager)
+    try:
+        payload = _drain_ping(spoke)
+        client_send_frame(spoke, OPCODE_PONG, payload)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not manager.is_responsive("laptop"):
+            time.sleep(0.01)
+        assert manager.is_responsive("laptop") is True
+
+        time.sleep(0.3)
+        assert manager.is_live("laptop") is True
+        assert manager.is_responsive("laptop") is False
+    finally:
+        spoke.close()
+
+
+def test_an_unknown_host_is_neither_live_nor_responsive() -> None:
+    manager = RelayManager()
+    assert manager.is_live("nobody") is False
+    assert manager.is_responsive("nobody") is False
+    assert manager.silent_for("nobody") is None

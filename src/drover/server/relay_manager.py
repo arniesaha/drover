@@ -214,6 +214,14 @@ class _Connection:
         # while taking state_lock per inbound frame would put the reader in
         # contention with every dispatch it performs.
         self.last_rx = time.monotonic()
+        # Whether a frame has ever arrived on this connection. `last_rx` alone
+        # cannot answer that: it is stamped at attach so a brand-new socket
+        # looks as fresh as a busy one, which is exactly how a spoke that
+        # attaches and then says nothing reported "online" for the whole
+        # SILENCE_TIMEOUT_S before teardown, reconnected, and did it again.
+        # Same lock-free reasoning as `last_rx`: written on the reader's hot
+        # path, and a single attribute store/load needs no lock.
+        self.frames_seen = False
 
     @contextlib.contextmanager
     def write_access(self, timeout_s: float) -> Iterator[None]:
@@ -341,7 +349,37 @@ class RelayManager:
         log.info("relay connection attached for host %s", host_id)
 
     def is_live(self, host_id: str) -> bool:
+        """Whether a socket is attached. Routing's question, not presence's."""
         return self._live(host_id) is not None
+
+    def is_responsive(self, host_id: str) -> bool:
+        """Whether the spoke on the other end is demonstrably talking back.
+
+        An attached socket is not a working host. A spoke can complete the
+        upgrade and then send nothing at all - no frames, not even a pong -
+        and `is_live` cannot tell that apart from a healthy connection,
+        because the silence watchdog only tears down after SILENCE_TIMEOUT_S
+        and the spoke reconnects immediately afterwards. Presence built on
+        `is_live` therefore reads "online" almost continuously for a host that
+        has not spoken in an hour.
+
+        Two things have to hold. The spoke must have sent at least one frame,
+        which rules out a socket that has never carried anything; and the last
+        one must be recent, which closes the window between a connection going
+        silent and the watchdog's next pass noticing. The hub pings on attach,
+        so a healthy spoke satisfies both within a round trip.
+        """
+        connection = self._live(host_id)
+        if connection is None or not connection.frames_seen:
+            return False
+        return (time.monotonic() - connection.last_rx) <= SILENCE_TIMEOUT_S
+
+    def silent_for(self, host_id: str) -> float | None:
+        """Seconds since the last inbound frame, or None if none ever arrived."""
+        connection = self._live(host_id)
+        if connection is None or not connection.frames_seen:
+            return None
+        return time.monotonic() - connection.last_rx
 
     def live_host_ids(self) -> set[str]:
         with self._lock:
@@ -508,6 +546,7 @@ class RelayManager:
             # Every frame counts as proof of life, pongs included - see
             # SILENCE_TIMEOUT_S.
             connection.last_rx = time.monotonic()
+            connection.frames_seen = True
             if frame.opcode == OPCODE_CLOSE:
                 raise WebSocketClosed()
             if frame.opcode == OPCODE_PING:
@@ -613,13 +652,11 @@ class RelayManager:
         what came *back* (see SILENCE_TIMEOUT_S). Tearing down here also
         unblocks the reader, which is parked in a blocking ``recv``.
         """
-        while not connection.dead.wait(PING_INTERVAL_S):
-            silent_for = time.monotonic() - connection.last_rx
-            if silent_for > SILENCE_TIMEOUT_S:
-                self._teardown(
-                    connection, f"no frames from spoke for {silent_for:.0f}s"
-                )
-                return
+        while True:
+            # Ping before the first wait, not after it. Until a frame comes
+            # back the connection is attached but unproven and presence reports
+            # it offline (see is_responsive); a healthy spoke should clear that
+            # in a round trip rather than in up to PING_INTERVAL_S.
             try:
                 connection.send_control(OPCODE_PING, b"hb")
             except _WriteTimeout as exc:
@@ -627,6 +664,14 @@ class RelayManager:
                 return
             except (OSError, WebSocketClosed) as exc:
                 self._teardown(connection, f"ping failed: {exc}")
+                return
+            if connection.dead.wait(PING_INTERVAL_S):
+                return
+            silent_for = time.monotonic() - connection.last_rx
+            if silent_for > SILENCE_TIMEOUT_S:
+                self._teardown(
+                    connection, f"no frames from spoke for {silent_for:.0f}s"
+                )
                 return
 
     def _teardown(self, connection: _Connection, reason: str) -> None:

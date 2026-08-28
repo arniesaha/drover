@@ -2052,6 +2052,15 @@ class _FakeRelay:
     def is_live(self, host_id: str) -> bool:
         return host_id == "laptop"
 
+    def is_responsive(self, host_id: str) -> bool:
+        # "laptop" is attached *and* talking back. Presence asks this rather
+        # than is_live, because an attached socket that never carries a frame
+        # is not a working host (#231).
+        return host_id == "laptop"
+
+    def silent_for(self, host_id: str) -> float | None:
+        return 0.0 if host_id == "laptop" else None
+
     def request(self, host_id, method, path, body, timeout_s=15):
         self.calls.append((host_id, method, path, body))
         self.timeouts.append(timeout_s)
@@ -2591,9 +2600,9 @@ def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> 
     # Top-level key confirmed by reading render_harness_json / harness_snapshot:
     # it emits {"hosts": [...], "sessions": [...], "cwd_suggestions": [...]}.
     collector = collector_with_hosts  # "laptop" registered connection_kind="relay", status "online"
-    # Second relay host, stored "online", but _FakeRelay.is_live only recognizes
-    # "laptop" -- this is the realistic production case: hub up, some other
-    # relay host's socket has dropped. Registered directly against the
+    # Second relay host, stored "online", but _FakeRelay only recognizes
+    # "laptop" as responsive -- this is the realistic production case: hub up,
+    # some other relay host's socket has dropped (or attached and gone mute). Registered directly against the
     # fixture's duckdb so we don't disturb collector_with_hosts for other tests.
     registry = HarnessRegistry(collector.duckdb_path)
     registry.register_host(
@@ -2602,7 +2611,7 @@ def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> 
         kind="ios",
         connection_kind="relay",
     )
-    collector.relay_manager = _FakeRelay()  # is_live: only "laptop"
+    collector.relay_manager = _FakeRelay()  # responsive: only "laptop"
 
     payload = json.loads(collector.render_harness_json(include_sessions=False))
     hosts = {h["host_id"]: h for h in payload["hosts"]}
