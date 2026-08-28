@@ -1,5 +1,6 @@
 """Drive RelayManager over a socketpair; this test plays the spoke."""
 
+import contextlib
 import json
 import socket
 import struct
@@ -262,14 +263,21 @@ def test_started_response_requires_pending_request_before_body_read(
             "body_bytes": 0,
         },
     )
-    client_send_frame(spoke, 0x1, b"")
+    # Racing the teardown this frame is meant to prove was already decided:
+    # the hub rejects at the header stage, so by the time this lands the
+    # socket may already be shut down. Either way it was never read.
+    with contextlib.suppress(OSError):
+        client_send_frame(spoke, 0x1, b"")
 
     deadline = time.monotonic() + 2
     while manager.is_live("laptop") and time.monotonic() < deadline:
         time.sleep(0.01)
 
     assert not manager.is_live("laptop")
-    assert observed_caps == [64 * 1024]
+    # The header stage read at the control cap; the body stage was never
+    # reached, because the request was not pending.
+    assert observed_caps[0] == 64 * 1024
+    assert 4096 not in observed_caps
 
 
 def test_request_to_unknown_host_is_502() -> None:
