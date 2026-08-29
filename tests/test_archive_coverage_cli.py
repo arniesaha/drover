@@ -7,6 +7,7 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 
+import duckdb
 import pytest
 from click.testing import CliRunner
 
@@ -28,6 +29,33 @@ _UPDATED_AT = "2026-08-29T11:00:00Z"
 _CREATED_AT = "2026-08-29T10:00:00Z"
 _FIRST_MESSAGE_AT = "2026-08-29T10:01:00Z"
 _LAST_MESSAGE_AT = "2026-08-29T10:02:00Z"
+
+_MINIMAL_POND = r"""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["LOCAL_POND_MARKER"]).write_text("local", encoding="utf-8")
+if sys.argv[1:] == ["--version"]:
+    print("pond 0.16.3")
+    raise SystemExit(0)
+
+output = Path(sys.argv[sys.argv.index("--output-file") + 1])
+sql = sys.argv[sys.argv.index("sql") + 1]
+if "worst_case_ndjson_bytes" in sql:
+    row = {"row_count": 1, "worst_case_ndjson_bytes": 512}
+else:
+    row = {
+        "session_id": "native-private",
+        "source_agent": "claude-code",
+        "created_at": "2026-08-29T10:00:00Z",
+        "message_count": 2,
+        "first_message_at": "2026-08-29T10:01:00Z",
+        "last_message_at": "2026-08-29T10:02:00Z",
+    }
+output.write_text(json.dumps(row) + "\n", encoding="utf-8")
+"""
 
 
 def _source_inventory(
@@ -86,6 +114,45 @@ def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
 
 
+def _write_minimal_pond(path: Path) -> None:
+    path.write_text(_MINIMAL_POND, encoding="utf-8")
+    path.chmod(0o700)
+
+
+def _write_isolated_config(tmp_path: Path) -> Path:
+    config = tmp_path / "isolated-config.toml"
+    config.write_text(
+        f"""[paths]
+incoming_dir = {json.dumps(str(tmp_path / 'incoming'))}
+parquet_dir = {json.dumps(str(tmp_path / 'parquet'))}
+duckdb_path = {json.dumps(str(tmp_path / 'configured.duckdb'))}
+processed_retention_days = 7
+
+[server]
+otlp_grpc_port = 14317
+mcp_http_port = 17077
+
+[agent]
+agent_id = "test"
+principal_id = "test"
+""",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _write_empty_registry(path: Path) -> None:
+    with duckdb.connect(str(path)) as connection:
+        connection.execute("""
+            CREATE TABLE harness_sessions (
+                session_id VARCHAR,
+                host_id VARCHAR,
+                harness VARCHAR,
+                native_session_id VARCHAR
+            )
+            """)
+
+
 def _assert_private_values_absent(result, caplog, *values: object) -> None:
     rendered = "\n".join(
         (
@@ -103,19 +170,23 @@ def _coverage_args(
     output: Path,
     source: Path,
     pond: Path,
+    config: Path,
     db: Path | None = None,
     prior: tuple[Path, ...] = (),
 ) -> list[str]:
-    args = [
-        "archive",
-        "coverage",
-        "--output",
-        str(output),
-        "--source-inventory",
-        str(source),
-        "--pond-inventory",
-        str(pond),
-    ]
+    args: list[str] = ["--config", str(config)]
+    args.extend(
+        [
+            "archive",
+            "coverage",
+            "--output",
+            str(output),
+            "--source-inventory",
+            str(source),
+            "--pond-inventory",
+            str(pond),
+        ]
+    )
     if db is not None:
         args.extend(("--db", str(db)))
     for path in prior:
@@ -129,30 +200,39 @@ def test_archive_help_exposes_only_the_three_local_operator_commands():
     result = runner.invoke(main, ["archive", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert {"source-inventory", "pond-inventory", "coverage"} <= set(
-        result.output.split()
-    )
+    assert set(server_main.archive_cmd.commands) == {
+        "source-inventory",
+        "pond-inventory",
+        "coverage",
+    }
 
-    source_help = runner.invoke(main, ["archive", "source-inventory", "--help"])
-    assert source_help.exit_code == 0, source_help.output
-    assert "--host-id HOST" in source_help.output
-    assert "--output FILE" in source_help.output
+    def option_names(command_name):
+        command = server_main.archive_cmd.commands[command_name]
+        return {
+            option
+            for parameter in command.params
+            for option in parameter.opts
+            if option.startswith("--")
+        }
+
+    assert option_names("source-inventory") == {"--host-id", "--output"}
+    assert option_names("pond-inventory") == {
+        "--storage-path",
+        "--output",
+        "--pond-binary",
+        "--timeout",
+    }
+    assert option_names("coverage") == {
+        "--output",
+        "--db",
+        "--source-inventory",
+        "--pond-inventory",
+        "--prior-source-inventory",
+    }
 
     pond_help = runner.invoke(main, ["archive", "pond-inventory", "--help"])
     assert pond_help.exit_code == 0, pond_help.output
-    assert "--storage-path DIRECTORY" in pond_help.output
-    assert "--output FILE" in pond_help.output
-    assert "--pond-binary FILE" in pond_help.output
     assert "--timeout SECONDS" in pond_help.output
-
-    coverage_help = runner.invoke(main, ["archive", "coverage", "--help"])
-    assert coverage_help.exit_code == 0, coverage_help.output
-    assert "--output FILE" in coverage_help.output
-    assert "--db FILE" in coverage_help.output
-    assert "--source-inventory FILE" in coverage_help.output
-    assert "--pond-inventory FILE" in coverage_help.output
-    assert "--prior-source-inventory FILE" in coverage_help.output
-    assert "--apply" not in coverage_help.output
 
 
 def test_source_inventory_writes_private_manifest_and_prints_only_sorted_summary(
@@ -304,6 +384,62 @@ def test_pond_inventory_resolves_binary_in_documented_order_and_writes_once(
     )
 
 
+@pytest.mark.parametrize("resolution", ["explicit-relative", "environment-relative"])
+def test_pond_inventory_cli_executes_the_validated_relative_binary(
+    resolution, monkeypatch, tmp_path, caplog
+):
+    local_binary = tmp_path / "pond"
+    _write_minimal_pond(local_binary)
+    local_marker = tmp_path / "local-pond-ran"
+    path_bin = tmp_path / "hostile-path"
+    path_bin.mkdir()
+    namesake_marker = tmp_path / "path-namesake-ran"
+    namesake = path_bin / "pond"
+    namesake.write_text(
+        '#!/bin/sh\nprintf namesake > "$PATH_NAMESAKE_MARKER"\n'
+        "printf 'pond 9.9.9\\n'\n",
+        encoding="utf-8",
+    )
+    namesake.chmod(0o700)
+    storage = tmp_path / "private-store"
+    storage.mkdir()
+    output = tmp_path / "private-pond-output.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(path_bin) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setenv("LOCAL_POND_MARKER", str(local_marker))
+    monkeypatch.setenv("PATH_NAMESAKE_MARKER", str(namesake_marker))
+    args = [
+        "archive",
+        "pond-inventory",
+        "--storage-path",
+        str(storage),
+        "--output",
+        str(output),
+    ]
+    if resolution == "explicit-relative":
+        monkeypatch.setenv("POND_BINARY", str(namesake))
+        args.extend(("--pond-binary", "./pond"))
+    else:
+        monkeypatch.setenv("POND_BINARY", "pond")
+
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "archive_sessions": 1,
+        "by_harness": {"claude-code": 1},
+        "empty_sessions": 0,
+        "pond_version": "0.16.3",
+        "schema_version": 1,
+    }
+    assert local_marker.read_text(encoding="utf-8") == "local"
+    assert not namesake_marker.exists()
+    assert _mode(output) == 0o600
+    _assert_private_values_absent(
+        result, caplog, local_binary, local_marker, namesake, namesake_marker, output
+    )
+
+
 def test_pond_inventory_refuses_absent_binary_without_creating_output(
     monkeypatch, tmp_path, caplog
 ):
@@ -329,6 +465,59 @@ def test_pond_inventory_refuses_absent_binary_without_creating_output(
     assert "archive pond inventory binary unavailable" in result.output
     assert not output.exists()
     _assert_private_values_absent(result, caplog, storage, output)
+
+
+@pytest.mark.parametrize(
+    "raw_timeout",
+    [
+        "/SENSITIVE/private/timeout-token",
+        "not-a-number-SENSITIVE",
+        "nan",
+        "inf",
+        "-inf",
+        "4.99",
+        "601",
+    ],
+)
+def test_pond_inventory_timeout_errors_never_disclose_the_raw_token(
+    raw_timeout, monkeypatch, tmp_path, caplog
+):
+    storage = tmp_path / "private-store"
+    storage.mkdir()
+    output = tmp_path / "private-output.json"
+    binary = tmp_path / "private-pond"
+    export_called = False
+
+    def unexpected_export(*_args, **_kwargs):
+        nonlocal export_called
+        export_called = True
+        raise AssertionError("invalid timeout reached Pond export")
+
+    monkeypatch.setattr(server_main, "export_pond_inventory", unexpected_export)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "archive",
+            "pond-inventory",
+            "--storage-path",
+            str(storage),
+            "--output",
+            str(output),
+            "--pond-binary",
+            str(binary),
+            "--timeout",
+            raw_timeout,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert result.output == "Error: archive pond inventory invalid timeout\n"
+    assert export_called is False
+    assert not output.exists()
+    _assert_private_values_absent(
+        result, caplog, raw_timeout, storage, output, binary, "SENSITIVE"
+    )
 
 
 @pytest.mark.parametrize("storage_kind", ["relative", "url", "file", "missing"])
@@ -431,6 +620,7 @@ def test_coverage_snapshots_resolved_registry_writes_report_before_safe_exit(
     requested_db = tmp_path / "requested-private.duckdb"
     resolved_registry = tmp_path / "resolved-private.registry.duckdb"
     snapshot = tmp_path / "snapshot-private.registry.duckdb"
+    config = _write_isolated_config(tmp_path)
     _write_native(current_path)
     _write_pond(pond_path, _pond_inventory(pond_session_id))
     calls: list[tuple[str, Path]] = []
@@ -465,6 +655,7 @@ def test_coverage_snapshots_resolved_registry_writes_report_before_safe_exit(
             output=output,
             source=current_path,
             pond=pond_path,
+            config=config,
             db=requested_db,
         ),
     )
@@ -493,12 +684,70 @@ def test_coverage_snapshots_resolved_registry_writes_report_before_safe_exit(
         pond_path,
         output,
         requested_db,
+        config,
         resolved_registry,
         snapshot,
         "drover-private",
         "host-private",
         "native-private",
         pond_session_id,
+    )
+
+
+@pytest.mark.parametrize("manifest_role", ["pond", "prior"])
+@pytest.mark.parametrize("failure_kind", ["missing", "unsafe", "wrong-kind"])
+def test_coverage_independently_rejects_invalid_pond_and_prior_manifests(
+    manifest_role, failure_kind, tmp_path, caplog
+):
+    config = _write_isolated_config(tmp_path)
+    registry = tmp_path / "isolated.registry.duckdb"
+    _write_empty_registry(registry)
+    current_path = tmp_path / "current-private.json"
+    pond_path = tmp_path / "pond-private.json"
+    prior_path = tmp_path / "prior-private.json"
+    output = tmp_path / "coverage-private.json"
+    _write_native(current_path)
+    if manifest_role != "pond" or failure_kind != "missing":
+        if manifest_role == "pond" and failure_kind == "wrong-kind":
+            _write_native(pond_path)
+        else:
+            _write_pond(pond_path)
+    if manifest_role != "prior" or failure_kind != "missing":
+        if manifest_role == "prior" and failure_kind == "wrong-kind":
+            _write_pond(prior_path)
+        else:
+            _write_native(prior_path, _source_inventory("prior-private-host"))
+    invalid_path = pond_path if manifest_role == "pond" else prior_path
+    if failure_kind == "unsafe":
+        invalid_path.chmod(0o644)
+
+    result = CliRunner().invoke(
+        main,
+        _coverage_args(
+            output=output,
+            source=current_path,
+            pond=pond_path,
+            config=config,
+            db=registry,
+            prior=(prior_path,),
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert result.output == "Error: archive coverage failed\n"
+    assert not output.exists()
+    _assert_private_values_absent(
+        result,
+        caplog,
+        config,
+        registry,
+        current_path,
+        pond_path,
+        prior_path,
+        output,
+        "host-private",
+        "prior-private-host",
+        "native-private",
     )
 
 
@@ -521,6 +770,7 @@ def test_coverage_input_registry_and_output_failures_write_no_new_report(
     pond_path = tmp_path / "pond-private.json"
     output = tmp_path / "coverage-private.json"
     db = tmp_path / "malformed-private.registry.duckdb"
+    config = _write_isolated_config(tmp_path)
     _write_native(current_path)
     _write_pond(pond_path)
     db.write_bytes(b"not a DuckDB catalog")
@@ -547,6 +797,7 @@ def test_coverage_input_registry_and_output_failures_write_no_new_report(
         output=output,
         source=current_path,
         pond=pond_path,
+        config=config,
         db=db,
     )
     if failure_kind == "duplicate-current-host":
@@ -568,6 +819,7 @@ def test_coverage_input_registry_and_output_failures_write_no_new_report(
         pond_path,
         output,
         db,
+        config,
         "host-private",
         "native-private",
     )
@@ -580,10 +832,19 @@ def test_coverage_accepts_private_prior_inventories_but_no_apply_option(
     prior_path = tmp_path / "prior-private.json"
     pond_path = tmp_path / "pond-private.json"
     output = tmp_path / "coverage-private.json"
+    config = _write_isolated_config(tmp_path)
+    registry = tmp_path / "isolated.registry.duckdb"
+    _write_empty_registry(registry)
     _write_native(current_path)
     _write_native(prior_path, _source_inventory("prior-private-host"))
     _write_pond(pond_path)
-    monkeypatch.setattr(server_main, "load_registry_candidates", lambda _path: ())
+    real_resolve_config = server_main._resolve_config
+
+    def reject_operator_config(config_path):
+        assert config_path is not None, "test reached the default operator config"
+        return real_resolve_config(config_path)
+
+    monkeypatch.setattr(server_main, "_resolve_config", reject_operator_config)
 
     success = CliRunner().invoke(
         main,
@@ -591,6 +852,8 @@ def test_coverage_accepts_private_prior_inventories_but_no_apply_option(
             output=output,
             source=current_path,
             pond=pond_path,
+            config=config,
+            db=registry,
             prior=(prior_path,),
         ),
     )
@@ -606,6 +869,8 @@ def test_coverage_accepts_private_prior_inventories_but_no_apply_option(
             output=mutation_output,
             source=current_path,
             pond=pond_path,
+            config=config,
+            db=registry,
         )
         + ["--apply"],
     )
@@ -619,6 +884,8 @@ def test_coverage_accepts_private_prior_inventories_but_no_apply_option(
         current_path,
         prior_path,
         pond_path,
+        config,
+        registry,
         mutation_output,
         "host-private",
         "native-private",

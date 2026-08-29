@@ -230,7 +230,7 @@ def pond_inventory_summary(inventory: PondInventory) -> dict[str, object]:
 
 def _require_executable(binary: Path) -> Path:
     try:
-        path = Path(binary)
+        path = Path(binary).resolve(strict=True)
         metadata = path.stat()
     except (OSError, TypeError, ValueError):
         raise _failure("binary") from None

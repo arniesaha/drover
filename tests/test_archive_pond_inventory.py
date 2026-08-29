@@ -294,6 +294,43 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
     assert load_pond_inventory(output) == inventory
 
 
+@pytest.mark.parametrize("relative_binary", ["./pond", "pond"])
+def test_export_executes_the_validated_relative_binary_not_a_path_namesake(
+    relative_binary, fake_pond, monkeypatch, tmp_path
+):
+    binary, local_store, record = fake_pond
+    path_bin = tmp_path / "hostile-path"
+    path_bin.mkdir()
+    namesake_marker = tmp_path / "path-namesake-ran"
+    namesake = path_bin / "pond"
+    namesake.write_text(
+        '#!/bin/sh\nprintf namesake > "$PATH_NAMESAKE_MARKER"\n'
+        "printf 'pond 9.9.9\\n'\n",
+        encoding="utf-8",
+    )
+    namesake.chmod(0o700)
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "relative-pond-inventory.json"
+    environment = _environment(
+        record,
+        PATH=str(path_bin) + os.pathsep + os.environ["PATH"],
+        PATH_NAMESAKE_MARKER=str(namesake_marker),
+    )
+
+    inventory = export_pond_inventory(
+        Path(relative_binary),
+        output,
+        storage_path=local_store,
+        env=environment,
+    )
+
+    calls = json.loads(record.read_text(encoding="utf-8"))
+    assert inventory.pond_version == "0.16.3"
+    assert [call["argv"][0] for call in calls] == [str(binary.resolve())] * 3
+    assert not namesake_marker.exists()
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
 def test_export_normalizes_datafusion_timestamps_and_returns_safe_summary(
     fake_pond, tmp_path
 ):

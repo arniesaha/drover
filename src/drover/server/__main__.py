@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -823,18 +824,24 @@ def archive_source_inventory_cmd(host_id: str, output: Path) -> None:
 @click.option(
     "--timeout",
     "timeout_seconds",
-    default=60.0,
+    default="60",
     show_default=True,
-    type=click.FloatRange(min=5.0, max=600.0),
+    type=str,
     metavar="SECONDS",
 )
 def archive_pond_inventory_cmd(
     storage_path: Path,
     output: Path,
     pond_binary: Optional[Path],
-    timeout_seconds: float,
+    timeout_seconds: str,
 ) -> None:
     """Export supported Pond root-session metadata."""
+    try:
+        parsed_timeout = float(timeout_seconds)
+    except (TypeError, ValueError, OverflowError):
+        raise click.ClickException("archive pond inventory invalid timeout") from None
+    if not math.isfinite(parsed_timeout) or not 5.0 <= parsed_timeout <= 600.0:
+        raise click.ClickException("archive pond inventory invalid timeout")
     binary = pond_binary
     if binary is None:
         configured = os.environ.get("POND_BINARY", "").strip()
@@ -851,7 +858,7 @@ def archive_pond_inventory_cmd(
             binary,
             output,
             storage_path=storage_path,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=parsed_timeout,
         )
         summary = pond_inventory_summary(inventory)
     except Exception:
