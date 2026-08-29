@@ -642,8 +642,12 @@ def drover_open_loops(
     duckdb_path: Path,
     container_type: Optional[str] = None,
     limit: int = 20,
+    project_key: Optional[str] = None,
 ) -> dict:
-    """Return context containers with a known next action or open loop."""
+    """Return context containers with a known next action or open loop.
+
+    When supplied, ``project_key`` must be one exact ``<owner>/<name>`` pair.
+    """
     where = [
         "(COALESCE(next_action, '') <> '' OR COALESCE(open_loop, '') <> '')",
     ]
@@ -651,6 +655,12 @@ def drover_open_loops(
     if container_type:
         where.append("container_type = ?")
         params.append(normalize_context_type(container_type))
+    if project_key is not None:
+        owner, separator, name = project_key.partition("/")
+        if not separator or not owner or not name or "/" in name:
+            raise ValueError("open_loops: project_key must be one <owner>/<name> pair")
+        where.extend(["repo_owner = ?", "repo_name = ?"])
+        params.extend([owner, name])
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
