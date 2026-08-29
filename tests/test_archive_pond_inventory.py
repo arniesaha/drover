@@ -699,6 +699,12 @@ def test_snapshot_fails_closed_if_a_source_file_changes_during_copy(
     source = local_store / "racy.bin"
     source.write_bytes(b"a" * (256 * 1024))
     monkeypatch.setattr(pond_inventory_module, "_COPY_CHUNK_BYTES", 1)
+    # The watcher globs the process temp root for the snapshot directory.
+    # Under xdist a sibling test's snapshot lands in the shared system root
+    # and both the watcher and the final baseline assertion see it, so each
+    # test gets a private root instead.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "snapshot-root"))
+    (tmp_path / "snapshot-root").mkdir()
     temporary_root = Path(tempfile.gettempdir())
     baseline = set(temporary_root.glob("drover-pond-inventory-*"))
     changed = threading.Event()
@@ -743,6 +749,10 @@ def test_snapshot_revalidates_earlier_files_after_the_whole_copy(
     early.write_bytes(b"early original")
     (local_store / "z-slow.bin").write_bytes(b"z" * (256 * 1024))
     monkeypatch.setattr(pond_inventory_module, "_COPY_CHUNK_BYTES", 1)
+    # Same isolation as the mid-copy race above: a shared system temp root
+    # makes sibling xdist workers visible to the glob and the baseline check.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "snapshot-root"))
+    (tmp_path / "snapshot-root").mkdir()
     temporary_root = Path(tempfile.gettempdir())
     baseline = set(temporary_root.glob("drover-pond-inventory-*"))
     changed = threading.Event()
