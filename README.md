@@ -155,7 +155,8 @@ These commands do not sync or upload data, configure Cloudflare R2 or other
 remote storage, certify archive content, write to the Pond archive, or
 authorize retention or deletion.
 
-Pass `--dry-run` to see exactly what it would do without changing anything.
+Run the installer as `install.sh --dry-run` to preview its actions without
+changing anything.
 
 Continue with [Getting Started](docs/getting-started.md) for the source-build
 path, verification, private Tailscale setup, and optional context ingestion.

@@ -31,3 +31,13 @@ def test_documented_cli_command_is_available(args: list[str], expected: str) -> 
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert expected in result.stdout
+
+
+def test_archive_docs_attribute_dry_run_to_the_installer() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    archive_section = readme.split("## Optional: cross-session recall archive", 1)[
+        1
+    ].split("## Context store", 1)[0]
+
+    assert "`install.sh --dry-run`" in archive_section
+    assert "Pass `--dry-run`" not in archive_section
