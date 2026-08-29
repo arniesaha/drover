@@ -163,9 +163,12 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
     assert server.settings.host == "127.0.0.1"
 
     recall_tool = next(tool for tool in tools if tool.name == "drover_recall_bundle")
-    assert recall_tool.description == (
-        "Return bounded native-harness archive evidence plus scoped Drover context."
-    )
+    recall_description = recall_tool.description.lower()
+    assert "bounded native-harness archive recall" in recall_description
+    assert "scoped drover context" in recall_description
+    assert "bounded drover-only fallback" in recall_description
+    for fallback_state in ("disabled", "busy", "unavailable"):
+        assert fallback_state in recall_description
     assert list(recall_tool.inputSchema["properties"]) == [
         "query",
         "repo",

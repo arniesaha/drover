@@ -124,7 +124,11 @@ def build_mcp_server(
         limit: Optional[int] = None,
         max_context_chars: Optional[int] = None,
     ) -> dict:
-        """Return bounded native-harness archive evidence plus scoped Drover context."""
+        """Return bounded native-harness archive recall plus scoped Drover context.
+
+        When the local archive is disabled, busy, or unavailable, return a
+        bounded Drover-only fallback.
+        """
         return recall_service.recall_bundle(
             query=query,
             repo=repo,
