@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-28
+
+### Added
+
+- Optional cross-session recall archive: Drover reads a local Pond
+  (pinned v0.16.3) HTTP endpoint, and the new `drover_recall_bundle` MCP
+  tool composes bounded, source-cited evidence from archived native
+  sessions alongside Drover's own summaries, briefs, and open loops.
+  Disabled by default; loopback-only; responses are streamed and
+  byte-capped before decoding, and bundles compose one at a time. An
+  archive outage or the disabled state degrades to Drover-only context
+  with a structured warning -- it never blocks startup or a live session.
+- `[archive]` configuration block with strict validation (loopback URL,
+  bounded timeouts, limits, and response caps).
+- CI job proving the archive client against the real checksum-verified
+  Pond binary, so an upstream contract drift breaks the build rather than
+  an operator's hub.
+
+### Fixed
+
+- The fleet's most-polled endpoint (`/harness/hosts`) is cached per render
+  variant; previously every poll recomputed the snapshot and opened a
+  DuckDB connection under the registry connect lock, stalling for tens of
+  seconds behind writers (#289).
+- Pre-split control-plane table copies no longer resurrect deliberately
+  deleted rows; `harness prune-legacy-tables` removes the copies once the
+  control plane demonstrably holds every row (#283, #284).
+- Provider token usage is normalized under one arithmetic per harness
+  (cumulative vs per-message), counting every billed token class (#287).
+
 ## [0.3.7] - 2026-08-21
 
 ### Fixed

@@ -45,6 +45,12 @@ Analytics expands provider-reported quota windows and usage distributions.
   Parquet and DuckDB storage, then derives summaries, project briefs, and
   embeddings for recall.
 - The **MCP surface** exposes that context to coding agents as `drover_*` tools.
+- An optional **session archive** enriches recall across harnesses. Point
+  Drover at a local [Pond](https://github.com/tenequm/pond) HTTP endpoint and
+  the `drover_recall_bundle` MCP tool composes bounded, source-cited evidence
+  from archived native sessions alongside Drover's own context. Off by
+  default; Drover works fully without it, and an archive outage only removes
+  the enrichment.
 
 See [Architecture](docs/architecture.md) for the component boundaries and
 [Context Store](docs/context-store.md) for the data model.
@@ -67,6 +73,43 @@ to add.
 
 Add another machine with the one-liner printed by
 `drover-server pair-host --name <host>`.
+
+## Optional: cross-session recall archive
+
+Drover can read a local [Pond](https://github.com/tenequm/pond) archive
+(pinned: v0.16.3) to answer "how did we solve this?" questions across every
+harness's native history. The integration is read-only, loopback-only, and
+disabled by default -- enabling it changes nothing about session control,
+telemetry, or handoff.
+
+```toml
+# ~/.drover/config.toml
+[archive]
+enabled = true
+base_url = "http://127.0.0.1:9797"
+```
+
+Set up the archive itself with Pond (one-off, then re-run `pond sync` when
+you want fresh history):
+
+```bash
+pond init --yes --skip-mcp --adapters claude-code,codex-cli
+pond sync
+pond serve --transport http
+```
+
+Properties worth knowing:
+
+- `base_url` must resolve to loopback; redirects are never followed.
+- Responses are streamed and byte-capped before they are decoded, and one
+  recall bundle is composed at a time, so the enrichment cannot become a
+  memory problem for the hub.
+- When Pond is down or the feature is disabled, `drover_recall_bundle`
+  returns Drover-only context with a structured warning -- never an error,
+  and never a blocked startup.
+- The archive covers the machine it synced. Fleet-wide coverage is a
+  planned phase (shared object-store destination), not a property of this
+  release.
 
 Pass `--dry-run` to see exactly what it would do without changing anything.
 

@@ -131,3 +131,21 @@ jobs:
           echo "::endgroup::"
         done
         exit "$status"
+
+    # The archive client's unit tests prove it against a fake that encodes
+    # what we believe Pond v0.16.3 says on the wire. That belief is what an
+    # upstream release can silently change, so the same client also runs
+    # against the real pinned binary here -- checksum-verified, empty store.
+    # Contract drift breaks this step, not an operator's hub.
+    - name: Pond pinned-binary contract
+      if: steps.scope.outputs.python == 'true'
+      run: |
+        PIN=v0.16.3
+        SHA=68888f85f17020ab95460391dc23b7abb51cb48146f43595256abe7491e660c6
+        curl -fsSL -o pond.tar.xz \
+          "https://github.com/tenequm/pond/releases/download/${PIN}/pond-x86_64-unknown-linux-gnu.tar.xz"
+        echo "${SHA}  pond.tar.xz" | sha256sum -c -
+        tar xf pond.tar.xz
+        POND_BINARY="$(find . -maxdepth 3 -name pond -type f | head -1)"
+        chmod +x "$POND_BINARY"
+        POND_BINARY="$POND_BINARY" pytest tests/test_pond_binary_contract.py -q
