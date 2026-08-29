@@ -23,6 +23,7 @@ from drover.server.updates import (
     ReleaseArtifact,
     install_cached_into_venv,
     install_version,
+    venv_interpreter,
 )
 
 log = logging.getLogger("drover.harnessd.update")
@@ -143,6 +144,51 @@ def resolve_activation(cfg) -> tuple[str, str]:
     if mode != ACTIVATION_IN_PLACE:
         return ACTIVATION_SYMLINK, ""
     return ACTIVATION_IN_PLACE, venv
+
+
+def warn_if_in_place_venv_is_unusable(activation: str, venv: str) -> bool:
+    """Say at startup what would otherwise only surface hours later.
+
+    `resolve_activation` deliberately never touches the filesystem: it resolves
+    configuration, and a host may legitimately be configured before the venv it
+    names exists. The install is already guarded where it matters --
+    `install_cached_into_venv` refuses a path with no interpreter under it and
+    the host stays on the version it is running -- so this changes no decision
+    and is not a second gate.
+
+    What it buys is timing. Activation waits for the host to go idle, which can
+    be hours, so a typo in `in_place_venv` sits undetected until the worst
+    possible moment to discover it. One stat at startup turns that into a log
+    line while somebody is still watching. Returns whether the venv looks usable.
+    """
+    if activation != ACTIVATION_IN_PLACE or not venv:
+        return True
+    python = venv_interpreter(venv)
+    try:
+        python.stat()
+    except FileNotFoundError:
+        log.warning(
+            "update.in_place_venv %s has no interpreter at %s; in-place "
+            "activation will refuse and this host will stay on its current "
+            "version",
+            venv,
+            python,
+        )
+        return False
+    except OSError as exc:
+        # Not the same problem, and not the same fix. A launchd job denied the
+        # privacy grant for an external volume cannot stat its own venv, and
+        # `Path.exists()` reports that as absent -- sending the operator to
+        # hunt a config typo that is not there.
+        log.warning(
+            "cannot check update.in_place_venv %s (%s); if this host runs "
+            "under a service manager the venv may need a privacy grant rather "
+            "than a config change",
+            python,
+            exc,
+        )
+        return False
+    return True
 
 
 class HostUpdater:
