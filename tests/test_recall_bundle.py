@@ -260,6 +260,7 @@ def test_validation_normalizes_query_and_reports_requested_and_effective_limits(
         "truncated": False,
         "dropped": {
             "archive_neighborhoods": 0,
+            "archive_siblings": 0,
             "repository_open_loops": 0,
             "repository_recent_summaries": 0,
             "project_brief": 0,
@@ -482,6 +483,9 @@ def test_composition_preserves_rank_exact_joins_and_self_contained_citations(
         "limits",
     ]
     assert [item["rank"] for item in bundle["archive_evidence"]] == [1, 3, 4]
+    assert all(
+        item["context_truncated"] is False for item in bundle["archive_evidence"]
+    )
     assert [request.message_id for request in archive.message_requests] == [
         "pond-message-1",
         "pond-message-2",
@@ -671,15 +675,17 @@ def _budget_order_service(tmp_path: Path) -> RecallBundleService:
         "recent_drops",
         "brief_drops",
         "keyword_drops",
+        "archive_ranks",
+        "keyword_event_ids",
     ),
     [
-        (3_100, 1, 0, 0, 0, 0),
-        (2_669, 3, 0, 0, 0, 0),
-        (2_500, 3, 1, 0, 0, 0),
-        (2_300, 3, 1, 1, 0, 0),
-        (1_200, 3, 1, 2, 1, 0),
-        (1_050, 3, 1, 2, 1, 1),
-        (1_000, 3, 1, 2, 1, 2),
+        (3_100, 1, 0, 0, 0, 0, [1, 3], ["event-linked", "event-independent"]),
+        (2_669, 3, 0, 0, 0, 0, [], ["event-linked", "event-independent"]),
+        (2_500, 3, 1, 0, 0, 0, [], ["event-linked", "event-independent"]),
+        (2_300, 3, 1, 1, 0, 0, [], ["event-linked", "event-independent"]),
+        (1_200, 3, 1, 2, 1, 0, [], ["event-linked", "event-independent"]),
+        (1_050, 3, 1, 2, 1, 1, [], ["event-linked"]),
+        (1_000, 3, 1, 2, 1, 2, [], []),
     ],
 )
 def test_budget_removal_boundaries_follow_the_required_order(
@@ -690,6 +696,8 @@ def test_budget_removal_boundaries_follow_the_required_order(
     recent_drops: int,
     brief_drops: int,
     keyword_drops: int,
+    archive_ranks: list[int],
+    keyword_event_ids: list[str],
 ) -> None:
     service = _budget_order_service(tmp_path)
 
@@ -701,12 +709,18 @@ def test_budget_removal_boundaries_follow_the_required_order(
 
     assert bundle["limits"]["dropped"] == {
         "archive_neighborhoods": archive_drops,
+        "archive_siblings": 0,
         "repository_open_loops": loop_drops,
         "repository_recent_summaries": recent_drops,
         "project_brief": brief_drops,
         "drover_keyword_matches": keyword_drops,
         "exact_session_summaries": 0,
     }
+    assert [item["rank"] for item in bundle["archive_evidence"]] == archive_ranks
+    assert [
+        item["source_identifiers"]["event_id"]
+        for item in bundle["drover_context"]["keyword_matches"]
+    ] == keyword_event_ids
     assert bundle["limits"]["used_chars"] <= budget
     for item in _content_items(bundle):
         assert item["source_identifiers"]
@@ -738,6 +752,7 @@ def test_budget_drops_optional_evidence_in_the_required_order(
     assert surviving["join_basis"] == "exact_session_id"
     assert bundle["limits"]["dropped"] == {
         "archive_neighborhoods": 3,
+        "archive_siblings": 0,
         "repository_open_loops": 1,
         "repository_recent_summaries": 2,
         "project_brief": 1,
@@ -783,6 +798,50 @@ def test_budget_truncates_only_final_highest_priority_text_on_unicode_boundary(
         bundle["limits"]["used_chars"]
         <= bundle["limits"]["effective_max_context_chars"]
     )
+
+
+def test_budget_records_removed_archive_context_without_truncating_target_text(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    hit = _hit(
+        rank=1,
+        message_id="context-budget-message",
+        session_id="context-budget-session",
+        timestamp="2026-08-28T12:00:00Z",
+        text="T" * 100,
+    )
+    archive = StrictArchive(
+        result=ArchiveSearchResult(
+            hits=(hit,), matched_total=1, searchable_in_scope=1, has_more=False
+        ),
+        neighborhoods={hit.message_id: _neighborhood(hit, sibling_text="S" * 950)},
+        expected_query="context budget",
+        expected_project=None,
+        expected_since=None,
+        expected_limit=3,
+    )
+    service = _service(duckdb_path, archive, max_context_chars=1_000)
+
+    bundle = service.recall_bundle(query="context budget", max_context_chars=1_000)
+
+    assert len(bundle["archive_evidence"]) == 1
+    surviving = bundle["archive_evidence"][0]
+    assert surviving["text"] == "T" * 100
+    assert surviving["truncated"] is False
+    assert surviving["context_truncated"] is True
+    assert surviving["siblings"] == []
+    assert bundle["limits"]["dropped"] == {
+        "archive_neighborhoods": 0,
+        "archive_siblings": 1,
+        "repository_open_loops": 0,
+        "repository_recent_summaries": 0,
+        "project_brief": 0,
+        "drover_keyword_matches": 0,
+        "exact_session_summaries": 0,
+    }
+    assert bundle["limits"]["used_chars"] == 100
+    assert bundle["limits"]["truncated"] is True
 
 
 @pytest.mark.parametrize("requested", [1_000, 100_000])

@@ -373,6 +373,7 @@ def _project_archive_neighborhood(
         {
             "rank": hit.rank,
             "role": hit.role,
+            "context_truncated": False,
             "session": {
                 "session_id": neighborhood.session.session_id,
                 "project": neighborhood.session.project,
@@ -570,6 +571,7 @@ def _z_to_offset(value: str) -> str:
 def _empty_drop_counts() -> dict[str, int]:
     return {
         "archive_neighborhoods": 0,
+        "archive_siblings": 0,
         "repository_open_loops": 0,
         "repository_recent_summaries": 0,
         "project_brief": 0,
@@ -674,13 +676,19 @@ def _apply_character_budget(bundle: dict, maximum: int) -> None:
 
     if _used_chars(bundle) > maximum and keeper is not None:
         _retain_only(bundle, keeper, dropped=dropped)
-        keeper["text"] = keeper["text"][:maximum]
-        keeper["truncated"] = True
+        if _used_chars(bundle) > maximum:
+            keeper["text"] = keeper["text"][:maximum]
+            keeper["truncated"] = True
 
     used = _used_chars(bundle)
     bundle["limits"]["used_chars"] = used
-    bundle["limits"]["truncated"] = bool(sum(dropped.values())) or any(
-        item["truncated"] for item in _text_items(bundle)
+    bundle["limits"]["truncated"] = (
+        bool(sum(dropped.values()))
+        or any(
+            neighborhood["context_truncated"]
+            for neighborhood in bundle["archive_evidence"]
+        )
+        or any(item["truncated"] for item in _text_items(bundle))
     )
 
 
@@ -708,6 +716,9 @@ def _retain_only(bundle: dict, keeper: dict, *, dropped: dict[str, int]) -> None
     for neighborhood in bundle["archive_evidence"]:
         if neighborhood is keeper:
             dropped["archive_neighborhoods"] += len(bundle["archive_evidence"]) - 1
+            removed_siblings = len(neighborhood["siblings"])
+            dropped["archive_siblings"] += removed_siblings
+            neighborhood["context_truncated"] = removed_siblings > 0
             neighborhood["siblings"] = []
             kept_archive = [neighborhood]
             break
