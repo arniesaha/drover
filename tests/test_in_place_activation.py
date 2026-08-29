@@ -584,6 +584,8 @@ def test_a_venv_we_cannot_stat_is_reported_as_a_grant_problem(
         )
     assert "privacy grant" in caplog.text
     assert "has no interpreter" not in caplog.text
+
+
 # --- services that share the venv (#226) -------------------------------------
 
 
@@ -731,3 +733,101 @@ def test_restart_units_round_trip_through_config(tmp_path):
 
 def test_restart_units_default_to_nothing(tmp_path):
     assert default_config().update_restart_units == ()
+
+
+# --- the rollback path rewrites the same venv --------------------------------
+
+
+def test_rollback_restarts_the_services_sharing_the_venv(tmp_path):
+    """Self-repair rewrites the venv too, so it owes siblings the same restart.
+
+    Without this the hub rolls back, restarts harnessd onto the previous
+    version, and leaves drover-server running the version being undone with
+    its lazy imports coming from the rolled-back files: the exact mismatch
+    this feature exists to prevent, on the path meant to fix things.
+    """
+    from drover.server.harness.daemon import _rollback_watchdog
+
+    layout = RuntimeLayout(tmp_path / "home")
+    _installed(layout, "0.1.3")
+    _installed(layout, "0.1.4")
+    layout.flip("0.1.4")
+    layout.write_marker("0.1.3", "0.1.4")
+    venv = _venv(tmp_path)
+    events, siblings, myself = _restart_recorder()
+
+    _rollback_watchdog(
+        SimpleNamespace(registered_at_least_once=False),
+        layout,
+        deadline_seconds=0,
+        sleep=lambda _s: None,
+        restarter=myself,
+        activation=ACTIVATION_IN_PLACE,
+        in_place_venv=str(venv),
+        restart_units=("com.drover.server",),
+        sibling_restarter=siblings,
+    )
+
+    assert [name for name, _ in events] == ["siblings", "self"]
+
+
+def test_rollback_on_a_symlink_host_restarts_only_itself(tmp_path):
+    from drover.server.harness.daemon import _rollback_watchdog
+
+    layout = RuntimeLayout(tmp_path / "home")
+    _installed(layout, "0.1.3")
+    _installed(layout, "0.1.4")
+    layout.flip("0.1.4")
+    layout.write_marker("0.1.3", "0.1.4")
+    events, siblings, myself = _restart_recorder()
+
+    _rollback_watchdog(
+        SimpleNamespace(registered_at_least_once=False),
+        layout,
+        deadline_seconds=0,
+        sleep=lambda _s: None,
+        restarter=myself,
+        restart_units=("com.drover.server",),
+        sibling_restarter=siblings,
+    )
+
+    assert events == [("self", ())]
+
+
+# --- malformed config is dropped, never fatal --------------------------------
+
+
+def test_a_bare_string_restart_units_is_ignored_not_iterated(tmp_path):
+    """`restart_units = "com.drover.server"` would otherwise become 17 units."""
+    path = tmp_path / "config.toml"
+    path.write_text('[update]\nrestart_units = "com.drover.server"\n', encoding="utf-8")
+    assert load_config(path).update_restart_units == ()
+
+
+def test_non_string_restart_unit_entries_are_dropped(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[update]\nrestart_units = ["com.drover.server", 7, ""]\n',
+        encoding="utf-8",
+    )
+    assert load_config(path).update_restart_units == ("com.drover.server",)
+
+
+def test_this_service_is_skipped_if_named_in_restart_units(monkeypatch):
+    """Restarting ourselves mid-list would truncate everything after it."""
+    import drover.server.harness.updater as updater_mod
+
+    monkeypatch.setattr(updater_mod.sys, "platform", "linux")
+    monkeypatch.setattr(updater_mod, "_systemd_unit", lambda: "drover-harnessd.service")
+    ran: list = []
+    monkeypatch.setattr(
+        updater_mod.subprocess,
+        "run",
+        lambda argv, **kw: ran.append(argv) or SimpleNamespace(returncode=0, stderr=""),
+    )
+
+    updater_mod.default_sibling_restarter(
+        ("drover-harnessd.service", "drover-server.service")
+    )
+
+    assert ran == [["systemctl", "--user", "restart", "drover-server.service"]]

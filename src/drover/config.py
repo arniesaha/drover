@@ -367,6 +367,25 @@ def _merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _restart_units(value: object) -> tuple[str, ...]:
+    """Units to restart on in-place activation, ignoring anything malformed.
+
+    Same policy as `harness.favorite_cwds`: a bad entry is dropped, not fatal.
+    A daemon that refuses to start over one line of config is worse than one
+    that starts and restarts fewer services than intended. A bare string is
+    the likely typo (`restart_units = "com.drover.server"`) and is rejected
+    outright rather than iterated, which would otherwise expand into one
+    single-character unit name per letter.
+    """
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        name
+        for name in (str(entry).strip() for entry in value if isinstance(entry, str))
+        if name
+    )
+
+
 def _from_dict(d: dict) -> DroverConfig:
     s = d["summarizer"]
     e = d["embeddings"]
@@ -436,11 +455,7 @@ def _from_dict(d: dict) -> DroverConfig:
         update_repo=str(d["update"]["repo"]),
         update_activation=_activation_mode(d["update"]["activation"]),
         update_in_place_venv=str(d["update"]["in_place_venv"]).strip(),
-        update_restart_units=tuple(
-            name
-            for name in (str(entry).strip() for entry in d["update"]["restart_units"])
-            if name
-        ),
+        update_restart_units=_restart_units(d["update"]["restart_units"]),
         harness_favorite_cwds=tuple(
             favorite
             for favorite in (

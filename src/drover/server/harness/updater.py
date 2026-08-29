@@ -139,7 +139,15 @@ def default_sibling_restarter(units: Sequence[str]) -> None:
     venv, so stopping here would leave *this* process mixed as well rather
     than fixing anything.
     """
+    own = _launchd_label() if sys.platform == "darwin" else _systemd_unit()
     for unit in units:
+        if unit == own:
+            # Restarting ourselves here would end the process partway through
+            # the list, so every unit after this one would silently never
+            # restart. We restart last anyway; dropping it changes nothing but
+            # the truncation.
+            log.debug("skipping %s in update.restart_units: that is this service", unit)
+            continue
         if sys.platform == "darwin":
             target = f"gui/{os.getuid()}/{unit}"
             log.info("asking launchd to restart sibling %s", target)
