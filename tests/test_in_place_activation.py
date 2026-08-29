@@ -543,3 +543,29 @@ def test_the_startup_check_does_not_change_the_resolved_mode(tmp_path):
         update_in_place_venv=str(tmp_path / "absent"),
     )
     assert resolve_activation(cfg) == (ACTIVATION_IN_PLACE, str(tmp_path / "absent"))
+
+
+def test_a_venv_we_cannot_stat_is_reported_as_a_grant_problem(
+    tmp_path, caplog, monkeypatch
+):
+    """An unreadable venv is not a missing one, and the fix is different.
+
+    `Path.exists()` swallows OSError and would call this absent, sending the
+    operator to hunt a config typo. On this fleet the usual cause is a service
+    manager job without the privacy grant for an external volume.
+    """
+    unreadable = tmp_path / ".drover-venv" / "bin" / "python"
+
+    def deny(_path):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(Path, "stat", deny)
+    with caplog.at_level("WARNING"):
+        assert (
+            warn_if_in_place_venv_is_unusable(
+                ACTIVATION_IN_PLACE, str(unreadable.parent.parent)
+            )
+            is False
+        )
+    assert "privacy grant" in caplog.text
+    assert "has no interpreter" not in caplog.text

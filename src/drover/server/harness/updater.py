@@ -23,6 +23,7 @@ from drover.server.updates import (
     ReleaseArtifact,
     install_cached_into_venv,
     install_version,
+    venv_interpreter,
 )
 
 log = logging.getLogger("drover.harnessd.update")
@@ -162,16 +163,32 @@ def warn_if_in_place_venv_is_unusable(activation: str, venv: str) -> bool:
     """
     if activation != ACTIVATION_IN_PLACE or not venv:
         return True
-    python = Path(venv) / "bin" / "python"
-    if python.exists():
-        return True
-    log.warning(
-        "update.in_place_venv %s has no interpreter at %s; in-place activation "
-        "will refuse and this host will stay on its current version",
-        venv,
-        python,
-    )
-    return False
+    python = venv_interpreter(venv)
+    try:
+        python.stat()
+    except FileNotFoundError:
+        log.warning(
+            "update.in_place_venv %s has no interpreter at %s; in-place "
+            "activation will refuse and this host will stay on its current "
+            "version",
+            venv,
+            python,
+        )
+        return False
+    except OSError as exc:
+        # Not the same problem, and not the same fix. A launchd job denied the
+        # privacy grant for an external volume cannot stat its own venv, and
+        # `Path.exists()` reports that as absent -- sending the operator to
+        # hunt a config typo that is not there.
+        log.warning(
+            "cannot check update.in_place_venv %s (%s); if this host runs "
+            "under a service manager the venv may need a privacy grant rather "
+            "than a config change",
+            python,
+            exc,
+        )
+        return False
+    return True
 
 
 class HostUpdater:

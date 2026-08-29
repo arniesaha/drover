@@ -236,6 +236,17 @@ def _run_steps(steps: list[list[str]], *, runner) -> bool:
     return True
 
 
+def venv_interpreter(venv: Path | str) -> Path:
+    """The interpreter an in-place install writes through.
+
+    One definition, because two things depend on agreeing about it: the
+    install refuses a venv without this path, and the startup check warns
+    about one. A second copy of the layout would let them drift into
+    disagreeing about which venvs are usable.
+    """
+    return Path(venv) / "bin" / "python"
+
+
 def install_cached_into_venv(
     layout: RuntimeLayout,
     version: str,
@@ -263,7 +274,7 @@ def install_cached_into_venv(
     if cached is None:
         log.error("%s has no cached artifact; refusing to install it in place", version)
         return False
-    python = Path(venv) / "bin" / "python"
+    python = venv_interpreter(venv)
     if not python.exists():
         # Guessing an interpreter is how the wrong venv gets overwritten.
         log.error("%s is not an interpreter we can install into", python)
