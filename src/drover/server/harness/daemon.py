@@ -14,6 +14,7 @@ import queue
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -583,50 +584,124 @@ def _codex_transcript_path(
 
 
 def _discover_claude_sessions(home: Path) -> list[dict[str, Any]]:
-    sessions = []
-    for path in (home / ".claude/projects").glob("*/*.jsonl"):
-        if not path.is_file():
-            continue
-        metadata = _jsonl_metadata(path)
-        session_id = _optional_text(metadata.get("sessionId")) or path.stem
-        cwd = _optional_text(metadata.get("cwd"))
-        updated_at_ts = path.stat().st_mtime
-        sessions.append(
-            _candidate(
-                harness="claude-code",
-                session_id=session_id,
-                cwd=cwd,
-                path=path,
-                updated_at_ts=updated_at_ts,
-                source="claude jsonl",
-            )
-        )
-    return sessions
+    return [source.candidate for source in _iter_claude_session_sources(home)]
 
 
 def _discover_codex_sessions(home: Path) -> list[dict[str, Any]]:
-    sessions = []
-    for path in (home / ".codex/sessions").glob("**/*.jsonl"):
-        if not path.is_file():
-            continue
-        metadata = _jsonl_metadata(path)
-        session_id = _codex_session_id(path) or _optional_text(
-            metadata.get("session_id")
-        )
-        if not session_id:
-            continue
-        cwd = _optional_text(metadata.get("cwd"))
-        sessions.append(
-            _candidate(
-                harness="codex",
-                session_id=session_id,
-                cwd=cwd,
-                path=path,
-                updated_at_ts=path.stat().st_mtime,
-                source="codex jsonl",
+    return [source.candidate for source in _iter_codex_session_sources(home)]
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeSessionSource:
+    harness: str
+    session_id: str
+    size_bytes: int
+    updated_at_ts: float
+    candidate: dict[str, Any]
+
+
+def discover_native_history_metadata(
+    home: Path, *, max_records: int = 100_000
+) -> list[dict[str, Any]]:
+    """Return bounded, path-free source metadata for a local inventory run."""
+    if (
+        isinstance(max_records, bool)
+        or not isinstance(max_records, int)
+        or not 0 <= max_records <= 100_000
+    ):
+        raise ValueError("native history invalid max_records")
+    records: list[dict[str, Any]] = []
+    try:
+        for source in _iter_native_session_sources(home, fail_on_error=True):
+            if len(records) >= max_records:
+                raise ValueError("native history exceeded max_records")
+            records.append(
+                {
+                    "harness": source.harness,
+                    "session_id": source.session_id,
+                    "size_bytes": source.size_bytes,
+                    "updated_at": _utc_timestamp(source.updated_at_ts),
+                }
             )
+    except OSError:
+        raise ValueError("native history discovery failed") from None
+    return records
+
+
+def _iter_native_session_sources(home: Path, *, fail_on_error: bool = False):
+    yield from _iter_claude_session_sources(home, fail_on_error=fail_on_error)
+    yield from _iter_codex_session_sources(home, fail_on_error=fail_on_error)
+
+
+def _iter_claude_session_sources(home: Path, *, fail_on_error: bool = False):
+    for path in (home / ".claude/projects").glob("*/*.jsonl"):
+        source = _native_session_source(
+            path,
+            harness="claude-code",
+            session_id=lambda metadata: _optional_text(metadata.get("sessionId"))
+            or path.stem,
+            source="claude jsonl",
+            fail_on_error=fail_on_error,
         )
-    return sessions
+        if source is not None:
+            yield source
+
+
+def _iter_codex_session_sources(home: Path, *, fail_on_error: bool = False):
+    for path in (home / ".codex/sessions").glob("**/*.jsonl"):
+        source = _native_session_source(
+            path,
+            harness="codex",
+            session_id=lambda metadata: _codex_session_id(path)
+            or _optional_text(metadata.get("session_id")),
+            source="codex jsonl",
+            fail_on_error=fail_on_error,
+        )
+        if source is not None:
+            yield source
+
+
+def _native_session_source(
+    path: Path,
+    *,
+    harness: str,
+    session_id: Callable[[dict[str, Any]], str | None],
+    source: str,
+    fail_on_error: bool,
+) -> _NativeSessionSource | None:
+    if fail_on_error:
+        initial_metadata = path.stat()
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            return None
+    elif not path.is_file():
+        return None
+    metadata = _jsonl_metadata(path, fail_on_error=fail_on_error)
+    native_session_id = session_id(metadata)
+    if not native_session_id:
+        return None
+    source_metadata = path.stat()
+    return _NativeSessionSource(
+        harness=harness,
+        session_id=native_session_id,
+        size_bytes=source_metadata.st_size,
+        updated_at_ts=source_metadata.st_mtime,
+        candidate=_candidate(
+            harness=harness,
+            session_id=native_session_id,
+            cwd=_optional_text(metadata.get("cwd")),
+            path=path,
+            updated_at_ts=source_metadata.st_mtime,
+            source=source,
+        ),
+    )
+
+
+def _utc_timestamp(timestamp: float) -> str:
+    return (
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _candidate(
@@ -1001,7 +1076,9 @@ def _clip_transcript_text(value: Any, *, max_chars: int = 12000) -> str:
     return text[:max_chars].rstrip() + "\n\n...[truncated]"
 
 
-def _jsonl_metadata(path: Path, *, max_lines: int = 250) -> dict[str, Any]:
+def _jsonl_metadata(
+    path: Path, *, max_lines: int = 250, fail_on_error: bool = False
+) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     try:
         with path.open(errors="replace") as stream:
@@ -1018,6 +1095,8 @@ def _jsonl_metadata(path: Path, *, max_lines: int = 250) -> dict[str, Any]:
                 if metadata.get("sessionId") and metadata.get("cwd"):
                     break
     except OSError:
+        if fail_on_error:
+            raise
         return metadata
     return metadata
 

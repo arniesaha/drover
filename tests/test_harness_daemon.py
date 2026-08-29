@@ -39,6 +39,7 @@ from drover.server.harness.daemon import (
     HarnessPreset,
     build_launch_command,
     create_harness_server,
+    discover_native_history_metadata,
     discover_native_resume_sessions,
     native_transcript_for_session,
     register_daemon_host,
@@ -2376,6 +2377,20 @@ def test_discovers_codex_native_resume_sessions(tmp_path):
     assert candidates[0]["native_resume"]["session_id"] == session_id
     assert candidates[0]["cwd"] == "/Users/arnabmac/jenny/nexus"
     assert candidates[0]["path_hint"] == str(session)
+
+
+def test_native_history_metadata_refuses_sources_beyond_its_configured_hard_cap(
+    tmp_path,
+):
+    session_dir = tmp_path / ".claude/projects/project"
+    session_dir.mkdir(parents=True)
+    for session_id in ("first", "second"):
+        (session_dir / f"{session_id}.jsonl").write_text(
+            json.dumps({"sessionId": session_id}), encoding="utf-8"
+        )
+
+    with pytest.raises(ValueError, match="max_records"):
+        discover_native_history_metadata(tmp_path, max_records=1)
 
 
 def test_harnessd_creates_shell_session(tmp_path):
