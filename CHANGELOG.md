@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Three local-only, read-only archive inventory commands capture private
+  native and Pond identity manifests and compare candidate coverage. They
+  create only new owner-readable `0600` artifacts, refuse unsafe inputs and
+  existing outputs, emit aggregate-only stdout, and exit `2` when conservative
+  duplicate or readiness checks block progression. They do not sync, upload,
+  configure remote storage, certify content, mutate the archive, or authorize
+  deletion.
+
 ## [0.4.0] - 2026-08-28
 
 ### Added

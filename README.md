@@ -111,6 +111,50 @@ Properties worth knowing:
   planned phase (shared object-store destination), not a property of this
   release.
 
+### Check local archive inventory coverage
+
+This operator-run check compares current native history, Drover's registry,
+and an existing local Pond store. Run the three commands in order:
+
+```bash
+drover-server archive source-inventory \
+  --host-id HOST_ALIAS --output PRIVATE_NATIVE.json
+drover-server archive pond-inventory \
+  --pond-binary /absolute/path/to/pond \
+  --storage-path /absolute/path/to/local/pond --output PRIVATE_POND.json
+drover-server archive coverage \
+  --source-inventory PRIVATE_NATIVE.json \
+  --pond-inventory PRIVATE_POND.json \
+  --output PRIVATE_COVERAGE.json
+```
+
+The three output files contain session identities. Keep them local and
+owner-only: Drover creates them as new `0600` files, refuses an existing
+output, and accepts identity-bearing inputs only when they are private regular
+files. Only the aggregate JSON printed to stdout may be copied into a
+sanitized operations record.
+
+The coverage command exits `2` after writing its private report when a
+conservative readiness check is not clean; this is a blocked readiness result,
+not permission to change the archive. Its three candidate miss reasons are:
+
+- `discovered_not_synced`: the current native source exists but no matching
+  Pond session was found.
+- `source_absent_after_prior_inventory`: the source is absent now but was
+  present in a supplied prior inventory.
+- `unverifiable`: neither current nor prior native inventory can verify the
+  unmatched registry candidate.
+
+Duplicate source identities, cross-harness native-ID collisions, duplicate
+logical Pond signatures, and Pond sessions too empty to compare are all
+reported conservatively and can block readiness. They are candidates for
+investigation, not deletion decisions. Candidate identity matches are not
+content certification: `certified_coverage.status = "not_implemented"`.
+
+These commands do not sync or upload data, configure Cloudflare R2 or other
+remote storage, certify archive content, write to the Pond archive, or
+authorize retention or deletion.
+
 Pass `--dry-run` to see exactly what it would do without changing anything.
 
 Continue with [Getting Started](docs/getting-started.md) for the source-build

@@ -15,13 +15,15 @@ import os
 import socket
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from drover.config import ArchiveConfig
-from drover.server.archive import PondArchiveClient
+from drover.server.archive import PondArchiveClient, export_pond_inventory
 from drover.server.archive.errors import ArchiveError, ArchiveRequestRejected
+from drover.server.archive.inventory import load_pond_inventory
 from drover.server.archive.types import ArchiveMessageRequest, ArchiveSearchRequest
 
 POND_BINARY = os.environ.get("POND_BINARY")
@@ -37,14 +39,22 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+@dataclass(frozen=True)
+class PondRuntime:
+    client: PondArchiveClient
+    env: dict[str, str]
+    storage_path: Path
+
+
 @pytest.fixture(scope="module")
-def pond_server(tmp_path_factory):
+def pond_runtime(tmp_path_factory):
     home = tmp_path_factory.mktemp("pond")
     config = home / "config.toml"
+    storage_path = home / "store"
     env = dict(
         os.environ,
         POND_CONFIG_FILE=str(config),
-        POND_STORAGE_PATH=str(home / "store"),
+        POND_STORAGE_PATH=str(storage_path),
     )
     subprocess.run(
         [POND_BINARY, "init", "--yes", "--skip-mcp", "--adapters", ""],
@@ -86,7 +96,7 @@ def pond_server(tmp_path_factory):
     else:
         proc.terminate()
         pytest.fail(f"pond serve never answered: {last}")
-    yield client
+    yield PondRuntime(client=client, env=env, storage_path=storage_path)
     proc.terminate()
     proc.wait(timeout=10)
 
@@ -98,24 +108,39 @@ def test_the_pinned_binary_is_the_pinned_version():
     assert "0.16.3" in out.stdout, out.stdout
 
 
-def test_search_on_an_empty_store_returns_an_empty_result(pond_server):
-    result = pond_server.search(ArchiveSearchRequest(query="anything at all"))
+def test_search_on_an_empty_store_returns_an_empty_result(pond_runtime):
+    result = pond_runtime.client.search(ArchiveSearchRequest(query="anything at all"))
     assert result.hits == ()
 
 
-def test_search_honors_scoping_parameters(pond_server):
-    result = pond_server.search(
+def test_search_honors_scoping_parameters(pond_runtime):
+    result = pond_runtime.client.search(
         ArchiveSearchRequest(query="scoped", project="drover", limit=3)
     )
     assert result.hits == ()
 
 
-def test_get_message_for_an_unknown_id_is_a_typed_rejection(pond_server):
+def test_get_message_for_an_unknown_id_is_a_typed_rejection(pond_runtime):
     with pytest.raises((ArchiveRequestRejected, ArchiveError)):
-        pond_server.get_message(
+        pond_runtime.client.get_message(
             ArchiveMessageRequest(
                 message_id="00000000-0000-0000-0000-000000000000",
                 context_before=1,
                 context_after=1,
             )
         )
+
+
+def test_pinned_binary_exports_the_inventory_sql_contract(pond_runtime, tmp_path):
+    output = tmp_path / "pond-inventory.json"
+
+    inventory = export_pond_inventory(
+        Path(POND_BINARY),
+        output,
+        storage_path=pond_runtime.storage_path,
+        env=pond_runtime.env,
+    )
+
+    assert inventory.pond_version == "0.16.3"
+    assert inventory.records == ()
+    assert load_pond_inventory(output) == inventory

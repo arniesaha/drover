@@ -796,13 +796,61 @@ def test_export_rejects_invalid_ndjson_rows(fake_pond, tmp_path, body):
         _export(fake_pond, tmp_path / "pond.json", FAKE_NDJSON=body)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "extra"])
-def test_export_requires_exact_six_columns(fake_pond, tmp_path, mutation):
+def test_export_normalizes_omitted_null_timestamp_keys_for_an_empty_row(
+    fake_pond, tmp_path
+):
+    row = dict(_DEFAULT_ROWS[1])
+    del row["first_message_at"]
+    del row["last_message_at"]
+
+    inventory, _ = _export(
+        fake_pond,
+        tmp_path / "pond.json",
+        FAKE_NDJSON=_ndjson((row,)),
+    )
+
+    assert inventory.records[0].message_count == 0
+    assert inventory.records[0].first_message_at is None
+    assert inventory.records[0].last_message_at is None
+
+
+@pytest.mark.parametrize("missing_timestamp", ["first_message_at", "last_message_at"])
+def test_export_rejects_only_one_omitted_timestamp_key_for_an_empty_row(
+    fake_pond, tmp_path, missing_timestamp
+):
+    row = dict(_DEFAULT_ROWS[1])
+    del row[missing_timestamp]
+
+    with pytest.raises(ValueError, match="columns"):
+        _export(fake_pond, tmp_path / "pond.json", FAKE_NDJSON=_ndjson((row,)))
+
+
+def test_export_rejects_omitted_timestamp_keys_for_a_nonempty_row(fake_pond, tmp_path):
     row = dict(_DEFAULT_ROWS[0])
-    if mutation == "missing":
-        del row["last_message_at"]
-    else:
-        row["project"] = "/sensitive/project"
+    del row["first_message_at"]
+    del row["last_message_at"]
+
+    with pytest.raises(ValueError, match="columns"):
+        _export(fake_pond, tmp_path / "pond.json", FAKE_NDJSON=_ndjson((row,)))
+
+
+@pytest.mark.parametrize(
+    "missing_column",
+    ["session_id", "source_agent", "created_at", "message_count"],
+)
+def test_export_rejects_every_other_missing_required_column(
+    fake_pond, tmp_path, missing_column
+):
+    row = dict(_DEFAULT_ROWS[1])
+    del row[missing_column]
+
+    with pytest.raises(ValueError, match="columns"):
+        _export(fake_pond, tmp_path / "pond.json", FAKE_NDJSON=_ndjson((row,)))
+
+
+def test_export_rejects_an_extra_column(fake_pond, tmp_path):
+    row = dict(_DEFAULT_ROWS[0])
+    row["project"] = "/sensitive/project"
 
     with pytest.raises(ValueError, match="columns"):
         _export(fake_pond, tmp_path / "pond.json", FAKE_NDJSON=_ndjson((row,)))

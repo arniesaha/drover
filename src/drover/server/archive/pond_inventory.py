@@ -77,6 +77,10 @@ _POND_COLUMNS = frozenset(
         "last_message_at",
     }
 )
+_POND_EMPTY_ROW_COLUMNS = _POND_COLUMNS - {
+    "first_message_at",
+    "last_message_at",
+}
 _ROOT_SOURCE_AGENTS = frozenset({"claude-code", "codex-cli"})
 _URI_SCHEME = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*:")
 _DATAFUSION_TIMESTAMP = re.compile(
@@ -694,7 +698,10 @@ def _read_pond_rows(path: Path) -> tuple[PondInventoryRecord, ...]:
             raise _failure("row") from None
         if not isinstance(row, dict):
             raise _failure("row")
-        if set(row) != _POND_COLUMNS:
+        columns = set(row)
+        if columns == _POND_EMPTY_ROW_COLUMNS and row.get("message_count") == 0:
+            row = {**row, "first_message_at": None, "last_message_at": None}
+        elif columns != _POND_COLUMNS:
             raise _failure("columns")
         record = _pond_record(row)
         key = (record.source_agent, record.session_id)
