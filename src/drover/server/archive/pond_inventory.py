@@ -35,6 +35,36 @@ WHERE s.source_agent IN ('claude-code', 'codex-cli')
 GROUP BY s.session_id, s.source_agent, s.created_at
 ORDER BY s.source_agent, s.session_id
 LIMIT 100001"""
+# The empty six-column NDJSON object plus newline is exactly 117 bytes. For
+# every value byte, six bytes is the JSON worst case (a ``\u00xx`` escape).
+# Optional timestamp strings are added without subtracting their null
+# placeholders, and the count length is added without subtracting its one-digit
+# placeholder, so the aggregate deliberately overestimates the main export.
+POND_INVENTORY_PREFLIGHT_SQL = """WITH inventory AS (
+    SELECT s.session_id, s.source_agent, s.created_at,
+           count(m.message_id) AS message_count,
+           min(m.timestamp) AS first_message_at,
+           max(m.timestamp) AS last_message_at
+    FROM sessions s
+    LEFT JOIN messages m ON m.session_id = s.session_id
+    WHERE s.source_agent IN ('claude-code', 'codex-cli')
+    GROUP BY s.session_id, s.source_agent, s.created_at
+    ORDER BY s.source_agent, s.session_id
+    LIMIT 100001
+)
+SELECT count(*) AS row_count,
+       coalesce(sum(
+           117
+           + 6 * coalesce(octet_length(session_id), 4)
+           + 6 * coalesce(octet_length(source_agent), 4)
+           + 6 * coalesce(octet_length(CAST(created_at AS VARCHAR)), 4)
+           + octet_length(CAST(message_count AS VARCHAR))
+           + CASE WHEN first_message_at IS NULL THEN 0
+                  ELSE 2 + 6 * octet_length(CAST(first_message_at AS VARCHAR)) END
+           + CASE WHEN last_message_at IS NULL THEN 0
+                  ELSE 2 + 6 * octet_length(CAST(last_message_at AS VARCHAR)) END
+       ), 0) AS worst_case_ndjson_bytes
+FROM inventory"""
 
 _POND_VERSION_TOKENS = ("pond", POND_VERSION)
 _POND_COLUMNS = frozenset(
@@ -55,6 +85,7 @@ _DATAFUSION_TIMESTAMP = re.compile(
 _CHUNK_BYTES = 64 * 1024
 _ARTIFACT_POLL_SECONDS = 0.01
 _TERMINATE_GRACE_SECONDS = 0.25
+_COPY_CHUNK_BYTES = 64 * 1024
 
 
 class _PondInventoryError(ValueError):
@@ -85,6 +116,8 @@ def export_pond_inventory(
         raise _failure("temporary") from None
     with temporary as temporary_name:
         temporary_path = Path(temporary_name)
+        snapshot_path = temporary_path / "pond-store"
+        _snapshot_store(local_store, snapshot_path)
         version_stdout = temporary_path / "version.stdout"
         version_stderr = temporary_path / "version.stderr"
         version_returncode = _run_bounded(
@@ -104,13 +137,41 @@ def export_pond_inventory(
         if version_tokens != _POND_VERSION_TOKENS:
             raise _failure("version")
 
+        preflight_path = temporary_path / "preflight.ndjson"
+        preflight_stdout = temporary_path / "preflight.stdout"
+        preflight_stderr = temporary_path / "preflight.stderr"
+        preflight_command = [
+            str(executable),
+            "--storage-path",
+            str(snapshot_path),
+            "sql",
+            POND_INVENTORY_PREFLIGHT_SQL,
+            "--format",
+            "ndjson",
+            "--output-file",
+            str(preflight_path),
+            "--timeout",
+            str(timeout),
+        ]
+        preflight_returncode = _run_bounded(
+            preflight_command,
+            timeout_seconds=float(timeout),
+            env=child_env,
+            stdout_path=preflight_stdout,
+            stderr_path=preflight_stderr,
+            artifact_path=preflight_path,
+        )
+        if preflight_returncode != 0:
+            raise _failure("preflight")
+        _read_preflight(preflight_path)
+
         export_path = temporary_path / "inventory.ndjson"
         sql_stdout = temporary_path / "sql.stdout"
         sql_stderr = temporary_path / "sql.stderr"
         command = [
             str(executable),
             "--storage-path",
-            str(local_store),
+            str(snapshot_path),
             "sql",
             POND_INVENTORY_SQL,
             "--format",
@@ -186,6 +247,9 @@ def _require_local_storage(storage_path: Path) -> Path:
         path = Path(raw)
         if not path.is_absolute():
             raise _failure("storage")
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise _failure("storage")
         resolved = path.resolve(strict=True)
         if not resolved.is_dir():
             raise _failure("storage")
@@ -194,6 +258,209 @@ def _require_local_storage(storage_path: Path) -> Path:
         raise
     except (OSError, TypeError, ValueError):
         raise _failure("storage") from None
+
+
+def _snapshot_store(source: Path, target: Path) -> None:
+    source_descriptor: int | None = None
+    try:
+        target.mkdir(mode=0o700)
+        target.chmod(0o700)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        source_descriptor = os.open(source, flags)
+        opened = os.fstat(source_descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise _failure("snapshot")
+        if _snapshot_signature(source.lstat()) != _snapshot_signature(opened):
+            raise _failure("snapshot")
+        signatures: dict[tuple[str, ...], tuple[int, ...]] = {}
+        directory_names: dict[tuple[str, ...], tuple[str, ...]] = {}
+        _snapshot_directory(
+            source_descriptor,
+            target,
+            (),
+            signatures,
+            directory_names,
+        )
+        _validate_snapshot_tree(
+            source_descriptor,
+            (),
+            signatures,
+            directory_names,
+        )
+        if _snapshot_signature(source.lstat()) != _snapshot_signature(opened):
+            raise _failure("snapshot")
+    except _PondInventoryError:
+        raise _failure("snapshot") from None
+    except (OSError, TypeError, ValueError):
+        raise _failure("snapshot") from None
+    finally:
+        if source_descriptor is not None:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+
+
+def _snapshot_directory(
+    source_descriptor: int,
+    target: Path,
+    relative: tuple[str, ...],
+    signatures: dict[tuple[str, ...], tuple[int, ...]],
+    directory_names: dict[tuple[str, ...], tuple[str, ...]],
+) -> None:
+    before = os.fstat(source_descriptor)
+    names_before = _snapshot_names(source_descriptor)
+    signatures[relative] = _snapshot_signature(before)
+    directory_names[relative] = names_before
+    for name in names_before:
+        entry_before = os.stat(
+            name,
+            dir_fd=source_descriptor,
+            follow_symlinks=False,
+        )
+        destination = target / name
+        child_relative = (*relative, name)
+        if stat.S_ISREG(entry_before.st_mode):
+            signatures[child_relative] = _snapshot_signature(entry_before)
+            _snapshot_regular_file(
+                source_descriptor,
+                name,
+                entry_before,
+                destination,
+            )
+        elif stat.S_ISDIR(entry_before.st_mode):
+            destination.mkdir(mode=0o700)
+            destination.chmod(0o700)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            child_descriptor = os.open(name, flags, dir_fd=source_descriptor)
+            try:
+                if _snapshot_signature(
+                    os.fstat(child_descriptor)
+                ) != _snapshot_signature(entry_before):
+                    raise _failure("snapshot")
+                _snapshot_directory(
+                    child_descriptor,
+                    destination,
+                    child_relative,
+                    signatures,
+                    directory_names,
+                )
+            finally:
+                os.close(child_descriptor)
+        else:
+            raise _failure("snapshot")
+        entry_after = os.stat(
+            name,
+            dir_fd=source_descriptor,
+            follow_symlinks=False,
+        )
+        if _snapshot_signature(entry_after) != _snapshot_signature(entry_before):
+            raise _failure("snapshot")
+    if names_before != _snapshot_names(source_descriptor):
+        raise _failure("snapshot")
+    if _snapshot_signature(os.fstat(source_descriptor)) != _snapshot_signature(before):
+        raise _failure("snapshot")
+
+
+def _validate_snapshot_tree(
+    source_descriptor: int,
+    relative: tuple[str, ...],
+    signatures: Mapping[tuple[str, ...], tuple[int, ...]],
+    directory_names: Mapping[tuple[str, ...], tuple[str, ...]],
+) -> None:
+    if _snapshot_signature(os.fstat(source_descriptor)) != signatures[relative]:
+        raise _failure("snapshot")
+    names = _snapshot_names(source_descriptor)
+    if names != directory_names[relative]:
+        raise _failure("snapshot")
+    for name in names:
+        child_relative = (*relative, name)
+        metadata = os.stat(
+            name,
+            dir_fd=source_descriptor,
+            follow_symlinks=False,
+        )
+        if _snapshot_signature(metadata) != signatures[child_relative]:
+            raise _failure("snapshot")
+        if stat.S_ISDIR(metadata.st_mode):
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            child_descriptor = os.open(name, flags, dir_fd=source_descriptor)
+            try:
+                _validate_snapshot_tree(
+                    child_descriptor,
+                    child_relative,
+                    signatures,
+                    directory_names,
+                )
+            finally:
+                os.close(child_descriptor)
+
+
+def _snapshot_regular_file(
+    source_directory: int,
+    name: str,
+    expected: os.stat_result,
+    destination: Path,
+) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    source_descriptor = os.open(name, flags, dir_fd=source_directory)
+    try:
+        opened = os.fstat(source_descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _snapshot_signature(
+            opened
+        ) != _snapshot_signature(expected):
+            raise _failure("snapshot")
+        copied = 0
+        with _open_private_output(destination) as output:
+            while chunk := os.read(source_descriptor, _COPY_CHUNK_BYTES):
+                output.write(chunk)
+                copied += len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        after = os.fstat(source_descriptor)
+        if copied != expected.st_size or _snapshot_signature(
+            after
+        ) != _snapshot_signature(expected):
+            raise _failure("snapshot")
+        destination_metadata = destination.lstat()
+        if (
+            not stat.S_ISREG(destination_metadata.st_mode)
+            or destination_metadata.st_mode & 0o077
+            or destination_metadata.st_size != copied
+        ):
+            raise _failure("snapshot")
+    finally:
+        os.close(source_descriptor)
+
+
+def _snapshot_names(source_descriptor: int) -> tuple[str, ...]:
+    with os.scandir(source_descriptor) as entries:
+        return tuple(sorted(entry.name for entry in entries))
+
+
+def _snapshot_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _require_timeout(timeout_seconds: float) -> int:
@@ -259,6 +526,7 @@ def _run_bounded(
 
         assert process.stdout is not None
         assert process.stderr is not None
+        process_group = process.pid
         selector: selectors.BaseSelector | None = None
         try:
             selector = selectors.DefaultSelector()
@@ -288,12 +556,15 @@ def _run_bounded(
                     counts[sink] += len(chunk)
             if artifact_path is not None:
                 _check_artifact_during_run(artifact_path)
-            return process.wait(timeout=0)
+            returncode = process.wait(timeout=0)
+            if _process_group_exists(process_group):
+                _stop_process(process, process_group)
+            return returncode
         except _PondInventoryError:
-            _stop_process(process)
+            _stop_process(process, process_group)
             raise
         except (OSError, ValueError, subprocess.SubprocessError):
-            _stop_process(process)
+            _stop_process(process, process_group)
             raise _failure("subprocess") from None
         finally:
             if selector is not None:
@@ -315,32 +586,42 @@ def _check_artifact_during_run(path: Path) -> None:
         raise _failure("size")
 
 
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    _signal_process_group(process, signal.SIGTERM)
-    try:
-        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    _signal_process_group(process, signal.SIGKILL)
+def _stop_process(process: subprocess.Popen[bytes], process_group: int) -> None:
+    _signal_process_group(process, process_group, signal.SIGTERM)
+    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+    while _process_group_exists(process_group) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if _process_group_exists(process_group):
+        _signal_process_group(process, process_group, signal.SIGKILL)
     try:
         process.wait(timeout=_TERMINATE_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        pass
+        _signal_process_group(process, process_group, signal.SIGKILL)
+        try:
+            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
 
 
-def _signal_process_group(process: subprocess.Popen[bytes], signal_number: int) -> None:
+def _process_group_exists(process_group: int) -> bool:
     try:
-        os.killpg(process.pid, signal_number)
-        return
+        os.killpg(process_group, 0)
     except (OSError, AttributeError):
-        pass
+        return False
+    return True
+
+
+def _signal_process_group(
+    process: subprocess.Popen[bytes], process_group: int, signal_number: int
+) -> None:
     try:
-        process.send_signal(signal_number)
-    except OSError:
-        pass
+        os.killpg(process_group, signal_number)
+    except (OSError, AttributeError):
+        if process.poll() is None:
+            try:
+                process.send_signal(signal_number)
+            except OSError:
+                pass
 
 
 def _read_private_bytes(path: Path, category: str) -> bytes:
@@ -368,6 +649,36 @@ def _read_private_bytes(path: Path, category: str) -> bytes:
     if len(data) > MAX_INVENTORY_BYTES:
         raise _failure("size")
     return data
+
+
+def _read_preflight(path: Path) -> tuple[int, int]:
+    data = _read_private_bytes(path, "preflight")
+    lines = data.splitlines()
+    if len(lines) != 1:
+        raise _failure("preflight")
+    try:
+        row = json.loads(lines[0].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _failure("preflight") from None
+    if not isinstance(row, dict) or set(row) != {
+        "row_count",
+        "worst_case_ndjson_bytes",
+    }:
+        raise _failure("preflight")
+    row_count = row["row_count"]
+    worst_case_bytes = row["worst_case_ndjson_bytes"]
+    if (
+        isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count < 0
+        or isinstance(worst_case_bytes, bool)
+        or not isinstance(worst_case_bytes, int)
+        or worst_case_bytes < 0
+        or row_count > MAX_INVENTORY_RECORDS
+        or worst_case_bytes > MAX_INVENTORY_BYTES
+    ):
+        raise _failure("preflight")
+    return row_count, worst_case_bytes
 
 
 def _read_pond_rows(path: Path) -> tuple[PondInventoryRecord, ...]:

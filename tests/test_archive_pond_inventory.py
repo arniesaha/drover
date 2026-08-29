@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import signal
 import stat
+import tempfile
 import textwrap
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from drover.server.archive import pond_inventory as pond_inventory_module
 from drover.server.archive.inventory import load_pond_inventory
 from drover.server.archive.pond_inventory import (
+    POND_INVENTORY_PREFLIGHT_SQL,
     POND_INVENTORY_SQL,
     export_pond_inventory,
     pond_inventory_summary,
@@ -49,6 +56,9 @@ _FAKE_POND = r"""#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import signal
+import stat
+import subprocess
 import sys
 import time
 
@@ -59,6 +69,11 @@ except FileNotFoundError:
     calls = []
 calls.append({"argv": sys.argv, "storage_env": os.environ.get("POND_STORAGE_PATH")})
 record_path.write_text(json.dumps(calls), encoding="utf-8")
+
+def update_call(**values):
+    current = json.loads(record_path.read_text(encoding="utf-8"))
+    current[-1].update(values)
+    record_path.write_text(json.dumps(current), encoding="utf-8")
 
 if sys.argv[1:] == ["--version"]:
     if os.environ.get("FAKE_VERSION_MODE") == "oversize_stdout":
@@ -71,7 +86,27 @@ if sys.argv[1:] == ["--version"]:
 
 mode = os.environ.get("FAKE_SQL_MODE", "success")
 output = Path(sys.argv[sys.argv.index("--output-file") + 1])
-if mode == "timeout":
+sql = sys.argv[sys.argv.index("sql") + 1]
+if "worst_case_ndjson_bytes" in sql:
+    preflight_mode = os.environ.get("FAKE_PREFLIGHT_MODE", "success")
+    if preflight_mode == "oversize_output":
+        output.write_bytes(b"x" * (32 * 1024 * 1024 + 1))
+        time.sleep(30)
+    elif preflight_mode == "invalid":
+        output.write_text("not-json\n", encoding="utf-8")
+    elif preflight_mode == "two_rows":
+        row = {"row_count": 1, "worst_case_ndjson_bytes": 512}
+        output.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
+    else:
+        row = {
+            "row_count": json.loads(os.environ.get("FAKE_PREFLIGHT_ROWS", "2")),
+            "worst_case_ndjson_bytes": json.loads(
+                os.environ.get("FAKE_PREFLIGHT_BYTES", "2048")
+            ),
+        }
+        output.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    raise SystemExit(0)
+elif mode == "timeout":
     time.sleep(30)
 elif mode == "nonzero":
     sys.stdout.write("SENSITIVE STDOUT pond-session-secret")
@@ -109,6 +144,46 @@ elif mode == "too_many_rows":
 elif mode == "unsafe_export_mode":
     output.write_text(os.environ["FAKE_NDJSON"], encoding="utf-8")
     output.chmod(0o644)
+elif mode == "mutate_store":
+    storage = Path(sys.argv[sys.argv.index("--storage-path") + 1])
+    relative = os.environ.get("FAKE_MUTATE_RELATIVE", "manifest.bin")
+    target = storage / relative
+    target.write_bytes(target.read_bytes() + b"-backfilled")
+    (storage / "pond-backfill.created").write_bytes(b"created by pond")
+    update_call(
+        snapshot_mutated=True,
+        snapshot_file_mode=stat.S_IMODE(target.stat().st_mode),
+    )
+    output.write_text(os.environ["FAKE_NDJSON"], encoding="utf-8")
+elif mode == "orphan_descendant":
+    child_code = r'''import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+pid_path = Path(os.environ["FAKE_DESCENDANT_PID"])
+marker_path = Path(os.environ["FAKE_DESCENDANT_MARKER"])
+
+def terminate(_signum, _frame):
+    marker_path.write_text("terminated", encoding="utf-8")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, terminate)
+pid_path.write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(30)
+'''
+    subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=os.environ,
+    )
+    pid_path = Path(os.environ["FAKE_DESCENDANT_PID"])
+    deadline = time.monotonic() + 2
+    while not pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    raise SystemExit(0)
 else:
     output.write_text(os.environ["FAKE_NDJSON"], encoding="utf-8")
 """
@@ -149,6 +224,28 @@ def _export(fake_pond, output: Path, **env_values: str):
     return inventory, calls
 
 
+def _stable_metadata(path: Path) -> tuple[int, ...]:
+    metadata = path.lstat()
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
     fake_pond, tmp_path
 ):
@@ -157,12 +254,27 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
 
     inventory, calls = _export(fake_pond, output)
 
-    export_path = Path(calls[1]["argv"][calls[1]["argv"].index("--output-file") + 1])
+    preflight_path = Path(calls[1]["argv"][calls[1]["argv"].index("--output-file") + 1])
+    export_path = Path(calls[2]["argv"][calls[2]["argv"].index("--output-file") + 1])
+    snapshot_path = Path(calls[1]["argv"][2])
     assert calls[0]["argv"] == [str(binary), "--version"]
     assert calls[1]["argv"] == [
         str(binary),
         "--storage-path",
-        str(local_store),
+        str(snapshot_path),
+        "sql",
+        POND_INVENTORY_PREFLIGHT_SQL,
+        "--format",
+        "ndjson",
+        "--output-file",
+        str(preflight_path),
+        "--timeout",
+        "60",
+    ]
+    assert calls[2]["argv"] == [
+        str(binary),
+        "--storage-path",
+        str(snapshot_path),
         "sql",
         POND_INVENTORY_SQL,
         "--format",
@@ -172,7 +284,11 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
         "--timeout",
         "60",
     ]
+    assert snapshot_path != local_store
+    assert calls[2]["argv"][2] == str(snapshot_path)
     assert export_path != output
+    assert not snapshot_path.exists()
+    assert not preflight_path.exists()
     assert not export_path.exists()
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert load_pond_inventory(output) == inventory
@@ -292,6 +408,237 @@ def test_export_rejects_nonlocal_or_non_directory_storage_before_start(
     assert str(storage_path) not in str(raised.value)
 
 
+def test_pond_mutations_are_confined_to_a_private_store_snapshot(fake_pond, tmp_path):
+    _, local_store, _ = fake_pond
+    manifest = local_store / "manifest.bin"
+    manifest.write_bytes(b"original opaque pond bytes")
+    manifest.chmod(0o644)
+    original_bytes = manifest.read_bytes()
+    original_file_metadata = _stable_metadata(manifest)
+    original_dir_metadata = _stable_metadata(local_store)
+
+    _, calls = _export(
+        fake_pond,
+        tmp_path / "pond.json",
+        FAKE_SQL_MODE="mutate_store",
+    )
+
+    snapshot_path = Path(calls[1]["argv"][2])
+    assert calls[2]["snapshot_mutated"] is True
+    assert calls[2]["snapshot_file_mode"] == 0o600
+    assert not snapshot_path.exists()
+    assert manifest.read_bytes() == original_bytes
+    assert _stable_metadata(manifest) == original_file_metadata
+    assert _stable_metadata(local_store) == original_dir_metadata
+    assert not (local_store / "pond-backfill.created").exists()
+
+
+@pytest.mark.parametrize("kind", ["root_symlink", "child_symlink", "fifo"])
+def test_snapshot_refuses_symlinks_and_special_files_before_pond_starts(
+    fake_pond, tmp_path, kind
+):
+    binary, local_store, record = fake_pond
+    storage_path = local_store
+    if kind == "root_symlink":
+        storage_path = tmp_path / "linked-store"
+        storage_path.symlink_to(local_store, target_is_directory=True)
+    elif kind == "child_symlink":
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"outside")
+        (local_store / "linked-file").symlink_to(outside)
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO unavailable")
+        os.mkfifo(local_store / "special-fifo")
+
+    with pytest.raises(ValueError, match="snapshot|storage") as raised:
+        export_pond_inventory(
+            binary,
+            tmp_path / "pond.json",
+            storage_path=storage_path,
+            env=_environment(record),
+        )
+
+    assert not record.exists()
+    assert str(storage_path) not in str(raised.value)
+
+
+def test_snapshot_fails_closed_if_a_source_file_changes_during_copy(
+    fake_pond, tmp_path, monkeypatch
+):
+    binary, local_store, record = fake_pond
+    source = local_store / "racy.bin"
+    source.write_bytes(b"a" * (256 * 1024))
+    monkeypatch.setattr(pond_inventory_module, "_COPY_CHUNK_BYTES", 1)
+    temporary_root = Path(tempfile.gettempdir())
+    baseline = set(temporary_root.glob("drover-pond-inventory-*"))
+    changed = threading.Event()
+
+    def mutate_during_copy() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            for candidate in (
+                set(temporary_root.glob("drover-pond-inventory-*")) - baseline
+            ):
+                copied = candidate / "pond-store" / "racy.bin"
+                try:
+                    if copied.stat().st_size > 0:
+                        source.write_bytes(b"changed during snapshot")
+                        changed.set()
+                        return
+                except FileNotFoundError:
+                    pass
+            time.sleep(0.001)
+
+    racer = threading.Thread(target=mutate_during_copy, daemon=True)
+    racer.start()
+    with pytest.raises(ValueError, match="snapshot"):
+        export_pond_inventory(
+            binary,
+            tmp_path / "pond.json",
+            storage_path=local_store,
+            env=_environment(record),
+        )
+    racer.join(timeout=6)
+
+    assert changed.is_set()
+    assert not record.exists()
+    assert set(temporary_root.glob("drover-pond-inventory-*")) == baseline
+
+
+def test_snapshot_revalidates_earlier_files_after_the_whole_copy(
+    fake_pond, tmp_path, monkeypatch
+):
+    binary, local_store, record = fake_pond
+    early = local_store / "a-early.bin"
+    early.write_bytes(b"early original")
+    (local_store / "z-slow.bin").write_bytes(b"z" * (256 * 1024))
+    monkeypatch.setattr(pond_inventory_module, "_COPY_CHUNK_BYTES", 1)
+    temporary_root = Path(tempfile.gettempdir())
+    baseline = set(temporary_root.glob("drover-pond-inventory-*"))
+    changed = threading.Event()
+
+    def mutate_after_early_copy() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            for candidate in (
+                set(temporary_root.glob("drover-pond-inventory-*")) - baseline
+            ):
+                copied_early = candidate / "pond-store" / early.name
+                copied_slow = candidate / "pond-store" / "z-slow.bin"
+                try:
+                    if copied_early.exists() and copied_slow.stat().st_size > 0:
+                        early.write_bytes(b"changed after early copy")
+                        changed.set()
+                        return
+                except FileNotFoundError:
+                    pass
+            time.sleep(0.001)
+
+    racer = threading.Thread(target=mutate_after_early_copy, daemon=True)
+    racer.start()
+    with pytest.raises(ValueError, match="snapshot"):
+        export_pond_inventory(
+            binary,
+            tmp_path / "pond.json",
+            storage_path=local_store,
+            env=_environment(record),
+        )
+    racer.join(timeout=6)
+
+    assert changed.is_set()
+    assert not record.exists()
+    assert set(temporary_root.glob("drover-pond-inventory-*")) == baseline
+
+
+@pytest.mark.parametrize(
+    ("rows", "size"),
+    [(100_001, 1024), (1, 32 * 1024 * 1024 + 1)],
+)
+def test_preflight_refuses_over_limit_inventory_before_main_export(
+    fake_pond, tmp_path, rows, size
+):
+    _, _, record = fake_pond
+
+    with pytest.raises(ValueError, match="preflight"):
+        _export(
+            fake_pond,
+            tmp_path / "pond.json",
+            FAKE_PREFLIGHT_ROWS=str(rows),
+            FAKE_PREFLIGHT_BYTES=str(size),
+        )
+
+    calls = json.loads(record.read_text(encoding="utf-8"))
+    assert len(calls) == 2
+    assert calls[1]["argv"][calls[1]["argv"].index("sql") + 1] == (
+        POND_INVENTORY_PREFLIGHT_SQL
+    )
+
+
+def test_preflight_allows_exact_row_and_byte_limits(fake_pond, tmp_path):
+    _, calls = _export(
+        fake_pond,
+        tmp_path / "pond.json",
+        FAKE_PREFLIGHT_ROWS="100000",
+        FAKE_PREFLIGHT_BYTES=str(32 * 1024 * 1024),
+    )
+
+    assert len(calls) == 3
+    assert calls[2]["argv"][calls[2]["argv"].index("sql") + 1] == POND_INVENTORY_SQL
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"FAKE_PREFLIGHT_MODE": "invalid"},
+        {"FAKE_PREFLIGHT_MODE": "two_rows"},
+        {"FAKE_PREFLIGHT_ROWS": "true"},
+        {"FAKE_PREFLIGHT_BYTES": "-1"},
+        {"FAKE_PREFLIGHT_MODE": "oversize_output"},
+    ],
+)
+def test_preflight_output_is_bounded_and_strictly_parsed(fake_pond, tmp_path, values):
+    _, _, record = fake_pond
+
+    with pytest.raises(ValueError, match="preflight|size"):
+        _export(fake_pond, tmp_path / "pond.json", **values)
+
+    assert len(json.loads(record.read_text(encoding="utf-8"))) == 2
+
+
+def test_timeout_cleanup_signals_descendants_after_the_leader_exits(
+    fake_pond, tmp_path
+):
+    binary, local_store, record = fake_pond
+    pid_path = tmp_path / "descendant.pid"
+    marker_path = tmp_path / "descendant-terminated"
+    descendant_pid = None
+    try:
+        with pytest.raises(ValueError, match="timeout"):
+            export_pond_inventory(
+                binary,
+                tmp_path / "pond.json",
+                storage_path=local_store,
+                timeout_seconds=5,
+                env=_environment(
+                    record,
+                    FAKE_SQL_MODE="orphan_descendant",
+                    FAKE_DESCENDANT_PID=str(pid_path),
+                    FAKE_DESCENDANT_MARKER=str(marker_path),
+                ),
+            )
+        descendant_pid = int(pid_path.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 2
+        while _pid_exists(descendant_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert marker_path.read_text(encoding="utf-8") == "terminated"
+        assert not _pid_exists(descendant_pid)
+    finally:
+        if descendant_pid is not None and _pid_exists(descendant_pid):
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
 def test_explicit_storage_path_removes_inherited_remote_selector(fake_pond, tmp_path):
     _, calls = _export(
         fake_pond,
@@ -301,6 +648,7 @@ def test_explicit_storage_path_removes_inherited_remote_selector(fake_pond, tmp_
 
     assert calls[0]["storage_env"] is None
     assert calls[1]["storage_env"] is None
+    assert calls[2]["storage_env"] is None
 
 
 @pytest.mark.parametrize(
@@ -337,6 +685,7 @@ def test_export_renders_an_exact_integral_float_timeout(fake_pond, tmp_path):
 
     calls = json.loads(record.read_text(encoding="utf-8"))
     assert calls[1]["argv"][-2:] == ["--timeout", "5"]
+    assert calls[2]["argv"][-2:] == ["--timeout", "5"]
 
 
 def test_export_terminates_timed_out_sql_without_writing_manifest(fake_pond, tmp_path):
@@ -353,7 +702,7 @@ def test_export_terminates_timed_out_sql_without_writing_manifest(fake_pond, tmp
         )
 
     assert not output.exists()
-    assert len(json.loads(record.read_text(encoding="utf-8"))) == 2
+    assert len(json.loads(record.read_text(encoding="utf-8"))) == 3
 
 
 def test_export_does_not_retry_a_nonzero_sql_exit_or_leak_child_output(
@@ -370,7 +719,7 @@ def test_export_does_not_retry_a_nonzero_sql_exit_or_leak_child_output(
             env=_environment(record, FAKE_SQL_MODE="nonzero"),
         )
 
-    assert len(json.loads(record.read_text(encoding="utf-8"))) == 2
+    assert len(json.loads(record.read_text(encoding="utf-8"))) == 3
     assert "SENSITIVE" not in str(raised.value)
     assert "pond-session-secret" not in str(raised.value)
     assert "storage-secret" not in str(raised.value)
@@ -560,6 +909,34 @@ def test_export_errors_do_not_disclose_paths_sql_rows_ids_or_storage(
     message = str(raised.value)
     for secret in (str(binary), str(local_store), str(output), secret_id, "SELECT"):
         assert secret not in message
+
+
+def test_pond_inventory_preflight_sql_returns_only_conservative_aggregates():
+    assert POND_INVENTORY_PREFLIGHT_SQL == """WITH inventory AS (
+    SELECT s.session_id, s.source_agent, s.created_at,
+           count(m.message_id) AS message_count,
+           min(m.timestamp) AS first_message_at,
+           max(m.timestamp) AS last_message_at
+    FROM sessions s
+    LEFT JOIN messages m ON m.session_id = s.session_id
+    WHERE s.source_agent IN ('claude-code', 'codex-cli')
+    GROUP BY s.session_id, s.source_agent, s.created_at
+    ORDER BY s.source_agent, s.session_id
+    LIMIT 100001
+)
+SELECT count(*) AS row_count,
+       coalesce(sum(
+           117
+           + 6 * coalesce(octet_length(session_id), 4)
+           + 6 * coalesce(octet_length(source_agent), 4)
+           + 6 * coalesce(octet_length(CAST(created_at AS VARCHAR)), 4)
+           + octet_length(CAST(message_count AS VARCHAR))
+           + CASE WHEN first_message_at IS NULL THEN 0
+                  ELSE 2 + 6 * octet_length(CAST(first_message_at AS VARCHAR)) END
+           + CASE WHEN last_message_at IS NULL THEN 0
+                  ELSE 2 + 6 * octet_length(CAST(last_message_at AS VARCHAR)) END
+       ), 0) AS worst_case_ndjson_bytes
+FROM inventory"""
 
 
 def test_pond_inventory_sql_selects_only_the_bounded_metadata_projection():
