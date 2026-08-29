@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -52,7 +53,19 @@ from drover.server.advisory.worker import (
     operational_analyzers,
     operational_snapshot_source_version,
 )
-from drover.server.archive import PondArchiveClient
+from drover.server.archive import (
+    PondArchiveClient,
+    build_coverage_report,
+    coverage_summary,
+    discover_native_history_inventory,
+    export_pond_inventory,
+    load_native_inventory,
+    load_pond_inventory,
+    load_registry_candidates,
+    native_inventory_summary,
+    pond_inventory_summary,
+    write_private_json,
+)
 from drover.server.briefs.worker import (
     BriefWorker,
     enqueue_brief,
@@ -763,6 +776,167 @@ def session_cmd() -> None:
 @main.group(name="harness")
 def harness_cmd() -> None:
     """Audit and migrate Drover harness data."""
+
+
+@main.group(name="archive")
+def archive_cmd() -> None:
+    """Capture and compare local archive inventories."""
+
+
+@archive_cmd.command(name="source-inventory")
+@click.option("--host-id", required=True, metavar="HOST")
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+def archive_source_inventory_cmd(host_id: str, output: Path) -> None:
+    """Capture supported native session-source metadata."""
+    try:
+        inventory = discover_native_history_inventory(Path.home(), host_id)
+        summary = native_inventory_summary(inventory)
+        write_private_json(output, inventory.to_wire())
+    except Exception:
+        raise click.ClickException("archive source inventory failed") from None
+    click.echo(json.dumps(summary, sort_keys=True))
+
+
+@archive_cmd.command(name="pond-inventory")
+@click.option(
+    "--storage-path",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="DIRECTORY",
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--pond-binary",
+    default=None,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    default="60",
+    show_default=True,
+    type=str,
+    metavar="SECONDS",
+)
+def archive_pond_inventory_cmd(
+    storage_path: Path,
+    output: Path,
+    pond_binary: Optional[Path],
+    timeout_seconds: str,
+) -> None:
+    """Export supported Pond root-session metadata."""
+    try:
+        parsed_timeout = float(timeout_seconds)
+    except (TypeError, ValueError, OverflowError):
+        raise click.ClickException("archive pond inventory invalid timeout") from None
+    if not math.isfinite(parsed_timeout) or not 5.0 <= parsed_timeout <= 600.0:
+        raise click.ClickException("archive pond inventory invalid timeout")
+    binary = pond_binary
+    if binary is None:
+        configured = os.environ.get("POND_BINARY", "").strip()
+        if configured:
+            binary = Path(configured)
+    if binary is None:
+        discovered = shutil.which("pond")
+        if discovered:
+            binary = Path(discovered)
+    if binary is None:
+        raise click.ClickException("archive pond inventory binary unavailable")
+    try:
+        inventory = export_pond_inventory(
+            binary,
+            output,
+            storage_path=storage_path,
+            timeout_seconds=parsed_timeout,
+        )
+        summary = pond_inventory_summary(inventory)
+    except Exception:
+        raise click.ClickException("archive pond inventory failed") from None
+    click.echo(json.dumps(summary, sort_keys=True))
+
+
+@archive_cmd.command(name="coverage")
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--db",
+    "duckdb_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--source-inventory",
+    "source_inventory_paths",
+    required=True,
+    multiple=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--pond-inventory",
+    "pond_inventory_path",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--prior-source-inventory",
+    "prior_source_inventory_paths",
+    multiple=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.pass_context
+def archive_coverage_cmd(
+    ctx: click.Context,
+    output: Path,
+    duckdb_path: Optional[Path],
+    source_inventory_paths: tuple[Path, ...],
+    pond_inventory_path: Path,
+    prior_source_inventory_paths: tuple[Path, ...],
+) -> None:
+    """Compare private source, registry, and Pond identity inventories."""
+    try:
+        current_sources = tuple(
+            load_native_inventory(path) for path in source_inventory_paths
+        )
+        prior_sources = tuple(
+            load_native_inventory(path) for path in prior_source_inventory_paths
+        )
+        pond = load_pond_inventory(pond_inventory_path)
+        cfg = _resolve_config(ctx.obj["config_path"])
+        registry_path = control_plane_path(duckdb_path or cfg.duckdb_path)
+        with _diagnostic_db_path(registry_path) as snapshot_path:
+            registry = load_registry_candidates(snapshot_path)
+        report = build_coverage_report(
+            registry,
+            current_sources,
+            pond,
+            prior_sources=prior_sources,
+        )
+        summary = coverage_summary(report)
+        write_private_json(output, report.to_wire())
+    except Exception:
+        raise click.ClickException("archive coverage failed") from None
+    click.echo(json.dumps(summary, sort_keys=True))
+    if not report.ready_for_next_writer:
+        ctx.exit(2)
 
 
 @main.command(name="pair")
