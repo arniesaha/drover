@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import duckdb
 
-from drover.server.archive.inventory import NativeInventory, PondInventory
+from drover.server.archive.inventory import (
+    NativeInventory,
+    PondInventory,
+    SourceEligibilityReceipt,
+)
 from drover.server.archive.pond_inventory import POND_VERSION
 
 _ROOT_SOURCE_AGENTS = frozenset({"claude-code", "codex-cli"})
@@ -22,6 +26,7 @@ _CoverageStatus = Literal[
     "matched",
     "discovered_not_synced",
     "source_absent_after_prior_inventory",
+    "source_not_archive_eligible",
     "unverifiable",
 ]
 
@@ -68,7 +73,7 @@ class _CurrentSourceDetail:
     source_agent: str
     native_session_id: str
     pond_session_id: str | None
-    status: Literal["matched", "discovered_not_synced"]
+    status: Literal["matched", "discovered_not_synced", "source_not_archive_eligible"]
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -286,18 +291,54 @@ def _eligible_registry(
     )
 
 
+def _validated_receipts(
+    receipts: Sequence[SourceEligibilityReceipt],
+    current: Sequence[NativeInventory],
+) -> dict[tuple[str, str, str], SourceEligibilityReceipt]:
+    current_records = {
+        (inventory.host_id, record.source_agent, record.session_id): record
+        for inventory in current
+        for record in inventory.records
+    }
+    source_identity_counts = Counter(
+        (record.source_agent, record.session_id)
+        for inventory in current
+        for record in inventory.records
+    )
+    validated: dict[tuple[str, str, str], SourceEligibilityReceipt] = {}
+    for receipt in receipts:
+        try:
+            receipt.to_wire()
+        except (AttributeError, TypeError, ValueError):
+            raise _failure("eligibility receipt") from None
+        key = (receipt.host_id, receipt.source_agent, receipt.session_id)
+        record = current_records.get(key)
+        if (
+            key in validated
+            or record is None
+            or record.source_copies != 1
+            or source_identity_counts[(record.source_agent, record.session_id)] != 1
+            or record.source_fingerprint != receipt.source_fingerprint
+        ):
+            raise _failure("eligibility receipt")
+        validated[key] = receipt
+    return validated
+
+
 def build_coverage_report(
     registry: Sequence[RegistryCandidate],
     current_sources: Sequence[NativeInventory],
     pond: PondInventory,
     *,
     prior_sources: Sequence[NativeInventory] = (),
+    eligibility_receipts: Sequence[SourceEligibilityReceipt] = (),
 ) -> CoverageReport:
     """Join private inventories without mutating the registry or archive."""
     registry_rows = tuple(registry)
     current = _validated_native_sources(current_sources, current=True)
     prior = _validated_native_sources(prior_sources, current=False)
     archive = _validated_pond(pond)
+    receipts_by_identity = _validated_receipts(eligibility_receipts, current)
     eligible = _eligible_registry(registry_rows)
     unsupported_harness_sessions = sum(
         1
@@ -332,6 +373,8 @@ def build_coverage_report(
         )
         if pond_record is not None:
             status: _CoverageStatus = "matched"
+        elif host_identity in receipts_by_identity:
+            status = "source_not_archive_eligible"
         elif host_identity in current_by_host_identity:
             status = "discovered_not_synced"
         elif host_identity in prior_by_host_identity:
@@ -361,6 +404,14 @@ def build_coverage_report(
             key=lambda value: (value.source_agent, value.session_id),
         ):
             pond_record = pond_by_identity.get((record.source_agent, record.session_id))
+            source_identity = (
+                inventory.host_id,
+                record.source_agent,
+                record.session_id,
+            )
+            receipt = receipts_by_identity.get(source_identity)
+            if pond_record is not None and receipt is not None:
+                raise _failure("eligibility receipt")
             current_source_details.append(
                 _CurrentSourceDetail(
                     host_id=inventory.host_id,
@@ -372,7 +423,11 @@ def build_coverage_report(
                     status=(
                         "matched"
                         if pond_record is not None
-                        else "discovered_not_synced"
+                        else (
+                            "source_not_archive_eligible"
+                            if receipt is not None
+                            else "discovered_not_synced"
+                        )
                     ),
                 )
             )
@@ -484,6 +539,10 @@ def coverage_summary(report: CoverageReport) -> dict[str, object]:
     current_matched = sum(
         detail.status == "matched" for detail in report.current_source_details
     )
+    current_not_archive_eligible = sum(
+        detail.status == "source_not_archive_eligible"
+        for detail in report.current_source_details
+    )
     current_discovered = len(report.current_source_details)
     return {
         "schema_version": 1,
@@ -496,7 +555,10 @@ def coverage_summary(report: CoverageReport) -> dict[str, object]:
         "current_source_coverage": {
             "discovered": current_discovered,
             "matched": current_matched,
-            "discovered_not_synced": current_discovered - current_matched,
+            "source_not_archive_eligible": current_not_archive_eligible,
+            "discovered_not_synced": (
+                current_discovered - current_matched - current_not_archive_eligible
+            ),
         },
         "certified_coverage": {"status": "not_implemented", "certified": 0},
         "misses": {

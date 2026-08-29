@@ -18,6 +18,7 @@ from drover.server.archive.inventory import (
     NativeInventoryRecord,
     PondInventory,
     PondInventoryRecord,
+    SourceEligibilityReceipt,
 )
 
 _CAPTURED_AT = "2026-08-28T12:00:00Z"
@@ -72,6 +73,22 @@ def _candidate(
     native_session_id: str,
 ) -> RegistryCandidate:
     return RegistryCandidate(session_id, host_id, harness, native_session_id)
+
+
+def _receipt(
+    host_id: str,
+    session_id: str,
+    fingerprint: str,
+) -> SourceEligibilityReceipt:
+    return SourceEligibilityReceipt(
+        schema_version=1,
+        assessed_at=_CAPTURED_AT,
+        host_id=host_id,
+        source_agent="claude-code",
+        session_id=session_id,
+        source_fingerprint=fingerprint,
+        classification="source_not_archive_eligible",
+    )
 
 
 def test_registry_projection_filters_blank_ids_preserves_wrappers_and_is_read_only(
@@ -199,6 +216,7 @@ def test_candidate_rows_receive_all_four_states_and_public_aggregate_shape():
         "current_source_coverage": {
             "discovered": 5,
             "matched": 4,
+            "source_not_archive_eligible": 0,
             "discovered_not_synced": 1,
         },
         "certified_coverage": {"status": "not_implemented", "certified": 0},
@@ -276,9 +294,165 @@ def test_current_sources_without_registry_rows_still_block_progression():
     assert summary["current_source_coverage"] == {
         "discovered": 2,
         "matched": 1,
+        "source_not_archive_eligible": 0,
         "discovered_not_synced": 1,
     }
     assert summary["ready_for_next_writer"] is False
+
+
+def test_matching_receipt_classifies_metadata_only_source_without_claiming_archive_match():
+    fingerprint = "a" * 64
+    current = (
+        NativeInventory(
+            2,
+            _CAPTURED_AT,
+            "host-a",
+            (
+                NativeInventoryRecord(
+                    "claude-code",
+                    "metadata-only",
+                    "2026-08-28T11:00:00Z",
+                    123,
+                    1,
+                    fingerprint,
+                ),
+            ),
+        ),
+    )
+
+    report = build_coverage_report(
+        (),
+        current,
+        _pond(),
+        eligibility_receipts=(_receipt("host-a", "metadata-only", fingerprint),),
+    )
+    summary = coverage_summary(report)
+
+    assert report.current_source_details[0].status == "source_not_archive_eligible"
+    assert summary["current_source_coverage"] == {
+        "discovered": 1,
+        "matched": 0,
+        "source_not_archive_eligible": 1,
+        "discovered_not_synced": 0,
+    }
+    assert summary["ready_for_next_writer"] is True
+
+
+@pytest.mark.parametrize(
+    "receipt_factory",
+    [
+        lambda fingerprint: _receipt("other-host", "metadata-only", fingerprint),
+        lambda _fingerprint: _receipt("host-a", "metadata-only", "b" * 64),
+    ],
+    ids=["host-replay", "changed-source"],
+)
+def test_receipt_must_match_the_current_host_source_and_fingerprint(receipt_factory):
+    fingerprint = "a" * 64
+    current = (
+        NativeInventory(
+            2,
+            _CAPTURED_AT,
+            "host-a",
+            (
+                NativeInventoryRecord(
+                    "claude-code",
+                    "metadata-only",
+                    "2026-08-28T11:00:00Z",
+                    123,
+                    1,
+                    fingerprint,
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^archive coverage eligibility receipt$"
+    ) as raised:
+        build_coverage_report(
+            (),
+            current,
+            _pond(),
+            eligibility_receipts=(receipt_factory(fingerprint),),
+        )
+
+    assert "metadata-only" not in str(raised.value)
+    assert "host-a" not in str(raised.value)
+    assert fingerprint not in str(raised.value)
+
+
+def test_receipt_refuses_duplicate_source_copy_or_existing_archive_session():
+    fingerprint = "a" * 64
+    receipt = _receipt("host-a", "metadata-only", fingerprint)
+    duplicated = (
+        NativeInventory(
+            2,
+            _CAPTURED_AT,
+            "host-a",
+            (
+                NativeInventoryRecord(
+                    "claude-code",
+                    "metadata-only",
+                    "2026-08-28T11:00:00Z",
+                    123,
+                    2,
+                    fingerprint,
+                ),
+            ),
+        ),
+    )
+    single = (
+        NativeInventory(
+            2,
+            _CAPTURED_AT,
+            "host-a",
+            (
+                NativeInventoryRecord(
+                    "claude-code",
+                    "metadata-only",
+                    "2026-08-28T11:00:00Z",
+                    123,
+                    1,
+                    fingerprint,
+                ),
+            ),
+        ),
+    )
+    cross_host_duplicate = (
+        *single,
+        NativeInventory(
+            2,
+            _CAPTURED_AT,
+            "host-b",
+            (
+                NativeInventoryRecord(
+                    "claude-code",
+                    "metadata-only",
+                    "2026-08-28T11:00:00Z",
+                    123,
+                    1,
+                    "b" * 64,
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="eligibility receipt"):
+        build_coverage_report((), duplicated, _pond(), eligibility_receipts=(receipt,))
+    with pytest.raises(ValueError, match="eligibility receipt"):
+        build_coverage_report(
+            (),
+            cross_host_duplicate,
+            _pond(),
+            eligibility_receipts=(receipt,),
+        )
+    with pytest.raises(ValueError, match="eligibility receipt"):
+        build_coverage_report(
+            (),
+            single,
+            _pond(_archive("metadata-only", "claude-code")),
+            eligibility_receipts=(receipt,),
+        )
 
 
 def test_current_source_manifests_require_one_snapshot_per_host():

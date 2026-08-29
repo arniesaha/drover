@@ -22,6 +22,7 @@ _NATIVE_ROOT_FIELDS = frozenset(
 _NATIVE_RECORD_FIELDS = frozenset(
     {"source_agent", "session_id", "updated_at", "size_bytes", "source_copies"}
 )
+_NATIVE_RECORD_FIELDS_V2 = _NATIVE_RECORD_FIELDS | {"source_fingerprint"}
 _POND_ROOT_FIELDS = frozenset(
     {"kind", "schema_version", "captured_at", "pond_version", "records"}
 )
@@ -33,6 +34,18 @@ _POND_RECORD_FIELDS = frozenset(
         "message_count",
         "first_message_at",
         "last_message_at",
+    }
+)
+_ELIGIBILITY_ROOT_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "assessed_at",
+        "host_id",
+        "source_agent",
+        "session_id",
+        "source_fingerprint",
+        "classification",
     }
 )
 
@@ -86,6 +99,22 @@ def _require_schema_version(value: Any) -> int:
     return 1
 
 
+def _require_native_schema_version(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2}:
+        raise _error("invalid", "schema_version")
+    return value
+
+
+def _require_source_fingerprint(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise _error("invalid", "source_fingerprint")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class NativeInventoryRecord:
     source_agent: str
@@ -93,6 +122,7 @@ class NativeInventoryRecord:
     updated_at: str
     size_bytes: int
     source_copies: int
+    source_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +146,11 @@ class NativeInventory:
                     "updated_at": record.updated_at,
                     "size_bytes": record.size_bytes,
                     "source_copies": record.source_copies,
+                    **(
+                        {"source_fingerprint": record.source_fingerprint}
+                        if self.schema_version == 2
+                        else {}
+                    ),
                 }
                 for record in sorted(
                     self.records,
@@ -166,6 +201,30 @@ class PondInventory:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class SourceEligibilityReceipt:
+    schema_version: int
+    assessed_at: str
+    host_id: str
+    source_agent: str
+    session_id: str
+    source_fingerprint: str
+    classification: str
+
+    def to_wire(self) -> dict[str, Any]:
+        _validate_source_eligibility_receipt(self)
+        return {
+            "kind": "native_source_eligibility_receipt",
+            "schema_version": self.schema_version,
+            "assessed_at": self.assessed_at,
+            "host_id": self.host_id,
+            "source_agent": self.source_agent,
+            "session_id": self.session_id,
+            "source_fingerprint": self.source_fingerprint,
+            "classification": self.classification,
+        }
+
+
 def _validate_native_record(record: NativeInventoryRecord) -> None:
     if type(record) is not NativeInventoryRecord:
         raise _error("invalid", "record")
@@ -181,7 +240,7 @@ def _validate_native_inventory(inventory: NativeInventory) -> None:
         inventory.records, tuple
     ):
         raise _error("invalid", "inventory")
-    _require_schema_version(inventory.schema_version)
+    _require_native_schema_version(inventory.schema_version)
     _require_timestamp(inventory.captured_at, "captured_at")
     _require_string(inventory.host_id, "host_id")
     if len(inventory.records) > MAX_INVENTORY_RECORDS:
@@ -189,6 +248,11 @@ def _validate_native_inventory(inventory: NativeInventory) -> None:
     seen: set[tuple[str, str]] = set()
     for record in inventory.records:
         _validate_native_record(record)
+        if inventory.schema_version == 1:
+            if record.source_fingerprint is not None:
+                raise _error("invalid", "source_fingerprint")
+        else:
+            _require_source_fingerprint(record.source_fingerprint)
         key = (record.source_agent, record.session_id)
         if key in seen:
             raise _error("invalid", "records")
@@ -230,13 +294,33 @@ def _validate_pond_inventory(inventory: PondInventory) -> None:
         seen.add(key)
 
 
+def _validate_source_eligibility_receipt(
+    receipt: SourceEligibilityReceipt,
+) -> None:
+    if type(receipt) is not SourceEligibilityReceipt:
+        raise _error("invalid", "eligibility_receipt")
+    _require_schema_version(receipt.schema_version)
+    _require_timestamp(receipt.assessed_at, "assessed_at")
+    _require_string(receipt.host_id, "host_id")
+    if receipt.source_agent != "claude-code":
+        raise _error("invalid", "source_agent")
+    _require_string(receipt.session_id, "session_id")
+    _require_source_fingerprint(receipt.source_fingerprint)
+    if receipt.classification != "source_not_archive_eligible":
+        raise _error("invalid", "classification")
+
+
 def _native_inventory_from_wire(payload: Any) -> NativeInventory:
     root = _require_exact_fields(payload, _NATIVE_ROOT_FIELDS, "root")
     if root["kind"] != "native_source_inventory":
         raise _error("invalid", "kind")
+    schema_version = _require_native_schema_version(root["schema_version"])
     records: list[NativeInventoryRecord] = []
     for value in _require_records(root["records"]):
-        record = _require_exact_fields(value, _NATIVE_RECORD_FIELDS, "record")
+        expected_fields = (
+            _NATIVE_RECORD_FIELDS_V2 if schema_version == 2 else _NATIVE_RECORD_FIELDS
+        )
+        record = _require_exact_fields(value, expected_fields, "record")
         records.append(
             NativeInventoryRecord(
                 source_agent=_require_string(record["source_agent"], "source_agent"),
@@ -248,10 +332,15 @@ def _native_inventory_from_wire(payload: Any) -> NativeInventory:
                 source_copies=_require_nonnegative_integer(
                     record["source_copies"], "source_copies"
                 ),
+                source_fingerprint=(
+                    _require_source_fingerprint(record["source_fingerprint"])
+                    if schema_version == 2
+                    else None
+                ),
             )
         )
     inventory = NativeInventory(
-        schema_version=_require_schema_version(root["schema_version"]),
+        schema_version=schema_version,
         captured_at=_require_timestamp(root["captured_at"], "captured_at"),
         host_id=_require_string(root["host_id"], "host_id"),
         records=tuple(records),
@@ -307,6 +396,23 @@ def _pond_inventory_from_wire(payload: Any) -> PondInventory:
             )
         ),
     )
+
+
+def _source_eligibility_receipt_from_wire(payload: Any) -> SourceEligibilityReceipt:
+    root = _require_exact_fields(payload, _ELIGIBILITY_ROOT_FIELDS, "root")
+    if root["kind"] != "native_source_eligibility_receipt":
+        raise _error("invalid", "kind")
+    receipt = SourceEligibilityReceipt(
+        schema_version=_require_schema_version(root["schema_version"]),
+        assessed_at=_require_timestamp(root["assessed_at"], "assessed_at"),
+        host_id=_require_string(root["host_id"], "host_id"),
+        source_agent=_require_string(root["source_agent"], "source_agent"),
+        session_id=_require_string(root["session_id"], "session_id"),
+        source_fingerprint=_require_source_fingerprint(root["source_fingerprint"]),
+        classification=_require_string(root["classification"], "classification"),
+    )
+    _validate_source_eligibility_receipt(receipt)
+    return receipt
 
 
 def _encode_private_json(payload: Any) -> bytes:
@@ -427,3 +533,8 @@ def load_native_inventory(path: str | Path) -> NativeInventory:
 def load_pond_inventory(path: str | Path) -> PondInventory:
     """Load exactly one Pond-session inventory manifest."""
     return _pond_inventory_from_wire(read_private_json(path))
+
+
+def load_source_eligibility_receipt(path: str | Path) -> SourceEligibilityReceipt:
+    """Load exactly one private native-source eligibility receipt."""
+    return _source_eligibility_receipt_from_wire(read_private_json(path))

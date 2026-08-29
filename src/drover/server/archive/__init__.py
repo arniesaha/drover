@@ -22,8 +22,10 @@ from drover.server.archive.inventory import (
     NativeInventoryRecord,
     PondInventory,
     PondInventoryRecord,
+    SourceEligibilityReceipt,
     load_native_inventory,
     load_pond_inventory,
+    load_source_eligibility_receipt,
     read_private_json,
     write_private_json,
 )
@@ -35,6 +37,10 @@ from drover.server.archive.pond import PondArchiveClient
 from drover.server.archive.pond_inventory import (
     export_pond_inventory,
     pond_inventory_summary,
+)
+from drover.server.archive.source_eligibility import (
+    assess_metadata_only_source,
+    source_eligibility_summary,
 )
 from drover.server.archive.types import (
     ArchiveMessage,
@@ -71,17 +77,21 @@ __all__ = [
     "NativeInventoryRecord",
     "PondInventory",
     "PondInventoryRecord",
+    "SourceEligibilityReceipt",
     "RegistryCandidate",
     "SessionArchive",
     "build_coverage_report",
+    "assess_metadata_only_source",
     "coverage_summary",
     "discover_native_history_inventory",
     "export_pond_inventory",
     "load_native_inventory",
     "load_pond_inventory",
+    "load_source_eligibility_receipt",
     "load_registry_candidates",
     "native_inventory_summary",
     "pond_inventory_summary",
     "read_private_json",
+    "source_eligibility_summary",
     "write_private_json",
 ]

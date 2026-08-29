@@ -114,7 +114,7 @@ Properties worth knowing:
 ### Check local archive inventory coverage
 
 This operator-run check compares current native history, Drover's registry,
-and an existing local Pond store. Run the three commands in order:
+and an existing local Pond store. Run the inventory commands before coverage:
 
 ```bash
 drover-server archive source-inventory \
@@ -128,13 +128,35 @@ drover-server archive coverage \
   --output PRIVATE_COVERAGE.json
 ```
 
-The three output files contain session identities. Keep them local and
+If a current Claude source contains only `ai-title` and `agent-name` metadata,
+Pond intentionally has no session to archive. Assess that one canonical file
+explicitly, then pass its receipt to coverage:
+
+```bash
+drover-server archive source-eligibility \
+  --host-id HOST_ALIAS --source /absolute/path/to/source.jsonl \
+  --output PRIVATE_ELIGIBILITY.json
+drover-server archive coverage \
+  --source-inventory PRIVATE_NATIVE.json \
+  --pond-inventory PRIVATE_POND.json \
+  --source-eligibility-receipt PRIVATE_ELIGIBILITY.json \
+  --output PRIVATE_COVERAGE.json
+```
+
+The eligibility assessment refuses files larger than 4 KiB, incomplete or
+noncanonical files, symlinks, unknown event types, and any message-bearing
+content. Its receipt stores no source path or event content and is bound to the
+schema-v2 source inventory's opaque fingerprint, so a changed source invalidates
+the receipt.
+
+These output files contain private session identities or fingerprints. Keep them local and
 owner-only: Drover creates them as new `0600` files, refuses an existing
 output, and accepts identity-bearing inputs only when they are private regular
 files. Only the aggregate JSON printed to stdout may be copied into a
 sanitized operations record.
 
-The coverage command exits `2` after writing its private report when a
+The coverage command reports an applied receipt as
+`source_not_archive_eligible`. It exits `2` after writing its private report when a
 conservative readiness check is not clean; this is a blocked readiness result,
 not permission to change the archive. Its three candidate miss reasons are:
 

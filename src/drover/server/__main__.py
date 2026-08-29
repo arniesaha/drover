@@ -55,6 +55,7 @@ from drover.server.advisory.worker import (
 )
 from drover.server.archive import (
     PondArchiveClient,
+    assess_metadata_only_source,
     build_coverage_report,
     coverage_summary,
     discover_native_history_inventory,
@@ -62,8 +63,10 @@ from drover.server.archive import (
     load_native_inventory,
     load_pond_inventory,
     load_registry_candidates,
+    load_source_eligibility_receipt,
     native_inventory_summary,
     pond_inventory_summary,
+    source_eligibility_summary,
     write_private_json,
 )
 from drover.server.briefs.worker import (
@@ -802,6 +805,35 @@ def archive_source_inventory_cmd(host_id: str, output: Path) -> None:
     click.echo(json.dumps(summary, sort_keys=True))
 
 
+@archive_cmd.command(name="source-eligibility")
+@click.option("--host-id", required=True, metavar="HOST")
+@click.option(
+    "--source",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
+def archive_source_eligibility_cmd(
+    host_id: str,
+    source: Path,
+    output: Path,
+) -> None:
+    """Classify one bounded metadata-only Claude source."""
+    try:
+        receipt = assess_metadata_only_source(Path.home(), source, host_id)
+        summary = source_eligibility_summary(receipt)
+        write_private_json(output, receipt.to_wire())
+    except Exception:
+        raise click.ClickException("archive source eligibility failed") from None
+    click.echo(json.dumps(summary, sort_keys=True))
+
+
 @archive_cmd.command(name="pond-inventory")
 @click.option(
     "--storage-path",
@@ -902,6 +934,13 @@ def archive_pond_inventory_cmd(
     type=click.Path(path_type=Path),
     metavar="FILE",
 )
+@click.option(
+    "--source-eligibility-receipt",
+    "source_eligibility_receipt_paths",
+    multiple=True,
+    type=click.Path(path_type=Path),
+    metavar="FILE",
+)
 @click.pass_context
 def archive_coverage_cmd(
     ctx: click.Context,
@@ -910,6 +949,7 @@ def archive_coverage_cmd(
     source_inventory_paths: tuple[Path, ...],
     pond_inventory_path: Path,
     prior_source_inventory_paths: tuple[Path, ...],
+    source_eligibility_receipt_paths: tuple[Path, ...],
 ) -> None:
     """Compare private source, registry, and Pond identity inventories."""
     try:
@@ -918,6 +958,10 @@ def archive_coverage_cmd(
         )
         prior_sources = tuple(
             load_native_inventory(path) for path in prior_source_inventory_paths
+        )
+        eligibility_receipts = tuple(
+            load_source_eligibility_receipt(path)
+            for path in source_eligibility_receipt_paths
         )
         pond = load_pond_inventory(pond_inventory_path)
         cfg = _resolve_config(ctx.obj["config_path"])
@@ -929,6 +973,7 @@ def archive_coverage_cmd(
             current_sources,
             pond,
             prior_sources=prior_sources,
+            eligibility_receipts=eligibility_receipts,
         )
         summary = coverage_summary(report)
         write_private_json(output, report.to_wire())
