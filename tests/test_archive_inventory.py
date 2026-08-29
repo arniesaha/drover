@@ -142,6 +142,16 @@ def test_private_writer_refuses_existing_output_including_symlink(tmp_path, name
     assert path.is_symlink() or path.read_text(encoding="utf-8") == "keep"
 
 
+def test_private_writer_refuses_payload_larger_than_32_mib(tmp_path):
+    path = tmp_path / "large.json"
+    payload = {"payload": "x" * (32 * 1024 * 1024)}
+
+    with pytest.raises(ValueError, match="size"):
+        write_private_json(path, payload)
+
+    assert not path.exists()
+
+
 @pytest.mark.parametrize("kind", ["directory", "group-readable"])
 def test_private_reader_refuses_non_private_regular_input(tmp_path, kind):
     path = tmp_path / "input.json"
@@ -175,6 +185,18 @@ def test_private_reader_rejects_file_larger_than_limit_before_decoding(tmp_path)
 
     with pytest.raises(ValueError, match="size"):
         read_private_json(path, max_bytes=16)
+
+
+def test_private_reader_closes_descriptor_when_rejecting_group_readable_input(tmp_path):
+    path = tmp_path / "group-readable.json"
+    _write_input(path, _native_inventory().to_wire(), mode=0o640)
+    baseline = len(os.listdir("/dev/fd"))
+
+    for _ in range(64):
+        with pytest.raises(ValueError, match="input"):
+            read_private_json(path)
+
+    assert len(os.listdir("/dev/fd")) <= baseline + 1
 
 
 @pytest.mark.parametrize("body", [b"\xff", b"not json"])

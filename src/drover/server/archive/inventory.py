@@ -318,6 +318,8 @@ def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
         )
     except (TypeError, ValueError, UnicodeError):
         raise _error("output", "payload") from None
+    if len(encoded) > MAX_INVENTORY_BYTES:
+        raise _error("output", "size")
     try:
         target = os.fspath(path)
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -351,12 +353,12 @@ def read_private_json(
     except (OSError, TypeError):
         raise _error("input", "file") from None
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
-            raise _error("input", "file")
-        if metadata.st_size > max_bytes:
-            raise _error("input", "size")
         with os.fdopen(descriptor, "rb") as input_file:
+            metadata = os.fstat(input_file.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+                raise _error("input", "file")
+            if metadata.st_size > max_bytes:
+                raise _error("input", "size")
             data = input_file.read(max_bytes + 1)
     except ValueError:
         raise
