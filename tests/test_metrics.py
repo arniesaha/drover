@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -4906,6 +4906,10 @@ def test_expired_metrics_cache_is_served_stale_while_it_refreshes(
     while monotonic() < deadline:
         if json.loads(collector.render_json())["quality"]["score"] == 2.0:
             break
+        # The production caller is a periodic scraper, not a hot loop. Yield
+        # here so the test itself does not starve the background renderer it is
+        # trying to observe under a loaded test host.
+        sleep(0.01)
     else:  # pragma: no cover - only on a hung refresh
         pytest.fail("background refresh never replaced the stale render")
 
