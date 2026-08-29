@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 from drover.config import ArchiveConfig
 from drover.server.archive import (
+    ArchiveError,
     ArchiveMessage,
     ArchiveMessageNeighborhood,
     ArchiveMessageRequest,
@@ -28,6 +30,7 @@ from drover.server.mcp.tools import (
 _MAX_CALLER_LIMIT = 20
 _MIN_CONTEXT_CHARS = 1_000
 _MAX_CONTEXT_CHARS = 100_000
+_ARCHIVE_ENRICHMENT_SLOT = threading.BoundedSemaphore(1)
 
 
 class RecallBundleService:
@@ -38,12 +41,16 @@ class RecallBundleService:
         *,
         duckdb_path: Path,
         archive_config: ArchiveConfig,
-        archive: SessionArchive,
+        archive: SessionArchive | None,
+        archive_slot: Any | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._duckdb_path = Path(duckdb_path)
         self._archive_config = archive_config
         self._archive = archive
+        self._archive_slot = (
+            _ARCHIVE_ENRICHMENT_SLOT if archive_slot is None else archive_slot
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def recall_bundle(
@@ -70,20 +77,61 @@ class RecallBundleService:
         effective_chars = min(requested_chars, self._archive_config.max_context_chars)
         retrieval_timestamp = _retrieval_timestamp(self._clock)
 
-        # Task 6 wraps this frame with the process-local archive slot. Keeping
-        # every decoded search/hydration value in this private call lets that
-        # wrapper release the slot only after the final bounded dictionaries
-        # have been returned and the archive intermediates are out of scope.
-        return self._build_archive_bundle(
-            query=normalized_query,
-            repo=repo,
-            since=normalized_since,
-            requested_limit=requested_limit,
-            effective_limit=effective_limit,
-            requested_chars=requested_chars,
-            effective_chars=effective_chars,
-            retrieval_timestamp=retrieval_timestamp,
-        )
+        build_arguments = {
+            "query": normalized_query,
+            "repo": repo,
+            "since": normalized_since,
+            "requested_limit": requested_limit,
+            "effective_limit": effective_limit,
+            "requested_chars": requested_chars,
+            "effective_chars": effective_chars,
+            "retrieval_timestamp": retrieval_timestamp,
+        }
+        if not self._archive_config.enabled:
+            return self._build_projected_bundle(
+                **build_arguments,
+                archive_status="disabled",
+                search_latency_ms=0,
+                matched_total=0,
+                searchable_in_scope=0,
+                has_more=False,
+                selected=(),
+                archive_evidence=[],
+                warnings=[],
+            )
+        if self._archive is None:
+            return self._build_projected_bundle(
+                **build_arguments,
+                archive_status="unavailable",
+                search_latency_ms=0,
+                matched_total=0,
+                searchable_in_scope=0,
+                has_more=False,
+                selected=(),
+                archive_evidence=[],
+                warnings=[{"category": "unavailable"}],
+            )
+        if not self._archive_slot.acquire(timeout=self._archive_config.timeout_seconds):
+            return self._build_projected_bundle(
+                **build_arguments,
+                archive_status="busy",
+                search_latency_ms=0,
+                matched_total=0,
+                searchable_in_scope=0,
+                has_more=False,
+                selected=(),
+                archive_evidence=[],
+                warnings=[],
+            )
+
+        # This private frame owns every decoded search and hydration value.
+        # Assign only its bounded dictionary result in the caller so its frame
+        # and archive intermediates are gone before the slot is released.
+        try:
+            bundle = self._build_archive_bundle(**build_arguments)
+            return bundle
+        finally:
+            self._archive_slot.release()
 
     def _build_archive_bundle(
         self,
@@ -97,32 +145,114 @@ class RecallBundleService:
         effective_chars: int,
         retrieval_timestamp: str,
     ) -> dict:
+        archive = self._archive
+        assert archive is not None
         search_started = perf_counter()
-        result = self._archive.search(
-            ArchiveSearchRequest(
-                query=query,
-                project=repo,
-                since=since,
-                limit=effective_limit,
+        result = None
+        search_warning = None
+        try:
+            result = archive.search(
+                ArchiveSearchRequest(
+                    query=query,
+                    project=repo,
+                    since=since,
+                    limit=effective_limit,
+                )
             )
-        )
+        except ArchiveError as error:
+            search_warning = {"category": error.category}
+        except Exception:
+            search_warning = {"category": "protocol_error"}
         search_latency_ms = max(0, int((perf_counter() - search_started) * 1_000))
+        if result is None:
+            warning = search_warning or {"category": "protocol_error"}
+            return self._build_projected_bundle(
+                query=query,
+                repo=repo,
+                since=since,
+                requested_limit=requested_limit,
+                effective_limit=effective_limit,
+                requested_chars=requested_chars,
+                effective_chars=effective_chars,
+                retrieval_timestamp=retrieval_timestamp,
+                archive_status="unavailable",
+                search_latency_ms=search_latency_ms,
+                matched_total=0,
+                searchable_in_scope=0,
+                has_more=False,
+                selected=(),
+                archive_evidence=[],
+                warnings=[warning],
+            )
+
         selected = _distinct_hits(result.hits, limit=effective_limit)
 
         archive_evidence: list[dict] = []
+        warnings: list[dict] = []
         for hit in selected:
-            neighborhood = self._archive.get_message(
-                ArchiveMessageRequest(
-                    message_id=hit.message_id,
-                    context_before=self._archive_config.context_before,
-                    context_after=self._archive_config.context_after,
+            warning_category = None
+            try:
+                neighborhood = archive.get_message(
+                    ArchiveMessageRequest(
+                        message_id=hit.message_id,
+                        context_before=self._archive_config.context_before,
+                        context_after=self._archive_config.context_after,
+                    )
                 )
-            )
-            archive_evidence.append(
-                _project_archive_neighborhood(
-                    hit, neighborhood, retrieval_timestamp=retrieval_timestamp
+            except ArchiveError as error:
+                warning_category = error.category
+            except Exception:
+                warning_category = "protocol_error"
+            else:
+                archive_evidence.append(
+                    _project_archive_neighborhood(
+                        hit, neighborhood, retrieval_timestamp=retrieval_timestamp
+                    )
                 )
-            )
+            if warning_category is not None:
+                warnings.append(
+                    {"message_id": hit.message_id, "category": warning_category}
+                )
+
+        return self._build_projected_bundle(
+            query=query,
+            repo=repo,
+            since=since,
+            requested_limit=requested_limit,
+            effective_limit=effective_limit,
+            requested_chars=requested_chars,
+            effective_chars=effective_chars,
+            retrieval_timestamp=retrieval_timestamp,
+            archive_status="partial" if warnings else "available",
+            search_latency_ms=search_latency_ms,
+            matched_total=result.matched_total,
+            searchable_in_scope=result.searchable_in_scope,
+            has_more=result.has_more,
+            selected=selected,
+            archive_evidence=archive_evidence,
+            warnings=warnings,
+        )
+
+    def _build_projected_bundle(
+        self,
+        *,
+        query: str,
+        repo: str | None,
+        since: str | None,
+        requested_limit: int,
+        effective_limit: int,
+        requested_chars: int,
+        effective_chars: int,
+        retrieval_timestamp: str,
+        archive_status: str,
+        search_latency_ms: int,
+        matched_total: int,
+        searchable_in_scope: int,
+        has_more: bool,
+        selected: tuple[ArchiveSearchHit, ...],
+        archive_evidence: list[dict],
+        warnings: list[dict],
+    ) -> dict:
 
         exact_session_ids = {hit.session_id for hit in selected}
         drover_context = self._build_drover_context(
@@ -134,20 +264,24 @@ class RecallBundleService:
             selected=selected,
             retrieval_timestamp=retrieval_timestamp,
         )
+        archive_metadata = {
+            "status": archive_status,
+            "search_latency_ms": search_latency_ms,
+            "matched_total": matched_total,
+            "searchable_in_scope": searchable_in_scope,
+            "has_more": has_more,
+            "selected_count": len(selected),
+            "hydrated_count": len(archive_evidence),
+            "retained_count": len(archive_evidence),
+            "result_set_freshness": _newest_selected_timestamp(selected),
+            "retrieval_timestamp": retrieval_timestamp,
+        }
+        if warnings:
+            archive_metadata["warnings"] = warnings
+
         bundle = {
             "query": {"text": query, "repo": repo, "since": since},
-            "archive": {
-                "status": "available",
-                "search_latency_ms": search_latency_ms,
-                "matched_total": result.matched_total,
-                "searchable_in_scope": result.searchable_in_scope,
-                "has_more": result.has_more,
-                "selected_count": len(selected),
-                "hydrated_count": len(archive_evidence),
-                "retained_count": len(archive_evidence),
-                "result_set_freshness": _newest_selected_timestamp(selected),
-                "retrieval_timestamp": retrieval_timestamp,
-            },
+            "archive": archive_metadata,
             "archive_evidence": archive_evidence,
             "drover_context": drover_context,
             "limits": {

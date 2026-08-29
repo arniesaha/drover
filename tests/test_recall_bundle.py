@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import threading
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,15 +18,24 @@ import pytest
 
 from drover.config import ArchiveConfig
 from drover.schema import bootstrap
+from drover.server import recall_bundle as recall_bundle_module
 from drover.server.archive import (
+    ArchiveError,
     ArchiveMessage,
     ArchiveMessageNeighborhood,
     ArchiveMessageRequest,
     ArchivePartSummary,
+    ArchiveProtocolError,
+    ArchiveRequestRejected,
+    ArchiveResponseTooLarge,
     ArchiveSearchHit,
     ArchiveSearchRequest,
     ArchiveSearchResult,
     ArchiveSession,
+    ArchiveStorageUnavailable,
+    ArchiveTimeout,
+    ArchiveUnavailable,
+    SessionArchive,
 )
 from drover.server.recall_bundle import RecallBundleService
 
@@ -38,12 +50,16 @@ def _seed(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _archive_config(
-    *, search_limit: int = 3, max_context_chars: int = 20_000
+    *,
+    enabled: bool = True,
+    timeout_seconds: float = 3.0,
+    search_limit: int = 3,
+    max_context_chars: int = 20_000,
 ) -> ArchiveConfig:
     return ArchiveConfig(
-        enabled=True,
-        base_url="http://127.0.0.1:8585",
-        timeout_seconds=3.0,
+        enabled=enabled,
+        base_url="http://127.0.0.1:8585" if enabled else "",
+        timeout_seconds=timeout_seconds,
         search_limit=search_limit,
         context_before=2,
         context_after=2,
@@ -129,6 +145,8 @@ class StrictArchive:
     expected_limit: int | None = None
     search_requests: list[ArchiveSearchRequest] = field(default_factory=list)
     message_requests: list[ArchiveMessageRequest] = field(default_factory=list)
+    search_failure: BaseException | None = None
+    message_failures: dict[str, BaseException] = field(default_factory=dict)
     _hydrating: bool = False
 
     def search(self, request: ArchiveSearchRequest) -> ArchiveSearchResult:
@@ -139,6 +157,8 @@ class StrictArchive:
             limit=self.expected_limit or request.limit,
         )
         self.search_requests.append(request)
+        if self.search_failure is not None:
+            raise self.search_failure
         return self.result
 
     def get_message(self, request: ArchiveMessageRequest) -> ArchiveMessageNeighborhood:
@@ -149,6 +169,9 @@ class StrictArchive:
         self._hydrating = True
         try:
             self.message_requests.append(request)
+            failure = self.message_failures.get(request.message_id)
+            if failure is not None:
+                raise failure
             return self.neighborhoods[request.message_id]
         finally:
             self._hydrating = False
@@ -166,17 +189,22 @@ def _empty_archive(**expectations: object) -> StrictArchive:
 
 def _service(
     duckdb_path: Path,
-    archive: StrictArchive,
+    archive: SessionArchive | None,
     *,
+    archive_config: ArchiveConfig | None = None,
+    archive_slot: object | None = None,
     search_limit: int = 3,
     max_context_chars: int = 20_000,
 ) -> RecallBundleService:
     return RecallBundleService(
         duckdb_path=duckdb_path,
-        archive_config=_archive_config(
-            search_limit=search_limit, max_context_chars=max_context_chars
+        archive_config=archive_config
+        or _archive_config(
+            search_limit=search_limit,
+            max_context_chars=max_context_chars,
         ),
         archive=archive,
+        archive_slot=archive_slot,
         clock=lambda: RETRIEVED_AT,
     )
 
@@ -869,3 +897,600 @@ def test_validation_accepts_caller_limit_boundaries(
 
     assert bundle["limits"]["requested_limit"] == requested
     assert bundle["limits"]["effective_limit"] == min(requested, 3)
+
+
+ARCHIVE_FAILURE_CASES: tuple[tuple[type[ArchiveError], str], ...] = (
+    (ArchiveUnavailable, "unavailable"),
+    (ArchiveTimeout, "timeout"),
+    (ArchiveRequestRejected, "request_rejected"),
+    (ArchiveStorageUnavailable, "storage_unavailable"),
+    (ArchiveProtocolError, "protocol_error"),
+    (ArchiveResponseTooLarge, "response_too_large"),
+)
+
+
+class ForbiddenSlot:
+    """Test slot that makes any archive-slot interaction observable."""
+
+    def acquire(self, *, timeout: float) -> bool:
+        raise AssertionError(f"archive slot must not be acquired ({timeout=})")
+
+    def release(self) -> None:
+        raise AssertionError("archive slot must not be released")
+
+
+def _assert_useful_bounded_drover_fallback(bundle: dict) -> None:
+    assert bundle["archive_evidence"] == []
+    assert bundle["drover_context"]["keyword_matches"]
+    assert bundle["drover_context"]["project_brief"] is not None
+    assert 0 < bundle["limits"]["used_chars"] <= 1_000
+    assert (
+        bundle["limits"]["used_chars"]
+        <= bundle["limits"]["effective_max_context_chars"]
+    )
+
+
+def test_disabled_archive_skips_slot_and_client_but_returns_bounded_drover_context(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    service = _service(
+        duckdb_path,
+        archive,
+        archive_config=_archive_config(enabled=False, max_context_chars=1_000),
+        archive_slot=ForbiddenSlot(),
+    )
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+        max_context_chars=1_000,
+    )
+
+    assert bundle["archive"] == {
+        "status": "disabled",
+        "search_latency_ms": 0,
+        "matched_total": 0,
+        "searchable_in_scope": 0,
+        "has_more": False,
+        "selected_count": 0,
+        "hydrated_count": 0,
+        "retained_count": 0,
+        "result_set_freshness": None,
+        "retrieval_timestamp": "2026-08-28T19:30:00+00:00",
+    }
+    assert archive.search_requests == []
+    assert archive.message_requests == []
+    _assert_useful_bounded_drover_fallback(bundle)
+
+
+def test_validation_rejects_arguments_before_touching_archive_slot(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    service = _service(
+        duckdb_path,
+        _empty_archive(),
+        archive_slot=ForbiddenSlot(),
+    )
+
+    with pytest.raises(ValueError, match="query"):
+        service.recall_bundle(query="  ")
+
+
+def test_enabled_archive_without_client_degrades_to_unavailable_drover_context(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    service = _service(
+        duckdb_path,
+        None,
+        archive_config=_archive_config(max_context_chars=1_000),
+        archive_slot=ForbiddenSlot(),
+    )
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+        max_context_chars=1_000,
+    )
+
+    assert bundle["archive"]["status"] == "unavailable"
+    assert bundle["archive"]["warnings"] == [{"category": "unavailable"}]
+    assert bundle["archive"]["search_latency_ms"] == 0
+    _assert_useful_bounded_drover_fallback(bundle)
+
+
+@pytest.mark.parametrize(("failure_type", "category"), ARCHIVE_FAILURE_CASES)
+def test_unavailable_search_failures_are_sanitized_and_keep_drover_context(
+    tmp_path: Path,
+    failure_type: type[ArchiveError],
+    category: str,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    archive.search_failure = failure_type(status_code=503, byte_count=12_345)
+    service = _service(duckdb_path, archive, max_context_chars=1_000)
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+        max_context_chars=1_000,
+    )
+
+    metadata = dict(bundle["archive"])
+    latency = metadata.pop("search_latency_ms")
+    assert type(latency) is int and latency >= 0
+    assert metadata == {
+        "status": "unavailable",
+        "matched_total": 0,
+        "searchable_in_scope": 0,
+        "has_more": False,
+        "selected_count": 0,
+        "hydrated_count": 0,
+        "retained_count": 0,
+        "result_set_freshness": None,
+        "retrieval_timestamp": "2026-08-28T19:30:00+00:00",
+        "warnings": [{"category": category}],
+    }
+    assert archive.message_requests == []
+    _assert_useful_bounded_drover_fallback(bundle)
+    json.dumps(bundle)
+
+
+def test_unavailable_unexpected_search_exception_maps_to_sanitized_protocol_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    archive.search_failure = RuntimeError("secret upstream response and transcript")
+    service = _service(duckdb_path, archive, max_context_chars=1_000)
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+        max_context_chars=1_000,
+    )
+
+    assert bundle["archive"]["status"] == "unavailable"
+    assert bundle["archive"]["warnings"] == [{"category": "protocol_error"}]
+    assert "secret upstream" not in json.dumps(bundle)
+    assert "secret upstream" not in caplog.text
+    _assert_useful_bounded_drover_fallback(bundle)
+
+
+@pytest.mark.parametrize(("failure_type", "category"), ARCHIVE_FAILURE_CASES)
+def test_partial_hydration_failure_keeps_successful_neighborhoods_and_sanitizes_warning(
+    tmp_path: Path,
+    failure_type: type[ArchiveError],
+    category: str,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    archive.message_failures["pond-message-2"] = failure_type(
+        status_code=503, byte_count=12_345
+    )
+    service = _service(duckdb_path, archive)
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+    )
+
+    assert [item["rank"] for item in bundle["archive_evidence"]] == [1, 4]
+    assert bundle["archive"]["status"] == "partial"
+    assert bundle["archive"]["selected_count"] == 3
+    assert bundle["archive"]["hydrated_count"] == 2
+    assert bundle["archive"]["retained_count"] == 2
+    assert bundle["archive"]["warnings"] == [
+        {"message_id": "pond-message-2", "category": category}
+    ]
+    assert [request.message_id for request in archive.message_requests] == [
+        "pond-message-1",
+        "pond-message-2",
+        "pond-message-3",
+    ]
+    assert bundle["drover_context"]["keyword_matches"]
+    assert bundle["limits"]["used_chars"] <= 20_000
+    json.dumps(bundle)
+
+
+def test_partial_unexpected_hydration_exception_maps_to_sanitized_protocol_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    archive.message_failures["pond-message-2"] = RuntimeError(
+        "secret hydrated transcript"
+    )
+    service = _service(duckdb_path, archive)
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+    )
+
+    assert [item["rank"] for item in bundle["archive_evidence"]] == [1, 4]
+    assert bundle["archive"]["status"] == "partial"
+    assert bundle["archive"]["warnings"] == [
+        {"message_id": "pond-message-2", "category": "protocol_error"}
+    ]
+    assert "secret hydrated" not in json.dumps(bundle)
+    assert "secret hydrated" not in caplog.text
+
+
+def test_partial_all_hydrations_fail_but_search_aggregates_and_warnings_remain(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    archive.message_failures = {
+        "pond-message-1": ArchiveUnavailable(),
+        "pond-message-2": ArchiveTimeout(),
+        "pond-message-3": ArchiveProtocolError(),
+    }
+    service = _service(duckdb_path, archive)
+
+    bundle = service.recall_bundle(
+        query="retry state machine",
+        repo="arniesaha/drover",
+        since="2026-08-01T00:00:00Z",
+    )
+
+    assert bundle["archive_evidence"] == []
+    metadata = dict(bundle["archive"])
+    search_latency_ms = metadata.pop("search_latency_ms")
+    assert type(search_latency_ms) is int and search_latency_ms >= 0
+    assert metadata == {
+        "status": "partial",
+        "matched_total": 8,
+        "searchable_in_scope": 80,
+        "has_more": True,
+        "selected_count": 3,
+        "hydrated_count": 0,
+        "retained_count": 0,
+        "result_set_freshness": "2026-08-27T14:00:00-07:00",
+        "retrieval_timestamp": "2026-08-28T19:30:00+00:00",
+        "warnings": [
+            {"message_id": "pond-message-1", "category": "unavailable"},
+            {"message_id": "pond-message-2", "category": "timeout"},
+            {"message_id": "pond-message-3", "category": "protocol_error"},
+        ],
+    }
+    assert bundle["drover_context"]["keyword_matches"]
+    assert bundle["limits"]["used_chars"] <= 20_000
+
+
+class BlockingHydrationArchive:
+    """Expose any concurrent normalized hydration as two open raw bodies."""
+
+    def __init__(self, delegate: StrictArchive) -> None:
+        self._delegate = delegate
+        self._lock = threading.Lock()
+        self.first_body_open = threading.Event()
+        self.close_first_body = threading.Event()
+        self.message_requests: list[ArchiveMessageRequest] = []
+        self.open_body_count = 0
+        self.maximum_open_bodies = 0
+
+    def search(self, request: ArchiveSearchRequest) -> ArchiveSearchResult:
+        return self._delegate.search(request)
+
+    def get_message(self, request: ArchiveMessageRequest) -> ArchiveMessageNeighborhood:
+        with self._lock:
+            self.open_body_count += 1
+            self.maximum_open_bodies = max(
+                self.maximum_open_bodies, self.open_body_count
+            )
+            self.message_requests.append(request)
+            request_number = len(self.message_requests)
+        try:
+            if request_number == 1:
+                self.first_body_open.set()
+                if not self.close_first_body.wait(timeout=3):
+                    raise AssertionError("test did not close the first raw body")
+            return self._delegate.neighborhoods[request.message_id]
+        finally:
+            with self._lock:
+                self.open_body_count -= 1
+
+
+def test_sequential_hydration_never_opens_a_second_raw_body(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    archive = BlockingHydrationArchive(_composition_archive())
+    service = _service(duckdb_path, archive)
+    bundles: list[dict] = []
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            bundles.append(
+                service.recall_bundle(
+                    query="retry state machine",
+                    repo="arniesaha/drover",
+                    since="2026-08-01T00:00:00Z",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted in parent thread
+            failures.append(exc)
+
+    worker = threading.Thread(target=run, name="blocking-hydration-test")
+    worker.start()
+    assert archive.first_body_open.wait(timeout=3)
+    assert archive.open_body_count == 1
+    assert [request.message_id for request in archive.message_requests] == [
+        "pond-message-1"
+    ]
+    archive.close_first_body.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert archive.maximum_open_bodies == 1
+    assert archive.open_body_count == 0
+    assert [request.message_id for request in archive.message_requests] == [
+        "pond-message-1",
+        "pond-message-2",
+        "pond-message-3",
+    ]
+    assert bundles[0]["archive"]["status"] == "available"
+
+
+def test_busy_archive_slot_returns_bounded_drover_context_without_archive_calls(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _seed_composition_rows(parquet_dir, duckdb_path)
+    archive = _composition_archive()
+    slot = threading.BoundedSemaphore(1)
+    assert slot.acquire(blocking=False)
+    service = _service(
+        duckdb_path,
+        archive,
+        archive_config=_archive_config(timeout_seconds=0.1, max_context_chars=1_000),
+        archive_slot=slot,
+    )
+
+    try:
+        bundle = service.recall_bundle(
+            query="retry state machine",
+            repo="arniesaha/drover",
+            max_context_chars=1_000,
+        )
+    finally:
+        slot.release()
+
+    assert bundle["archive"]["status"] == "busy"
+    assert bundle["archive"]["search_latency_ms"] == 0
+    assert "warnings" not in bundle["archive"]
+    assert archive.search_requests == []
+    assert archive.message_requests == []
+    _assert_useful_bounded_drover_fallback(bundle)
+
+
+class LifetimeArchive:
+    """Return normalized values retained only through weak references."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.search_count = 0
+        self.sentinel_refs: list[weakref.ReferenceType[object]] = []
+        self.second_search_started = threading.Event()
+        self.all_first_sentinels_dead_at_second_search: bool | None = None
+
+    def _remember(self, *values: object) -> None:
+        self.sentinel_refs.extend(weakref.ref(value) for value in values)
+
+    def search(self, request: ArchiveSearchRequest) -> ArchiveSearchResult:
+        with self._lock:
+            self.search_count += 1
+            search_number = self.search_count
+        if search_number == 2:
+            gc.collect()
+            self.all_first_sentinels_dead_at_second_search = all(
+                reference() is None for reference in self.sentinel_refs
+            )
+            self.second_search_started.set()
+            return ArchiveSearchResult(
+                hits=(), matched_total=0, searchable_in_scope=0, has_more=False
+            )
+
+        hit = _hit(
+            rank=1,
+            message_id="lifetime-message",
+            session_id="lifetime-session",
+            timestamp="2026-08-28T18:00:00Z",
+            text="Lifetime target.",
+        )
+        result = ArchiveSearchResult(
+            hits=(hit,), matched_total=1, searchable_in_scope=1, has_more=False
+        )
+        self._remember(request, hit.parts_summary[0], hit, result)
+        return result
+
+    def get_message(self, request: ArchiveMessageRequest) -> ArchiveMessageNeighborhood:
+        sibling_part = ArchivePartSummary(
+            kind="tool_call", label="Read", call_id="lifetime-call"
+        )
+        session = ArchiveSession(
+            session_id="lifetime-session",
+            project="arniesaha/drover",
+            source_agent="codex",
+            created_at="2026-08-28T17:00:00Z",
+        )
+        target = ArchiveMessage(
+            message_id="lifetime-message",
+            session_id="lifetime-session",
+            project="arniesaha/drover",
+            source_agent="codex",
+            role="user",
+            timestamp="2026-08-28T18:00:00Z",
+            text=None,
+            parts=(),
+        )
+        sibling = ArchiveMessage(
+            message_id="lifetime-sibling",
+            session_id="lifetime-session",
+            project="arniesaha/drover",
+            source_agent="codex",
+            role="assistant",
+            timestamp="2026-08-28T18:01:00Z",
+            text="Lifetime sibling.",
+            parts=(sibling_part,),
+        )
+        neighborhood = ArchiveMessageNeighborhood(
+            session=session,
+            target=target,
+            siblings=(sibling,),
+            target_part_count=0,
+            target_parts_remaining=0,
+            context_before=2,
+            context_after=2,
+        )
+        self._remember(request, sibling_part, session, target, sibling, neighborhood)
+        return neighborhood
+
+
+class LifetimeObservingSlot:
+    """Observe object lifetime immediately before opening the next slot."""
+
+    def __init__(self, archive: LifetimeArchive) -> None:
+        self._archive = archive
+        self._semaphore = threading.BoundedSemaphore(1)
+        self._lock = threading.Lock()
+        self.acquire_count = 0
+        self.release_count = 0
+        self.second_call_waiting = threading.Event()
+        self.first_release_observed = threading.Event()
+        self.all_sentinels_dead_at_first_release: bool | None = None
+
+    def acquire(self, *, timeout: float) -> bool:
+        with self._lock:
+            self.acquire_count += 1
+            if self.acquire_count == 2:
+                self.second_call_waiting.set()
+        return self._semaphore.acquire(timeout=timeout)
+
+    def release(self) -> None:
+        with self._lock:
+            first_release = self.release_count == 0
+            self.release_count += 1
+        if first_release:
+            gc.collect()
+            self.all_sentinels_dead_at_first_release = all(
+                reference() is None for reference in self._archive.sentinel_refs
+            )
+            self.first_release_observed.set()
+        self._semaphore.release()
+
+
+def test_lifetime_slot_stays_owned_until_archive_intermediates_die_after_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    archive = LifetimeArchive()
+    slot = LifetimeObservingSlot(archive)
+    projection_complete = threading.Event()
+    allow_private_frame_to_return = threading.Event()
+    real_apply_character_budget = recall_bundle_module._apply_character_budget
+
+    def block_after_final_projection(bundle: dict, maximum: int) -> None:
+        real_apply_character_budget(bundle, maximum)
+        if not projection_complete.is_set():
+            projection_complete.set()
+            if not allow_private_frame_to_return.wait(timeout=3):
+                raise AssertionError("test did not release final projection")
+
+    monkeypatch.setattr(
+        recall_bundle_module,
+        "_apply_character_budget",
+        block_after_final_projection,
+    )
+    service = _service(
+        duckdb_path,
+        archive,
+        archive_config=_archive_config(timeout_seconds=1.0),
+        archive_slot=slot,
+    )
+    bundles: list[dict] = []
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            bundles.append(service.recall_bundle(query="lifetime"))
+        except BaseException as exc:  # pragma: no cover - asserted in parent thread
+            failures.append(exc)
+
+    first = threading.Thread(target=run, name="lifetime-first")
+    second = threading.Thread(target=run, name="lifetime-second")
+    first.start()
+    assert projection_complete.wait(timeout=3)
+    gc.collect()
+    assert any(reference() is not None for reference in archive.sentinel_refs)
+
+    second.start()
+    assert slot.second_call_waiting.wait(timeout=3)
+    assert not archive.second_search_started.is_set()
+    assert any(reference() is not None for reference in archive.sentinel_refs)
+
+    allow_private_frame_to_return.set()
+    assert slot.first_release_observed.wait(timeout=3)
+    assert slot.all_sentinels_dead_at_first_release is True
+    assert archive.second_search_started.wait(timeout=3)
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert failures == []
+    assert archive.all_first_sentinels_dead_at_second_search is True
+    assert slot.acquire_count == 2
+    assert slot.release_count == 2
+    assert [bundle["archive"]["status"] for bundle in bundles] == [
+        "available",
+        "available",
+    ]
+
+
+@pytest.mark.parametrize("failure_point", ["drover_projection", "budget"])
+def test_lifetime_archive_slot_release_is_finally_safe_when_projection_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    archive = _empty_archive()
+    slot = threading.BoundedSemaphore(1)
+    service = _service(duckdb_path, archive, archive_slot=slot)
+
+    def fail(*_: object, **__: object) -> None:
+        raise RuntimeError(f"{failure_point} failed")
+
+    target = (
+        "drover_search"
+        if failure_point == "drover_projection"
+        else "_apply_character_budget"
+    )
+    monkeypatch.setattr(recall_bundle_module, target, fail)
+
+    with pytest.raises(RuntimeError, match=failure_point):
+        service.recall_bundle(query="retry")
+
+    assert slot.acquire(blocking=False)
+    slot.release()
