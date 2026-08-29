@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import click
 import duckdb
+from mcp.server.fastmcp import FastMCP
 
 import drover
 from drover.agent_aliases import canonicalize
@@ -51,6 +52,7 @@ from drover.server.advisory.worker import (
     operational_analyzers,
     operational_snapshot_source_version,
 )
+from drover.server.archive import PondArchiveClient
 from drover.server.briefs.worker import (
     BriefWorker,
     enqueue_brief,
@@ -552,6 +554,32 @@ def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
         wake_timeout_s=cfg.summarizer_wake_timeout_s,
         local_ollama_launchd_label=cfg.summarizer_local_ollama_launchd_label or None,
         local_ollama_launchd_plist=cfg.summarizer_local_ollama_launchd_plist or None,
+    )
+
+
+def _archive_client_from_config(cfg: DroverConfig) -> PondArchiveClient | None:
+    """Construct the optional local archive client without probing Pond."""
+    if not cfg.archive.enabled:
+        return None
+    return PondArchiveClient(cfg.archive)
+
+
+def _build_runtime_mcp_server(
+    *,
+    cfg: DroverConfig,
+    host: str,
+    backend_config: SummarizerBackendConfig,
+    summarize_job_stream: object | None,
+) -> FastMCP:
+    """Inject resolved runtime dependencies into the FastMCP server."""
+    return build_mcp_server(
+        duckdb_path=cfg.duckdb_path,
+        host=host,
+        port=cfg.mcp_http_port,
+        backend_config=backend_config,
+        summarize_job_stream=summarize_job_stream,
+        archive_config=cfg.archive,
+        archive=_archive_client_from_config(cfg),
     )
 
 
@@ -1981,10 +2009,9 @@ def run(
                 gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
                 wake_timeout_s=cfg.summarizer_wake_timeout_s,
             )
-            mcp = build_mcp_server(
-                duckdb_path=cfg.duckdb_path,
+            mcp = _build_runtime_mcp_server(
+                cfg=cfg,
                 host=mcp_host,
-                port=cfg.mcp_http_port,
                 backend_config=mcp_backend_cfg,
                 summarize_job_stream=job_streams.get("summarize"),
             )

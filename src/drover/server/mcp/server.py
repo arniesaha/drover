@@ -12,7 +12,10 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from drover.config import ArchiveConfig, default_config
+from drover.server.archive import SessionArchive
 from drover.server.mcp import tools as t
+from drover.server.recall_bundle import RecallBundleService
 from drover.server.summarizer.backends import SummarizerBackendConfig
 
 
@@ -24,6 +27,8 @@ def build_mcp_server(
     port: int = 7077,
     backend_config: Optional[SummarizerBackendConfig] = None,
     summarize_job_stream: object | None = None,
+    archive: SessionArchive | None = None,
+    archive_config: ArchiveConfig | None = None,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
@@ -34,6 +39,11 @@ def build_mcp_server(
     mcp = FastMCP(name, host=host, port=port)
     db = Path(duckdb_path)
     bcfg = backend_config
+    recall_service = RecallBundleService(
+        duckdb_path=db,
+        archive_config=archive_config or default_config().archive,
+        archive=archive,
+    )
 
     @mcp.tool()
     def drover_handoff(
@@ -104,6 +114,23 @@ def build_mcp_server(
             since=since,
             limit=limit,
             default_since_days=default_since_days,
+        )
+
+    @mcp.tool()
+    def drover_recall_bundle(
+        query: str,
+        repo: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: Optional[int] = None,
+        max_context_chars: Optional[int] = None,
+    ) -> dict:
+        """Return bounded native-harness archive evidence plus scoped Drover context."""
+        return recall_service.recall_bundle(
+            query=query,
+            repo=repo,
+            since=since,
+            limit=limit,
+            max_context_chars=max_context_chars,
         )
 
     @mcp.tool()
