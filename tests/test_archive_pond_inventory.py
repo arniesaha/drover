@@ -368,12 +368,25 @@ def test_export_normalizes_datafusion_timestamps_and_returns_safe_summary(
     }
 
 
+def test_export_accepts_the_pinned_release_version_detail(fake_pond, tmp_path):
+    inventory, _ = _export(
+        fake_pond,
+        tmp_path / "pond.json",
+        FAKE_POND_VERSION="pond 0.16.3 (23c7d0e x86_64-linux)\n",
+    )
+
+    assert inventory.pond_version == "0.16.3"
+
+
 @pytest.mark.parametrize(
     "version",
     [
         "pond 0.16.2\n",
         "pond 0.16.30\n",
         "pond 0.16.3-dev\n",
+        "pond 0.16.3 (0000000 x86_64-linux)\n",
+        "pond 0.16.3 (23c7d0e unknown-linux)\n",
+        "pond 0.16.3 (23c7d0e x86_64-linux) extra\n",
         "0.16.3\n",
         "pond version 0.16.3\n",
         "pond 0.16.3 extra\n",

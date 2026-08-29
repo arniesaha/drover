@@ -68,6 +68,15 @@ SELECT count(*) AS row_count,
 FROM inventory"""
 
 _POND_VERSION_TOKENS = ("pond", POND_VERSION)
+_POND_RELEASE_COMMIT = "23c7d0e"
+_POND_RELEASE_TARGETS = frozenset(
+    {
+        "aarch64-linux",
+        "aarch64-macos",
+        "x86_64-linux",
+        "x86_64-windows",
+    }
+)
 _POND_COLUMNS = frozenset(
     {
         "session_id",
@@ -108,6 +117,18 @@ class _PinnedOutput:
 
 def _failure(category: str) -> _PondInventoryError:
     return _PondInventoryError(f"pond inventory {category}")
+
+
+def _is_pinned_pond_version(tokens: tuple[str, ...]) -> bool:
+    if tokens == _POND_VERSION_TOKENS:
+        return True
+    return (
+        len(tokens) == 4
+        and tokens[:2] == _POND_VERSION_TOKENS
+        and tokens[2] == f"({_POND_RELEASE_COMMIT}"
+        and tokens[3].endswith(")")
+        and tokens[3][:-1] in _POND_RELEASE_TARGETS
+    )
 
 
 def export_pond_inventory(
@@ -173,7 +194,7 @@ def _export_to_pinned_output(
             version_tokens = tuple(version_bytes.decode("utf-8").split())
         except UnicodeDecodeError:
             raise _failure("version") from None
-        if version_tokens != _POND_VERSION_TOKENS:
+        if not _is_pinned_pond_version(version_tokens):
             raise _failure("version")
 
         preflight_path = temporary_path / "preflight.ndjson"
