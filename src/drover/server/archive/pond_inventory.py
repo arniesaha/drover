@@ -111,6 +111,7 @@ def export_pond_inventory(
     """Export strict session metadata without exposing Pond rows or locations."""
     executable = _require_executable(binary)
     local_store = _require_local_storage(storage_path)
+    _require_external_output(output, local_store)
     timeout = _require_timeout(timeout_seconds)
     child_env = _child_environment(env)
 
@@ -262,6 +263,28 @@ def _require_local_storage(storage_path: Path) -> Path:
         raise
     except (OSError, TypeError, ValueError):
         raise _failure("storage") from None
+
+
+def _require_external_output(output: Path, local_store: Path) -> None:
+    try:
+        candidate = Path(output)
+        try:
+            output_metadata = candidate.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(output_metadata.st_mode):
+                raise _failure("output")
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(local_store)
+        except ValueError:
+            return
+        raise _failure("output")
+    except _PondInventoryError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _failure("output") from None
 
 
 def _snapshot_store(source: Path, target: Path) -> None:

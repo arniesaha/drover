@@ -440,6 +440,63 @@ def test_pond_inventory_cli_executes_the_validated_relative_binary(
     )
 
 
+@pytest.mark.parametrize("output_kind", ["equal", "inside", "symlink-alias"])
+def test_pond_inventory_cli_refuses_output_in_original_store_before_pond(
+    output_kind, monkeypatch, tmp_path, caplog
+):
+    binary = tmp_path / "private-pond"
+    _write_minimal_pond(binary)
+    marker = tmp_path / "private-pond-ran"
+    storage = tmp_path / "private-store"
+    storage.mkdir()
+    sentinel = storage / "opaque-store-data"
+    sentinel.write_bytes(b"unchanged")
+    alias = tmp_path / "existing-parent-alias"
+    if output_kind == "equal":
+        output = storage
+    elif output_kind == "inside":
+        output = storage / "private-inventory.json"
+    else:
+        alias.symlink_to(storage, target_is_directory=True)
+        output = alias / "private-inventory.json"
+    before_entries = tuple(sorted(path.name for path in storage.iterdir()))
+    before_sentinel = sentinel.stat()
+    monkeypatch.setenv("LOCAL_POND_MARKER", str(marker))
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "archive",
+            "pond-inventory",
+            "--storage-path",
+            str(storage),
+            "--output",
+            str(output),
+            "--pond-binary",
+            str(binary),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert result.output == "Error: archive pond inventory failed\n"
+    assert not marker.exists()
+    assert tuple(sorted(path.name for path in storage.iterdir())) == before_entries
+    assert sentinel.read_bytes() == b"unchanged"
+    after_sentinel = sentinel.stat()
+    assert (
+        after_sentinel.st_ino,
+        after_sentinel.st_size,
+        after_sentinel.st_mtime_ns,
+        after_sentinel.st_ctime_ns,
+    ) == (
+        before_sentinel.st_ino,
+        before_sentinel.st_size,
+        before_sentinel.st_mtime_ns,
+        before_sentinel.st_ctime_ns,
+    )
+    _assert_private_values_absent(result, caplog, binary, storage, output, marker)
+
+
 def test_pond_inventory_refuses_absent_binary_without_creating_output(
     monkeypatch, tmp_path, caplog
 ):

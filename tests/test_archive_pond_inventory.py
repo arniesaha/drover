@@ -445,6 +445,102 @@ def test_export_rejects_nonlocal_or_non_directory_storage_before_start(
     assert str(storage_path) not in str(raised.value)
 
 
+@pytest.mark.parametrize("output_kind", ["equal", "inside", "symlink-alias"])
+def test_export_refuses_output_in_original_store_before_temporary_work(
+    fake_pond, monkeypatch, tmp_path, output_kind
+):
+    binary, local_store, record = fake_pond
+    sentinel = local_store / "opaque-private-store-data"
+    sentinel.write_bytes(b"unchanged")
+    before_entries = tuple(sorted(path.name for path in local_store.iterdir()))
+    before_store_metadata = _stable_metadata(local_store)
+    before_sentinel_metadata = _stable_metadata(sentinel)
+    alias = tmp_path / "existing-parent-alias"
+    if output_kind == "equal":
+        output = local_store
+    elif output_kind == "inside":
+        output = local_store / "private-inventory.json"
+    else:
+        alias.symlink_to(local_store, target_is_directory=True)
+        output = alias / "private-inventory.json"
+
+    def unexpected_temporary_directory(*_args, **_kwargs):
+        raise AssertionError("unsafe output reached temporary snapshot setup")
+
+    monkeypatch.setattr(
+        pond_inventory_module.tempfile,
+        "TemporaryDirectory",
+        unexpected_temporary_directory,
+    )
+
+    with pytest.raises(ValueError, match=r"^pond inventory output$") as raised:
+        export_pond_inventory(
+            binary,
+            output,
+            storage_path=local_store,
+            env=_environment(record),
+        )
+
+    assert not record.exists()
+    assert tuple(sorted(path.name for path in local_store.iterdir())) == before_entries
+    assert sentinel.read_bytes() == b"unchanged"
+    assert _stable_metadata(local_store) == before_store_metadata
+    assert _stable_metadata(sentinel) == before_sentinel_metadata
+    assert str(local_store) not in str(raised.value)
+    assert str(output) not in str(raised.value)
+
+
+def test_export_preserves_exclusive_writer_refusal_for_external_dangling_symlink(
+    fake_pond, tmp_path
+):
+    binary, local_store, record = fake_pond
+    target = tmp_path / "must-not-be-created.json"
+    output = tmp_path / "dangling-output-symlink.json"
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="output") as raised:
+        export_pond_inventory(
+            binary,
+            output,
+            storage_path=local_store,
+            env=_environment(record),
+        )
+
+    assert output.is_symlink()
+    assert not target.exists()
+    assert str(output) not in str(raised.value)
+    assert str(target) not in str(raised.value)
+
+
+def test_export_sanitizes_output_symlink_loop_before_temporary_work(
+    fake_pond, monkeypatch, tmp_path
+):
+    binary, local_store, record = fake_pond
+    output = tmp_path / "private-output-loop"
+    output.symlink_to(output)
+
+    def unexpected_temporary_directory(*_args, **_kwargs):
+        raise AssertionError("invalid output reached temporary snapshot setup")
+
+    monkeypatch.setattr(
+        pond_inventory_module.tempfile,
+        "TemporaryDirectory",
+        unexpected_temporary_directory,
+    )
+
+    with pytest.raises(ValueError, match=r"^pond inventory output$") as raised:
+        export_pond_inventory(
+            binary,
+            output,
+            storage_path=local_store,
+            env=_environment(record),
+        )
+
+    assert not record.exists()
+    assert output.is_symlink()
+    assert str(output) not in str(raised.value)
+
+
 def test_pond_mutations_are_confined_to_a_private_store_snapshot(fake_pond, tmp_path):
     _, local_store, _ = fake_pond
     manifest = local_store / "manifest.bin"

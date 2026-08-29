@@ -600,6 +600,14 @@ class _NativeSessionSource:
     candidate: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _NativeHistorySource:
+    harness: str
+    session_id: str
+    size_bytes: int
+    updated_at_ns: int
+
+
 def discover_native_history_metadata(
     home: Path, *, max_records: int = 100_000
 ) -> list[dict[str, Any]]:
@@ -612,7 +620,7 @@ def discover_native_history_metadata(
         raise ValueError("native history invalid max_records")
     records: list[dict[str, Any]] = []
     try:
-        for source in _iter_native_session_sources(home, fail_on_error=True):
+        for source in _iter_native_history_sources(home):
             if len(records) >= max_records:
                 raise ValueError("native history exceeded max_records")
             records.append(
@@ -626,6 +634,51 @@ def discover_native_history_metadata(
     except OSError:
         raise ValueError("native history discovery failed") from None
     return records
+
+
+def _iter_native_history_sources(home: Path):
+    for path in (home / ".claude/projects").glob("*/*.jsonl"):
+        source = _native_history_source(
+            path,
+            harness="claude-code",
+            session_id=_optional_text(path.stem),
+        )
+        if source is not None:
+            yield source
+    for path in (home / ".codex/sessions").glob("**/*.jsonl"):
+        source = _native_history_source(
+            path,
+            harness="codex",
+            session_id=_codex_session_id(path),
+        )
+        if source is not None:
+            yield source
+
+
+def _native_history_source(
+    path: Path,
+    *,
+    harness: str,
+    session_id: str | None,
+) -> _NativeHistorySource | None:
+    if not session_id:
+        return None
+    with path.open("rb") as stream:
+        initial_metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            return None
+        source_metadata = os.fstat(stream.fileno())
+    path_metadata = path.stat()
+    if not _same_source_snapshot(
+        initial_metadata, source_metadata
+    ) or not _same_source_snapshot(source_metadata, path_metadata):
+        raise OSError("native source changed during discovery")
+    return _NativeHistorySource(
+        harness=harness,
+        session_id=session_id,
+        size_bytes=source_metadata.st_size,
+        updated_at_ns=source_metadata.st_mtime_ns,
+    )
 
 
 def _iter_native_session_sources(home: Path, *, fail_on_error: bool = False):
@@ -716,11 +769,13 @@ def _same_source_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
         left.st_ino,
         left.st_size,
         left.st_mtime_ns,
+        left.st_ctime_ns,
     ) == (
         right.st_dev,
         right.st_ino,
         right.st_size,
         right.st_mtime_ns,
+        right.st_ctime_ns,
     )
 
 
