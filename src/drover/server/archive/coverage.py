@@ -249,6 +249,8 @@ def _validated_pond(pond: PondInventory) -> PondInventory:
         raise _failure("pond inventory") from None
     if pond.pond_version != POND_VERSION:
         raise _failure("pond inventory")
+    if any(record.source_agent not in _ROOT_SOURCE_AGENTS for record in pond.records):
+        raise _failure("pond inventory")
     return pond
 
 

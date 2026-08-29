@@ -84,18 +84,43 @@ def test_registry_projection_filters_blank_ids_preserves_wrappers_and_is_read_on
                 session_id VARCHAR,
                 host_id VARCHAR,
                 harness VARCHAR,
-                native_session_id VARCHAR
+                native_session_id VARCHAR,
+                transcript_preview VARCHAR
             )
             """)
         connection.executemany(
-            "INSERT INTO harness_sessions VALUES (?, ?, ?, ?)",
+            "INSERT INTO harness_sessions VALUES (?, ?, ?, ?, ?)",
             [
-                ("wrapper-b", "host-b", "codex", "native-shared"),
-                ("blank", "host-a", "codex", "  "),
-                ("unsupported", "host-a", "gemini", "native-unsupported"),
-                ("wrapper-a2", "host-a", "codex", "native-shared"),
-                ("wrapper-a1", "host-a", "codex", "native-shared"),
-                ("missing", "host-a", "claude-code", None),
+                (
+                    "wrapper-b",
+                    "host-b",
+                    "codex",
+                    "native-shared",
+                    "SENSITIVE-CANARY-TRANSCRIPT",
+                ),
+                ("blank", "host-a", "codex", "  ", "blank-canary"),
+                (
+                    "unsupported",
+                    "host-a",
+                    "gemini",
+                    "native-unsupported",
+                    "unsupported-canary",
+                ),
+                (
+                    "wrapper-a2",
+                    "host-a",
+                    "codex",
+                    "native-shared",
+                    "wrapper-a2-canary",
+                ),
+                (
+                    "wrapper-a1",
+                    "host-a",
+                    "codex",
+                    "native-shared",
+                    "wrapper-a1-canary",
+                ),
+                ("missing", "host-a", "claude-code", None, "missing-canary"),
             ],
         )
     real_connect = duckdb.connect
@@ -117,6 +142,7 @@ def test_registry_projection_filters_blank_ids_preserves_wrappers_and_is_read_on
         RegistryCandidate("unsupported", "host-a", "gemini", "native-unsupported"),
         RegistryCandidate("wrapper-b", "host-b", "codex", "native-shared"),
     )
+    assert "SENSITIVE-CANARY-TRANSCRIPT" not in repr(candidates)
     assert connect_calls == [((str(registry_path),), {"read_only": True})]
     with duckdb.connect(str(registry_path), read_only=True) as connection:
         assert connection.execute("SHOW TABLES").fetchall() == [("harness_sessions",)]
@@ -220,7 +246,6 @@ def test_unsupported_registry_harnesses_are_counted_but_never_become_summary_key
     pond = _pond(
         _archive("native-codex", "codex-cli"),
         _archive("native-claude", "claude-code", created_at="2026-08-28T11:00:00Z"),
-        _archive("native-other", "private-agent", created_at="2026-08-28T09:00:00Z"),
     )
 
     summary = coverage_summary(build_coverage_report(registry, (), pond))
@@ -442,6 +467,31 @@ def test_coverage_refuses_an_inventory_from_an_unpinned_pond_version():
 
     with pytest.raises(ValueError, match="pond inventory"):
         build_coverage_report((), (), pond)
+
+
+@pytest.mark.parametrize("message_count", [0, 1], ids=["empty", "nonempty"])
+def test_coverage_rejects_unsupported_pond_agents_without_exposing_identifiers(
+    message_count,
+):
+    unsupported_agent = "private-unsupported-pond-agent"
+    private_session_id = "private-unsupported-pond-session"
+    pond = _pond(
+        _archive(
+            private_session_id,
+            unsupported_agent,
+            message_count=message_count,
+            first_message_at=(None if message_count == 0 else "2026-08-28T10:01:00Z"),
+            last_message_at=(None if message_count == 0 else "2026-08-28T10:02:00Z"),
+        )
+    )
+
+    with pytest.raises(
+        ValueError, match=r"^archive coverage pond inventory$"
+    ) as raised:
+        build_coverage_report((), (), pond)
+
+    assert unsupported_agent not in str(raised.value)
+    assert private_session_id not in str(raised.value)
 
 
 def test_private_report_keeps_investigation_ids_while_public_summary_is_recursive_safe():
