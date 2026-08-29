@@ -222,6 +222,10 @@ class _Connection:
         # Same lock-free reasoning as `last_rx`: written on the reader's hot
         # path, and a single attribute store/load needs no lock.
         self.frames_seen = False
+        # The same fact as `frames_seen`, in a form a caller can block on.
+        # Set once, on the transition, so the reader's hot path pays the
+        # Event's lock exactly one time rather than on every frame.
+        self.spoke_proven = threading.Event()
 
     @contextlib.contextmanager
     def write_access(self, timeout_s: float) -> Iterator[None]:
@@ -373,6 +377,27 @@ class RelayManager:
         if connection is None or not connection.frames_seen:
             return False
         return (time.monotonic() - connection.last_rx) <= SILENCE_TIMEOUT_S
+
+    def wait_until_responsive(self, host_id: str, timeout_s: float) -> bool:
+        """Like `is_responsive`, but give a fresh connection its round trip.
+
+        Between `attach` and the first pong a perfectly healthy socket has not
+        proven anything yet, and callers that refuse on `is_responsive` alone
+        would turn a reconnect into a spurious failure. Presence can absorb
+        that -- it re-renders seconds later -- but a one-shot action the user
+        just asked for cannot, so it waits instead.
+
+        Bounded, and short: the hub pings on attach, so a working spoke answers
+        in a round trip. A mute one costs the caller this timeout and is then
+        refused, which is still far better than the alternative it replaces --
+        accepting the work onto a socket nobody is reading.
+        """
+        connection = self._live(host_id)
+        if connection is None:
+            return False
+        if not connection.spoke_proven.wait(max(timeout_s, 0.0)):
+            return False
+        return self.is_responsive(host_id)
 
     def silent_for(self, host_id: str) -> float | None:
         """Seconds since the last inbound frame, or None if none ever arrived."""
@@ -546,7 +571,9 @@ class RelayManager:
             # Every frame counts as proof of life, pongs included - see
             # SILENCE_TIMEOUT_S.
             connection.last_rx = time.monotonic()
-            connection.frames_seen = True
+            if not connection.frames_seen:
+                connection.frames_seen = True
+                connection.spoke_proven.set()
             if frame.opcode == OPCODE_CLOSE:
                 raise WebSocketClosed()
             if frame.opcode == OPCODE_PING:

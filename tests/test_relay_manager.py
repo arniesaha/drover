@@ -709,3 +709,43 @@ def test_an_unknown_host_is_neither_live_nor_responsive() -> None:
     assert manager.is_live("nobody") is False
     assert manager.is_responsive("nobody") is False
     assert manager.silent_for("nobody") is None
+
+
+def test_waiting_for_proof_returns_as_soon_as_the_spoke_answers() -> None:
+    """A reconnect must not become a spurious refusal for a healthy host."""
+    manager = RelayManager()
+    spoke = _attach(manager)
+    try:
+        assert manager.is_responsive("laptop") is False  # not proven yet
+
+        def answer() -> None:
+            payload = _drain_ping(spoke)
+            client_send_frame(spoke, OPCODE_PONG, payload)
+
+        thread = threading.Thread(target=answer, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        assert manager.wait_until_responsive("laptop", 5.0) is True
+        assert time.monotonic() - started < 5.0
+        thread.join(timeout=5)
+    finally:
+        spoke.close()
+
+
+def test_waiting_for_proof_gives_up_on_a_mute_spoke() -> None:
+    """Bounded: a spoke that never reads its socket costs the caller the budget."""
+    manager = RelayManager()
+    spoke = _attach(manager)
+    try:
+        started = time.monotonic()
+        assert manager.wait_until_responsive("laptop", 0.2) is False
+        assert time.monotonic() - started >= 0.2
+    finally:
+        spoke.close()
+
+
+def test_waiting_for_proof_on_an_unattached_host_does_not_block() -> None:
+    manager = RelayManager()
+    started = time.monotonic()
+    assert manager.wait_until_responsive("nobody", 5.0) is False
+    assert time.monotonic() - started < 1.0

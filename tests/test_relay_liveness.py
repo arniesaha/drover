@@ -31,6 +31,7 @@ class _Relay:
     def __init__(self, *, attached: bool, silent_for: float | None) -> None:
         self._attached = attached
         self._silent_for = silent_for
+        self.waited: list[float] = []
 
     def is_live(self, host_id: str) -> bool:
         return self._attached
@@ -39,6 +40,10 @@ class _Relay:
         return (
             self._attached and self._silent_for is not None and self._silent_for <= 60.0
         )
+
+    def wait_until_responsive(self, host_id: str, timeout_s: float) -> bool:
+        self.waited.append(timeout_s)
+        return self.is_responsive(host_id)
 
     def silent_for(self, host_id: str) -> float | None:
         return self._silent_for if self._attached else None

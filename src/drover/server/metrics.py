@@ -93,6 +93,11 @@ RELAY_MIN_TIMEOUT_S = 5.0
 # Deliberately generous rather than tuned: the cost of waiting is a slow
 # handoff, and the cost of not waiting is a session the hub cannot see.
 CREATE_SESSION_TIMEOUT_S = 120.0
+# How long creating a session waits for a freshly attached spoke to prove it is
+# reading its socket. Only ever spent on a connection that has not yet sent a
+# frame; the hub pings on attach, so a working spoke costs a round trip and a
+# reconnect does not become a spurious refusal.
+RELAY_PROOF_TIMEOUT_S = 2.0
 
 # How long the hub waits for a host to complete a typed path.
 #
@@ -1222,7 +1227,9 @@ class MetricsCollector:
         # create was delivered to a socket the host was not reading.
         if getattr(host, "connection_kind", "direct") == "relay":
             relay = self.relay_manager
-            if relay is None or not relay.is_responsive(host_id):
+            if relay is None or not relay.wait_until_responsive(
+                host_id, RELAY_PROOF_TIMEOUT_S
+            ):
                 return _json_response(
                     502,
                     {
