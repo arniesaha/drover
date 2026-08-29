@@ -12,6 +12,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.mcp.tools import (
+    drover_open_loops,
     drover_project_activity,
     drover_project_brief,
     drover_recall,
@@ -368,6 +369,40 @@ def test_project_activity_uses_bounded_enriched_span_partitions(
 
     assert len(out["rows"]) == 1
     assert out["rows"][0]["project_key"] == "arniesaha/nexus"
+
+
+def test_open_loops_scopes_project_key_to_exact_repository(tmp_path: Path) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute("""INSERT INTO context_containers
+                (context_id, container_type, label, source_harness, confidence,
+                 evidence, last_touched_at, next_action, open_loop, session_ids,
+                 task_ids, repo_owner, repo_name, branch, summary_md, redaction_policy)
+                VALUES
+                ('ctx-drover-loop', 'code_project', 'Drover loop', 'codex', 0.95,
+                 'repo-backed context', now(), 'Run the recall tests.', 'query is open',
+                 [], [], 'arniesaha', 'drover', 'main', 'Drover work.',
+                 'session-summary-redacted'),
+                ('ctx-other-loop', 'code_project', 'Other loop', 'codex', 0.95,
+                 'repo-backed context', now() - INTERVAL 1 HOUR, 'Review the other repo.',
+                 'query is open', [], [], 'arniesaha', 'other', 'main', 'Other work.',
+                 'session-summary-redacted')""")
+    finally:
+        con.close()
+
+    unscoped = drover_open_loops(duckdb_path=duckdb_path)
+    scoped = drover_open_loops(
+        duckdb_path=duckdb_path, project_key="arniesaha/drover"
+    )
+
+    assert [row["context_id"] for row in unscoped["open_loops"]] == [
+        "ctx-drover-loop",
+        "ctx-other-loop",
+    ]
+    assert [row["context_id"] for row in scoped["open_loops"]] == [
+        "ctx-drover-loop"
+    ]
 
 
 def test_recall_orders_by_cosine_similarity(tmp_path: Path) -> None:

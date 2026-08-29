@@ -188,10 +188,18 @@ def build_mcp_server(
     def drover_open_loops(
         container_type: Optional[str] = None,
         limit: int = 20,
+        project_key: Optional[str] = None,
     ) -> dict:
-        """Return context containers with known next actions or open loops."""
+        """Return context containers with known next actions or open loops.
+
+        ``project_key`` optionally scopes results to one exact ``owner/name``
+        repository pair.
+        """
         return t.drover_open_loops(
-            duckdb_path=db, container_type=container_type, limit=limit
+            duckdb_path=db,
+            container_type=container_type,
+            limit=limit,
+            project_key=project_key,
         )
 
     @mcp.tool()
