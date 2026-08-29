@@ -1291,11 +1291,13 @@ class LifetimeArchive:
         self._lock = threading.Lock()
         self.search_count = 0
         self.sentinel_refs: list[weakref.ReferenceType[object]] = []
+        self.sentinel_type_names: list[str] = []
         self.second_search_started = threading.Event()
         self.all_first_sentinels_dead_at_second_search: bool | None = None
 
     def _remember(self, *values: object) -> None:
         self.sentinel_refs.extend(weakref.ref(value) for value in values)
+        self.sentinel_type_names.extend(type(value).__name__ for value in values)
 
     def search(self, request: ArchiveSearchRequest) -> ArchiveSearchResult:
         with self._lock:
@@ -1469,28 +1471,159 @@ def test_lifetime_slot_stays_owned_until_archive_intermediates_die_after_project
 
 
 @pytest.mark.parametrize("failure_point", ["drover_projection", "budget"])
-def test_lifetime_archive_slot_release_is_finally_safe_when_projection_raises(
+def test_lifetime_failure_drops_archive_intermediates_before_slot_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure_point: str,
 ) -> None:
     _, duckdb_path = _seed(tmp_path)
+    archive = LifetimeArchive()
+    slot = LifetimeObservingSlot(archive)
+    failure_point_entered = threading.Event()
+    allow_failure = threading.Event()
+    service = _service(
+        duckdb_path,
+        archive,
+        archive_config=_archive_config(timeout_seconds=1.0),
+        archive_slot=slot,
+    )
+    first_failures: list[
+        tuple[type[BaseException], tuple[object, ...], int, tuple[str, ...]]
+    ] = []
+    second_bundles: list[dict] = []
+    second_failures: list[BaseException] = []
+    first_thread: threading.Thread
+
+    def block_then_fail() -> None:
+        failure_point_entered.set()
+        if not allow_failure.wait(timeout=3):
+            raise AssertionError("test did not allow the first call to fail")
+        raise RuntimeError(f"{failure_point} failed")
+
+    if failure_point == "drover_projection":
+        real_drover_search = recall_bundle_module.drover_search
+
+        def fail_first_drover_projection(**kwargs: object) -> dict:
+            if threading.current_thread() is first_thread:
+                block_then_fail()
+            return real_drover_search(**kwargs)
+
+        monkeypatch.setattr(
+            recall_bundle_module,
+            "drover_search",
+            fail_first_drover_projection,
+        )
+    else:
+        real_apply_character_budget = recall_bundle_module._apply_character_budget
+
+        def fail_first_budget(bundle: dict, maximum: int) -> None:
+            if threading.current_thread() is first_thread:
+                block_then_fail()
+            real_apply_character_budget(bundle, maximum)
+
+        monkeypatch.setattr(
+            recall_bundle_module,
+            "_apply_character_budget",
+            fail_first_budget,
+        )
+
+    def run_first() -> None:
+        try:
+            service.recall_bundle(query="lifetime failure")
+        except BaseException as exc:  # pragma: no branch - required observation
+            frame_names: list[str] = []
+            traceback = exc.__traceback__
+            while traceback is not None:
+                frame_names.append(traceback.tb_frame.f_code.co_name)
+                traceback = traceback.tb_next
+            first_failures.append(
+                (type(exc), exc.args, slot.release_count, tuple(frame_names))
+            )
+
+    def run_second() -> None:
+        try:
+            second_bundles.append(service.recall_bundle(query="lifetime failure"))
+        except BaseException as exc:  # pragma: no cover - asserted in parent thread
+            second_failures.append(exc)
+
+    first_thread = threading.Thread(target=run_first, name=f"{failure_point}-first")
+    second_thread = threading.Thread(target=run_second, name=f"{failure_point}-second")
+    first_thread.start()
+    assert failure_point_entered.wait(timeout=3)
+    assert {
+        "ArchiveSearchRequest",
+        "ArchiveSearchResult",
+        "ArchiveSearchHit",
+        "ArchivePartSummary",
+        "ArchiveMessageRequest",
+        "ArchiveMessageNeighborhood",
+        "ArchiveSession",
+        "ArchiveMessage",
+    }.issubset(set(archive.sentinel_type_names))
+    gc.collect()
+    assert any(reference() is not None for reference in archive.sentinel_refs)
+
+    second_thread.start()
+    assert slot.second_call_waiting.wait(timeout=3)
+    assert not archive.second_search_started.is_set()
+    assert any(reference() is not None for reference in archive.sentinel_refs)
+
+    allow_failure.set()
+    assert slot.first_release_observed.wait(timeout=3)
+    assert archive.second_search_started.wait(timeout=3)
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert slot.all_sentinels_dead_at_first_release is True
+    assert archive.all_first_sentinels_dead_at_second_search is True
+    assert second_failures == []
+    assert len(second_bundles) == 1
+    assert second_bundles[0]["archive"]["status"] == "available"
+    assert first_failures == [
+        (
+            RuntimeError,
+            (f"{failure_point} failed",),
+            1,
+            ("run_first", "recall_bundle"),
+        )
+    ]
+    assert slot.acquire_count == 2
+    assert slot.release_count == 2
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "failure_args"),
+    [(KeyboardInterrupt, ("stop now",)), (SystemExit, (17,))],
+)
+def test_failure_rethrow_preserves_control_flow_exception_type_and_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+    failure_args: tuple[object, ...],
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
     archive = _empty_archive()
     slot = threading.BoundedSemaphore(1)
     service = _service(duckdb_path, archive, archive_slot=slot)
+    original = failure_type(*failure_args)
 
-    def fail(*_: object, **__: object) -> None:
-        raise RuntimeError(f"{failure_point} failed")
+    def fail_projection(**_: object) -> dict:
+        raise original
 
-    target = (
-        "drover_search"
-        if failure_point == "drover_projection"
-        else "_apply_character_budget"
-    )
-    monkeypatch.setattr(recall_bundle_module, target, fail)
+    monkeypatch.setattr(recall_bundle_module, "drover_search", fail_projection)
 
-    with pytest.raises(RuntimeError, match=failure_point):
-        service.recall_bundle(query="retry")
+    with pytest.raises(failure_type) as caught:
+        service.recall_bundle(query="control flow failure")
 
+    assert caught.value is not original
+    assert caught.value.args == failure_args
+    frame_names: list[str] = []
+    traceback = caught.value.__traceback__
+    while traceback is not None:
+        frame_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "_build_archive_bundle" not in frame_names
     assert slot.acquire(blocking=False)
     slot.release()

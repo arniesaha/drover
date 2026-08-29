@@ -33,6 +33,19 @@ _MAX_CONTEXT_CHARS = 100_000
 _ARCHIVE_ENRICHMENT_SLOT = threading.BoundedSemaphore(1)
 
 
+class _CapturedFailure:
+    """Traceback-free exception data safe to retain across slot release."""
+
+    __slots__ = ("exception_type", "args")
+
+    def __init__(self, exception: BaseException) -> None:
+        self.exception_type: type[BaseException] = type(exception)
+        self.args: tuple[Any, ...] = exception.args
+
+    def recreate(self) -> BaseException:
+        return self.exception_type(*self.args)
+
+
 class RecallBundleService:
     """Build one JSON-serializable recall result without cross-store scoring."""
 
@@ -124,14 +137,27 @@ class RecallBundleService:
                 warnings=[],
             )
 
-        # This private frame owns every decoded search and hydration value.
-        # Assign only its bounded dictionary result in the caller so its frame
-        # and archive intermediates are gone before the slot is released.
+        # This private frame owns every decoded search and hydration value. On
+        # failure, retain only type/args and sever the original traceback before
+        # releasing the slot; otherwise the active traceback keeps that frame
+        # and its archive intermediates alive through finally cleanup.
+        bundle = None
+        captured_failure = None
         try:
-            bundle = self._build_archive_bundle(**build_arguments)
-            return bundle
+            try:
+                bundle = self._build_archive_bundle(**build_arguments)
+            except BaseException as error:
+                captured_failure = _CapturedFailure(error)
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
         finally:
             self._archive_slot.release()
+
+        if captured_failure is not None:
+            raise captured_failure.recreate() from None
+        assert bundle is not None
+        return bundle
 
     def _build_archive_bundle(
         self,
