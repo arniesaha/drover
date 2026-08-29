@@ -665,6 +665,7 @@ def test_cli_help_lists_subcommands():
         "session",
         "embeddings",
         "context",
+        "archive",
     ):
         assert sub in res.output
 

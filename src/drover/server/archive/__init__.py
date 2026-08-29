@@ -1,5 +1,12 @@
 """Stable archive boundary for optional local Pond recall."""
 
+from drover.server.archive.coverage import (
+    CoverageReport,
+    RegistryCandidate,
+    build_coverage_report,
+    coverage_summary,
+    load_registry_candidates,
+)
 from drover.server.archive.errors import (
     ArchiveDisabled,
     ArchiveError,
@@ -20,7 +27,15 @@ from drover.server.archive.inventory import (
     read_private_json,
     write_private_json,
 )
+from drover.server.archive.native_inventory import (
+    discover_native_history_inventory,
+    native_inventory_summary,
+)
 from drover.server.archive.pond import PondArchiveClient
+from drover.server.archive.pond_inventory import (
+    export_pond_inventory,
+    pond_inventory_summary,
+)
 from drover.server.archive.types import (
     ArchiveMessage,
     ArchiveMessageNeighborhood,
@@ -51,13 +66,22 @@ __all__ = [
     "ArchiveStorageUnavailable",
     "ArchiveTimeout",
     "ArchiveUnavailable",
+    "CoverageReport",
     "NativeInventory",
     "NativeInventoryRecord",
     "PondInventory",
     "PondInventoryRecord",
+    "RegistryCandidate",
     "SessionArchive",
+    "build_coverage_report",
+    "coverage_summary",
+    "discover_native_history_inventory",
+    "export_pond_inventory",
     "load_native_inventory",
     "load_pond_inventory",
+    "load_registry_candidates",
+    "native_inventory_summary",
+    "pond_inventory_summary",
     "read_private_json",
     "write_private_json",
 ]
