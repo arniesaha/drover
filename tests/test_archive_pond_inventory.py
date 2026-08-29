@@ -144,6 +144,23 @@ elif mode == "too_many_rows":
 elif mode == "unsafe_export_mode":
     output.write_text(os.environ["FAKE_NDJSON"], encoding="utf-8")
     output.chmod(0o644)
+elif mode == "swap_output_parent":
+    final_parent = Path(os.environ["FAKE_FINAL_OUTPUT_PARENT"])
+    moved_parent = Path(os.environ["FAKE_MOVED_OUTPUT_PARENT"])
+    final_parent.rename(moved_parent)
+    final_parent.symlink_to(
+        Path(os.environ["FAKE_OUTPUT_PARENT_TARGET"]),
+        target_is_directory=True,
+    )
+    update_call(output_parent_swapped=True)
+    output.write_text(os.environ["FAKE_NDJSON"], encoding="utf-8")
+elif mode == "relocate_output_parent_into_store":
+    final_parent = Path(os.environ["FAKE_FINAL_OUTPUT_PARENT"])
+    relocated_parent = Path(os.environ["FAKE_RELOCATED_OUTPUT_PARENT"])
+    final_parent.rename(relocated_parent)
+    final_parent.symlink_to(relocated_parent, target_is_directory=True)
+    update_call(output_parent_relocated=True)
+    output.write_text(os.environ["FAKE_NDJSON"], encoding="utf-8")
 elif mode == "mutate_store":
     storage = Path(sys.argv[sys.argv.index("--storage-path") + 1])
     relative = os.environ.get("FAKE_MUTATE_RELATIVE", "manifest.bin")
@@ -200,7 +217,9 @@ def fake_pond(tmp_path):
     binary.chmod(0o700)
     local_store = tmp_path / "local-store"
     local_store.mkdir()
-    record = tmp_path / "calls.json"
+    control = tmp_path / "fake-control"
+    control.mkdir()
+    record = control / "calls.json"
     return binary, local_store, record
 
 
@@ -539,6 +558,70 @@ def test_export_sanitizes_output_symlink_loop_before_temporary_work(
     assert not record.exists()
     assert output.is_symlink()
     assert str(output) not in str(raised.value)
+
+
+def test_export_fails_closed_if_external_output_parent_is_swapped_to_store(
+    fake_pond, tmp_path
+):
+    binary, local_store, record = fake_pond
+    output_parent = tmp_path / "initially-external-output"
+    output_parent.mkdir()
+    moved_parent = tmp_path / "moved-original-output"
+    output = output_parent / "private-inventory.json"
+
+    with pytest.raises(ValueError, match=r"^pond inventory output$") as raised:
+        export_pond_inventory(
+            binary,
+            output,
+            storage_path=local_store,
+            env=_environment(
+                record,
+                FAKE_SQL_MODE="swap_output_parent",
+                FAKE_FINAL_OUTPUT_PARENT=str(output_parent),
+                FAKE_MOVED_OUTPUT_PARENT=str(moved_parent),
+                FAKE_OUTPUT_PARENT_TARGET=str(local_store),
+            ),
+        )
+
+    assert output_parent.is_symlink()
+    assert output_parent.resolve() == local_store
+    assert not (local_store / output.name).exists()
+    assert not (moved_parent / output.name).exists()
+    assert not output.exists()
+    message = str(raised.value)
+    for private_path in (local_store, output_parent, moved_parent, output):
+        assert str(private_path) not in message
+
+
+def test_export_fails_closed_if_pinned_output_parent_is_relocated_into_store(
+    fake_pond, tmp_path
+):
+    binary, local_store, record = fake_pond
+    output_parent = tmp_path / "initially-external-output"
+    output_parent.mkdir()
+    relocated_parent = local_store / "relocated-output-parent"
+    output = output_parent / "private-inventory.json"
+
+    with pytest.raises(ValueError, match=r"^pond inventory output$") as raised:
+        export_pond_inventory(
+            binary,
+            output,
+            storage_path=local_store,
+            env=_environment(
+                record,
+                FAKE_SQL_MODE="relocate_output_parent_into_store",
+                FAKE_FINAL_OUTPUT_PARENT=str(output_parent),
+                FAKE_RELOCATED_OUTPUT_PARENT=str(relocated_parent),
+            ),
+        )
+
+    assert output_parent.is_symlink()
+    assert output_parent.resolve() == relocated_parent
+    assert not (relocated_parent / output.name).exists()
+    assert not output.exists()
+    message = str(raised.value)
+    for private_path in (local_store, output_parent, relocated_parent, output):
+        assert str(private_path) not in message
 
 
 def test_pond_mutations_are_confined_to_a_private_store_snapshot(fake_pond, tmp_path):
@@ -1056,7 +1139,9 @@ def test_export_invokes_binary_directly_without_a_shell(tmp_path):
     binary.chmod(0o700)
     local_store = tmp_path / "local store; still argv"
     local_store.mkdir()
-    record = tmp_path / "calls.json"
+    control = tmp_path / "fake-control"
+    control.mkdir()
+    record = control / "calls.json"
 
     export_pond_inventory(
         binary,

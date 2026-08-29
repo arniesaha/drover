@@ -7,6 +7,7 @@ import stat
 
 import pytest
 
+from drover.server.archive import inventory as inventory_module
 from drover.server.archive.inventory import (
     NativeInventory,
     NativeInventoryRecord,
@@ -140,6 +141,34 @@ def test_private_writer_refuses_existing_output_including_symlink(tmp_path, name
 
     assert str(path) not in str(raised.value)
     assert path.is_symlink() or path.read_text(encoding="utf-8") == "keep"
+
+
+def test_private_descriptor_writer_never_follows_a_replaced_parent_path(tmp_path):
+    original_parent = tmp_path / "original-parent"
+    original_parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    hostile_parent = tmp_path / "hostile-parent"
+    hostile_parent.mkdir()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(original_parent, flags)
+    try:
+        original_parent.rename(moved_parent)
+        original_parent.symlink_to(hostile_parent, target_is_directory=True)
+
+        inventory_module._write_private_json_at(
+            descriptor,
+            "inventory.json",
+            _native_inventory().to_wire(),
+        )
+    finally:
+        os.close(descriptor)
+
+    pinned_output = moved_parent / "inventory.json"
+    assert load_native_inventory(pinned_output) == _native_inventory()
+    assert stat.S_IMODE(pinned_output.stat().st_mode) == 0o600
+    assert not (hostile_parent / "inventory.json").exists()
 
 
 def test_private_writer_refuses_payload_larger_than_32_mib(tmp_path):

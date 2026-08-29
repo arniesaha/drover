@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Mapping, Sequence
@@ -21,7 +22,7 @@ from drover.server.archive.inventory import (
     MAX_INVENTORY_RECORDS,
     PondInventory,
     PondInventoryRecord,
-    write_private_json,
+    _write_private_json_at,
 )
 
 POND_VERSION = "0.16.3"
@@ -96,6 +97,15 @@ class _PondInventoryError(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _PinnedOutput:
+    directory_descriptor: int
+    requested_parent: Path
+    name: str
+    directory_identity: tuple[int, int, int, int]
+    local_store: Path
+
+
 def _failure(category: str) -> _PondInventoryError:
     return _PondInventoryError(f"pond inventory {category}")
 
@@ -111,9 +121,33 @@ def export_pond_inventory(
     """Export strict session metadata without exposing Pond rows or locations."""
     executable = _require_executable(binary)
     local_store = _require_local_storage(storage_path)
-    _require_external_output(output, local_store)
-    timeout = _require_timeout(timeout_seconds)
-    child_env = _child_environment(env)
+    pinned_output = _pin_external_output(output, local_store)
+    try:
+        timeout = _require_timeout(timeout_seconds)
+        child_env = _child_environment(env)
+        return _export_to_pinned_output(
+            executable,
+            pinned_output,
+            local_store=local_store,
+            timeout=timeout,
+            child_env=child_env,
+        )
+    finally:
+        try:
+            os.close(pinned_output.directory_descriptor)
+        except OSError:
+            pass
+
+
+def _export_to_pinned_output(
+    executable: Path,
+    pinned_output: _PinnedOutput,
+    *,
+    local_store: Path,
+    timeout: int,
+    child_env: Mapping[str, str],
+) -> PondInventory:
+    """Run the bounded export while retaining the validated output directory."""
 
     try:
         temporary = tempfile.TemporaryDirectory(prefix="drover-pond-inventory-")
@@ -205,7 +239,12 @@ def export_pond_inventory(
                 sorted(records, key=lambda row: (row.source_agent, row.session_id))
             ),
         )
-        write_private_json(output, inventory.to_wire())
+        _validate_pinned_output_parent(pinned_output)
+        _write_private_json_at(
+            pinned_output.directory_descriptor,
+            pinned_output.name,
+            inventory.to_wire(),
+        )
         return inventory
 
 
@@ -265,9 +304,13 @@ def _require_local_storage(storage_path: Path) -> Path:
         raise _failure("storage") from None
 
 
-def _require_external_output(output: Path, local_store: Path) -> None:
+def _pin_external_output(output: Path, local_store: Path) -> _PinnedOutput:
+    descriptor: int | None = None
     try:
         candidate = Path(output)
+        name = candidate.name
+        if not name or name in {".", ".."} or os.path.basename(name) != name:
+            raise _failure("output")
         try:
             output_metadata = candidate.lstat()
         except FileNotFoundError:
@@ -275,16 +318,78 @@ def _require_external_output(output: Path, local_store: Path) -> None:
         else:
             if stat.S_ISLNK(output_metadata.st_mode):
                 raise _failure("output")
-        resolved = candidate.resolve(strict=False)
+        requested_parent = Path(os.path.abspath(os.fspath(candidate.parent)))
+        resolved_parent = requested_parent.resolve(strict=True)
+        resolved = resolved_parent / name
         try:
             resolved.relative_to(local_store)
         except ValueError:
-            return
-        raise _failure("output")
+            pass
+        else:
+            raise _failure("output")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(resolved_parent, flags)
+        opened = os.fstat(descriptor)
+        requested = requested_parent.stat()
+        opened_identity = _directory_identity(opened)
+        if opened_identity is None or _directory_identity(requested) != opened_identity:
+            raise _failure("output")
+        pinned = _PinnedOutput(
+            directory_descriptor=descriptor,
+            requested_parent=requested_parent,
+            name=name,
+            directory_identity=opened_identity,
+            local_store=local_store,
+        )
+        descriptor = None
+        return pinned
     except _PondInventoryError:
         raise
     except (OSError, RuntimeError, TypeError, ValueError):
         raise _failure("output") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int] | None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        return None
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_pinned_output_parent(pinned: _PinnedOutput) -> None:
+    try:
+        resolved_parent = pinned.requested_parent.resolve(strict=True)
+        try:
+            resolved_parent.relative_to(pinned.local_store)
+        except ValueError:
+            pass
+        else:
+            raise _failure("output")
+        opened = os.fstat(pinned.directory_descriptor)
+        requested = pinned.requested_parent.stat()
+    except _PondInventoryError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise _failure("output") from None
+    if (
+        _directory_identity(opened) != pinned.directory_identity
+        or _directory_identity(requested) != pinned.directory_identity
+    ):
+        raise _failure("output")
 
 
 def _snapshot_store(source: Path, target: Path) -> None:

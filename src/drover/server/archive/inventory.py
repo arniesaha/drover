@@ -309,8 +309,7 @@ def _pond_inventory_from_wire(payload: Any) -> PondInventory:
     )
 
 
-def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
-    """Write a new JSON file that only its owner can read or modify."""
+def _encode_private_json(payload: Any) -> bytes:
     try:
         encoded = (
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -320,22 +319,70 @@ def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
         raise _error("output", "payload") from None
     if len(encoded) > MAX_INVENTORY_BYTES:
         raise _error("output", "size")
+    return encoded
+
+
+def _private_output_flags() -> int:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _write_private_json_descriptor(descriptor: int, encoded: bytes) -> None:
     try:
-        target = os.fspath(path)
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags, 0o600)
-    except (OSError, TypeError):
-        raise _error("output", "file") from None
+        output = os.fdopen(descriptor, "wb")
+    except (OSError, ValueError):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise _error("output", "write") from None
     try:
-        with os.fdopen(descriptor, "wb") as output:
+        with output:
             os.fchmod(output.fileno(), 0o600)
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
     except OSError:
         raise _error("output", "write") from None
+
+
+def _write_private_json_at(
+    directory_descriptor: int,
+    name: str,
+    payload: Any,
+) -> None:
+    """Write one private manifest relative to an already-pinned directory."""
+    encoded = _encode_private_json(payload)
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or os.path.basename(name) != name
+    ):
+        raise _error("output", "file")
+    try:
+        descriptor = os.open(
+            name,
+            _private_output_flags(),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except (OSError, TypeError, ValueError):
+        raise _error("output", "file") from None
+    _write_private_json_descriptor(descriptor, encoded)
+
+
+def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
+    """Write a new JSON file that only its owner can read or modify."""
+    encoded = _encode_private_json(payload)
+    try:
+        target = os.fspath(path)
+        descriptor = os.open(target, _private_output_flags(), 0o600)
+    except (OSError, TypeError):
+        raise _error("output", "file") from None
+    _write_private_json_descriptor(descriptor, encoded)
 
 
 def read_private_json(

@@ -46,6 +46,13 @@ sql = sys.argv[sys.argv.index("sql") + 1]
 if "worst_case_ndjson_bytes" in sql:
     row = {"row_count": 1, "worst_case_ndjson_bytes": 512}
 else:
+    if os.environ.get("SWAP_FINAL_OUTPUT_PARENT"):
+        final_parent = Path(os.environ["SWAP_FINAL_OUTPUT_PARENT"])
+        final_parent.rename(Path(os.environ["SWAP_MOVED_OUTPUT_PARENT"]))
+        final_parent.symlink_to(
+            Path(os.environ["SWAP_OUTPUT_PARENT_TARGET"]),
+            target_is_directory=True,
+        )
     row = {
         "session_id": "native-private",
         "source_agent": "claude-code",
@@ -390,10 +397,12 @@ def test_pond_inventory_cli_executes_the_validated_relative_binary(
 ):
     local_binary = tmp_path / "pond"
     _write_minimal_pond(local_binary)
-    local_marker = tmp_path / "local-pond-ran"
+    control = tmp_path / "fake-control"
+    control.mkdir()
+    local_marker = control / "local-pond-ran"
     path_bin = tmp_path / "hostile-path"
     path_bin.mkdir()
-    namesake_marker = tmp_path / "path-namesake-ran"
+    namesake_marker = control / "path-namesake-ran"
     namesake = path_bin / "pond"
     namesake.write_text(
         '#!/bin/sh\nprintf namesake > "$PATH_NAMESAKE_MARKER"\n'
@@ -495,6 +504,57 @@ def test_pond_inventory_cli_refuses_output_in_original_store_before_pond(
         before_sentinel.st_ctime_ns,
     )
     _assert_private_values_absent(result, caplog, binary, storage, output, marker)
+
+
+def test_pond_inventory_cli_fails_closed_if_output_parent_is_swapped_to_store(
+    monkeypatch, tmp_path, caplog
+):
+    binary = tmp_path / "private-pond"
+    _write_minimal_pond(binary)
+    marker = tmp_path / "private-pond-ran"
+    storage = tmp_path / "private-store"
+    storage.mkdir()
+    output_parent = tmp_path / "initially-external-output"
+    output_parent.mkdir()
+    moved_parent = tmp_path / "moved-original-output"
+    output = output_parent / "private-inventory.json"
+    monkeypatch.setenv("LOCAL_POND_MARKER", str(marker))
+    monkeypatch.setenv("SWAP_FINAL_OUTPUT_PARENT", str(output_parent))
+    monkeypatch.setenv("SWAP_MOVED_OUTPUT_PARENT", str(moved_parent))
+    monkeypatch.setenv("SWAP_OUTPUT_PARENT_TARGET", str(storage))
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "archive",
+            "pond-inventory",
+            "--storage-path",
+            str(storage),
+            "--output",
+            str(output),
+            "--pond-binary",
+            str(binary),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert result.output == "Error: archive pond inventory failed\n"
+    assert marker.exists()
+    assert output_parent.is_symlink()
+    assert output_parent.resolve() == storage
+    assert not (storage / output.name).exists()
+    assert not (moved_parent / output.name).exists()
+    assert not output.exists()
+    _assert_private_values_absent(
+        result,
+        caplog,
+        binary,
+        marker,
+        storage,
+        output_parent,
+        moved_parent,
+        output,
+    )
 
 
 def test_pond_inventory_refuses_absent_binary_without_creating_output(
