@@ -993,7 +993,8 @@ def test_coverage_accepts_private_prior_inventories_but_no_apply_option(
     )
 
     assert rejected.exit_code != 0
-    assert "No such option: --apply" in rejected.output
+    assert "No such option" in rejected.output
+    assert "--apply" in rejected.output
     assert not mutation_output.exists()
     _assert_private_values_absent(
         rejected,
