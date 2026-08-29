@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from drover.server.archive.inventory import NativeInventoryRecord
+from drover.server.archive.inventory import NativeInventory, NativeInventoryRecord
 from drover.server.archive.native_inventory import (
     discover_native_history_inventory,
     native_inventory_summary,
@@ -100,7 +100,7 @@ def test_native_inventory_groups_duplicate_source_sessions_and_uses_latest_mtime
         NativeInventoryRecord(
             source_agent="claude-code",
             session_id="claude-duplicate",
-            updated_at="2026-08-29T10:42:03Z",
+            updated_at="2026-08-29T10:42:03.000000000Z",
             size_bytes=first.stat().st_size + second.stat().st_size,
             source_copies=2,
         ),
@@ -112,6 +112,23 @@ def test_native_inventory_groups_duplicate_source_sessions_and_uses_latest_mtime
         "duplicate_source_groups": 1,
         "by_harness": {"claude-code": 1},
     }
+
+
+def test_native_inventory_uses_later_fractional_mtime_within_the_same_second(
+    tmp_path,
+):
+    first = _write_claude_session(
+        tmp_path, session_id="claude-fractional", project="one", body="first\n"
+    )
+    second = _write_claude_session(
+        tmp_path, session_id="claude-fractional", project="two", body="second\n"
+    )
+    os.utime(first, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    os.utime(second, ns=(1_700_000_000_500_000_000, 1_700_000_000_500_000_000))
+
+    inventory = discover_native_history_inventory(tmp_path, "host-test")
+
+    assert inventory.records[0].updated_at == "2023-11-14T22:13:20.500000000Z"
 
 
 def test_native_inventory_excludes_unsupported_harness_files_and_sorts_records(
@@ -154,6 +171,71 @@ def test_native_inventory_fails_when_a_source_disappears_between_read_and_stat(
         discover_native_history_inventory(tmp_path, "host-test")
 
     assert str(tmp_path) not in str(raised.value)
+
+
+def test_native_inventory_refuses_a_source_replaced_after_metadata_read(
+    monkeypatch, tmp_path
+):
+    session = _write_claude_session(
+        tmp_path, session_id="claude-original", body='{"sessionId":"claude-original"}\n'
+    )
+    original = harness_daemon._jsonl_metadata
+
+    def replace_after_read(path, **kwargs):
+        metadata = original(path, **kwargs)
+        replacement = path.with_suffix(".replacement")
+        replacement.write_text('{"sessionId":"claude-replaced"}\n', encoding="utf-8")
+        os.replace(replacement, path)
+        return metadata
+
+    monkeypatch.setattr(harness_daemon, "_jsonl_metadata", replace_after_read)
+
+    with pytest.raises(ValueError, match="native history discovery") as raised:
+        discover_native_history_inventory(tmp_path, "host-test")
+
+    assert str(session) not in str(raised.value)
+
+
+def test_native_inventory_fails_closed_when_a_source_cannot_be_read(
+    monkeypatch, tmp_path
+):
+    session = _write_claude_session(tmp_path, session_id="claude-unreadable")
+    original_open = type(session).open
+
+    def deny_session_read(path, *args, **kwargs):
+        if path == session:
+            raise PermissionError("denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(session), "open", deny_session_read)
+
+    with pytest.raises(ValueError, match="native history discovery") as raised:
+        discover_native_history_inventory(tmp_path, "host-test")
+
+    assert str(session) not in str(raised.value)
+
+
+def test_native_inventory_summary_refuses_unsupported_source_agent():
+    unsafe_source_agent = "private-untrusted-agent"
+    inventory = NativeInventory(
+        schema_version=1,
+        captured_at="2026-08-28T12:00:00Z",
+        host_id="host-test",
+        records=(
+            NativeInventoryRecord(
+                source_agent=unsafe_source_agent,
+                session_id="session-test",
+                updated_at="2026-08-28T11:00:00Z",
+                size_bytes=1,
+                source_copies=1,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="source_agent") as raised:
+        native_inventory_summary(inventory)
+
+    assert unsafe_source_agent not in str(raised.value)
 
 
 def test_native_inventory_refuses_more_than_one_hundred_thousand_records(tmp_path):

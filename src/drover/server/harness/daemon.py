@@ -596,7 +596,7 @@ class _NativeSessionSource:
     harness: str
     session_id: str
     size_bytes: int
-    updated_at_ts: float
+    updated_at_ns: int
     candidate: dict[str, Any]
 
 
@@ -620,7 +620,7 @@ def discover_native_history_metadata(
                     "harness": source.harness,
                     "session_id": source.session_id,
                     "size_bytes": source.size_bytes,
-                    "updated_at": _utc_timestamp(source.updated_at_ts),
+                    "updated_at": _utc_timestamp(source.updated_at_ns),
                 }
             )
     except OSError:
@@ -670,21 +670,35 @@ def _native_session_source(
     fail_on_error: bool,
 ) -> _NativeSessionSource | None:
     if fail_on_error:
-        initial_metadata = path.stat()
-        if not stat.S_ISREG(initial_metadata.st_mode):
-            return None
+        with path.open(errors="replace") as stream:
+            initial_metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(initial_metadata.st_mode):
+                return None
+            metadata = _jsonl_metadata(
+                path,
+                fail_on_error=True,
+                stream=stream,
+            )
+            source_metadata = os.fstat(stream.fileno())
+        path_metadata = path.stat()
+        if not _same_source_snapshot(
+            initial_metadata, source_metadata
+        ) or not _same_source_snapshot(source_metadata, path_metadata):
+            raise OSError("native source changed during discovery")
     elif not path.is_file():
         return None
-    metadata = _jsonl_metadata(path, fail_on_error=fail_on_error)
+    else:
+        metadata = _jsonl_metadata(path)
     native_session_id = session_id(metadata)
     if not native_session_id:
         return None
-    source_metadata = path.stat()
+    if not fail_on_error:
+        source_metadata = path.stat()
     return _NativeSessionSource(
         harness=harness,
         session_id=native_session_id,
         size_bytes=source_metadata.st_size,
-        updated_at_ts=source_metadata.st_mtime,
+        updated_at_ns=source_metadata.st_mtime_ns,
         candidate=_candidate(
             harness=harness,
             session_id=native_session_id,
@@ -696,11 +710,25 @@ def _native_session_source(
     )
 
 
-def _utc_timestamp(timestamp: float) -> str:
+def _same_source_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
     return (
-        datetime.fromtimestamp(timestamp, timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
+        left.st_dev,
+        left.st_ino,
+        left.st_size,
+        left.st_mtime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_size,
+        right.st_mtime_ns,
+    )
+
+
+def _utc_timestamp(timestamp_ns: int) -> str:
+    seconds, nanoseconds = divmod(timestamp_ns, 1_000_000_000)
+    return (
+        datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        + f".{nanoseconds:09d}Z"
     )
 
 
@@ -1077,23 +1105,34 @@ def _clip_transcript_text(value: Any, *, max_chars: int = 12000) -> str:
 
 
 def _jsonl_metadata(
-    path: Path, *, max_lines: int = 250, fail_on_error: bool = False
+    path: Path,
+    *,
+    max_lines: int = 250,
+    fail_on_error: bool = False,
+    stream: Any | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     try:
-        with path.open(errors="replace") as stream:
-            for index, line in enumerate(stream):
-                if index >= max_lines:
-                    break
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                _collect_metadata(item, metadata)
-                if metadata.get("sessionId") and metadata.get("cwd"):
-                    break
+        if stream is None:
+            with path.open(errors="replace") as opened:
+                return _jsonl_metadata(
+                    path,
+                    max_lines=max_lines,
+                    fail_on_error=fail_on_error,
+                    stream=opened,
+                )
+        for index, line in enumerate(stream):
+            if index >= max_lines:
+                break
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            _collect_metadata(item, metadata)
+            if metadata.get("sessionId") and metadata.get("cwd"):
+                break
     except OSError:
         if fail_on_error:
             raise

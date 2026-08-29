@@ -9,6 +9,7 @@ from drover.server.archive.inventory import NativeInventory, NativeInventoryReco
 from drover.server.harness.daemon import discover_native_history_metadata
 
 MAX_NATIVE_INVENTORY_RECORDS = 100_000
+_SUMMARY_SOURCE_AGENTS = frozenset({"claude-code", "codex-cli"})
 
 
 def discover_native_history_inventory(
@@ -59,6 +60,8 @@ def native_inventory_summary(inventory: NativeInventory) -> dict[str, object]:
     """Return aggregate-only inventory counts suitable for operator output."""
     by_harness: dict[str, int] = {}
     for record in inventory.records:
+        if record.source_agent not in _SUMMARY_SOURCE_AGENTS:
+            raise ValueError("native inventory invalid source_agent")
         by_harness[record.source_agent] = by_harness.get(record.source_agent, 0) + 1
     return {
         "schema_version": 1,
