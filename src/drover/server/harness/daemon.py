@@ -17,6 +17,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -30,6 +31,7 @@ from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
 from drover.config import (
+    ACTIVATION_IN_PLACE,
     ACTIVATION_SYMLINK,
     config_home,
     default_token_file,
@@ -66,6 +68,7 @@ from drover.server.harness.updater import (
     REGISTRATION_DEADLINE_SECONDS,
     HostUpdater,
     default_restarter,
+    default_sibling_restarter,
     resolve_activation,
     verify_after_restart,
     warn_if_in_place_venv_is_unusable,
@@ -3535,6 +3538,8 @@ def _rollback_watchdog(
     restarter=default_restarter,
     activation: str = ACTIVATION_SYMLINK,
     in_place_venv: str = "",
+    restart_units: Sequence[str] = (),
+    sibling_restarter=default_sibling_restarter,
 ) -> None:
     """Undo a flip whose new version cannot reach the hub.
 
@@ -3554,6 +3559,17 @@ def _rollback_watchdog(
     # The symlink now points back at the previous version, but this process is
     # still the new one. The service manager owns the restart; asking it to
     # bounce us is what actually puts the old version back in memory.
+    #
+    # In in_place mode the rollback rewrote the shared venv too, so the same
+    # reasoning as activation applies: a sibling restarted onto the version we
+    # are undoing is still running it, and its lazy imports now come from the
+    # rolled-back files. Siblings first, because our own restart ends this
+    # process.
+    if activation == ACTIVATION_IN_PLACE and restart_units:
+        try:
+            sibling_restarter(restart_units)
+        except Exception:
+            log.exception("could not restart services sharing the venv")
     restarter()
 
 
@@ -3563,11 +3579,16 @@ def _start_rollback_watchdog(
     *,
     activation: str = ACTIVATION_SYMLINK,
     in_place_venv: str = "",
+    restart_units: Sequence[str] = (),
 ) -> threading.Thread:
     thread = threading.Thread(
         target=_rollback_watchdog,
         args=(state, layout),
-        kwargs={"activation": activation, "in_place_venv": in_place_venv},
+        kwargs={
+            "activation": activation,
+            "in_place_venv": in_place_venv,
+            "restart_units": tuple(restart_units),
+        },
         name="drover-harnessd-watchdog",
         daemon=True,
     )
@@ -3735,7 +3756,11 @@ def run_harnessd(
         activation, in_place_venv = resolve_activation(cfg)
         warn_if_in_place_venv_is_unusable(activation, in_place_venv)
         _start_rollback_watchdog(
-            state, layout, activation=activation, in_place_venv=in_place_venv
+            state,
+            layout,
+            activation=activation,
+            in_place_venv=in_place_venv,
+            restart_units=cfg.update_restart_units,
         )
     server = create_harness_server(
         listen_host=listen_host,

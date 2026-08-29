@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,6 +120,55 @@ def default_restarter() -> None:
         subprocess.run(["systemctl", "--user", "restart", unit], check=False)
 
 
+def default_sibling_restarter(units: Sequence[str]) -> None:
+    """Restart other services that exec the venv we just installed into.
+
+    Only in-place activation needs this. A symlink flip does not touch a
+    running venv, so a sibling keeps executing its own files until it restarts
+    for its own reasons, and restarting it would be a gratuitous interruption.
+    Installing in place rewrites the files underneath it while it runs, which
+    is a different thing entirely: on the mac-mini hub `com.drover.server` and
+    `com.drover.harnessd` share `~/.drover-venv`, so activating leaves the
+    server executing the version it imported at startup while anything it
+    imports lazily afterwards comes from the new one. That mismatch does not
+    crash, which is exactly what makes it worth restarting for rather than
+    hoping somebody remembers.
+
+    Best effort, and deliberately not fatal. A sibling that fails to restart
+    is reported and the activation continues: we have already rewritten the
+    venv, so stopping here would leave *this* process mixed as well rather
+    than fixing anything.
+    """
+    own = _launchd_label() if sys.platform == "darwin" else _systemd_unit()
+    for unit in units:
+        if unit == own:
+            # Restarting ourselves here would end the process partway through
+            # the list, so every unit after this one would silently never
+            # restart. We restart last anyway; dropping it changes nothing but
+            # the truncation.
+            log.debug("skipping %s in update.restart_units: that is this service", unit)
+            continue
+        if sys.platform == "darwin":
+            target = f"gui/{os.getuid()}/{unit}"
+            log.info("asking launchd to restart sibling %s", target)
+            argv = ["launchctl", "kickstart", "-k", target]
+        else:
+            log.info("asking systemd to restart sibling %s", unit)
+            argv = ["systemctl", "--user", "restart", unit]
+        try:
+            result = subprocess.run(argv, check=False, capture_output=True, text=True)
+        except OSError as exc:
+            log.error("could not restart sibling %s: %s", unit, exc)
+            continue
+        if result.returncode != 0:
+            log.error(
+                "restarting sibling %s failed (%s): %s",
+                unit,
+                result.returncode,
+                (result.stderr or "").strip(),
+            )
+
+
 def resolve_activation(cfg) -> tuple[str, str]:
     """The activation mode this host will actually use, and its venv.
 
@@ -208,6 +258,7 @@ class HostUpdater:
         installer=install_version,
         restarter=default_restarter,
         in_place_installer=install_cached_into_venv,
+        sibling_restarter=default_sibling_restarter,
     ) -> None:
         self._state = state
         self._layout = layout
@@ -215,6 +266,8 @@ class HostUpdater:
         self._installer = installer
         self._restarter = restarter
         self._in_place_installer = in_place_installer
+        self._sibling_restarter = sibling_restarter
+        self._restart_units = tuple(getattr(cfg, "update_restart_units", ()) or ())
         self._activation, self._in_place_venv = resolve_activation(cfg)
         self._lock = threading.Lock()
         self._pending: str | None = None
@@ -374,6 +427,18 @@ class HostUpdater:
             if self._pending == target:
                 self._clear_locked()
         log.info("activated %s (was %s); restarting", target, previous or "unknown")
+        # Siblings first: restarting ourselves ends this process, so anything
+        # sequenced after it would never run. Only in-place activation needs
+        # them -- see `default_sibling_restarter`.
+        if self._activation == ACTIVATION_IN_PLACE and self._restart_units:
+            try:
+                self._sibling_restarter(self._restart_units)
+            except Exception:
+                # Never strand ourselves on a sibling's failure. The venv is
+                # already rewritten, so skipping our own restart would leave
+                # this process mixed as well instead of fixing anything -- and
+                # a raise here would propagate into the activation caller.
+                log.exception("could not restart services sharing the venv")
         self._restarter()
         return True
 
