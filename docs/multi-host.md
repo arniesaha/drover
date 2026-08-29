@@ -258,3 +258,25 @@ test it there, and still wait for quiesce. The `current` symlink is still
 flipped, but on these hosts it is a record of what is active rather than the
 path the services run from. Rollback reinstalls the previous version's cached
 wheel, which is why `keep_versions` must stay at 2 or more.
+
+If more than one service execs that venv, name the others so they are
+restarted too:
+
+```toml
+[update]
+activation = "in_place"
+in_place_venv = "~/.drover-venv"
+restart_units = ["com.drover.server"]
+```
+
+Installing in place rewrites the venv underneath every process running from
+it, while the daemon restarts only itself. A service left out of this list
+keeps executing the version it imported at startup, and picks up the new one
+for anything it imports lazily afterwards. That mismatch does not crash, which
+is what makes it easy to miss.
+
+Use the service manager's own names: launchd labels on macOS, systemd units on
+Linux. They are restarted before the daemon restarts itself, because that
+restart ends the process. The list is empty by default and only applies to
+`in_place`. A symlink flip does not touch a running venv, so on those hosts a
+sibling keeps running its own files until it restarts for its own reasons.
