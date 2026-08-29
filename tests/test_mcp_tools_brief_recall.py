@@ -392,17 +392,13 @@ def test_open_loops_scopes_project_key_to_exact_repository(tmp_path: Path) -> No
         con.close()
 
     unscoped = drover_open_loops(duckdb_path=duckdb_path)
-    scoped = drover_open_loops(
-        duckdb_path=duckdb_path, project_key="arniesaha/drover"
-    )
+    scoped = drover_open_loops(duckdb_path=duckdb_path, project_key="arniesaha/drover")
 
     assert [row["context_id"] for row in unscoped["open_loops"]] == [
         "ctx-drover-loop",
         "ctx-other-loop",
     ]
-    assert [row["context_id"] for row in scoped["open_loops"]] == [
-        "ctx-drover-loop"
-    ]
+    assert [row["context_id"] for row in scoped["open_loops"]] == ["ctx-drover-loop"]
 
 
 def test_recall_orders_by_cosine_similarity(tmp_path: Path) -> None:
