@@ -6,7 +6,7 @@ import gc
 import json
 import threading
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -220,10 +220,11 @@ def test_validation_rejects_blank_or_non_string_queries(
         service.recall_bundle(query=query)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("since", ["", "yesterday", "2026-99-99", True, 42])
-def test_validation_rejects_invalid_iso_8601_since(
-    tmp_path: Path, since: object
-) -> None:
+@pytest.mark.parametrize(
+    "since",
+    ["", "yesterday", "2026-99-99", "2026-08-01T00:00:00Z", True, 42],
+)
+def test_validation_rejects_invalid_date_since(tmp_path: Path, since: object) -> None:
     _, duckdb_path = _seed(tmp_path)
     service = _service(duckdb_path, _empty_archive())
 
@@ -262,14 +263,14 @@ def test_validation_normalizes_query_and_reports_requested_and_effective_limits(
     archive = _empty_archive(
         expected_query="retry state machine",
         expected_project=None,
-        expected_since="2026-08-01T00:00:00Z",
+        expected_since="2026-08-01",
         expected_limit=3,
     )
     service = _service(duckdb_path, archive, search_limit=3, max_context_chars=1_500)
 
     bundle = service.recall_bundle(
         query="  retry\n state\t machine  ",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         limit=20,
         max_context_chars=100_000,
     )
@@ -277,7 +278,7 @@ def test_validation_normalizes_query_and_reports_requested_and_effective_limits(
     assert bundle["query"] == {
         "text": "retry state machine",
         "repo": None,
-        "since": "2026-08-01T00:00:00Z",
+        "since": "2026-08-01",
     }
     assert bundle["limits"] == {
         "requested_limit": 20,
@@ -456,7 +457,7 @@ def _composition_archive() -> StrictArchive:
         },
         expected_query="retry state machine",
         expected_project="arniesaha/drover",
-        expected_since="2026-08-01T00:00:00Z",
+        expected_since="2026-08-01",
         expected_limit=3,
     )
 
@@ -499,7 +500,7 @@ def test_composition_preserves_rank_exact_joins_and_self_contained_citations(
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         limit=3,
     )
 
@@ -582,6 +583,138 @@ def test_composition_preserves_rank_exact_joins_and_self_contained_citations(
     assert bundle["limits"]["used_chars"] == expected_used
     assert bundle["limits"]["used_chars"] <= 20_000
     json.dumps(bundle)
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "target_message_id",
+        "target_session_id",
+        "session_session_id",
+        "target_project",
+        "session_project",
+        "target_source_agent",
+        "session_source_agent",
+        "target_role",
+        "target_timestamp",
+    ],
+)
+def test_hydration_identity_mismatch_is_a_per_hit_protocol_error(
+    tmp_path: Path, mismatch: str
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    hit = _hit(
+        rank=1,
+        message_id="ranked-message",
+        session_id="ranked-session",
+        timestamp="2026-08-27T15:00:00Z",
+        text="Ranked target text.",
+    )
+    neighborhood = _neighborhood(hit, sibling_text="Sibling context.")
+    if mismatch.startswith("target_"):
+        field_name = mismatch.removeprefix("target_")
+        neighborhood = replace(
+            neighborhood,
+            target=replace(neighborhood.target, **{field_name: f"wrong-{field_name}"}),
+        )
+    else:
+        field_name = mismatch.removeprefix("session_")
+        neighborhood = replace(
+            neighborhood,
+            session=replace(
+                neighborhood.session, **{field_name: f"wrong-{field_name}"}
+            ),
+        )
+    archive = StrictArchive(
+        result=ArchiveSearchResult(
+            hits=(hit,), matched_total=1, searchable_in_scope=10, has_more=False
+        ),
+        neighborhoods={hit.message_id: neighborhood},
+        expected_query="retry",
+        expected_limit=3,
+    )
+
+    bundle = _service(duckdb_path, archive).recall_bundle(query="retry")
+
+    assert bundle["archive"]["status"] == "partial"
+    assert bundle["archive"]["warnings"] == [
+        {"message_id": "ranked-message", "category": "protocol_error"}
+    ]
+    assert bundle["archive_evidence"] == []
+
+
+def test_hydration_timestamp_offset_for_same_instant_is_coherent(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    hit = _hit(
+        rank=1,
+        message_id="ranked-message",
+        session_id="ranked-session",
+        timestamp="2026-08-27T15:00:00Z",
+        text="Ranked target text.",
+    )
+    neighborhood = _neighborhood(hit, sibling_text="Sibling context.")
+    neighborhood = replace(
+        neighborhood,
+        target=replace(neighborhood.target, timestamp="2026-08-27T08:00:00-07:00"),
+    )
+    archive = StrictArchive(
+        result=ArchiveSearchResult(
+            hits=(hit,), matched_total=1, searchable_in_scope=10, has_more=False
+        ),
+        neighborhoods={hit.message_id: neighborhood},
+        expected_query="retry",
+        expected_limit=3,
+    )
+
+    bundle = _service(duckdb_path, archive).recall_bundle(query="retry")
+
+    assert bundle["archive"]["status"] == "available"
+    assert [item["rank"] for item in bundle["archive_evidence"]] == [1]
+
+
+def test_result_set_freshness_includes_newer_unselected_returned_hit(
+    tmp_path: Path,
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    selected_hit = _hit(
+        rank=1,
+        message_id="selected-message",
+        session_id="selected-session",
+        timestamp="2026-08-27T15:00:00Z",
+        text="Selected target text.",
+    )
+    unselected_hit = _hit(
+        rank=2,
+        message_id="unselected-message",
+        session_id="unselected-session",
+        timestamp="2026-08-28T09:30:00-07:00",
+        text="Newer target outside the cap.",
+    )
+    archive = StrictArchive(
+        result=ArchiveSearchResult(
+            hits=(selected_hit, unselected_hit),
+            matched_total=2,
+            searchable_in_scope=10,
+            has_more=False,
+        ),
+        neighborhoods={
+            selected_hit.message_id: _neighborhood(
+                selected_hit, sibling_text="Selected sibling."
+            )
+        },
+        expected_query="retry",
+        expected_limit=1,
+    )
+
+    bundle = _service(duckdb_path, archive, search_limit=1).recall_bundle(query="retry")
+
+    assert [item["rank"] for item in bundle["archive_evidence"]] == [1]
+    assert [request.message_id for request in archive.message_requests] == [
+        "selected-message"
+    ]
+    assert bundle["archive"]["result_set_freshness"] == "2026-08-28T09:30:00-07:00"
 
 
 def test_composition_passes_non_exact_repo_only_to_archive_and_keyword_search(
@@ -763,7 +896,7 @@ def test_budget_drops_optional_evidence_in_the_required_order(
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         max_context_chars=1_000,
     )
 
@@ -802,7 +935,7 @@ def test_budget_truncates_only_final_highest_priority_text_on_unicode_boundary(
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         max_context_chars=1_000,
     )
 
@@ -946,7 +1079,7 @@ def test_disabled_archive_skips_slot_and_client_but_returns_bounded_drover_conte
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         max_context_chars=1_000,
     )
 
@@ -996,7 +1129,7 @@ def test_enabled_archive_without_client_degrades_to_unavailable_drover_context(
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         max_context_chars=1_000,
     )
 
@@ -1021,7 +1154,7 @@ def test_unavailable_search_failures_are_sanitized_and_keep_drover_context(
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         max_context_chars=1_000,
     )
 
@@ -1057,7 +1190,7 @@ def test_unavailable_unexpected_search_exception_maps_to_sanitized_protocol_erro
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
         max_context_chars=1_000,
     )
 
@@ -1085,7 +1218,7 @@ def test_partial_hydration_failure_keeps_successful_neighborhoods_and_sanitizes_
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
     )
 
     assert [item["rank"] for item in bundle["archive_evidence"]] == [1, 4]
@@ -1120,7 +1253,7 @@ def test_partial_unexpected_hydration_exception_maps_to_sanitized_protocol_error
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
     )
 
     assert [item["rank"] for item in bundle["archive_evidence"]] == [1, 4]
@@ -1148,7 +1281,7 @@ def test_partial_all_hydrations_fail_but_search_aggregates_and_warnings_remain(
     bundle = service.recall_bundle(
         query="retry state machine",
         repo="arniesaha/drover",
-        since="2026-08-01T00:00:00Z",
+        since="2026-08-01",
     )
 
     assert bundle["archive_evidence"] == []
@@ -1224,7 +1357,7 @@ def test_sequential_hydration_never_opens_a_second_raw_body(
                 service.recall_bundle(
                     query="retry state machine",
                     repo="arniesaha/drover",
-                    since="2026-08-01T00:00:00Z",
+                    since="2026-08-01",
                 )
             )
         except BaseException as exc:  # pragma: no cover - asserted in parent thread

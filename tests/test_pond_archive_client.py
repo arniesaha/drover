@@ -187,6 +187,13 @@ def _search_response() -> dict[str, object]:
                 "matched_message_count": 2,
                 "matches": [
                     {
+                        "message_id": "message-12",
+                        "role": "assistant",
+                        "timestamp": "2026-08-28T12:02:00Z",
+                        "text": "transitioned to retrying",
+                        "score": 0.81,
+                    },
+                    {
                         "message_id": "message-11",
                         "role": "user",
                         "timestamp": "2026-08-28T12:01:00Z",
@@ -198,13 +205,6 @@ def _search_response() -> dict[str, object]:
                                 "label": "retry-plan.md",
                             },
                         ],
-                    },
-                    {
-                        "message_id": "message-12",
-                        "role": "assistant",
-                        "timestamp": "2026-08-28T12:02:00Z",
-                        "text": "transitioned to retrying",
-                        "score": 0.81,
                     },
                 ],
             },
@@ -220,7 +220,7 @@ def _search_response() -> dict[str, object]:
                         "role": "system",
                         "timestamp": "2026-08-27T09:30:00Z",
                         "text": "state-machine policy",
-                        "score": 0.67,
+                        "score": 0.98,
                     }
                 ],
             },
@@ -282,7 +282,7 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
         ArchiveSearchRequest(
             query="retry state machine",
             project="arniesaha/drover",
-            since="2026-08-01T00:00:00Z",
+            since="2026-08-01",
             limit=3,
         )
     )
@@ -298,7 +298,7 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
                 "sort_by": "relevance",
                 "filters": {
                     "project": {"contains": "arniesaha/drover"},
-                    "from_date": "2026-08-01T00:00:00Z",
+                    "from_date": "2026-08-01",
                 },
                 "limit": 3,
             },
@@ -320,6 +320,18 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
             ),
             ArchiveSearchHit(
                 rank=2,
+                message_id="message-21",
+                session_id="session-2",
+                project="arniesaha/drover",
+                source_agent="claude",
+                role="system",
+                timestamp="2026-08-27T09:30:00Z",
+                text="state-machine policy",
+                score=0.98,
+                parts_summary=(),
+            ),
+            ArchiveSearchHit(
+                rank=3,
                 message_id="message-12",
                 session_id="session-1",
                 project="arniesaha/drover",
@@ -330,23 +342,26 @@ def test_search_posts_exact_contract_and_flattens_grouped_sessions_in_order(
                 score=0.81,
                 parts_summary=(),
             ),
-            ArchiveSearchHit(
-                rank=3,
-                message_id="message-21",
-                session_id="session-2",
-                project="arniesaha/drover",
-                source_agent="claude",
-                role="system",
-                timestamp="2026-08-27T09:30:00Z",
-                text="state-machine policy",
-                score=0.67,
-                parts_summary=(),
-            ),
         ),
         matched_total=3,
         searchable_in_scope=25,
         has_more=True,
     )
+
+
+def test_search_rejects_timestamp_shaped_from_date_before_http(pond_server):
+    _enqueue_json(pond_server, _search_response())
+    client = PondArchiveClient(_config(pond_server))
+
+    with pytest.raises(ValueError, match="since.*YYYY-MM-DD"):
+        client.search(
+            ArchiveSearchRequest(
+                query="retry state machine",
+                since="2026-08-01T00:00:00Z",
+            )
+        )
+
+    assert pond_server.requests == []
 
 
 def test_get_message_posts_exact_contract_and_normalizes_without_raw_parts(
@@ -803,6 +818,33 @@ def test_v0163_get_message_target_body_is_only_in_target_parts(pond_server):
     )
 
 
+def test_get_message_rejects_mismatched_target_id_with_sanitized_diagnostic(
+    pond_server, caplog
+):
+    body = _message_response()
+    body["target"]["id"] = "MISMATCHED-TARGET-SECRET"
+    raw = _enqueue_json(pond_server, body)
+
+    with caplog.at_level(logging.INFO, logger="drover.server.archive.pond"):
+        with pytest.raises(ArchiveProtocolError) as caught:
+            PondArchiveClient(_config(pond_server)).get_message(
+                ArchiveMessageRequest("message-11")
+            )
+
+    assert caught.value.status_code == 200
+    assert caught.value.byte_count == len(raw)
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "drover.server.archive.pond"
+    ]
+    assert len(records) == 1
+    assert "operation=get_message" in records[0].getMessage()
+    assert "category=protocol_error" in records[0].getMessage()
+    assert "MISMATCHED-TARGET-SECRET" not in caplog.text
+    assert "MISMATCHED-TARGET-SECRET" not in repr(caught.value)
+
+
 @pytest.mark.parametrize(
     "parts_summary",
     [
@@ -833,7 +875,7 @@ def test_v0163_rejects_invalid_part_summary_shapes(pond_server, parts_summary):
 
 def test_search_rejects_non_empty_parts_summary_for_non_user_hit(pond_server):
     body = _search_response()
-    body["sessions"][0]["matches"][1]["parts_summary"] = [
+    body["sessions"][0]["matches"][0]["parts_summary"] = [
         {"kind": "tool_call", "label": "shell", "call_id": "call-12"}
     ]
     _enqueue_json(pond_server, body)

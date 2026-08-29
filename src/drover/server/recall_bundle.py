@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -108,6 +108,7 @@ class RecallBundleService:
                 matched_total=0,
                 searchable_in_scope=0,
                 has_more=False,
+                result_set_freshness=None,
                 selected=(),
                 archive_evidence=[],
                 warnings=[],
@@ -120,6 +121,7 @@ class RecallBundleService:
                 matched_total=0,
                 searchable_in_scope=0,
                 has_more=False,
+                result_set_freshness=None,
                 selected=(),
                 archive_evidence=[],
                 warnings=[{"category": "unavailable"}],
@@ -132,6 +134,7 @@ class RecallBundleService:
                 matched_total=0,
                 searchable_in_scope=0,
                 has_more=False,
+                result_set_freshness=None,
                 selected=(),
                 archive_evidence=[],
                 warnings=[],
@@ -206,11 +209,13 @@ class RecallBundleService:
                 matched_total=0,
                 searchable_in_scope=0,
                 has_more=False,
+                result_set_freshness=None,
                 selected=(),
                 archive_evidence=[],
                 warnings=[warning],
             )
 
+        result_set_freshness = _newest_returned_timestamp(result.hits)
         selected = _distinct_hits(result.hits, limit=effective_limit)
 
         archive_evidence: list[dict] = []
@@ -225,6 +230,7 @@ class RecallBundleService:
                         context_after=self._archive_config.context_after,
                     )
                 )
+                _validate_hydration_identity(hit, neighborhood)
             except ArchiveError as error:
                 warning_category = error.category
             except Exception:
@@ -254,6 +260,7 @@ class RecallBundleService:
             matched_total=result.matched_total,
             searchable_in_scope=result.searchable_in_scope,
             has_more=result.has_more,
+            result_set_freshness=result_set_freshness,
             selected=selected,
             archive_evidence=archive_evidence,
             warnings=warnings,
@@ -275,6 +282,7 @@ class RecallBundleService:
         matched_total: int,
         searchable_in_scope: int,
         has_more: bool,
+        result_set_freshness: str | None,
         selected: tuple[ArchiveSearchHit, ...],
         archive_evidence: list[dict],
         warnings: list[dict],
@@ -299,7 +307,7 @@ class RecallBundleService:
             "selected_count": len(selected),
             "hydrated_count": len(archive_evidence),
             "retained_count": len(archive_evidence),
-            "result_set_freshness": _newest_selected_timestamp(selected),
+            "result_set_freshness": result_set_freshness,
             "retrieval_timestamp": retrieval_timestamp,
         }
         if warnings:
@@ -438,12 +446,18 @@ def _normalize_query(query: str) -> str:
 def _validate_since(since: str | None) -> str | None:
     if since is None:
         return None
-    if not isinstance(since, str) or not since:
-        raise ValueError("since must be an ISO-8601 string")
+    if (
+        type(since) is not str
+        or len(since) != 10
+        or since[4] != "-"
+        or since[7] != "-"
+        or not since.replace("-", "").isdigit()
+    ):
+        raise ValueError("since must be a valid YYYY-MM-DD date")
     try:
-        datetime.fromisoformat(_z_to_offset(since))
+        date.fromisoformat(since)
     except ValueError as exc:
-        raise ValueError("since must be an ISO-8601 string") from exc
+        raise ValueError("since must be a valid YYYY-MM-DD date") from exc
     return since
 
 
@@ -484,6 +498,36 @@ def _distinct_hits(
         if len(selected) == limit:
             break
     return tuple(selected)
+
+
+def _validate_hydration_identity(
+    hit: ArchiveSearchHit, neighborhood: ArchiveMessageNeighborhood
+) -> None:
+    target = neighborhood.target
+    session = neighborhood.session
+    if (
+        target.message_id != hit.message_id
+        or target.session_id != hit.session_id
+        or session.session_id != hit.session_id
+        or target.project != hit.project
+        or session.project != hit.project
+        or target.source_agent != hit.source_agent
+        or session.source_agent != hit.source_agent
+        or target.role != hit.role
+        or _archive_timestamp_instant(target.timestamp)
+        != _archive_timestamp_instant(hit.timestamp)
+    ):
+        raise ArchiveProtocolError()
+
+
+def _archive_timestamp_instant(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(_z_to_offset(value))
+    except (TypeError, ValueError):
+        raise ArchiveProtocolError() from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _source_item(
@@ -709,7 +753,7 @@ def _is_exact_repository(repo: str | None) -> bool:
     return bool(owner and name and owner == owner.strip() and name == name.strip())
 
 
-def _newest_selected_timestamp(hits: tuple[ArchiveSearchHit, ...]) -> str | None:
+def _newest_returned_timestamp(hits: tuple[ArchiveSearchHit, ...]) -> str | None:
     parseable: list[tuple[datetime, str]] = []
     for hit in hits:
         try:

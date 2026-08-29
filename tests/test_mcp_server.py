@@ -30,7 +30,7 @@ class NormalizedArchive:
         assert request == ArchiveSearchRequest(
             query="bounded recall",
             project="arniesaha/drover",
-            since="2026-08-01T00:00:00Z",
+            since="2026-08-01",
             limit=1,
         )
         return ArchiveSearchResult(
@@ -169,6 +169,7 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
     assert "bounded drover-only fallback" in recall_description
     for fallback_state in ("disabled", "busy", "unavailable"):
         assert fallback_state in recall_description
+    assert "yyyy-mm-dd" in recall_description
     assert list(recall_tool.inputSchema["properties"]) == [
         "query",
         "repo",
@@ -207,7 +208,7 @@ def test_recall_bundle_invocation_returns_the_public_five_field_bundle(
         {
             "query": "bounded recall",
             "repo": "arniesaha/drover",
-            "since": "2026-08-01T00:00:00Z",
+            "since": "2026-08-01",
             "limit": 1,
             "max_context_chars": 1_500,
         },

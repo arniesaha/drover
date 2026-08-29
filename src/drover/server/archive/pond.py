@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import time
+from datetime import date
 from typing import Any, cast
 
 import requests
@@ -72,7 +73,7 @@ class PondArchiveClient:
         if request.project is not None:
             filters["project"] = {"contains": request.project}
         if request.since is not None:
-            filters["from_date"] = request.since
+            filters["from_date"] = _validate_from_date(request.since)
         payload = {
             "protocol_version": _PROTOCOL_VERSION,
             "namespace": _NAMESPACE,
@@ -97,11 +98,21 @@ class PondArchiveClient:
         }
         return cast(
             ArchiveMessageNeighborhood,
-            self._post_json("get_message", "/v1/get-message", payload),
+            self._post_json(
+                "get_message",
+                "/v1/get-message",
+                payload,
+                expected_message_id=request.message_id,
+            ),
         )
 
     def _post_json(
-        self, operation: str, path: str, payload: dict[str, object]
+        self,
+        operation: str,
+        path: str,
+        payload: dict[str, object],
+        *,
+        expected_message_id: str | None = None,
     ) -> object:
         started = time.monotonic()
         status_code: int | None = None
@@ -172,7 +183,11 @@ class PondArchiveClient:
             if operation == "search":
                 normalized = _normalize_search(decoded)
             elif operation == "get_message":
-                normalized = _normalize_message(decoded)
+                if expected_message_id is None:
+                    raise ArchiveProtocolError()
+                normalized = _normalize_message(
+                    decoded, expected_message_id=expected_message_id
+                )
             else:
                 raise ArchiveProtocolError()
             category = "success"
@@ -193,9 +208,25 @@ class PondArchiveClient:
             )
 
 
+def _validate_from_date(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 10
+        or value[4] != "-"
+        or value[7] != "-"
+        or not value.replace("-", "").isdigit()
+    ):
+        raise ValueError("since must be a valid YYYY-MM-DD date")
+    try:
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("since must be a valid YYYY-MM-DD date") from exc
+    return value
+
+
 def _normalize_search(value: object) -> ArchiveSearchResult:
     root = _required_mapping(value)
-    hits: list[ArchiveSearchHit] = []
+    matches: list[dict[str, Any]] = []
     for session_value in _required_list(root, "sessions"):
         session = _required_mapping(session_value)
         session_id = _required_string(session, "session_id", identifier=True)
@@ -209,29 +240,43 @@ def _normalize_search(value: object) -> ArchiveSearchResult:
             parts_summary = _parts_summary(match)
             if role != "user" and parts_summary:
                 raise ArchiveProtocolError()
-            hits.append(
-                ArchiveSearchHit(
-                    rank=len(hits) + 1,
-                    message_id=_required_string(match, "message_id", identifier=True),
-                    session_id=session_id,
-                    project=project,
-                    source_agent=source_agent,
-                    role=role,
-                    timestamp=_required_string(match, "timestamp"),
-                    text=_required_string(match, "text"),
-                    score=_required_number(match, "score"),
-                    parts_summary=parts_summary,
-                )
+            matches.append(
+                {
+                    "message_id": _required_string(
+                        match, "message_id", identifier=True
+                    ),
+                    "session_id": session_id,
+                    "project": project,
+                    "source_agent": source_agent,
+                    "role": role,
+                    "timestamp": _required_string(match, "timestamp"),
+                    "text": _required_string(match, "text"),
+                    "score": _required_number(match, "score"),
+                    "parts_summary": parts_summary,
+                }
             )
+    matches.sort(
+        key=lambda match: (
+            -match["score"],
+            match["session_id"],
+            match["message_id"],
+        )
+    )
+    hits = tuple(
+        ArchiveSearchHit(rank=rank, **match)
+        for rank, match in enumerate(matches, start=1)
+    )
     return ArchiveSearchResult(
-        hits=tuple(hits),
+        hits=hits,
         matched_total=_required_integer(root, "matched_total"),
         searchable_in_scope=_required_integer(root, "searchable_in_scope"),
         has_more=_required_boolean(root, "has_more"),
     )
 
 
-def _normalize_message(value: object) -> ArchiveMessageNeighborhood:
+def _normalize_message(
+    value: object, *, expected_message_id: str
+) -> ArchiveMessageNeighborhood:
     root = _required_mapping(value)
     if _required_string(root, "scope") != "message":
         raise ArchiveProtocolError()
@@ -245,6 +290,8 @@ def _normalize_message(value: object) -> ArchiveMessageNeighborhood:
     target = _message_view(
         _required_value(root, "target"), session, allow_absent_text=True
     )
+    if target.message_id != expected_message_id:
+        raise ArchiveProtocolError()
     siblings = tuple(
         _message_view(item, session) for item in _required_list(root, "siblings")
     )

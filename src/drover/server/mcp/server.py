@@ -126,6 +126,7 @@ def build_mcp_server(
     ) -> dict:
         """Return bounded native-harness archive recall plus scoped Drover context.
 
+        ``since`` is an exact ``YYYY-MM-DD`` lower-bound date.
         When the local archive is disabled, busy, or unavailable, return a
         bounded Drover-only fallback.
         """
