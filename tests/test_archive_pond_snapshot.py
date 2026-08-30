@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import stat
@@ -9,13 +10,12 @@ import textwrap
 from dataclasses import replace
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from drover.server.archive.inventory import PondInventory, PondInventoryRecord
-from drover.server.archive.pond_inventory import POND_INVENTORY_SQL
 from drover.server.archive.pond_snapshot import (
-    POND_CORPUS_COUNTS_SQL,
-    POND_LOGICAL_DUPLICATES_SQL,
+    POND_CORPUS_SNAPSHOT_SQL,
     LocalPondStore,
     PondCorpusCounts,
     PondStoreSnapshot,
@@ -59,6 +59,42 @@ _DUPLICATE_ROW = {
     "sessions_in_logical_duplicate_groups": 0,
 }
 
+
+def _corpus_rows(
+    *,
+    roots: tuple[dict[str, object], ...] = _ROOT_ROWS,
+    corpus: dict[str, int] = _CORPUS_ROW,
+    duplicates: dict[str, int] = _DUPLICATE_ROW,
+) -> list[dict[str, object]]:
+    rows = [
+        {
+            "row_kind": "root",
+            **root,
+            "sessions": None,
+            "messages": None,
+            "parts": None,
+            "disallowed_sessions": None,
+            "logical_duplicate_groups": None,
+            "sessions_in_logical_duplicate_groups": None,
+        }
+        for root in roots
+    ]
+    rows.append(
+        {
+            "row_kind": "aggregate",
+            "session_id": None,
+            "source_agent": None,
+            "created_at": None,
+            "message_count": None,
+            "first_message_at": None,
+            "last_message_at": None,
+            **corpus,
+            **duplicates,
+        }
+    )
+    return rows
+
+
 _FAKE_POND = r"""#!/usr/bin/env python3
 import json
 import os
@@ -77,17 +113,13 @@ if sys.argv[1:] == ["--version"]:
     sys.stdout.write(os.environ.get("FAKE_POND_VERSION", "pond 0.16.3\n"))
     raise SystemExit(0)
 
-sql = sys.argv[sys.argv.index("sql") + 1]
 output = Path(sys.argv[sys.argv.index("--output-file") + 1])
-if "logical_duplicate_groups" in sql:
-    phase = "duplicates"
-    payload = os.environ["FAKE_DUPLICATE_ROW"]
-elif "disallowed_sessions" in sql:
-    phase = "counts"
-    payload = os.environ["FAKE_CORPUS_ROW"]
+phase = "corpus"
+query_calls = sum("sql" in call for call in calls)
+if os.environ.get("FAKE_MUTATE_AFTER_FIRST_QUERY") == "1" and query_calls > 1:
+    payload = os.environ["FAKE_MUTATED_CORPUS_ROWS"]
 else:
-    phase = "root"
-    payload = os.environ["FAKE_ROOT_ROWS"]
+    payload = os.environ["FAKE_CORPUS_ROWS"]
 
 if os.environ.get("FAKE_FAIL_PHASE") == phase:
     sys.stdout.write("private-child-stdout")
@@ -105,11 +137,9 @@ elif mode == phase + "-two-rows":
     if isinstance(row, list):
         row = row[0]
     output.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
-elif phase == "root":
+else:
     rows = json.loads(payload)
     output.write_text("".join(json.dumps(row) + "\n" for row in rows))
-else:
-    output.write_text(json.dumps(json.loads(payload)) + "\n", encoding="utf-8")
 """
 
 
@@ -128,9 +158,20 @@ def pond_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote_config.chmod(0o600)
     record = tmp_path / "calls-private.json"
     monkeypatch.setenv("FAKE_POND_RECORD", str(record))
-    monkeypatch.setenv("FAKE_ROOT_ROWS", json.dumps(_ROOT_ROWS))
-    monkeypatch.setenv("FAKE_CORPUS_ROW", json.dumps(_CORPUS_ROW))
-    monkeypatch.setenv("FAKE_DUPLICATE_ROW", json.dumps(_DUPLICATE_ROW))
+    monkeypatch.setenv("FAKE_CORPUS_ROWS", json.dumps(_corpus_rows()))
+    monkeypatch.setenv(
+        "FAKE_MUTATED_CORPUS_ROWS",
+        json.dumps(
+            _corpus_rows(
+                corpus={
+                    "sessions": 4,
+                    "messages": 6,
+                    "parts": 9,
+                    "disallowed_sessions": 0,
+                }
+            )
+        ),
+    )
     monkeypatch.delenv("POND_STORAGE_PATH", raising=False)
     return binary, local_store, local_config, remote_config, record
 
@@ -182,35 +223,96 @@ def test_snapshot_uses_exact_sql_and_argument_order_for_local_store(
 
     calls = json.loads(record.read_text(encoding="utf-8"))
     assert calls[0] == [str(binary), "--version"]
-    for call, sql, name in zip(
-        calls[1:],
-        (POND_INVENTORY_SQL, POND_CORPUS_COUNTS_SQL, POND_LOGICAL_DUPLICATES_SQL),
-        ("root-inventory.ndjson", "corpus-counts.ndjson", "duplicates.ndjson"),
-        strict=True,
-    ):
-        assert call == [
+    assert calls[1:] == [
+        [
             str(binary),
             "--config-file",
             str(config),
             "--storage-path",
             str(store),
             "sql",
-            sql,
+            POND_CORPUS_SNAPSHOT_SQL,
             "--format",
             "ndjson",
             "--output-file",
-            str(workspace / name),
+            str(workspace / "corpus-snapshot.ndjson"),
             "--timeout",
             "60",
         ]
-    assert "source_agent NOT LIKE 'claude-code/%'" in POND_CORPUS_COUNTS_SQL
-    assert "WHERE s.source_agent IN ('claude-code', 'codex-cli')" in POND_INVENTORY_SQL
-    assert (
-        "WHERE"
-        not in POND_LOGICAL_DUPLICATES_SQL.split("WITH signatures AS", 1)[1].split(
-            "duplicate_groups AS", 1
-        )[0]
+    ]
+
+
+def test_snapshot_uses_one_corpus_query_when_live_store_changes(
+    pond_environment, monkeypatch, tmp_path
+) -> None:
+    *_, record = pond_environment
+    monkeypatch.setenv("FAKE_MUTATE_AFTER_FIRST_QUERY", "1")
+
+    snapshot = _capture_local(pond_environment, tmp_path)
+
+    calls = json.loads(record.read_text(encoding="utf-8"))
+    corpus_calls = [call for call in calls if "sql" in call]
+    assert len(corpus_calls) == 1
+    assert snapshot.counts.sessions == 3
+
+
+def test_snapshot_calls_progress_callback_for_version_and_corpus_processes(
+    pond_environment, monkeypatch, tmp_path
+) -> None:
+    snapshot_module = importlib.import_module("drover.server.archive.pond_snapshot")
+    real_run = snapshot_module.run_pond_process
+    callback_labels: list[str] = []
+    callback_calls = 0
+
+    def callback() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    def observe_callbacks(*args, **kwargs):
+        label = kwargs["label"]
+        supplied_callback = kwargs["progress_callback"]
+
+        def observed_callback():
+            callback_labels.append(label)
+            supplied_callback()
+
+        return real_run(*args, **{**kwargs, "progress_callback": observed_callback})
+
+    monkeypatch.setattr(snapshot_module, "run_pond_process", observe_callbacks)
+    binary, store, config, _, _ = pond_environment
+
+    capture_pond_store_snapshot(
+        binary,
+        storage=LocalPondStore(store),
+        pond_config=config,
+        workspace=_workspace(tmp_path),
+        timeout_seconds=60,
+        progress_callback=callback,
     )
+
+    assert set(callback_labels) == {"snapshot-version", "corpus-snapshot"}
+    assert callback_calls == len(callback_labels)
+
+
+def test_corpus_sql_counts_null_source_agent_as_disallowed() -> None:
+    with duckdb.connect() as connection:
+        connection.execute(
+            "CREATE TABLE sessions (session_id VARCHAR, source_agent VARCHAR, "
+            "created_at TIMESTAMP)"
+        )
+        connection.execute(
+            "CREATE TABLE messages (message_id VARCHAR, session_id VARCHAR, "
+            "timestamp TIMESTAMP)"
+        )
+        connection.execute("CREATE TABLE parts (part_id VARCHAR)")
+        connection.execute("INSERT INTO sessions VALUES ('private', NULL, now())")
+
+        cursor = connection.execute(POND_CORPUS_SNAPSHOT_SQL)
+        columns = [column[0] for column in cursor.description]
+        rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+    aggregate = next(row for row in rows if row["row_kind"] == "aggregate")
+    assert aggregate["disallowed_sessions"] == 1
 
 
 def test_snapshot_uses_remote_wrapper_and_remote_config_without_repr_disclosure(
@@ -265,22 +367,18 @@ def test_snapshot_rejects_unwrapped_storage_without_disclosing_it(
 
 
 @pytest.mark.parametrize(
-    ("phase", "mode"),
-    [
-        ("root", "root-malformed"),
-        ("counts", "counts-two-rows"),
-        ("duplicates", "duplicates-malformed"),
-    ],
+    "mode",
+    ["corpus-malformed", "corpus-two-rows"],
 )
 def test_snapshot_requires_strict_ndjson_without_row_disclosure(
-    phase, mode, pond_environment, monkeypatch, tmp_path
+    mode, pond_environment, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("FAKE_INVALID_PHASE", mode)
 
     with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$") as raised:
         _capture_local(pond_environment, tmp_path)
 
-    assert phase not in str(raised.value)
+    assert "corpus" not in str(raised.value)
     assert "private-invalid-row" not in str(raised.value)
 
 
@@ -298,7 +396,7 @@ def test_snapshot_rejects_non_exact_nonnegative_count_types(
 ):
     row = dict(_CORPUS_ROW)
     row[field] = value
-    monkeypatch.setenv("FAKE_CORPUS_ROW", json.dumps(row))
+    monkeypatch.setenv("FAKE_CORPUS_ROWS", json.dumps(_corpus_rows(corpus=row)))
 
     with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
         _capture_local(pond_environment, tmp_path)
@@ -307,10 +405,11 @@ def test_snapshot_rejects_non_exact_nonnegative_count_types(
 def test_snapshot_rejects_duplicate_ndjson_keys(
     pond_environment, monkeypatch, tmp_path
 ):
+    rows = [json.dumps(row) for row in _corpus_rows()]
+    rows[-1] = rows[-1].replace('"sessions": 3', '"sessions": 3, "sessions": 3', 1)
     monkeypatch.setenv(
-        "FAKE_COUNTS_RAW",
-        '{"sessions":3,"sessions":3,"messages":5,"parts":8,'
-        '"disallowed_sessions":0}\n',
+        "FAKE_CORPUS_RAW",
+        "\n".join(rows) + "\n",
     )
 
     with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
@@ -330,12 +429,11 @@ def test_snapshot_rejects_relationally_impossible_corpus_counts(counts) -> None:
         PondCorpusCounts(*counts)
 
 
-@pytest.mark.parametrize("phase", ["root", "counts", "duplicates"])
 def test_snapshot_sanitizes_child_failures_and_private_locations(
-    phase, pond_environment, monkeypatch, tmp_path
+    pond_environment, monkeypatch, tmp_path
 ):
     _, store, config, _, _ = pond_environment
-    monkeypatch.setenv("FAKE_FAIL_PHASE", phase)
+    monkeypatch.setenv("FAKE_FAIL_PHASE", "corpus")
 
     with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$") as raised:
         _capture_local(pond_environment, tmp_path)
@@ -380,9 +478,7 @@ def test_snapshot_artifacts_are_private_and_bounded_to_the_supplied_workspace(
 
     names = {path.name for path in workspace.iterdir()}
     assert "pond-inventory.json" in names
-    assert "root-inventory.ndjson" in names
-    assert "corpus-counts.ndjson" in names
-    assert "duplicates.ndjson" in names
+    assert "corpus-snapshot.ndjson" in names
     assert all(
         stat.S_IMODE(path.stat().st_mode) == 0o600 and path.is_file()
         for path in workspace.iterdir()

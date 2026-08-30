@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import stat
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -18,9 +18,12 @@ from drover.config import default_config
 from drover.server.archive.backup_config import BackupConfig
 from drover.server.archive.backup_preflight import (
     BackupPreflightResult,
+    _PreflightDependencies,
+    _run_backup_preflight,
     backup_preflight_summary,
     run_backup_preflight,
 )
+from drover.server.archive.backup_runtime import RuntimeGuard, RuntimeIdentity
 from drover.server.archive.coverage import (
     RegistryCandidate,
     build_coverage_report,
@@ -78,6 +81,60 @@ class _Runtime:
 
     def __repr__(self) -> str:
         return "_Runtime(private)"
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeSnapshot:
+    identity: RuntimeIdentity
+    host_id: str
+    dropped_events: int
+    healthy: bool
+    health_latency_ms: float
+    swap_used_bytes: int
+
+
+class _RuntimeProbe:
+    def __init__(self, samples: list[_RuntimeSnapshot]) -> None:
+        self._samples = list(samples)
+
+    def capture(self) -> _RuntimeSnapshot:
+        if len(self._samples) > 1:
+            return self._samples.pop(0)
+        return self._samples[0]
+
+    def wait_for_next_sample(self) -> None:
+        pass
+
+
+def _runtime_snapshot(*, host_id: str = _HOST_ID) -> _RuntimeSnapshot:
+    return _RuntimeSnapshot(
+        identity=RuntimeIdentity("hub-private", "harness-private", "pond-private"),
+        host_id=host_id,
+        dropped_events=0,
+        healthy=True,
+        health_latency_ms=1.0,
+        swap_used_bytes=0,
+    )
+
+
+def _runtime_guard(
+    *, active: bool, samples: list[_RuntimeSnapshot] | None = None
+) -> RuntimeGuard:
+    guard = RuntimeGuard(
+        _RuntimeProbe(samples or [_runtime_snapshot()]), minimum_samples=1
+    )
+    if active:
+        guard.capture_baseline()
+    return guard
+
+
+@dataclass(frozen=True, slots=True)
+class _DependencyFixture:
+    dependencies: _PreflightDependencies
+    calls: list[tuple[object, ...]]
+    loaded_snapshots: list[Path]
+    home: Path
+    registry: Path
 
 
 def _write_native_sources(home: Path, *, include_metadata_only: bool = False) -> None:
@@ -146,7 +203,7 @@ def _snapshot(*, counts: PondCorpusCounts | None = None) -> PondStoreSnapshot:
     )
 
 
-def _registry(path: Path, *, include_metadata_only: bool = False) -> None:
+def _registry(path: Path) -> None:
     with duckdb.connect(str(path)) as connection:
         connection.execute("""
             CREATE TABLE harness_sessions (
@@ -173,16 +230,6 @@ def _registry(path: Path, *, include_metadata_only: bool = False) -> None:
                 "PRIVATE REGISTRY TRANSCRIPT",
             ),
         ]
-        if include_metadata_only:
-            rows.append(
-                (
-                    "wrapper-metadata-private",
-                    _HOST_ID,
-                    "claude-code",
-                    "metadata-private",
-                    "PRIVATE REGISTRY TRANSCRIPT",
-                )
-            )
         connection.executemany(
             "INSERT INTO harness_sessions VALUES (?, ?, ?, ?, ?)", rows
         )
@@ -235,14 +282,32 @@ def _dependencies(
     home.mkdir()
     _write_native_sources(home, include_metadata_only=include_metadata_only)
     registry = tmp_path / "live-registry-private.duckdb"
-    _registry(registry, include_metadata_only=include_metadata_only)
+    _registry(registry)
     calls: list[tuple[object, ...]] = []
     loaded_snapshots: list[Path] = []
 
-    def capture(binary, *, storage, pond_config, workspace, timeout_seconds):
+    def capture(
+        binary,
+        *,
+        storage,
+        pond_config,
+        workspace,
+        timeout_seconds,
+        progress_callback=None,
+    ):
         calls.append(
-            ("snapshot", binary, storage, pond_config, workspace, timeout_seconds)
+            (
+                "snapshot",
+                binary,
+                storage,
+                pond_config,
+                workspace,
+                timeout_seconds,
+                progress_callback,
+            )
         )
+        if progress_callback is not None:
+            progress_callback()
         value = snapshot or _snapshot()
         write_private_json(
             workspace / "pond-inventory.json", value.root_inventory.to_wire()
@@ -277,6 +342,9 @@ def _dependencies(
                 kwargs,
             )
         )
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback is not None:
+            progress_callback()
         stdout = Path(run_directory) / f"{label}.stdout"
         stderr = Path(run_directory) / f"{label}.stderr"
         stdout.write_text(json.dumps(dry_run) + "\n", encoding="utf-8")
@@ -285,7 +353,7 @@ def _dependencies(
         stderr.chmod(0o600)
         return PondProcessResult(0, 1, 0, None, 0, stdout, stderr)
 
-    return SimpleNamespace(
+    production_dependencies = _PreflightDependencies(
         native_home=lambda: home,
         discover_native_inventory=discover_native_history_inventory,
         capture_pond_snapshot=capture,
@@ -294,6 +362,9 @@ def _dependencies(
         build_coverage_report=build_coverage_report,
         coverage_summary=summary_override or coverage_summary,
         run_pond_process=run_process,
+    )
+    return _DependencyFixture(
+        dependencies=production_dependencies,
         calls=calls,
         loaded_snapshots=loaded_snapshots,
         home=home,
@@ -318,15 +389,15 @@ def _run(
         include_metadata_only=include_metadata_only,
         summary_override=summary_override,
     )
-    runtime = _Runtime()
+    runtime = _runtime_guard(active=True)
     workspace = tmp_path / "workspace-private"
     drover_config = replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb")
-    result = run_backup_preflight(
+    result = _run_backup_preflight(
         config,
         drover_config,
         workspace,
         runtime,
-        dependencies=dependencies,
+        dependencies=dependencies.dependencies,
     )
     return result, config, dependencies, runtime, workspace
 
@@ -348,13 +419,41 @@ def test_archive_package_exports_only_the_completed_preflight_interfaces() -> No
     assert all(hasattr(archive_package, name) for name in expected)
 
 
+def test_public_preflight_has_no_dependency_injection_bypass(tmp_path) -> None:
+    config = _backup_config(tmp_path)
+    dependencies = _dependencies(tmp_path, config)
+
+    assert "dependencies" not in inspect.signature(run_backup_preflight).parameters
+    with pytest.raises(TypeError):
+        run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _Runtime(),
+            dependencies=dependencies,
+        )
+
+
+@pytest.mark.parametrize("runtime_guard", [object(), _runtime_guard(active=False)])
+def test_public_preflight_requires_an_active_real_runtime_guard(
+    runtime_guard, tmp_path
+) -> None:
+    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+        run_backup_preflight(
+            _backup_config(tmp_path),
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            runtime_guard,
+        )
+
+
 def test_preflight_is_local_only_and_requires_a_clean_denominator(tmp_path):
     result, config, dependencies, runtime, workspace = _run(tmp_path)
 
     assert result.coverage.ready_for_next_writer is True
     assert result.pond_snapshot.counts.disallowed_sessions == 0
     assert backup_preflight_summary(result)["ready"] is True
-    assert runtime.calls == 1
+    assert type(runtime) is RuntimeGuard
     process_calls = [call for call in dependencies.calls if call[0] == "process"]
     assert process_calls == [
         (
@@ -382,6 +481,49 @@ def test_preflight_is_local_only_and_requires_a_clean_denominator(tmp_path):
     assert list(config.receipt_directory.glob("backup-*.json")) == []
 
 
+def test_preflight_passes_active_runtime_sample_to_snapshot_and_dry_run(tmp_path):
+    _, _, fixture, runtime, _ = _run(tmp_path)
+
+    snapshot_call = next(call for call in fixture.calls if call[0] == "snapshot")
+    process_call = next(call for call in fixture.calls if call[0] == "process")
+    assert snapshot_call[-1] == runtime.sample
+    assert process_call[-1]["progress_callback"] == runtime.sample
+
+
+@pytest.mark.parametrize(
+    ("phase", "samples"),
+    [
+        ("snapshot", [_runtime_snapshot(), _runtime_snapshot(host_id="changed")]),
+        (
+            "dry-run",
+            [
+                _runtime_snapshot(),
+                _runtime_snapshot(),
+                _runtime_snapshot(host_id="changed"),
+            ],
+        ),
+    ],
+)
+def test_preflight_fails_fixed_when_runtime_changes_during_any_phase(
+    phase, samples, tmp_path
+):
+    config = _backup_config(tmp_path)
+    fixture = _dependencies(tmp_path, config)
+    runtime = _runtime_guard(active=True, samples=samples)
+
+    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+        _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            runtime,
+            dependencies=fixture.dependencies,
+        )
+
+    reached_dry_run = any(call[0] == "process" for call in fixture.calls)
+    assert reached_dry_run is (phase == "dry-run")
+
+
 def test_preflight_rejects_coverage_eligibility_count_mismatch(tmp_path):
     def faulty_summary(report):
         summary = coverage_summary(report)
@@ -403,6 +545,50 @@ def test_preflight_rejects_nonaggregate_nested_coverage_summary(tmp_path):
         _run(tmp_path, summary_override=faulty_summary)
 
     assert "private-id" not in str(raised.value)
+
+
+def test_preflight_coverage_summary_is_deeply_immutable_after_return(tmp_path):
+    result, *_ = _run(tmp_path)
+
+    with pytest.raises(TypeError):
+        result.coverage_summary["misses"]["discovered_not_synced"] = 1
+
+    assert backup_preflight_summary(result)["coverage"]["misses"] == {
+        "discovered_not_synced": 0,
+        "source_absent_after_prior_inventory": 0,
+        "unverifiable": 0,
+    }
+
+
+def test_preflight_requires_every_candidate_to_be_matched(tmp_path):
+    config = _backup_config(tmp_path)
+    fixture = _dependencies(tmp_path, config)
+    original_build = fixture.dependencies.build_coverage_report
+
+    def build_with_unmatched_candidate(*args, **kwargs):
+        report = original_build(*args, **kwargs)
+        details = (
+            replace(report.details[0], status="source_not_archive_eligible"),
+            *report.details[1:],
+        )
+        return replace(report, details=details, ready_for_next_writer=True)
+
+    fixture = replace(
+        fixture,
+        dependencies=replace(
+            fixture.dependencies,
+            build_coverage_report=build_with_unmatched_candidate,
+        ),
+    )
+
+    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+        _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _runtime_guard(active=True),
+            dependencies=fixture.dependencies,
+        )
 
 
 def test_preflight_discovers_metadata_without_parsing_native_transcript_bodies(
@@ -451,15 +637,15 @@ def test_preflight_loads_exact_bound_eligibility_from_fixed_directory(tmp_path):
         classification="source_not_archive_eligible",
     )
     write_private_json(eligibility / "metadata-private.json", receipt.to_wire())
-    runtime = _Runtime()
+    runtime = _runtime_guard(active=True)
     workspace = tmp_path / "workspace-private"
 
-    result = run_backup_preflight(
+    result = _run_backup_preflight(
         config,
         replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
         workspace,
         runtime,
-        dependencies=dependencies,
+        dependencies=dependencies.dependencies,
     )
 
     assert result.source_not_archive_eligible == 1
@@ -492,12 +678,12 @@ def test_preflight_rejects_stale_eligibility_binding_with_fixed_error(tmp_path):
     write_private_json(eligibility / "metadata-private.json", receipt.to_wire())
 
     with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        run_backup_preflight(
+        _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
             tmp_path / "workspace-private",
-            _Runtime(),
-            dependencies=dependencies,
+            _runtime_guard(active=True),
+            dependencies=dependencies.dependencies,
         )
 
 
@@ -628,6 +814,55 @@ def test_preflight_discards_partial_registry_snapshot_when_copy_fails(
     assert not (tmp_path / "workspace-private/registry-snapshot.duckdb").exists()
 
 
+def test_preflight_rejects_atomic_registry_path_replacement_and_cleans_copy(
+    tmp_path, monkeypatch
+):
+    preflight_module = importlib.import_module("drover.server.archive.backup_preflight")
+    config = _backup_config(tmp_path)
+    fixture = _dependencies(tmp_path, config)
+    source_parent = tmp_path / "registry-parent-private"
+    source_parent.mkdir()
+    registry = source_parent / "registry-private.duckdb"
+    os.replace(fixture.registry, registry)
+    replacement_bytes = registry.read_bytes()
+    replacement_mode = stat.S_IMODE(registry.stat().st_mode)
+    moved_parent = tmp_path / "moved-registry-parent-private"
+    fixture = replace(
+        fixture,
+        dependencies=replace(
+            fixture.dependencies,
+            resolve_control_plane_path=lambda _path: registry,
+        ),
+    )
+    real_read = preflight_module.os.read
+    replaced = False
+
+    def replace_path_after_read(descriptor, size):
+        nonlocal replaced
+        chunk = real_read(descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            os.replace(source_parent, moved_parent)
+            source_parent.mkdir()
+            registry.write_bytes(replacement_bytes)
+            registry.chmod(replacement_mode)
+        return chunk
+
+    monkeypatch.setattr(preflight_module.os, "read", replace_path_after_read)
+
+    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+        _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _runtime_guard(active=True),
+            dependencies=fixture.dependencies,
+        )
+
+    assert replaced is True
+    assert not (tmp_path / "workspace-private/registry-snapshot.duckdb").exists()
+
+
 def test_preflight_requires_capture_to_publish_the_exact_private_pond_artifact(
     tmp_path,
 ):
@@ -637,22 +872,28 @@ def test_preflight_requires_capture_to_publish_the_exact_private_pond_artifact(
     def capture_without_artifact(*_args, **_kwargs):
         return _snapshot()
 
-    dependencies.capture_pond_snapshot = capture_without_artifact
+    dependencies = replace(
+        dependencies,
+        dependencies=replace(
+            dependencies.dependencies,
+            capture_pond_snapshot=capture_without_artifact,
+        ),
+    )
 
     with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        run_backup_preflight(
+        _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
             tmp_path / "workspace-private",
-            _Runtime(),
-            dependencies=dependencies,
+            _runtime_guard(active=True),
+            dependencies=dependencies.dependencies,
         )
 
 
 def test_preflight_rejects_dry_run_result_paths_outside_the_workspace(tmp_path):
     config = _backup_config(tmp_path)
     dependencies = _dependencies(tmp_path, config)
-    original_run = dependencies.run_pond_process
+    original_run = dependencies.dependencies.run_pond_process
     outside = tmp_path / "outside-private"
     outside.mkdir(mode=0o700)
 
@@ -663,15 +904,21 @@ def test_preflight_rejects_dry_run_result_paths_outside_the_workspace(tmp_path):
         external.chmod(0o600)
         return replace(result, stdout_path=external)
 
-    dependencies.run_pond_process = wrong_result_path
+    dependencies = replace(
+        dependencies,
+        dependencies=replace(
+            dependencies.dependencies,
+            run_pond_process=wrong_result_path,
+        ),
+    )
 
     with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        run_backup_preflight(
+        _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
             tmp_path / "workspace-private",
-            _Runtime(),
-            dependencies=dependencies,
+            _runtime_guard(active=True),
+            dependencies=dependencies.dependencies,
         )
 
 
@@ -720,12 +967,12 @@ def test_preflight_rejects_non_private_or_symlinked_workspace(tmp_path):
     symlink.symlink_to(target, target_is_directory=True)
 
     with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        run_backup_preflight(
+        _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
             symlink,
-            _Runtime(),
-            dependencies=dependencies,
+            _runtime_guard(active=True),
+            dependencies=dependencies.dependencies,
         )
 
 
@@ -746,12 +993,12 @@ def test_preflight_rejects_more_than_one_hundred_thousand_eligibility_entries(
     monkeypatch.setattr(os, "listdir", oversized_listdir)
 
     with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        run_backup_preflight(
+        _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
             tmp_path / "workspace-private",
-            _Runtime(),
-            dependencies=dependencies,
+            _runtime_guard(active=True),
+            dependencies=dependencies.dependencies,
         )
 
 
@@ -777,10 +1024,10 @@ def test_preflight_rejects_eligibility_directory_changes_during_load(
     monkeypatch.setattr(os, "listdir", racing_listdir)
 
     with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        run_backup_preflight(
+        _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
             tmp_path / "workspace-private",
-            _Runtime(),
-            dependencies=dependencies,
+            _runtime_guard(active=True),
+            dependencies=dependencies.dependencies,
         )

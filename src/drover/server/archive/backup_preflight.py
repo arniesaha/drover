@@ -8,6 +8,7 @@ import os
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from drover.config import DroverConfig
@@ -153,8 +154,26 @@ def run_backup_preflight(
     drover_config: DroverConfig,
     workspace: Path,
     runtime_guard: RuntimeGuard,
+) -> BackupPreflightResult:
+    """Run preflight through fixed production dependencies and a real guard."""
+    if type(runtime_guard) is not RuntimeGuard:
+        raise _failure()
+    return _run_backup_preflight(
+        config,
+        drover_config,
+        workspace,
+        runtime_guard,
+        dependencies=_PRODUCTION_DEPENDENCIES,
+    )
+
+
+def _run_backup_preflight(
+    config: BackupConfig,
+    drover_config: DroverConfig,
+    workspace: Path,
+    runtime_guard: RuntimeGuard,
     *,
-    dependencies: Any | None = None,
+    dependencies: _PreflightDependencies,
 ) -> BackupPreflightResult:
     """Capture one local-only denominator and reject every unsafe counter."""
     workspace_descriptor: int | None = None
@@ -163,8 +182,12 @@ def run_backup_preflight(
     try:
         if type(config) is not BackupConfig or type(drover_config) is not DroverConfig:
             raise _failure()
-        deps = dependencies if dependencies is not None else _PRODUCTION_DEPENDENCIES
-        _require_dependencies(deps)
+        if (
+            type(runtime_guard) is not RuntimeGuard
+            or type(dependencies) is not _PreflightDependencies
+        ):
+            raise _failure()
+        deps = dependencies
         workspace_path, workspace_descriptor, workspace_identity = _pin_workspace(
             workspace
         )
@@ -211,6 +234,7 @@ def run_backup_preflight(
             pond_config=config.local_pond_config,
             workspace=workspace_path,
             timeout_seconds=config.copy_timeout_seconds,
+            progress_callback=runtime_guard.sample,
         )
         if type(pond_snapshot) is not PondStoreSnapshot:
             raise _failure()
@@ -239,8 +263,12 @@ def run_backup_preflight(
         )
         if type(report) is not CoverageReport:
             raise _failure()
-        summary = deps.coverage_summary(report)
-        _require_coverage_ready(summary)
+        supplied_summary = deps.coverage_summary(report)
+        canonical_summary = coverage_summary(report)
+        if supplied_summary != canonical_summary:
+            raise _failure()
+        _require_coverage_ready(canonical_summary)
+        summary = _freeze_mapping(canonical_summary)
         _require_snapshot_ready(pond_snapshot)
         _require_local_dry_run(
             config,
@@ -296,33 +324,20 @@ def backup_preflight_summary(result: BackupPreflightResult) -> dict[str, object]
     """Return only aggregate, identifier-free preflight evidence."""
     try:
         _require_result_ready(result)
+        canonical_coverage = coverage_summary(result.coverage)
+        _require_coverage_ready(canonical_coverage)
         return {
             "schema_version": 1,
             "ready": True,
             "source_inventory": native_inventory_summary(result.source_inventory),
             "pond_corpus": result.pond_snapshot.counts.to_wire(),
-            "coverage": dict(result.coverage_summary),
+            "coverage": canonical_coverage,
             "source_not_archive_eligible": result.source_not_archive_eligible,
         }
     except BackupPreflightError:
         raise
     except Exception:
         raise _failure() from None
-
-
-def _require_dependencies(dependencies: Any) -> None:
-    fields = (
-        "native_home",
-        "discover_native_inventory",
-        "capture_pond_snapshot",
-        "resolve_control_plane_path",
-        "load_registry_candidates",
-        "build_coverage_report",
-        "coverage_summary",
-        "run_pond_process",
-    )
-    if any(not callable(getattr(dependencies, name, None)) for name in fields):
-        raise _failure()
 
 
 def _require_source_inventory(inventory: NativeInventory, host_id: str) -> None:
@@ -397,7 +412,7 @@ def _require_coverage_ready(summary: Mapping[str, object]) -> None:
     percent = candidate["percent"]
     by_harness = candidate["by_harness"]
     if (
-        matched > eligible
+        matched != eligible
         or type(percent) is not float
         or not math.isfinite(percent)
         or percent != (round(matched * 100 / eligible, 1) if eligible else 0.0)
@@ -431,7 +446,6 @@ def _require_result_ready(result: BackupPreflightResult) -> None:
         raise _failure()
     _require_source_inventory(result.source_inventory, result.source_inventory.host_id)
     _require_snapshot_ready(result.pond_snapshot)
-    _require_coverage_ready(result.coverage_summary)
     if (
         type(result.coverage) is not CoverageReport
         or isinstance(result.source_not_archive_eligible, bool)
@@ -439,7 +453,11 @@ def _require_result_ready(result: BackupPreflightResult) -> None:
         or result.source_not_archive_eligible < 0
     ):
         raise _failure()
-    current = result.coverage_summary["current_source_coverage"]
+    canonical_summary = coverage_summary(result.coverage)
+    _require_coverage_ready(canonical_summary)
+    if _thaw_mapping(result.coverage_summary) != canonical_summary:
+        raise _failure()
+    current = canonical_summary["current_source_coverage"]
     if (
         not isinstance(current, dict)
         or _exact_nonnegative(current["source_not_archive_eligible"])
@@ -455,12 +473,30 @@ def _require_result_ready(result: BackupPreflightResult) -> None:
         raise _failure()
 
 
+def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType(
+        {
+            key: _freeze_mapping(item) if isinstance(item, dict) else item
+            for key, item in value.items()
+        }
+    )
+
+
+def _thaw_mapping(value: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise _failure()
+    return {
+        key: _thaw_mapping(item) if isinstance(item, Mapping) else item
+        for key, item in value.items()
+    }
+
+
 def _require_local_dry_run(
     config: BackupConfig,
     workspace: Path,
     workspace_descriptor: int,
     runtime_guard: RuntimeGuard,
-    dependencies: Any,
+    dependencies: _PreflightDependencies,
 ) -> None:
     result = dependencies.run_pond_process(
         config.pond_binary,
@@ -809,18 +845,33 @@ def _read_private_file_at(directory_descriptor: int, name: str) -> bytes:
 def _copy_registry_snapshot(
     source: Path, workspace_descriptor: int, workspace: Path
 ) -> tuple[Path, tuple[int, int]]:
+    parent_descriptor: int | None = None
     source_descriptor: int | None = None
     destination_descriptor: int | None = None
     completed = False
     try:
         if not source.is_absolute() or source.resolve(strict=True) != source:
             raise _failure()
-        source_descriptor = _open_nofollow_path(source)
+        parent = source.parent
+        parent_descriptor, parent_identity = _pin_path(
+            parent, directory=True, private=False
+        )
+        source_descriptor = os.open(
+            source.name,
+            _descriptor_flags(),
+            dir_fd=parent_descriptor,
+        )
         before = os.fstat(source_descriptor)
+        before_path = os.stat(
+            source.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.geteuid()
             or before.st_size > _MAX_REGISTRY_SNAPSHOT_BYTES
+            or _file_identity(before) != _file_identity(before_path)
         ):
             raise _failure()
         destination_descriptor = os.open(
@@ -845,6 +896,11 @@ def _copy_registry_snapshot(
                     raise _failure()
                 view = view[written:]
         after = os.fstat(source_descriptor)
+        final_source = os.stat(
+            source.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         destination = os.fstat(destination_descriptor)
         final = os.stat(
             _REGISTRY_SNAPSHOT_FILENAME,
@@ -853,6 +909,7 @@ def _copy_registry_snapshot(
         )
         if (
             _file_identity(before) != _file_identity(after)
+            or _file_identity(before) != _file_identity(final_source)
             or copied != before.st_size
             or destination.st_dev != final.st_dev
             or destination.st_ino != final.st_ino
@@ -862,6 +919,12 @@ def _copy_registry_snapshot(
             or stat.S_IMODE(final.st_mode) != 0o600
         ):
             raise _failure()
+        _require_pinned_path(
+            parent,
+            parent_descriptor,
+            parent_identity,
+            directory=True,
+        )
         os.fsync(destination_descriptor)
         os.fsync(workspace_descriptor)
         completed = True
@@ -878,7 +941,11 @@ def _copy_registry_snapshot(
             _discard_partial_registry_snapshot(
                 workspace_descriptor, destination_descriptor
             )
-        for descriptor in (destination_descriptor, source_descriptor):
+        for descriptor in (
+            destination_descriptor,
+            source_descriptor,
+            parent_descriptor,
+        ):
             if descriptor is not None:
                 try:
                     os.close(descriptor)

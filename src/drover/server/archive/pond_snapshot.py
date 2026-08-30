@@ -11,7 +11,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -24,30 +24,28 @@ from drover.server.archive.inventory import (
     _write_private_json_at,
     private_json_sha256,
 )
-from drover.server.archive.pond_inventory import POND_INVENTORY_SQL, _pond_record
+from drover.server.archive.pond_inventory import _pond_record
 from drover.server.archive.pond_process import (
     POND_VERSION,
     is_pinned_pond_version,
     run_pond_process,
 )
 
-POND_CORPUS_COUNTS_SQL = """SELECT
-  (SELECT count(*) FROM sessions) AS sessions,
-  (SELECT count(*) FROM messages) AS messages,
-  (SELECT count(*) FROM parts) AS parts,
-  (SELECT count(*) FROM sessions
-   WHERE source_agent != 'claude-code'
-     AND source_agent NOT LIKE 'claude-code/%'
-     AND source_agent != 'codex-cli') AS disallowed_sessions"""
-
-POND_LOGICAL_DUPLICATES_SQL = """WITH signatures AS (
-    SELECT s.source_agent, s.created_at,
+POND_CORPUS_SNAPSHOT_SQL = """WITH signatures AS (
+    SELECT s.session_id, s.source_agent, s.created_at,
            count(m.message_id) AS message_count,
            min(m.timestamp) AS first_message_at,
            max(m.timestamp) AS last_message_at
     FROM sessions s
     LEFT JOIN messages m ON m.session_id = s.session_id
     GROUP BY s.session_id, s.source_agent, s.created_at
+), root_records AS (
+    SELECT session_id, source_agent, created_at, message_count,
+           first_message_at, last_message_at
+    FROM signatures
+    WHERE source_agent IN ('claude-code', 'codex-cli')
+    ORDER BY source_agent, session_id
+    LIMIT 100001
 ), duplicate_groups AS (
     SELECT source_agent, created_at, message_count,
            first_message_at, last_message_at,
@@ -56,15 +54,48 @@ POND_LOGICAL_DUPLICATES_SQL = """WITH signatures AS (
     GROUP BY source_agent, created_at, message_count,
              first_message_at, last_message_at
     HAVING count(*) > 1
+), aggregate_counts AS (
+    SELECT
+      (SELECT count(*) FROM sessions) AS sessions,
+      (SELECT count(*) FROM messages) AS messages,
+      (SELECT count(*) FROM parts) AS parts,
+      (SELECT count(*) FROM sessions
+       WHERE source_agent IS NULL
+          OR (source_agent != 'claude-code'
+              AND source_agent NOT LIKE 'claude-code/%'
+              AND source_agent != 'codex-cli')) AS disallowed_sessions,
+      (SELECT count(*) FROM duplicate_groups) AS logical_duplicate_groups,
+      (SELECT coalesce(sum(session_count), 0)
+       FROM duplicate_groups) AS sessions_in_logical_duplicate_groups
 )
-SELECT count(*) AS logical_duplicate_groups,
-       coalesce(sum(session_count), 0) AS sessions_in_logical_duplicate_groups
-FROM duplicate_groups"""
+SELECT 'root' AS row_kind,
+       session_id, source_agent,
+       CAST(created_at AS VARCHAR) AS created_at,
+       message_count,
+       CAST(first_message_at AS VARCHAR) AS first_message_at,
+       CAST(last_message_at AS VARCHAR) AS last_message_at,
+       CAST(NULL AS BIGINT) AS sessions,
+       CAST(NULL AS BIGINT) AS messages,
+       CAST(NULL AS BIGINT) AS parts,
+       CAST(NULL AS BIGINT) AS disallowed_sessions,
+       CAST(NULL AS BIGINT) AS logical_duplicate_groups,
+       CAST(NULL AS BIGINT) AS sessions_in_logical_duplicate_groups
+FROM root_records
+UNION ALL
+SELECT 'aggregate' AS row_kind,
+       CAST(NULL AS VARCHAR) AS session_id,
+       CAST(NULL AS VARCHAR) AS source_agent,
+       CAST(NULL AS VARCHAR) AS created_at,
+       CAST(NULL AS BIGINT) AS message_count,
+       CAST(NULL AS VARCHAR) AS first_message_at,
+       CAST(NULL AS VARCHAR) AS last_message_at,
+       sessions, messages, parts, disallowed_sessions,
+       logical_duplicate_groups, sessions_in_logical_duplicate_groups
+FROM aggregate_counts
+ORDER BY row_kind, source_agent, session_id"""
 
 _ERROR = "archive backup preflight failed"
-_ROOT_FILENAME = "root-inventory.ndjson"
-_COUNTS_FILENAME = "corpus-counts.ndjson"
-_DUPLICATES_FILENAME = "duplicates.ndjson"
+_CORPUS_FILENAME = "corpus-snapshot.ndjson"
 POND_INVENTORY_FILENAME = "pond-inventory.json"
 _ROOT_COLUMNS = frozenset(
     {
@@ -76,11 +107,12 @@ _ROOT_COLUMNS = frozenset(
         "last_message_at",
     }
 )
-_EMPTY_ROOT_COLUMNS = _ROOT_COLUMNS - {"first_message_at", "last_message_at"}
-_CORPUS_COLUMNS = frozenset({"sessions", "messages", "parts", "disallowed_sessions"})
+_COUNT_COLUMNS = frozenset({"sessions", "messages", "parts", "disallowed_sessions"})
 _DUPLICATE_COLUMNS = frozenset(
     {"logical_duplicate_groups", "sessions_in_logical_duplicate_groups"}
 )
+_ALL_COUNT_COLUMNS = _COUNT_COLUMNS | _DUPLICATE_COLUMNS
+_SNAPSHOT_COLUMNS = _ROOT_COLUMNS | _ALL_COUNT_COLUMNS | {"row_kind"}
 _ROOT_AGENTS = frozenset({"claude-code", "codex-cli"})
 _R2_AUTHORITY = re.compile(r"\A[a-z0-9][a-z0-9-]*\.r2\.cloudflarestorage\.com\Z")
 _MAX_TIMEOUT_SECONDS = 1800
@@ -228,6 +260,7 @@ def capture_pond_store_snapshot(
     pond_config: Path,
     workspace: Path,
     timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
 ) -> PondStoreSnapshot:
     """Capture root records and exact whole-store counts without retaining rows."""
     workspace_descriptor: int | None = None
@@ -249,6 +282,7 @@ def capture_pond_store_snapshot(
             timeout_seconds=10.0,
             run_directory=workspace_path,
             label="snapshot-version",
+            progress_callback=progress_callback,
         )
         if version.returncode != 0:
             raise _failure()
@@ -262,42 +296,19 @@ def capture_pond_store_snapshot(
         if not is_pinned_pond_version(version_tokens):
             raise _failure()
 
-        root_data = _run_sql(
+        corpus_data = _run_sql(
             binary,
             selector=selector,
             pond_config=pond_config,
             workspace=workspace_path,
             workspace_descriptor=workspace_descriptor,
             timeout=timeout,
-            sql=POND_INVENTORY_SQL,
-            filename=_ROOT_FILENAME,
-            label="root-inventory",
+            sql=POND_CORPUS_SNAPSHOT_SQL,
+            filename=_CORPUS_FILENAME,
+            label="corpus-snapshot",
+            progress_callback=progress_callback,
         )
-        count_data = _run_sql(
-            binary,
-            selector=selector,
-            pond_config=pond_config,
-            workspace=workspace_path,
-            workspace_descriptor=workspace_descriptor,
-            timeout=timeout,
-            sql=POND_CORPUS_COUNTS_SQL,
-            filename=_COUNTS_FILENAME,
-            label="corpus-counts",
-        )
-        duplicate_data = _run_sql(
-            binary,
-            selector=selector,
-            pond_config=pond_config,
-            workspace=workspace_path,
-            workspace_descriptor=workspace_descriptor,
-            timeout=timeout,
-            sql=POND_LOGICAL_DUPLICATES_SQL,
-            filename=_DUPLICATES_FILENAME,
-            label="duplicates",
-        )
-        records = _root_records(root_data)
-        corpus = _one_count_row(count_data, _CORPUS_COLUMNS)
-        duplicates = _one_count_row(duplicate_data, _DUPLICATE_COLUMNS)
+        records, corpus = _corpus_snapshot(corpus_data)
         inventory = PondInventory(
             schema_version=1,
             captured_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -309,8 +320,8 @@ def capture_pond_store_snapshot(
             messages=corpus["messages"],
             parts=corpus["parts"],
             disallowed_sessions=corpus["disallowed_sessions"],
-            logical_duplicate_groups=duplicates["logical_duplicate_groups"],
-            sessions_in_logical_duplicate_groups=duplicates[
+            logical_duplicate_groups=corpus["logical_duplicate_groups"],
+            sessions_in_logical_duplicate_groups=corpus[
                 "sessions_in_logical_duplicate_groups"
             ],
         )
@@ -556,6 +567,7 @@ def _run_sql(
     sql: str,
     filename: str,
     label: str,
+    progress_callback: Callable[[], None] | None,
 ) -> bytes:
     artifact = workspace / filename
     result = run_pond_process(
@@ -578,6 +590,7 @@ def _run_sql(
         run_directory=workspace,
         label=label,
         artifact_path=artifact,
+        progress_callback=progress_callback,
     )
     if result.returncode != 0:
         raise _failure()
@@ -616,25 +629,38 @@ def _read_private_artifact(directory_descriptor: int, name: str) -> bytes:
         raise _failure() from None
 
 
-def _root_records(data: bytes) -> tuple[PondInventoryRecord, ...]:
+def _corpus_snapshot(
+    data: bytes,
+) -> tuple[tuple[PondInventoryRecord, ...], dict[str, int]]:
     records: list[PondInventoryRecord] = []
     seen: set[tuple[str, str]] = set()
-    for line_number, line in enumerate(data.splitlines(), 1):
-        if line_number > MAX_INVENTORY_RECORDS:
-            raise _failure()
+    aggregate: dict[str, int] | None = None
+    lines = data.splitlines()
+    if not lines or len(lines) > MAX_INVENTORY_RECORDS + 2:
+        raise _failure()
+    for line in lines:
         try:
             row = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_object)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise _failure() from None
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or set(row) != _SNAPSHOT_COLUMNS:
             raise _failure()
-        columns = set(row)
-        if columns == _EMPTY_ROOT_COLUMNS and row.get("message_count") == 0:
-            row = {**row, "first_message_at": None, "last_message_at": None}
-        elif columns != _ROOT_COLUMNS:
+        row_kind = row["row_kind"]
+        if row_kind == "aggregate":
+            if aggregate is not None or any(
+                row[field] is not None for field in _ROOT_COLUMNS
+            ):
+                raise _failure()
+            aggregate = _count_values(row)
+            continue
+        if row_kind != "root" or any(
+            row[field] is not None for field in _ALL_COUNT_COLUMNS
+        ):
+            raise _failure()
+        if len(records) >= MAX_INVENTORY_RECORDS:
             raise _failure()
         try:
-            record = _pond_record(row)
+            record = _pond_record({field: row[field] for field in _ROOT_COLUMNS})
         except (KeyError, TypeError, ValueError):
             raise _failure() from None
         key = (record.source_agent, record.session_id)
@@ -642,25 +668,22 @@ def _root_records(data: bytes) -> tuple[PondInventoryRecord, ...]:
             raise _failure()
         seen.add(key)
         records.append(record)
-    return tuple(sorted(records, key=lambda row: (row.source_agent, row.session_id)))
+    if aggregate is None:
+        raise _failure()
+    return (
+        tuple(sorted(records, key=lambda row: (row.source_agent, row.session_id))),
+        aggregate,
+    )
 
 
-def _one_count_row(data: bytes, columns: frozenset[str]) -> dict[str, int]:
-    lines = data.splitlines()
-    if len(lines) != 1:
-        raise _failure()
-    try:
-        row = json.loads(lines[0].decode("utf-8"), object_pairs_hook=_unique_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        raise _failure() from None
-    if not isinstance(row, dict) or set(row) != columns:
-        raise _failure()
+def _count_values(row: dict[str, Any]) -> dict[str, int]:
+    values = {field: row[field] for field in _ALL_COUNT_COLUMNS}
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in row.values()
+        for value in values.values()
     ):
         raise _failure()
-    return row
+    return values
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
