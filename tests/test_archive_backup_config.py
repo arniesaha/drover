@@ -270,6 +270,39 @@ def test_backup_config_rejects_noncanonical_url_text(
     assert private_value not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("name", "character"),
+    [
+        ("next-line", "\u0085"),
+        ("no-break-space", "\u00a0"),
+        ("ideographic-space", "\u3000"),
+        ("line-separator", "\u2028"),
+        ("paragraph-separator", "\u2029"),
+        ("zero-width-space", "\u200b"),
+        ("left-to-right-mark", "\u200e"),
+        ("right-to-left-override", "\u202e"),
+        ("left-to-right-isolate", "\u2066"),
+        ("zero-width-no-break-space", "\ufeff"),
+    ],
+    ids=lambda value: value if len(value) > 1 else None,
+)
+def test_backup_config_rejects_unicode_whitespace_and_controls(
+    tmp_path, name: str, character: str
+):
+    values = _valid_config_values(tmp_path)
+    private_value = str(values["backup_root_url"]).replace(
+        "/drover", f"/dro{character}ver"
+    )
+    values["backup_root_url"] = private_value
+    config_path = _write_config(tmp_path / "backup.toml", values)
+
+    with pytest.raises(ValueError, match=r"^archive backup config failed$") as raised:
+        load_backup_config(config_path)
+
+    assert name not in str(raised.value)
+    assert private_value not in str(raised.value)
+
+
 def test_backup_config_rejects_noncanonical_executable_path(tmp_path):
     values = _valid_config_values(tmp_path)
     values["pond_binary"] = str(tmp_path / "pond-store" / ".." / "pond")

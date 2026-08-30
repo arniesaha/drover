@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -210,7 +211,10 @@ def _require_receipt_directory(value: Any) -> Path:
 
 def _require_backup_root_url(value: Any) -> str:
     value = _require_string(value)
-    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+    if any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    ):
         raise _invalid()
     try:
         parsed = urlsplit(value)
