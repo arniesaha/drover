@@ -19,6 +19,13 @@ from drover.server.archive.backup_receipt import (
     load_backup_receipt_chain,
     write_backup_receipt,
 )
+from drover.server.archive.backup_restore import (
+    BackupRestoreError,
+    RestoreResult,
+    restore_backup,
+    restore_summary,
+    validate_restore_request,
+)
 from drover.server.archive.backup_run import (
     BackupRunError,
     backup_run_summary,
@@ -109,6 +116,7 @@ __all__ = [
     "BackupConfig",
     "BackupPreflightResult",
     "BackupReceipt",
+    "BackupRestoreError",
     "BackupRunError",
     "CollisionCounts",
     "CoverageReport",
@@ -122,6 +130,7 @@ __all__ = [
     "RemotePondGeneration",
     "SourceEligibilityReceipt",
     "RegistryCandidate",
+    "RestoreResult",
     "SessionArchive",
     "build_coverage_report",
     "backup_receipt_summary",
@@ -150,6 +159,9 @@ __all__ = [
     "source_eligibility_summary",
     "run_backup_preflight",
     "run_backup",
+    "restore_backup",
+    "restore_summary",
+    "validate_restore_request",
     "write_private_json",
     "write_backup_receipt",
 ]
