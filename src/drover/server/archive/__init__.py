@@ -5,6 +5,11 @@ from drover.server.archive.backup_config import (
     generation_storage_url,
     load_backup_config,
 )
+from drover.server.archive.backup_preflight import (
+    BackupPreflightResult,
+    backup_preflight_summary,
+    run_backup_preflight,
+)
 from drover.server.archive.backup_receipt import (
     BackupReceipt,
     CollisionCounts,
@@ -54,6 +59,14 @@ from drover.server.archive.pond_inventory import (
     export_pond_inventory,
     pond_inventory_summary,
 )
+from drover.server.archive.pond_snapshot import (
+    LocalPondStore,
+    PondCorpusCounts,
+    PondStoreSnapshot,
+    RemotePondGeneration,
+    capture_pond_store_snapshot,
+    pond_inventory_content_sha256,
+)
 from drover.server.archive.source_eligibility import (
     assess_metadata_only_source,
     source_eligibility_summary,
@@ -89,21 +102,28 @@ __all__ = [
     "ArchiveTimeout",
     "ArchiveUnavailable",
     "BackupConfig",
+    "BackupPreflightResult",
     "BackupReceipt",
     "CollisionCounts",
     "CoverageReport",
     "NativeInventory",
     "NativeInventoryRecord",
+    "LocalPondStore",
     "PondInventory",
     "PondInventoryRecord",
+    "PondCorpusCounts",
+    "PondStoreSnapshot",
+    "RemotePondGeneration",
     "SourceEligibilityReceipt",
     "RegistryCandidate",
     "SessionArchive",
     "build_coverage_report",
     "backup_receipt_summary",
+    "backup_preflight_summary",
     "assess_metadata_only_source",
     "coverage_summary",
     "canonical_private_json_bytes",
+    "capture_pond_store_snapshot",
     "discover_native_history_inventory",
     "export_pond_inventory",
     "generation_storage_url",
@@ -117,9 +137,11 @@ __all__ = [
     "load_registry_candidates",
     "native_inventory_summary",
     "pond_inventory_summary",
+    "pond_inventory_content_sha256",
     "private_json_sha256",
     "read_private_json",
     "source_eligibility_summary",
+    "run_backup_preflight",
     "write_private_json",
     "write_backup_receipt",
 ]

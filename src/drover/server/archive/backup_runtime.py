@@ -218,6 +218,13 @@ class RuntimeGuard:
             self._state = "failed"
             raise
 
+    def baseline_host_id(self) -> str:
+        """Return the private host identity from one active baseline."""
+        baseline = self._baseline
+        if self._state != "active" or baseline is None:
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        return baseline.host_id
+
     def finish(self) -> RuntimeEvidence:
         """Take a final sample and enforce the strict health percentile."""
         if self._state != "active":

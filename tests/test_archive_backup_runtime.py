@@ -391,6 +391,26 @@ def test_runtime_guard_collects_thirty_baseline_samples_and_a_final_sample() -> 
     assert evidence.health_p95_ms == 8.0
 
 
+def test_runtime_guard_refuses_host_identity_before_baseline_capture() -> None:
+    guard = RuntimeGuard(_FakeRuntimeProbe([_snapshot()]), minimum_samples=1)
+
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        guard.baseline_host_id()
+
+
+def test_runtime_guard_returns_private_host_identity_only_after_baseline_capture() -> (
+    None
+):
+    guard = RuntimeGuard(
+        _FakeRuntimeProbe([_snapshot(), _snapshot()]), minimum_samples=1
+    )
+
+    guard.capture_baseline()
+
+    assert guard.baseline_host_id() == _PRIVATE_HOST
+    assert _PRIVATE_HOST not in repr(guard)
+
+
 @pytest.mark.parametrize(
     "changed",
     ["host", "hub", "harnessd", "pond", "dropped"],
