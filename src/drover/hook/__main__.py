@@ -3,8 +3,18 @@
 Invoked by Claude Code SessionStart/SessionEnd hooks (and per-harness
 wrappers for OpenClaw, Hermes, pi-mono).
 
-Per spec §3.1: hard 2-second budget, errors print "(drover offline)" to
-stderr and exit 0 — never block the agent from starting.
+Per spec §3.1: hard 2-second budget. Two distinct failure modes:
+
+- **Timeout** (server live but slow): prints
+  ``"(drover timeout: context unavailable)"`` to stderr and exits 0.
+- **Connection failure** (server unreachable/refused): prints
+  ``"(drover offline)"`` to stderr and exits 0.
+
+The hook never blocks the agent from starting.
+
+Note: No automatic retry is performed. The hook operates within a
+deliberate hard latency budget; retry would silently double it. Use
+``--timeout`` to adjust the budget if needed.
 """
 
 from __future__ import annotations
@@ -43,6 +53,12 @@ def _load_hook_config(path: Optional[Path]) -> dict:
 def _emit_offline(reason: str) -> None:
     print("(drover offline)", file=sys.stderr)
     log.warning("drover-hook offline: %s", reason)
+
+
+def _emit_timeout() -> None:
+    """Emit the stable timeout sentinel. Never uses the word 'offline'."""
+    print("(drover timeout: context unavailable)", file=sys.stderr)
+    log.warning("drover-hook timeout: context unavailable")
 
 
 @click.group()
@@ -93,7 +109,7 @@ def session_start(
             timeout_s=timeout_s,
         )
     except HookTimeout:
-        _emit_offline(f"timeout after {timeout_s}s")
+        _emit_timeout()
         return
     except Exception as exc:  # noqa: BLE001
         _emit_offline(f"{type(exc).__name__}: {exc}")
@@ -125,7 +141,7 @@ def session_end(
             timeout_s=timeout_s,
         )
     except HookTimeout:
-        _emit_offline(f"timeout after {timeout_s}s")
+        _emit_timeout()
     except Exception as exc:  # noqa: BLE001
         _emit_offline(f"{type(exc).__name__}: {exc}")
 

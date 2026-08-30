@@ -50,9 +50,15 @@ mcp_url  = "http://drover-host.local:7077/mcp"  # default: http://127.0.0.1:7077
 
 ## Failure modes
 
-- drover-server unreachable → both subcommands print `(drover offline)`
-  to stderr and exit 0. The agent never blocks.
-- Hard 2-second budget per spec §3.1.
+- **Timeout** (server live but slow): both subcommands print
+  `(drover timeout: context unavailable)` to stderr and exit 0.
+- **Connection failure** (server unreachable/refused): both subcommands
+  print `(drover offline)` to stderr and exit 0.
+- In all cases the agent never blocks.
+- Hard 2-second budget per spec §3.1. Use `--timeout` to adjust.
+
+  No automatic retry is performed — the hook operates within a deliberate
+  hard latency budget and retry would silently double it.
 
 ## Per-host paths
 
