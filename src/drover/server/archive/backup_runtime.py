@@ -27,6 +27,11 @@ from drover.config import (
     resolve_api_token_env,
 )
 from drover.server.archive.inventory import _open_nofollow_path
+from drover.server.archive.pond_process import (
+    LeaderGoneError,
+    LeaderObservationError,
+    observe_leader_exit_unreaped,
+)
 
 _PREFLIGHT_ERROR = "archive backup preflight failed"
 _LOCAL_CHANGED_ERROR = "archive backup local changed"
@@ -1244,16 +1249,11 @@ def _tool_leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
     if process.returncode is not None:
         raise _ToolLeaderReapedOrUnknown(_PREFLIGHT_ERROR)
     try:
-        status = os.waitid(
-            os.P_PID,
-            process.pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        )
-    except ChildProcessError:
+        return observe_leader_exit_unreaped(process)
+    except LeaderGoneError:
         raise _ToolLeaderReapedOrUnknown(_PREFLIGHT_ERROR) from None
-    except (AttributeError, OSError):
+    except LeaderObservationError:
         raise _ToolLeaderObservationFailed(_PREFLIGHT_ERROR) from None
-    return status is not None
 
 
 def _tool_leader_still_reserved(process: subprocess.Popen[bytes]) -> bool:

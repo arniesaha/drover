@@ -947,19 +947,109 @@ def _enforce_resource_limits(
         raise PondProcessError("resource")
 
 
-def _leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
-    """Observe leader exit while retaining its PID/PGID reservation."""
+class LeaderGoneError(Exception):
+    """The leader was reaped or vanished while we still held its reservation."""
+
+
+class LeaderObservationError(Exception):
+    """The platform could not answer whether the leader has exited."""
+
+
+#: XNU `sys/proc.h` process status values; SZOMB marks an exited, unreaped
+#: process. Stable ABI constants, not guesses.
+_DARWIN_SZOMB = 5
+#: `PROC_PIDTBSDINFO` flavor and the exact `struct proc_bsdinfo` size the
+#: kernel insists on (a short buffer makes the call fail, not truncate).
+_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_PROC_BSDINFO_SIZE = 136
+_DARWIN_PBI_STATUS_OFFSET = 4
+
+
+def _darwin_leader_exited_unreaped(pid: int) -> bool:
+    """`waitid(WNOWAIT)` equivalent for macOS, which ships no `os.waitid`.
+
+    Two observations, measured rather than assumed:
+
+    * `kill(pid, 0)` succeeds for a zombie and fails `ESRCH` only once the
+      process is reaped -- so its success is proof the PID/PGID reservation
+      the callers depend on is still held.
+    * `proc_pidinfo(PROC_PIDTBSDINFO)` refuses zombies with `ESRCH` while
+      answering for running processes.
+
+    A reserved PID the kernel refuses to describe is therefore exactly an
+    exited, unreaped leader. We are the only reaper of our own children, so
+    the refusal cannot mean anything else here. A PID that fails `kill(0)`
+    was reaped out from under us; that is `LeaderGoneError`, matching what
+    `waitid` reports as `ChildProcessError`.
+    """
+    import ctypes
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise LeaderGoneError from None
+    except OSError:
+        raise LeaderObservationError from None
+    try:
+        libproc = ctypes.CDLL("libproc.dylib", use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        raise LeaderObservationError from None
+    buffer = ctypes.create_string_buffer(_DARWIN_PROC_BSDINFO_SIZE)
+    returned = proc_pidinfo(
+        pid, _DARWIN_PROC_PIDTBSDINFO, 0, buffer, _DARWIN_PROC_BSDINFO_SIZE
+    )
+    if returned != _DARWIN_PROC_BSDINFO_SIZE:
+        # Reserved (kill succeeded moments ago) but not describable: a zombie.
+        return True
+    status = int.from_bytes(
+        buffer.raw[_DARWIN_PBI_STATUS_OFFSET : _DARWIN_PBI_STATUS_OFFSET + 4],
+        "little",
+    )
+    return status == _DARWIN_SZOMB
+
+
+def observe_leader_exit_unreaped(process: subprocess.Popen[bytes]) -> bool:
+    """Whether the leader has exited, without surrendering its reservation.
+
+    On platforms with `os.waitid` this is `WNOWAIT`. macOS CPython ships no
+    `os.waitid` at all -- which CI (Linux) cannot notice, and which made every
+    subprocess-supervised archive command fail on the platform the hub
+    actually runs on -- so there the same answer comes from `proc_pidinfo`.
+    Raises `LeaderGoneError` when the leader was already reaped and
+    `LeaderObservationError` when the platform cannot say.
+    """
     if process.returncode is not None:
         return True
+    if not hasattr(os, "waitid"):
+        return _darwin_leader_exited_unreaped(process.pid)
     try:
         status = os.waitid(
             os.P_PID,
             process.pid,
             os.WEXITED | os.WNOHANG | os.WNOWAIT,
         )
-    except (AttributeError, ChildProcessError, OSError):
-        raise PondProcessError("subprocess") from None
+    except ChildProcessError:
+        raise LeaderGoneError from None
+    except OSError:
+        raise LeaderObservationError from None
     return status is not None
+
+
+def _leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
+    """Observe leader exit while retaining its PID/PGID reservation."""
+    try:
+        return observe_leader_exit_unreaped(process)
+    except (LeaderGoneError, LeaderObservationError):
+        raise PondProcessError("subprocess") from None
 
 
 def _stop_process(process: subprocess.Popen[bytes], process_group: int) -> int:
@@ -1196,14 +1286,9 @@ def _select_readable(
 
 def _sampler_leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
     try:
-        status = os.waitid(
-            os.P_PID,
-            process.pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        )
-    except (AttributeError, ChildProcessError, OSError):
+        return observe_leader_exit_unreaped(process)
+    except (LeaderGoneError, LeaderObservationError):
         raise PondProcessError("resource") from None
-    return status is not None
 
 
 def _stop_sampler_process(process: subprocess.Popen[bytes]) -> int:

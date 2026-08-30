@@ -1152,13 +1152,15 @@ def test_bounded_command_never_signals_a_group_after_reaping_its_leader(
 def test_bounded_command_never_signals_after_observer_loses_child_ownership(
     monkeypatch: pytest.MonkeyPatch, observer_failure: str
 ) -> None:
+    """Patched at the portable observer seam, not `os.waitid`: macOS has no
+    waitid at all, so the platform primitive is no longer the contract."""
     signals: list[tuple[str, int, int]] = []
 
-    def reap_then_fail(_id_type: int, pid: int, _options: int) -> None:
-        os.waitpid(pid, 0)
+    def reap_then_fail(process: object) -> bool:
+        os.waitpid(process.pid, 0)
         if observer_failure == "child_process":
-            raise ChildProcessError
-        raise OSError
+            raise runtime_module.LeaderGoneError
+        raise runtime_module.LeaderObservationError
 
     def forbidden_killpg(process_group: int, signal_number: int) -> None:
         signals.append(("group", process_group, signal_number))
@@ -1168,7 +1170,7 @@ def test_bounded_command_never_signals_after_observer_loses_child_ownership(
         signals.append(("process", pid, signal_number))
         raise ProcessLookupError
 
-    monkeypatch.setattr(runtime_module.os, "waitid", reap_then_fail)
+    monkeypatch.setattr(runtime_module, "observe_leader_exit_unreaped", reap_then_fail)
     monkeypatch.setattr(runtime_module.os, "killpg", forbidden_killpg)
     monkeypatch.setattr(runtime_module.os, "kill", forbidden_kill)
 
@@ -1198,14 +1200,16 @@ def test_bounded_command_signals_when_observer_fails_but_child_is_still_live(
     signals: list[tuple[int, int]] = []
     process_group = 0
 
-    def failed_waitid(*_args: object) -> None:
-        raise OSError
+    def failed_observation(_process: object) -> bool:
+        raise runtime_module.LeaderObservationError
 
     def recording_killpg(process_group: int, signal_number: int) -> None:
         signals.append((process_group, signal_number))
         real_killpg(process_group, signal_number)
 
-    monkeypatch.setattr(runtime_module.os, "waitid", failed_waitid)
+    monkeypatch.setattr(
+        runtime_module, "observe_leader_exit_unreaped", failed_observation
+    )
     monkeypatch.setattr(runtime_module.os, "killpg", recording_killpg)
 
     try:
@@ -1227,10 +1231,13 @@ def test_bounded_command_signals_when_observer_fails_but_child_is_still_live(
             _wait_for_process_group_exit(process_group)
 
 
-@pytest.mark.parametrize("failure", ["missing", "error"])
+@pytest.mark.parametrize("failure", ["gone", "error"])
 def test_tool_leader_observation_fails_closed_without_reaping_fallback(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
+    """Both observer outcomes fail closed; neither may fall back to a reaping
+    `poll()`. The old "waitid missing" case is now a supported platform
+    (macOS) handled inside the observer, not a failure to simulate."""
     observer = getattr(runtime_module, "_tool_leader_exited_without_reap", None)
     assert observer is not None
 
@@ -1241,14 +1248,14 @@ def test_tool_leader_observation_fails_closed_without_reaping_fallback(
         def poll(self) -> int:
             raise AssertionError("poll would reap the reserved leader")
 
-    if failure == "missing":
-        monkeypatch.delattr(runtime_module.os, "waitid")
-    else:
+    def failed_observation(_process: object) -> bool:
+        if failure == "gone":
+            raise runtime_module.LeaderGoneError
+        raise runtime_module.LeaderObservationError
 
-        def failed_waitid(*_args: object) -> None:
-            raise OSError
-
-        monkeypatch.setattr(runtime_module.os, "waitid", failed_waitid)
+    monkeypatch.setattr(
+        runtime_module, "observe_leader_exit_unreaped", failed_observation
+    )
 
     with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
         observer(UnreapedProcess())
