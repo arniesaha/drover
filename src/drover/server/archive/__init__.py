@@ -19,6 +19,11 @@ from drover.server.archive.backup_receipt import (
     load_backup_receipt_chain,
     write_backup_receipt,
 )
+from drover.server.archive.backup_run import (
+    BackupRunError,
+    backup_run_summary,
+    run_backup,
+)
 from drover.server.archive.coverage import (
     CoverageReport,
     RegistryCandidate,
@@ -104,6 +109,7 @@ __all__ = [
     "BackupConfig",
     "BackupPreflightResult",
     "BackupReceipt",
+    "BackupRunError",
     "CollisionCounts",
     "CoverageReport",
     "NativeInventory",
@@ -119,6 +125,7 @@ __all__ = [
     "SessionArchive",
     "build_coverage_report",
     "backup_receipt_summary",
+    "backup_run_summary",
     "backup_preflight_summary",
     "assess_metadata_only_source",
     "coverage_summary",
@@ -142,6 +149,7 @@ __all__ = [
     "read_private_json",
     "source_eligibility_summary",
     "run_backup_preflight",
+    "run_backup",
     "write_private_json",
     "write_backup_receipt",
 ]
