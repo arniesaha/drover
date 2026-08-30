@@ -48,6 +48,7 @@ from drover.server.archive.pond_process import (
 from drover.server.archive.pond_snapshot import (
     POND_INVENTORY_FILENAME,
     LocalPondStore,
+    PondCorpusCounts,
     PondStoreSnapshot,
     capture_pond_store_snapshot,
 )
@@ -209,6 +210,7 @@ def _run_backup_preflight_at(
         resource_limits=resource_limits,
         receipt_directory_descriptor=receipt_directory_descriptor,
         receipt_directory_identity=receipt_directory_identity,
+        require_ready=True,
         dependencies=_PRODUCTION_DEPENDENCIES,
     )
 
@@ -222,9 +224,10 @@ def _run_backup_preflight(
     resource_limits: ResourceLimits | None = None,
     receipt_directory_descriptor: int | None = None,
     receipt_directory_identity: tuple[int, ...] | None = None,
+    require_ready: bool = False,
     dependencies: _PreflightDependencies,
 ) -> BackupPreflightResult:
-    """Capture one local-only denominator and reject every unsafe counter."""
+    """Capture one local-only denominator and optionally require readiness."""
     workspace_descriptor: int | None = None
     config_descriptor: int | None = None
     store_descriptor: int | None = None
@@ -234,6 +237,7 @@ def _run_backup_preflight(
         if (
             type(runtime_guard) is not RuntimeGuard
             or type(dependencies) is not _PreflightDependencies
+            or type(require_ready) is not bool
         ):
             raise _failure()
         deps = dependencies
@@ -321,9 +325,9 @@ def _run_backup_preflight(
         canonical_summary = coverage_summary(report)
         if supplied_summary != canonical_summary:
             raise _failure()
-        _require_coverage_ready(canonical_summary)
+        _require_coverage_valid(canonical_summary)
         summary = _freeze_mapping(canonical_summary)
-        _require_snapshot_ready(pond_snapshot)
+        _require_snapshot_valid(pond_snapshot)
         dry_run_evidence = _require_local_dry_run(
             config,
             workspace_path,
@@ -365,7 +369,9 @@ def _run_backup_preflight(
             ),
             eligibility_receipts_sha256=_eligibility_receipts_sha256(receipts),
         )
-        _require_result_ready(result)
+        _require_result_valid(result)
+        if require_ready and not _result_ready(result):
+            raise _failure()
         return result
     except BackupPreflightError:
         raise
@@ -385,12 +391,12 @@ def _run_backup_preflight(
 def backup_preflight_summary(result: BackupPreflightResult) -> dict[str, object]:
     """Return only aggregate, identifier-free preflight evidence."""
     try:
-        _require_result_ready(result)
+        _require_result_valid(result)
         canonical_coverage = coverage_summary(result.coverage)
-        _require_coverage_ready(canonical_coverage)
+        _require_coverage_valid(canonical_coverage)
         return {
             "schema_version": 1,
-            "ready": True,
+            "ready": _result_ready(result),
             "source_inventory": native_inventory_summary(result.source_inventory),
             "pond_corpus": result.pond_snapshot.counts.to_wire(),
             "coverage": canonical_coverage,
@@ -417,25 +423,31 @@ def _require_source_inventory(inventory: NativeInventory, host_id: str) -> None:
         raise _failure() from None
 
 
-def _require_snapshot_ready(snapshot: PondStoreSnapshot) -> None:
+def _require_snapshot_valid(snapshot: PondStoreSnapshot) -> None:
     try:
         if type(snapshot) is not PondStoreSnapshot:
             raise _failure()
         snapshot.root_inventory.to_wire()
-        counts = snapshot.counts
-        if (
-            counts.disallowed_sessions != 0
-            or counts.logical_duplicate_groups != 0
-            or counts.sessions_in_logical_duplicate_groups != 0
-        ):
+        if type(snapshot.counts) is not PondCorpusCounts:
             raise _failure()
+        snapshot.counts.to_wire()
     except BackupPreflightError:
         raise
     except (AttributeError, TypeError, ValueError):
         raise _failure() from None
 
 
-def _require_coverage_ready(summary: Mapping[str, object]) -> None:
+def _snapshot_ready(snapshot: PondStoreSnapshot) -> bool:
+    _require_snapshot_valid(snapshot)
+    counts = snapshot.counts
+    return (
+        counts.disallowed_sessions == 0
+        and counts.logical_duplicate_groups == 0
+        and counts.sessions_in_logical_duplicate_groups == 0
+    )
+
+
+def _require_coverage_valid(summary: Mapping[str, object]) -> None:
     if not isinstance(summary, dict) or set(summary) != _COVERAGE_ROOT_FIELDS:
         raise _failure()
     if type(summary["schema_version"]) is not int or summary["schema_version"] != 1:
@@ -458,23 +470,22 @@ def _require_coverage_ready(summary: Mapping[str, object]) -> None:
         or set(certified) != _CERTIFIED_FIELDS
     ):
         raise _failure()
-    if any(_exact_nonnegative(misses[field]) != 0 for field in _MISS_FIELDS):
-        raise _failure()
-    if any(_exact_nonnegative(collisions[field]) != 0 for field in _COLLISION_FIELDS):
-        raise _failure()
-    if _exact_nonnegative(current["discovered_not_synced"]) != 0:
-        raise _failure()
+    for field in _MISS_FIELDS:
+        _exact_nonnegative(misses[field])
+    for field in _COLLISION_FIELDS:
+        _exact_nonnegative(collisions[field])
     current_discovered = _exact_nonnegative(current["discovered"])
     current_matched = _exact_nonnegative(current["matched"])
     current_ineligible = _exact_nonnegative(current["source_not_archive_eligible"])
-    if current_discovered != current_matched + current_ineligible:
+    current_not_synced = _exact_nonnegative(current["discovered_not_synced"])
+    if current_discovered != current_matched + current_ineligible + current_not_synced:
         raise _failure()
     eligible = _exact_nonnegative(candidate["eligible"])
     matched = _exact_nonnegative(candidate["matched"])
     percent = candidate["percent"]
     by_harness = candidate["by_harness"]
     if (
-        matched != eligible
+        matched > eligible
         or type(percent) is not float
         or not math.isfinite(percent)
         or percent != (round(matched * 100 / eligible, 1) if eligible else 0.0)
@@ -487,9 +498,11 @@ def _require_coverage_ready(summary: Mapping[str, object]) -> None:
     for harness in by_harness.values():
         if not isinstance(harness, dict) or set(harness) != _HARNESS_FIELDS:
             raise _failure()
-        harness_eligible += _exact_nonnegative(harness["eligible"])
-        harness_matched += _exact_nonnegative(harness["matched"])
-        if harness["matched"] > harness["eligible"]:
+        eligible_count = _exact_nonnegative(harness["eligible"])
+        matched_count = _exact_nonnegative(harness["matched"])
+        harness_eligible += eligible_count
+        harness_matched += matched_count
+        if matched_count > eligible_count:
             raise _failure()
     if harness_eligible != eligible or harness_matched != matched:
         raise _failure()
@@ -498,16 +511,32 @@ def _require_coverage_ready(summary: Mapping[str, object]) -> None:
         or _exact_nonnegative(certified["certified"]) != 0
     ):
         raise _failure()
-    unsupported = _exact_nonnegative(summary["unsupported_harness_sessions"])
-    if unsupported != 0 or summary["ready_for_next_writer"] is not True:
+    _exact_nonnegative(summary["unsupported_harness_sessions"])
+    if type(summary["ready_for_next_writer"]) is not bool:
         raise _failure()
 
 
-def _require_result_ready(result: BackupPreflightResult) -> None:
+def _coverage_ready(summary: Mapping[str, object]) -> bool:
+    _require_coverage_valid(summary)
+    misses = summary["misses"]
+    collisions = summary["collisions"]
+    current = summary["current_source_coverage"]
+    candidate = summary["candidate_coverage"]
+    return bool(
+        all(misses[field] == 0 for field in _MISS_FIELDS)
+        and all(collisions[field] == 0 for field in _COLLISION_FIELDS)
+        and current["discovered_not_synced"] == 0
+        and candidate["matched"] == candidate["eligible"]
+        and summary["unsupported_harness_sessions"] == 0
+        and summary["ready_for_next_writer"] is True
+    )
+
+
+def _require_result_valid(result: BackupPreflightResult) -> None:
     if type(result) is not BackupPreflightResult:
         raise _failure()
     _require_source_inventory(result.source_inventory, result.source_inventory.host_id)
-    _require_snapshot_ready(result.pond_snapshot)
+    _require_snapshot_valid(result.pond_snapshot)
     if (
         type(result.coverage) is not CoverageReport
         or type(result.resource_evidence) is not PondResourceEvidence
@@ -523,7 +552,7 @@ def _require_result_ready(result: BackupPreflightResult) -> None:
     ):
         raise _failure()
     canonical_summary = coverage_summary(result.coverage)
-    _require_coverage_ready(canonical_summary)
+    _require_coverage_valid(canonical_summary)
     if _thaw_mapping(result.coverage_summary) != canonical_summary:
         raise _failure()
     current = canonical_summary["current_source_coverage"]
@@ -540,6 +569,12 @@ def _require_result_ready(result: BackupPreflightResult) -> None:
     )
     if any(not isinstance(path, Path) for path in paths):
         raise _failure()
+
+
+def _result_ready(result: BackupPreflightResult) -> bool:
+    return _snapshot_ready(result.pond_snapshot) and _coverage_ready(
+        coverage_summary(result.coverage)
+    )
 
 
 def _freeze_mapping(value: Mapping[str, object]) -> Mapping[str, object]:

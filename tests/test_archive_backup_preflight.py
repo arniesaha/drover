@@ -20,6 +20,7 @@ from drover.server.archive.backup_preflight import (
     BackupPreflightResult,
     _PreflightDependencies,
     _run_backup_preflight,
+    _run_backup_preflight_at,
     backup_preflight_summary,
     run_backup_preflight,
 )
@@ -636,35 +637,55 @@ def test_preflight_coverage_summary_is_deeply_immutable_after_return(tmp_path):
     }
 
 
-def test_preflight_requires_every_candidate_to_be_matched(tmp_path):
+def test_public_preflight_returns_valid_not_ready_for_a_coverage_gate(tmp_path):
     config = _backup_config(tmp_path)
     fixture = _dependencies(tmp_path, config)
-    original_build = fixture.dependencies.build_coverage_report
+    original_load = fixture.dependencies.load_registry_candidates
 
-    def build_with_unmatched_candidate(*args, **kwargs):
-        report = original_build(*args, **kwargs)
-        details = (
-            replace(report.details[0], status="source_not_archive_eligible"),
-            *report.details[1:],
+    def load_with_unverifiable_candidate(path):
+        return (
+            *original_load(path),
+            RegistryCandidate(
+                "wrapper-private-missing",
+                _HOST_ID,
+                "claude-code",
+                "native-private-missing",
+            ),
         )
-        return replace(report, details=details, ready_for_next_writer=True)
 
     fixture = replace(
         fixture,
         dependencies=replace(
             fixture.dependencies,
-            build_coverage_report=build_with_unmatched_candidate,
+            load_registry_candidates=load_with_unverifiable_candidate,
         ),
     )
+    workspace = tmp_path / "workspace-private"
 
-    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        _run_backup_preflight(
-            config,
-            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
-            tmp_path / "workspace-private",
-            _runtime_guard(active=True),
-            dependencies=fixture.dependencies,
-        )
+    result = _run_backup_preflight(
+        config,
+        replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+        workspace,
+        _runtime_guard(active=True),
+        dependencies=fixture.dependencies,
+    )
+
+    summary = backup_preflight_summary(result)
+    assert summary["ready"] is False
+    assert summary["coverage"]["candidate_coverage"] == {
+        "eligible": 3,
+        "matched": 2,
+        "percent": 66.7,
+        "by_harness": {
+            "claude-code": {"eligible": 2, "matched": 1},
+            "codex-cli": {"eligible": 1, "matched": 1},
+        },
+    }
+    assert summary["coverage"]["misses"]["unverifiable"] == 1
+    assert any(call[0] == "process" for call in fixture.calls)
+    assert result.source_inventory_path.exists()
+    assert result.pond_inventory_path.exists()
+    assert result.coverage_report_path.exists()
 
 
 def test_preflight_discovers_metadata_without_parsing_native_transcript_bodies(
@@ -870,6 +891,61 @@ def test_applied_preflight_rejects_a_mismatched_receipt_root_identity(
         os.close(descriptor)
 
 
+def test_lock_owned_applied_preflight_fails_closed_on_valid_not_ready_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight_module = importlib.import_module("drover.server.archive.backup_preflight")
+    config = _backup_config(tmp_path)
+    fixture = _dependencies(tmp_path, config)
+    original_load = fixture.dependencies.load_registry_candidates
+
+    def load_with_unverifiable_candidate(path):
+        return (
+            *original_load(path),
+            RegistryCandidate(
+                "wrapper-private-missing",
+                _HOST_ID,
+                "claude-code",
+                "native-private-missing",
+            ),
+        )
+
+    dependencies = replace(
+        fixture.dependencies,
+        load_registry_candidates=load_with_unverifiable_candidate,
+    )
+    monkeypatch.setattr(preflight_module, "_PRODUCTION_DEPENDENCIES", dependencies)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(config.receipt_directory, flags)
+    metadata = os.fstat(descriptor)
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
+
+    try:
+        with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+            _run_backup_preflight_at(
+                config,
+                replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+                tmp_path / "workspace-private",
+                _runtime_guard(active=True),
+                receipt_directory_descriptor=descriptor,
+                receipt_directory_identity=identity,
+            )
+    finally:
+        os.close(descriptor)
+
+    assert any(call[0] == "process" for call in fixture.calls)
+
+
 def test_preflight_rejects_stale_eligibility_binding_with_fixed_error(tmp_path):
     config = _backup_config(tmp_path)
     dependencies = _dependencies(
@@ -965,7 +1041,7 @@ def test_preflight_requires_exact_dry_run_json_shape(dry_run, tmp_path):
         ("ready_for_next_writer",),
     ],
 )
-def test_preflight_checks_every_coverage_counter_not_only_ready_boolean(
+def test_preflight_rejects_noncanonical_dependency_summary_for_every_counter(
     fault_path, tmp_path
 ):
     def faulty_summary(report):
@@ -995,9 +1071,15 @@ def test_preflight_checks_every_coverage_counter_not_only_ready_boolean(
         ),
     ],
 )
-def test_preflight_requires_every_full_store_safety_counter_zero(counts, tmp_path):
-    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-        _run(tmp_path, snapshot=_snapshot(counts=counts))
+def test_public_preflight_returns_valid_not_ready_for_corpus_safety_gates(
+    counts, tmp_path
+):
+    result, _, fixture, _, _ = _run(tmp_path, snapshot=_snapshot(counts=counts))
+
+    summary = backup_preflight_summary(result)
+    assert summary["ready"] is False
+    assert summary["pond_corpus"] == counts.to_wire()
+    assert any(call[0] == "process" for call in fixture.calls)
 
 
 def test_preflight_registry_snapshot_exists_only_during_candidate_load(tmp_path):

@@ -7,11 +7,23 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import click
 import pytest
 from click.testing import CliRunner
 
 from drover.server import __main__ as server_main
 from drover.server.__main__ import main
+from drover.server.archive.backup_preflight import (
+    BackupPreflightResult,
+    backup_preflight_summary,
+)
+from drover.server.archive.coverage import (
+    RegistryCandidate,
+    build_coverage_report,
+    coverage_summary,
+)
+from drover.server.archive.inventory import NativeInventory, PondInventory
+from drover.server.archive.pond_snapshot import PondCorpusCounts, PondStoreSnapshot
 
 _ERROR_CATEGORIES = (
     "archive backup config failed",
@@ -46,6 +58,38 @@ def _assert_one_sorted_json(result, expected: dict[str, object]) -> None:
     assert result.stdout == json.dumps(expected, sort_keys=True) + "\n"
     assert result.stderr == ""
     assert len(result.stdout.splitlines()) == 1
+
+
+def _not_ready_preflight_result(workspace: Path) -> BackupPreflightResult:
+    captured_at = "2026-08-29T12:00:00Z"
+    source = NativeInventory(2, captured_at, "host-private", ())
+    pond = PondInventory(1, captured_at, "0.16.3", ())
+    snapshot = PondStoreSnapshot(
+        pond,
+        PondCorpusCounts(0, 0, 0, 0, 0, 0),
+    )
+    report = build_coverage_report(
+        (
+            RegistryCandidate(
+                "wrapper-private",
+                "host-private",
+                "unsupported-private",
+                "native-private",
+            ),
+        ),
+        (source,),
+        pond,
+    )
+    return BackupPreflightResult(
+        source_inventory=source,
+        pond_snapshot=snapshot,
+        coverage=report,
+        coverage_summary=coverage_summary(report),
+        source_inventory_path=workspace / "source-inventory.json",
+        pond_inventory_path=workspace / "pond-inventory.json",
+        coverage_report_path=workspace / "coverage-report.json",
+        source_not_archive_eligible=0,
+    )
 
 
 def _install_happy_services(monkeypatch, tmp_path: Path) -> dict[str, object]:
@@ -191,6 +235,18 @@ def test_archive_backup_help_is_exact() -> None:
         "restore",
         "run",
     }
+    assert type(server_main.archive_backup_cmd) is server_main._ArchiveBackupGroup
+    assert tuple(server_main.archive_backup_cmd.commands) == (
+        "preflight",
+        "run",
+        "restore",
+        "inspect-receipt",
+    )
+    assert server_main.archive_backup_cmd.params == []
+    assert server_main.archive_backup_cmd.context_settings == {}
+    assert server_main.archive_backup_cmd.chain is False
+    assert server_main.archive_backup_cmd.invoke_without_command is False
+    assert server_main.archive_backup_cmd.no_args_is_help is True
     expected_options = {
         "preflight": {"--config", "--help"},
         "run": {"--apply", "--config", "--help"},
@@ -203,13 +259,181 @@ def test_archive_backup_help_is_exact() -> None:
         },
         "inspect-receipt": {"--help", "--receipt"},
     }
+    expected_parameters = {
+        "preflight": (
+            (
+                "backup_config_path",
+                ("--config",),
+                True,
+                False,
+                click.types.StringParamType,
+            ),
+        ),
+        "run": (
+            (
+                "backup_config_path",
+                ("--config",),
+                True,
+                False,
+                click.types.StringParamType,
+            ),
+            ("apply", ("--apply",), False, True, click.types.BoolParamType),
+        ),
+        "restore": (
+            (
+                "backup_config_path",
+                ("--config",),
+                True,
+                False,
+                click.types.StringParamType,
+            ),
+            (
+                "receipt_path",
+                ("--receipt",),
+                True,
+                False,
+                click.types.StringParamType,
+            ),
+            (
+                "destination_path",
+                ("--destination",),
+                True,
+                False,
+                click.types.StringParamType,
+            ),
+            ("apply", ("--apply",), False, True, click.types.BoolParamType),
+        ),
+        "inspect-receipt": (
+            (
+                "receipt_path",
+                ("--receipt",),
+                True,
+                False,
+                click.types.StringParamType,
+            ),
+        ),
+    }
     for command, options in expected_options.items():
         help_result = runner.invoke(main, ["archive", "backup", command, "--help"])
         assert help_result.exit_code == 0
         assert _option_names(help_result.stdout) == options
+        click_command = server_main.archive_backup_cmd.commands[command]
+        assert type(click_command) is server_main._ArchiveBackupCommand
+        assert click_command.context_settings == {}
+        assert click_command.hidden is False
+        assert click_command.deprecated is False
+        assert (
+            tuple(
+                (
+                    parameter.name,
+                    tuple(parameter.opts),
+                    parameter.required,
+                    parameter.is_flag,
+                    type(parameter.type),
+                )
+                for parameter in click_command.params
+            )
+            == expected_parameters[command]
+        )
+        assert all(parameter.secondary_opts == [] for parameter in click_command.params)
+        assert all(parameter.nargs == 1 for parameter in click_command.params)
+        assert all(parameter.multiple is False for parameter in click_command.params)
+        assert all(parameter.hidden is False for parameter in click_command.params)
 
 
-def test_cli_preflight_composer_uses_a_private_temporary_workspace_and_runtime(
+@pytest.mark.parametrize(
+    ("arguments", "category", "private_values"),
+    (
+        (
+            ["archive", "backup", "s3+https://private-token.invalid/bucket"],
+            "archive backup config failed",
+            ("s3+https://private-token.invalid/bucket", "private-token"),
+        ),
+        (
+            ["archive", "backup", "--private-token=secret-value"],
+            "archive backup config failed",
+            ("--private-token", "secret-value"),
+        ),
+        (
+            ["archive", "backup", "preflight"],
+            "archive backup preflight failed",
+            (),
+        ),
+        (
+            ["archive", "backup", "preflight", "--config"],
+            "archive backup preflight failed",
+            ("--config",),
+        ),
+        (
+            [
+                "archive",
+                "backup",
+                "run",
+                "--private-token=child-secret-value",
+            ],
+            "archive backup preflight failed",
+            ("--private-token", "child-secret-value"),
+        ),
+        (
+            [
+                "archive",
+                "backup",
+                "run",
+                "--config",
+                "/private/operator/config.toml",
+                "split-secret",
+            ],
+            "archive backup preflight failed",
+            ("/private/operator/config.toml", "split-secret"),
+        ),
+        (
+            [
+                "archive",
+                "backup",
+                "restore",
+                "--config",
+                "/private/config.toml",
+                "--receipt",
+                "https://private.invalid/receipt",
+                "--destination",
+            ],
+            "archive backup restore failed",
+            (
+                "/private/config.toml",
+                "https://private.invalid/receipt",
+                "--destination",
+            ),
+        ),
+        (
+            [
+                "archive",
+                "backup",
+                "inspect-receipt",
+                "--receipt",
+                "/private/receipt.json",
+                "token-shaped-extra",
+            ],
+            "archive backup receipt failed",
+            ("/private/receipt.json", "token-shaped-extra"),
+        ),
+    ),
+)
+def test_archive_backup_parser_failures_are_fixed_and_sanitized(
+    arguments: list[str], category: str, private_values: tuple[str, ...]
+) -> None:
+    result = CliRunner().invoke(main, arguments)
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == f"Error: {category}\n"
+    assert result.exception is not None
+    for private_value in private_values:
+        assert private_value not in result.stdout
+        assert private_value not in result.stderr
+        assert private_value not in repr(result.exception)
+
+
+def test_cli_preflight_composer_retains_a_private_diagnostic_workspace_and_runtime(
     tmp_path: Path, monkeypatch
 ) -> None:
     receipts = tmp_path / "receipts"
@@ -265,7 +489,98 @@ def test_cli_preflight_composer_uses_a_private_temporary_workspace_and_runtime(
     assert events[3:] == ["finish", ("summary", preflight_result)]
     assert workspace_path is not None
     assert workspace_path.parent == receipts
-    assert not workspace_path.exists()
+    assert workspace_path.exists()
+    assert workspace_path.is_dir()
+    assert workspace_path.stat().st_mode & 0o777 == 0o700
+
+
+def test_cli_preflight_workspace_path_substitution_cannot_trigger_deletion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    receipts = tmp_path / "receipts"
+    receipts.mkdir(mode=0o700)
+    config = SimpleNamespace(receipt_directory=receipts)
+    moved_workspace = tmp_path / "retained-original-workspace"
+    observed_workspace: Path | None = None
+
+    class RecordingRuntime:
+        def __init__(self, _config) -> None:
+            pass
+
+        def capture_baseline(self) -> None:
+            pass
+
+        def finish(self) -> None:
+            pass
+
+    def preflight(_config, _drover_config, workspace, _runtime):
+        nonlocal observed_workspace
+        observed_workspace = workspace
+        original_marker = workspace / "original-private-artifact"
+        original_marker.write_text("private", encoding="utf-8")
+        original_marker.chmod(0o600)
+        workspace.rename(moved_workspace)
+        workspace.mkdir(mode=0o700)
+        replacement_marker = workspace / "replacement-private-artifact"
+        replacement_marker.write_text("private", encoding="utf-8")
+        replacement_marker.chmod(0o600)
+        return object()
+
+    monkeypatch.setattr(server_main, "RuntimeGuard", RecordingRuntime)
+    monkeypatch.setattr(server_main, "run_backup_preflight", preflight)
+    monkeypatch.setattr(
+        server_main,
+        "backup_preflight_summary",
+        lambda _result: {"ready": True, "schema_version": 1},
+    )
+
+    server_main._run_backup_preflight_for_cli(config, object())
+
+    assert observed_workspace is not None
+    assert observed_workspace.is_dir()
+    assert (observed_workspace / "replacement-private-artifact").is_file()
+    assert moved_workspace.is_dir()
+    assert (moved_workspace / "original-private-artifact").is_file()
+    for directory in (observed_workspace, moved_workspace):
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert next(directory.iterdir()).stat().st_mode & 0o777 == 0o600
+
+
+def test_cli_preflight_failure_retains_private_diagnostic_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    receipts = tmp_path / "receipts"
+    receipts.mkdir(mode=0o700)
+    config = SimpleNamespace(receipt_directory=receipts)
+    observed_workspace: Path | None = None
+
+    class RecordingRuntime:
+        def __init__(self, _config) -> None:
+            pass
+
+        def capture_baseline(self) -> None:
+            pass
+
+    def fail_preflight(_config, _drover_config, workspace, _runtime):
+        nonlocal observed_workspace
+        observed_workspace = workspace
+        marker = workspace / "failure-private-artifact"
+        marker.write_text("private", encoding="utf-8")
+        marker.chmod(0o600)
+        raise ValueError("private failure detail")
+
+    monkeypatch.setattr(server_main, "RuntimeGuard", RecordingRuntime)
+    monkeypatch.setattr(server_main, "run_backup_preflight", fail_preflight)
+
+    with pytest.raises(ValueError, match="^private failure detail$"):
+        server_main._run_backup_preflight_for_cli(config, object())
+
+    assert observed_workspace is not None
+    assert observed_workspace.is_dir()
+    assert observed_workspace.stat().st_mode & 0o777 == 0o700
+    artifact = observed_workspace / "failure-private-artifact"
+    assert artifact.is_file()
+    assert artifact.stat().st_mode & 0o777 == 0o600
 
 
 def test_preflight_emits_one_aggregate_json_document(
@@ -291,25 +606,58 @@ def test_preflight_emits_one_aggregate_json_document(
     ]
 
 
-def test_preflight_not_ready_emits_report_then_exits_two(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("command", ["preflight", "run"])
+def test_not_ready_local_preflight_emits_one_report_then_exits_two(
+    tmp_path: Path, monkeypatch, command: str
 ) -> None:
-    services = _install_happy_services(monkeypatch, tmp_path)
-    report = {"ready": False, "schema_version": 1}
-    monkeypatch.setattr(
-        server_main, "_run_backup_preflight_for_cli", lambda *_args: report
-    )
+    receipts = tmp_path / "receipts"
+    receipts.mkdir(mode=0o700)
+    config = SimpleNamespace(receipt_directory=receipts)
+    drover_config = object()
+    results: list[BackupPreflightResult] = []
+
+    class RecordingRuntime:
+        def __init__(self, supplied_config) -> None:
+            assert supplied_config is drover_config
+
+        def capture_baseline(self) -> None:
+            pass
+
+        def finish(self) -> None:
+            pass
+
+    def preflight(_config, _drover_config, workspace, _runtime):
+        result = _not_ready_preflight_result(workspace)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(server_main, "load_backup_config", lambda _path: config)
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: drover_config)
+    monkeypatch.setattr(server_main, "RuntimeGuard", RecordingRuntime)
+    monkeypatch.setattr(server_main, "run_backup_preflight", preflight)
 
     result = CliRunner().invoke(
         main,
         _global_args(tmp_path)
-        + ["archive", "backup", "preflight", "--config", _PRIVATE_CONFIG],
+        + ["archive", "backup", command, "--config", _PRIVATE_CONFIG],
     )
 
+    assert len(results) == 1
+    report = backup_preflight_summary(results[0])
+    expected = (
+        report
+        if command == "preflight"
+        else {
+            "mode": "dry-run",
+            "preflight_ready": False,
+            "remote_contacted": False,
+            "schema_version": 1,
+        }
+    )
     assert result.exit_code == 2
-    assert result.stdout == json.dumps(report, sort_keys=True) + "\n"
+    assert result.stdout == json.dumps(expected, sort_keys=True) + "\n"
     assert result.stderr == ""
-    assert all(call[0] not in {"run", "restore"} for call in services["calls"])
+    assert len(result.stdout.splitlines()) == 1
 
 
 def test_run_without_apply_is_local_only(tmp_path: Path, monkeypatch) -> None:

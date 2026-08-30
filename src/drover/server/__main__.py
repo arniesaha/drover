@@ -837,28 +837,92 @@ def _raise_archive_backup_error(error: Exception, fallback: str) -> None:
     raise click.ClickException(category) from None
 
 
+def _raise_archive_backup_usage_error(error: click.UsageError, category: str) -> None:
+    """Replace private parser input with one fixed operator category."""
+    if isinstance(error, click.exceptions.NoArgsIsHelpError):
+        raise error
+    raise click.ClickException(category) from None
+
+
+class _ArchiveBackupCommand(click.Command):
+    """Click command boundary that never formats private parser input."""
+
+    def __init__(self, *args: object, error_category: str, **kwargs: object) -> None:
+        self._error_category = error_category
+        super().__init__(*args, **kwargs)
+
+    def make_context(
+        self,
+        info_name: str | None,
+        args: list[str],
+        parent: click.Context | None = None,
+        **extra: object,
+    ) -> click.Context:
+        try:
+            return super().make_context(info_name, args, parent=parent, **extra)
+        except click.UsageError as error:
+            _raise_archive_backup_usage_error(error, self._error_category)
+
+
+class _ArchiveBackupGroup(click.Group):
+    """Click group boundary that sanitizes its own command resolution."""
+
+    def __init__(self, *args: object, error_category: str, **kwargs: object) -> None:
+        self._error_category = error_category
+        super().__init__(*args, **kwargs)
+
+    def make_context(
+        self,
+        info_name: str | None,
+        args: list[str],
+        parent: click.Context | None = None,
+        **extra: object,
+    ) -> click.Context:
+        try:
+            return super().make_context(info_name, args, parent=parent, **extra)
+        except click.UsageError as error:
+            _raise_archive_backup_usage_error(error, self._error_category)
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as error:
+            _raise_archive_backup_usage_error(error, self._error_category)
+
+
 def _run_backup_preflight_for_cli(
     config: BackupConfig, drover_config: DroverConfig
 ) -> dict[str, object]:
     """Compose the fixed local-only preflight service for Click callbacks."""
-    with tempfile.TemporaryDirectory(
-        prefix=".drover-backup-preflight-",
-        dir=config.receipt_directory,
-    ) as workspace_text:
-        workspace = Path(workspace_text)
-        runtime = RuntimeGuard(drover_config)
-        runtime.capture_baseline()
-        result = run_backup_preflight(config, drover_config, workspace, runtime)
-        runtime.finish()
-        return backup_preflight_summary(result)
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix=".drover-backup-preflight-",
+            dir=config.receipt_directory,
+        )
+    )
+    runtime = RuntimeGuard(drover_config)
+    runtime.capture_baseline()
+    result = run_backup_preflight(config, drover_config, workspace, runtime)
+    runtime.finish()
+    return backup_preflight_summary(result)
 
 
-@archive_cmd.group(name="backup")
+@archive_cmd.group(
+    name="backup",
+    cls=_ArchiveBackupGroup,
+    error_category="archive backup config failed",
+)
 def archive_backup_cmd() -> None:
     """Verify, back up, and restore private Pond generations."""
 
 
-@archive_backup_cmd.command(name="preflight")
+@archive_backup_cmd.command(
+    name="preflight",
+    cls=_ArchiveBackupCommand,
+    error_category="archive backup preflight failed",
+)
 @click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
 @click.pass_context
 def archive_backup_preflight_cmd(ctx: click.Context, backup_config_path: str) -> None:
@@ -880,7 +944,11 @@ def archive_backup_preflight_cmd(ctx: click.Context, backup_config_path: str) ->
         ctx.exit(2)
 
 
-@archive_backup_cmd.command(name="run")
+@archive_backup_cmd.command(
+    name="run",
+    cls=_ArchiveBackupCommand,
+    error_category="archive backup preflight failed",
+)
 @click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
 @click.option("--apply", is_flag=True)
 @click.pass_context
@@ -918,7 +986,11 @@ def archive_backup_run_cmd(
     click.echo(json.dumps(summary, sort_keys=True))
 
 
-@archive_backup_cmd.command(name="restore")
+@archive_backup_cmd.command(
+    name="restore",
+    cls=_ArchiveBackupCommand,
+    error_category="archive backup restore failed",
+)
 @click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
 @click.option("--receipt", "receipt_path", required=True, type=str, metavar="FILE")
 @click.option(
@@ -962,7 +1034,11 @@ def archive_backup_restore_cmd(
     click.echo(json.dumps(summary, sort_keys=True))
 
 
-@archive_backup_cmd.command(name="inspect-receipt")
+@archive_backup_cmd.command(
+    name="inspect-receipt",
+    cls=_ArchiveBackupCommand,
+    error_category="archive backup receipt failed",
+)
 @click.option("--receipt", "receipt_path", required=True, type=str, metavar="FILE")
 def archive_backup_inspect_receipt_cmd(receipt_path: str) -> None:
     """Validate one private receipt and print only aggregate evidence."""
