@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
+import http.server
 import json
 import os
+import signal
+import socket
 import stat
+import subprocess
+import sys
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 
 import pytest
 
@@ -62,6 +71,84 @@ class _Clock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+@dataclass(frozen=True, slots=True)
+class _HTTPReply:
+    status: int
+    body: bytes
+    delay_seconds: float = 0.0
+
+
+@contextmanager
+def _loopback_http_server(
+    replies: list[_HTTPReply],
+) -> Iterator[tuple[str, list[tuple[str, str | None]]]]:
+    pending = list(replies)
+    requests: list[tuple[str, str | None]] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append((self.path, self.headers.get("Authorization")))
+            reply = pending.pop(0)
+            if reply.delay_seconds:
+                time.sleep(reply.delay_seconds)
+            self.send_response(reply.status)
+            self.send_header("Content-Length", str(len(reply.body)))
+            self.end_headers()
+            try:
+                self.wfile.write(reply.body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_path(path: Path, timeout_seconds: float = 1.0) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            value = path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            value = ""
+        if value:
+            return value
+        time.sleep(0.01)
+    raise AssertionError("test process did not publish its identity")
+
+
+def _wait_for_process_group_exit(
+    process_group: int, timeout_seconds: float = 1.0
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group):
+            return True
+        time.sleep(0.01)
+    return not _process_group_exists(process_group)
 
 
 def _identity(
@@ -237,6 +324,33 @@ def test_backup_lock_rejects_unsafe_paths_without_disclosing_them(
 
     assert str(candidate) not in str(raised.value)
     assert target.read_text(encoding="utf-8") == "do not touch"
+
+
+def test_backup_lock_rejects_a_hard_link_without_mutating_the_source(
+    tmp_path: Path,
+) -> None:
+    receipt_directory = tmp_path / "private-receipts"
+    receipt_directory.mkdir(mode=0o700)
+    unrelated = tmp_path / "unrelated-private-file"
+    unrelated.write_bytes(b"unrelated private content")
+    unrelated.chmod(0o640)
+    lock_path = receipt_directory / ".backup.lock"
+    os.link(unrelated, lock_path)
+    expected_mode = stat.S_IMODE(unrelated.stat().st_mode)
+    expected_content = unrelated.read_bytes()
+    failure: BackupRuntimeError | None = None
+
+    try:
+        with BackupLock(receipt_directory):
+            pass
+    except BackupRuntimeError as error:
+        failure = error
+
+    assert stat.S_IMODE(unrelated.stat().st_mode) == expected_mode
+    assert unrelated.read_bytes() == expected_content
+    assert unrelated.stat().st_nlink == 2
+    assert failure is not None
+    assert str(failure) == "archive backup preflight failed"
 
 
 def test_backup_lock_releases_after_the_protected_body_raises(tmp_path: Path) -> None:
@@ -469,6 +583,58 @@ def test_live_runtime_uses_only_the_required_local_surfaces_and_is_lazy(
     ]
 
 
+@pytest.mark.parametrize(
+    "pond_url",
+    [
+        "http://127.0.0.1:0",
+        "http://localhost:0",
+        "http://[::1]:0",
+    ],
+)
+def test_live_runtime_rejects_an_explicit_zero_pond_port(
+    pond_url: str,
+) -> None:
+    with pytest.raises(
+        BackupRuntimeError, match=r"^archive backup preflight failed$"
+    ) as raised:
+        RuntimeGuard(_drover_config(pond_url=pond_url), minimum_samples=1)
+
+    assert pond_url not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("pond_url", "expected_port"),
+    [
+        ("http://127.0.0.1:9137", 9137),
+        ("http://localhost", 80),
+        ("http://[::1]", 80),
+    ],
+)
+def test_live_runtime_accepts_an_explicit_port_and_defaults_only_an_omitted_port(
+    pond_url: str, expected_port: int
+) -> None:
+    clock = _Clock()
+    listener_ports: list[int] = []
+
+    def listener_identity(port: int, _deadline: float) -> str:
+        listener_ports.append(port)
+        return f"process-{len(listener_ports)}"
+
+    guard = RuntimeGuard(
+        _drover_config(pond_url=pond_url),
+        minimum_samples=1,
+        http_get=_http_fake(clock),
+        listener_identity=listener_identity,
+        clock=clock,
+        swap_used=lambda _deadline: 100 * _MIB,
+        wait=lambda seconds: clock.advance(seconds),
+    )
+
+    guard.capture_baseline()
+
+    assert listener_ports == [7080, 7081, expected_port]
+
+
 def test_live_runtime_rejects_a_nonloopback_pond_url_without_contacting_it() -> None:
     config = _drover_config()
     private_url = "http://192.0.2.10:9123"
@@ -564,7 +730,7 @@ def test_live_runtime_rejects_a_listener_pid_reuse_without_exposing_it() -> None
         if "-iTCP:" in " ".join(command):
             port = int(next(part for part in command if part.startswith("-iTCP:"))[6:])
             pid = {7080: 101, 7081: 102, 9123: 103}[port]
-            return f"p{pid}\n".encode()
+            return f"{pid}\n".encode()
 
         raise AssertionError("only absolute listener discovery may spawn a tool")
 
@@ -595,7 +761,7 @@ def test_live_runtime_rejects_a_listener_pid_reuse_without_exposing_it() -> None
         assert private_value not in str(raised.value)
 
 
-@pytest.mark.parametrize("owners", [b"", b"p101\np202\n"])
+@pytest.mark.parametrize("owners", [b"", b"101\n202\n"])
 def test_live_runtime_fails_closed_on_zero_or_multiple_listener_owners(
     owners: bytes,
 ) -> None:
@@ -629,7 +795,7 @@ def test_live_runtime_rejects_a_start_token_change_during_listener_discovery() -
     def command_output(command: tuple[str, ...], _deadline: float) -> bytes:
         if not Path(command[0]).is_absolute() or "-iTCP:" not in " ".join(command):
             raise AssertionError("unexpected OS command")
-        return b"p101\n"
+        return b"101\n"
 
     def process_start(_pid: int, _deadline: float) -> str:
         nonlocal reads
@@ -713,3 +879,305 @@ def test_live_runtime_maps_all_http_and_parsing_values_to_a_fixed_error() -> Non
 
     assert private_payload.decode() not in str(raised.value)
     assert "/private/path" not in str(raised.value)
+
+
+def test_bounded_http_get_uses_real_loopback_status_body_and_authorization() -> None:
+    reply = _HTTPReply(status=202, body=b"accepted")
+    with _loopback_http_server([reply]) as (root, requests):
+        status, body = runtime_module._bounded_http_get(
+            f"{root}/runtime-check",
+            {"Authorization": "Bearer private-test-token"},
+            0.5,
+            len(reply.body),
+        )
+
+    assert status == 202
+    assert body == b"accepted"
+    assert requests == [("/runtime-check", "Bearer private-test-token")]
+
+
+def test_bounded_http_get_caps_a_real_loopback_response_body() -> None:
+    with _loopback_http_server([_HTTPReply(status=200, body=b"oversized")]) as (
+        root,
+        _requests,
+    ):
+        with pytest.raises(
+            BackupRuntimeError, match=r"^archive backup preflight failed$"
+        ):
+            runtime_module._bounded_http_get(f"{root}/body", {}, 0.5, 4)
+
+
+def test_live_runtime_rejects_a_real_loopback_http_status_without_disclosure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_body = b"private status body"
+    with _loopback_http_server([_HTTPReply(status=503, body=private_body)]) as (
+        root,
+        requests,
+    ):
+        port = int(root.rsplit(":", 1)[1])
+        config = dataclasses.replace(_drover_config(), metrics_http_port=port)
+        monkeypatch.setattr(runtime_module, "_HARNESS_PORT", port)
+        guard = RuntimeGuard(
+            config,
+            minimum_samples=1,
+            listener_identity=lambda listener_port, _deadline: f"owner-{listener_port}",
+            swap_used=lambda _deadline: 0,
+        )
+
+        with pytest.raises(
+            BackupRuntimeError, match=r"^archive backup preflight failed$"
+        ) as raised:
+            guard.capture_baseline()
+
+    assert requests == [("/healthz", f"Bearer {_PRIVATE_TOKEN}")]
+    assert private_body.decode("ascii") not in str(raised.value)
+
+
+def test_live_runtime_uses_real_loopback_auth_only_for_hub_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replies = [
+        _HTTPReply(status=200, body=b"ok\n"),
+        _HTTPReply(status=200, body=b'{"ready":true}'),
+        _HTTPReply(status=200, body=b"drover_harness_dropped_events_total 7\n"),
+        _HTTPReply(status=200, body=b'{"ok":true,"host_id":"private-host"}'),
+    ]
+    with _loopback_http_server(replies) as (root, requests):
+        port = int(root.rsplit(":", 1)[1])
+        config = dataclasses.replace(_drover_config(), metrics_http_port=port)
+        monkeypatch.setattr(runtime_module, "_HARNESS_PORT", port)
+        guard = RuntimeGuard(
+            config,
+            minimum_samples=1,
+            listener_identity=lambda listener_port, _deadline: f"owner-{listener_port}",
+            swap_used=lambda _deadline: 0,
+        )
+
+        guard.capture_baseline()
+
+    authorization = f"Bearer {_PRIVATE_TOKEN}"
+    assert requests == [
+        ("/healthz", authorization),
+        ("/readyz", authorization),
+        ("/metrics", authorization),
+        ("/healthz", None),
+    ]
+
+
+def test_live_runtime_shares_its_deadline_across_real_loopback_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replies = [
+        _HTTPReply(status=200, body=b"ok\n", delay_seconds=0.05),
+        _HTTPReply(status=200, body=b'{"ready":true}', delay_seconds=0.05),
+        _HTTPReply(
+            status=200,
+            body=b"drover_harness_dropped_events_total 7\n",
+            delay_seconds=0.5,
+        ),
+    ]
+    with _loopback_http_server(replies) as (root, requests):
+        port = int(root.rsplit(":", 1)[1])
+        config = dataclasses.replace(_drover_config(), metrics_http_port=port)
+        monkeypatch.setattr(runtime_module, "_HARNESS_PORT", port)
+        monkeypatch.setattr(runtime_module, "_CAPTURE_BUDGET_SECONDS", 0.35)
+        monkeypatch.setattr(runtime_module, "_HTTP_SLICE_SECONDS", 0.5)
+        guard = RuntimeGuard(
+            config,
+            minimum_samples=1,
+            listener_identity=lambda listener_port, _deadline: f"owner-{listener_port}",
+            swap_used=lambda _deadline: 0,
+        )
+        started = time.monotonic()
+
+        with pytest.raises(
+            BackupRuntimeError, match=r"^archive backup preflight failed$"
+        ):
+            guard.capture_baseline()
+        elapsed = time.monotonic() - started
+
+    assert requests[:2] == [
+        ("/healthz", f"Bearer {_PRIVATE_TOKEN}"),
+        ("/readyz", f"Bearer {_PRIVATE_TOKEN}"),
+    ]
+    assert len(requests) < 4
+    assert elapsed < 0.5
+
+
+def test_native_process_start_is_stable_and_fails_after_process_exit() -> None:
+    first = runtime_module._native_process_start(os.getpid(), time.monotonic() + 1.0)
+    second = runtime_module._native_process_start(os.getpid(), time.monotonic() + 1.0)
+    assert first == second
+
+    process = subprocess.Popen(
+        ("/bin/sleep", "0.2"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        child_token = runtime_module._native_process_start(
+            process.pid, time.monotonic() + 1.0
+        )
+        assert child_token
+        process.wait(timeout=1.0)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1.0)
+
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        runtime_module._native_process_start(process.pid, time.monotonic() + 1.0)
+
+
+def test_darwin_process_start_rejects_a_native_pid_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("native libproc PID validation is available only on Darwin")
+
+    class MismatchedProcPidInfo:
+        argtypes: list[object] = []
+        restype: object | None = None
+
+        def __call__(
+            self,
+            pid: int,
+            _flavor: int,
+            _argument: int,
+            address: object,
+            size: int,
+        ) -> int:
+            info = ctypes.cast(
+                address, ctypes.POINTER(runtime_module._ProcBSDInfo)
+            ).contents
+            info.pbi_pid = pid + 1
+            info.pbi_start_tvsec = 1
+            info.pbi_start_tvusec = 1
+            return size
+
+    class MismatchedLibproc:
+        proc_pidinfo = MismatchedProcPidInfo()
+
+    monkeypatch.setattr(
+        runtime_module.ctypes, "CDLL", lambda *_args, **_kwargs: MismatchedLibproc()
+    )
+
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        runtime_module._darwin_process_start(os.getpid())
+
+
+def test_linux_process_start_parser_rejects_an_embedded_pid_mismatch() -> None:
+    parser = getattr(runtime_module, "_parse_linux_process_start", None)
+    assert parser is not None
+    stat_bytes = b"321 (private command) " + b" ".join(
+        [b"S"] + [b"1"] * 18 + [b"12345"]
+    )
+
+    assert parser(321, stat_bytes) == "12345"
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        parser(654, stat_bytes)
+
+
+def test_bounded_command_times_out_and_reaps_the_real_process() -> None:
+    started = time.monotonic()
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        runtime_module._bounded_command_output(
+            ("/bin/sleep", "60"),
+            time.monotonic() + 0.1,
+            clock=time.monotonic,
+        )
+
+    assert time.monotonic() - started < 0.5
+
+
+def test_bounded_command_caps_real_process_output() -> None:
+    command = (
+        sys.executable,
+        "-c",
+        "import os; os.write(1, b'x' * 70000)",
+    )
+
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        runtime_module._bounded_command_output(
+            command,
+            time.monotonic() + 1.0,
+            clock=time.monotonic,
+        )
+
+
+def test_bounded_command_kills_an_orphaned_real_process_group(
+    tmp_path: Path,
+) -> None:
+    identity_path = tmp_path / "process-identities"
+    code = (
+        "import os,time; "
+        "child=os.fork(); "
+        f"path={str(identity_path)!r}; "
+        "(time.sleep(60) if child == 0 else "
+        "(open(path, 'w', encoding='ascii').write(f'{os.getpid()} {child}'), "
+        "os._exit(0)))"
+    )
+    process_group = 0
+    try:
+        with pytest.raises(
+            BackupRuntimeError, match=r"^archive backup preflight failed$"
+        ):
+            runtime_module._bounded_command_output(
+                (sys.executable, "-c", code),
+                time.monotonic() + 0.3,
+                clock=time.monotonic,
+            )
+        process_group, _child = map(int, _wait_for_path(identity_path).split())
+
+        assert _wait_for_process_group_exit(process_group)
+    finally:
+        if process_group and _process_group_exists(process_group):
+            os.killpg(process_group, signal.SIGKILL)
+            _wait_for_process_group_exit(process_group)
+
+
+def test_real_ephemeral_listener_has_one_stable_opaque_owner() -> None:
+    if not Path(runtime_module._LSOF_PATH).is_file():
+        pytest.skip(f"listener discovery tool unavailable on {sys.platform}")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        first = runtime_module._listener_process_identity(
+            port,
+            time.monotonic() + 2.0,
+            lambda command, deadline: runtime_module._bounded_command_output(
+                command, deadline, clock=time.monotonic
+            ),
+            runtime_module._native_process_start,
+        )
+        second = runtime_module._listener_process_identity(
+            port,
+            time.monotonic() + 2.0,
+            lambda command, deadline: runtime_module._bounded_command_output(
+                command, deadline, clock=time.monotonic
+            ),
+            runtime_module._native_process_start,
+        )
+
+    assert first == second
+    assert len(first) == 64
+    assert str(os.getpid()) not in first
+
+
+def test_direct_platform_swap_read_is_bounded_and_nonnegative() -> None:
+    started = time.monotonic()
+    used = runtime_module._system_swap_used(
+        time.monotonic() + 1.0,
+        lambda command, deadline: runtime_module._bounded_command_output(
+            command, deadline, clock=time.monotonic
+        ),
+    )
+
+    assert isinstance(used, int)
+    assert used >= 0
+    assert time.monotonic() - started < 1.0

@@ -533,10 +533,17 @@ def open_private_lock(path: Path) -> int:
         if (
             not stat.S_ISREG(lock_metadata.st_mode)
             or lock_metadata.st_uid != os.geteuid()
+            or lock_metadata.st_nlink != 1
         ):
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
         os.fchmod(lock_descriptor, 0o600)
-        if stat.S_IMODE(os.fstat(lock_descriptor).st_mode) != 0o600:
+        lock_metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.geteuid()
+            or lock_metadata.st_nlink != 1
+            or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+        ):
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
         _require_same_directory(directory, directory_metadata)
         keep_lock_descriptor = True
@@ -615,6 +622,8 @@ def _require_same_lock(path: Path, expected_descriptor: int) -> None:
     if (
         (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino)
         or not stat.S_ISREG(current.st_mode)
+        or expected.st_nlink != 1
+        or current.st_nlink != 1
         or current.st_uid != os.geteuid()
         or stat.S_IMODE(current.st_mode) != 0o600
     ):
@@ -630,7 +639,8 @@ def _loopback_pond_port(config: Any) -> int:
         raise BackupRuntimeError(_PREFLIGHT_ERROR)
     try:
         parsed = urlsplit(value)
-        port = parsed.port or 80
+        parsed_port = parsed.port
+        port = 80 if parsed_port is None else parsed_port
         host = parsed.hostname
         loopback = host == "localhost" or (
             host is not None and ipaddress.ip_address(host).is_loopback
@@ -836,7 +846,7 @@ def _listener_process_identity(
         "-a",
         f"-iTCP:{checked_port}",
         "-sTCP:LISTEN",
-        "-Fp",
+        "-t",
     )
     first_pids = _parse_listener_pids(command_output(lsof, deadline))
     if len(first_pids) != 1:
@@ -856,9 +866,9 @@ def _parse_listener_pids(output: bytes) -> tuple[int, ...]:
         raise BackupRuntimeError(_PREFLIGHT_ERROR)
     pids: set[int] = set()
     for line in output.splitlines():
-        if len(line) < 2 or line[:1] != b"p" or not line[1:].isdigit():
+        if not line.isdigit():
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
-        pid = int(line[1:])
+        pid = int(line)
         if pid <= 0:
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
         pids.add(pid)
@@ -965,11 +975,33 @@ def _linux_process_start(pid: int) -> str:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if len(data) > _MAX_PROCESS_TOKEN_BYTES:
+    return _parse_linux_process_start(pid, data)
+
+
+def _parse_linux_process_start(pid: int, data: bytes) -> str:
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or not isinstance(data, bytes)
+        or len(data) > _MAX_PROCESS_TOKEN_BYTES
+    ):
         raise BackupRuntimeError(_PREFLIGHT_ERROR)
+    opening_parenthesis = data.find(b" (")
     closing_parenthesis = data.rfind(b")")
-    fields = data[closing_parenthesis + 1 :].split() if closing_parenthesis >= 0 else []
-    if len(fields) < 20 or not fields[19].isdigit() or int(fields[19]) <= 0:
+    fields = (
+        data[closing_parenthesis + 1 :].split()
+        if closing_parenthesis > opening_parenthesis >= 1
+        else []
+    )
+    embedded_pid = data[:opening_parenthesis]
+    if (
+        not embedded_pid.isdigit()
+        or int(embedded_pid) != pid
+        or len(fields) < 20
+        or not fields[19].isdigit()
+        or int(fields[19]) <= 0
+    ):
         raise BackupRuntimeError(_PREFLIGHT_ERROR)
     return fields[19].decode("ascii")
 
@@ -1041,8 +1073,7 @@ def _bounded_command_output(
 
 
 def _reap_tool(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+    process.poll()
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (OSError, AttributeError):
