@@ -70,10 +70,10 @@ POND_CORPUS_SNAPSHOT_SQL = """WITH signatures AS (
 )
 SELECT 'root' AS row_kind,
        session_id, source_agent,
-       CAST(created_at AS VARCHAR) AS created_at,
+       created_at,
        message_count,
-       CAST(first_message_at AS VARCHAR) AS first_message_at,
-       CAST(last_message_at AS VARCHAR) AS last_message_at,
+       first_message_at,
+       last_message_at,
        CAST(NULL AS BIGINT) AS sessions,
        CAST(NULL AS BIGINT) AS messages,
        CAST(NULL AS BIGINT) AS parts,
@@ -85,10 +85,10 @@ UNION ALL
 SELECT 'aggregate' AS row_kind,
        CAST(NULL AS VARCHAR) AS session_id,
        CAST(NULL AS VARCHAR) AS source_agent,
-       CAST(NULL AS VARCHAR) AS created_at,
+       NULL AS created_at,
        CAST(NULL AS BIGINT) AS message_count,
-       CAST(NULL AS VARCHAR) AS first_message_at,
-       CAST(NULL AS VARCHAR) AS last_message_at,
+       NULL AS first_message_at,
+       NULL AS last_message_at,
        sessions, messages, parts, disallowed_sessions,
        logical_duplicate_groups, sessions_in_logical_duplicate_groups
 FROM aggregate_counts

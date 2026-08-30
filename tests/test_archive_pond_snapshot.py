@@ -8,6 +8,7 @@ import os
 import stat
 import textwrap
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
@@ -20,6 +21,7 @@ from drover.server.archive.pond_snapshot import (
     PondCorpusCounts,
     PondStoreSnapshot,
     RemotePondGeneration,
+    _corpus_snapshot,
     capture_pond_store_snapshot,
     pond_inventory_content_sha256,
 )
@@ -193,6 +195,50 @@ def _capture_local(pond_environment, tmp_path: Path) -> PondStoreSnapshot:
     )
 
 
+def _create_corpus_schema(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute(
+        "CREATE TABLE sessions (session_id VARCHAR, source_agent VARCHAR, "
+        "created_at TIMESTAMPTZ)"
+    )
+    connection.execute(
+        "CREATE TABLE messages (message_id VARCHAR, session_id VARCHAR, "
+        "timestamp TIMESTAMPTZ)"
+    )
+    connection.execute("CREATE TABLE parts (part_id VARCHAR)")
+
+
+def _pond_ndjson(cursor: duckdb.DuckDBPyConnection) -> bytes:
+    columns = [column[0] for column in cursor.description]
+
+    def encode_timestamp(value: object) -> str:
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise TypeError
+        return value.isoformat().replace("+00:00", "Z")
+
+    return "".join(
+        json.dumps(
+            dict(zip(columns, row, strict=True)),
+            default=encode_timestamp,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for row in cursor.fetchall()
+    ).encode("utf-8")
+
+
+def _snapshot_from_corpus_ndjson(data: bytes) -> PondStoreSnapshot:
+    records, counts = _corpus_snapshot(data)
+    return PondStoreSnapshot(
+        PondInventory(
+            schema_version=1,
+            captured_at="2026-08-29T12:00:00Z",
+            pond_version="0.16.3",
+            records=records,
+        ),
+        PondCorpusCounts(**counts),
+    )
+
+
 def test_snapshot_contains_root_inventory_and_full_store_safety_counts(
     pond_environment, tmp_path
 ):
@@ -313,6 +359,54 @@ def test_corpus_sql_counts_null_source_agent_as_disallowed() -> None:
 
     aggregate = next(row for row in rows if row["row_kind"] == "aggregate")
     assert aggregate["disallowed_sessions"] == 1
+
+
+def test_unified_corpus_sql_keeps_timestamps_for_the_production_parser() -> None:
+    with duckdb.connect() as connection:
+        connection.execute("SET TimeZone = 'America/Vancouver'")
+        _create_corpus_schema(connection)
+        connection.execute("""INSERT INTO sessions VALUES
+               ('claude-private', 'claude-code',
+                TIMESTAMPTZ '2026-08-29 03:00:00-07:00'),
+               ('codex-empty-private', 'codex-cli',
+                TIMESTAMPTZ '2026-08-29 04:00:00-07:00')""")
+        connection.execute("""INSERT INTO messages VALUES
+               ('message-private', 'claude-private',
+                TIMESTAMPTZ '2026-08-29 03:01:00-07:00')""")
+        data = _pond_ndjson(connection.execute(POND_CORPUS_SNAPSHOT_SQL))
+
+    snapshot = _snapshot_from_corpus_ndjson(data)
+
+    assert snapshot.root_inventory.records == (
+        PondInventoryRecord(
+            session_id="claude-private",
+            source_agent="claude-code",
+            created_at="2026-08-29T10:00:00Z",
+            message_count=1,
+            first_message_at="2026-08-29T10:01:00Z",
+            last_message_at="2026-08-29T10:01:00Z",
+        ),
+        PondInventoryRecord(
+            session_id="codex-empty-private",
+            source_agent="codex-cli",
+            created_at="2026-08-29T11:00:00Z",
+            message_count=0,
+            first_message_at=None,
+            last_message_at=None,
+        ),
+    )
+    assert snapshot.counts == PondCorpusCounts(2, 1, 0, 0, 0, 0)
+
+
+def test_unified_corpus_sql_constructs_an_empty_snapshot() -> None:
+    with duckdb.connect() as connection:
+        _create_corpus_schema(connection)
+        data = _pond_ndjson(connection.execute(POND_CORPUS_SNAPSHOT_SQL))
+
+    snapshot = _snapshot_from_corpus_ndjson(data)
+
+    assert snapshot.root_inventory.records == ()
+    assert snapshot.counts == PondCorpusCounts(0, 0, 0, 0, 0, 0)
 
 
 def test_snapshot_uses_remote_wrapper_and_remote_config_without_repr_disclosure(
