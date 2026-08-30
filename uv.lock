@@ -411,7 +411,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.0" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27" },
-    { name = "isort", marker = "extra == 'dev'" },
+    { name = "isort", marker = "extra == 'dev'", specifier = "==8.0.1" },
     { name = "mcp", specifier = ">=1.2,<2" },
     { name = "opentelemetry-proto", specifier = ">=1.30" },
     { name = "pyarrow", specifier = ">=15.0" },

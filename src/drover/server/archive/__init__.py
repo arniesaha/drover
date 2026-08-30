@@ -1,5 +1,36 @@
 """Stable archive boundary for optional local Pond recall."""
 
+from drover.server.archive.backup_config import (
+    BackupConfig,
+    generation_storage_url,
+    load_backup_config,
+)
+from drover.server.archive.backup_preflight import (
+    BackupPreflightResult,
+    backup_preflight_summary,
+    run_backup_preflight,
+)
+from drover.server.archive.backup_receipt import (
+    BackupReceipt,
+    CollisionCounts,
+    backup_receipt_summary,
+    latest_backup_receipt,
+    load_backup_receipt,
+    load_backup_receipt_chain,
+    write_backup_receipt,
+)
+from drover.server.archive.backup_restore import (
+    BackupRestoreError,
+    RestoreResult,
+    restore_backup,
+    restore_summary,
+    validate_restore_request,
+)
+from drover.server.archive.backup_run import (
+    BackupRunError,
+    backup_run_summary,
+    run_backup,
+)
 from drover.server.archive.coverage import (
     CoverageReport,
     RegistryCandidate,
@@ -23,9 +54,11 @@ from drover.server.archive.inventory import (
     PondInventory,
     PondInventoryRecord,
     SourceEligibilityReceipt,
+    canonical_private_json_bytes,
     load_native_inventory,
     load_pond_inventory,
     load_source_eligibility_receipt,
+    private_json_sha256,
     read_private_json,
     write_private_json,
 )
@@ -37,6 +70,14 @@ from drover.server.archive.pond import PondArchiveClient
 from drover.server.archive.pond_inventory import (
     export_pond_inventory,
     pond_inventory_summary,
+)
+from drover.server.archive.pond_snapshot import (
+    LocalPondStore,
+    PondCorpusCounts,
+    PondStoreSnapshot,
+    RemotePondGeneration,
+    capture_pond_store_snapshot,
+    pond_inventory_content_sha256,
 )
 from drover.server.archive.source_eligibility import (
     assess_metadata_only_source,
@@ -72,26 +113,55 @@ __all__ = [
     "ArchiveStorageUnavailable",
     "ArchiveTimeout",
     "ArchiveUnavailable",
+    "BackupConfig",
+    "BackupPreflightResult",
+    "BackupReceipt",
+    "BackupRestoreError",
+    "BackupRunError",
+    "CollisionCounts",
     "CoverageReport",
     "NativeInventory",
     "NativeInventoryRecord",
+    "LocalPondStore",
     "PondInventory",
     "PondInventoryRecord",
+    "PondCorpusCounts",
+    "PondStoreSnapshot",
+    "RemotePondGeneration",
     "SourceEligibilityReceipt",
     "RegistryCandidate",
+    "RestoreResult",
     "SessionArchive",
     "build_coverage_report",
+    "backup_receipt_summary",
+    "backup_run_summary",
+    "backup_preflight_summary",
     "assess_metadata_only_source",
     "coverage_summary",
+    "canonical_private_json_bytes",
+    "capture_pond_store_snapshot",
     "discover_native_history_inventory",
     "export_pond_inventory",
+    "generation_storage_url",
+    "latest_backup_receipt",
+    "load_backup_config",
+    "load_backup_receipt",
+    "load_backup_receipt_chain",
     "load_native_inventory",
     "load_pond_inventory",
     "load_source_eligibility_receipt",
     "load_registry_candidates",
     "native_inventory_summary",
     "pond_inventory_summary",
+    "pond_inventory_content_sha256",
+    "private_json_sha256",
     "read_private_json",
     "source_eligibility_summary",
+    "run_backup_preflight",
+    "run_backup",
+    "restore_backup",
+    "restore_summary",
+    "validate_restore_request",
     "write_private_json",
+    "write_backup_receipt",
 ]

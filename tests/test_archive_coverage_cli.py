@@ -40,7 +40,7 @@ import sys
 
 Path(os.environ["LOCAL_POND_MARKER"]).write_text("local", encoding="utf-8")
 if sys.argv[1:] == ["--version"]:
-    print("pond 0.16.3")
+    print("pond 0.16.3 (23c7d0e aarch64-macos)")
     raise SystemExit(0)
 
 output = Path(sys.argv[sys.argv.index("--output-file") + 1])
@@ -227,13 +227,14 @@ def _coverage_args(
     return args
 
 
-def test_archive_help_exposes_only_the_four_local_operator_commands():
+def test_archive_help_exposes_only_the_local_operator_commands():
     runner = CliRunner()
 
     result = runner.invoke(main, ["archive", "--help"])
 
     assert result.exit_code == 0, result.output
     assert set(server_main.archive_cmd.commands) == {
+        "backup",
         "source-inventory",
         "source-eligibility",
         "pond-inventory",

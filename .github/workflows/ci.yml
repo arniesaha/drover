@@ -135,7 +135,8 @@ jobs:
     # The archive client's unit tests prove it against a fake that encodes
     # what we believe Pond v0.16.3 says on the wire. That belief is what an
     # upstream release can silently change, so the same client also runs
-    # against the real pinned binary here -- checksum-verified, empty store.
+    # against the real pinned binary here -- checksum-verified, including a
+    # nonempty local copy, verification, and restore contract.
     # Contract drift breaks this step, not an operator's hub.
     - name: Pond pinned-binary contract
       if: steps.scope.outputs.python == 'true'

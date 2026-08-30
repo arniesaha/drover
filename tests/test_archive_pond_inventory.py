@@ -23,6 +23,7 @@ from drover.server.archive.pond_inventory import (
     export_pond_inventory,
     pond_inventory_summary,
 )
+from drover.server.archive.pond_process import PondProcessError
 
 _COLUMNS = {
     "session_id",
@@ -81,7 +82,12 @@ if sys.argv[1:] == ["--version"]:
     elif os.environ.get("FAKE_VERSION_MODE") == "invalid_utf8":
         sys.stdout.buffer.write(b"pond \xff\n")
     else:
-        sys.stdout.write(os.environ.get("FAKE_POND_VERSION", "pond 0.16.3\n"))
+        sys.stdout.write(
+            os.environ.get(
+                "FAKE_POND_VERSION",
+                "pond 0.16.3 (23c7d0e aarch64-macos)\n",
+            )
+        )
     raise SystemExit(int(os.environ.get("FAKE_VERSION_EXIT", "0")))
 
 mode = os.environ.get("FAKE_SQL_MODE", "success")
@@ -216,7 +222,7 @@ def fake_pond(tmp_path):
     binary.write_text(textwrap.dedent(_FAKE_POND), encoding="utf-8")
     binary.chmod(0o700)
     local_store = tmp_path / "local-store"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     control = tmp_path / "fake-control"
     control.mkdir()
     record = control / "calls.json"
@@ -276,9 +282,23 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
     preflight_path = Path(calls[1]["argv"][calls[1]["argv"].index("--output-file") + 1])
     export_path = Path(calls[2]["argv"][calls[2]["argv"].index("--output-file") + 1])
     snapshot_path = Path(calls[1]["argv"][2])
-    assert calls[0]["argv"] == [str(binary), "--version"]
-    assert calls[1]["argv"] == [
-        str(binary),
+    executables = [Path(call["argv"][0]) for call in calls]
+    assert len(set(executables)) == 3
+    artifact_directories = {path.parent for path in executables}
+    assert len(artifact_directories) == 3
+    assert len({path.parent for path in artifact_directories}) == 1
+    assert all(
+        path.name.startswith(".drover-pond-tool-") and not path.exists()
+        for path in artifact_directories
+    )
+    assert all(
+        path.name.startswith(".drover-pond-executable-")
+        and path.parent in artifact_directories
+        and not path.exists()
+        for path in executables
+    )
+    assert calls[0]["argv"][1:] == ["--version"]
+    assert calls[1]["argv"][1:] == [
         "--storage-path",
         str(snapshot_path),
         "sql",
@@ -290,8 +310,7 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
         "--timeout",
         "60",
     ]
-    assert calls[2]["argv"] == [
-        str(binary),
+    assert calls[2]["argv"][1:] == [
         "--storage-path",
         str(snapshot_path),
         "sql",
@@ -345,7 +364,14 @@ def test_export_executes_the_validated_relative_binary_not_a_path_namesake(
 
     calls = json.loads(record.read_text(encoding="utf-8"))
     assert inventory.pond_version == "0.16.3"
-    assert [call["argv"][0] for call in calls] == [str(binary.resolve())] * 3
+    executables = [Path(call["argv"][0]) for call in calls]
+    assert len(set(executables)) == 3
+    assert all(
+        path.name.startswith(".drover-pond-executable-")
+        and path != namesake
+        and path != binary.resolve()
+        for path in executables
+    )
     assert not namesake_marker.exists()
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
@@ -368,6 +394,24 @@ def test_export_normalizes_datafusion_timestamps_and_returns_safe_summary(
     }
 
 
+def test_export_preserves_allowed_claude_prefix_agent_identity(fake_pond, tmp_path):
+    prefix_agent = "claude-code/1.0.123"
+    prefix_row = dict(
+        _DEFAULT_ROWS[0],
+        session_id="claude-prefix-private",
+        source_agent=prefix_agent,
+    )
+
+    inventory, _ = _export(
+        fake_pond,
+        tmp_path / "pond.json",
+        FAKE_NDJSON=_ndjson((prefix_row,)),
+    )
+
+    assert inventory.records[0].source_agent == prefix_agent
+    assert pond_inventory_summary(inventory)["by_harness"] == {"claude-code": 1}
+
+
 def test_export_accepts_the_pinned_release_version_detail(fake_pond, tmp_path):
     inventory, _ = _export(
         fake_pond,
@@ -381,6 +425,7 @@ def test_export_accepts_the_pinned_release_version_detail(fake_pond, tmp_path):
 @pytest.mark.parametrize(
     "version",
     [
+        "pond 0.16.3\n",
         "pond 0.16.2\n",
         "pond 0.16.30\n",
         "pond 0.16.3-dev\n",
@@ -475,6 +520,58 @@ def test_export_rejects_nonlocal_or_non_directory_storage_before_start(
 
     assert not record.exists()
     assert str(storage_path) not in str(raised.value)
+
+
+def test_process_error_keeps_the_established_fixed_inventory_category(
+    fake_pond, monkeypatch, tmp_path
+):
+    binary, local_store, record = fake_pond
+
+    def fail_process(*_args, **_kwargs):
+        raise PondProcessError("timeout")
+
+    monkeypatch.setattr(pond_inventory_module, "run_pond_process", fail_process)
+
+    with pytest.raises(ValueError, match=r"^pond inventory timeout$") as raised:
+        export_pond_inventory(
+            binary,
+            tmp_path / "private-output.json",
+            storage_path=local_store,
+            env=_environment(record, PRIVATE_ENV="private-value"),
+        )
+
+    assert "private-value" not in str(raised.value)
+    assert not record.exists()
+
+
+@pytest.mark.parametrize(
+    ("failing_label", "expected_category"),
+    [("version", "version"), ("preflight", "preflight"), ("inventory", "subprocess")],
+)
+def test_resource_sampler_failure_maps_to_the_established_phase_category(
+    fake_pond, monkeypatch, tmp_path, failing_label, expected_category
+):
+    binary, local_store, record = fake_pond
+    original_run = pond_inventory_module.run_pond_process
+
+    def fail_selected_phase(*args, **kwargs):
+        if kwargs["label"] == failing_label:
+            raise PondProcessError("resource")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(pond_inventory_module, "run_pond_process", fail_selected_phase)
+
+    with pytest.raises(
+        ValueError, match=rf"^pond inventory {expected_category}$"
+    ) as raised:
+        export_pond_inventory(
+            binary,
+            tmp_path / "private-output.json",
+            storage_path=local_store,
+            env=_environment(record, PRIVATE_ENV="private-value"),
+        )
+
+    assert "private-value" not in str(raised.value)
 
 
 @pytest.mark.parametrize("output_kind", ["equal", "inside", "symlink-alias"])
@@ -1161,7 +1258,7 @@ def test_export_invokes_binary_directly_without_a_shell(tmp_path):
     binary.write_text(textwrap.dedent(_FAKE_POND), encoding="utf-8")
     binary.chmod(0o700)
     local_store = tmp_path / "local store; still argv"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     control = tmp_path / "fake-control"
     control.mkdir()
     record = control / "calls.json"
@@ -1208,7 +1305,9 @@ def test_pond_inventory_preflight_sql_returns_only_conservative_aggregates():
            max(m.timestamp) AS last_message_at
     FROM sessions s
     LEFT JOIN messages m ON m.session_id = s.session_id
-    WHERE s.source_agent IN ('claude-code', 'codex-cli')
+    WHERE (s.source_agent = 'claude-code'
+           OR s.source_agent LIKE 'claude-code/%'
+           OR s.source_agent = 'codex-cli')
     GROUP BY s.session_id, s.source_agent, s.created_at
     ORDER BY s.source_agent, s.session_id
     LIMIT 100001
@@ -1235,7 +1334,9 @@ def test_pond_inventory_sql_selects_only_the_bounded_metadata_projection():
        max(m.timestamp) AS last_message_at
 FROM sessions s
 LEFT JOIN messages m ON m.session_id = s.session_id
-WHERE s.source_agent IN ('claude-code', 'codex-cli')
+WHERE (s.source_agent = 'claude-code'
+       OR s.source_agent LIKE 'claude-code/%'
+       OR s.source_agent = 'codex-cli')
 GROUP BY s.session_id, s.source_agent, s.created_at
 ORDER BY s.source_agent, s.session_id
 LIMIT 100001"""

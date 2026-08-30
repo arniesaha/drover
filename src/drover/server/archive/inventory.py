@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -415,10 +416,16 @@ def _source_eligibility_receipt_from_wire(payload: Any) -> SourceEligibilityRece
     return receipt
 
 
-def _encode_private_json(payload: Any) -> bytes:
+def canonical_private_json_bytes(payload: Any) -> bytes:
+    """Encode one bounded private JSON document in its canonical wire form."""
     try:
         encoded = (
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                payload,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
             + b"\n"
         )
     except (TypeError, ValueError, UnicodeError):
@@ -428,6 +435,11 @@ def _encode_private_json(payload: Any) -> bytes:
     return encoded
 
 
+def private_json_sha256(payload: Any) -> str:
+    """Hash exactly the bytes written for a private JSON document."""
+    return hashlib.sha256(canonical_private_json_bytes(payload)).hexdigest()
+
+
 def _private_output_flags() -> int:
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -435,9 +447,46 @@ def _private_output_flags() -> int:
     return flags
 
 
-def _write_private_json_descriptor(descriptor: int, encoded: bytes) -> None:
+def _open_nofollow_path(
+    path: str | os.PathLike[str], *, flags: int = os.O_RDONLY
+) -> int:
+    """Open a path without following a symlink in any component."""
+    target = Path(os.fspath(path))
+    if ".." in target.parts:
+        raise ValueError
+    absolute = Path(os.path.abspath(target))
+    parts = absolute.parts
+    if len(parts) < 2:
+        raise ValueError
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        flags |= os.O_NOFOLLOW
+    directory_descriptor = os.open(parts[0], directory_flags)
     try:
-        output = os.fdopen(descriptor, "wb")
+        for component in parts[1:-1]:
+            child_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = child_descriptor
+        return os.open(parts[-1], flags, dir_fd=directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _write_private_json_descriptor(
+    descriptor: int,
+    encoded: bytes,
+    *,
+    retain: bool = False,
+) -> os.stat_result:
+    try:
+        output = os.fdopen(descriptor, "wb", closefd=not retain)
     except (OSError, ValueError):
         try:
             os.close(descriptor)
@@ -450,17 +499,24 @@ def _write_private_json_descriptor(descriptor: int, encoded: bytes) -> None:
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
+            metadata = os.fstat(output.fileno())
     except OSError:
+        if retain:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise _error("output", "write") from None
+    return metadata
 
 
 def _write_private_json_at(
     directory_descriptor: int,
     name: str,
     payload: Any,
-) -> None:
+) -> os.stat_result:
     """Write one private manifest relative to an already-pinned directory."""
-    encoded = _encode_private_json(payload)
+    encoded = canonical_private_json_bytes(payload)
     if (
         not isinstance(name, str)
         or not name
@@ -477,12 +533,39 @@ def _write_private_json_at(
         )
     except (OSError, TypeError, ValueError):
         raise _error("output", "file") from None
-    _write_private_json_descriptor(descriptor, encoded)
+    return _write_private_json_descriptor(descriptor, encoded)
+
+
+def _write_private_json_at_retained(
+    directory_descriptor: int,
+    name: str,
+    payload: Any,
+) -> tuple[int, os.stat_result]:
+    """Write one private manifest and retain its opened file descriptor."""
+    encoded = canonical_private_json_bytes(payload)
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or os.path.basename(name) != name
+    ):
+        raise _error("output", "file")
+    try:
+        descriptor = os.open(
+            name,
+            _private_output_flags(),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except (OSError, TypeError, ValueError):
+        raise _error("output", "file") from None
+    metadata = _write_private_json_descriptor(descriptor, encoded, retain=True)
+    return descriptor, metadata
 
 
 def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
     """Write a new JSON file that only its owner can read or modify."""
-    encoded = _encode_private_json(payload)
+    encoded = canonical_private_json_bytes(payload)
     try:
         target = os.fspath(path)
         descriptor = os.open(target, _private_output_flags(), 0o600)
@@ -498,12 +581,8 @@ def read_private_json(
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
         raise _error("invalid", "max_bytes")
     try:
-        target = os.fspath(path)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags)
-    except (OSError, TypeError):
+        descriptor = _open_nofollow_path(path)
+    except (OSError, TypeError, ValueError):
         raise _error("input", "file") from None
     try:
         with os.fdopen(descriptor, "rb") as input_file:

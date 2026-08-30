@@ -670,6 +670,20 @@ def test_cli_help_lists_subcommands():
         assert sub in res.output
 
 
+def test_archive_help_preserves_existing_commands_and_adds_backup():
+    result = CliRunner().invoke(main, ["archive", "--help"])
+
+    assert result.exit_code == 0
+    for command in (
+        "backup",
+        "coverage",
+        "pond-inventory",
+        "source-eligibility",
+        "source-inventory",
+    ):
+        assert command in result.output
+
+
 def test_cli_export_bundle_requires_selector(tmp_path):
     runner = CliRunner()
     cfg = _make_config(tmp_path)

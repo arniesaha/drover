@@ -668,6 +668,37 @@ def test_coverage_rejects_unsupported_pond_agents_without_exposing_identifiers(
     assert private_session_id not in str(raised.value)
 
 
+def test_coverage_preserves_prefix_agent_identity_but_matches_claude_family() -> None:
+    native_session_id = "claude-prefix-private"
+    prefix_agent = "claude-code/1.0.123"
+    registry = (
+        _candidate(
+            "drover-prefix-private",
+            "host-a",
+            "claude-code",
+            native_session_id,
+        ),
+    )
+    current = (_native("host-a", _source("claude-code", native_session_id)),)
+    pond = _pond(_archive(native_session_id, prefix_agent))
+
+    report = build_coverage_report(registry, current, pond)
+    summary = coverage_summary(report)
+
+    assert pond.records[0].source_agent == prefix_agent
+    assert report.details[0].source_agent == "claude-code"
+    assert report.details[0].status == "matched"
+    assert report.current_source_details[0].status == "matched"
+    assert summary["candidate_coverage"]["matched"] == 1
+    assert summary["current_source_coverage"]["matched"] == 1
+    assert summary["collisions"] == {
+        "duplicate_source_groups": 0,
+        "cross_harness_native_id_groups": 0,
+        "archive_logical_duplicate_candidate_groups": 0,
+        "archive_signature_unverifiable": 0,
+    }
+
+
 def test_private_report_keeps_investigation_ids_while_public_summary_is_recursive_safe():
     sensitive_values = (
         "drover-id-private",
