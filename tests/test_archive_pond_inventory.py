@@ -23,6 +23,7 @@ from drover.server.archive.pond_inventory import (
     export_pond_inventory,
     pond_inventory_summary,
 )
+from drover.server.archive.pond_process import PondProcessError
 
 _COLUMNS = {
     "session_id",
@@ -475,6 +476,28 @@ def test_export_rejects_nonlocal_or_non_directory_storage_before_start(
 
     assert not record.exists()
     assert str(storage_path) not in str(raised.value)
+
+
+def test_process_error_keeps_the_established_fixed_inventory_category(
+    fake_pond, monkeypatch, tmp_path
+):
+    binary, local_store, record = fake_pond
+
+    def fail_process(*_args, **_kwargs):
+        raise PondProcessError("timeout")
+
+    monkeypatch.setattr(pond_inventory_module, "run_pond_process", fail_process)
+
+    with pytest.raises(ValueError, match=r"^pond inventory timeout$") as raised:
+        export_pond_inventory(
+            binary,
+            tmp_path / "private-output.json",
+            storage_path=local_store,
+            env=_environment(record, PRIVATE_ENV="private-value"),
+        )
+
+    assert "private-value" not in str(raised.value)
+    assert not record.exists()
 
 
 @pytest.mark.parametrize("output_kind", ["equal", "inside", "symlink-alias"])

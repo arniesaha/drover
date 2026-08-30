@@ -6,16 +6,12 @@ import json
 import math
 import os
 import re
-import selectors
-import signal
 import stat
-import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Mapping, Sequence
+from typing import BinaryIO, Mapping
 
 from drover.server.archive.inventory import (
     MAX_INVENTORY_BYTES,
@@ -24,8 +20,14 @@ from drover.server.archive.inventory import (
     PondInventoryRecord,
     _write_private_json_at,
 )
+from drover.server.archive.pond_process import (
+    POND_VERSION,
+    PondProcessError,
+    is_pinned_pond_version,
+    require_pinned_pond,
+    run_pond_process,
+)
 
-POND_VERSION = "0.16.3"
 POND_INVENTORY_SQL = """SELECT s.session_id, s.source_agent, s.created_at,
        count(m.message_id) AS message_count,
        min(m.timestamp) AS first_message_at,
@@ -67,16 +69,6 @@ SELECT count(*) AS row_count,
        ), 0) AS worst_case_ndjson_bytes
 FROM inventory"""
 
-_POND_VERSION_TOKENS = ("pond", POND_VERSION)
-_POND_RELEASE_COMMIT = "23c7d0e"
-_POND_RELEASE_TARGETS = frozenset(
-    {
-        "aarch64-linux",
-        "aarch64-macos",
-        "x86_64-linux",
-        "x86_64-windows",
-    }
-)
 _POND_COLUMNS = frozenset(
     {
         "session_id",
@@ -96,9 +88,6 @@ _URI_SCHEME = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*:")
 _DATAFUSION_TIMESTAMP = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?" r"(?:Z|[+-]\d{2}:\d{2})\Z"
 )
-_CHUNK_BYTES = 64 * 1024
-_ARTIFACT_POLL_SECONDS = 0.01
-_TERMINATE_GRACE_SECONDS = 0.25
 _COPY_CHUNK_BYTES = 64 * 1024
 
 
@@ -119,16 +108,9 @@ def _failure(category: str) -> _PondInventoryError:
     return _PondInventoryError(f"pond inventory {category}")
 
 
-def _is_pinned_pond_version(tokens: tuple[str, ...]) -> bool:
-    if tokens == _POND_VERSION_TOKENS:
-        return True
-    return (
-        len(tokens) == 4
-        and tokens[:2] == _POND_VERSION_TOKENS
-        and tokens[2] == f"({_POND_RELEASE_COMMIT}"
-        and tokens[3].endswith(")")
-        and tokens[3][:-1] in _POND_RELEASE_TARGETS
-    )
+def _raise_process_failure(error: PondProcessError) -> None:
+    category = "export" if error.category == "artifact" else error.category
+    raise _failure(category) from None
 
 
 def export_pond_inventory(
@@ -140,18 +122,20 @@ def export_pond_inventory(
     env: Mapping[str, str] | None = None,
 ) -> PondInventory:
     """Export strict session metadata without exposing Pond rows or locations."""
-    executable = _require_executable(binary)
+    try:
+        executable = require_pinned_pond(binary)
+    except PondProcessError as error:
+        _raise_process_failure(error)
     local_store = _require_local_storage(storage_path)
     pinned_output = _pin_external_output(output, local_store)
     try:
         timeout = _require_timeout(timeout_seconds)
-        child_env = _child_environment(env)
         return _export_to_pinned_output(
             executable,
             pinned_output,
             local_store=local_store,
             timeout=timeout,
-            child_env=child_env,
+            env=env,
         )
     finally:
         try:
@@ -166,7 +150,7 @@ def _export_to_pinned_output(
     *,
     local_store: Path,
     timeout: int,
-    child_env: Mapping[str, str],
+    env: Mapping[str, str] | None,
 ) -> PondInventory:
     """Run the bounded export while retaining the validated output directory."""
 
@@ -178,30 +162,29 @@ def _export_to_pinned_output(
         temporary_path = Path(temporary_name)
         snapshot_path = temporary_path / "pond-store"
         _snapshot_store(local_store, snapshot_path)
-        version_stdout = temporary_path / "version.stdout"
-        version_stderr = temporary_path / "version.stderr"
-        version_returncode = _run_bounded(
-            [str(executable), "--version"],
-            timeout_seconds=10.0,
-            env=child_env,
-            stdout_path=version_stdout,
-            stderr_path=version_stderr,
-        )
-        if version_returncode != 0:
+        try:
+            version_result = run_pond_process(
+                executable,
+                ("--version",),
+                timeout_seconds=10.0,
+                run_directory=temporary_path,
+                label="version",
+                env=env,
+            )
+        except PondProcessError as error:
+            _raise_process_failure(error)
+        if version_result.returncode != 0:
             raise _failure("version")
-        version_bytes = _read_private_bytes(version_stdout, "version")
+        version_bytes = _read_private_bytes(version_result.stdout_path, "version")
         try:
             version_tokens = tuple(version_bytes.decode("utf-8").split())
         except UnicodeDecodeError:
             raise _failure("version") from None
-        if not _is_pinned_pond_version(version_tokens):
+        if not is_pinned_pond_version(version_tokens):
             raise _failure("version")
 
         preflight_path = temporary_path / "preflight.ndjson"
-        preflight_stdout = temporary_path / "preflight.stdout"
-        preflight_stderr = temporary_path / "preflight.stderr"
-        preflight_command = [
-            str(executable),
+        preflight_arguments = (
             "--storage-path",
             str(snapshot_path),
             "sql",
@@ -212,24 +195,25 @@ def _export_to_pinned_output(
             str(preflight_path),
             "--timeout",
             str(timeout),
-        ]
-        preflight_returncode = _run_bounded(
-            preflight_command,
-            timeout_seconds=float(timeout),
-            env=child_env,
-            stdout_path=preflight_stdout,
-            stderr_path=preflight_stderr,
-            artifact_path=preflight_path,
         )
-        if preflight_returncode != 0:
+        try:
+            preflight_result = run_pond_process(
+                executable,
+                preflight_arguments,
+                timeout_seconds=float(timeout),
+                run_directory=temporary_path,
+                label="preflight",
+                env=env,
+                artifact_path=preflight_path,
+            )
+        except PondProcessError as error:
+            _raise_process_failure(error)
+        if preflight_result.returncode != 0:
             raise _failure("preflight")
         _read_preflight(preflight_path)
 
         export_path = temporary_path / "inventory.ndjson"
-        sql_stdout = temporary_path / "sql.stdout"
-        sql_stderr = temporary_path / "sql.stderr"
-        command = [
-            str(executable),
+        arguments = (
             "--storage-path",
             str(snapshot_path),
             "sql",
@@ -240,16 +224,20 @@ def _export_to_pinned_output(
             str(export_path),
             "--timeout",
             str(timeout),
-        ]
-        returncode = _run_bounded(
-            command,
-            timeout_seconds=float(timeout),
-            env=child_env,
-            stdout_path=sql_stdout,
-            stderr_path=sql_stderr,
-            artifact_path=export_path,
         )
-        if returncode != 0:
+        try:
+            result = run_pond_process(
+                executable,
+                arguments,
+                timeout_seconds=float(timeout),
+                run_directory=temporary_path,
+                label="inventory",
+                env=env,
+                artifact_path=export_path,
+            )
+        except PondProcessError as error:
+            _raise_process_failure(error)
+        if result.returncode != 0:
             raise _failure("subprocess")
         records = _read_pond_rows(export_path)
         inventory = PondInventory(
@@ -291,17 +279,6 @@ def pond_inventory_summary(inventory: PondInventory) -> dict[str, object]:
         "empty_sessions": empty_sessions,
         "by_harness": dict(sorted(by_harness.items())),
     }
-
-
-def _require_executable(binary: Path) -> Path:
-    try:
-        path = Path(binary).resolve(strict=True)
-        metadata = path.stat()
-    except (OSError, TypeError, ValueError):
-        raise _failure("binary") from None
-    if not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
-        raise _failure("binary")
-    return path
 
 
 def _require_local_storage(storage_path: Path) -> Path:
@@ -628,17 +605,6 @@ def _require_timeout(timeout_seconds: float) -> int:
     return int(timeout_seconds)
 
 
-def _child_environment(env: Mapping[str, str] | None) -> dict[str, str]:
-    try:
-        child_env = dict(os.environ)
-        if env is not None:
-            child_env.update(env)
-        child_env.pop("POND_STORAGE_PATH", None)
-        return child_env
-    except (TypeError, ValueError):
-        raise _failure("environment") from None
-
-
 def _open_private_output(path: Path) -> BinaryIO:
     try:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -649,132 +615,6 @@ def _open_private_output(path: Path) -> BinaryIO:
         return os.fdopen(descriptor, "wb", buffering=0)
     except OSError:
         raise _failure("temporary") from None
-
-
-def _run_bounded(
-    command: Sequence[str],
-    *,
-    timeout_seconds: float,
-    env: Mapping[str, str],
-    stdout_path: Path,
-    stderr_path: Path,
-    artifact_path: Path | None = None,
-) -> int:
-    with (
-        _open_private_output(stdout_path) as stdout_file,
-        _open_private_output(stderr_path) as stderr_file,
-    ):
-        try:
-            process = subprocess.Popen(
-                command,
-                env=env,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-                umask=0o077,
-            )
-        except (OSError, TypeError, ValueError):
-            raise _failure("subprocess") from None
-
-        assert process.stdout is not None
-        assert process.stderr is not None
-        process_group = process.pid
-        selector: selectors.BaseSelector | None = None
-        try:
-            selector = selectors.DefaultSelector()
-            selector.register(process.stdout, selectors.EVENT_READ, stdout_file)
-            selector.register(process.stderr, selectors.EVENT_READ, stderr_file)
-            counts = {stdout_file: 0, stderr_file: 0}
-            deadline = time.monotonic() + timeout_seconds
-            while selector.get_map() or process.poll() is None:
-                if artifact_path is not None:
-                    _check_artifact_during_run(artifact_path)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise _failure("timeout")
-                ready = selector.select(min(remaining, _ARTIFACT_POLL_SECONDS))
-                for key, _ in ready:
-                    sink = key.data
-                    capacity = MAX_INVENTORY_BYTES - counts[sink]
-                    chunk = os.read(key.fd, min(_CHUNK_BYTES, capacity + 1))
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    if len(chunk) > capacity:
-                        if capacity:
-                            sink.write(chunk[:capacity])
-                        raise _failure("size")
-                    sink.write(chunk)
-                    counts[sink] += len(chunk)
-            if artifact_path is not None:
-                _check_artifact_during_run(artifact_path)
-            returncode = process.wait(timeout=0)
-            if _process_group_exists(process_group):
-                _stop_process(process, process_group)
-            return returncode
-        except _PondInventoryError:
-            _stop_process(process, process_group)
-            raise
-        except (OSError, ValueError, subprocess.SubprocessError):
-            _stop_process(process, process_group)
-            raise _failure("subprocess") from None
-        finally:
-            if selector is not None:
-                selector.close()
-            process.stdout.close()
-            process.stderr.close()
-
-
-def _check_artifact_during_run(path: Path) -> None:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        raise _failure("export") from None
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
-        raise _failure("export")
-    if metadata.st_size > MAX_INVENTORY_BYTES:
-        raise _failure("size")
-
-
-def _stop_process(process: subprocess.Popen[bytes], process_group: int) -> None:
-    _signal_process_group(process, process_group, signal.SIGTERM)
-    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
-    while _process_group_exists(process_group) and time.monotonic() < deadline:
-        time.sleep(0.01)
-    if _process_group_exists(process_group):
-        _signal_process_group(process, process_group, signal.SIGKILL)
-    try:
-        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, process_group, signal.SIGKILL)
-        try:
-            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-
-
-def _process_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except (OSError, AttributeError):
-        return False
-    return True
-
-
-def _signal_process_group(
-    process: subprocess.Popen[bytes], process_group: int, signal_number: int
-) -> None:
-    try:
-        os.killpg(process_group, signal_number)
-    except (OSError, AttributeError):
-        if process.poll() is None:
-            try:
-                process.send_signal(signal_number)
-            except OSError:
-                pass
 
 
 def _read_private_bytes(path: Path, category: str) -> bytes:
