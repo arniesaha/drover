@@ -177,6 +177,12 @@ These commands do not sync or upload data, configure Cloudflare R2 or other
 remote storage, certify archive content, write to the Pond archive, or
 authorize retention or deletion.
 
+For the manual experimental backup boundary, see
+[Verified Pond backups to R2](docs/archive-r2-backup.md). The local Pond store
+remains the only live recall and sync target; R2 stores immutable backup
+generations for restore into a fresh stopped local directory and is never a
+live recall or sync target.
+
 Run the installer as `install.sh --dry-run` to preview its actions without
 changing anything.
 

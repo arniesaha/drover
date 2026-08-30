@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   title/name events. Coverage reports the source as
   `source_not_archive_eligible`; changed, duplicate, message-bearing, oversized,
   or noncanonical sources fail closed.
+- Manual, fail-closed Pond v0.16.3 backup and restore commands create verified,
+  immutable R2 generations while the local Pond store remains the only live
+  recall and sync target. The operator runbook covers private configuration,
+  dry-run and health gates, retained diagnostics, read-only restore drills, and
+  manual Cloudflare cost and lifecycle evidence.
 
 ## [0.4.0] - 2026-08-28
 
