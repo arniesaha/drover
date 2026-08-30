@@ -140,6 +140,7 @@ def test_receipt_round_trip_preserves_the_exact_v1_contract(tmp_path):
 
     assert path == directory / f"backup-{GENERATION_ID}.json"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert {entry.name for entry in directory.iterdir()} == {path.name}
     assert load_backup_receipt(path) == receipt
     assert set(receipt.to_wire()) == EXPECTED_RECEIPT_FIELDS
     assert set(receipt.to_wire()["collision_counts"]) == EXPECTED_COLLISION_FIELDS
@@ -334,6 +335,55 @@ def test_receipt_writer_rejects_replacement_after_created_file_closes(
 
     with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
         write_backup_receipt(directory, receipt)
+
+
+def test_receipt_writer_removes_final_if_publication_directory_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _receipt_directory(tmp_path)
+    receipt = _verified_receipt()
+    final = directory / f"backup-{GENERATION_ID}.json"
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("private directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(receipt_module.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
+        write_backup_receipt(directory, receipt)
+
+    assert calls >= 2
+    assert not final.exists()
+
+
+def test_receipt_writer_removes_final_if_postpublication_validation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _receipt_directory(tmp_path)
+    receipt = _verified_receipt()
+    final_name = f"backup-{GENERATION_ID}.json"
+    final = directory / final_name
+    real_stat = os.stat
+
+    def fail_final_validation(path, *args, **kwargs):
+        if path == final_name and kwargs.get("dir_fd") is not None:
+            raise OSError("private final validation failure")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(receipt_module.os, "stat", fail_final_validation)
+
+    with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
+        write_backup_receipt(directory, receipt)
+
+    assert not final.exists()
 
 
 @pytest.mark.parametrize("unsafe", ["mode", "symlink"])

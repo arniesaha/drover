@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping
 
 from drover.config import DroverConfig
 from drover.server.archive.backup_config import BackupConfig
-from drover.server.archive.backup_runtime import RuntimeGuard
+from drover.server.archive.backup_runtime import BackupRuntimeError, RuntimeGuard
 from drover.server.archive.coverage import (
     CoverageReport,
     build_coverage_report,
@@ -28,13 +28,23 @@ from drover.server.archive.inventory import (
     _pond_inventory_from_wire,
     _source_eligibility_receipt_from_wire,
     _write_private_json_at,
+    canonical_private_json_bytes,
+    private_json_sha256,
 )
 from drover.server.archive.native_inventory import (
     MAX_NATIVE_INVENTORY_RECORDS,
     discover_native_history_inventory,
     native_inventory_summary,
 )
-from drover.server.archive.pond_process import PondProcessResult, run_pond_process
+from drover.server.archive.pond_process import (
+    PondProcessError,
+    PondProcessResult,
+    PondResourceEvidence,
+    ResourceLimits,
+    _aggregate_resource_evidence,
+    _process_resource_evidence,
+    run_pond_process,
+)
 from drover.server.archive.pond_snapshot import (
     POND_INVENTORY_FILENAME,
     LocalPondStore,
@@ -131,6 +141,14 @@ class BackupPreflightResult:
     pond_inventory_path: Path = field(repr=False)
     coverage_report_path: Path = field(repr=False)
     source_not_archive_eligible: int
+    resource_evidence: PondResourceEvidence = field(
+        default=PondResourceEvidence(0, None, 0),
+        repr=False,
+    )
+    eligibility_receipts_sha256: str = field(
+        default=private_json_sha256([]),
+        repr=False,
+    )
 
 
 def _native_home() -> Path:
@@ -154,6 +172,8 @@ def run_backup_preflight(
     drover_config: DroverConfig,
     workspace: Path,
     runtime_guard: RuntimeGuard,
+    *,
+    resource_limits: ResourceLimits | None = None,
 ) -> BackupPreflightResult:
     """Run preflight through fixed production dependencies and a real guard."""
     if type(runtime_guard) is not RuntimeGuard:
@@ -163,6 +183,7 @@ def run_backup_preflight(
         drover_config,
         workspace,
         runtime_guard,
+        resource_limits=resource_limits,
         dependencies=_PRODUCTION_DEPENDENCIES,
     )
 
@@ -173,6 +194,7 @@ def _run_backup_preflight(
     workspace: Path,
     runtime_guard: RuntimeGuard,
     *,
+    resource_limits: ResourceLimits | None = None,
     dependencies: _PreflightDependencies,
 ) -> BackupPreflightResult:
     """Capture one local-only denominator and reject every unsafe counter."""
@@ -235,6 +257,7 @@ def _run_backup_preflight(
             workspace=workspace_path,
             timeout_seconds=config.copy_timeout_seconds,
             progress_callback=runtime_guard.sample,
+            resource_limits=resource_limits,
         )
         if type(pond_snapshot) is not PondStoreSnapshot:
             raise _failure()
@@ -270,12 +293,13 @@ def _run_backup_preflight(
         _require_coverage_ready(canonical_summary)
         summary = _freeze_mapping(canonical_summary)
         _require_snapshot_ready(pond_snapshot)
-        _require_local_dry_run(
+        dry_run_evidence = _require_local_dry_run(
             config,
             workspace_path,
             workspace_descriptor,
             runtime_guard,
             deps,
+            resource_limits,
         )
         _write_workspace_json(
             workspace_descriptor,
@@ -304,10 +328,17 @@ def _run_backup_preflight(
             pond_inventory_path=workspace_path / POND_INVENTORY_FILENAME,
             coverage_report_path=workspace_path / _COVERAGE_REPORT_FILENAME,
             source_not_archive_eligible=len(receipts),
+            resource_evidence=_aggregate_resource_evidence(
+                pond_snapshot.resource_evidence,
+                dry_run_evidence,
+            ),
+            eligibility_receipts_sha256=_eligibility_receipts_sha256(receipts),
         )
         _require_result_ready(result)
         return result
     except BackupPreflightError:
+        raise
+    except (BackupRuntimeError, PondProcessError):
         raise
     except Exception:
         raise _failure() from None
@@ -448,6 +479,13 @@ def _require_result_ready(result: BackupPreflightResult) -> None:
     _require_snapshot_ready(result.pond_snapshot)
     if (
         type(result.coverage) is not CoverageReport
+        or type(result.resource_evidence) is not PondResourceEvidence
+        or not isinstance(result.eligibility_receipts_sha256, str)
+        or len(result.eligibility_receipts_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in result.eligibility_receipts_sha256
+        )
         or isinstance(result.source_not_archive_eligible, bool)
         or not isinstance(result.source_not_archive_eligible, int)
         or result.source_not_archive_eligible < 0
@@ -497,7 +535,8 @@ def _require_local_dry_run(
     workspace_descriptor: int,
     runtime_guard: RuntimeGuard,
     dependencies: _PreflightDependencies,
-) -> None:
+    resource_limits: ResourceLimits | None,
+) -> PondResourceEvidence:
     result = dependencies.run_pond_process(
         config.pond_binary,
         (
@@ -513,6 +552,7 @@ def _require_local_dry_run(
         timeout_seconds=float(config.copy_timeout_seconds),
         run_directory=workspace,
         label="local-dry-run",
+        resource_limits=resource_limits,
         progress_callback=runtime_guard.sample,
     )
     if type(result) is not PondProcessResult or result.returncode != 0:
@@ -556,6 +596,7 @@ def _require_local_dry_run(
             raise _failure()
     if seen != _DRY_RUN_ADAPTERS:
         raise _failure()
+    return _process_resource_evidence(result)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -800,6 +841,17 @@ def _load_eligibility_receipts(
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+def _eligibility_receipts_sha256(
+    receipts: tuple[SourceEligibilityReceipt, ...],
+) -> str:
+    try:
+        wires = [receipt.to_wire() for receipt in receipts]
+        ordered = sorted(wires, key=canonical_private_json_bytes)
+        return private_json_sha256(ordered)
+    except (AttributeError, TypeError, ValueError):
+        raise _failure() from None
 
 
 def _read_private_json_at(directory_descriptor: int, name: str) -> object:

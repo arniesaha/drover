@@ -15,6 +15,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from drover.server.archive.backup_runtime import BackupRuntimeError
 from drover.server.archive.inventory import (
     MAX_INVENTORY_BYTES,
     MAX_INVENTORY_RECORDS,
@@ -27,6 +28,12 @@ from drover.server.archive.inventory import (
 from drover.server.archive.pond_inventory import _pond_record
 from drover.server.archive.pond_process import (
     POND_VERSION,
+    PondProcessError,
+    PondProcessResult,
+    PondResourceEvidence,
+    ResourceLimits,
+    _aggregate_resource_evidence,
+    _process_resource_evidence,
     is_pinned_pond_version,
     run_pond_process,
 )
@@ -206,6 +213,10 @@ class PondCorpusCounts:
 class PondStoreSnapshot:
     root_inventory: PondInventory = field(repr=False)
     counts: PondCorpusCounts = field(repr=False)
+    resource_evidence: PondResourceEvidence = field(
+        default=PondResourceEvidence(0, None, 0),
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         try:
@@ -220,6 +231,8 @@ class PondStoreSnapshot:
             ):
                 raise _failure()
             if type(self.counts) is not PondCorpusCounts:
+                raise _failure()
+            if type(self.resource_evidence) is not PondResourceEvidence:
                 raise _failure()
             if len(self.root_inventory.records) > self.counts.sessions:
                 raise _failure()
@@ -261,6 +274,7 @@ def capture_pond_store_snapshot(
     workspace: Path,
     timeout_seconds: float,
     progress_callback: Callable[[], None] | None = None,
+    resource_limits: ResourceLimits | None = None,
 ) -> PondStoreSnapshot:
     """Capture root records and exact whole-store counts without retaining rows."""
     workspace_descriptor: int | None = None
@@ -282,6 +296,7 @@ def capture_pond_store_snapshot(
             timeout_seconds=10.0,
             run_directory=workspace_path,
             label="snapshot-version",
+            resource_limits=resource_limits,
             progress_callback=progress_callback,
         )
         if version.returncode != 0:
@@ -296,7 +311,7 @@ def capture_pond_store_snapshot(
         if not is_pinned_pond_version(version_tokens):
             raise _failure()
 
-        corpus_data = _run_sql(
+        corpus_data, corpus_result = _run_sql(
             binary,
             selector=selector,
             pond_config=pond_config,
@@ -307,6 +322,7 @@ def capture_pond_store_snapshot(
             filename=_CORPUS_FILENAME,
             label="corpus-snapshot",
             progress_callback=progress_callback,
+            resource_limits=resource_limits,
         )
         records, corpus = _corpus_snapshot(corpus_data)
         inventory = PondInventory(
@@ -325,7 +341,14 @@ def capture_pond_store_snapshot(
                 "sessions_in_logical_duplicate_groups"
             ],
         )
-        snapshot = PondStoreSnapshot(inventory, counts)
+        snapshot = PondStoreSnapshot(
+            inventory,
+            counts,
+            _aggregate_resource_evidence(
+                _process_resource_evidence(version),
+                _process_resource_evidence(corpus_result),
+            ),
+        )
         _require_workspace_same(workspace_path, workspace_identity)
         _require_pinned_path(pond_config, config_descriptor, config_identity)
         _require_local_store_path(storage, store_descriptor, store_identity)
@@ -333,6 +356,8 @@ def capture_pond_store_snapshot(
         _require_workspace_same(workspace_path, workspace_identity)
         return snapshot
     except _SnapshotError:
+        raise
+    except (BackupRuntimeError, PondProcessError):
         raise
     except Exception:
         raise _failure() from None
@@ -568,7 +593,8 @@ def _run_sql(
     filename: str,
     label: str,
     progress_callback: Callable[[], None] | None,
-) -> bytes:
+    resource_limits: ResourceLimits | None,
+) -> tuple[bytes, PondProcessResult]:
     artifact = workspace / filename
     result = run_pond_process(
         binary,
@@ -590,11 +616,12 @@ def _run_sql(
         run_directory=workspace,
         label=label,
         artifact_path=artifact,
+        resource_limits=resource_limits,
         progress_callback=progress_callback,
     )
     if result.returncode != 0:
         raise _failure()
-    return _read_private_artifact(workspace_descriptor, filename)
+    return _read_private_artifact(workspace_descriptor, filename), result
 
 
 def _read_private_artifact(directory_descriptor: int, name: str) -> bytes:

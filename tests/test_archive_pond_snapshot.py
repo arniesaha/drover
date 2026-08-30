@@ -14,7 +14,14 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from drover.server.archive.backup_runtime import BackupRuntimeError
 from drover.server.archive.inventory import PondInventory, PondInventoryRecord
+from drover.server.archive.pond_process import (
+    PondProcessError,
+    PondProcessResult,
+    PondResourceEvidence,
+    ResourceLimits,
+)
 from drover.server.archive.pond_snapshot import (
     POND_CORPUS_SNAPSHOT_SQL,
     LocalPondStore,
@@ -338,6 +345,95 @@ def test_snapshot_calls_progress_callback_for_version_and_corpus_processes(
 
     assert set(callback_labels) == {"snapshot-version", "corpus-snapshot"}
     assert callback_calls == len(callback_labels)
+
+
+def test_snapshot_forwards_limits_and_aggregates_both_process_results(
+    pond_environment,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_module = importlib.import_module("drover.server.archive.pond_snapshot")
+    binary, store, config, _, _ = pond_environment
+    limits = ResourceLimits(1024, 2048, 64)
+    received_limits: list[ResourceLimits | None] = []
+
+    def run_process(
+        received_binary,
+        arguments,
+        *,
+        run_directory,
+        label,
+        artifact_path=None,
+        resource_limits=None,
+        **_kwargs,
+    ):
+        assert received_binary == binary
+        received_limits.append(resource_limits)
+        stdout = Path(run_directory) / f"{label}.stdout"
+        stderr = Path(run_directory) / f"{label}.stderr"
+        if label == "snapshot-version":
+            stdout.write_text("pond 0.16.3\n", encoding="utf-8")
+            evidence = (111, 222, 3)
+        else:
+            assert artifact_path is not None
+            Path(artifact_path).write_text(
+                "".join(json.dumps(row) + "\n" for row in _corpus_rows()),
+                encoding="utf-8",
+            )
+            Path(artifact_path).chmod(0o600)
+            stdout.write_bytes(b"")
+            evidence = (333, 444, 5)
+        stdout.chmod(0o600)
+        stderr.write_bytes(b"")
+        stderr.chmod(0o600)
+        return PondProcessResult(0, 1, *evidence, stdout, stderr)
+
+    monkeypatch.setattr(snapshot_module, "run_pond_process", run_process)
+
+    snapshot = capture_pond_store_snapshot(
+        binary,
+        storage=LocalPondStore(store),
+        pond_config=config,
+        workspace=_workspace(tmp_path),
+        timeout_seconds=60,
+        resource_limits=limits,
+    )
+
+    assert received_limits == [limits, limits]
+    assert snapshot.resource_evidence == PondResourceEvidence(333, 444, 5)
+
+
+@pytest.mark.parametrize("phase", ["snapshot-version", "corpus-snapshot"])
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        (
+            BackupRuntimeError("archive backup local changed"),
+            "archive backup local changed",
+        ),
+        (PondProcessError("resource"), "resource"),
+    ],
+)
+def test_snapshot_preserves_runtime_and_resource_failures_from_both_processes(
+    pond_environment,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    phase: str,
+    failure: Exception,
+    category: str,
+) -> None:
+    snapshot_module = importlib.import_module("drover.server.archive.pond_snapshot")
+    real_run = snapshot_module.run_pond_process
+
+    def fail_selected(*args, **kwargs):
+        if kwargs["label"] == phase:
+            raise failure
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot_module, "run_pond_process", fail_selected)
+
+    with pytest.raises(type(failure), match=rf"^{category}$"):
+        _capture_local(pond_environment, tmp_path)
 
 
 def test_corpus_sql_counts_null_source_agent_as_disallowed() -> None:

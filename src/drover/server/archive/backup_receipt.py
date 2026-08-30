@@ -10,8 +10,8 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
-from uuid import UUID
+from typing import Any, Callable, Literal
+from uuid import UUID, uuid4
 
 from drover.server.archive.inventory import (
     MAX_INVENTORY_BYTES,
@@ -335,13 +335,19 @@ def _directory_flags() -> int:
     return flags
 
 
-def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
-    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid)
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
 
 
 def _open_receipt_directory(
     path: str | os.PathLike[str],
-) -> tuple[Path, int, tuple[int, int, int, int]]:
+) -> tuple[Path, int, tuple[int, ...]]:
     descriptor = -1
     try:
         directory = Path(path)
@@ -373,7 +379,7 @@ def _open_receipt_directory(
 
 
 def _require_unchanged_directory(
-    directory: Path, descriptor: int, identity: tuple[int, int, int, int]
+    directory: Path, descriptor: int, identity: tuple[int, ...]
 ) -> None:
     try:
         opened = os.fstat(descriptor)
@@ -567,11 +573,13 @@ def latest_backup_receipt(
     """Return the tail of the one valid chain for a private store scope."""
     descriptor = -1
     try:
-        scope = _require_uuid(store_scope_id)
         directory, descriptor, identity = _open_receipt_directory(receipt_directory)
-        _require_unchanged_directory(directory, descriptor, identity)
-        ordered = _linear_scope_chain(_scan_receipts(descriptor), scope)
-        return ordered[-1][1] if ordered else None
+        return _latest_backup_receipt_at(
+            directory,
+            descriptor,
+            identity,
+            store_scope_id,
+        )
     except (KeyError, OSError, TypeError, ValueError):
         raise ValueError(_RECEIPT_ERROR) from None
     finally:
@@ -582,34 +590,172 @@ def latest_backup_receipt(
                 pass
 
 
+def _latest_backup_receipt_at(
+    directory: Path,
+    descriptor: int,
+    identity: tuple[int, ...],
+    store_scope_id: str,
+) -> BackupReceipt | None:
+    """Return one tail using only a caller-owned pinned directory descriptor."""
+    try:
+        scope = _require_uuid(store_scope_id)
+        _require_unchanged_directory(directory, descriptor, identity)
+        ordered = _linear_scope_chain(_scan_receipts(descriptor), scope)
+        _require_unchanged_directory(directory, descriptor, identity)
+        return ordered[-1][1] if ordered else None
+    except (KeyError, OSError, TypeError, ValueError):
+        raise ValueError(_RECEIPT_ERROR) from None
+
+
 def write_backup_receipt(
     receipt_directory: str | os.PathLike[str], receipt: BackupReceipt
 ) -> Path:
     """Exclusively persist one validated receipt in a pinned private directory."""
     descriptor = -1
     try:
-        payload = receipt.to_wire()
         directory, descriptor, identity = _open_receipt_directory(receipt_directory)
-        name = f"backup-{receipt.generation_id}.json"
-        _require_unchanged_directory(directory, descriptor, identity)
-        created = _write_private_json_at(descriptor, name, payload)
-        written = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(written.st_mode)
-            or written.st_uid != os.geteuid()
-            or stat.S_IMODE(written.st_mode) != 0o600
-            or (written.st_dev, written.st_ino) != (created.st_dev, created.st_ino)
-        ):
-            raise _invalid()
-        os.fsync(descriptor)
-        _require_unchanged_directory(directory, descriptor, identity)
-        return directory / name
+        return _write_backup_receipt_at(
+            directory,
+            descriptor,
+            identity,
+            receipt,
+        )
     except (KeyError, OSError, TypeError, ValueError):
         raise ValueError(_RECEIPT_ERROR) from None
     finally:
         if descriptor >= 0:
             try:
                 os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _write_backup_receipt_at(
+    directory: Path,
+    descriptor: int,
+    identity: tuple[int, ...],
+    receipt: BackupReceipt,
+    *,
+    before_publish: Callable[[], None] | None = None,
+) -> Path:
+    """Write through one caller-owned pinned receipt-directory descriptor."""
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    published = False
+    name: str | None = None
+    try:
+        payload = receipt.to_wire()
+        name = f"backup-{receipt.generation_id}.json"
+        _require_unchanged_directory(directory, descriptor, identity)
+        temporary_name = f".backup-receipt-{uuid4()}.tmp"
+        created = _write_private_json_at(descriptor, temporary_name, payload)
+        temporary = os.stat(
+            temporary_name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(temporary.st_mode)
+            or temporary.st_uid != os.geteuid()
+            or temporary.st_nlink != 1
+            or stat.S_IMODE(temporary.st_mode) != 0o600
+            or (temporary.st_dev, temporary.st_ino) != (created.st_dev, created.st_ino)
+        ):
+            raise _invalid()
+        temporary_identity = (temporary.st_dev, temporary.st_ino)
+        prepared_identity = _require_same_directory_node(
+            directory,
+            descriptor,
+            identity,
+        )
+        if before_publish is not None:
+            before_publish()
+        _require_unchanged_directory(directory, descriptor, prepared_identity)
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        published = True
+        written = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(written.st_mode)
+            or written.st_uid != os.geteuid()
+            or stat.S_IMODE(written.st_mode) != 0o600
+            or (written.st_dev, written.st_ino) != temporary_identity
+        ):
+            raise _invalid()
+        os.unlink(temporary_name, dir_fd=descriptor)
+        temporary_name = None
+        os.fsync(descriptor)
+        final = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_uid != os.geteuid()
+            or final.st_nlink != 1
+            or stat.S_IMODE(final.st_mode) != 0o600
+            or (final.st_dev, final.st_ino) != temporary_identity
+        ):
+            raise _invalid()
+        _require_same_directory_node(directory, descriptor, identity)
+        return directory / name
+    except (KeyError, OSError, TypeError, ValueError):
+        if published and name is not None and temporary_identity is not None:
+            _rollback_published_receipt(descriptor, name, temporary_identity)
+        raise ValueError(_RECEIPT_ERROR) from None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=descriptor)
+            except OSError:
+                pass
+
+
+def _require_same_directory_node(
+    directory: Path,
+    descriptor: int,
+    expected: tuple[int, ...],
+) -> tuple[int, ...]:
+    try:
+        opened = _directory_identity(os.fstat(descriptor))
+        lexical_descriptor = _open_nofollow_path(directory, flags=_directory_flags())
+        try:
+            lexical = _directory_identity(os.fstat(lexical_descriptor))
+        finally:
+            os.close(lexical_descriptor)
+    except OSError:
+        raise _invalid() from None
+    if opened != lexical or opened[:4] != expected[:4]:
+        raise _invalid()
+    return opened
+
+
+def _rollback_published_receipt(
+    descriptor: int,
+    name: str,
+    expected: tuple[int, int],
+) -> None:
+    final_descriptor = -1
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        final_descriptor = os.open(name, flags, dir_fd=descriptor)
+        current = os.fstat(final_descriptor)
+        if (current.st_dev, current.st_ino) == expected:
+            os.unlink(name, dir_fd=descriptor)
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        if final_descriptor >= 0:
+            try:
+                os.close(final_descriptor)
             except OSError:
                 pass
 

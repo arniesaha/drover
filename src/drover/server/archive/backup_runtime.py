@@ -286,38 +286,103 @@ class BackupLock:
     """A same-host single-flight lock, not cross-host writer election."""
 
     def __init__(self, receipt_directory: str | os.PathLike[str]) -> None:
-        self._path = Path(receipt_directory) / _LOCK_NAME
+        self._directory = Path(receipt_directory)
+        self._path = self._directory / _LOCK_NAME
         self._descriptor: int | None = None
+        self._directory_descriptor: int | None = None
+        self._directory_identity: tuple[int, ...] | None = None
 
     def __enter__(self) -> BackupLock:
         if self._descriptor is not None:
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
-        descriptor = open_private_lock(self._path)
+        directory_descriptor = -1
+        descriptor = -1
         try:
+            directory_descriptor = _open_private_receipt_directory(self._directory)
+            descriptor = _open_private_lock_at(directory_descriptor)
             acquire_nonblocking_flock(descriptor)
-            _require_same_lock(self._path, descriptor)
+            directory_identity = _identity(os.fstat(directory_descriptor))
+            _require_same_directory(self._directory, directory_identity)
+            _require_same_lock_at(directory_descriptor, descriptor)
         except BaseException:
+            if descriptor >= 0:
+                try:
+                    release_flock(descriptor)
+                except BackupRuntimeError:
+                    pass
+                finally:
+                    os.close(descriptor)
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
+            raise
+        self._descriptor = descriptor
+        self._directory_descriptor = directory_descriptor
+        self._directory_identity = directory_identity
+        return self
+
+    def _duplicate_receipt_directory(self) -> tuple[int, tuple[int, ...]]:
+        """Return one checked duplicate of the directory protected by this lock."""
+        self._require_same()
+        descriptor = self._directory_descriptor
+        identity = self._directory_identity
+        if descriptor is None or identity is None:
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        duplicate = -1
+        try:
+            duplicate = os.dup(descriptor)
+            os.set_inheritable(duplicate, False)
+            if _identity(os.fstat(duplicate)) != identity:
+                raise BackupRuntimeError(_PREFLIGHT_ERROR)
+            return duplicate, identity
+        except BackupRuntimeError:
+            if duplicate >= 0:
+                os.close(duplicate)
+            raise
+        except OSError:
+            if duplicate >= 0:
+                os.close(duplicate)
+            raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+
+    def _require_same(self) -> None:
+        descriptor = self._directory_descriptor
+        lock_descriptor = self._descriptor
+        identity = self._directory_identity
+        if descriptor is None or lock_descriptor is None or identity is None:
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        if _identity(os.fstat(descriptor)) != identity:
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        _require_same_directory(self._directory, identity)
+        _require_same_lock_at(descriptor, lock_descriptor)
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        directory_descriptor, self._directory_descriptor = (
+            self._directory_descriptor,
+            None,
+        )
+        self._directory_identity = None
+        if descriptor is None:
+            if directory_descriptor is not None:
+                try:
+                    os.close(directory_descriptor)
+                except OSError:
+                    pass
+            return
+        try:
             try:
                 release_flock(descriptor)
             except BackupRuntimeError:
                 pass
-            finally:
-                os.close(descriptor)
-            raise
-        self._descriptor = descriptor
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        descriptor, self._descriptor = self._descriptor, None
-        if descriptor is None:
-            return
-        try:
-            release_flock(descriptor)
         finally:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+            if directory_descriptor is not None:
+                try:
+                    os.close(directory_descriptor)
+                except OSError:
+                    pass
 
 
 class _LiveRuntimeProbe:
@@ -528,39 +593,11 @@ def open_private_lock(path: Path) -> int:
             or directory.resolve(strict=True) != directory
         ):
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
-        directory_descriptor = _open_nofollow_path(
-            directory, flags=_directory_open_flags()
-        )
-        directory_metadata = os.fstat(directory_descriptor)
-        if (
-            not stat.S_ISDIR(directory_metadata.st_mode)
-            or directory_metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
-        ):
-            raise BackupRuntimeError(_PREFLIGHT_ERROR)
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        lock_descriptor = os.open(_LOCK_NAME, flags, 0o600, dir_fd=directory_descriptor)
-        lock_metadata = os.fstat(lock_descriptor)
-        if (
-            not stat.S_ISREG(lock_metadata.st_mode)
-            or lock_metadata.st_uid != os.geteuid()
-            or lock_metadata.st_nlink != 1
-        ):
-            raise BackupRuntimeError(_PREFLIGHT_ERROR)
-        os.fchmod(lock_descriptor, 0o600)
-        lock_metadata = os.fstat(lock_descriptor)
-        if (
-            not stat.S_ISREG(lock_metadata.st_mode)
-            or lock_metadata.st_uid != os.geteuid()
-            or lock_metadata.st_nlink != 1
-            or stat.S_IMODE(lock_metadata.st_mode) != 0o600
-        ):
-            raise BackupRuntimeError(_PREFLIGHT_ERROR)
-        _require_same_directory(directory, directory_metadata)
+        directory_descriptor = _open_private_receipt_directory(directory)
+        lock_descriptor = _open_private_lock_at(directory_descriptor)
+        directory_identity = _identity(os.fstat(directory_descriptor))
+        _require_same_directory(directory, directory_identity)
+        _require_same_lock_at(directory_descriptor, lock_descriptor)
         keep_lock_descriptor = True
         return lock_descriptor
     except BackupRuntimeError:
@@ -605,11 +642,82 @@ def _directory_open_flags() -> int:
     return flags
 
 
-def _identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
-    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid)
+def _identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
 
 
-def _require_same_directory(directory: Path, expected: os.stat_result) -> None:
+def _open_private_receipt_directory(directory: Path) -> int:
+    descriptor = -1
+    try:
+        if not directory.is_absolute() or directory.resolve(strict=True) != directory:
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        descriptor = _open_nofollow_path(directory, flags=_directory_open_flags())
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        return descriptor
+    except BackupRuntimeError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+
+
+def _open_private_lock_at(directory_descriptor: int) -> int:
+    lock_descriptor = -1
+    try:
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        lock_descriptor = os.open(
+            _LOCK_NAME,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        os.fchmod(lock_descriptor, 0o600)
+        metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        return lock_descriptor
+    except BackupRuntimeError:
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        raise
+    except (OSError, TypeError, ValueError):
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+
+
+def _require_same_directory(directory: Path, expected: tuple[int, ...]) -> None:
     descriptor = -1
     try:
         descriptor = _open_nofollow_path(directory, flags=_directory_open_flags())
@@ -619,7 +727,31 @@ def _require_same_directory(directory: Path, expected: os.stat_result) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if _identity(current) != _identity(expected):
+    if _identity(current) != expected:
+        raise BackupRuntimeError(_PREFLIGHT_ERROR)
+
+
+def _require_same_lock_at(
+    directory_descriptor: int,
+    expected_descriptor: int,
+) -> None:
+    try:
+        expected = os.fstat(expected_descriptor)
+        current = os.stat(
+            _LOCK_NAME,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, ValueError):
+        raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+    if (
+        (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino)
+        or not stat.S_ISREG(current.st_mode)
+        or expected.st_nlink != 1
+        or current.st_nlink != 1
+        or current.st_uid != os.geteuid()
+        or stat.S_IMODE(current.st_mode) != 0o600
+    ):
         raise BackupRuntimeError(_PREFLIGHT_ERROR)
 
 

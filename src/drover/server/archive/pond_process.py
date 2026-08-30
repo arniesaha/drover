@@ -118,6 +118,53 @@ class PondProcessResult:
     stderr_path: Path
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class PondResourceEvidence:
+    """Aggregate-only resource maxima, with unknown physical use preserved."""
+
+    peak_rss_bytes: int
+    peak_physical_bytes: int | None
+    swap_delta_bytes: int
+
+    def __post_init__(self) -> None:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (self.peak_rss_bytes, self.swap_delta_bytes)
+        ):
+            raise PondProcessError("resource")
+        if self.peak_physical_bytes is not None and (
+            isinstance(self.peak_physical_bytes, bool)
+            or not isinstance(self.peak_physical_bytes, int)
+            or self.peak_physical_bytes < 0
+        ):
+            raise PondProcessError("resource")
+
+
+def _process_resource_evidence(result: PondProcessResult) -> PondResourceEvidence:
+    if type(result) is not PondProcessResult:
+        raise PondProcessError("resource")
+    return PondResourceEvidence(
+        result.peak_rss_bytes,
+        result.peak_physical_bytes,
+        result.swap_delta_bytes,
+    )
+
+
+def _aggregate_resource_evidence(
+    *evidence: PondResourceEvidence,
+) -> PondResourceEvidence:
+    if not evidence or any(
+        type(value) is not PondResourceEvidence for value in evidence
+    ):
+        raise PondProcessError("resource")
+    physical = tuple(value.peak_physical_bytes for value in evidence)
+    return PondResourceEvidence(
+        max(value.peak_rss_bytes for value in evidence),
+        None if any(value is None for value in physical) else max(physical),
+        max(value.swap_delta_bytes for value in evidence),
+    )
+
+
 def require_pinned_pond(binary: Path) -> Path:
     """Resolve one executable so Pond is always invoked by canonical path."""
     try:

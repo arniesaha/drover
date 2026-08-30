@@ -16,6 +16,7 @@ from uuid import UUID
 import pytest
 
 import drover.server.archive as archive_package
+import drover.server.archive.backup_runtime as backup_runtime_module
 from drover.config import default_config
 from drover.server.archive.backup_config import BackupConfig
 from drover.server.archive.backup_preflight import (
@@ -25,6 +26,8 @@ from drover.server.archive.backup_preflight import (
 from drover.server.archive.backup_receipt import (
     BackupReceipt,
     CollisionCounts,
+    _latest_backup_receipt_at,
+    _write_backup_receipt_at,
     write_backup_receipt,
 )
 from drover.server.archive.backup_run import (
@@ -36,6 +39,7 @@ from drover.server.archive.backup_run import (
     run_backup,
 )
 from drover.server.archive.backup_runtime import (
+    BackupLock,
     BackupRuntimeError,
     RuntimeEvidence,
 )
@@ -55,6 +59,7 @@ from drover.server.archive.inventory import (
 from drover.server.archive.pond_process import (
     PondProcessError,
     PondProcessResult,
+    PondResourceEvidence,
     ResourceLimits,
 )
 from drover.server.archive.pond_snapshot import PondCorpusCounts, PondStoreSnapshot
@@ -174,6 +179,7 @@ def _snapshot(
     *,
     inventory: PondInventory | None = None,
     counts: PondCorpusCounts | None = None,
+    resource_evidence: PondResourceEvidence | None = None,
 ) -> PondStoreSnapshot:
     return PondStoreSnapshot(
         inventory or _pond_inventory(),
@@ -186,6 +192,7 @@ def _snapshot(
             logical_duplicate_groups=0,
             sessions_in_logical_duplicate_groups=0,
         ),
+        resource_evidence or PondResourceEvidence(300, 600, 10),
     )
 
 
@@ -193,6 +200,7 @@ def _empty_snapshot() -> PondStoreSnapshot:
     return PondStoreSnapshot(
         PondInventory(1, _CAPTURED_AT, "0.16.3", ()),
         PondCorpusCounts(0, 0, 0, 0, 0, 0),
+        PondResourceEvidence(400, 800, 20),
     )
 
 
@@ -226,6 +234,8 @@ def _preflight_result(
     snapshot: PondStoreSnapshot | None = None,
     registry_suffix: str = "",
     artifact_fault: str | None = None,
+    resource_evidence: PondResourceEvidence | None = None,
+    eligibility_receipts_sha256: str | None = None,
 ) -> BackupPreflightResult:
     source_value = source or _native_inventory()
     snapshot_value = snapshot or _snapshot()
@@ -262,6 +272,9 @@ def _preflight_result(
         pond_inventory_path=pond_path,
         coverage_report_path=coverage_path,
         source_not_archive_eligible=0,
+        resource_evidence=resource_evidence or PondResourceEvidence(500, 900, 40),
+        eligibility_receipts_sha256=eligibility_receipts_sha256
+        or private_json_sha256([]),
     )
 
 
@@ -335,11 +348,69 @@ class _Fixture:
     events: list[str]
     attempts: Counter[str]
     written_receipts: list[BackupReceipt]
+    applied_limits: list[tuple[str, ResourceLimits | None]]
     latest_calls: int = 0
     active_phase: str | None = None
     runtime: _Runtime | None = None
     dependencies: _BackupDependencies | None = None
     previous: BackupReceipt | None = None
+    swapped_paths: list[Path] | None = None
+
+
+_WORKSPACE_PHASES = (
+    "before",
+    "storage",
+    "remote-empty",
+    "copy",
+    "verify",
+    "after",
+    "remote-after",
+)
+
+
+def _replace_workspace_directory(fixture: _Fixture, target: str) -> None:
+    if fixture.swapped_paths is None:
+        fixture.swapped_paths = []
+    receipt = fixture.config.receipt_directory
+    runs = receipt / ".backup-runs"
+    generation = runs / str(_GENERATION_ID)
+    if target == "receipt":
+        selected = receipt
+        replacement_parent = receipt.parent
+    elif target == "runs":
+        selected = runs
+        replacement_parent = receipt
+    elif target == "generation":
+        selected = generation
+        replacement_parent = runs
+    elif target in _WORKSPACE_PHASES:
+        selected = generation / target
+        replacement_parent = generation
+    else:
+        raise AssertionError("unknown workspace replacement target")
+    moved = (
+        replacement_parent / f"relocated-{selected.name}-{len(fixture.swapped_paths)}"
+    )
+    selected.rename(moved)
+    selected.mkdir(mode=0o700)
+    if target == "runs":
+        generation = selected / str(_GENERATION_ID)
+        generation.mkdir(mode=0o700)
+        for phase in _WORKSPACE_PHASES:
+            (generation / phase).mkdir(mode=0o700)
+    elif target == "generation":
+        for phase in _WORKSPACE_PHASES:
+            (selected / phase).mkdir(mode=0o700)
+    fixture.swapped_paths.append(moved)
+
+
+def _maybe_replace_workspace(fixture: _Fixture, point: str) -> None:
+    fault = fixture.fault
+    if fixture.swapped_paths:
+        return
+    if fault == f"workspace-{point}":
+        target = point if point in {"receipt", "runs", "generation"} else point
+        _replace_workspace_directory(fixture, target)
 
 
 def _remote_snapshot_for_fault(fault: str | None) -> PondStoreSnapshot:
@@ -388,6 +459,8 @@ def _fixture(
         events=[],
         attempts=Counter(),
         written_receipts=[],
+        applied_limits=[],
+        swapped_paths=[],
     )
     fixture.runtime = _Runtime(fixture)
 
@@ -408,10 +481,13 @@ def _fixture(
         assert receipt_directory == config.receipt_directory
         fixture.events.append("lock-enter")
         fixture.attempts["lock"] += 1
-        try:
-            yield
-        finally:
-            fixture.events.append("lock-exit")
+        with BackupLock(receipt_directory) as lock:
+            if fault == "workspace-receipt":
+                _replace_workspace_directory(fixture, "receipt")
+            try:
+                yield lock
+            finally:
+                fixture.events.append("lock-exit")
 
     def runtime_guard(drover_config):
         assert drover_config is fixture.drover_config
@@ -423,6 +499,8 @@ def _fixture(
         drover_config,
         workspace,
         runtime,
+        *,
+        resource_limits=None,
     ):
         assert received_config is config
         assert drover_config is fixture.drover_config
@@ -431,14 +509,32 @@ def _fixture(
         phase = "preflight-before" if before else "preflight-after"
         fixture.attempts[phase] += 1
         fixture.commands.append("local-sync-dry-run")
+        prefix = "before" if before else "after"
+        for subprocess_phase in ("snapshot-version", "corpus-snapshot", "dry-run"):
+            fixture.applied_limits.append(
+                (f"{prefix}-{subprocess_phase}", resource_limits)
+            )
         if before:
+            _maybe_replace_workspace(fixture, "before")
+            _maybe_replace_workspace(fixture, "runs")
+            _maybe_replace_workspace(fixture, "generation")
             if fault == "preflight":
                 raise BackupPreflightError("archive backup preflight failed")
+            if fault in {"resource-before-version", "resource-before-corpus"}:
+                raise PondProcessError("resource")
             return _preflight_result(
                 workspace,
                 artifact_fault="source" if fault == "before_source_artifact" else None,
+                resource_evidence=PondResourceEvidence(
+                    900,
+                    None if fault == "physical_none_before" else 700,
+                    30,
+                ),
             )
         fixture.commands.append("local-postflight")
+        _maybe_replace_workspace(fixture, "after")
+        if fault in {"resource-after-version", "resource-after-corpus"}:
+            raise PondProcessError("resource")
         if fault in {"eligibility_rebinding", "collision"}:
             raise BackupPreflightError("archive backup preflight failed")
         source = (
@@ -477,6 +573,14 @@ def _fixture(
                     )
                 )
             ),
+            resource_evidence=PondResourceEvidence(
+                500,
+                None if fault == "physical_none_after" else 900,
+                40,
+            ),
+            eligibility_receipts_sha256=(
+                "f" * 64 if fault == "eligibility_exact_bytes" else None
+            ),
         )
 
     def run_process(
@@ -492,8 +596,15 @@ def _fixture(
         fixture.commands.append(label)
         fixture.attempts[label] += 1
         fixture.active_phase = label
+        phase_name = {
+            "storage-check": "storage",
+            "copy": "copy",
+            "verify-only": "verify",
+        }[label]
+        _maybe_replace_workspace(fixture, phase_name)
         arguments_tuple = tuple(arguments)
         fixture.process_calls.append((arguments_tuple, dict(kwargs)))
+        fixture.applied_limits.append((label, kwargs.get("resource_limits")))
         callback = kwargs.get("progress_callback")
         assert callback is not None
         callback()
@@ -503,6 +614,7 @@ def _fixture(
                 "storage-check": {
                     "storage_timeout": "timeout",
                     "storage_overflow": "size",
+                    "storage_resource": "resource",
                 },
                 "copy": {
                     "copy_timeout": "timeout",
@@ -555,7 +667,15 @@ def _fixture(
         physical = 128
         rss = 64
         swap = 0
+        if label == "storage-check":
+            rss = 700
+            physical = 1000
+            swap = 50
         if label == "copy" and fault == "physical_none":
+            physical = None
+        if label == "storage-check" and fault == "physical_none_storage":
+            physical = None
+        if label == "verify-only" and fault == "physical_none_verify":
             physical = None
         if label == "copy" and fault == "rss_ceiling":
             rss = config.max_rss_bytes + 1
@@ -581,6 +701,7 @@ def _fixture(
         workspace,
         timeout_seconds,
         progress_callback=None,
+        resource_limits=None,
     ):
         assert binary == config.pond_binary
         assert pond_config == config.remote_pond_config
@@ -588,6 +709,17 @@ def _fixture(
         assert progress_callback is not None
         remote_after = fixture.attempts["remote-empty-snapshot"] == 1
         label = "remote-postflight" if remote_after else "remote-empty-snapshot"
+        prefix = "final" if remote_after else "empty"
+        fixture.applied_limits.extend(
+            (
+                (f"{prefix}-snapshot-version", resource_limits),
+                (f"{prefix}-corpus-snapshot", resource_limits),
+            )
+        )
+        _maybe_replace_workspace(
+            fixture,
+            "remote-after" if remote_after else "remote-empty",
+        )
         fixture.commands.append(label)
         fixture.attempts[label] += 1
         fixture.active_phase = label
@@ -595,22 +727,55 @@ def _fixture(
         fixture.active_phase = None
         if fault == "empty_snapshot_failure" and not remote_after:
             raise ValueError(_PRIVATE_URL)
+        if not remote_after and fault in {
+            "resource-empty-version",
+            "resource-empty-corpus",
+        }:
+            raise PondProcessError("resource")
         if fault == "remote_snapshot_failure" and remote_after:
             raise ValueError(_PRIVATE_URL)
+        if remote_after and fault in {
+            "resource-final-version",
+            "resource-final-corpus",
+        }:
+            raise PondProcessError("resource")
         if not remote_after:
             value = _snapshot() if fault == "nonempty_generation" else _empty_snapshot()
+            value = replace(
+                value,
+                resource_evidence=PondResourceEvidence(
+                    400,
+                    None if fault == "physical_none_empty" else 1800,
+                    20,
+                ),
+            )
         else:
             value = _remote_snapshot_for_fault(fault)
+            value = replace(
+                value,
+                resource_evidence=PondResourceEvidence(
+                    600,
+                    None if fault == "physical_none_final" else 1000,
+                    25,
+                ),
+            )
         write_private_json(
             Path(workspace) / "pond-inventory.json",
             value.root_inventory.to_wire(),
         )
         return value
 
-    def latest_receipt(receipt_directory, store_scope_id):
+    def latest_receipt(
+        receipt_directory,
+        receipt_descriptor,
+        receipt_identity,
+        store_scope_id,
+    ):
         fixture.latest_calls += 1
         assert receipt_directory == config.receipt_directory
         assert store_scope_id == config.store_scope_id
+        if fault == "workspace-predecessor" and fixture.latest_calls == 1:
+            _replace_workspace_directory(fixture, "runs")
         if fault == "parent_swap" and fixture.latest_calls == 1:
             relocated = tmp_path / "relocated-receipts-private"
             config.receipt_directory.rename(relocated)
@@ -623,15 +788,38 @@ def _fixture(
                 _receipt(config, _PREVIOUS_ID),
                 store_scope_id="sha256:" + "f" * 64,
             )
-        from drover.server.archive.backup_receipt import latest_backup_receipt
+        return _latest_backup_receipt_at(
+            receipt_directory,
+            receipt_descriptor,
+            receipt_identity,
+            store_scope_id,
+        )
 
-        return latest_backup_receipt(receipt_directory, store_scope_id)
-
-    def write_receipt(receipt_directory, receipt):
+    def write_receipt(
+        receipt_directory,
+        receipt_descriptor,
+        receipt_identity,
+        receipt,
+        *,
+        before_publish,
+    ):
         fixture.attempts["receipt-write"] += 1
+        final = receipt_directory / f"backup-{receipt.generation_id}.json"
+        if fault != "receipt_collision":
+            assert not final.exists()
+        assert fixture.attempts["runtime-finish"] == 1
+        assert fixture.latest_calls == 2
+        if fault == "workspace-writer":
+            _replace_workspace_directory(fixture, "generation")
         if fault == "receipt_write":
             raise ValueError(_PRIVATE_MESSAGE)
-        path = write_backup_receipt(receipt_directory, receipt)
+        path = _write_backup_receipt_at(
+            receipt_directory,
+            receipt_descriptor,
+            receipt_identity,
+            receipt,
+            before_publish=before_publish,
+        )
         fixture.written_receipts.append(receipt)
         return path
 
@@ -733,14 +921,33 @@ def test_applied_backup_runs_every_gate_once_and_writes_one_linked_receipt(
     assert receipt.created_at == "2026-08-29T12:30:00Z"
     assert receipt.copy_duration_ms == 20
     assert receipt.verify_duration_ms == 10
-    assert receipt.peak_rss_bytes == 64
-    assert receipt.peak_physical_bytes == 128
+    assert receipt.peak_rss_bytes == 900
+    assert receipt.peak_physical_bytes == 1800
+    assert receipt.swap_delta_bytes == 50
     assert len(fixture.written_receipts) == 1
     assert len(list(fixture.config.receipt_directory.glob("backup-*.json"))) == 2
     run_directory = (
         fixture.config.receipt_directory / ".backup-runs" / str(_GENERATION_ID)
     )
     assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
+
+
+def test_unlock_cleanup_cannot_override_a_successfully_published_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def fail_unlock(_descriptor: int) -> None:
+        raise BackupRuntimeError("archive backup preflight failed")
+
+    monkeypatch.setattr(backup_runtime_module, "release_flock", fail_unlock)
+
+    receipt = _run(fixture)
+
+    final = fixture.config.receipt_directory / f"backup-{receipt.generation_id}.json"
+    assert final.is_file()
+    assert fixture.written_receipts == [receipt]
 
 
 def test_runner_uses_exact_remote_config_argv_callbacks_and_limits(
@@ -786,6 +993,21 @@ def test_runner_uses_exact_remote_config_argv_callbacks_and_limits(
         assert kwargs["resource_limits"] == expected_limits
         assert kwargs["progress_callback"] is not None
         assert "env" not in kwargs
+
+
+def test_applied_backup_limits_all_thirteen_processes_and_aggregates_all_peaks(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    receipt = _run(fixture)
+
+    expected_limits = ResourceLimits(1024, 2048, 64)
+    assert len(fixture.applied_limits) == 13
+    assert all(limits == expected_limits for _, limits in fixture.applied_limits)
+    assert receipt.peak_rss_bytes == 900
+    assert receipt.peak_physical_bytes == 1800
+    assert receipt.swap_delta_bytes == 50
 
 
 @pytest.mark.parametrize(
@@ -851,8 +1073,15 @@ def test_copy_verify_and_remote_capture_never_retry_or_publish(
     "fault",
     [
         "copy_resource",
+        "storage_resource",
         "verify_resource",
         "physical_none",
+        "physical_none_before",
+        "physical_none_storage",
+        "physical_none_empty",
+        "physical_none_verify",
+        "physical_none_after",
+        "physical_none_final",
         "rss_ceiling",
         "physical_ceiling",
         "swap_ceiling",
@@ -874,6 +1103,32 @@ def test_missing_or_exceeded_resource_evidence_never_publishes(
 
 
 @pytest.mark.parametrize(
+    "fault",
+    [
+        "resource-before-version",
+        "resource-before-corpus",
+        "resource-empty-version",
+        "resource-empty-corpus",
+        "resource-after-version",
+        "resource-after-corpus",
+        "resource-final-version",
+        "resource-final-corpus",
+    ],
+)
+def test_snapshot_resource_failure_in_every_applied_phase_keeps_fixed_category(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    fixture = _fixture(tmp_path, fault=fault)
+
+    with pytest.raises(BackupRunError, match=r"^archive backup resource limit$"):
+        _run(fixture)
+
+    assert fixture.attempts["receipt-write"] == 0
+    assert fixture.written_receipts == []
+
+
+@pytest.mark.parametrize(
     ("fault", "category"),
     [
         ("baseline_health", "archive backup preflight failed"),
@@ -884,6 +1139,7 @@ def test_missing_or_exceeded_resource_evidence_never_publishes(
         ("listener_restart", "archive backup local changed"),
         ("source_fingerprint", "archive backup local changed"),
         ("eligibility_rebinding", "archive backup local changed"),
+        ("eligibility_exact_bytes", "archive backup local changed"),
         ("coverage_binding", "archive backup local changed"),
         ("collision", "archive backup local changed"),
         ("local_root", "archive backup local changed"),
@@ -943,6 +1199,36 @@ def test_receipt_fork_collision_swap_and_write_fail_before_publication(
 
     assert fixture.written_receipts == []
     assert fixture.attempts["receipt-write"] <= 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "workspace-receipt",
+        "workspace-runs",
+        "workspace-generation",
+        "workspace-before",
+        "workspace-storage",
+        "workspace-remote-empty",
+        "workspace-copy",
+        "workspace-verify",
+        "workspace-after",
+        "workspace-remote-after",
+        "workspace-predecessor",
+        "workspace-writer",
+    ],
+)
+def test_lock_and_every_workspace_level_remain_one_descriptor_bound_transaction(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    fixture = _fixture(tmp_path, fault=fault)
+
+    with pytest.raises(BackupRunError):
+        _run(fixture)
+
+    assert list(tmp_path.rglob("backup-*.json")) == []
+    assert fixture.written_receipts == []
 
 
 @pytest.mark.parametrize(

@@ -26,9 +26,9 @@ from drover.server.archive.backup_preflight import (
 from drover.server.archive.backup_receipt import (
     BackupReceipt,
     CollisionCounts,
+    _latest_backup_receipt_at,
+    _write_backup_receipt_at,
     backup_receipt_summary,
-    latest_backup_receipt,
-    write_backup_receipt,
 )
 from drover.server.archive.backup_runtime import (
     BackupLock,
@@ -46,7 +46,16 @@ from drover.server.archive.pond_inventory import POND_VERSION
 from drover.server.archive.pond_process import (
     PondProcessError,
     PondProcessResult,
+    PondResourceEvidence,
     ResourceLimits,
+)
+from drover.server.archive.pond_process import (
+    _aggregate_resource_evidence as _pond_aggregate_resource_evidence,
+)
+from drover.server.archive.pond_process import (
+    _process_resource_evidence as _pond_process_resource_evidence,
+)
+from drover.server.archive.pond_process import (
     run_pond_process,
 )
 from drover.server.archive.pond_snapshot import (
@@ -106,7 +115,13 @@ class _Runtime(Protocol):
 
 
 class _BackupLockFactory(Protocol):
-    def __call__(self, receipt_directory: Path) -> AbstractContextManager[Any]: ...
+    def __call__(
+        self, receipt_directory: Path
+    ) -> AbstractContextManager[_HeldBackupLock]: ...
+
+
+class _HeldBackupLock(Protocol):
+    def _duplicate_receipt_directory(self) -> tuple[int, tuple[int, ...]]: ...
 
 
 class _RuntimeFactory(Protocol):
@@ -120,6 +135,8 @@ class _Preflight(Protocol):
         drover_config: DroverConfig,
         workspace: Path,
         runtime_guard: _Runtime,
+        *,
+        resource_limits: ResourceLimits,
     ) -> BackupPreflightResult: ...
 
 
@@ -149,17 +166,30 @@ class _CaptureSnapshot(Protocol):
         workspace: Path,
         timeout_seconds: float,
         progress_callback: Callable[[], None] | None = None,
+        resource_limits: ResourceLimits | None = None,
     ) -> PondStoreSnapshot: ...
 
 
 class _LatestReceipt(Protocol):
     def __call__(
-        self, receipt_directory: Path, store_scope_id: str
+        self,
+        receipt_directory: Path,
+        receipt_descriptor: int,
+        receipt_identity: tuple[int, ...],
+        store_scope_id: str,
     ) -> BackupReceipt | None: ...
 
 
 class _WriteReceipt(Protocol):
-    def __call__(self, receipt_directory: Path, receipt: BackupReceipt) -> Path: ...
+    def __call__(
+        self,
+        receipt_directory: Path,
+        receipt_descriptor: int,
+        receipt_identity: tuple[int, ...],
+        receipt: BackupReceipt,
+        *,
+        before_publish: Callable[[], None],
+    ) -> Path: ...
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -184,8 +214,8 @@ def _production_backup_dependencies() -> _BackupDependencies:
         run_preflight=run_backup_preflight,
         run_pond_process=run_pond_process,
         capture_pond_snapshot=capture_pond_store_snapshot,
-        latest_receipt=latest_backup_receipt,
-        write_receipt=write_backup_receipt,
+        latest_receipt=_latest_backup_receipt_at,
+        write_receipt=_write_backup_receipt_at,
         now=lambda: datetime.now(timezone.utc),
     )
 
@@ -214,8 +244,17 @@ def _run_backup(
         raise BackupRunError(_PREFLIGHT_ERROR)
     try:
         lock = dependencies.backup_lock(config.receipt_directory)
-        with lock:
-            return _run_locked(config, drover_config, dependencies)
+        with lock as held_lock:
+            receipt_descriptor, receipt_identity = (
+                held_lock._duplicate_receipt_directory()
+            )
+            return _run_locked(
+                config,
+                drover_config,
+                dependencies,
+                receipt_descriptor=receipt_descriptor,
+                receipt_identity=receipt_identity,
+            )
     except BackupRunError:
         raise
     except BackupRuntimeError as error:
@@ -228,21 +267,38 @@ def _run_locked(
     config: BackupConfig,
     drover_config: DroverConfig,
     dependencies: _BackupDependencies,
+    *,
+    receipt_descriptor: int,
+    receipt_identity: tuple[int, ...],
 ) -> BackupReceipt:
-    generation_id = _new_generation_id(dependencies)
     try:
-        workspace_context = _PinnedRunWorkspace(config, generation_id)
+        generation_id = _new_generation_id(dependencies)
+    except Exception:
+        try:
+            os.close(receipt_descriptor)
+        except OSError:
+            pass
+        raise
+    try:
+        workspace_context = _PinnedRunWorkspace(
+            config,
+            generation_id,
+            receipt_descriptor,
+            receipt_identity,
+        )
     except Exception:
         raise BackupRunError(_PREFLIGHT_ERROR) from None
     with workspace_context as workspace:
         runtime = _create_runtime(dependencies, drover_config)
         _capture_baseline(runtime)
+        limits = _resource_limits(config)
         before = _preflight(
             dependencies,
             config,
             drover_config,
             workspace.phase("before"),
             runtime,
+            limits,
             after_copy=False,
         )
         _validate_preflight_artifacts(before, _PREFLIGHT_ERROR)
@@ -252,8 +308,7 @@ def _run_locked(
             remote_generation = RemotePondGeneration(generation_url)
         except Exception:
             raise BackupRunError(_PREFLIGHT_ERROR) from None
-        limits = _resource_limits(config)
-        _storage_check(
+        storage_result = _storage_check(
             dependencies,
             config,
             generation_url,
@@ -268,6 +323,7 @@ def _run_locked(
             remote_generation,
             workspace.phase("remote-empty"),
             runtime,
+            limits,
             empty=True,
         )
         _require_empty_generation(empty)
@@ -296,6 +352,7 @@ def _run_locked(
             drover_config,
             workspace.phase("after"),
             runtime,
+            limits,
             after_copy=True,
         )
         workspace.require_same()
@@ -305,6 +362,7 @@ def _run_locked(
             remote_generation,
             workspace.phase("remote-after"),
             runtime,
+            limits,
             empty=False,
         )
         workspace.require_same()
@@ -319,12 +377,20 @@ def _run_locked(
         local_digest = pond_inventory_content_sha256(after.pond_snapshot.root_inventory)
         runtime_evidence = _finish_runtime(runtime)
         resource_evidence = _aggregate_resource_evidence(
-            config, copy_result, verify_result
+            config,
+            before.resource_evidence,
+            _pond_process_resource_evidence(storage_result),
+            empty.resource_evidence,
+            _pond_process_resource_evidence(copy_result),
+            _pond_process_resource_evidence(verify_result),
+            after.resource_evidence,
+            remote.resource_evidence,
         )
         workspace.require_same()
         receipt, predecessor_digest = _build_verified_receipt(
             dependencies,
             config,
+            workspace,
             generation_id,
             after,
             source_digest=source_digest,
@@ -340,11 +406,11 @@ def _run_locked(
         _require_predecessor_unchanged(
             dependencies,
             config,
+            workspace,
             predecessor_digest,
         )
         workspace.require_same()
-        _write_verified_receipt(dependencies, config, receipt)
-        workspace.require_same()
+        _write_verified_receipt(dependencies, config, workspace, receipt)
         return receipt
 
 
@@ -398,6 +464,7 @@ def _preflight(
     drover_config: DroverConfig,
     workspace: Path,
     runtime: _Runtime,
+    limits: ResourceLimits,
     *,
     after_copy: bool,
 ) -> BackupPreflightResult:
@@ -408,6 +475,7 @@ def _preflight(
             drover_config,
             workspace,
             runtime,
+            resource_limits=limits,
         )
         if type(result) is not BackupPreflightResult:
             raise ValueError
@@ -415,6 +483,11 @@ def _preflight(
         return result
     except BackupRunError:
         raise
+    except BackupRuntimeError as error:
+        raise BackupRunError(_runtime_category(error)) from None
+    except PondProcessError as error:
+        mapped = _RESOURCE_ERROR if error.category == "resource" else category
+        raise BackupRunError(mapped) from None
     except Exception:
         raise BackupRunError(category) from None
 
@@ -437,7 +510,7 @@ def _storage_check(
     workspace: Path,
     runtime: _Runtime,
     limits: ResourceLimits,
-) -> None:
+) -> PondProcessResult:
     try:
         result = dependencies.run_pond_process(
             config.pond_binary,
@@ -469,6 +542,7 @@ def _storage_check(
             or payload["failure"] is not None
         ):
             raise ValueError
+        return result
     except BackupRuntimeError as error:
         raise BackupRunError(_runtime_category(error)) from None
     except PondProcessError as error:
@@ -486,6 +560,7 @@ def _capture_remote_snapshot(
     storage: RemotePondGeneration,
     workspace: Path,
     runtime: _Runtime,
+    limits: ResourceLimits,
     *,
     empty: bool,
 ) -> PondStoreSnapshot:
@@ -498,6 +573,7 @@ def _capture_remote_snapshot(
             workspace=workspace,
             timeout_seconds=config.copy_timeout_seconds,
             progress_callback=runtime.sample,
+            resource_limits=limits,
         )
         if type(snapshot) is not PondStoreSnapshot:
             raise ValueError
@@ -511,6 +587,11 @@ def _capture_remote_snapshot(
         return snapshot
     except BackupRunError:
         raise
+    except BackupRuntimeError as error:
+        raise BackupRunError(_runtime_category(error)) from None
+    except PondProcessError as error:
+        mapped = _RESOURCE_ERROR if error.category == "resource" else category
+        raise BackupRunError(mapped) from None
     except Exception:
         raise BackupRunError(category) from None
 
@@ -666,6 +747,7 @@ def _require_unchanged_local(
             or before.coverage.to_wire() != after.coverage.to_wire()
             or dict(before.coverage_summary) != dict(after.coverage_summary)
             or before.source_not_archive_eligible != after.source_not_archive_eligible
+            or before.eligibility_receipts_sha256 != after.eligibility_receipts_sha256
         ):
             raise ValueError
     except Exception:
@@ -779,23 +861,15 @@ def _finish_runtime(runtime: _Runtime) -> RuntimeEvidence:
 
 def _aggregate_resource_evidence(
     config: BackupConfig,
-    copy_result: PondProcessResult,
-    verify_result: PondProcessResult,
+    *values: PondResourceEvidence,
 ) -> tuple[int, int, int]:
     try:
-        values = (copy_result, verify_result)
-        for result in values:
-            _require_process_result(
-                result,
-                result.stdout_path.parent,
-                result.stdout_path.stem,
-            )
-        physical = tuple(result.peak_physical_bytes for result in values)
-        if any(value is None for value in physical):
+        evidence = _pond_aggregate_resource_evidence(*values)
+        if evidence.peak_physical_bytes is None:
             raise ValueError
-        peak_rss = max(result.peak_rss_bytes for result in values)
-        peak_physical = max(value for value in physical if value is not None)
-        swap_delta = max(result.swap_delta_bytes for result in values)
+        peak_rss = evidence.peak_rss_bytes
+        peak_physical = evidence.peak_physical_bytes
+        swap_delta = evidence.swap_delta_bytes
         if (
             peak_rss > config.max_rss_bytes
             or peak_physical > config.max_physical_bytes
@@ -810,6 +884,7 @@ def _aggregate_resource_evidence(
 def _build_verified_receipt(
     dependencies: _BackupDependencies,
     config: BackupConfig,
+    workspace: _PinnedRunWorkspace,
     generation_id: UUID,
     after: BackupPreflightResult,
     *,
@@ -824,7 +899,7 @@ def _build_verified_receipt(
 ) -> tuple[BackupReceipt, str | None]:
     try:
         predecessor = dependencies.latest_receipt(
-            config.receipt_directory,
+            *workspace.receipt_binding(),
             config.store_scope_id,
         )
         predecessor_digest = (
@@ -881,11 +956,12 @@ def _build_verified_receipt(
 def _require_predecessor_unchanged(
     dependencies: _BackupDependencies,
     config: BackupConfig,
+    workspace: _PinnedRunWorkspace,
     expected_digest: str | None,
 ) -> None:
     try:
         current = dependencies.latest_receipt(
-            config.receipt_directory,
+            *workspace.receipt_binding(),
             config.store_scope_id,
         )
         current_digest = (
@@ -900,13 +976,15 @@ def _require_predecessor_unchanged(
 def _write_verified_receipt(
     dependencies: _BackupDependencies,
     config: BackupConfig,
+    workspace: _PinnedRunWorkspace,
     receipt: BackupReceipt,
 ) -> None:
     try:
-        path = dependencies.write_receipt(config.receipt_directory, receipt)
-        expected = config.receipt_directory / f"backup-{receipt.generation_id}.json"
-        if not isinstance(path, Path) or path != expected:
-            raise ValueError
+        dependencies.write_receipt(
+            *workspace.receipt_binding(),
+            receipt,
+            before_publish=workspace.prepare_publish,
+        )
     except Exception:
         raise BackupRunError(_RECEIPT_ERROR) from None
 
@@ -974,8 +1052,18 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
-    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid)
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
+
+
+def _directory_node(identity: tuple[int, ...]) -> tuple[int, ...]:
+    return identity[:4]
 
 
 def _directory_flags() -> int:
@@ -989,22 +1077,38 @@ def _directory_flags() -> int:
 
 class _PinnedRunWorkspace:
     __slots__ = (
+        "_active_phase",
         "_config",
         "_generation_id",
+        "_phase_descriptors",
+        "_phase_identities",
         "_receipt_descriptor",
         "_receipt_identity",
         "_runs_descriptor",
+        "_runs_identity",
         "_run_descriptor",
+        "_run_identity",
         "path",
     )
 
-    def __init__(self, config: BackupConfig, generation_id: UUID) -> None:
+    def __init__(
+        self,
+        config: BackupConfig,
+        generation_id: UUID,
+        receipt_descriptor: int,
+        receipt_identity: tuple[int, ...],
+    ) -> None:
+        self._active_phase: str | None = None
         self._config = config
         self._generation_id = generation_id
-        self._receipt_descriptor = -1
-        self._receipt_identity: tuple[int, int, int, int] | None = None
+        self._phase_descriptors: dict[str, int] = {}
+        self._phase_identities: dict[str, tuple[int, ...]] = {}
+        self._receipt_descriptor = receipt_descriptor
+        self._receipt_identity: tuple[int, ...] | None = receipt_identity
         self._runs_descriptor = -1
+        self._runs_identity: tuple[int, ...] | None = None
         self._run_descriptor = -1
+        self._run_identity: tuple[int, ...] | None = None
         self.path = config.receipt_directory / _RUNS_DIRECTORY / str(generation_id)
 
     def __repr__(self) -> str:
@@ -1015,14 +1119,14 @@ class _PinnedRunWorkspace:
             receipt = self._config.receipt_directory
             if not receipt.is_absolute() or receipt.resolve(strict=True) != receipt:
                 raise ValueError
-            self._receipt_descriptor = _open_nofollow_path(
-                receipt,
-                flags=_directory_flags(),
-            )
             receipt_metadata = os.fstat(self._receipt_descriptor)
-            if not _is_private_directory(receipt_metadata):
+            if (
+                self._receipt_identity is None
+                or not _is_private_directory(receipt_metadata)
+                or _directory_identity(receipt_metadata) != self._receipt_identity
+            ):
                 raise ValueError
-            self._receipt_identity = _directory_identity(receipt_metadata)
+            self._require_root(self._receipt_identity)
             self._runs_descriptor = _open_or_create_private_directory(
                 self._receipt_descriptor,
                 _RUNS_DIRECTORY,
@@ -1039,7 +1143,16 @@ class _PinnedRunWorkspace:
                     name,
                     exclusive=True,
                 )
-                os.close(descriptor)
+                self._phase_descriptors[name] = descriptor
+            self._receipt_identity = _directory_identity(
+                os.fstat(self._receipt_descriptor)
+            )
+            self._runs_identity = _directory_identity(os.fstat(self._runs_descriptor))
+            self._run_identity = _directory_identity(os.fstat(self._run_descriptor))
+            self._phase_identities = {
+                name: _directory_identity(os.fstat(descriptor))
+                for name, descriptor in self._phase_descriptors.items()
+            }
             self.require_same()
             return self
         except Exception:
@@ -1052,34 +1165,98 @@ class _PinnedRunWorkspace:
     def phase(self, name: str) -> Path:
         if name not in _PHASE_DIRECTORIES:
             raise BackupRunError(_PREFLIGHT_ERROR)
+        self.require_same()
+        self._active_phase = name
         return self.path / name
 
-    def require_same(self) -> None:
+    def receipt_binding(self) -> tuple[Path, int, tuple[int, ...]]:
+        self.require_same()
+        if self._receipt_identity is None:
+            raise BackupRunError(_RECEIPT_ERROR)
+        return (
+            self._config.receipt_directory,
+            self._receipt_descriptor,
+            self._receipt_identity,
+        )
+
+    def prepare_publish(self) -> None:
+        """Accept only the writer's temp-entry ctime change, then check all paths."""
         try:
-            if self._receipt_identity is None or self._receipt_descriptor < 0:
+            if self._receipt_identity is None:
                 raise ValueError
-            current_descriptor = os.fstat(self._receipt_descriptor)
-            current_path_descriptor = _open_nofollow_path(
+            descriptor_identity = _directory_identity(
+                os.fstat(self._receipt_descriptor)
+            )
+            path_descriptor = _open_nofollow_path(
                 self._config.receipt_directory,
                 flags=_directory_flags(),
             )
             try:
-                current_path = os.fstat(current_path_descriptor)
+                path_identity = _directory_identity(os.fstat(path_descriptor))
             finally:
-                os.close(current_path_descriptor)
-            run = os.fstat(self._run_descriptor)
+                os.close(path_descriptor)
+            if descriptor_identity != path_identity or _directory_node(
+                descriptor_identity
+            ) != _directory_node(self._receipt_identity):
+                raise ValueError
+            self._receipt_identity = descriptor_identity
+            self.require_same()
+        except BackupRunError:
+            raise
+        except Exception:
+            raise BackupRunError(_RECEIPT_ERROR) from None
+
+    def require_same(self) -> None:
+        try:
             if (
-                _directory_identity(current_descriptor) != self._receipt_identity
-                or _directory_identity(current_path) != self._receipt_identity
-                or not _is_private_directory(run)
+                self._receipt_identity is None
+                or self._runs_identity is None
+                or self._run_identity is None
+                or self._receipt_descriptor < 0
+                or self._runs_descriptor < 0
+                or self._run_descriptor < 0
+                or set(self._phase_descriptors) != set(_PHASE_DIRECTORIES)
+                or set(self._phase_identities) != set(_PHASE_DIRECTORIES)
             ):
                 raise ValueError
+            self._require_root(self._receipt_identity)
+            _require_directory_entry(
+                self._receipt_descriptor,
+                _RUNS_DIRECTORY,
+                self._runs_descriptor,
+                self._runs_identity,
+            )
+            _require_directory_entry(
+                self._runs_descriptor,
+                str(self._generation_id),
+                self._run_descriptor,
+                self._run_identity,
+            )
+            for name in _PHASE_DIRECTORIES:
+                current = _require_directory_entry(
+                    self._run_descriptor,
+                    name,
+                    self._phase_descriptors[name],
+                    self._phase_identities[name],
+                    allow_ctime_change=name == self._active_phase,
+                )
+                if name == self._active_phase:
+                    self._phase_identities[name] = current
+            self._active_phase = None
         except BackupRunError:
             raise
         except Exception:
             raise BackupRunError(_RECEIPT_ERROR) from None
 
     def close(self) -> None:
+        for descriptor in self._phase_descriptors.values():
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        self._phase_descriptors.clear()
+        self._phase_identities.clear()
         for name in (
             "_run_descriptor",
             "_runs_descriptor",
@@ -1092,6 +1269,43 @@ class _PinnedRunWorkspace:
                     os.close(descriptor)
                 except OSError:
                     pass
+
+    def _require_root(self, expected: tuple[int, ...]) -> None:
+        descriptor_identity = _directory_identity(os.fstat(self._receipt_descriptor))
+        path_descriptor = _open_nofollow_path(
+            self._config.receipt_directory,
+            flags=_directory_flags(),
+        )
+        try:
+            path_identity = _directory_identity(os.fstat(path_descriptor))
+        finally:
+            os.close(path_descriptor)
+        if descriptor_identity != expected or path_identity != expected:
+            raise ValueError
+
+
+def _require_directory_entry(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+    expected: tuple[int, ...],
+    *,
+    allow_ctime_change: bool = False,
+) -> tuple[int, ...]:
+    opened = os.fstat(descriptor)
+    lexical = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if not _is_private_directory(opened) or not _is_private_directory(lexical):
+        raise ValueError
+    opened_identity = _directory_identity(opened)
+    lexical_identity = _directory_identity(lexical)
+    if opened_identity != lexical_identity:
+        raise ValueError
+    if allow_ctime_change:
+        if _directory_node(opened_identity) != _directory_node(expected):
+            raise ValueError
+    elif opened_identity != expected:
+        raise ValueError
+    return opened_identity
 
 
 def _open_or_create_private_directory(

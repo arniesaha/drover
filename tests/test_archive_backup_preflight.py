@@ -23,7 +23,11 @@ from drover.server.archive.backup_preflight import (
     backup_preflight_summary,
     run_backup_preflight,
 )
-from drover.server.archive.backup_runtime import RuntimeGuard, RuntimeIdentity
+from drover.server.archive.backup_runtime import (
+    BackupRuntimeError,
+    RuntimeGuard,
+    RuntimeIdentity,
+)
 from drover.server.archive.coverage import (
     RegistryCandidate,
     build_coverage_report,
@@ -37,7 +41,12 @@ from drover.server.archive.inventory import (
     write_private_json,
 )
 from drover.server.archive.native_inventory import discover_native_history_inventory
-from drover.server.archive.pond_process import PondProcessResult
+from drover.server.archive.pond_process import (
+    PondProcessError,
+    PondProcessResult,
+    PondResourceEvidence,
+    ResourceLimits,
+)
 from drover.server.archive.pond_snapshot import PondCorpusCounts, PondStoreSnapshot
 from drover.server.harness import daemon as harness_daemon
 
@@ -294,6 +303,7 @@ def _dependencies(
         workspace,
         timeout_seconds,
         progress_callback=None,
+        resource_limits=None,
     ):
         calls.append(
             (
@@ -304,11 +314,15 @@ def _dependencies(
                 workspace,
                 timeout_seconds,
                 progress_callback,
+                resource_limits,
             )
         )
         if progress_callback is not None:
             progress_callback()
-        value = snapshot or _snapshot()
+        value = replace(
+            snapshot or _snapshot(),
+            resource_evidence=PondResourceEvidence(700, 800, 0),
+        )
         write_private_json(
             workspace / "pond-inventory.json", value.root_inventory.to_wire()
         )
@@ -351,7 +365,7 @@ def _dependencies(
         stderr.write_bytes(b"")
         stdout.chmod(0o600)
         stderr.chmod(0o600)
-        return PondProcessResult(0, 1, 0, None, 0, stdout, stderr)
+        return PondProcessResult(0, 1, 300, 400, 0, stdout, stderr)
 
     production_dependencies = _PreflightDependencies(
         native_home=lambda: home,
@@ -379,6 +393,7 @@ def _run(
     snapshot: PondStoreSnapshot | None = None,
     include_metadata_only: bool = False,
     summary_override=None,
+    resource_limits: ResourceLimits | None = None,
 ):
     config = _backup_config(tmp_path)
     dependencies = _dependencies(
@@ -397,6 +412,7 @@ def _run(
         drover_config,
         workspace,
         runtime,
+        resource_limits=resource_limits,
         dependencies=dependencies.dependencies,
     )
     return result, config, dependencies, runtime, workspace
@@ -472,7 +488,10 @@ def test_preflight_is_local_only_and_requires_a_clean_denominator(tmp_path):
             60.0,
             workspace,
             "local-dry-run",
-            {"progress_callback": runtime.sample},
+            {
+                "progress_callback": runtime.sample,
+                "resource_limits": None,
+            },
         )
     ]
     rendered_calls = repr(dependencies.calls)
@@ -486,8 +505,22 @@ def test_preflight_passes_active_runtime_sample_to_snapshot_and_dry_run(tmp_path
 
     snapshot_call = next(call for call in fixture.calls if call[0] == "snapshot")
     process_call = next(call for call in fixture.calls if call[0] == "process")
-    assert snapshot_call[-1] == runtime.sample
+    assert snapshot_call[-2] == runtime.sample
     assert process_call[-1]["progress_callback"] == runtime.sample
+
+
+def test_applied_preflight_forwards_limits_and_aggregates_snapshot_and_dry_run(
+    tmp_path: Path,
+) -> None:
+    limits = ResourceLimits(1024, 2048, 0)
+
+    result, _, fixture, _, _ = _run(tmp_path, resource_limits=limits)
+
+    snapshot_call = next(call for call in fixture.calls if call[0] == "snapshot")
+    process_call = next(call for call in fixture.calls if call[0] == "process")
+    assert snapshot_call[-1] == limits
+    assert process_call[-1]["resource_limits"] == limits
+    assert result.resource_evidence == PondResourceEvidence(700, 800, 0)
 
 
 @pytest.mark.parametrize(
@@ -511,7 +544,10 @@ def test_preflight_fails_fixed_when_runtime_changes_during_any_phase(
     fixture = _dependencies(tmp_path, config)
     runtime = _runtime_guard(active=True, samples=samples)
 
-    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+    with pytest.raises(
+        BackupRuntimeError,
+        match=r"^archive backup local changed$",
+    ):
         _run_backup_preflight(
             config,
             replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
@@ -522,6 +558,46 @@ def test_preflight_fails_fixed_when_runtime_changes_during_any_phase(
 
     reached_dry_run = any(call[0] == "process" for call in fixture.calls)
     assert reached_dry_run is (phase == "dry-run")
+
+
+@pytest.mark.parametrize("phase", ["snapshot", "dry-run"])
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        (
+            BackupRuntimeError("archive backup local changed"),
+            "archive backup local changed",
+        ),
+        (PondProcessError("resource"), "resource"),
+    ],
+)
+def test_preflight_preserves_runtime_and_resource_failures(
+    tmp_path: Path,
+    phase: str,
+    failure: Exception,
+    category: str,
+) -> None:
+    config = _backup_config(tmp_path)
+    fixture = _dependencies(tmp_path, config)
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    dependencies = replace(
+        fixture.dependencies,
+        **{
+            "capture_pond_snapshot" if phase == "snapshot" else "run_pond_process": fail
+        },
+    )
+
+    with pytest.raises(type(failure), match=rf"^{category}$"):
+        _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _runtime_guard(active=True),
+            dependencies=dependencies,
+        )
 
 
 def test_preflight_rejects_coverage_eligibility_count_mismatch(tmp_path):
@@ -655,6 +731,62 @@ def test_preflight_loads_exact_bound_eligibility_from_fixed_directory(tmp_path):
         "source_not_archive_eligible": 1,
         "discovered_not_synced": 0,
     }
+
+
+def test_preflight_digest_binds_exact_sorted_eligibility_receipt_bytes(
+    tmp_path: Path,
+) -> None:
+    config = _backup_config(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        config,
+        include_metadata_only=True,
+    )
+    inventory = discover_native_history_inventory(dependencies.home, _HOST_ID)
+    metadata = next(
+        row for row in inventory.records if row.session_id == "metadata-private"
+    )
+    eligibility = config.receipt_directory / "eligibility"
+    eligibility.mkdir(mode=0o700)
+    receipt_path = eligibility / "metadata-private.json"
+
+    def write_receipt(assessed_at: str) -> None:
+        receipt = SourceEligibilityReceipt(
+            schema_version=1,
+            assessed_at=assessed_at,
+            host_id=_HOST_ID,
+            source_agent="claude-code",
+            session_id="metadata-private",
+            source_fingerprint=metadata.source_fingerprint or "",
+            classification="source_not_archive_eligible",
+        )
+        write_private_json(receipt_path, receipt.to_wire())
+
+    drover_config = replace(
+        default_config(),
+        duckdb_path=tmp_path / "ignored.duckdb",
+    )
+    write_receipt("2026-08-29T12:00:00Z")
+    first = _run_backup_preflight(
+        config,
+        drover_config,
+        tmp_path / "workspace-first-private",
+        _runtime_guard(active=True),
+        dependencies=dependencies.dependencies,
+    )
+    receipt_path.unlink()
+    write_receipt("2026-08-29T12:00:01Z")
+    second = _run_backup_preflight(
+        config,
+        drover_config,
+        tmp_path / "workspace-second-private",
+        _runtime_guard(active=True),
+        dependencies=dependencies.dependencies,
+    )
+
+    assert first.source_not_archive_eligible == second.source_not_archive_eligible == 1
+    assert first.coverage.to_wire() == second.coverage.to_wire()
+    assert first.eligibility_receipts_sha256 != second.eligibility_receipts_sha256
 
 
 def test_preflight_rejects_stale_eligibility_binding_with_fixed_error(tmp_path):
