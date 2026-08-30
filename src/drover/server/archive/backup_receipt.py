@@ -15,6 +15,7 @@ from uuid import UUID
 
 from drover.server.archive.inventory import (
     MAX_INVENTORY_BYTES,
+    _open_nofollow_path,
     _write_private_json_at,
     private_json_sha256,
 )
@@ -313,10 +314,7 @@ def load_backup_receipt(path: str | os.PathLike[str]) -> BackupReceipt:
     """Load and validate one bounded owner-only receipt."""
     descriptor = -1
     try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(os.fspath(path), flags)
+        descriptor = _open_nofollow_path(path)
         return _receipt_from_wire(_read_private_json_descriptor(descriptor))
     except (KeyError, OSError, TypeError, ValueError):
         raise ValueError(_RECEIPT_ERROR) from None
@@ -349,9 +347,13 @@ def _open_receipt_directory(
         directory = Path(path)
         if not directory.is_absolute() or directory.resolve(strict=True) != directory:
             raise _invalid()
-        descriptor = os.open(directory, _directory_flags())
+        descriptor = _open_nofollow_path(directory, flags=_directory_flags())
         opened = os.fstat(descriptor)
-        lexical = os.stat(directory, follow_symlinks=False)
+        lexical_descriptor = _open_nofollow_path(directory, flags=_directory_flags())
+        try:
+            lexical = os.fstat(lexical_descriptor)
+        finally:
+            os.close(lexical_descriptor)
     except (OSError, RuntimeError, TypeError, ValueError):
         if descriptor >= 0:
             try:
@@ -375,7 +377,11 @@ def _require_unchanged_directory(
 ) -> None:
     try:
         opened = os.fstat(descriptor)
-        lexical = os.stat(directory, follow_symlinks=False)
+        lexical_descriptor = _open_nofollow_path(directory, flags=_directory_flags())
+        try:
+            lexical = os.fstat(lexical_descriptor)
+        finally:
+            os.close(lexical_descriptor)
     except OSError:
         raise _invalid() from None
     if (
@@ -420,9 +426,21 @@ def _read_private_json_descriptor(input_descriptor: int) -> Any:
     ):
         raise _invalid()
     try:
-        return json.loads(data.decode("utf-8"))
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise _invalid() from None
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _invalid()
+        result[key] = value
+    return result
 
 
 def _read_private_json_at(descriptor: int, name: str) -> Any:
@@ -574,12 +592,13 @@ def write_backup_receipt(
         directory, descriptor, identity = _open_receipt_directory(receipt_directory)
         name = f"backup-{receipt.generation_id}.json"
         _require_unchanged_directory(directory, descriptor, identity)
-        _write_private_json_at(descriptor, name, payload)
+        created = _write_private_json_at(descriptor, name, payload)
         written = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if (
             not stat.S_ISREG(written.st_mode)
             or written.st_uid != os.geteuid()
             or stat.S_IMODE(written.st_mode) != 0o600
+            or (written.st_dev, written.st_ino) != (created.st_dev, created.st_ino)
         ):
             raise _invalid()
         os.fsync(descriptor)

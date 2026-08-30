@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import stat
 from dataclasses import replace
 from pathlib import Path
@@ -124,6 +125,11 @@ def _verified_receipt(
 def _write_payload(path: Path, payload: object, *, mode: int = 0o600) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
     path.chmod(mode)
+
+
+def _write_raw_private_json(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o600)
 
 
 def test_receipt_round_trip_preserves_the_exact_v1_contract(tmp_path):
@@ -261,6 +267,42 @@ def test_receipt_loader_rejects_non_private_input(tmp_path, mode):
         load_backup_receipt(path)
 
 
+@pytest.mark.parametrize("duplicate_location", ["root", "collision_counts"])
+def test_receipt_loader_rejects_duplicate_json_keys(tmp_path, duplicate_location):
+    encoded = json.dumps(_verified_receipt().to_wire(), separators=(",", ":"))
+    if duplicate_location == "root":
+        private_value = "private-secret-generation"
+        encoded = encoded.replace("{", f'{{"generation_id":"{private_value}",', 1)
+    else:
+        private_value = "private-secret-collision"
+        encoded = encoded.replace(
+            '"collision_counts":{',
+            '"collision_counts":{"duplicate_source_groups":1,',
+            1,
+        )
+    path = tmp_path / "receipt.json"
+    _write_raw_private_json(path, encoded)
+
+    with pytest.raises(ValueError, match=r"^archive backup receipt failed$") as raised:
+        load_backup_receipt(path)
+
+    assert private_value not in str(raised.value)
+
+
+def test_receipt_loader_rejects_receipt_below_a_symlinked_ancestor(tmp_path):
+    real_parent = tmp_path / "real-private-parent"
+    real_parent.mkdir(mode=0o700)
+    receipt_path = real_parent / "receipt.json"
+    _write_payload(receipt_path, _verified_receipt().to_wire())
+    symlinked_parent = tmp_path / "private-secret-ancestor"
+    symlinked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match=r"^archive backup receipt failed$") as raised:
+        load_backup_receipt(symlinked_parent / receipt_path.name)
+
+    assert symlinked_parent.name not in str(raised.value)
+
+
 def test_receipt_writer_is_exclusive_and_refuses_a_final_symlink(tmp_path):
     directory = _receipt_directory(tmp_path)
     receipt = _verified_receipt()
@@ -273,6 +315,25 @@ def test_receipt_writer_is_exclusive_and_refuses_a_final_symlink(tmp_path):
 
     assert path.is_symlink()
     assert not target.exists()
+
+
+def test_receipt_writer_rejects_replacement_after_created_file_closes(
+    tmp_path, monkeypatch
+):
+    directory = _receipt_directory(tmp_path)
+    receipt = _verified_receipt()
+    real_write = receipt_module._write_private_json_at
+
+    def replace_after_write(descriptor, name, payload):
+        created_identity = real_write(descriptor, name, payload)
+        os.unlink(name, dir_fd=descriptor)
+        real_write(descriptor, name, payload)
+        return created_identity
+
+    monkeypatch.setattr(receipt_module, "_write_private_json_at", replace_after_write)
+
+    with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
+        write_backup_receipt(directory, receipt)
 
 
 @pytest.mark.parametrize("unsafe", ["mode", "symlink"])

@@ -227,6 +227,49 @@ def test_backup_config_rejects_symlinked_config_file(tmp_path):
         load_backup_config(config_path)
 
 
+def test_backup_config_rejects_config_below_a_symlinked_ancestor(tmp_path):
+    values = _valid_config_values(tmp_path)
+    real_parent = tmp_path / "real-private-parent"
+    real_parent.mkdir(mode=0o700)
+    config_path = _write_config(real_parent / "backup.toml", values)
+    symlinked_parent = tmp_path / "private-secret-ancestor"
+    symlinked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match=r"^archive backup config failed$") as raised:
+        load_backup_config(symlinked_parent / config_path.name)
+
+    assert symlinked_parent.name not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        (" ", ""),
+        ("", " "),
+        ("\t", ""),
+        ("", "\t"),
+        ("\n", ""),
+        ("", "\n"),
+        ("\r", ""),
+        ("", "\r"),
+        ("\x01", ""),
+        ("", "\x1f"),
+    ],
+)
+def test_backup_config_rejects_noncanonical_url_text(
+    tmp_path, prefix: str, suffix: str
+):
+    values = _valid_config_values(tmp_path)
+    private_value = prefix + str(values["backup_root_url"]) + suffix
+    values["backup_root_url"] = private_value
+    config_path = _write_config(tmp_path / "backup.toml", values)
+
+    with pytest.raises(ValueError, match=r"^archive backup config failed$") as raised:
+        load_backup_config(config_path)
+
+    assert private_value not in str(raised.value)
+
+
 def test_backup_config_rejects_noncanonical_executable_path(tmp_path):
     values = _valid_config_values(tmp_path)
     values["pond_binary"] = str(tmp_path / "pond-store" / ".." / "pond")

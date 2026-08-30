@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from drover.server.archive.inventory import MAX_INVENTORY_BYTES
+from drover.server.archive.inventory import MAX_INVENTORY_BYTES, _open_nofollow_path
 
 _CONFIG_ERROR = "archive backup config failed"
 _CONFIG_FIELDS = frozenset(
@@ -86,8 +86,7 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 def _read_private_toml(path: str | os.PathLike[str]) -> dict[str, Any]:
     try:
-        target = os.fspath(path)
-        descriptor = os.open(target, _descriptor_flags())
+        descriptor = _open_nofollow_path(path)
     except (OSError, TypeError, ValueError):
         raise _invalid() from None
     try:
@@ -158,7 +157,10 @@ def _canonical_existing_path(value: Any) -> Path:
 
 def _open_validated_path(path: Path, *, directory: bool) -> os.stat_result:
     try:
-        descriptor = os.open(path, _descriptor_flags(directory=directory))
+        descriptor = _open_nofollow_path(
+            path,
+            flags=_descriptor_flags(directory=directory),
+        )
     except (OSError, TypeError, ValueError):
         raise _invalid() from None
     try:
@@ -208,6 +210,8 @@ def _require_receipt_directory(value: Any) -> Path:
 
 def _require_backup_root_url(value: Any) -> str:
     value = _require_string(value)
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+        raise _invalid()
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -223,6 +227,7 @@ def _require_backup_root_url(value: Any) -> str:
         or parsed.netloc != parsed.hostname
         or parsed.query
         or parsed.fragment
+        or parsed.geturl() != value
         or not parsed.path.startswith("/")
         or parsed.path.endswith("/")
         or "\\" in parsed.path
