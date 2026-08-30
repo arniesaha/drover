@@ -282,9 +282,15 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
     preflight_path = Path(calls[1]["argv"][calls[1]["argv"].index("--output-file") + 1])
     export_path = Path(calls[2]["argv"][calls[2]["argv"].index("--output-file") + 1])
     snapshot_path = Path(calls[1]["argv"][2])
-    assert calls[0]["argv"] == [str(binary), "--version"]
-    assert calls[1]["argv"] == [
-        str(binary),
+    executables = [Path(call["argv"][0]) for call in calls]
+    assert len(set(executables)) == 3
+    assert len({path.parent for path in executables}) == 1
+    assert all(
+        path.name.startswith(".drover-pond-executable-") and not path.exists()
+        for path in executables
+    )
+    assert calls[0]["argv"][1:] == ["--version"]
+    assert calls[1]["argv"][1:] == [
         "--storage-path",
         str(snapshot_path),
         "sql",
@@ -296,8 +302,7 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
         "--timeout",
         "60",
     ]
-    assert calls[2]["argv"] == [
-        str(binary),
+    assert calls[2]["argv"][1:] == [
         "--storage-path",
         str(snapshot_path),
         "sql",
@@ -351,7 +356,14 @@ def test_export_executes_the_validated_relative_binary_not_a_path_namesake(
 
     calls = json.loads(record.read_text(encoding="utf-8"))
     assert inventory.pond_version == "0.16.3"
-    assert [call["argv"][0] for call in calls] == [str(binary.resolve())] * 3
+    executables = [Path(call["argv"][0]) for call in calls]
+    assert len(set(executables)) == 3
+    assert all(
+        path.name.startswith(".drover-pond-executable-")
+        and path != namesake
+        and path != binary.resolve()
+        for path in executables
+    )
     assert not namesake_marker.exists()
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 

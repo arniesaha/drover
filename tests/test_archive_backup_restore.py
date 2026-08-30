@@ -848,6 +848,76 @@ def test_restore_does_not_absorb_a_workspace_replacement_at_creation(
     assert all(path.is_dir() and stat_mode(path) == 0o700 for path in retained)
 
 
+def test_restore_rejects_actual_workspace_staging_substitution(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path)
+    real_mkdir = backup_restore_module.os.mkdir
+    moved_name = ".moved-actual-workspace-staging-private"
+    replaced = False
+
+    def replace_actual_staging(path, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        result = real_mkdir(path, mode, dir_fd=dir_fd)
+        name = os.fspath(path)
+        if not replaced and name.startswith(".drover-restore-workspace-staging-"):
+            replaced = True
+            backup_restore_module.os.rename(
+                name,
+                moved_name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            real_mkdir(name, 0o700, dir_fd=dir_fd)
+        return result
+
+    monkeypatch.setattr(backup_restore_module.os, "mkdir", replace_actual_staging)
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert replaced
+    assert fixture.attempts["snapshot-version"] == 0
+    moved = fixture.destination.parent / moved_name
+    assert moved.is_dir()
+    assert stat_mode(moved) == 0o700
+
+
+def test_restore_rejects_actual_destination_staging_substitution(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _fixture(tmp_path)
+    real_mkdir = backup_restore_module.os.mkdir
+    moved_name = ".moved-actual-destination-staging-private"
+    replaced = False
+
+    def replace_actual_staging(path, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        result = real_mkdir(path, mode, dir_fd=dir_fd)
+        name = os.fspath(path)
+        if not replaced and name.startswith(".drover-restore-destination-"):
+            replaced = True
+            backup_restore_module.os.rename(
+                name,
+                moved_name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            real_mkdir(name, 0o700, dir_fd=dir_fd)
+        return result
+
+    monkeypatch.setattr(backup_restore_module.os, "mkdir", replace_actual_staging)
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert replaced
+    assert fixture.attempts["snapshot-version"] == 1
+    assert fixture.attempts["copy-from-generation"] == 0
+    moved = fixture.destination.parent / moved_name
+    assert moved.is_dir()
+    assert stat_mode(moved) == 0o700
+
+
 def test_restore_revalidates_published_destination_as_local(tmp_path):
     fixture = _fixture(tmp_path)
     assert fixture.dependencies is not None

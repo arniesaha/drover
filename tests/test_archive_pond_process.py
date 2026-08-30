@@ -151,7 +151,7 @@ def _wait_for_pid_exit(pid: int) -> None:
         time.sleep(0.01)
 
 
-def test_runner_uses_the_canonical_binary_directly_in_a_new_process_group(
+def test_runner_uses_the_pinned_private_artifact_directly_in_a_new_process_group(
     fake_pond: tuple[Path, Path], tmp_path: Path
 ) -> None:
     binary, record = fake_pond
@@ -168,17 +168,51 @@ def test_runner_uses_the_canonical_binary_directly_in_a_new_process_group(
 
     observation = json.loads(result.stdout_path.read_text(encoding="utf-8"))
     calls = json.loads(record.read_text(encoding="utf-8"))
-    assert calls == [
-        {
-            "argv": [str(binary.resolve()), "inspect", _PRIVATE_REMOTE],
-            "secret": _PRIVATE_ENVIRONMENT,
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0]["argv"][1:] == ["inspect", _PRIVATE_REMOTE]
+    assert calls[0]["secret"] == _PRIVATE_ENVIRONMENT
+    artifact = Path(calls[0]["argv"][0])
+    assert artifact.parent == run_directory
+    assert artifact.name.startswith(".drover-pond-executable-")
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o500
+    assert observation["argv"] == calls[0]["argv"]
     assert observation["pid"] == observation["pgid"] == observation["sid"]
     assert not (tmp_path / "no-shell-injection").exists()
     assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
     assert stat.S_IMODE(result.stdout_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(result.stderr_path.stat().st_mode) == 0o600
+
+
+def test_runner_removes_artifact_parent_write_permission_during_spawn(
+    fake_pond: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary, record = fake_pond
+    run_directory = tmp_path / "protected-spawn-run"
+    real_popen = subprocess.Popen
+    parent_modes: list[int] = []
+
+    def record_parent_mode(*args, **kwargs):
+        artifact = Path(kwargs["executable"])
+        parent_modes.append(stat.S_IMODE(artifact.parent.stat().st_mode))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(pond_process_module.subprocess, "Popen", record_parent_mode)
+
+    result = run_pond_process(
+        binary,
+        ("inspect",),
+        timeout_seconds=5,
+        run_directory=run_directory,
+        label="copy",
+        env=_environment(record),
+        resource_sampler=lambda _process_group: ResourceSample(1, 2, 3),
+    )
+
+    assert result.returncode == 0
+    assert parent_modes == [0o500]
+    assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
 
 
 def test_retained_executable_pin_detects_a_swap_restore_during_process(
@@ -213,6 +247,68 @@ def test_retained_executable_pin_detects_a_swap_restore_during_process(
                 env=_environment(record),
                 progress_callback=swap_restore,
             )
+
+
+def test_retained_executable_never_runs_a_path_swapped_at_spawn(
+    fake_pond: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary, record = fake_pond
+    moved = binary.with_name("approved-private-pond")
+    unapproved = binary.with_name("unapproved-private-pond")
+    marker = tmp_path / "unapproved-executed"
+    unapproved.write_text(
+        '#!/bin/sh\nprintf unapproved > "$UNAPPROVED_MARKER"\n',
+        encoding="utf-8",
+    )
+    unapproved.chmod(0o700)
+    real_popen = subprocess.Popen
+    swapped = False
+
+    def swap_before_spawn(*args, **kwargs):
+        nonlocal swapped
+        assert not swapped
+        swapped = True
+        binary.rename(moved)
+        unapproved.rename(binary)
+        try:
+            process = real_popen(*args, **kwargs)
+            deadline = time.monotonic() + 1
+            while (
+                not marker.exists()
+                and not record.exists()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            return process
+        finally:
+            binary.rename(unapproved)
+            moved.rename(binary)
+
+    monkeypatch.setattr(pond_process_module.subprocess, "Popen", swap_before_spawn)
+
+    with pond_process_module._pin_pond_executable(binary) as executable:
+        with pytest.raises(PondProcessError, match=r"^binary$"):
+            run_pond_process(
+                executable,
+                ("inspect", _PRIVATE_REMOTE),
+                timeout_seconds=5,
+                run_directory=tmp_path / "spawn-pin-run",
+                label="copy",
+                env=_environment(record, UNAPPROVED_MARKER=str(marker)),
+            )
+
+    assert swapped
+    assert not marker.exists()
+    calls = json.loads(record.read_text(encoding="utf-8"))
+    assert len(calls) == 1
+    assert calls[0]["argv"][1:] == ["inspect", _PRIVATE_REMOTE]
+    assert calls[0]["secret"] == _PRIVATE_ENVIRONMENT
+    artifact = Path(calls[0]["argv"][0])
+    assert artifact.parent == tmp_path / "spawn-pin-run"
+    assert artifact.name.startswith(".drover-pond-executable-")
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o500
 
 
 @pytest.mark.parametrize("kind", ["missing", "not_executable"])

@@ -6,6 +6,7 @@ import ctypes
 import math
 import os
 import re
+import secrets
 import selectors
 import signal
 import stat
@@ -40,6 +41,7 @@ _SAMPLER_OUTPUT_BYTES = 1024 * 1024
 _SAMPLER_TIMEOUT_SECONDS = 1.0
 _PROC_FILE_BYTES = 64 * 1024
 _MAX_PROC_ENTRIES = 131_072
+_EXECUTABLE_COPY_CHUNK_BYTES = 1024 * 1024
 _LABEL = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SWAP_USAGE = re.compile(rb"\bused\s*=\s*([0-9]+(?:\.[0-9]+)?)([KMGTP])\b")
 _PROC_ROOT = Path("/proc")
@@ -180,7 +182,17 @@ def _executable_identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 
 class _PinnedPondExecutable:
-    __slots__ = ("_closed", "_descriptor", "_identity", "path")
+    __slots__ = (
+        "_artifact_descriptor",
+        "_artifact_directory_descriptor",
+        "_artifact_directory_identity",
+        "_artifact_identity",
+        "_artifact_path",
+        "_closed",
+        "_descriptor",
+        "_identity",
+        "path",
+    )
 
     def __init__(
         self,
@@ -191,6 +203,11 @@ class _PinnedPondExecutable:
         self.path = path
         self._descriptor = descriptor
         self._identity = identity
+        self._artifact_descriptor = -1
+        self._artifact_directory_descriptor = -1
+        self._artifact_directory_identity: tuple[int, ...] | None = None
+        self._artifact_identity: tuple[int, ...] | None = None
+        self._artifact_path: Path | None = None
         self._closed = False
 
     def __enter__(self) -> _PinnedPondExecutable:
@@ -213,17 +230,201 @@ class _PinnedPondExecutable:
                 or not os.access(self.path, os.X_OK)
             ):
                 raise ValueError
+            if self._artifact_descriptor >= 0:
+                if (
+                    self._artifact_directory_descriptor < 0
+                    or self._artifact_directory_identity is None
+                    or self._artifact_identity is None
+                    or self._artifact_path is None
+                ):
+                    raise ValueError
+                self._require_artifact_directory_mode(0o700)
+                artifact_opened = os.fstat(self._artifact_descriptor)
+                artifact_lexical = os.stat(
+                    self._artifact_path,
+                    follow_symlinks=False,
+                )
+                if (
+                    _executable_identity(artifact_opened) != self._artifact_identity
+                    or _executable_identity(artifact_lexical) != self._artifact_identity
+                    or not stat.S_ISREG(artifact_opened.st_mode)
+                    or artifact_opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(artifact_opened.st_mode) != 0o500
+                ):
+                    raise ValueError
         except (OSError, TypeError, ValueError):
             raise PondProcessError("binary") from None
+
+    def execution_path(self, directory: Path) -> Path:
+        self.require_same()
+        if self._artifact_descriptor < 0:
+            self._create_execution_artifact(directory)
+        self.require_same()
+        if self._artifact_path is None:
+            raise PondProcessError("binary")
+        return self._artifact_path
+
+    def begin_spawn(self) -> None:
+        self.require_same()
+        try:
+            os.fchmod(self._artifact_directory_descriptor, 0o500)
+            self._require_artifact_directory_mode(0o500)
+        except (OSError, TypeError, ValueError):
+            raise PondProcessError("binary") from None
+
+    def finish_spawn(self) -> None:
+        try:
+            os.fchmod(self._artifact_directory_descriptor, 0o700)
+            self._require_artifact_directory_mode(0o700)
+        except (OSError, TypeError, ValueError):
+            raise PondProcessError("binary") from None
+        self.require_same()
+
+    def _require_artifact_directory_mode(self, mode: int) -> None:
+        if self._artifact_directory_identity is None or self._artifact_path is None:
+            raise ValueError
+        opened = os.fstat(self._artifact_directory_descriptor)
+        lexical = os.stat(self._artifact_path.parent, follow_symlinks=False)
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+        )
+        lexical_identity = (
+            lexical.st_dev,
+            lexical.st_ino,
+            lexical.st_uid,
+            lexical.st_gid,
+        )
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened_identity != self._artifact_directory_identity
+            or lexical_identity != opened_identity
+            or stat.S_IMODE(opened.st_mode) != mode
+            or stat.S_IMODE(lexical.st_mode) != mode
+        ):
+            raise ValueError
+
+    def _create_execution_artifact(self, directory: Path) -> None:
+        directory_descriptor = -1
+        writer = -1
+        reader = -1
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            directory_descriptor = os.open(directory, flags)
+            directory_opened = os.fstat(directory_descriptor)
+            directory_lexical = os.stat(directory, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(directory_opened.st_mode)
+                or directory_opened.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_opened.st_mode) != 0o700
+                or (directory_opened.st_dev, directory_opened.st_ino)
+                != (directory_lexical.st_dev, directory_lexical.st_ino)
+            ):
+                raise ValueError
+            name = f".drover-pond-executable-{secrets.token_hex(16)}"
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                create_flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                create_flags |= os.O_CLOEXEC
+            writer = os.open(
+                name,
+                create_flags,
+                0o500,
+                dir_fd=directory_descriptor,
+            )
+            os.fchmod(writer, 0o500)
+            source = os.fstat(self._descriptor)
+            if _executable_identity(source) != self._identity:
+                raise ValueError
+            offset = 0
+            while offset < source.st_size:
+                chunk = os.pread(
+                    self._descriptor,
+                    min(_EXECUTABLE_COPY_CHUNK_BYTES, source.st_size - offset),
+                    offset,
+                )
+                if not chunk:
+                    raise ValueError
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(writer, remaining)
+                    if written <= 0:
+                        raise ValueError
+                    remaining = remaining[written:]
+                offset += len(chunk)
+            if os.pread(self._descriptor, 1, source.st_size):
+                raise ValueError
+            os.fsync(writer)
+            if _executable_identity(os.fstat(self._descriptor)) != self._identity:
+                raise ValueError
+            read_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                read_flags |= os.O_CLOEXEC
+            reader = os.open(name, read_flags, dir_fd=directory_descriptor)
+            artifact = os.fstat(reader)
+            lexical = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            identity = _executable_identity(artifact)
+            if (
+                identity != _executable_identity(os.fstat(writer))
+                or identity != _executable_identity(lexical)
+                or not stat.S_ISREG(artifact.st_mode)
+                or artifact.st_uid != os.geteuid()
+                or stat.S_IMODE(artifact.st_mode) != 0o500
+                or artifact.st_nlink != 1
+                or artifact.st_size != source.st_size
+            ):
+                raise ValueError
+            self._artifact_descriptor = reader
+            self._artifact_directory_descriptor = directory_descriptor
+            self._artifact_directory_identity = (
+                directory_opened.st_dev,
+                directory_opened.st_ino,
+                directory_opened.st_uid,
+                directory_opened.st_gid,
+            )
+            self._artifact_identity = identity
+            self._artifact_path = directory / name
+            reader = -1
+            directory_descriptor = -1
+        except (OSError, TypeError, ValueError):
+            raise PondProcessError("binary") from None
+        finally:
+            for descriptor in (reader, writer, directory_descriptor):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            os.close(self._descriptor)
-        except OSError:
-            pass
+        for descriptor in (
+            self._artifact_descriptor,
+            self._artifact_directory_descriptor,
+            self._descriptor,
+        ):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _pin_pond_executable(binary: Path) -> _PinnedPondExecutable:
@@ -380,10 +581,10 @@ def _run_pinned_pond_process(
     progress_callback: Callable[[], None] | None = None,
 ) -> PondProcessResult:
     binary.require_same()
-    executable = binary.path
     arguments_tuple = _require_arguments(arguments)
     timeout = _require_timeout(timeout_seconds)
     directory = _require_run_directory(run_directory)
+    executable = binary.execution_path(directory)
     safe_label = _require_label(label)
     child_environment = pond_child_environment(env)
     monitored_artifact = _require_artifact_path(artifact_path, directory)
@@ -397,20 +598,33 @@ def _run_pinned_pond_process(
         _open_private_output(stdout_path) as stdout_file,
         _open_private_output(stderr_path) as stderr_file,
     ):
+        process: subprocess.Popen[bytes] | None = None
         try:
             binary.require_same()
-            process = subprocess.Popen(
-                (str(executable), *arguments_tuple),
-                env=child_environment,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-                umask=0o077,
-            )
+            binary.begin_spawn()
+            try:
+                process = subprocess.Popen(
+                    (str(binary.path), *arguments_tuple),
+                    executable=str(executable),
+                    env=child_environment,
+                    shell=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    umask=0o077,
+                )
+            finally:
+                binary.finish_spawn()
+        except PondProcessError:
+            if process is not None:
+                _stop_process(process, process.pid)
+            raise
         except (OSError, TypeError, ValueError):
+            if process is not None:
+                _stop_process(process, process.pid)
             raise PondProcessError("subprocess") from None
 
+        assert process is not None
         assert process.stdout is not None
         assert process.stderr is not None
         process_group = process.pid

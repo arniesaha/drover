@@ -566,7 +566,12 @@ class _PinnedRestoreRequest:
             staging_name = f".drover-restore-workspace-staging-{token}"
             _require_absent_at(self._parent_descriptor, workspace_name)
             _require_absent_at(self._parent_descriptor, staging_name)
+            parent_links = _directory_link_count(self._parent_descriptor)
             os.mkdir(staging_name, 0o700, dir_fd=self._parent_descriptor)
+            _require_one_new_child_directory(
+                self._parent_descriptor,
+                parent_links,
+            )
             self._refresh_parent_identity()
             staging_descriptor, staging_identity = _open_created_directory_at(
                 self._parent_descriptor,
@@ -634,7 +639,12 @@ class _PinnedRestoreRequest:
             staging_name = f".drover-restore-destination-{token}"
             staging_path = self.destination_parent / staging_name
             _require_absent_at(self._parent_descriptor, staging_name)
+            parent_links = _directory_link_count(self._parent_descriptor)
             os.mkdir(staging_name, 0o700, dir_fd=self._parent_descriptor)
+            _require_one_new_child_directory(
+                self._parent_descriptor,
+                parent_links,
+            )
             self._refresh_parent_identity()
             staging_descriptor, staging_identity = _open_created_directory_at(
                 self._parent_descriptor,
@@ -1486,6 +1496,30 @@ def _new_restore_uuid(factory: Callable[[], UUID]) -> UUID:
         return token
     except Exception:
         raise BackupRestoreError(_RESTORE_ERROR) from None
+
+
+def _directory_link_count(descriptor: int) -> int:
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_nlink < 1:
+            raise ValueError
+        return metadata.st_nlink
+    except Exception:
+        raise BackupRestoreError(_RESTORE_ERROR) from None
+
+
+def _require_one_new_child_directory(descriptor: int, before: int) -> None:
+    """Reject extra mutations when the filesystem exposes directory link deltas.
+
+    A link count below two is uninformative and cannot close the POSIX
+    mkdir-to-open seam; the unpredictable owner-only staging boundary remains
+    required on those filesystems.
+    """
+    after = _directory_link_count(descriptor)
+    if (before >= 2 and after != before + 1) or (
+        before < 2 and after not in {before, before + 1}
+    ):
+        raise BackupRestoreError(_RESTORE_ERROR)
 
 
 def _open_created_directory_at(

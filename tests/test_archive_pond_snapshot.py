@@ -281,10 +281,16 @@ def test_snapshot_uses_exact_sql_and_argument_order_for_local_store(
     _capture_local(pond_environment, tmp_path)
 
     calls = json.loads(record.read_text(encoding="utf-8"))
-    assert calls[0] == [str(binary), "--version"]
-    assert calls[1:] == [
+    executables = [Path(call[0]) for call in calls]
+    assert all(path.parent == workspace for path in executables)
+    assert all(
+        path.name.startswith(".drover-pond-executable-")
+        and stat.S_IMODE(path.stat().st_mode) == 0o500
+        for path in executables
+    )
+    assert calls[0][1:] == ["--version"]
+    assert [call[1:] for call in calls[1:]] == [
         [
-            str(binary),
             "--config-file",
             str(config),
             "--storage-path",
@@ -686,7 +692,9 @@ def test_snapshot_artifacts_are_private_and_bounded_to_the_supplied_workspace(
     assert "pond-inventory.json" in names
     assert "corpus-snapshot.ndjson" in names
     assert all(
-        stat.S_IMODE(path.stat().st_mode) == 0o600 and path.is_file()
+        path.is_file()
+        and stat.S_IMODE(path.stat().st_mode)
+        == (0o500 if path.name.startswith(".drover-pond-executable-") else 0o600)
         for path in workspace.iterdir()
     )
 
