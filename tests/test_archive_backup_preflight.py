@@ -789,6 +789,87 @@ def test_preflight_digest_binds_exact_sorted_eligibility_receipt_bytes(
     assert first.eligibility_receipts_sha256 != second.eligibility_receipts_sha256
 
 
+def test_applied_preflight_uses_only_the_supplied_receipt_root_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _backup_config(tmp_path)
+    dependencies = _dependencies(tmp_path, config)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(config.receipt_directory, flags)
+    metadata = os.fstat(descriptor)
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
+    real_stat = Path.stat
+
+    def reject_receipt_path_reopen(path: Path, *args, **kwargs):
+        if path == config.receipt_directory:
+            raise AssertionError("applied eligibility reopened configured root")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", reject_receipt_path_reopen)
+    try:
+        result = _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _runtime_guard(active=True),
+            receipt_directory_descriptor=descriptor,
+            receipt_directory_identity=identity,
+            dependencies=dependencies.dependencies,
+        )
+        os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert result.source_not_archive_eligible == 0
+
+
+def test_applied_preflight_rejects_a_mismatched_receipt_root_identity(
+    tmp_path: Path,
+) -> None:
+    config = _backup_config(tmp_path)
+    dependencies = _dependencies(tmp_path, config)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(config.receipt_directory, flags)
+    metadata = os.fstat(descriptor)
+    wrong_identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns + 1,
+    )
+
+    try:
+        with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+            _run_backup_preflight(
+                config,
+                replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+                tmp_path / "workspace-private",
+                _runtime_guard(active=True),
+                receipt_directory_descriptor=descriptor,
+                receipt_directory_identity=wrong_identity,
+                dependencies=dependencies.dependencies,
+            )
+        os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def test_preflight_rejects_stale_eligibility_binding_with_fixed_error(tmp_path):
     config = _backup_config(tmp_path)
     dependencies = _dependencies(

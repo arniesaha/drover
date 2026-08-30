@@ -20,8 +20,8 @@ from drover.server.archive.backup_config import (
 )
 from drover.server.archive.backup_preflight import (
     BackupPreflightResult,
+    _run_backup_preflight_at,
     backup_preflight_summary,
-    run_backup_preflight,
 )
 from drover.server.archive.backup_receipt import (
     BackupReceipt,
@@ -136,6 +136,8 @@ class _Preflight(Protocol):
         workspace: Path,
         runtime_guard: _Runtime,
         *,
+        receipt_directory_descriptor: int,
+        receipt_directory_identity: tuple[int, ...],
         resource_limits: ResourceLimits,
     ) -> BackupPreflightResult: ...
 
@@ -211,7 +213,7 @@ def _production_backup_dependencies() -> _BackupDependencies:
         backup_lock=BackupLock,
         uuid4=uuid4,
         runtime_guard=RuntimeGuard,
-        run_preflight=run_backup_preflight,
+        run_preflight=_run_backup_preflight_at,
         run_pond_process=run_pond_process,
         capture_pond_snapshot=capture_pond_store_snapshot,
         latest_receipt=_latest_backup_receipt_at,
@@ -296,7 +298,8 @@ def _run_locked(
             dependencies,
             config,
             drover_config,
-            workspace.phase("before"),
+            workspace,
+            "before",
             runtime,
             limits,
             after_copy=False,
@@ -350,7 +353,8 @@ def _run_locked(
             dependencies,
             config,
             drover_config,
-            workspace.phase("after"),
+            workspace,
+            "after",
             runtime,
             limits,
             after_copy=True,
@@ -462,19 +466,24 @@ def _preflight(
     dependencies: _BackupDependencies,
     config: BackupConfig,
     drover_config: DroverConfig,
-    workspace: Path,
+    workspace: _PinnedRunWorkspace,
+    phase: str,
     runtime: _Runtime,
     limits: ResourceLimits,
     *,
     after_copy: bool,
 ) -> BackupPreflightResult:
     category = _LOCAL_CHANGED_ERROR if after_copy else _PREFLIGHT_ERROR
+    receipt_descriptor = -1
     try:
+        receipt_descriptor, receipt_identity = workspace.duplicate_receipt_directory()
         result = dependencies.run_preflight(
             config,
             drover_config,
-            workspace,
+            workspace.phase(phase),
             runtime,
+            receipt_directory_descriptor=receipt_descriptor,
+            receipt_directory_identity=receipt_identity,
             resource_limits=limits,
         )
         if type(result) is not BackupPreflightResult:
@@ -490,6 +499,12 @@ def _preflight(
         raise BackupRunError(mapped) from None
     except Exception:
         raise BackupRunError(category) from None
+    finally:
+        if receipt_descriptor >= 0:
+            try:
+                os.close(receipt_descriptor)
+            except OSError:
+                pass
 
 
 def _resource_limits(config: BackupConfig) -> ResourceLimits:
@@ -1178,6 +1193,33 @@ class _PinnedRunWorkspace:
             self._receipt_descriptor,
             self._receipt_identity,
         )
+
+    def duplicate_receipt_directory(self) -> tuple[int, tuple[int, ...]]:
+        """Return one checked duplicate for a descriptor-bound sub-operation."""
+        duplicate = -1
+        try:
+            self.require_same()
+            if self._receipt_identity is None:
+                raise ValueError
+            duplicate = os.dup(self._receipt_descriptor)
+            os.set_inheritable(duplicate, False)
+            if _directory_identity(os.fstat(duplicate)) != self._receipt_identity:
+                raise ValueError
+            return duplicate, self._receipt_identity
+        except BackupRunError:
+            if duplicate >= 0:
+                try:
+                    os.close(duplicate)
+                except OSError:
+                    pass
+            raise
+        except (OSError, TypeError, ValueError):
+            if duplicate >= 0:
+                try:
+                    os.close(duplicate)
+                except OSError:
+                    pass
+            raise BackupRunError(_RECEIPT_ERROR) from None
 
     def prepare_publish(self) -> None:
         """Accept only the writer's temp-entry ctime change, then check all paths."""

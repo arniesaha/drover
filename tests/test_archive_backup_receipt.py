@@ -363,7 +363,7 @@ def test_receipt_writer_removes_final_if_publication_directory_fsync_fails(
     assert not final.exists()
 
 
-def test_receipt_writer_removes_final_if_postpublication_validation_fails(
+def test_receipt_writer_performs_no_syscall_or_callback_after_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,19 +371,214 @@ def test_receipt_writer_removes_final_if_postpublication_validation_fails(
     receipt = _verified_receipt()
     final_name = f"backup-{GENERATION_ID}.json"
     final = directory / final_name
+    pinned_directory, descriptor, identity = receipt_module._open_receipt_directory(
+        directory
+    )
+    real_lstat = os.lstat
     real_stat = os.stat
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+    callbacks = 0
 
-    def fail_final_validation(path, *args, **kwargs):
-        if path == final_name and kwargs.get("dir_fd") is not None:
-            raise OSError("private final validation failure")
+    def published() -> bool:
+        try:
+            real_lstat(final)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def reject_stat(*args, **kwargs):
+        if published():
+            raise AssertionError("stat after publication")
+        return real_stat(*args, **kwargs)
+
+    def reject_fsync(*args, **kwargs):
+        if published():
+            raise AssertionError("fsync after publication")
+        return real_fsync(*args, **kwargs)
+
+    def reject_unlink(*args, **kwargs):
+        if published():
+            raise AssertionError("unlink after publication")
+        return real_unlink(*args, **kwargs)
+
+    def before_publish() -> None:
+        nonlocal callbacks
+        assert not published()
+        callbacks += 1
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(receipt_module.os, "stat", reject_stat)
+            patch.setattr(receipt_module.os, "fsync", reject_fsync)
+            patch.setattr(receipt_module.os, "unlink", reject_unlink)
+            path = receipt_module._write_backup_receipt_at(
+                pinned_directory,
+                descriptor,
+                identity,
+                receipt,
+                before_publish=before_publish,
+            )
+    finally:
+        os.close(descriptor)
+
+    assert path == final
+    assert callbacks == 1
+    assert final.is_file()
+
+
+def test_postpublication_permission_loss_cannot_turn_success_into_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _receipt_directory(tmp_path)
+    receipt = _verified_receipt()
+    final_name = f"backup-{GENERATION_ID}.json"
+    final = directory / final_name
+    real_lstat = os.lstat
+    real_stat = os.stat
+    changed_after_publication = False
+
+    def published() -> bool:
+        try:
+            real_lstat(final)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def remove_write_permission_on_postpublication_stat(path, *args, **kwargs):
+        nonlocal changed_after_publication
+        if (
+            not changed_after_publication
+            and kwargs.get("dir_fd") is not None
+            and published()
+        ):
+            os.fchmod(kwargs["dir_fd"], 0o500)
+            changed_after_publication = True
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(receipt_module.os, "stat", fail_final_validation)
+    monkeypatch.setattr(
+        receipt_module.os,
+        "stat",
+        remove_write_permission_on_postpublication_stat,
+    )
+    failure: Exception | None = None
+    path: Path | None = None
+    try:
+        try:
+            path = write_backup_receipt(directory, receipt)
+        except Exception as error:
+            failure = error
+    finally:
+        directory.chmod(0o700)
+
+    assert final.is_file()
+    assert failure is None
+    assert path == final
+    assert changed_after_publication is False
+
+
+@pytest.mark.parametrize("competitor", ["file", "symlink"])
+def test_exclusive_publication_refuses_a_concurrent_final_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    competitor: str,
+) -> None:
+    directory = _receipt_directory(tmp_path)
+    receipt = _verified_receipt()
+    final = directory / f"backup-{GENERATION_ID}.json"
+    target = tmp_path / "outside-private"
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def create_competitor_before_publication(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            try:
+                if competitor == "file":
+                    competing_descriptor = os.open(
+                        final.name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        os.write(competing_descriptor, b"competing private entry")
+                        real_fsync(competing_descriptor)
+                    finally:
+                        os.close(competing_descriptor)
+                else:
+                    os.symlink(target, final.name, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        receipt_module.os, "fsync", create_competitor_before_publication
+    )
 
     with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
         write_backup_receipt(directory, receipt)
 
-    assert not final.exists()
+    if competitor == "file":
+        assert final.read_bytes() == b"competing private entry"
+    else:
+        assert final.is_symlink()
+        assert os.readlink(final) == str(target)
+        assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("platform", "symbol", "flag"),
+    [
+        ("darwin", "renameatx_np", 0x00000004),
+        ("linux", "renameat2", 0x00000001),
+    ],
+)
+def test_exclusive_rename_selects_the_platform_no_replace_primitive(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    symbol: str,
+    flag: int,
+) -> None:
+    class Function:
+        argtypes = None
+        restype = None
+
+    function = Function()
+    library = type("Library", (), {symbol: function})()
+    monkeypatch.setattr(receipt_module.sys, "platform", platform)
+    monkeypatch.setattr(
+        receipt_module.ctypes, "CDLL", lambda *_args, **_kwargs: library
+    )
+
+    selected, selected_flag = receipt_module._load_exclusive_rename()
+
+    assert selected is function
+    assert selected_flag == flag
+    assert function.argtypes == (
+        receipt_module.ctypes.c_int,
+        receipt_module.ctypes.c_char_p,
+        receipt_module.ctypes.c_int,
+        receipt_module.ctypes.c_char_p,
+        receipt_module.ctypes.c_uint,
+    )
+    assert function.restype is receipt_module.ctypes.c_int
+
+
+def test_unsupported_exclusive_rename_fails_before_creating_any_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _receipt_directory(tmp_path)
+    monkeypatch.setattr(receipt_module, "_EXCLUSIVE_RENAME", None)
+    monkeypatch.setattr(receipt_module, "_EXCLUSIVE_RENAME_FLAG", 0)
+
+    with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
+        write_backup_receipt(directory, _verified_receipt())
+
+    assert list(directory.iterdir()) == []
 
 
 @pytest.mark.parametrize("unsafe", ["mode", "symlink"])

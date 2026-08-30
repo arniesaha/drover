@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import math
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +36,33 @@ _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 _RECEIPT_NAME = re.compile(
     r"\Abackup-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json\Z"
 )
+
+
+def _load_exclusive_rename() -> tuple[Any | None, int]:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "darwin":
+            function = library.renameatx_np
+            flag = 0x00000004  # RENAME_EXCL
+        elif sys.platform.startswith("linux"):
+            function = library.renameat2
+            flag = 0x00000001  # RENAME_NOREPLACE
+        else:
+            return None, 0
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        function.restype = ctypes.c_int
+        return function, flag
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None, 0
+
+
+_EXCLUSIVE_RENAME, _EXCLUSIVE_RENAME_FLAG = _load_exclusive_rename()
 _RECEIPT_FIELDS = frozenset(
     {
         "kind",
@@ -639,30 +669,21 @@ def _write_backup_receipt_at(
     before_publish: Callable[[], None] | None = None,
 ) -> Path:
     """Write through one caller-owned pinned receipt-directory descriptor."""
-    temporary_name: str | None = None
-    temporary_identity: tuple[int, int] | None = None
-    published = False
-    name: str | None = None
+    temporary_name = ""
     try:
         payload = receipt.to_wire()
         name = f"backup-{receipt.generation_id}.json"
+        final_path = directory / name
+        _require_exclusive_rename_supported()
         _require_unchanged_directory(directory, descriptor, identity)
         temporary_name = f".backup-receipt-{uuid4()}.tmp"
         created = _write_private_json_at(descriptor, temporary_name, payload)
-        temporary = os.stat(
+        temporary_identity = (created.st_dev, created.st_ino)
+        _require_private_temporary(
+            descriptor,
             temporary_name,
-            dir_fd=descriptor,
-            follow_symlinks=False,
+            temporary_identity,
         )
-        if (
-            not stat.S_ISREG(temporary.st_mode)
-            or temporary.st_uid != os.geteuid()
-            or temporary.st_nlink != 1
-            or stat.S_IMODE(temporary.st_mode) != 0o600
-            or (temporary.st_dev, temporary.st_ino) != (created.st_dev, created.st_ino)
-        ):
-            raise _invalid()
-        temporary_identity = (temporary.st_dev, temporary.st_ino)
         prepared_identity = _require_same_directory_node(
             directory,
             descriptor,
@@ -671,46 +692,85 @@ def _write_backup_receipt_at(
         if before_publish is not None:
             before_publish()
         _require_unchanged_directory(directory, descriptor, prepared_identity)
-        os.link(
+        _require_private_temporary(
+            descriptor,
             temporary_name,
-            name,
-            src_dir_fd=descriptor,
-            dst_dir_fd=descriptor,
-            follow_symlinks=False,
+            temporary_identity,
         )
-        published = True
-        written = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(written.st_mode)
-            or written.st_uid != os.geteuid()
-            or stat.S_IMODE(written.st_mode) != 0o600
-            or (written.st_dev, written.st_ino) != temporary_identity
-        ):
-            raise _invalid()
-        os.unlink(temporary_name, dir_fd=descriptor)
-        temporary_name = None
+        _require_absent_entry(descriptor, name)
         os.fsync(descriptor)
-        final = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(final.st_mode)
-            or final.st_uid != os.geteuid()
-            or final.st_nlink != 1
-            or stat.S_IMODE(final.st_mode) != 0o600
-            or (final.st_dev, final.st_ino) != temporary_identity
-        ):
-            raise _invalid()
-        _require_same_directory_node(directory, descriptor, identity)
-        return directory / name
     except (KeyError, OSError, TypeError, ValueError):
-        if published and name is not None and temporary_identity is not None:
-            _rollback_published_receipt(descriptor, name, temporary_identity)
-        raise ValueError(_RECEIPT_ERROR) from None
-    finally:
-        if temporary_name is not None:
+        if temporary_name:
             try:
                 os.unlink(temporary_name, dir_fd=descriptor)
             except OSError:
                 pass
+        raise ValueError(_RECEIPT_ERROR) from None
+    try:
+        _rename_noreplace_at(descriptor, temporary_name, descriptor, name)
+    except (OSError, TypeError, ValueError):
+        raise ValueError(_RECEIPT_ERROR) from None
+    return final_path
+
+
+def _require_exclusive_rename_supported() -> None:
+    if _EXCLUSIVE_RENAME is None or _EXCLUSIVE_RENAME_FLAG == 0:
+        raise _invalid()
+
+
+def _require_private_temporary(
+    descriptor: int,
+    name: str,
+    expected: tuple[int, int],
+) -> None:
+    temporary = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(temporary.st_mode)
+        or temporary.st_uid != os.geteuid()
+        or temporary.st_nlink != 1
+        or stat.S_IMODE(temporary.st_mode) != 0o600
+        or (temporary.st_dev, temporary.st_ino) != expected
+    ):
+        raise _invalid()
+
+
+def _require_absent_entry(descriptor: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise _invalid()
+
+
+def _rename_noreplace_at(
+    source_descriptor: int,
+    source_name: str,
+    destination_descriptor: int,
+    destination_name: str,
+) -> None:
+    function = _EXCLUSIVE_RENAME
+    flag = _EXCLUSIVE_RENAME_FLAG
+    if function is None or flag == 0:
+        raise OSError(errno.ENOTSUP, "exclusive receipt publication unsupported")
+    if any(
+        isinstance(descriptor, bool) or not isinstance(descriptor, int)
+        for descriptor in (source_descriptor, destination_descriptor)
+    ):
+        raise TypeError
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    ctypes.set_errno(0)
+    result = function(
+        source_descriptor,
+        source,
+        destination_descriptor,
+        destination,
+        flag,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno() or errno.EIO
+    raise OSError(error, "exclusive receipt publication failed")
 
 
 def _require_same_directory_node(
@@ -730,34 +790,6 @@ def _require_same_directory_node(
     if opened != lexical or opened[:4] != expected[:4]:
         raise _invalid()
     return opened
-
-
-def _rollback_published_receipt(
-    descriptor: int,
-    name: str,
-    expected: tuple[int, int],
-) -> None:
-    final_descriptor = -1
-    try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        final_descriptor = os.open(name, flags, dir_fd=descriptor)
-        current = os.fstat(final_descriptor)
-        if (current.st_dev, current.st_ino) == expected:
-            os.unlink(name, dir_fd=descriptor)
-            try:
-                os.fsync(descriptor)
-            except OSError:
-                pass
-    except OSError:
-        pass
-    finally:
-        if final_descriptor >= 0:
-            try:
-                os.close(final_descriptor)
-            except OSError:
-                pass
 
 
 def backup_receipt_summary(receipt: BackupReceipt) -> dict[str, Any]:

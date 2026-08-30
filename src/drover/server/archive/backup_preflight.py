@@ -188,6 +188,31 @@ def run_backup_preflight(
     )
 
 
+def _run_backup_preflight_at(
+    config: BackupConfig,
+    drover_config: DroverConfig,
+    workspace: Path,
+    runtime_guard: RuntimeGuard,
+    *,
+    receipt_directory_descriptor: int,
+    receipt_directory_identity: tuple[int, ...],
+    resource_limits: ResourceLimits | None = None,
+) -> BackupPreflightResult:
+    """Run applied preflight against one lock-owned receipt-root duplicate."""
+    if type(runtime_guard) is not RuntimeGuard:
+        raise _failure()
+    return _run_backup_preflight(
+        config,
+        drover_config,
+        workspace,
+        runtime_guard,
+        resource_limits=resource_limits,
+        receipt_directory_descriptor=receipt_directory_descriptor,
+        receipt_directory_identity=receipt_directory_identity,
+        dependencies=_PRODUCTION_DEPENDENCIES,
+    )
+
+
 def _run_backup_preflight(
     config: BackupConfig,
     drover_config: DroverConfig,
@@ -195,6 +220,8 @@ def _run_backup_preflight(
     runtime_guard: RuntimeGuard,
     *,
     resource_limits: ResourceLimits | None = None,
+    receipt_directory_descriptor: int | None = None,
+    receipt_directory_identity: tuple[int, ...] | None = None,
     dependencies: _PreflightDependencies,
 ) -> BackupPreflightResult:
     """Capture one local-only denominator and reject every unsafe counter."""
@@ -237,7 +264,11 @@ def _run_backup_preflight(
             _SOURCE_INVENTORY_FILENAME,
             source_inventory.to_wire(),
         )
-        receipts = _load_eligibility_receipts(config.receipt_directory)
+        receipts = _load_eligibility_receipts(
+            config.receipt_directory,
+            receipt_directory_descriptor=receipt_directory_descriptor,
+            receipt_directory_identity=receipt_directory_identity,
+        )
         _require_pinned_path(
             config.local_pond_config,
             config_descriptor,
@@ -644,6 +675,16 @@ def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _receipt_directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
+
+
 def _pin_workspace(path: Path) -> tuple[Path, int, tuple[int, ...]]:
     descriptor: int | None = None
     try:
@@ -770,13 +811,43 @@ def _write_workspace_json(
 
 def _load_eligibility_receipts(
     receipt_directory: Path,
+    *,
+    receipt_directory_descriptor: int | None = None,
+    receipt_directory_identity: tuple[int, ...] | None = None,
 ) -> tuple[SourceEligibilityReceipt, ...]:
     root_descriptor: int | None = None
+    close_root = False
     eligibility_descriptor: int | None = None
     try:
-        root_descriptor, _ = _pin_path(receipt_directory, directory=True, private=False)
+        if receipt_directory_descriptor is None:
+            if receipt_directory_identity is not None:
+                raise _failure()
+            root_descriptor, _ = _pin_path(
+                receipt_directory,
+                directory=True,
+                private=False,
+            )
+            close_root = True
+        else:
+            if (
+                isinstance(receipt_directory_descriptor, bool)
+                or not isinstance(receipt_directory_descriptor, int)
+                or receipt_directory_descriptor < 0
+                or type(receipt_directory_identity) is not tuple
+            ):
+                raise _failure()
+            root_descriptor = receipt_directory_descriptor
         root_metadata = os.fstat(root_descriptor)
-        if stat.S_IMODE(root_metadata.st_mode) != 0o700:
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+            or (
+                receipt_directory_identity is not None
+                and _receipt_directory_identity(root_metadata)
+                != receipt_directory_identity
+            )
+        ):
             raise _failure()
         root_content_identity = _file_identity(root_metadata)
         try:
@@ -786,8 +857,11 @@ def _load_eligibility_receipts(
                 dir_fd=root_descriptor,
             )
         except FileNotFoundError:
-            _require_unchanged_directory(
-                receipt_directory, root_descriptor, root_content_identity
+            _require_unchanged_eligibility_root(
+                receipt_directory,
+                root_descriptor,
+                root_content_identity,
+                reopen_path=close_root,
             )
             return ()
         eligibility_metadata = os.fstat(eligibility_descriptor)
@@ -826,8 +900,11 @@ def _load_eligibility_receipts(
             or _file_identity(current) != eligibility_identity
         ):
             raise _failure()
-        _require_unchanged_directory(
-            receipt_directory, root_descriptor, root_content_identity
+        _require_unchanged_eligibility_root(
+            receipt_directory,
+            root_descriptor,
+            root_content_identity,
+            reopen_path=close_root,
         )
         return tuple(receipts)
     except BackupPreflightError:
@@ -835,12 +912,33 @@ def _load_eligibility_receipts(
     except (OSError, TypeError, ValueError):
         raise _failure() from None
     finally:
-        for descriptor in (eligibility_descriptor, root_descriptor):
+        descriptors = [eligibility_descriptor]
+        if close_root:
+            descriptors.append(root_descriptor)
+        for descriptor in descriptors:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+def _require_unchanged_eligibility_root(
+    path: Path,
+    descriptor: int,
+    expected: tuple[int, ...],
+    *,
+    reopen_path: bool,
+) -> None:
+    try:
+        if _file_identity(os.fstat(descriptor)) != expected:
+            raise _failure()
+        if reopen_path and _file_identity(path.stat(follow_symlinks=False)) != expected:
+            raise _failure()
+    except BackupPreflightError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise _failure() from None
 
 
 def _eligibility_receipts_sha256(

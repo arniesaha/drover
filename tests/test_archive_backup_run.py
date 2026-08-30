@@ -11,17 +11,22 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 
 import drover.server.archive as archive_package
+import drover.server.archive.backup_preflight as backup_preflight_module
 import drover.server.archive.backup_runtime as backup_runtime_module
 from drover.config import default_config
 from drover.server.archive.backup_config import BackupConfig
 from drover.server.archive.backup_preflight import (
     BackupPreflightError,
     BackupPreflightResult,
+    _PreflightDependencies,
+    _run_backup_preflight,
+    _run_backup_preflight_at,
 )
 from drover.server.archive.backup_receipt import (
     BackupReceipt,
@@ -42,6 +47,8 @@ from drover.server.archive.backup_runtime import (
     BackupLock,
     BackupRuntimeError,
     RuntimeEvidence,
+    RuntimeGuard,
+    RuntimeIdentity,
 )
 from drover.server.archive.coverage import (
     RegistryCandidate,
@@ -53,6 +60,7 @@ from drover.server.archive.inventory import (
     NativeInventoryRecord,
     PondInventory,
     PondInventoryRecord,
+    SourceEligibilityReceipt,
     private_json_sha256,
     write_private_json,
 )
@@ -93,14 +101,16 @@ def _private_file(path: Path, content: str = "private") -> Path:
     return path
 
 
-def _config(tmp_path: Path) -> BackupConfig:
+def _config(tmp_path: Path, *, nested_receipt: bool = False) -> BackupConfig:
     binary = _private_file(tmp_path / "pond-private", "#!/bin/sh\nexit 0\n")
     binary.chmod(0o700)
     local_config = _private_file(tmp_path / "local-private.toml")
     remote_config = _private_file(tmp_path / "remote-private.toml")
     local_store = tmp_path / "local-store-private"
     local_store.mkdir()
-    receipts = tmp_path / "receipts-private"
+    receipt_parent = tmp_path / "receipt-parent-private" if nested_receipt else tmp_path
+    receipt_parent.mkdir(exist_ok=True)
+    receipts = receipt_parent / "receipts-private"
     receipts.mkdir(mode=0o700)
     return BackupConfig(
         schema_version=1,
@@ -446,8 +456,9 @@ def _fixture(
     *,
     fault: str | None = None,
     with_previous: bool = False,
+    nested_receipt: bool = False,
 ) -> _Fixture:
-    config = _config(tmp_path)
+    config = _config(tmp_path, nested_receipt=nested_receipt)
     fixture = _Fixture(
         config=config,
         drover_config=replace(
@@ -500,11 +511,22 @@ def _fixture(
         workspace,
         runtime,
         *,
+        receipt_directory_descriptor=None,
+        receipt_directory_identity=None,
         resource_limits=None,
     ):
         assert received_config is config
         assert drover_config is fixture.drover_config
         assert runtime is fixture.runtime
+        assert isinstance(receipt_directory_descriptor, int)
+        receipt_metadata = os.fstat(receipt_directory_descriptor)
+        assert (
+            receipt_metadata.st_dev,
+            receipt_metadata.st_ino,
+            receipt_metadata.st_mode,
+            receipt_metadata.st_uid,
+            receipt_metadata.st_ctime_ns,
+        ) == receipt_directory_identity
         before = fixture.attempts["preflight-before"] == 0
         phase = "preflight-before" if before else "preflight-after"
         fixture.attempts[phase] += 1
@@ -884,6 +906,7 @@ def test_production_dependency_construction_is_lazy_and_private() -> None:
         "write_receipt",
         "now",
     )
+    assert dependencies.run_preflight is _run_backup_preflight_at
     assert _PRIVATE_URL not in repr(dependencies)
 
 
@@ -1008,6 +1031,225 @@ def test_applied_backup_limits_all_thirteen_processes_and_aggregates_all_peaks(
     assert receipt.peak_rss_bytes == 900
     assert receipt.peak_physical_bytes == 1800
     assert receipt.swap_delta_bytes == 50
+
+
+def test_applied_preflight_eligibility_uses_the_lock_owned_root_during_swaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, nested_receipt=True)
+    base_records = _native_inventory().records
+    source = NativeInventory(
+        schema_version=2,
+        captured_at=_CAPTURED_AT,
+        host_id="host-private",
+        records=(
+            base_records[0],
+            NativeInventoryRecord(
+                source_agent="claude-code",
+                session_id="metadata-private",
+                updated_at="2026-08-29T11:30:00Z",
+                size_bytes=50,
+                source_copies=1,
+                source_fingerprint="c" * 64,
+            ),
+            base_records[1],
+        ),
+    )
+    eligibility = fixture.config.receipt_directory / "eligibility"
+    eligibility.mkdir(mode=0o700)
+    correct = SourceEligibilityReceipt(
+        schema_version=1,
+        assessed_at="2026-08-29T12:00:00Z",
+        host_id=source.host_id,
+        source_agent="claude-code",
+        session_id="metadata-private",
+        source_fingerprint="c" * 64,
+        classification="source_not_archive_eligible",
+    )
+    write_private_json(eligibility / "metadata-private.json", correct.to_wire())
+    wrong_parent = tmp_path / "wrong-receipt-parent-private"
+    wrong_root = wrong_parent / fixture.config.receipt_directory.name
+    wrong_eligibility = wrong_root / "eligibility"
+    wrong_eligibility.mkdir(parents=True, mode=0o700)
+    wrong_root.chmod(0o700)
+    wrong = replace(correct, assessed_at="2026-08-29T12:00:01Z")
+    write_private_json(wrong_eligibility / "metadata-private.json", wrong.to_wire())
+
+    registry = _private_file(tmp_path / "registry-snapshot-private")
+    registry_candidates = (
+        RegistryCandidate(
+            "wrapper-claude",
+            source.host_id,
+            "claude-code",
+            "claude-private",
+        ),
+        RegistryCandidate(
+            "wrapper-codex",
+            source.host_id,
+            "codex",
+            "codex-private",
+        ),
+    )
+
+    def capture_local_snapshot(
+        _binary,
+        *,
+        workspace,
+        progress_callback=None,
+        **_kwargs,
+    ):
+        if progress_callback is not None:
+            progress_callback()
+        value = _snapshot(resource_evidence=PondResourceEvidence(300, 600, 10))
+        write_private_json(
+            Path(workspace) / "pond-inventory.json",
+            value.root_inventory.to_wire(),
+        )
+        return value
+
+    clean_dry_run = {
+        "dry_run": True,
+        "adapters": [
+            {
+                "name": "claude-code",
+                "path": "/private/native/claude",
+                "sessions": 1,
+                "fresh": 1,
+                "pending": 0,
+            },
+            {
+                "name": "codex-cli",
+                "path": "/private/native/codex",
+                "sessions": 1,
+                "fresh": 1,
+                "pending": 0,
+            },
+        ],
+    }
+
+    def local_dry_run(
+        _binary,
+        _arguments,
+        *,
+        run_directory,
+        label,
+        progress_callback=None,
+        **_kwargs,
+    ):
+        if progress_callback is not None:
+            progress_callback()
+        stdout = Path(run_directory) / f"{label}.stdout"
+        stderr = Path(run_directory) / f"{label}.stderr"
+        stdout.write_text(json.dumps(clean_dry_run) + "\n", encoding="utf-8")
+        stderr.write_bytes(b"")
+        stdout.chmod(0o600)
+        stderr.chmod(0o600)
+        return PondProcessResult(0, 1, 300, 400, 0, stdout, stderr)
+
+    preflight_dependencies = _PreflightDependencies(
+        native_home=lambda: tmp_path,
+        discover_native_inventory=lambda *_args, **_kwargs: source,
+        capture_pond_snapshot=capture_local_snapshot,
+        resolve_control_plane_path=lambda _path: registry,
+        load_registry_candidates=lambda _path: registry_candidates,
+        build_coverage_report=build_coverage_report,
+        coverage_summary=coverage_summary,
+        run_pond_process=local_dry_run,
+    )
+    snapshot = SimpleNamespace(
+        identity=RuntimeIdentity("hub-private", "harness-private", "pond-private"),
+        host_id=source.host_id,
+        dropped_events=0,
+        healthy=True,
+        health_latency_ms=1.0,
+        swap_used_bytes=0,
+    )
+
+    class Probe:
+        def capture(self):
+            return snapshot
+
+        def wait_for_next_sample(self) -> None:
+            pass
+
+    runtime = RuntimeGuard(Probe(), minimum_samples=30)
+    fixture.runtime = runtime  # type: ignore[assignment]
+    real_load = backup_preflight_module._load_eligibility_receipts
+    swap_count = 0
+
+    def swap_restore_around_load(receipt_directory, *args, **kwargs):
+        nonlocal swap_count
+        swap_count += 1
+        configured_parent = fixture.config.receipt_directory.parent
+        held_parent = tmp_path / f"held-receipt-parent-private-{swap_count}"
+        configured_parent.rename(held_parent)
+        wrong_parent.rename(configured_parent)
+        try:
+            return real_load(receipt_directory, *args, **kwargs)
+        finally:
+            configured_parent.rename(wrong_parent)
+            held_parent.rename(configured_parent)
+
+    monkeypatch.setattr(
+        backup_preflight_module,
+        "_load_eligibility_receipts",
+        swap_restore_around_load,
+    )
+    observed_digests: list[str] = []
+
+    def applied_preflight(
+        config,
+        drover_config,
+        workspace,
+        runtime_guard,
+        *,
+        receipt_directory_descriptor,
+        receipt_directory_identity,
+        resource_limits=None,
+    ):
+        result = _run_backup_preflight(
+            config,
+            drover_config,
+            workspace,
+            runtime_guard,
+            resource_limits=resource_limits,
+            receipt_directory_descriptor=receipt_directory_descriptor,
+            receipt_directory_identity=receipt_directory_identity,
+            dependencies=preflight_dependencies,
+        )
+        observed_digests.append(result.eligibility_receipts_sha256)
+        return result
+
+    def write_applied_receipt(
+        receipt_directory,
+        receipt_descriptor,
+        receipt_identity,
+        receipt,
+        *,
+        before_publish,
+    ):
+        return _write_backup_receipt_at(
+            receipt_directory,
+            receipt_descriptor,
+            receipt_identity,
+            receipt,
+            before_publish=before_publish,
+        )
+
+    assert fixture.dependencies is not None
+    fixture.dependencies = replace(
+        fixture.dependencies,
+        runtime_guard=lambda _config: runtime,
+        run_preflight=applied_preflight,
+        write_receipt=write_applied_receipt,
+    )
+
+    receipt = _run(fixture)
+
+    assert receipt.source_not_archive_eligible == 1
+    assert swap_count == 2
+    assert observed_digests == [private_json_sha256([correct.to_wire()])] * 2
 
 
 @pytest.mark.parametrize(
