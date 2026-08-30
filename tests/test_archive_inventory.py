@@ -13,8 +13,10 @@ from drover.server.archive.inventory import (
     NativeInventoryRecord,
     PondInventory,
     PondInventoryRecord,
+    SourceEligibilityReceipt,
     load_native_inventory,
     load_pond_inventory,
+    load_source_eligibility_receipt,
     read_private_json,
     write_private_json,
 )
@@ -52,6 +54,18 @@ def _pond_inventory() -> PondInventory:
                 last_message_at="2026-08-28T10:02:00Z",
             ),
         ),
+    )
+
+
+def _eligibility_receipt() -> SourceEligibilityReceipt:
+    return SourceEligibilityReceipt(
+        1,
+        "2026-08-28T12:00:00Z",
+        "host-test",
+        "claude-code",
+        "metadata-only",
+        "a" * 64,
+        "source_not_archive_eligible",
     )
 
 
@@ -99,13 +113,47 @@ def test_pond_inventory_round_trips_and_sorts_records(tmp_path):
     )
 
 
-@pytest.mark.parametrize("factory", [_native_inventory, _pond_inventory])
+def test_source_eligibility_receipt_round_trips_through_owner_only_file(tmp_path):
+    path = tmp_path / "eligibility.json"
+    receipt = _eligibility_receipt()
+
+    write_private_json(path, receipt.to_wire())
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert load_source_eligibility_receipt(path) == receipt
+
+
+@pytest.mark.parametrize(
+    "factory", [_native_inventory, _pond_inventory, _eligibility_receipt]
+)
 def test_inventory_values_are_frozen_and_slotted(factory):
     inventory = factory()
 
     assert not hasattr(inventory, "__dict__")
     with pytest.raises(dataclasses.FrozenInstanceError):
         inventory.schema_version = 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_agent", "codex-cli"),
+        ("source_fingerprint", "not-a-fingerprint"),
+        ("classification", "archive-eligible"),
+    ],
+)
+def test_source_eligibility_loader_rejects_invalid_fixed_contract(
+    tmp_path, field, value
+):
+    payload = _eligibility_receipt().to_wire()
+    payload[field] = value
+    path = tmp_path / "eligibility.json"
+    _write_input(path, payload)
+
+    with pytest.raises(ValueError, match=field) as raised:
+        load_source_eligibility_receipt(path)
+
+    assert str(value) not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -305,8 +353,8 @@ def test_native_loader_rejects_invalid_field_values(tmp_path, field, value):
     assert repr(value) not in str(raised.value)
 
 
-@pytest.mark.parametrize("schema_version", [0, 2, "1", 1.0, True])
-def test_native_loader_accepts_only_schema_version_one(tmp_path, schema_version):
+@pytest.mark.parametrize("schema_version", [0, 3, "1", 1.0, True])
+def test_native_loader_accepts_only_supported_schema_versions(tmp_path, schema_version):
     payload = _native_inventory().to_wire()
     payload["schema_version"] = schema_version
     path = tmp_path / "native.json"
@@ -314,6 +362,29 @@ def test_native_loader_accepts_only_schema_version_one(tmp_path, schema_version)
 
     with pytest.raises(ValueError, match="schema_version"):
         load_native_inventory(path)
+
+
+def test_native_schema_v2_round_trip_requires_opaque_source_fingerprint(tmp_path):
+    path = tmp_path / "native-v2.json"
+    inventory = NativeInventory(
+        schema_version=2,
+        captured_at="2026-08-28T12:00:00Z",
+        host_id="host-test",
+        records=(
+            NativeInventoryRecord(
+                "claude-code",
+                "native-v2",
+                "2026-08-28T11:00:00Z",
+                123,
+                1,
+                "a" * 64,
+            ),
+        ),
+    )
+
+    write_private_json(path, inventory.to_wire())
+
+    assert load_native_inventory(path) == inventory
 
 
 def test_native_loader_rejects_more_than_one_hundred_thousand_records(tmp_path):
@@ -438,7 +509,7 @@ def test_pond_loader_rejects_duplicate_source_session_pair(tmp_path):
     "inventory",
     [
         NativeInventory(
-            schema_version=2,
+            schema_version=3,
             captured_at="2026-08-28T12:00:00Z",
             host_id="host-test",
             records=(),

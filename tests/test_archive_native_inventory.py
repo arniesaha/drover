@@ -71,7 +71,7 @@ def test_native_inventory_captures_all_supported_sources_without_paths(tmp_path)
     assert ".codex" not in wire
     assert "/private/project" not in wire
     assert native_inventory_summary(inventory) == {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_sessions": 2,
         "source_copies": 2,
         "duplicate_source_groups": 0,
@@ -115,6 +115,38 @@ def test_native_inventory_never_parses_large_canonical_transcript_records(
     assert parsed_sizes == []
 
 
+def test_native_inventory_fingerprint_invalidates_same_size_rewrite_with_restored_mtime(
+    tmp_path,
+):
+    original_body = b'{"type":"ai-title","title":"aaaa"}\n'
+    replacement_body = b'{"type":"ai-title","title":"bbbb"}\n'
+    assert len(original_body) == len(replacement_body)
+    session = _write_claude_session(
+        tmp_path,
+        session_id="claude-metadata-only",
+        body=original_body.decode("utf-8"),
+    )
+    before = session.stat()
+
+    first = discover_native_history_inventory(tmp_path, "host-test")
+    time.sleep(0.01)
+    session.write_bytes(replacement_body)
+    os.utime(session, ns=(before.st_atime_ns, before.st_mtime_ns))
+    second = discover_native_history_inventory(tmp_path, "host-test")
+
+    first_record = first.records[0]
+    second_record = second.records[0]
+    assert first.schema_version == 2
+    assert second.schema_version == 2
+    assert first_record.size_bytes == second_record.size_bytes
+    assert first_record.updated_at == second_record.updated_at
+    assert len(first_record.source_fingerprint) == 64
+    assert first_record.source_fingerprint != second_record.source_fingerprint
+    serialized = json.dumps(first.to_wire(), sort_keys=True)
+    assert str(session) not in serialized
+    assert "aaaa" not in serialized
+
+
 def test_native_inventory_groups_duplicate_source_sessions_and_uses_latest_mtime(
     tmp_path,
 ):
@@ -133,17 +165,15 @@ def test_native_inventory_groups_duplicate_source_sessions_and_uses_latest_mtime
         captured_at=datetime(2026, 8, 28, 12, tzinfo=timezone.utc),
     )
 
-    assert inventory.records == (
-        NativeInventoryRecord(
-            source_agent="claude-code",
-            session_id="claude-duplicate",
-            updated_at="2026-08-29T10:42:03.000000000Z",
-            size_bytes=first.stat().st_size + second.stat().st_size,
-            source_copies=2,
-        ),
-    )
+    record = inventory.records[0]
+    assert record.source_agent == "claude-code"
+    assert record.session_id == "claude-duplicate"
+    assert record.updated_at == "2026-08-29T10:42:03.000000000Z"
+    assert record.size_bytes == first.stat().st_size + second.stat().st_size
+    assert record.source_copies == 2
+    assert len(record.source_fingerprint) == 64
     assert native_inventory_summary(inventory) == {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_sessions": 1,
         "source_copies": 2,
         "duplicate_source_groups": 1,

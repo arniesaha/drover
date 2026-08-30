@@ -19,6 +19,8 @@ from drover.server.archive.inventory import (
     NativeInventoryRecord,
     PondInventory,
     PondInventoryRecord,
+    SourceEligibilityReceipt,
+    load_source_eligibility_receipt,
     write_private_json,
 )
 from drover.server.archive.native_inventory import native_inventory_summary
@@ -70,9 +72,10 @@ def _source_inventory(
     session_id: str = "native-private",
     *,
     source_agent: str = "claude-code",
+    source_fingerprint: str | None = None,
 ) -> NativeInventory:
     return NativeInventory(
-        schema_version=1,
+        schema_version=2 if source_fingerprint is not None else 1,
         captured_at=_CAPTURED_AT,
         host_id=host_id,
         records=(
@@ -82,6 +85,7 @@ def _source_inventory(
                 updated_at=_UPDATED_AT,
                 size_bytes=123,
                 source_copies=1,
+                source_fingerprint=source_fingerprint,
             ),
         ),
     )
@@ -115,6 +119,25 @@ def _write_native(path: Path, inventory: NativeInventory | None = None) -> None:
 
 def _write_pond(path: Path, inventory: PondInventory | None = None) -> None:
     write_private_json(path, (inventory or _pond_inventory()).to_wire())
+
+
+def _write_receipt(
+    path: Path,
+    *,
+    host_id: str = "host-private",
+    session_id: str = "native-private",
+    source_fingerprint: str = "a" * 64,
+) -> None:
+    receipt = SourceEligibilityReceipt(
+        1,
+        _CAPTURED_AT,
+        host_id,
+        "claude-code",
+        session_id,
+        source_fingerprint,
+        "source_not_archive_eligible",
+    )
+    write_private_json(path, receipt.to_wire())
 
 
 def _mode(path: Path) -> int:
@@ -180,6 +203,7 @@ def _coverage_args(
     config: Path,
     db: Path | None = None,
     prior: tuple[Path, ...] = (),
+    receipts: tuple[Path, ...] = (),
 ) -> list[str]:
     args: list[str] = ["--config", str(config)]
     args.extend(
@@ -198,10 +222,12 @@ def _coverage_args(
         args.extend(("--db", str(db)))
     for path in prior:
         args.extend(("--prior-source-inventory", str(path)))
+    for path in receipts:
+        args.extend(("--source-eligibility-receipt", str(path)))
     return args
 
 
-def test_archive_help_exposes_only_the_three_local_operator_commands():
+def test_archive_help_exposes_only_the_four_local_operator_commands():
     runner = CliRunner()
 
     result = runner.invoke(main, ["archive", "--help"])
@@ -209,6 +235,7 @@ def test_archive_help_exposes_only_the_three_local_operator_commands():
     assert result.exit_code == 0, result.output
     assert set(server_main.archive_cmd.commands) == {
         "source-inventory",
+        "source-eligibility",
         "pond-inventory",
         "coverage",
     }
@@ -223,6 +250,11 @@ def test_archive_help_exposes_only_the_three_local_operator_commands():
         }
 
     assert option_names("source-inventory") == {"--host-id", "--output"}
+    assert option_names("source-eligibility") == {
+        "--host-id",
+        "--source",
+        "--output",
+    }
     assert option_names("pond-inventory") == {
         "--storage-path",
         "--output",
@@ -235,11 +267,68 @@ def test_archive_help_exposes_only_the_three_local_operator_commands():
         "--source-inventory",
         "--pond-inventory",
         "--prior-source-inventory",
+        "--source-eligibility-receipt",
     }
 
     pond_help = runner.invoke(main, ["archive", "pond-inventory", "--help"])
     assert pond_help.exit_code == 0, pond_help.output
     assert "--timeout SECONDS" in pond_help.output
+
+
+def test_source_eligibility_cli_writes_private_receipt_and_only_aggregate_stdout(
+    tmp_path, caplog
+):
+    session_id = "metadata-only-private"
+    source = tmp_path / ".claude/projects/project" / f"{session_id}.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps(
+            {
+                "type": "ai-title",
+                "sessionId": session_id,
+                "title": "private title",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "private-eligibility-receipt.json"
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "archive",
+            "source-eligibility",
+            "--host-id",
+            "host-private",
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        env={"HOME": str(tmp_path)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "receipts": 1,
+        "schema_version": 1,
+        "source_not_archive_eligible": 1,
+    }
+    receipt = load_source_eligibility_receipt(output)
+    assert receipt.session_id == session_id
+    assert receipt.host_id == "host-private"
+    assert _mode(output) == 0o600
+    _assert_private_values_absent(
+        result,
+        caplog,
+        source,
+        output,
+        session_id,
+        "host-private",
+        "private title",
+        receipt.source_fingerprint,
+    )
 
 
 def test_source_inventory_writes_private_manifest_and_prints_only_sorted_summary(
@@ -808,6 +897,64 @@ def test_coverage_snapshots_resolved_registry_writes_report_before_safe_exit(
         "host-private",
         "native-private",
         pond_session_id,
+    )
+
+
+def test_coverage_cli_applies_private_eligibility_receipt_to_matching_v2_source(
+    tmp_path, caplog
+):
+    fingerprint = "a" * 64
+    config = _write_isolated_config(tmp_path)
+    registry = tmp_path / "isolated.registry.duckdb"
+    _write_empty_registry(registry)
+    current_path = tmp_path / "current-private.json"
+    pond_path = tmp_path / "pond-private.json"
+    receipt_path = tmp_path / "receipt-private.json"
+    output = tmp_path / "coverage-private.json"
+    _write_native(
+        current_path,
+        _source_inventory(source_fingerprint=fingerprint),
+    )
+    _write_pond(pond_path, PondInventory(1, _CAPTURED_AT, "0.16.3", ()))
+    _write_receipt(receipt_path, source_fingerprint=fingerprint)
+
+    result = CliRunner().invoke(
+        main,
+        _coverage_args(
+            output=output,
+            source=current_path,
+            pond=pond_path,
+            config=config,
+            db=registry,
+            receipts=(receipt_path,),
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["current_source_coverage"] == {
+        "discovered": 1,
+        "matched": 0,
+        "source_not_archive_eligible": 1,
+        "discovered_not_synced": 0,
+    }
+    assert summary["ready_for_next_writer"] is True
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["current_source_details"][0]["status"] == (
+        "source_not_archive_eligible"
+    )
+    _assert_private_values_absent(
+        result,
+        caplog,
+        config,
+        registry,
+        current_path,
+        pond_path,
+        receipt_path,
+        output,
+        fingerprint,
+        "host-private",
+        "native-private",
     )
 
 

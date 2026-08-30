@@ -38,6 +38,7 @@ from drover.config import (
     default_token_file,
     resolve_api_token_env,
 )
+from drover.native_history_identity import native_source_fingerprint
 from drover.server.harness.auth import (
     AuthFlowInputError,
     AuthFlowLaunchError,
@@ -606,6 +607,7 @@ class _NativeHistorySource:
     session_id: str
     size_bytes: int
     updated_at_ns: int
+    source_fingerprint: str
 
 
 def discover_native_history_metadata(
@@ -629,6 +631,7 @@ def discover_native_history_metadata(
                     "session_id": source.session_id,
                     "size_bytes": source.size_bytes,
                     "updated_at": _utc_timestamp(source.updated_at_ns),
+                    "source_fingerprint": source.source_fingerprint,
                 }
             )
     except OSError:
@@ -678,6 +681,7 @@ def _native_history_source(
         session_id=session_id,
         size_bytes=source_metadata.st_size,
         updated_at_ns=source_metadata.st_mtime_ns,
+        source_fingerprint=native_source_fingerprint(source_metadata),
     )
 
 
