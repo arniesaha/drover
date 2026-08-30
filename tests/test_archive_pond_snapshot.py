@@ -76,31 +76,13 @@ def _corpus_rows(
     corpus: dict[str, int] = _CORPUS_ROW,
     duplicates: dict[str, int] = _DUPLICATE_ROW,
 ) -> list[dict[str, object]]:
-    rows = [
+    rows = [{"row_kind": "aggregate", **corpus, **duplicates}]
+    rows.extend(
         {
             "row_kind": "root",
             **root,
-            "sessions": None,
-            "messages": None,
-            "parts": None,
-            "disallowed_sessions": None,
-            "logical_duplicate_groups": None,
-            "sessions_in_logical_duplicate_groups": None,
         }
         for root in roots
-    ]
-    rows.append(
-        {
-            "row_kind": "aggregate",
-            "session_id": None,
-            "source_agent": None,
-            "created_at": None,
-            "message_count": None,
-            "first_message_at": None,
-            "last_message_at": None,
-            **corpus,
-            **duplicates,
-        }
     )
     return rows
 
@@ -230,7 +212,11 @@ def _pond_ndjson(cursor: duckdb.DuckDBPyConnection) -> bytes:
 
     return "".join(
         json.dumps(
-            dict(zip(columns, row, strict=True)),
+            {
+                column: value
+                for column, value in zip(columns, row, strict=True)
+                if value is not None
+            },
             default=encode_timestamp,
             separators=(",", ":"),
         )
@@ -270,6 +256,135 @@ def test_snapshot_contains_root_inventory_and_full_store_safety_counts(
         "codex-cli",
     }
     assert len(snapshot.root_inventory.records) == 2
+
+
+@pytest.mark.parametrize(
+    ("kind", "missing"),
+    [
+        ("aggregate", "sessions"),
+        ("aggregate", "logical_duplicate_groups"),
+        ("root", "session_id"),
+        ("root", "created_at"),
+        ("root", "message_count"),
+    ],
+)
+def test_corpus_parser_rejects_missing_required_kind_fields(
+    kind: str, missing: str
+) -> None:
+    rows = _corpus_rows()
+    row = next(value for value in rows if value["row_kind"] == kind)
+    del row[missing]
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "aggregate-root-field",
+        "root-count-field",
+        "unknown-kind",
+        "unknown-field",
+    ],
+)
+def test_corpus_parser_rejects_union_mixing_and_unknown_fields(mutation: str) -> None:
+    rows = _corpus_rows()
+    aggregate = rows[0]
+    root = rows[1]
+    if mutation == "aggregate-root-field":
+        aggregate["session_id"] = None
+    elif mutation == "root-count-field":
+        root["sessions"] = None
+    elif mutation == "unknown-kind":
+        root["row_kind"] = "private-unknown"
+    else:
+        root["private-extra"] = None
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+        )
+
+
+def test_corpus_parser_normalizes_only_the_omitted_empty_root_timestamp_pair() -> None:
+    rows = _corpus_rows(
+        roots=(
+            {
+                "session_id": "claude-empty-private",
+                "source_agent": "claude-code",
+                "created_at": "2026-08-29T10:00:00Z",
+                "message_count": 0,
+            },
+        )
+    )
+
+    records, _ = _corpus_snapshot(
+        "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+    )
+
+    assert records[0].first_message_at is None
+    assert records[0].last_message_at is None
+
+
+@pytest.mark.parametrize("missing", ["first_message_at", "last_message_at"])
+def test_corpus_parser_rejects_one_omitted_root_timestamp(missing: str) -> None:
+    rows = _corpus_rows()
+    del rows[1][missing]
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+        )
+
+
+def test_corpus_parser_rejects_omitted_timestamps_for_a_nonempty_root() -> None:
+    rows = _corpus_rows()
+    del rows[1]["first_message_at"]
+    del rows[1]["last_message_at"]
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+        )
+
+
+@pytest.mark.parametrize("violation", ["aggregate-last", "roots-unsorted"])
+def test_corpus_parser_rejects_rows_outside_query_order(violation: str) -> None:
+    rows = _corpus_rows()
+    if violation == "aggregate-last":
+        rows = [*rows[1:], rows[0]]
+    else:
+        rows = [rows[0], *reversed(rows[1:])]
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+        )
+
+
+def test_corpus_parser_rejects_multiple_aggregate_rows() -> None:
+    rows = _corpus_rows()
+    rows.insert(1, dict(rows[0]))
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in rows).encode("utf-8")
+        )
+
+
+def test_corpus_parser_rejects_more_than_the_root_record_cap(monkeypatch) -> None:
+    snapshot_module = importlib.import_module("drover.server.archive.pond_snapshot")
+    monkeypatch.setattr(snapshot_module, "MAX_INVENTORY_RECORDS", 1)
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        _corpus_snapshot(
+            "".join(json.dumps(value) + "\n" for value in _corpus_rows()).encode(
+                "utf-8"
+            )
+        )
 
 
 def test_snapshot_uses_exact_sql_and_argument_order_for_local_store(
@@ -625,7 +740,7 @@ def test_snapshot_rejects_duplicate_ndjson_keys(
     pond_environment, monkeypatch, tmp_path
 ):
     rows = [json.dumps(row) for row in _corpus_rows()]
-    rows[-1] = rows[-1].replace('"sessions": 3', '"sessions": 3, "sessions": 3', 1)
+    rows[0] = rows[0].replace('"sessions": 3', '"sessions": 3, "sessions": 3', 1)
     monkeypatch.setenv(
         "FAKE_CORPUS_RAW",
         "\n".join(rows) + "\n",

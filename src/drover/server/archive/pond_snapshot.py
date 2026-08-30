@@ -120,7 +120,12 @@ _DUPLICATE_COLUMNS = frozenset(
     {"logical_duplicate_groups", "sessions_in_logical_duplicate_groups"}
 )
 _ALL_COUNT_COLUMNS = _COUNT_COLUMNS | _DUPLICATE_COLUMNS
-_SNAPSHOT_COLUMNS = _ROOT_COLUMNS | _ALL_COUNT_COLUMNS | {"row_kind"}
+_ROOT_ROW_COLUMNS = _ROOT_COLUMNS | {"row_kind"}
+_EMPTY_ROOT_ROW_COLUMNS = _ROOT_ROW_COLUMNS - {
+    "first_message_at",
+    "last_message_at",
+}
+_AGGREGATE_ROW_COLUMNS = _ALL_COUNT_COLUMNS | {"row_kind"}
 _ROOT_AGENTS = frozenset({"claude-code", "codex-cli"})
 _R2_AUTHORITY = re.compile(r"\A[a-z0-9][a-z0-9-]*\.r2\.cloudflarestorage\.com\Z")
 _MAX_TIMEOUT_SECONDS = 1800
@@ -753,28 +758,34 @@ def _corpus_snapshot(
 ) -> tuple[tuple[PondInventoryRecord, ...], dict[str, int]]:
     records: list[PondInventoryRecord] = []
     seen: set[tuple[str, str]] = set()
+    previous_key: tuple[str, str] | None = None
     aggregate: dict[str, int] | None = None
     lines = data.splitlines()
-    if not lines or len(lines) > MAX_INVENTORY_RECORDS + 2:
+    if not lines or len(lines) > MAX_INVENTORY_RECORDS + 1:
         raise _failure()
-    for line in lines:
+    for line_number, line in enumerate(lines):
         try:
             row = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_object)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise _failure() from None
-        if not isinstance(row, dict) or set(row) != _SNAPSHOT_COLUMNS:
+        if not isinstance(row, dict):
             raise _failure()
-        row_kind = row["row_kind"]
+        row_kind = row.get("row_kind")
+        columns = set(row)
         if row_kind == "aggregate":
-            if aggregate is not None or any(
-                row[field] is not None for field in _ROOT_COLUMNS
+            if (
+                line_number != 0
+                or aggregate is not None
+                or columns != _AGGREGATE_ROW_COLUMNS
             ):
                 raise _failure()
             aggregate = _count_values(row)
             continue
-        if row_kind != "root" or any(
-            row[field] is not None for field in _ALL_COUNT_COLUMNS
-        ):
+        if row_kind != "root" or aggregate is None:
+            raise _failure()
+        if columns == _EMPTY_ROOT_ROW_COLUMNS and row.get("message_count") == 0:
+            row = {**row, "first_message_at": None, "last_message_at": None}
+        elif columns != _ROOT_ROW_COLUMNS:
             raise _failure()
         if len(records) >= MAX_INVENTORY_RECORDS:
             raise _failure()
@@ -783,9 +794,10 @@ def _corpus_snapshot(
         except (KeyError, TypeError, ValueError):
             raise _failure() from None
         key = (record.source_agent, record.session_id)
-        if key in seen:
+        if key in seen or (previous_key is not None and key <= previous_key):
             raise _failure()
         seen.add(key)
+        previous_key = key
         records.append(record)
     if aggregate is None:
         raise _failure()
