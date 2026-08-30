@@ -24,6 +24,7 @@ from drover.server.archive.backup_receipt import (
     write_backup_receipt,
 )
 from drover.server.archive.inventory import (
+    _write_private_json_at,
     canonical_private_json_bytes,
     private_json_sha256,
 )
@@ -318,20 +319,29 @@ def test_receipt_writer_is_exclusive_and_refuses_a_final_symlink(tmp_path):
     assert not target.exists()
 
 
-def test_receipt_writer_rejects_replacement_after_created_file_closes(
+def test_receipt_writer_rejects_replacement_while_created_file_is_retained(
     tmp_path, monkeypatch
 ):
     directory = _receipt_directory(tmp_path)
     receipt = _verified_receipt()
-    real_write = receipt_module._write_private_json_at
+    real_write = _write_private_json_at
 
     def replace_after_write(descriptor, name, payload):
         created_identity = real_write(descriptor, name, payload)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        retained_descriptor = os.open(name, flags, dir_fd=descriptor)
         os.unlink(name, dir_fd=descriptor)
         real_write(descriptor, name, payload)
-        return created_identity
+        return retained_descriptor, created_identity
 
-    monkeypatch.setattr(receipt_module, "_write_private_json_at", replace_after_write)
+    monkeypatch.setattr(
+        receipt_module,
+        "_write_private_json_at_retained",
+        replace_after_write,
+        raising=False,
+    )
 
     with pytest.raises(ValueError, match=r"^archive backup receipt failed$"):
         write_backup_receipt(directory, receipt)

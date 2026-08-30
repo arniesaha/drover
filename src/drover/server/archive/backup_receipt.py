@@ -19,7 +19,7 @@ from uuid import UUID, uuid4
 from drover.server.archive.inventory import (
     MAX_INVENTORY_BYTES,
     _open_nofollow_path,
-    _write_private_json_at,
+    _write_private_json_at_retained,
     private_json_sha256,
 )
 from drover.server.archive.pond_inventory import POND_VERSION
@@ -670,6 +670,7 @@ def _write_backup_receipt_at(
 ) -> Path:
     """Write through one caller-owned pinned receipt-directory descriptor."""
     temporary_name = ""
+    temporary_descriptor = -1
     try:
         payload = receipt.to_wire()
         name = f"backup-{receipt.generation_id}.json"
@@ -677,11 +678,16 @@ def _write_backup_receipt_at(
         _require_exclusive_rename_supported()
         _require_unchanged_directory(directory, descriptor, identity)
         temporary_name = f".backup-receipt-{uuid4()}.tmp"
-        created = _write_private_json_at(descriptor, temporary_name, payload)
+        temporary_descriptor, created = _write_private_json_at_retained(
+            descriptor,
+            temporary_name,
+            payload,
+        )
         temporary_identity = (created.st_dev, created.st_ino)
         _require_private_temporary(
             descriptor,
             temporary_name,
+            temporary_descriptor,
             temporary_identity,
         )
         prepared_identity = _require_same_directory_node(
@@ -695,6 +701,7 @@ def _write_backup_receipt_at(
         _require_private_temporary(
             descriptor,
             temporary_name,
+            temporary_descriptor,
             temporary_identity,
         )
         _require_absent_entry(descriptor, name)
@@ -705,11 +712,23 @@ def _write_backup_receipt_at(
                 os.unlink(temporary_name, dir_fd=descriptor)
             except OSError:
                 pass
+        if temporary_descriptor >= 0:
+            try:
+                os.close(temporary_descriptor)
+            except OSError:
+                pass
+            temporary_descriptor = -1
         raise ValueError(_RECEIPT_ERROR) from None
     try:
         _rename_noreplace_at(descriptor, temporary_name, descriptor, name)
     except (OSError, TypeError, ValueError):
         raise ValueError(_RECEIPT_ERROR) from None
+    finally:
+        if temporary_descriptor >= 0:
+            try:
+                os.close(temporary_descriptor)
+            except OSError:
+                pass
     return final_path
 
 
@@ -721,14 +740,21 @@ def _require_exclusive_rename_supported() -> None:
 def _require_private_temporary(
     descriptor: int,
     name: str,
+    retained_descriptor: int,
     expected: tuple[int, int],
 ) -> None:
+    retained = os.fstat(retained_descriptor)
     temporary = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
     if (
-        not stat.S_ISREG(temporary.st_mode)
+        not stat.S_ISREG(retained.st_mode)
+        or retained.st_uid != os.geteuid()
+        or retained.st_nlink != 1
+        or stat.S_IMODE(retained.st_mode) != 0o600
+        or not stat.S_ISREG(temporary.st_mode)
         or temporary.st_uid != os.geteuid()
         or temporary.st_nlink != 1
         or stat.S_IMODE(temporary.st_mode) != 0o600
+        or (retained.st_dev, retained.st_ino) != expected
         or (temporary.st_dev, temporary.st_ino) != expected
     ):
         raise _invalid()

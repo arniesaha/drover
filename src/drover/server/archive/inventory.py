@@ -479,9 +479,14 @@ def _open_nofollow_path(
         os.close(directory_descriptor)
 
 
-def _write_private_json_descriptor(descriptor: int, encoded: bytes) -> os.stat_result:
+def _write_private_json_descriptor(
+    descriptor: int,
+    encoded: bytes,
+    *,
+    retain: bool = False,
+) -> os.stat_result:
     try:
-        output = os.fdopen(descriptor, "wb")
+        output = os.fdopen(descriptor, "wb", closefd=not retain)
     except (OSError, ValueError):
         try:
             os.close(descriptor)
@@ -496,6 +501,11 @@ def _write_private_json_descriptor(descriptor: int, encoded: bytes) -> os.stat_r
             os.fsync(output.fileno())
             metadata = os.fstat(output.fileno())
     except OSError:
+        if retain:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise _error("output", "write") from None
     return metadata
 
@@ -524,6 +534,33 @@ def _write_private_json_at(
     except (OSError, TypeError, ValueError):
         raise _error("output", "file") from None
     return _write_private_json_descriptor(descriptor, encoded)
+
+
+def _write_private_json_at_retained(
+    directory_descriptor: int,
+    name: str,
+    payload: Any,
+) -> tuple[int, os.stat_result]:
+    """Write one private manifest and retain its opened file descriptor."""
+    encoded = canonical_private_json_bytes(payload)
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or os.path.basename(name) != name
+    ):
+        raise _error("output", "file")
+    try:
+        descriptor = os.open(
+            name,
+            _private_output_flags(),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except (OSError, TypeError, ValueError):
+        raise _error("output", "file") from None
+    metadata = _write_private_json_descriptor(descriptor, encoded, retain=True)
+    return descriptor, metadata
 
 
 def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
