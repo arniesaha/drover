@@ -54,21 +54,33 @@ from drover.server.advisory.worker import (
     operational_snapshot_source_version,
 )
 from drover.server.archive import (
+    BackupConfig,
     PondArchiveClient,
     assess_metadata_only_source,
+    backup_preflight_summary,
+    backup_receipt_summary,
+    backup_run_summary,
     build_coverage_report,
     coverage_summary,
     discover_native_history_inventory,
     export_pond_inventory,
+    load_backup_config,
+    load_backup_receipt,
     load_native_inventory,
     load_pond_inventory,
     load_registry_candidates,
     load_source_eligibility_receipt,
     native_inventory_summary,
     pond_inventory_summary,
+    restore_backup,
+    restore_summary,
+    run_backup,
+    run_backup_preflight,
     source_eligibility_summary,
+    validate_restore_request,
     write_private_json,
 )
+from drover.server.archive.backup_runtime import RuntimeGuard
 from drover.server.briefs.worker import (
     BriefWorker,
     enqueue_brief,
@@ -148,6 +160,34 @@ _REDIS_JOB_STREAM_SUFFIXES = {
     "brief": "regenerate_project_brief",
     "embed_session": "embed_session",
     "embed_span": "embed_span",
+}
+
+_ARCHIVE_BACKUP_ERRORS = frozenset(
+    {
+        "archive backup config failed",
+        "archive backup preflight failed",
+        "archive backup local changed",
+        "archive backup storage unavailable",
+        "archive backup copy failed",
+        "archive backup verify failed",
+        "archive backup receipt failed",
+        "archive backup restore failed",
+        "archive backup resource limit",
+    }
+)
+_ARCHIVE_BACKUP_RUN_DRY_SUMMARY = {
+    "mode": "dry-run",
+    "preflight_ready": True,
+    "remote_contacted": False,
+    "schema_version": 1,
+}
+_ARCHIVE_BACKUP_RESTORE_DRY_SUMMARY = {
+    "destination_valid": True,
+    "mode": "dry-run",
+    "receipt_chain_valid": True,
+    "remote_contacted": False,
+    "schema_version": 1,
+    "store_started": False,
 }
 
 
@@ -784,6 +824,157 @@ def harness_cmd() -> None:
 @main.group(name="archive")
 def archive_cmd() -> None:
     """Capture and compare local archive inventories."""
+
+
+def _raise_archive_backup_error(error: Exception, fallback: str) -> None:
+    """Raise one identifier-free operator category for a backup failure."""
+    try:
+        category = str(error)
+    except Exception:
+        category = fallback
+    if category not in _ARCHIVE_BACKUP_ERRORS:
+        category = fallback
+    raise click.ClickException(category) from None
+
+
+def _run_backup_preflight_for_cli(
+    config: BackupConfig, drover_config: DroverConfig
+) -> dict[str, object]:
+    """Compose the fixed local-only preflight service for Click callbacks."""
+    with tempfile.TemporaryDirectory(
+        prefix=".drover-backup-preflight-",
+        dir=config.receipt_directory,
+    ) as workspace_text:
+        workspace = Path(workspace_text)
+        runtime = RuntimeGuard(drover_config)
+        runtime.capture_baseline()
+        result = run_backup_preflight(config, drover_config, workspace, runtime)
+        runtime.finish()
+        return backup_preflight_summary(result)
+
+
+@archive_cmd.group(name="backup")
+def archive_backup_cmd() -> None:
+    """Verify, back up, and restore private Pond generations."""
+
+
+@archive_backup_cmd.command(name="preflight")
+@click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
+@click.pass_context
+def archive_backup_preflight_cmd(ctx: click.Context, backup_config_path: str) -> None:
+    """Verify the local archive denominator without contacting R2."""
+    try:
+        config = load_backup_config(backup_config_path)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup config failed")
+    try:
+        drover_config = _resolve_config(ctx.obj["config_path"])
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup config failed")
+    try:
+        summary = _run_backup_preflight_for_cli(config, drover_config)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup preflight failed")
+    click.echo(json.dumps(summary, sort_keys=True))
+    if summary.get("ready") is not True:
+        ctx.exit(2)
+
+
+@archive_backup_cmd.command(name="run")
+@click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
+@click.option("--apply", is_flag=True)
+@click.pass_context
+def archive_backup_run_cmd(
+    ctx: click.Context, backup_config_path: str, apply: bool
+) -> None:
+    """Preflight locally, or apply one immutable backup generation."""
+    try:
+        config = load_backup_config(backup_config_path)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup config failed")
+    try:
+        drover_config = _resolve_config(ctx.obj["config_path"])
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup config failed")
+    if not apply:
+        try:
+            summary = _run_backup_preflight_for_cli(config, drover_config)
+        except Exception as error:
+            _raise_archive_backup_error(error, "archive backup preflight failed")
+        dry_summary = dict(_ARCHIVE_BACKUP_RUN_DRY_SUMMARY)
+        dry_summary["preflight_ready"] = summary.get("ready") is True
+        click.echo(json.dumps(dry_summary, sort_keys=True))
+        if dry_summary["preflight_ready"] is not True:
+            ctx.exit(2)
+        return
+    try:
+        receipt = run_backup(config, drover_config)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup preflight failed")
+    try:
+        summary = backup_run_summary(receipt)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup receipt failed")
+    click.echo(json.dumps(summary, sort_keys=True))
+
+
+@archive_backup_cmd.command(name="restore")
+@click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
+@click.option("--receipt", "receipt_path", required=True, type=str, metavar="FILE")
+@click.option(
+    "--destination", "destination_path", required=True, type=str, metavar="DIRECTORY"
+)
+@click.option("--apply", is_flag=True)
+@click.pass_context
+def archive_backup_restore_cmd(
+    ctx: click.Context,
+    backup_config_path: str,
+    receipt_path: str,
+    destination_path: str,
+    apply: bool,
+) -> None:
+    """Validate locally, or restore one receipt into a fresh stopped store."""
+    try:
+        config = load_backup_config(backup_config_path)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup config failed")
+    receipt = Path(receipt_path)
+    destination = Path(destination_path)
+    if not apply:
+        try:
+            validate_restore_request(config, receipt, destination)
+        except Exception as error:
+            _raise_archive_backup_error(error, "archive backup restore failed")
+        click.echo(json.dumps(_ARCHIVE_BACKUP_RESTORE_DRY_SUMMARY, sort_keys=True))
+        return
+    try:
+        drover_config = _resolve_config(ctx.obj["config_path"])
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup config failed")
+    try:
+        result = restore_backup(config, receipt, destination, drover_config)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup restore failed")
+    try:
+        summary = restore_summary(result)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup restore failed")
+    click.echo(json.dumps(summary, sort_keys=True))
+
+
+@archive_backup_cmd.command(name="inspect-receipt")
+@click.option("--receipt", "receipt_path", required=True, type=str, metavar="FILE")
+def archive_backup_inspect_receipt_cmd(receipt_path: str) -> None:
+    """Validate one private receipt and print only aggregate evidence."""
+    try:
+        receipt = load_backup_receipt(receipt_path)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup receipt failed")
+    try:
+        summary = backup_receipt_summary(receipt)
+    except Exception as error:
+        _raise_archive_backup_error(error, "archive backup receipt failed")
+    click.echo(json.dumps(summary, sort_keys=True))
 
 
 @archive_cmd.command(name="source-inventory")
