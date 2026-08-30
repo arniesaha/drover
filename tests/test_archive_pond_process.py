@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import stat
+import subprocess
 import sys
 import textwrap
 import time
@@ -69,7 +70,14 @@ elif mode == "overflow_artifact":
     artifact.write_bytes(b"x" * (32 * 1024 * 1024 + 1))
     artifact.chmod(0o600)
     time.sleep(30)
-elif mode in {"orphan", "stubborn_orphan"}:
+elif mode in {"orphan", "stubborn_orphan", "artifact_mutating_orphan"}:
+    if mode == "artifact_mutating_orphan":
+        artifact = Path(os.environ["FAKE_ARTIFACT"])
+        artifact.write_text("initial", encoding="utf-8")
+        artifact.chmod(0o600)
+    leader_pgid_path = os.environ.get("FAKE_LEADER_PGID")
+    if leader_pgid_path:
+        Path(leader_pgid_path).write_text(str(os.getpgid(0)), encoding="utf-8")
     child_code = r'''import os
 from pathlib import Path
 import signal
@@ -81,17 +89,23 @@ stubborn = os.environ.get("FAKE_DESCENDANT_STUBBORN") == "1"
 
 def terminate(_signum, _frame):
     marker_path.write_text("term", encoding="utf-8")
+    artifact_path = os.environ.get("FAKE_ARTIFACT")
+    if artifact_path:
+        Path(artifact_path).chmod(0o644)
     if not stubborn:
         raise SystemExit(0)
 
 signal.signal(signal.SIGTERM, terminate)
 pid_path.write_text(str(os.getpid()), encoding="utf-8")
+pgid_path = os.environ.get("FAKE_DESCENDANT_PGID")
+if pgid_path:
+    Path(pgid_path).write_text(str(os.getpgid(0)), encoding="utf-8")
 time.sleep(30)
 '''
     subprocess.Popen(
         [sys.executable, "-c", child_code],
-        stdout=sys.stdout,
-        stderr=sys.stderr,
+        stdout=subprocess.DEVNULL if mode == "artifact_mutating_orphan" else sys.stdout,
+        stderr=subprocess.DEVNULL if mode == "artifact_mutating_orphan" else sys.stderr,
         env=os.environ,
     )
     deadline = time.monotonic() + 2
@@ -251,6 +265,8 @@ def test_timeout_terms_then_kills_a_stubborn_orphan_after_its_leader_exits(
     binary, record = fake_pond
     pid_path = tmp_path / "descendant.pid"
     marker_path = tmp_path / "descendant.marker"
+    leader_pgid_path = tmp_path / "leader.pgid"
+    descendant_pgid_path = tmp_path / "descendant.pgid"
     descendant_pid: int | None = None
     try:
         with pytest.raises(PondProcessError, match=r"^timeout$"):
@@ -265,11 +281,16 @@ def test_timeout_terms_then_kills_a_stubborn_orphan_after_its_leader_exits(
                     FAKE_DESCENDANT_PID=str(pid_path),
                     FAKE_DESCENDANT_MARKER=str(marker_path),
                     FAKE_DESCENDANT_STUBBORN="1",
+                    FAKE_LEADER_PGID=str(leader_pgid_path),
+                    FAKE_DESCENDANT_PGID=str(descendant_pgid_path),
                 ),
             )
         descendant_pid = int(pid_path.read_text(encoding="utf-8"))
         _wait_for_pid_exit(descendant_pid)
         assert marker_path.read_text(encoding="utf-8") == "term"
+        assert descendant_pgid_path.read_text(encoding="utf-8") == (
+            leader_pgid_path.read_text(encoding="utf-8")
+        )
         assert not _pid_exists(descendant_pid)
     finally:
         if descendant_pid is not None and _pid_exists(descendant_pid):
@@ -370,6 +391,37 @@ def test_runner_samples_resources_and_calls_progress_throughout_supervision(
     assert result.swap_delta_bytes == 60
 
 
+def test_result_keeps_physical_peak_unavailable_after_any_unavailable_sample(
+    fake_pond: tuple[Path, Path], tmp_path: Path
+) -> None:
+    binary, record = fake_pond
+    samples = [
+        ResourceSample(10, 20, 100),
+        ResourceSample(20, None, 110),
+        ResourceSample(30, 40, 120),
+    ]
+    sample_count = 0
+
+    def sample(_pgid: int) -> ResourceSample:
+        nonlocal sample_count
+        value = samples[min(sample_count, len(samples) - 1)]
+        sample_count += 1
+        return value
+
+    result = run_pond_process(
+        binary,
+        ("wait",),
+        timeout_seconds=5,
+        run_directory=tmp_path / "run",
+        label="physical-unavailable",
+        env=_environment(record),
+        resource_sampler=sample,
+    )
+
+    assert sample_count >= 3
+    assert result.peak_physical_bytes is None
+
+
 def test_progress_failure_cleans_the_orphan_group_and_propagates_unchanged(
     fake_pond: tuple[Path, Path], tmp_path: Path
 ) -> None:
@@ -407,6 +459,259 @@ def test_progress_failure_cleans_the_orphan_group_and_propagates_unchanged(
     finally:
         if descendant_pid is not None and _pid_exists(descendant_pid):
             os.kill(descendant_pid, signal.SIGKILL)
+
+
+def test_cleanup_refuses_to_return_while_the_process_group_is_still_live(
+    fake_pond: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary, record = fake_pond
+    monkeypatch.setattr(pond_process_module, "_TERMINATE_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(pond_process_module, "_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(
+        pond_process_module, "_process_group_exists", lambda _process_group: True
+    )
+
+    with pytest.raises(PondProcessError, match=r"^subprocess$") as raised:
+        run_pond_process(
+            binary,
+            ("inspect", _PRIVATE_REMOTE),
+            timeout_seconds=5,
+            run_directory=tmp_path / "run",
+            label="cleanup",
+            env=_environment(record),
+        )
+
+    assert _PRIVATE_REMOTE not in str(raised.value)
+
+
+def test_cleanup_refuses_to_return_when_the_leader_cannot_be_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnreapableProcess:
+        returncode = None
+
+        def wait(self, timeout: float) -> int:
+            raise subprocess.TimeoutExpired("private-command", timeout)
+
+    monkeypatch.setattr(
+        pond_process_module, "_signal_process_group", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        pond_process_module, "_process_group_exists", lambda _process_group: False
+    )
+
+    with pytest.raises(PondProcessError, match=r"^subprocess$") as raised:
+        pond_process_module._stop_process(UnreapableProcess(), 987_654)
+
+    assert "private-command" not in str(raised.value)
+    assert "987654" not in str(raised.value)
+
+
+def test_cleanup_sanitizes_a_second_leader_reap_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReapFailureProcess:
+        returncode = None
+        waits = 0
+
+        def wait(self, timeout: float) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("private-command", timeout)
+            raise OSError("private wait failure")
+
+    monkeypatch.setattr(
+        pond_process_module, "_signal_process_group", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        pond_process_module, "_process_group_exists", lambda _process_group: False
+    )
+
+    with pytest.raises(PondProcessError, match=r"^subprocess$") as raised:
+        pond_process_module._stop_process(ReapFailureProcess(), 987_654)
+
+    assert "private" not in str(raised.value)
+    assert "987654" not in str(raised.value)
+
+
+def test_leader_exit_is_observed_without_reaping_until_group_cleanup() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while (
+            not pond_process_module._leader_exited_without_reap(process)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        assert process.returncode is None
+        assert pond_process_module._process_group_exists(process.pid)
+        assert pond_process_module._stop_process(process, process.pid) == 0
+        assert not pond_process_module._process_group_exists(process.pid)
+    finally:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
+def test_process_group_signal_fallback_does_not_poll_or_reap_the_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReservedLeader:
+        pid = 987_654
+
+        def send_signal(self, _signal_number: int) -> None:
+            raise AssertionError("Popen.send_signal polls and may reap the leader")
+
+    direct_signals: list[tuple[int, int]] = []
+
+    def missing_group(_process_group: int, _signal_number: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(pond_process_module.os, "killpg", missing_group)
+    monkeypatch.setattr(
+        pond_process_module.os,
+        "kill",
+        lambda pid, signal_number: direct_signals.append((pid, signal_number)),
+    )
+
+    pond_process_module._signal_process_group(ReservedLeader(), 987_654, signal.SIGKILL)
+
+    assert direct_signals == [(987_654, signal.SIGKILL)]
+
+
+def test_process_group_liveness_probe_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_probe(_process_group: int, _signal_number: int) -> None:
+        raise OSError("private liveness probe failure")
+
+    monkeypatch.setattr(pond_process_module.os, "killpg", unavailable_probe)
+
+    assert pond_process_module._process_group_exists(987_654)
+
+
+def test_descendant_artifact_mutation_is_revalidated_after_group_cleanup(
+    fake_pond: tuple[Path, Path], tmp_path: Path
+) -> None:
+    binary, record = fake_pond
+    run_directory = tmp_path / "run"
+    artifact_path = run_directory / "private-artifact.ndjson"
+    pid_path = tmp_path / "descendant.pid"
+    marker_path = tmp_path / "descendant.marker"
+    descendant_pid: int | None = None
+    try:
+        with pytest.raises(PondProcessError, match=r"^artifact$") as raised:
+            run_pond_process(
+                binary,
+                ("artifact_mutating_orphan", _PRIVATE_REMOTE),
+                timeout_seconds=5,
+                run_directory=run_directory,
+                label="artifact-cleanup",
+                env=_environment(
+                    record,
+                    FAKE_ARTIFACT=str(artifact_path),
+                    FAKE_DESCENDANT_PID=str(pid_path),
+                    FAKE_DESCENDANT_MARKER=str(marker_path),
+                ),
+                artifact_path=artifact_path,
+            )
+        descendant_pid = int(pid_path.read_text(encoding="utf-8"))
+        _wait_for_pid_exit(descendant_pid)
+        assert marker_path.read_text(encoding="utf-8") == "term"
+        assert stat.S_IMODE(artifact_path.stat().st_mode) == 0o644
+        assert _PRIVATE_REMOTE not in str(raised.value)
+        assert not _pid_exists(descendant_pid)
+    finally:
+        if descendant_pid is not None and _pid_exists(descendant_pid):
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
+def test_initial_swap_sample_precedes_progress_and_detects_callback_growth(
+    fake_pond: tuple[Path, Path], tmp_path: Path
+) -> None:
+    binary, record = fake_pond
+    swap_used = 100
+    events: list[str] = []
+    limits = ResourceLimits(1_000, 1_000, 300)
+
+    def sample(_process_group: int) -> ResourceSample:
+        events.append("sample")
+        return ResourceSample(10, 20, swap_used)
+
+    def progress() -> None:
+        nonlocal swap_used
+        events.append("progress")
+        swap_used = 401
+
+    with pytest.raises(PondProcessError, match=r"^resource$"):
+        run_pond_process(
+            binary,
+            ("wait",),
+            timeout_seconds=5,
+            run_directory=tmp_path / "run",
+            label="initial-swap",
+            env=_environment(record),
+            resource_limits=limits,
+            resource_sampler=sample,
+            progress_callback=progress,
+        )
+
+    assert events[:2] == ["sample", "progress"]
+
+
+def test_progress_callback_has_a_fixed_elapsed_budget(
+    fake_pond: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary, record = fake_pond
+    monkeypatch.setattr(pond_process_module, "_MAX_PROGRESS_CALLBACK_SECONDS", 0.02)
+
+    def blocked_progress() -> None:
+        time.sleep(0.05)
+
+    started = time.monotonic()
+    with pytest.raises(PondProcessError, match=r"^timeout$"):
+        run_pond_process(
+            binary,
+            ("wait",),
+            timeout_seconds=5,
+            run_directory=tmp_path / "run",
+            label="blocked-progress",
+            env=_environment(record),
+            resource_sampler=lambda _process_group: ResourceSample(1, 1, 1),
+            progress_callback=blocked_progress,
+        )
+
+    assert time.monotonic() - started < 0.8
+
+
+def test_progress_callback_completion_rechecks_the_process_deadline(
+    fake_pond: tuple[Path, Path], tmp_path: Path
+) -> None:
+    binary, record = fake_pond
+
+    def blocked_progress() -> None:
+        time.sleep(0.05)
+
+    with pytest.raises(PondProcessError, match=r"^timeout$"):
+        run_pond_process(
+            binary,
+            ("wait",),
+            timeout_seconds=0.02,
+            run_directory=tmp_path / "run",
+            label="callback-deadline",
+            env=_environment(record),
+            resource_sampler=lambda _process_group: ResourceSample(1, 1, 1),
+            progress_callback=blocked_progress,
+        )
 
 
 def test_child_environment_removes_an_inherited_remote_storage_selector(
@@ -477,3 +782,183 @@ def test_darwin_sampler_uses_bounded_absolute_tools_and_phys_footprint(
         physical_bytes=9000,
         swap_used_bytes=int(12.5 * _MIB),
     )
+
+
+def test_darwin_physical_footprint_is_unavailable_if_any_member_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProcPidRusage:
+        argtypes = None
+        restype = None
+
+        def __call__(self, pid: int, _version: int, info_pointer) -> int:
+            if pid == 101:
+                info_pointer._obj.ri_phys_footprint = 9000
+                return 0
+            return -1
+
+    class LibProc:
+        proc_pid_rusage = ProcPidRusage()
+
+    monkeypatch.setattr(
+        pond_process_module.ctypes, "CDLL", lambda *_args, **_kw: LibProc()
+    )
+
+    assert pond_process_module._darwin_physical_footprint((101, 202)) is None
+
+
+def test_darwin_helper_base_exception_still_kills_and_reaps_the_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SamplerAbort(BaseException):
+        pass
+
+    real_popen = subprocess.Popen
+    started_processes: list[subprocess.Popen[bytes]] = []
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        started_processes.append(process)
+        return process
+
+    def abort_select(*_args, **_kwargs):
+        raise SamplerAbort()
+
+    monkeypatch.setattr(pond_process_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(pond_process_module, "_select_readable", abort_select)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        with pytest.raises(SamplerAbort):
+            pond_process_module._bounded_command_output(
+                (
+                    str(Path(sys.executable).resolve()),
+                    "-c",
+                    "import time; time.sleep(30)",
+                )
+            )
+        process = started_processes[0]
+        _wait_for_pid_exit(process.pid)
+        assert process.returncode is not None
+        assert not _pid_exists(process.pid)
+    finally:
+        if process is not None and _pid_exists(process.pid):
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+def test_darwin_helper_success_with_descendant_still_cleans_the_whole_group(
+    tmp_path: Path,
+) -> None:
+    descendant_path = tmp_path / "helper-descendant.pid"
+    command = (
+        str(Path(sys.executable).resolve()),
+        "-c",
+        textwrap.dedent(f"""
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            Path({str(descendant_path)!r}).write_text(str(child.pid), encoding="utf-8")
+            """),
+    )
+    descendant_pid: int | None = None
+    try:
+        assert pond_process_module._bounded_command_output(command) == b""
+
+        descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
+        _wait_for_pid_exit(descendant_pid)
+        assert not _pid_exists(descendant_pid)
+    finally:
+        if descendant_pid is not None and _pid_exists(descendant_pid):
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
+def test_darwin_helper_timeout_and_output_cap_both_reap_the_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    started_processes: list[subprocess.Popen[bytes]] = []
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        started_processes.append(process)
+        return process
+
+    monkeypatch.setattr(pond_process_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(pond_process_module, "_SAMPLER_TIMEOUT_SECONDS", 0.05)
+
+    commands = (
+        (str(Path(sys.executable).resolve()), "-c", "import time; time.sleep(30)"),
+        (
+            str(Path(sys.executable).resolve()),
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'x' * (1024 * 1024 + 1))",
+        ),
+    )
+    for command in commands:
+        with pytest.raises(PondProcessError, match=r"^resource$"):
+            pond_process_module._bounded_command_output(command)
+
+    for process in started_processes:
+        _wait_for_pid_exit(process.pid)
+        assert process.returncode is not None
+        assert not _pid_exists(process.pid)
+
+
+def test_darwin_helper_cleanup_reports_an_unreapable_tool_without_private_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnreapableTool:
+        pid = 987_654
+        returncode = None
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout: float) -> int:
+            raise subprocess.TimeoutExpired("private-sampler-command", timeout)
+
+    monkeypatch.setattr(pond_process_module.os, "killpg", lambda *_args: None)
+
+    with pytest.raises(PondProcessError, match=r"^resource$") as raised:
+        pond_process_module._stop_sampler_process(UnreapableTool())
+
+    assert "private-sampler-command" not in str(raised.value)
+    assert "987654" not in str(raised.value)
+
+
+def test_darwin_helper_signal_fallback_does_not_poll_or_reap_the_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReservedTool:
+        pid = 987_654
+        returncode = None
+
+        def kill(self) -> None:
+            raise AssertionError("Popen.kill polls and may reap the leader")
+
+        def wait(self, timeout: float) -> int:
+            return 0
+
+    direct_signals: list[tuple[int, int]] = []
+
+    def missing_group(_process_group: int, _signal_number: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(pond_process_module.os, "killpg", missing_group)
+    monkeypatch.setattr(
+        pond_process_module.os,
+        "kill",
+        lambda pid, signal_number: direct_signals.append((pid, signal_number)),
+    )
+    monkeypatch.setattr(
+        pond_process_module, "_process_group_exists", lambda _process_group: False
+    )
+
+    assert pond_process_module._stop_sampler_process(ReservedTool()) == 0
+    assert direct_signals == [(987_654, signal.SIGKILL)]

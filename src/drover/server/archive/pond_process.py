@@ -33,6 +33,7 @@ _MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 _CHUNK_BYTES = 64 * 1024
 _POLL_SECONDS = 0.01
 _SAMPLE_SECONDS = 0.05
+_MAX_PROGRESS_CALLBACK_SECONDS = 1.0
 _TERMINATE_GRACE_SECONDS = 0.25
 _MAX_COMMAND_TIMEOUT_SECONDS = 1800.0
 _SAMPLER_OUTPUT_BYTES = 1024 * 1024
@@ -197,7 +198,10 @@ def run_pond_process(
     resource_sampler: Callable[[int], ResourceSample] = sample_process_group,
     progress_callback: Callable[[], None] | None = None,
 ) -> PondProcessResult:
-    """Run one pinned Pond command once, with bounded private evidence."""
+    """Run one pinned Pond command once, with bounded private evidence.
+
+    A progress callback must bound its own blocking operations.
+    """
     executable = require_pinned_pond(binary)
     arguments_tuple = _require_arguments(arguments)
     timeout = _require_timeout(timeout_seconds)
@@ -209,6 +213,7 @@ def run_pond_process(
     stdout_path = directory / f"{safe_label}.stdout"
     stderr_path = directory / f"{safe_label}.stderr"
     started_at = time.monotonic()
+    deadline = started_at + timeout
 
     with (
         _open_private_output(stdout_path) as stdout_file,
@@ -233,24 +238,42 @@ def run_pond_process(
         selector: selectors.BaseSelector | None = None
         peak_rss = 0
         peak_physical: int | None = None
+        physical_available = True
         initial_swap: int | None = None
         peak_swap = 0
+        cleanup_required = True
         try:
             selector = selectors.DefaultSelector()
             selector.register(process.stdout, selectors.EVENT_READ, stdout_file)
             selector.register(process.stderr, selectors.EVENT_READ, stderr_file)
             counts = {stdout_file: 0, stderr_file: 0}
-            deadline = started_at + timeout
-            next_sample = started_at
-            while selector.get_map() or process.poll() is None:
+            initial_sample = _take_resource_sample_before_deadline(
+                resource_sampler,
+                process_group,
+                deadline,
+            )
+            peak_rss = initial_sample.rss_bytes
+            peak_physical = initial_sample.physical_bytes
+            physical_available = peak_physical is not None
+            initial_swap = initial_sample.swap_used_bytes
+            peak_swap = initial_swap
+            _enforce_resource_limits(initial_sample, initial_swap, resource_limits)
+            _call_progress_before_deadline(progress_callback, deadline)
+            next_sample = time.monotonic() + _SAMPLE_SECONDS
+            while selector.get_map() or not _leader_exited_without_reap(process):
                 _check_artifact_during_run(monitored_artifact)
                 now = time.monotonic()
                 if now >= next_sample:
-                    if progress_callback is not None:
-                        progress_callback()
-                    sample = _take_resource_sample(resource_sampler, process_group)
+                    sample = _take_resource_sample_before_deadline(
+                        resource_sampler,
+                        process_group,
+                        deadline,
+                    )
                     peak_rss = max(peak_rss, sample.rss_bytes)
-                    if sample.physical_bytes is not None:
+                    if sample.physical_bytes is None:
+                        peak_physical = None
+                        physical_available = False
+                    elif physical_available:
                         peak_physical = max(peak_physical or 0, sample.physical_bytes)
                     if initial_swap is None:
                         initial_swap = sample.swap_used_bytes
@@ -258,7 +281,8 @@ def run_pond_process(
                     else:
                         peak_swap = max(peak_swap, sample.swap_used_bytes)
                     _enforce_resource_limits(sample, initial_swap, resource_limits)
-                    next_sample = now + _SAMPLE_SECONDS
+                    _call_progress_before_deadline(progress_callback, deadline)
+                    next_sample = time.monotonic() + _SAMPLE_SECONDS
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise PondProcessError("timeout")
@@ -282,11 +306,10 @@ def run_pond_process(
                     sink.write(chunk)
                     counts[sink] += len(chunk)
             _check_artifact_during_run(monitored_artifact)
-            if progress_callback is not None:
-                progress_callback()
-            returncode = process.wait(timeout=0)
-            if _process_group_exists(process_group):
-                _stop_process(process, process_group)
+            _call_progress_before_deadline(progress_callback, deadline)
+            returncode = _stop_process(process, process_group)
+            cleanup_required = False
+            _check_artifact_during_run(monitored_artifact)
             return PondProcessResult(
                 returncode=returncode,
                 duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
@@ -297,13 +320,16 @@ def run_pond_process(
                 stderr_path=stderr_path,
             )
         except PondProcessError:
-            _stop_process(process, process_group)
+            if cleanup_required:
+                _stop_process(process, process_group)
             raise
         except (OSError, ValueError, subprocess.SubprocessError):
-            _stop_process(process, process_group)
+            if cleanup_required:
+                _stop_process(process, process_group)
             raise PondProcessError("subprocess") from None
         except BaseException:
-            _stop_process(process, process_group)
+            if cleanup_required:
+                _stop_process(process, process_group)
             raise
         finally:
             if selector is not None:
@@ -426,6 +452,51 @@ def _take_resource_sample(
     return sample
 
 
+def _take_resource_sample_before_deadline(
+    sampler: Callable[[int], ResourceSample],
+    process_group: int,
+    deadline: float,
+) -> ResourceSample:
+    if time.monotonic() >= deadline:
+        raise PondProcessError("timeout")
+    try:
+        sample = _take_resource_sample(sampler, process_group)
+    except BaseException:
+        if time.monotonic() >= deadline:
+            raise PondProcessError("timeout") from None
+        raise
+    if time.monotonic() >= deadline:
+        raise PondProcessError("timeout")
+    return sample
+
+
+def _call_progress_before_deadline(
+    callback: Callable[[], None] | None,
+    deadline: float,
+) -> None:
+    if callback is None:
+        return
+    started_at = time.monotonic()
+    if started_at >= deadline:
+        raise PondProcessError("timeout")
+    try:
+        callback()
+    except BaseException:
+        completed_at = time.monotonic()
+        if (
+            completed_at >= deadline
+            or completed_at - started_at > _MAX_PROGRESS_CALLBACK_SECONDS
+        ):
+            raise PondProcessError("timeout") from None
+        raise
+    completed_at = time.monotonic()
+    if (
+        completed_at >= deadline
+        or completed_at - started_at > _MAX_PROGRESS_CALLBACK_SECONDS
+    ):
+        raise PondProcessError("timeout")
+
+
 def _enforce_resource_limits(
     sample: ResourceSample,
     initial_swap: int,
@@ -442,26 +513,48 @@ def _enforce_resource_limits(
         raise PondProcessError("resource")
 
 
-def _stop_process(process: subprocess.Popen[bytes], process_group: int) -> None:
+def _leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
+    """Observe leader exit while retaining its PID/PGID reservation."""
+    if process.returncode is not None:
+        return True
+    try:
+        status = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (AttributeError, ChildProcessError, OSError):
+        raise PondProcessError("subprocess") from None
+    return status is not None
+
+
+def _stop_process(process: subprocess.Popen[bytes], process_group: int) -> int:
+    if process.returncode is not None:
+        if _process_group_exists(process_group):
+            raise PondProcessError("subprocess")
+        return process.returncode
     _signal_process_group(process, process_group, signal.SIGTERM)
     deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
     while _process_group_exists(process_group) and time.monotonic() < deadline:
         time.sleep(_POLL_SECONDS)
     if _process_group_exists(process_group):
         _signal_process_group(process, process_group, signal.SIGKILL)
-        deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
-        while _process_group_exists(process_group) and time.monotonic() < deadline:
-            time.sleep(_POLL_SECONDS)
     try:
-        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        returncode = process.wait(timeout=_TERMINATE_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         _signal_process_group(process, process_group, signal.SIGKILL)
         try:
-            process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
+            returncode = process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            raise PondProcessError("subprocess") from None
     except OSError:
-        pass
+        raise PondProcessError("subprocess") from None
+    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+    while _process_group_exists(process_group) and time.monotonic() < deadline:
+        time.sleep(_POLL_SECONDS)
+    if _process_group_exists(process_group):
+        raise PondProcessError("subprocess")
+    return returncode
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -472,7 +565,7 @@ def _process_group_exists(process_group: int) -> bool:
     except PermissionError:
         return True
     except (OSError, AttributeError):
-        return False
+        return True
     return True
 
 
@@ -482,11 +575,10 @@ def _signal_process_group(
     try:
         os.killpg(process_group, signal_number)
     except (OSError, AttributeError):
-        if process.poll() is None:
-            try:
-                process.send_signal(signal_number)
-            except OSError:
-                pass
+        try:
+            os.kill(process.pid, signal_number)
+        except OSError:
+            pass
 
 
 def _sample_linux_process_group(process_group: int) -> ResourceSample:
@@ -619,6 +711,7 @@ def _bounded_command_output(command: tuple[str, ...]) -> bytes:
     chunks: list[bytes] = []
     count = 0
     deadline = time.monotonic() + _SAMPLER_TIMEOUT_SECONDS
+    reaped = False
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -637,17 +730,26 @@ def _bounded_command_output(command: tuple[str, ...]) -> bytes:
             if count > _SAMPLER_OUTPUT_BYTES:
                 raise PondProcessError("resource")
             chunks.append(chunk)
-        if process.wait(timeout=max(0.0, deadline - time.monotonic())) != 0:
+        while not _sampler_leader_exited_without_reap(process):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PondProcessError("resource")
+            time.sleep(min(_POLL_SECONDS, remaining))
+        returncode = _stop_sampler_process(process)
+        reaped = True
+        if returncode != 0:
             raise PondProcessError("resource")
         return b"".join(chunks)
     except PondProcessError:
-        _stop_sampler_process(process)
         raise
     except (OSError, subprocess.SubprocessError):
-        _stop_sampler_process(process)
         raise PondProcessError("resource") from None
     finally:
-        process.stdout.close()
+        try:
+            if not reaped:
+                _stop_sampler_process(process)
+        finally:
+            process.stdout.close()
 
 
 def _select_readable(
@@ -658,18 +760,52 @@ def _select_readable(
     return select.select([stream], [], [], timeout)
 
 
-def _stop_sampler_process(process: subprocess.Popen[bytes]) -> None:
+def _sampler_leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
+    try:
+        status = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (AttributeError, ChildProcessError, OSError):
+        raise PondProcessError("resource") from None
+    return status is not None
+
+
+def _stop_sampler_process(process: subprocess.Popen[bytes]) -> int:
+    if process.returncode is not None:
+        if _process_group_exists(process.pid):
+            raise PondProcessError("resource")
+        return process.returncode
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (OSError, AttributeError):
         try:
-            process.kill()
+            os.kill(process.pid, signal.SIGKILL)
         except OSError:
             pass
     try:
-        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        returncode = process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, AttributeError):
+            try:
+                os.kill(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            returncode = process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            raise PondProcessError("resource") from None
+    except OSError:
+        raise PondProcessError("resource") from None
+    deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+        time.sleep(_POLL_SECONDS)
+    if _process_group_exists(process.pid):
+        raise PondProcessError("resource")
+    return returncode
 
 
 def _darwin_swap_used(output: bytes) -> int:
@@ -729,6 +865,6 @@ def _darwin_physical_footprint(pids: tuple[int, ...]) -> int | None:
         if proc_pid_rusage(pid, 2, ctypes.byref(info)) == 0:
             total += int(info.ri_phys_footprint)
             measured += 1
-    if pids and measured == 0:
+    if measured != len(pids):
         return None
     return total

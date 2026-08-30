@@ -500,6 +500,36 @@ def test_process_error_keeps_the_established_fixed_inventory_category(
     assert not record.exists()
 
 
+@pytest.mark.parametrize(
+    ("failing_label", "expected_category"),
+    [("version", "version"), ("preflight", "preflight"), ("inventory", "subprocess")],
+)
+def test_resource_sampler_failure_maps_to_the_established_phase_category(
+    fake_pond, monkeypatch, tmp_path, failing_label, expected_category
+):
+    binary, local_store, record = fake_pond
+    original_run = pond_inventory_module.run_pond_process
+
+    def fail_selected_phase(*args, **kwargs):
+        if kwargs["label"] == failing_label:
+            raise PondProcessError("resource")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(pond_inventory_module, "run_pond_process", fail_selected_phase)
+
+    with pytest.raises(
+        ValueError, match=rf"^pond inventory {expected_category}$"
+    ) as raised:
+        export_pond_inventory(
+            binary,
+            tmp_path / "private-output.json",
+            storage_path=local_store,
+            env=_environment(record, PRIVATE_ENV="private-value"),
+        )
+
+    assert "private-value" not in str(raised.value)
+
+
 @pytest.mark.parametrize("output_kind", ["equal", "inside", "symlink-alias"])
 def test_export_refuses_output_in_original_store_before_temporary_work(
     fake_pond, monkeypatch, tmp_path, output_kind

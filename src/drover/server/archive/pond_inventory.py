@@ -108,8 +108,15 @@ def _failure(category: str) -> _PondInventoryError:
     return _PondInventoryError(f"pond inventory {category}")
 
 
-def _raise_process_failure(error: PondProcessError) -> None:
-    category = "export" if error.category == "artifact" else error.category
+def _raise_process_failure(
+    error: PondProcessError, *, resource_category: str = "subprocess"
+) -> None:
+    if error.category == "artifact":
+        category = "export"
+    elif error.category == "resource":
+        category = resource_category
+    else:
+        category = error.category
     raise _failure(category) from None
 
 
@@ -172,7 +179,7 @@ def _export_to_pinned_output(
                 env=env,
             )
         except PondProcessError as error:
-            _raise_process_failure(error)
+            _raise_process_failure(error, resource_category="version")
         if version_result.returncode != 0:
             raise _failure("version")
         version_bytes = _read_private_bytes(version_result.stdout_path, "version")
@@ -207,7 +214,7 @@ def _export_to_pinned_output(
                 artifact_path=preflight_path,
             )
         except PondProcessError as error:
-            _raise_process_failure(error)
+            _raise_process_failure(error, resource_category="preflight")
         if preflight_result.returncode != 0:
             raise _failure("preflight")
         _read_preflight(preflight_path)
@@ -236,7 +243,7 @@ def _export_to_pinned_output(
                 artifact_path=export_path,
             )
         except PondProcessError as error:
-            _raise_process_failure(error)
+            _raise_process_failure(error, resource_category="subprocess")
         if result.returncode != 0:
             raise _failure("subprocess")
         records = _read_pond_rows(export_path)
