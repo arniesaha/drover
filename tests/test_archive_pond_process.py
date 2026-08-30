@@ -181,6 +181,40 @@ def test_runner_uses_the_canonical_binary_directly_in_a_new_process_group(
     assert stat.S_IMODE(result.stderr_path.stat().st_mode) == 0o600
 
 
+def test_retained_executable_pin_detects_a_swap_restore_during_process(
+    fake_pond: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    binary, record = fake_pond
+    moved = binary.with_name("moved-private-pond")
+    swapped = binary.with_name("swapped-private-pond")
+    swapped.write_text(textwrap.dedent(_FAKE_POND), encoding="utf-8")
+    swapped.chmod(0o700)
+    swapped_once = False
+
+    def swap_restore() -> None:
+        nonlocal swapped_once
+        if swapped_once:
+            return
+        swapped_once = True
+        binary.rename(moved)
+        swapped.rename(binary)
+        binary.rename(swapped)
+        moved.rename(binary)
+
+    with pond_process_module._pin_pond_executable(binary) as executable:
+        with pytest.raises(PondProcessError, match=r"^binary$"):
+            run_pond_process(
+                executable,
+                ("wait",),
+                timeout_seconds=5,
+                run_directory=tmp_path / "retained-pin-run",
+                label="copy",
+                env=_environment(record),
+                progress_callback=swap_restore,
+            )
+
+
 @pytest.mark.parametrize("kind", ["missing", "not_executable"])
 def test_require_pinned_pond_rejects_an_invalid_binary_without_disclosing_it(
     fake_pond: tuple[Path, Path], tmp_path: Path, kind: str

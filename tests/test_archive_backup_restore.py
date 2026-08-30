@@ -42,8 +42,14 @@ from drover.server.archive.pond_process import (
     PondProcessResult,
     PondResourceEvidence,
     ResourceLimits,
+    _pin_pond_executable,
+    is_pinned_pond_version,
 )
-from drover.server.archive.pond_snapshot import PondCorpusCounts, PondStoreSnapshot
+from drover.server.archive.pond_snapshot import (
+    PondCorpusCounts,
+    PondStoreSnapshot,
+    _PondReleaseEvidence,
+)
 
 _GENERATION_ID = UUID("48d862c3-787a-4970-9a1c-842f9098473e")
 _SCOPE_ID = "536b300b-24ff-4dda-a3e9-52fde1154b59"
@@ -216,6 +222,9 @@ class _Runtime:
     def finish(self) -> RuntimeEvidence:
         self.fixture.events.append("runtime-finish")
         self.fixture.attempts["runtime-finish"] += 1
+        callback = self.fixture.finish_callback
+        if callback is not None:
+            callback()
         if self.fixture.fault == "finish-resource":
             raise BackupRuntimeError(_RESOURCE_ERROR)
         if self.fixture.fault == "finish-health":
@@ -240,6 +249,8 @@ class _Fixture:
     dependencies: _RestoreDependencies | None = None
     current_status: str = "current"
     baseline_callback: object = None
+    finish_callback: object = None
+    release_version: str = "pond 0.16.3 (23c7d0e aarch64-macos)\n"
 
 
 def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
@@ -266,6 +277,11 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
     )
     fixture.runtime = _Runtime(fixture)
 
+    def swap_restore_binary() -> None:
+        moved = config.pond_binary.with_name("moved-pond-private")
+        config.pond_binary.rename(moved)
+        moved.rename(config.pond_binary)
+
     def runtime_guard(received_config):
         assert received_config is fixture.drover_config
         assert fixture.runtime is not None
@@ -282,7 +298,7 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
         progress_callback=None,
         **kwargs,
     ):
-        assert binary == config.pond_binary
+        assert binary.path == config.pond_binary
         assert timeout_seconds == 60.0
         assert progress_callback is not None
         assert kwargs == {}
@@ -290,6 +306,8 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
         fixture.events.append(label)
         fixture.process_calls.append((tuple(arguments), {"label": label}))
         fixture.limits.append((label, resource_limits))
+        if fault == f"binary-swap-{label}":
+            swap_restore_binary()
         if fault == "destination-swap" and label == "copy-from-generation":
             moved = fixture.destination.with_name("moved-restored-private")
             fixture.destination.rename(moved)
@@ -309,7 +327,10 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
             raise PondProcessError(category)
         stdout = Path(run_directory) / f"{label}.stdout"
         stderr = Path(run_directory) / f"{label}.stderr"
-        stdout.write_bytes(b"")
+        stdout.write_text(
+            fixture.release_version if label == "snapshot-version" else "",
+            encoding="utf-8",
+        )
         stdout.chmod(0o600)
         stderr.write_text("PRIVATE CHILD DETAIL", encoding="utf-8")
         stderr.chmod(0o600)
@@ -326,6 +347,27 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
             stderr,
         )
 
+    def capture_release(
+        binary,
+        *,
+        workspace,
+        progress_callback=None,
+        resource_limits=None,
+    ):
+        assert binary.path == config.pond_binary
+        assert progress_callback is not None
+        fixture.attempts["snapshot-version"] += 1
+        fixture.events.append("snapshot-version")
+        fixture.limits.append(("snapshot-version", resource_limits))
+        if fault == "binary-swap-snapshot-version":
+            swap_restore_binary()
+        progress_callback()
+        if fault == "snapshot-version-resource":
+            raise PondProcessError("resource")
+        if not is_pinned_pond_version(tuple(fixture.release_version.split())):
+            raise ValueError("private release")
+        return _PondReleaseEvidence(PondResourceEvidence(150, 900, 15))
+
     def capture_snapshot(
         binary,
         *,
@@ -335,22 +377,26 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
         timeout_seconds,
         progress_callback=None,
         resource_limits=None,
+        release_evidence=None,
     ):
-        assert binary == config.pond_binary
+        assert binary.path == config.pond_binary
         assert pond_config == config.remote_pond_config
         assert storage.path == fixture.destination
         assert timeout_seconds == 60
         assert progress_callback is not None
-        for phase in ("snapshot-version", "snapshot-corpus"):
+        assert type(release_evidence) is _PondReleaseEvidence
+        for phase in ("snapshot-corpus",):
             fixture.attempts[phase] += 1
             fixture.events.append(phase)
             fixture.limits.append((phase, resource_limits))
+            if fault == f"binary-swap-{phase}":
+                swap_restore_binary()
             progress_callback()
             if fault == f"{phase}-resource":
                 raise PondProcessError("resource")
         inventory = _inventory()
         counts = PondCorpusCounts(2, 3, 5, 0, 0, 0)
-        resources = PondResourceEvidence(300, 600, 20)
+        resources = PondResourceEvidence(300, 900, 20)
         if fault == "inventory-digest":
             changed = replace(inventory.records[0], created_at="2026-08-29T09:59:00Z")
             inventory = _inventory(records=(changed, inventory.records[1]))
@@ -384,6 +430,8 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
         load_receipt_chain=load_backup_receipt_chain,
         runtime_guard=runtime_guard,
         run_pond_process=run_process,
+        pin_pond_executable=_pin_pond_executable,
+        capture_pond_release=capture_release,
         capture_pond_snapshot=capture_snapshot,
         current_source_coverage=current_coverage,
         workspace_uuid=lambda: UUID("8db84b0e-1d8e-421b-a060-00443d03422f"),
@@ -524,9 +572,9 @@ def test_restore_with_read_only_credentials_never_runs_a_write_probe(tmp_path):
     assert result.verified is True
     assert fixture.events == [
         "baseline",
+        "snapshot-version",
         "copy-from-generation",
         "verify-only",
-        "snapshot-version",
         "snapshot-corpus",
         "current-coverage",
         "runtime-finish",
@@ -534,6 +582,58 @@ def test_restore_with_read_only_credentials_never_runs_a_write_probe(tmp_path):
     assert "storage-check" not in fixture.events
     assert "sync" not in repr(fixture.process_calls)
     assert "optimize" not in repr(fixture.process_calls)
+
+
+@pytest.mark.parametrize(
+    "release_version",
+    [
+        "pond 0.16.3\n",
+        "pond 0.16.3 (0000000 aarch64-macos)\n",
+        "pond 0.16.3 (23c7d0e unknown-target)\n",
+    ],
+)
+def test_restore_requires_exact_release_before_r2_or_destination_mutation(
+    tmp_path,
+    release_version,
+):
+    fixture = _fixture(tmp_path)
+    fixture.release_version = release_version
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert fixture.events == ["baseline", "snapshot-version"]
+    assert fixture.attempts["copy-from-generation"] == 0
+    assert not fixture.destination.exists()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "snapshot-version",
+        "copy-from-generation",
+        "verify-only",
+        "snapshot-corpus",
+    ],
+)
+def test_restore_rejects_executable_swap_restore_during_every_process(
+    tmp_path,
+    phase,
+):
+    fixture = _fixture(tmp_path, fault=f"binary-swap-{phase}")
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert fixture.attempts[phase] == 1
+
+
+def test_restore_resource_evidence_includes_the_pre_r2_release_process(tmp_path):
+    fixture = _fixture(tmp_path)
+
+    result = _restore(fixture)
+
+    assert result.peak_physical_bytes == 900
 
 
 def test_missing_read_credential_fails_once_and_retains_stopped_destination(tmp_path):
@@ -661,6 +761,143 @@ def test_restore_creates_owner_only_destination_once_after_baseline(tmp_path):
     assert stat_mode(fixture.destination) == 0o700
 
 
+def test_restore_does_not_absorb_a_destination_replacement_at_creation(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _fixture(tmp_path)
+    real_mkdir = backup_restore_module.os.mkdir
+    replaced = False
+
+    def replace_at_creation(path, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        result = real_mkdir(path, mode, dir_fd=dir_fd)
+        name = os.fspath(path)
+        if not replaced and (
+            name == fixture.destination.name
+            or name.startswith(".drover-restore-destination-")
+        ):
+            replaced = True
+            if name == fixture.destination.name:
+                backup_restore_module.os.rename(
+                    name,
+                    "moved-created-destination-private",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+            real_mkdir(fixture.destination.name, 0o700, dir_fd=dir_fd)
+        return result
+
+    monkeypatch.setattr(backup_restore_module.os, "mkdir", replace_at_creation)
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert replaced
+    assert fixture.attempts["copy-from-generation"] == 0
+    retained = tuple(
+        path
+        for path in fixture.destination.parent.iterdir()
+        if "destination" in path.name and path != fixture.destination
+    )
+    assert retained
+    assert all(path.is_dir() and stat_mode(path) == 0o700 for path in retained)
+
+
+def test_restore_does_not_absorb_a_workspace_replacement_at_creation(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _fixture(tmp_path)
+    real_mkdir = backup_restore_module.os.mkdir
+    token = "8db84b0e-1d8e-421b-a060-00443d03422f"
+    workspace_name = f".drover-restore-{token}"
+    staging_name = f".drover-restore-workspace-staging-{token}"
+    replaced = False
+
+    def replace_at_creation(path, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        result = real_mkdir(path, mode, dir_fd=dir_fd)
+        name = os.fspath(path)
+        if not replaced and name in {workspace_name, staging_name}:
+            replaced = True
+            if name == workspace_name:
+                backup_restore_module.os.rename(
+                    name,
+                    ".moved-restore-workspace-private",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+            real_mkdir(workspace_name, 0o700, dir_fd=dir_fd)
+        return result
+
+    monkeypatch.setattr(backup_restore_module.os, "mkdir", replace_at_creation)
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert replaced
+    assert fixture.attempts["snapshot-version"] == 0
+    assert not fixture.destination.exists()
+    retained = tuple(
+        path
+        for path in fixture.destination.parent.iterdir()
+        if "workspace" in path.name
+    )
+    assert retained
+    assert all(path.is_dir() and stat_mode(path) == 0o700 for path in retained)
+
+
+def test_restore_revalidates_published_destination_as_local(tmp_path):
+    fixture = _fixture(tmp_path)
+    assert fixture.dependencies is not None
+    checked: list[Path] = []
+
+    def local_except_published(descriptor, path):
+        checked.append(path)
+        return path != fixture.destination
+
+    fixture.dependencies = replace(
+        fixture.dependencies,
+        is_local_filesystem=local_except_published,
+    )
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert checked[0] == fixture.destination.parent
+    assert checked[-1] == fixture.destination
+    assert fixture.destination.is_dir()
+    assert fixture.attempts["copy-from-generation"] == 0
+
+
+def test_restore_revalidates_live_store_containment_after_publication(tmp_path):
+    fixture = _fixture(tmp_path)
+    assert fixture.dependencies is not None
+    moved_live_store = fixture.config.local_store.with_name("moved-live-store-private")
+
+    def alias_live_store_after_publication(descriptor, path):
+        if path == fixture.destination:
+            fixture.config.local_store.rename(moved_live_store)
+            fixture.config.local_store.symlink_to(
+                fixture.destination,
+                target_is_directory=True,
+            )
+        return True
+
+    fixture.dependencies = replace(
+        fixture.dependencies,
+        is_local_filesystem=alias_live_store_after_publication,
+    )
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert fixture.destination.is_dir()
+    assert moved_live_store.is_dir()
+    assert fixture.attempts["copy-from-generation"] == 0
+
+
 def test_restore_closes_partial_workspace_descriptors_on_creation_failure(
     tmp_path,
     monkeypatch,
@@ -697,7 +934,7 @@ def test_restore_closes_partial_workspace_descriptors_on_creation_failure(
     assert phase_descriptors[0] in closed
     with pytest.raises(OSError):
         os.fstat(phase_descriptors[0])
-    assert fixture.destination.is_dir()
+    assert not fixture.destination.exists()
     assert fixture.attempts["copy-from-generation"] == 0
 
 
@@ -709,16 +946,17 @@ def test_restore_requires_the_command_created_destination_to_remain_fresh(
     fixture = _fixture(tmp_path)
     assert fixture.dependencies is not None
 
-    def mutate_fresh_destination():
-        unexpected = fixture.destination / "unexpected-private"
-        unexpected.write_bytes(b"private")
-        if restore_empty:
-            unexpected.unlink()
-        return UUID("8db84b0e-1d8e-421b-a060-00443d03422f")
+    def mutate_fresh_destination(descriptor, path):
+        if path == fixture.destination:
+            unexpected = fixture.destination / "unexpected-private"
+            unexpected.write_bytes(b"private")
+            if restore_empty:
+                unexpected.unlink()
+        return True
 
     fixture.dependencies = replace(
         fixture.dependencies,
-        workspace_uuid=mutate_fresh_destination,
+        is_local_filesystem=mutate_fresh_destination,
     )
     with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
         _restore(fixture)
@@ -801,7 +1039,7 @@ def test_restore_matches_receipt_and_leaves_store_stopped(tmp_path):
         health_samples=35,
         health_p95_ms=4.5,
         peak_rss_bytes=300,
-        peak_physical_bytes=600,
+        peak_physical_bytes=900,
         swap_delta_bytes=20,
     )
     assert restore_summary(result) == {
@@ -814,7 +1052,7 @@ def test_restore_matches_receipt_and_leaves_store_stopped(tmp_path):
         "health_samples": 35,
         "health_p95_ms": 4.5,
         "peak_rss_bytes": 300,
-        "peak_physical_bytes": 600,
+        "peak_physical_bytes": 900,
         "swap_delta_bytes": 20,
         "store_started": False,
     }
@@ -951,9 +1189,9 @@ def test_restore_applies_limits_and_callbacks_to_all_four_processes(tmp_path):
     _restore(fixture)
     expected = ResourceLimits(1024, 2048, 64)
     assert fixture.limits == [
+        ("snapshot-version", expected),
         ("copy-from-generation", expected),
         ("verify-only", expected),
-        ("snapshot-version", expected),
         ("snapshot-corpus", expected),
     ]
     assert fixture.attempts["runtime-sample"] == 4
@@ -962,10 +1200,10 @@ def test_restore_applies_limits_and_callbacks_to_all_four_processes(tmp_path):
 @pytest.mark.parametrize(
     ("fault", "verify_attempts", "snapshot_attempts"),
     [
-        ("copy-from-generation-physical-none", 0, 0),
-        ("copy-from-generation-rss", 0, 0),
-        ("verify-only-physical-none", 1, 0),
-        ("verify-only-swap", 1, 0),
+        ("copy-from-generation-physical-none", 0, 1),
+        ("copy-from-generation-rss", 0, 1),
+        ("verify-only-physical-none", 1, 1),
+        ("verify-only-swap", 1, 1),
     ],
 )
 def test_restore_stops_at_the_first_returned_process_resource_breach(
@@ -1026,6 +1264,50 @@ def test_restore_finishes_runtime_only_after_all_comparisons(tmp_path):
     fixture = _fixture(tmp_path)
     _restore(fixture)
     assert fixture.events[-2:] == ["current-coverage", "runtime-finish"]
+
+
+@pytest.mark.parametrize(
+    ("target", "restore_original"),
+    [
+        ("destination", False),
+        ("destination", True),
+        ("receipt", False),
+        ("receipt", True),
+    ],
+)
+def test_restore_rechecks_request_after_finish_time_swaps(
+    tmp_path,
+    target,
+    restore_original,
+):
+    fixture = _fixture(tmp_path)
+
+    def swap_request_entry() -> None:
+        if target == "destination":
+            path = fixture.destination
+            moved = path.with_name("finish-moved-destination-private")
+            path.rename(moved)
+            path.mkdir(mode=0o700)
+            if restore_original:
+                path.rmdir()
+                moved.rename(path)
+            return
+        path = fixture.receipt_path
+        moved = path.with_name("finish-moved-receipt-private.json")
+        payload = path.read_bytes()
+        path.rename(moved)
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        if restore_original:
+            path.unlink()
+            moved.rename(path)
+
+    fixture.finish_callback = swap_request_entry
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert fixture.attempts["runtime-finish"] == 1
 
 
 def test_validate_restore_request_is_local_only_and_does_not_create(tmp_path):

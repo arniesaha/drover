@@ -82,7 +82,12 @@ if sys.argv[1:] == ["--version"]:
     elif os.environ.get("FAKE_VERSION_MODE") == "invalid_utf8":
         sys.stdout.buffer.write(b"pond \xff\n")
     else:
-        sys.stdout.write(os.environ.get("FAKE_POND_VERSION", "pond 0.16.3\n"))
+        sys.stdout.write(
+            os.environ.get(
+                "FAKE_POND_VERSION",
+                "pond 0.16.3 (23c7d0e aarch64-macos)\n",
+            )
+        )
     raise SystemExit(int(os.environ.get("FAKE_VERSION_EXIT", "0")))
 
 mode = os.environ.get("FAKE_SQL_MODE", "success")
@@ -382,6 +387,7 @@ def test_export_accepts_the_pinned_release_version_detail(fake_pond, tmp_path):
 @pytest.mark.parametrize(
     "version",
     [
+        "pond 0.16.3\n",
         "pond 0.16.2\n",
         "pond 0.16.30\n",
         "pond 0.16.3-dev\n",

@@ -165,26 +165,115 @@ def _aggregate_resource_evidence(
     )
 
 
-def require_pinned_pond(binary: Path) -> Path:
-    """Resolve one executable so Pond is always invoked by canonical path."""
+def _executable_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+class _PinnedPondExecutable:
+    __slots__ = ("_closed", "_descriptor", "_identity", "path")
+
+    def __init__(
+        self,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, ...],
+    ) -> None:
+        self.path = path
+        self._descriptor = descriptor
+        self._identity = identity
+        self._closed = False
+
+    def __enter__(self) -> _PinnedPondExecutable:
+        self.require_same()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def require_same(self) -> None:
+        try:
+            if self._closed:
+                raise ValueError
+            opened = os.fstat(self._descriptor)
+            lexical = os.stat(self.path, follow_symlinks=False)
+            if (
+                _executable_identity(opened) != self._identity
+                or _executable_identity(lexical) != self._identity
+                or not stat.S_ISREG(opened.st_mode)
+                or not os.access(self.path, os.X_OK)
+            ):
+                raise ValueError
+        except (OSError, TypeError, ValueError):
+            raise PondProcessError("binary") from None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            os.close(self._descriptor)
+        except OSError:
+            pass
+
+
+def _pin_pond_executable(binary: Path) -> _PinnedPondExecutable:
+    """Retain one canonical executable descriptor and full stable identity."""
+    descriptor = -1
     try:
         path = Path(binary).resolve(strict=True)
-        metadata = path.stat()
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        lexical = os.stat(path, follow_symlinks=False)
     except (OSError, RuntimeError, TypeError, ValueError):
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise PondProcessError("binary") from None
     if (
         not path.is_absolute()
         or not stat.S_ISREG(metadata.st_mode)
+        or _executable_identity(metadata) != _executable_identity(lexical)
         or not os.access(path, os.X_OK)
     ):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
         raise PondProcessError("binary")
-    return path
+    executable = _PinnedPondExecutable(
+        path,
+        descriptor,
+        _executable_identity(metadata),
+    )
+    executable.require_same()
+    return executable
+
+
+def require_pinned_pond(binary: Path) -> Path:
+    """Resolve and validate one executable by descriptor and canonical path."""
+    with _pin_pond_executable(binary) as executable:
+        return executable.path
 
 
 def is_pinned_pond_version(tokens: tuple[str, ...]) -> bool:
     """Return whether Pond reported the one approved release identity."""
-    if tokens == _POND_VERSION_TOKENS:
-        return True
     return (
         len(tokens) == 4
         and tokens[:2] == _POND_VERSION_TOKENS
@@ -233,7 +322,7 @@ def sample_process_group(process_group: int) -> ResourceSample:
 
 
 def run_pond_process(
-    binary: Path,
+    binary: Path | _PinnedPondExecutable,
     arguments: Sequence[str],
     *,
     timeout_seconds: float,
@@ -249,7 +338,49 @@ def run_pond_process(
 
     A progress callback must bound its own blocking operations.
     """
-    executable = require_pinned_pond(binary)
+    if type(binary) is _PinnedPondExecutable:
+        return _run_pinned_pond_process(
+            binary,
+            arguments,
+            timeout_seconds=timeout_seconds,
+            run_directory=run_directory,
+            label=label,
+            env=env,
+            artifact_path=artifact_path,
+            resource_limits=resource_limits,
+            resource_sampler=resource_sampler,
+            progress_callback=progress_callback,
+        )
+    with _pin_pond_executable(binary) as executable:
+        return _run_pinned_pond_process(
+            executable,
+            arguments,
+            timeout_seconds=timeout_seconds,
+            run_directory=run_directory,
+            label=label,
+            env=env,
+            artifact_path=artifact_path,
+            resource_limits=resource_limits,
+            resource_sampler=resource_sampler,
+            progress_callback=progress_callback,
+        )
+
+
+def _run_pinned_pond_process(
+    binary: _PinnedPondExecutable,
+    arguments: Sequence[str],
+    *,
+    timeout_seconds: float,
+    run_directory: Path,
+    label: str,
+    env: Mapping[str, str] | None = None,
+    artifact_path: Path | None = None,
+    resource_limits: ResourceLimits | None = None,
+    resource_sampler: Callable[[int], ResourceSample] = sample_process_group,
+    progress_callback: Callable[[], None] | None = None,
+) -> PondProcessResult:
+    binary.require_same()
+    executable = binary.path
     arguments_tuple = _require_arguments(arguments)
     timeout = _require_timeout(timeout_seconds)
     directory = _require_run_directory(run_directory)
@@ -267,6 +398,7 @@ def run_pond_process(
         _open_private_output(stderr_path) as stderr_file,
     ):
         try:
+            binary.require_same()
             process = subprocess.Popen(
                 (str(executable), *arguments_tuple),
                 env=child_environment,
@@ -290,6 +422,7 @@ def run_pond_process(
         peak_swap = 0
         cleanup_required = True
         try:
+            binary.require_same()
             selector = selectors.DefaultSelector()
             selector.register(process.stdout, selectors.EVENT_READ, stdout_file)
             selector.register(process.stderr, selectors.EVENT_READ, stderr_file)
@@ -308,6 +441,7 @@ def run_pond_process(
             _call_progress_before_deadline(progress_callback, deadline)
             next_sample = time.monotonic() + _SAMPLE_SECONDS
             while selector.get_map() or not _leader_exited_without_reap(process):
+                binary.require_same()
                 _check_artifact_during_run(monitored_artifact)
                 now = time.monotonic()
                 if now >= next_sample:
@@ -356,6 +490,7 @@ def run_pond_process(
             _call_progress_before_deadline(progress_callback, deadline)
             returncode = _stop_process(process, process_group)
             cleanup_required = False
+            binary.require_same()
             _check_artifact_during_run(monitored_artifact)
             return PondProcessResult(
                 returncode=returncode,

@@ -21,6 +21,7 @@ from drover.server.archive.pond_process import (
     PondProcessResult,
     PondResourceEvidence,
     ResourceLimits,
+    _pin_pond_executable,
 )
 from drover.server.archive.pond_snapshot import (
     POND_CORPUS_SNAPSHOT_SQL,
@@ -119,7 +120,12 @@ calls.append(sys.argv)
 record.write_text(json.dumps(calls), encoding="utf-8")
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write(os.environ.get("FAKE_POND_VERSION", "pond 0.16.3\n"))
+    sys.stdout.write(
+        os.environ.get(
+            "FAKE_POND_VERSION",
+            "pond 0.16.3 (23c7d0e aarch64-macos)\n",
+        )
+    )
     raise SystemExit(0)
 
 output = Path(sys.argv[sys.argv.index("--output-file") + 1])
@@ -367,13 +373,16 @@ def test_snapshot_forwards_limits_and_aggregates_both_process_results(
         resource_limits=None,
         **_kwargs,
     ):
-        assert received_binary == binary
+        assert received_binary.path == binary
         received_limits.append(resource_limits)
         stdout = Path(run_directory) / f"{label}.stdout"
         stderr = Path(run_directory) / f"{label}.stderr"
         if label == "snapshot-version":
-            stdout.write_text("pond 0.16.3\n", encoding="utf-8")
-            evidence = (111, 222, 3)
+            stdout.write_text(
+                "pond 0.16.3 (23c7d0e aarch64-macos)\n",
+                encoding="utf-8",
+            )
+            evidence = (111, 900, 3)
         else:
             assert artifact_path is not None
             Path(artifact_path).write_text(
@@ -390,17 +399,24 @@ def test_snapshot_forwards_limits_and_aggregates_both_process_results(
 
     monkeypatch.setattr(snapshot_module, "run_pond_process", run_process)
 
-    snapshot = capture_pond_store_snapshot(
-        binary,
-        storage=LocalPondStore(store),
-        pond_config=config,
-        workspace=_workspace(tmp_path),
-        timeout_seconds=60,
-        resource_limits=limits,
-    )
+    with _pin_pond_executable(binary) as executable:
+        release = snapshot_module._capture_pond_release(
+            executable,
+            workspace=_workspace(tmp_path, "release-private"),
+            resource_limits=limits,
+        )
+        snapshot = snapshot_module._capture_pond_store_snapshot(
+            executable,
+            storage=LocalPondStore(store),
+            pond_config=config,
+            workspace=_workspace(tmp_path),
+            timeout_seconds=60,
+            resource_limits=limits,
+            release_evidence=release,
+        )
 
     assert received_limits == [limits, limits]
-    assert snapshot.resource_evidence == PondResourceEvidence(333, 444, 5)
+    assert snapshot.resource_evidence == PondResourceEvidence(333, 900, 5)
 
 
 @pytest.mark.parametrize("phase", ["snapshot-version", "corpus-snapshot"])

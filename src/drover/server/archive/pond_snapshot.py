@@ -33,6 +33,7 @@ from drover.server.archive.pond_process import (
     PondResourceEvidence,
     ResourceLimits,
     _aggregate_resource_evidence,
+    _PinnedPondExecutable,
     _process_resource_evidence,
     is_pinned_pond_version,
     run_pond_process,
@@ -247,6 +248,15 @@ class PondStoreSnapshot:
             raise _failure() from None
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _PondReleaseEvidence:
+    resource_evidence: PondResourceEvidence = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.resource_evidence) is not PondResourceEvidence:
+            raise _failure()
+
+
 def pond_inventory_content_sha256(inventory: PondInventory) -> str:
     """Hash the complete canonical inventory content except capture time."""
     try:
@@ -277,6 +287,30 @@ def capture_pond_store_snapshot(
     resource_limits: ResourceLimits | None = None,
 ) -> PondStoreSnapshot:
     """Capture root records and exact whole-store counts without retaining rows."""
+    return _capture_pond_store_snapshot(
+        binary,
+        storage=storage,
+        pond_config=pond_config,
+        workspace=workspace,
+        timeout_seconds=timeout_seconds,
+        progress_callback=progress_callback,
+        resource_limits=resource_limits,
+        release_evidence=None,
+    )
+
+
+def _capture_pond_store_snapshot(
+    binary: Path | _PinnedPondExecutable,
+    *,
+    storage: LocalPondStore | RemotePondGeneration,
+    pond_config: Path,
+    workspace: Path,
+    timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
+    resource_limits: ResourceLimits | None = None,
+    release_evidence: _PondReleaseEvidence | None,
+) -> PondStoreSnapshot:
+    """Private corpus capture that can consume one already-proved release."""
     workspace_descriptor: int | None = None
     config_descriptor: int | None = None
     store_descriptor: int | None = None
@@ -290,25 +324,17 @@ def capture_pond_store_snapshot(
         _require_pinned_path(pond_config, config_descriptor, config_identity)
         _require_local_store_path(storage, store_descriptor, store_identity)
 
-        version = run_pond_process(
-            binary,
-            ("--version",),
-            timeout_seconds=10.0,
-            run_directory=workspace_path,
-            label="snapshot-version",
-            resource_limits=resource_limits,
-            progress_callback=progress_callback,
-        )
-        if version.returncode != 0:
-            raise _failure()
-        version_bytes = _read_private_artifact(
-            workspace_descriptor, version.stdout_path.name
-        )
-        try:
-            version_tokens = tuple(version_bytes.decode("utf-8").split())
-        except UnicodeDecodeError:
-            raise _failure() from None
-        if not is_pinned_pond_version(version_tokens):
+        if release_evidence is None:
+            release = _capture_pond_release_at(
+                binary,
+                workspace=workspace_path,
+                workspace_descriptor=workspace_descriptor,
+                progress_callback=progress_callback,
+                resource_limits=resource_limits,
+            )
+        elif type(release_evidence) is _PondReleaseEvidence:
+            release = release_evidence
+        else:
             raise _failure()
 
         corpus_data, corpus_result = _run_sql(
@@ -345,7 +371,7 @@ def capture_pond_store_snapshot(
             inventory,
             counts,
             _aggregate_resource_evidence(
-                _process_resource_evidence(version),
+                release.resource_evidence,
                 _process_resource_evidence(corpus_result),
             ),
         )
@@ -368,6 +394,72 @@ def capture_pond_store_snapshot(
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+def _capture_pond_release(
+    binary: Path | _PinnedPondExecutable,
+    *,
+    workspace: Path,
+    progress_callback: Callable[[], None] | None = None,
+    resource_limits: ResourceLimits | None = None,
+) -> _PondReleaseEvidence:
+    """Capture one exact approved release before any storage-bearing command."""
+    descriptor: int | None = None
+    try:
+        path, descriptor, identity = _pin_workspace(workspace)
+        evidence = _capture_pond_release_at(
+            binary,
+            workspace=path,
+            workspace_descriptor=descriptor,
+            progress_callback=progress_callback,
+            resource_limits=resource_limits,
+        )
+        _require_workspace_same(path, identity)
+        return evidence
+    except _SnapshotError:
+        raise
+    except (BackupRuntimeError, PondProcessError):
+        raise
+    except Exception:
+        raise _failure() from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _capture_pond_release_at(
+    binary: Path | _PinnedPondExecutable,
+    *,
+    workspace: Path,
+    workspace_descriptor: int,
+    progress_callback: Callable[[], None] | None,
+    resource_limits: ResourceLimits | None,
+) -> _PondReleaseEvidence:
+    version = run_pond_process(
+        binary,
+        ("--version",),
+        timeout_seconds=10.0,
+        run_directory=workspace,
+        label="snapshot-version",
+        resource_limits=resource_limits,
+        progress_callback=progress_callback,
+    )
+    if version.returncode != 0:
+        raise _failure()
+    version_bytes = _read_private_artifact(
+        workspace_descriptor,
+        version.stdout_path.name,
+    )
+    try:
+        version_tokens = tuple(version_bytes.decode("utf-8").split())
+    except UnicodeDecodeError:
+        raise _failure() from None
+    if not is_pinned_pond_version(version_tokens):
+        raise _failure()
+    return _PondReleaseEvidence(_process_resource_evidence(version))
 
 
 def _require_generation_url(value: Any) -> str:
@@ -582,7 +674,7 @@ def _require_workspace_same(path: Path, expected: tuple[int, ...]) -> None:
 
 
 def _run_sql(
-    binary: Path,
+    binary: Path | _PinnedPondExecutable,
     *,
     selector: str,
     pond_config: Path,

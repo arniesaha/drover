@@ -20,6 +20,7 @@ from drover.server.archive.backup_config import (
 )
 from drover.server.archive.backup_receipt import (
     BackupReceipt,
+    _rename_noreplace_at,
     load_backup_receipt_chain,
 )
 from drover.server.archive.backup_runtime import (
@@ -43,6 +44,10 @@ from drover.server.archive.pond_process import (
     _aggregate_resource_evidence as _pond_aggregate_resource_evidence,
 )
 from drover.server.archive.pond_process import (
+    _pin_pond_executable,
+    _PinnedPondExecutable,
+)
+from drover.server.archive.pond_process import (
     _process_resource_evidence as _pond_process_resource_evidence,
 )
 from drover.server.archive.pond_process import (
@@ -51,14 +56,16 @@ from drover.server.archive.pond_process import (
 from drover.server.archive.pond_snapshot import (
     LocalPondStore,
     PondStoreSnapshot,
-    capture_pond_store_snapshot,
+    _capture_pond_release,
+    _capture_pond_store_snapshot,
+    _PondReleaseEvidence,
     pond_inventory_content_sha256,
 )
 
 _RESTORE_ERROR = "archive backup restore failed"
 _RESOURCE_ERROR = "archive backup resource limit"
 _ERRORS = frozenset({_RESTORE_ERROR, _RESOURCE_ERROR})
-_PHASES = ("copy", "verify", "snapshot")
+_PHASES = ("release", "copy", "verify", "snapshot")
 _COVERAGE_OUTCOMES = frozenset({"current", "stale", "unavailable"})
 _MAX_PATH_ANCESTORS = 1024
 _DARWIN_MNT_LOCAL = 0x00001000
@@ -150,7 +157,7 @@ class _RuntimeFactory(Protocol):
 class _RunPond(Protocol):
     def __call__(
         self,
-        binary: Path,
+        binary: Path | _PinnedPondExecutable,
         arguments: Sequence[str],
         *,
         timeout_seconds: float,
@@ -166,7 +173,7 @@ class _RunPond(Protocol):
 class _CaptureSnapshot(Protocol):
     def __call__(
         self,
-        binary: Path,
+        binary: Path | _PinnedPondExecutable,
         *,
         storage: LocalPondStore,
         pond_config: Path,
@@ -174,7 +181,19 @@ class _CaptureSnapshot(Protocol):
         timeout_seconds: float,
         progress_callback: Callable[[], None] | None = None,
         resource_limits: ResourceLimits | None = None,
+        release_evidence: _PondReleaseEvidence | None = None,
     ) -> PondStoreSnapshot: ...
+
+
+class _CaptureRelease(Protocol):
+    def __call__(
+        self,
+        binary: Path | _PinnedPondExecutable,
+        *,
+        workspace: Path,
+        progress_callback: Callable[[], None] | None = None,
+        resource_limits: ResourceLimits | None = None,
+    ) -> _PondReleaseEvidence: ...
 
 
 class _CurrentSourceCoverage(Protocol):
@@ -196,6 +215,8 @@ class _RestoreDependencies:
     load_receipt_chain: _LoadReceiptChain = field(repr=False)
     runtime_guard: _RuntimeFactory = field(repr=False)
     run_pond_process: _RunPond = field(repr=False)
+    pin_pond_executable: Callable[[Path], _PinnedPondExecutable] = field(repr=False)
+    capture_pond_release: _CaptureRelease = field(repr=False)
     capture_pond_snapshot: _CaptureSnapshot = field(repr=False)
     current_source_coverage: _CurrentSourceCoverage = field(repr=False)
     workspace_uuid: Callable[[], UUID] = field(repr=False)
@@ -208,7 +229,9 @@ def _production_restore_dependencies() -> _RestoreDependencies:
         load_receipt_chain=load_backup_receipt_chain,
         runtime_guard=RuntimeGuard,
         run_pond_process=run_pond_process,
-        capture_pond_snapshot=capture_pond_store_snapshot,
+        pin_pond_executable=_pin_pond_executable,
+        capture_pond_release=_capture_pond_release,
+        capture_pond_snapshot=_capture_pond_store_snapshot,
         current_source_coverage=_production_current_source_coverage,
         workspace_uuid=uuid4,
         is_local_filesystem=_is_local_filesystem,
@@ -276,61 +299,81 @@ def _restore_backup(
             runtime = _create_runtime(dependencies, drover_config)
             _capture_baseline(runtime)
             request.require_same()
-            request.create_destination_and_workspace(dependencies.workspace_uuid)
+            request.create_workspace(dependencies.workspace_uuid)
             limits = _resource_limits(config)
             progress = _restore_progress_callback(request, runtime)
-            copy_result = _copy_generation(
-                dependencies,
-                config,
-                request,
-                limits,
-                progress,
-                verify=False,
-            )
-            verify_result = _copy_generation(
-                dependencies,
-                config,
-                request,
-                limits,
-                progress,
-                verify=True,
-            )
-            snapshot = _capture_restored_snapshot(
-                dependencies,
-                config,
-                request,
-                limits,
-                progress,
-            )
-            _require_receipt_match(request.receipt, snapshot)
-            resource_evidence = _restore_resource_evidence(
-                config,
-                copy_result,
-                verify_result,
-                snapshot.resource_evidence,
-            )
-            current_coverage = _current_source_coverage(
-                dependencies,
-                snapshot,
-                request.receipt,
-                drover_config,
-                runtime,
-            )
-            request.require_same()
-            runtime_evidence = _finish_runtime(runtime)
-            peak_rss, peak_physical, swap_delta = resource_evidence
-            return RestoreResult(
-                verified=True,
-                sessions=snapshot.counts.sessions,
-                messages=snapshot.counts.messages,
-                parts=snapshot.counts.parts,
-                current_source_coverage=current_coverage,
-                health_samples=runtime_evidence.health_samples,
-                health_p95_ms=runtime_evidence.health_p95_ms,
-                peak_rss_bytes=peak_rss,
-                peak_physical_bytes=peak_physical,
-                swap_delta_bytes=swap_delta,
-            )
+            with dependencies.pin_pond_executable(config.pond_binary) as executable:
+                release = _capture_release(
+                    dependencies,
+                    config,
+                    request,
+                    executable,
+                    limits,
+                    progress,
+                )
+                request.create_destination(
+                    dependencies.workspace_uuid,
+                    dependencies.is_local_filesystem,
+                    config.local_store,
+                )
+                copy_result = _copy_generation(
+                    dependencies,
+                    config,
+                    request,
+                    executable,
+                    limits,
+                    progress,
+                    verify=False,
+                )
+                verify_result = _copy_generation(
+                    dependencies,
+                    config,
+                    request,
+                    executable,
+                    limits,
+                    progress,
+                    verify=True,
+                )
+                snapshot = _capture_restored_snapshot(
+                    dependencies,
+                    config,
+                    request,
+                    executable,
+                    release,
+                    limits,
+                    progress,
+                )
+                _require_receipt_match(request.receipt, snapshot)
+                resource_evidence = _restore_resource_evidence(
+                    config,
+                    copy_result,
+                    verify_result,
+                    snapshot.resource_evidence,
+                )
+                current_coverage = _current_source_coverage(
+                    dependencies,
+                    snapshot,
+                    request.receipt,
+                    drover_config,
+                    runtime,
+                )
+                request.require_same()
+                runtime_evidence = _finish_runtime(runtime)
+                executable.require_same()
+                request.require_same()
+                peak_rss, peak_physical, swap_delta = resource_evidence
+                return RestoreResult(
+                    verified=True,
+                    sessions=snapshot.counts.sessions,
+                    messages=snapshot.counts.messages,
+                    parts=snapshot.counts.parts,
+                    current_source_coverage=current_coverage,
+                    health_samples=runtime_evidence.health_samples,
+                    health_p95_ms=runtime_evidence.health_p95_ms,
+                    peak_rss_bytes=peak_rss,
+                    peak_physical_bytes=peak_physical,
+                    swap_delta_bytes=swap_delta,
+                )
     except BackupRestoreError:
         raise
     except PondProcessError as error:
@@ -510,38 +553,43 @@ class _PinnedRestoreRequest:
             )
         self._phase_bindings = tuple(refreshed)
 
-    def create_destination_and_workspace(
+    def create_workspace(
         self,
         workspace_uuid: Callable[[], UUID],
     ) -> None:
         self.require_same()
-        _require_absent_at(self._parent_descriptor, self.destination.name)
-        try:
-            os.mkdir(self.destination.name, 0o700, dir_fd=self._parent_descriptor)
-        except OSError:
-            raise BackupRestoreError(_RESTORE_ERROR) from None
-        self._refresh_parent_identity()
-        self._destination_descriptor, self._destination_identity = (
-            _open_created_directory_at(
-                self._parent_descriptor,
-                self.destination.name,
-            )
-        )
         bindings: list[tuple[Path, int, tuple[int, ...]]] = []
+        staging_descriptor = -1
         try:
-            token = workspace_uuid()
-            if type(token) is not UUID or token.version != 4:
-                raise ValueError
+            token = _new_restore_uuid(workspace_uuid)
             workspace_name = f".drover-restore-{token}"
+            staging_name = f".drover-restore-workspace-staging-{token}"
             _require_absent_at(self._parent_descriptor, workspace_name)
-            os.mkdir(workspace_name, 0o700, dir_fd=self._parent_descriptor)
+            _require_absent_at(self._parent_descriptor, staging_name)
+            os.mkdir(staging_name, 0o700, dir_fd=self._parent_descriptor)
             self._refresh_parent_identity()
+            staging_descriptor, staging_identity = _open_created_directory_at(
+                self._parent_descriptor,
+                staging_name,
+            )
+            _rename_noreplace_at(
+                self._parent_descriptor,
+                staging_name,
+                self._parent_descriptor,
+                workspace_name,
+            )
+            staging_identity = _current_directory_identity(staging_descriptor)
             self.workspace = self.destination_parent / workspace_name
-            self._workspace_descriptor, self._workspace_identity = (
-                _open_created_directory_at(
-                    self._parent_descriptor,
-                    workspace_name,
-                )
+            self._workspace_descriptor = staging_descriptor
+            self._workspace_identity = staging_identity
+            staging_descriptor = -1
+            self._refresh_parent_identity()
+            self._workspace_identity = _require_child_directory_same(
+                self._parent_descriptor,
+                workspace_name,
+                self._workspace_descriptor,
+                self._workspace_identity,
+                exact_ctime=True,
             )
             for phase in _PHASES:
                 os.mkdir(phase, 0o700, dir_fd=self._workspace_descriptor)
@@ -561,9 +609,79 @@ class _PinnedRestoreRequest:
         except Exception:
             raise BackupRestoreError(_RESTORE_ERROR) from None
         finally:
+            if staging_descriptor >= 0:
+                try:
+                    os.close(staging_descriptor)
+                except OSError:
+                    pass
             for _, descriptor, _ in bindings:
                 try:
                     os.close(descriptor)
+                except OSError:
+                    pass
+
+    def create_destination(
+        self,
+        workspace_uuid: Callable[[], UUID],
+        is_local_filesystem: _LocalFilesystemCheck,
+        local_store: Path,
+    ) -> None:
+        self.require_same()
+        _require_absent_at(self._parent_descriptor, self.destination.name)
+        staging_descriptor = -1
+        try:
+            token = _new_restore_uuid(workspace_uuid)
+            staging_name = f".drover-restore-destination-{token}"
+            staging_path = self.destination_parent / staging_name
+            _require_absent_at(self._parent_descriptor, staging_name)
+            os.mkdir(staging_name, 0o700, dir_fd=self._parent_descriptor)
+            self._refresh_parent_identity()
+            staging_descriptor, staging_identity = _open_created_directory_at(
+                self._parent_descriptor,
+                staging_name,
+            )
+            if is_local_filesystem(staging_descriptor, staging_path) is not True:
+                raise ValueError
+            _require_opened_not_live_store(local_store, staging_descriptor)
+            _rename_noreplace_at(
+                self._parent_descriptor,
+                staging_name,
+                self._parent_descriptor,
+                self.destination.name,
+            )
+            staging_identity = _current_directory_identity(staging_descriptor)
+            self._destination_descriptor = staging_descriptor
+            self._destination_identity = staging_identity
+            staging_descriptor = -1
+            self._refresh_parent_identity()
+            self._destination_identity = _require_child_directory_same(
+                self._parent_descriptor,
+                self.destination.name,
+                self._destination_descriptor,
+                self._destination_identity,
+                exact_ctime=True,
+            )
+            if (
+                is_local_filesystem(
+                    self._destination_descriptor,
+                    self.destination,
+                )
+                is not True
+            ):
+                raise ValueError
+            _require_opened_not_live_store(
+                local_store,
+                self._destination_descriptor,
+            )
+            self.require_same()
+        except BackupRestoreError:
+            raise
+        except Exception:
+            raise BackupRestoreError(_RESTORE_ERROR) from None
+        finally:
+            if staging_descriptor >= 0:
+                try:
+                    os.close(staging_descriptor)
                 except OSError:
                     pass
 
@@ -809,6 +927,7 @@ def _copy_generation(
     dependencies: _RestoreDependencies,
     config: BackupConfig,
     request: _PinnedRestoreRequest,
+    executable: _PinnedPondExecutable,
     limits: ResourceLimits,
     progress: Callable[[], None],
     *,
@@ -833,9 +952,10 @@ def _copy_generation(
         )
     )
     request.require_same()
+    executable.require_same()
     try:
         result = dependencies.run_pond_process(
-            config.pond_binary,
+            executable,
             tuple(command),
             timeout_seconds=float(config.copy_timeout_seconds),
             run_directory=request.phase("verify" if verify else "copy"),
@@ -852,6 +972,7 @@ def _copy_generation(
         raise BackupRestoreError(_runtime_category(error)) from None
     except Exception:
         raise BackupRestoreError(_RESTORE_ERROR) from None
+    executable.require_same()
     request.require_same()
     _require_process_result(
         result,
@@ -864,23 +985,61 @@ def _copy_generation(
     return result
 
 
+def _capture_release(
+    dependencies: _RestoreDependencies,
+    config: BackupConfig,
+    request: _PinnedRestoreRequest,
+    executable: _PinnedPondExecutable,
+    limits: ResourceLimits,
+    progress: Callable[[], None],
+) -> _PondReleaseEvidence:
+    request.require_same()
+    executable.require_same()
+    try:
+        release = dependencies.capture_pond_release(
+            executable,
+            workspace=request.phase("release"),
+            progress_callback=progress,
+            resource_limits=limits,
+        )
+        if type(release) is not _PondReleaseEvidence:
+            raise ValueError
+    except BackupRestoreError:
+        raise
+    except PondProcessError as error:
+        category = _RESOURCE_ERROR if error.category == "resource" else _RESTORE_ERROR
+        raise BackupRestoreError(category) from None
+    except BackupRuntimeError as error:
+        raise BackupRestoreError(_runtime_category(error)) from None
+    except Exception:
+        raise BackupRestoreError(_RESTORE_ERROR) from None
+    executable.require_same()
+    request.require_same()
+    _require_resource_evidence(config, release.resource_evidence)
+    return release
+
+
 def _capture_restored_snapshot(
     dependencies: _RestoreDependencies,
     config: BackupConfig,
     request: _PinnedRestoreRequest,
+    executable: _PinnedPondExecutable,
+    release: _PondReleaseEvidence,
     limits: ResourceLimits,
     progress: Callable[[], None],
 ) -> PondStoreSnapshot:
     request.require_same()
+    executable.require_same()
     try:
         snapshot = dependencies.capture_pond_snapshot(
-            config.pond_binary,
+            executable,
             storage=LocalPondStore(request.destination),
             pond_config=config.remote_pond_config,
             workspace=request.phase("snapshot"),
             timeout_seconds=config.copy_timeout_seconds,
             progress_callback=progress,
             resource_limits=limits,
+            release_evidence=release,
         )
         if type(snapshot) is not PondStoreSnapshot:
             raise ValueError
@@ -895,6 +1054,7 @@ def _capture_restored_snapshot(
         raise BackupRestoreError(_runtime_category(error)) from None
     except Exception:
         raise BackupRestoreError(_RESTORE_ERROR) from None
+    executable.require_same()
     request.require_same()
     return snapshot
 
@@ -945,6 +1105,23 @@ def _require_process_resources(
         evidence = _pond_process_resource_evidence(result)
         if (
             evidence.peak_physical_bytes is None
+            or evidence.peak_rss_bytes > config.max_rss_bytes
+            or evidence.peak_physical_bytes > config.max_physical_bytes
+            or evidence.swap_delta_bytes > config.max_swap_growth_bytes
+        ):
+            raise ValueError
+    except Exception:
+        raise BackupRestoreError(_RESOURCE_ERROR) from None
+
+
+def _require_resource_evidence(
+    config: BackupConfig,
+    evidence: PondResourceEvidence,
+) -> None:
+    try:
+        if (
+            type(evidence) is not PondResourceEvidence
+            or evidence.peak_physical_bytes is None
             or evidence.peak_rss_bytes > config.max_rss_bytes
             or evidence.peak_physical_bytes > config.max_physical_bytes
             or evidence.swap_delta_bytes > config.max_swap_growth_bytes
@@ -1301,6 +1478,16 @@ def _require_absent_at(directory_descriptor: int, name: str) -> None:
     raise BackupRestoreError(_RESTORE_ERROR)
 
 
+def _new_restore_uuid(factory: Callable[[], UUID]) -> UUID:
+    try:
+        token = factory()
+        if type(token) is not UUID or token.version != 4:
+            raise ValueError
+        return token
+    except Exception:
+        raise BackupRestoreError(_RESTORE_ERROR) from None
+
+
 def _open_created_directory_at(
     parent_descriptor: int,
     name: str,
@@ -1370,6 +1557,55 @@ def _require_not_live_store(
             raise ValueError
         live_key = (live.st_dev, live.st_ino)
         current_descriptor = os.dup(parent_descriptor)
+        for _ in range(_MAX_PATH_ANCESTORS):
+            current = os.fstat(current_descriptor)
+            if (current.st_dev, current.st_ino) == live_key:
+                raise ValueError
+            parent = os.open("..", _directory_flags(), dir_fd=current_descriptor)
+            parent_metadata = os.fstat(parent)
+            if (parent_metadata.st_dev, parent_metadata.st_ino) == (
+                current.st_dev,
+                current.st_ino,
+            ):
+                os.close(parent)
+                return
+            os.close(current_descriptor)
+            current_descriptor = parent
+        raise ValueError
+    except BackupRestoreError:
+        raise
+    except Exception:
+        raise BackupRestoreError(_RESTORE_ERROR) from None
+    finally:
+        for descriptor in (current_descriptor, live_descriptor):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _require_opened_not_live_store(
+    local_store: Path,
+    destination_descriptor: int,
+) -> None:
+    live_descriptor = -1
+    current_descriptor = -1
+    try:
+        if (
+            not local_store.is_absolute()
+            or local_store.resolve(strict=True) != local_store
+        ):
+            raise ValueError
+        live_descriptor = _open_nofollow_path(
+            local_store,
+            flags=_directory_flags(),
+        )
+        live = os.fstat(live_descriptor)
+        if not stat.S_ISDIR(live.st_mode):
+            raise ValueError
+        live_key = (live.st_dev, live.st_ino)
+        current_descriptor = os.dup(destination_descriptor)
         for _ in range(_MAX_PATH_ANCESTORS):
             current = os.fstat(current_descriptor)
             if (current.st_dev, current.st_ino) == live_key:
