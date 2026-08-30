@@ -1092,6 +1092,106 @@ def test_bounded_command_times_out_and_reaps_the_real_process() -> None:
     assert time.monotonic() - started < 0.5
 
 
+def test_bounded_command_never_signals_a_group_after_reaping_its_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not all(
+        hasattr(os, name)
+        for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    ):
+        pytest.skip("waitid WNOWAIT reservation check is unavailable")
+    real_killpg = os.killpg
+    real_waitid = os.waitid
+    signals: list[int] = []
+
+    def signal_only_while_reserved(process_group: int, signal_number: int) -> None:
+        try:
+            real_waitid(
+                os.P_PID,
+                process_group,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError as error:
+            raise AssertionError("process group signaled after leader reap") from error
+        signals.append(signal_number)
+        real_killpg(process_group, signal_number)
+
+    monkeypatch.setattr(runtime_module.os, "killpg", signal_only_while_reserved)
+
+    output = runtime_module._bounded_command_output(
+        ("/bin/echo", "bounded-output"),
+        time.monotonic() + 1.0,
+        clock=time.monotonic,
+    )
+
+    assert output == b"bounded-output\n"
+    assert signals
+
+
+@pytest.mark.parametrize("failure", ["missing", "error"])
+def test_tool_leader_observation_fails_closed_without_reaping_fallback(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    observer = getattr(runtime_module, "_tool_leader_exited_without_reap", None)
+    assert observer is not None
+
+    class UnreapedProcess:
+        pid = 101
+        returncode = None
+
+        def poll(self) -> int:
+            raise AssertionError("poll would reap the reserved leader")
+
+    if failure == "missing":
+        monkeypatch.delattr(runtime_module.os, "waitid")
+    else:
+
+        def failed_waitid(*_args: object) -> None:
+            raise OSError
+
+        monkeypatch.setattr(runtime_module.os, "waitid", failed_waitid)
+
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        observer(UnreapedProcess())
+
+
+def test_tool_cleanup_maps_reap_failure_without_popen_signal_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReapFailureProcess:
+        pid = 101
+        returncode = None
+        wait_calls = 0
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            raise AssertionError("Popen.kill polls and may reap the leader")
+
+        def wait(self, timeout: float) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired("private-test-command", timeout)
+            raise OSError
+
+    process = ReapFailureProcess()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        runtime_module.os,
+        "killpg",
+        lambda process_group, signal_number: signals.append(
+            (process_group, signal_number)
+        ),
+    )
+
+    with pytest.raises(BackupRuntimeError, match=r"^archive backup preflight failed$"):
+        runtime_module._reap_tool(process)
+
+    assert signals == [(101, signal.SIGKILL), (101, signal.SIGKILL)]
+    assert process.wait_calls == 2
+
+
 def test_bounded_command_caps_real_process_output() -> None:
     command = (
         sys.executable,

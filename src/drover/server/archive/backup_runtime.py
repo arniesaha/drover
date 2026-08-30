@@ -1022,6 +1022,7 @@ def _bounded_command_output(
     selector: selectors.BaseSelector | None = None
     chunks: list[bytes] = []
     count = 0
+    cleanup_attempted = False
     try:
         _remaining(deadline, clock)
         process = subprocess.Popen(
@@ -1054,8 +1055,11 @@ def _bounded_command_output(
                 if count > _MAX_TOOL_BYTES:
                     raise BackupRuntimeError(_PREFLIGHT_ERROR)
                 chunks.append(chunk)
-        remaining = _remaining(deadline, clock)
-        returncode = process.wait(timeout=remaining)
+        while not _tool_leader_exited_without_reap(process):
+            remaining = _remaining(deadline, clock)
+            time.sleep(min(_TOOL_POLL_SECONDS, remaining))
+        cleanup_attempted = True
+        returncode = _reap_tool(process)
         if returncode != 0:
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
         return b"".join(chunks)
@@ -1067,29 +1071,51 @@ def _bounded_command_output(
         if selector is not None:
             selector.close()
         if process is not None:
-            _reap_tool(process)
-            if process.stdout is not None:
-                process.stdout.close()
+            try:
+                if not cleanup_attempted:
+                    cleanup_attempted = True
+                    _reap_tool(process)
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
 
 
-def _reap_tool(process: subprocess.Popen[bytes]) -> None:
-    process.poll()
+def _tool_leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
+    if process.returncode is not None:
+        raise BackupRuntimeError(_PREFLIGHT_ERROR)
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        status = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (AttributeError, ChildProcessError, OSError):
+        raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+    return status is not None
+
+
+def _signal_tool_process_group(
+    process: subprocess.Popen[bytes], signal_number: int
+) -> None:
+    if process.returncode is not None:
+        raise BackupRuntimeError(_PREFLIGHT_ERROR)
+    try:
+        os.killpg(process.pid, signal_number)
     except (OSError, AttributeError):
         try:
-            process.kill()
+            os.kill(process.pid, signal_number)
         except OSError:
             pass
+
+
+def _reap_tool(process: subprocess.Popen[bytes]) -> int:
+    _signal_tool_process_group(process, signal.SIGKILL)
     try:
-        process.wait(timeout=_TOOL_REAP_SECONDS)
+        return process.wait(timeout=_TOOL_REAP_SECONDS)
     except subprocess.TimeoutExpired:
+        _signal_tool_process_group(process, signal.SIGKILL)
         try:
-            process.kill()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=_TOOL_REAP_SECONDS)
+            return process.wait(timeout=_TOOL_REAP_SECONDS)
         except (OSError, subprocess.SubprocessError):
             raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
     except OSError:
