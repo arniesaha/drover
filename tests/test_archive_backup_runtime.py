@@ -1128,6 +1128,85 @@ def test_bounded_command_never_signals_a_group_after_reaping_its_leader(
     assert signals
 
 
+@pytest.mark.parametrize("observer_failure", ["child_process", "os_error"])
+def test_bounded_command_never_signals_after_observer_loses_child_ownership(
+    monkeypatch: pytest.MonkeyPatch, observer_failure: str
+) -> None:
+    signals: list[tuple[str, int, int]] = []
+
+    def reap_then_fail(_id_type: int, pid: int, _options: int) -> None:
+        os.waitpid(pid, 0)
+        if observer_failure == "child_process":
+            raise ChildProcessError
+        raise OSError
+
+    def forbidden_killpg(process_group: int, signal_number: int) -> None:
+        signals.append(("group", process_group, signal_number))
+        raise ProcessLookupError
+
+    def forbidden_kill(pid: int, signal_number: int) -> None:
+        signals.append(("process", pid, signal_number))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(runtime_module.os, "waitid", reap_then_fail)
+    monkeypatch.setattr(runtime_module.os, "killpg", forbidden_killpg)
+    monkeypatch.setattr(runtime_module.os, "kill", forbidden_kill)
+
+    with pytest.raises(
+        BackupRuntimeError, match=r"^archive backup preflight failed$"
+    ) as raised:
+        runtime_module._bounded_command_output(
+            ("/bin/echo", "private-observer-output"),
+            time.monotonic() + 1.0,
+            clock=time.monotonic,
+        )
+
+    assert signals == []
+    assert "private-observer-output" not in str(raised.value)
+
+
+def test_bounded_command_signals_when_observer_fails_but_child_is_still_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity_path = tmp_path / "live-helper-pid"
+    code = (
+        "import os,time; "
+        f"open({str(identity_path)!r}, 'w', encoding='ascii').write(str(os.getpid())); "
+        "os.close(1); time.sleep(60)"
+    )
+    real_killpg = os.killpg
+    signals: list[tuple[int, int]] = []
+    process_group = 0
+
+    def failed_waitid(*_args: object) -> None:
+        raise OSError
+
+    def recording_killpg(process_group: int, signal_number: int) -> None:
+        signals.append((process_group, signal_number))
+        real_killpg(process_group, signal_number)
+
+    monkeypatch.setattr(runtime_module.os, "waitid", failed_waitid)
+    monkeypatch.setattr(runtime_module.os, "killpg", recording_killpg)
+
+    try:
+        with pytest.raises(
+            BackupRuntimeError, match=r"^archive backup preflight failed$"
+        ):
+            runtime_module._bounded_command_output(
+                (sys.executable, "-c", code),
+                time.monotonic() + 1.0,
+                clock=time.monotonic,
+            )
+        process_group = int(_wait_for_path(identity_path))
+
+        assert signals == [(process_group, signal.SIGKILL)]
+        assert _wait_for_process_group_exit(process_group)
+    finally:
+        if process_group and _process_group_exists(process_group):
+            real_killpg(process_group, signal.SIGKILL)
+            _wait_for_process_group_exit(process_group)
+
+
 @pytest.mark.parametrize("failure", ["missing", "error"])
 def test_tool_leader_observation_fails_closed_without_reaping_fallback(
     monkeypatch: pytest.MonkeyPatch, failure: str

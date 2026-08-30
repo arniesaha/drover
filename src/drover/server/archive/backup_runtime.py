@@ -61,6 +61,14 @@ class BackupRuntimeError(ValueError):
     """One fixed public runtime failure category."""
 
 
+class _ToolLeaderReapedOrUnknown(BackupRuntimeError):
+    pass
+
+
+class _ToolLeaderObservationFailed(BackupRuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class RuntimeIdentity:
     """Opaque identities for the three local listeners that must not restart."""
@@ -1022,7 +1030,7 @@ def _bounded_command_output(
     selector: selectors.BaseSelector | None = None
     chunks: list[bytes] = []
     count = 0
-    cleanup_attempted = False
+    cleanup_state = "absent"
     try:
         _remaining(deadline, clock)
         process = subprocess.Popen(
@@ -1035,6 +1043,7 @@ def _bounded_command_output(
             start_new_session=True,
             umask=0o077,
         )
+        cleanup_state = "reserved"
         assert process.stdout is not None
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
@@ -1055,10 +1064,22 @@ def _bounded_command_output(
                 if count > _MAX_TOOL_BYTES:
                     raise BackupRuntimeError(_PREFLIGHT_ERROR)
                 chunks.append(chunk)
-        while not _tool_leader_exited_without_reap(process):
+        while True:
+            try:
+                leader_exited = _tool_leader_exited_without_reap(process)
+            except _ToolLeaderReapedOrUnknown:
+                cleanup_state = "reaped_or_unknown"
+                raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+            except _ToolLeaderObservationFailed:
+                cleanup_state = "reaped_or_unknown"
+                if _tool_leader_still_reserved(process):
+                    cleanup_state = "reserved"
+                raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+            if leader_exited:
+                break
             remaining = _remaining(deadline, clock)
             time.sleep(min(_TOOL_POLL_SECONDS, remaining))
-        cleanup_attempted = True
+        cleanup_state = "attempted"
         returncode = _reap_tool(process)
         if returncode != 0:
             raise BackupRuntimeError(_PREFLIGHT_ERROR)
@@ -1072,8 +1093,8 @@ def _bounded_command_output(
             selector.close()
         if process is not None:
             try:
-                if not cleanup_attempted:
-                    cleanup_attempted = True
+                if cleanup_state == "reserved":
+                    cleanup_state = "attempted"
                     _reap_tool(process)
             finally:
                 if process.stdout is not None:
@@ -1082,16 +1103,30 @@ def _bounded_command_output(
 
 def _tool_leader_exited_without_reap(process: subprocess.Popen[bytes]) -> bool:
     if process.returncode is not None:
-        raise BackupRuntimeError(_PREFLIGHT_ERROR)
+        raise _ToolLeaderReapedOrUnknown(_PREFLIGHT_ERROR)
     try:
         status = os.waitid(
             os.P_PID,
             process.pid,
             os.WEXITED | os.WNOHANG | os.WNOWAIT,
         )
-    except (AttributeError, ChildProcessError, OSError):
-        raise BackupRuntimeError(_PREFLIGHT_ERROR) from None
+    except ChildProcessError:
+        raise _ToolLeaderReapedOrUnknown(_PREFLIGHT_ERROR) from None
+    except (AttributeError, OSError):
+        raise _ToolLeaderObservationFailed(_PREFLIGHT_ERROR) from None
     return status is not None
+
+
+def _tool_leader_still_reserved(process: subprocess.Popen[bytes]) -> bool:
+    if process.returncode is not None:
+        return False
+    try:
+        process.wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return False
 
 
 def _signal_tool_process_group(
