@@ -34,7 +34,9 @@ POND_INVENTORY_SQL = """SELECT s.session_id, s.source_agent, s.created_at,
        max(m.timestamp) AS last_message_at
 FROM sessions s
 LEFT JOIN messages m ON m.session_id = s.session_id
-WHERE s.source_agent IN ('claude-code', 'codex-cli')
+WHERE (s.source_agent = 'claude-code'
+       OR s.source_agent LIKE 'claude-code/%'
+       OR s.source_agent = 'codex-cli')
 GROUP BY s.session_id, s.source_agent, s.created_at
 ORDER BY s.source_agent, s.session_id
 LIMIT 100001"""
@@ -50,7 +52,9 @@ POND_INVENTORY_PREFLIGHT_SQL = """WITH inventory AS (
            max(m.timestamp) AS last_message_at
     FROM sessions s
     LEFT JOIN messages m ON m.session_id = s.session_id
-    WHERE s.source_agent IN ('claude-code', 'codex-cli')
+    WHERE (s.source_agent = 'claude-code'
+           OR s.source_agent LIKE 'claude-code/%'
+           OR s.source_agent = 'codex-cli')
     GROUP BY s.session_id, s.source_agent, s.created_at
     ORDER BY s.source_agent, s.session_id
     LIMIT 100001
@@ -83,7 +87,6 @@ _POND_EMPTY_ROW_COLUMNS = _POND_COLUMNS - {
     "first_message_at",
     "last_message_at",
 }
-_ROOT_SOURCE_AGENTS = frozenset({"claude-code", "codex-cli"})
 _URI_SCHEME = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*:")
 _DATAFUSION_TIMESTAMP = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?" r"(?:Z|[+-]\d{2}:\d{2})\Z"
@@ -106,6 +109,16 @@ class _PinnedOutput:
 
 def _failure(category: str) -> _PondInventoryError:
     return _PondInventoryError(f"pond inventory {category}")
+
+
+def _pond_source_agent_family(source_agent: object) -> str | None:
+    if not isinstance(source_agent, str):
+        return None
+    if source_agent == "claude-code" or source_agent.startswith("claude-code/"):
+        return "claude-code"
+    if source_agent == "codex-cli":
+        return "codex-cli"
+    return None
 
 
 def _raise_process_failure(
@@ -275,9 +288,10 @@ def pond_inventory_summary(inventory: PondInventory) -> dict[str, object]:
     by_harness: dict[str, int] = {}
     empty_sessions = 0
     for record in inventory.records:
-        if record.source_agent not in _ROOT_SOURCE_AGENTS:
+        source_agent_family = _pond_source_agent_family(record.source_agent)
+        if source_agent_family is None:
             raise _failure("summary")
-        by_harness[record.source_agent] = by_harness.get(record.source_agent, 0) + 1
+        by_harness[source_agent_family] = by_harness.get(source_agent_family, 0) + 1
         empty_sessions += record.message_count == 0
     return {
         "schema_version": inventory.schema_version,
@@ -715,7 +729,7 @@ def _pond_record(row: dict[str, object]) -> PondInventoryRecord:
     if (
         not isinstance(session_id, str)
         or not session_id.strip()
-        or source_agent not in _ROOT_SOURCE_AGENTS
+        or _pond_source_agent_family(source_agent) is None
         or isinstance(message_count, bool)
         or not isinstance(message_count, int)
         or message_count < 0

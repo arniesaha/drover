@@ -53,6 +53,10 @@ from drover.server.archive.pond_process import (
     _aggregate_resource_evidence as _pond_aggregate_resource_evidence,
 )
 from drover.server.archive.pond_process import (
+    _pin_pond_executable,
+    _PinnedPondExecutable,
+)
+from drover.server.archive.pond_process import (
     _process_resource_evidence as _pond_process_resource_evidence,
 )
 from drover.server.archive.pond_process import (
@@ -63,7 +67,7 @@ from drover.server.archive.pond_snapshot import (
     LocalPondStore,
     PondStoreSnapshot,
     RemotePondGeneration,
-    capture_pond_store_snapshot,
+    _capture_pond_store_snapshot,
     pond_inventory_content_sha256,
 )
 
@@ -138,6 +142,7 @@ class _Preflight(Protocol):
         *,
         receipt_directory_descriptor: int,
         receipt_directory_identity: tuple[int, ...],
+        pond_executable: _PinnedPondExecutable,
         resource_limits: ResourceLimits,
     ) -> BackupPreflightResult: ...
 
@@ -145,7 +150,7 @@ class _Preflight(Protocol):
 class _RunPond(Protocol):
     def __call__(
         self,
-        binary: Path,
+        binary: _PinnedPondExecutable,
         arguments: Sequence[str],
         *,
         timeout_seconds: float,
@@ -161,7 +166,7 @@ class _RunPond(Protocol):
 class _CaptureSnapshot(Protocol):
     def __call__(
         self,
-        binary: Path,
+        binary: _PinnedPondExecutable,
         *,
         storage: LocalPondStore | RemotePondGeneration,
         pond_config: Path,
@@ -200,6 +205,7 @@ class _BackupDependencies:
     uuid4: Callable[[], UUID] = field(repr=False)
     runtime_guard: _RuntimeFactory = field(repr=False)
     run_preflight: _Preflight = field(repr=False)
+    pin_pond_executable: Callable[[Path], _PinnedPondExecutable] = field(repr=False)
     run_pond_process: _RunPond = field(repr=False)
     capture_pond_snapshot: _CaptureSnapshot = field(repr=False)
     latest_receipt: _LatestReceipt = field(repr=False)
@@ -214,8 +220,9 @@ def _production_backup_dependencies() -> _BackupDependencies:
         uuid4=uuid4,
         runtime_guard=RuntimeGuard,
         run_preflight=_run_backup_preflight_at,
+        pin_pond_executable=_pin_pond_executable,
         run_pond_process=run_pond_process,
-        capture_pond_snapshot=capture_pond_store_snapshot,
+        capture_pond_snapshot=_capture_pond_store_snapshot,
         latest_receipt=_latest_backup_receipt_at,
         write_receipt=_write_backup_receipt_at,
         now=lambda: datetime.now(timezone.utc),
@@ -290,7 +297,10 @@ def _run_locked(
         )
     except Exception:
         raise BackupRunError(_PREFLIGHT_ERROR) from None
-    with workspace_context as workspace:
+    with (
+        workspace_context as workspace,
+        dependencies.pin_pond_executable(config.pond_binary) as executable,
+    ):
         runtime = _create_runtime(dependencies, drover_config)
         _capture_baseline(runtime)
         limits = _resource_limits(config)
@@ -302,6 +312,7 @@ def _run_locked(
             "before",
             runtime,
             limits,
+            executable,
             after_copy=False,
         )
         _validate_preflight_artifacts(before, _PREFLIGHT_ERROR)
@@ -318,6 +329,7 @@ def _run_locked(
             workspace.phase("storage"),
             runtime,
             limits,
+            executable,
         )
         workspace.require_same()
         empty = _capture_remote_snapshot(
@@ -327,6 +339,7 @@ def _run_locked(
             workspace.phase("remote-empty"),
             runtime,
             limits,
+            executable,
             empty=True,
         )
         _require_empty_generation(empty)
@@ -338,6 +351,7 @@ def _run_locked(
             workspace.phase("copy"),
             runtime,
             limits,
+            executable,
         )
         workspace.require_same()
         verify_result = _verify(
@@ -347,6 +361,7 @@ def _run_locked(
             workspace.phase("verify"),
             runtime,
             limits,
+            executable,
         )
         workspace.require_same()
         after = _preflight(
@@ -357,6 +372,7 @@ def _run_locked(
             "after",
             runtime,
             limits,
+            executable,
             after_copy=True,
         )
         workspace.require_same()
@@ -367,6 +383,7 @@ def _run_locked(
             workspace.phase("remote-after"),
             runtime,
             limits,
+            executable,
             empty=False,
         )
         workspace.require_same()
@@ -414,7 +431,13 @@ def _run_locked(
             predecessor_digest,
         )
         workspace.require_same()
-        _write_verified_receipt(dependencies, config, workspace, receipt)
+        _write_verified_receipt(
+            dependencies,
+            config,
+            workspace,
+            executable,
+            receipt,
+        )
         return receipt
 
 
@@ -470,6 +493,7 @@ def _preflight(
     phase: str,
     runtime: _Runtime,
     limits: ResourceLimits,
+    executable: _PinnedPondExecutable,
     *,
     after_copy: bool,
 ) -> BackupPreflightResult:
@@ -484,6 +508,7 @@ def _preflight(
             runtime,
             receipt_directory_descriptor=receipt_descriptor,
             receipt_directory_identity=receipt_identity,
+            pond_executable=executable,
             resource_limits=limits,
         )
         if type(result) is not BackupPreflightResult:
@@ -525,10 +550,11 @@ def _storage_check(
     workspace: Path,
     runtime: _Runtime,
     limits: ResourceLimits,
+    executable: _PinnedPondExecutable,
 ) -> PondProcessResult:
     try:
         result = dependencies.run_pond_process(
-            config.pond_binary,
+            executable,
             (
                 "--config-file",
                 str(config.remote_pond_config),
@@ -576,13 +602,14 @@ def _capture_remote_snapshot(
     workspace: Path,
     runtime: _Runtime,
     limits: ResourceLimits,
+    executable: _PinnedPondExecutable,
     *,
     empty: bool,
 ) -> PondStoreSnapshot:
     category = _STORAGE_ERROR if empty else _VERIFY_ERROR
     try:
         snapshot = dependencies.capture_pond_snapshot(
-            config.pond_binary,
+            executable,
             storage=storage,
             pond_config=config.remote_pond_config,
             workspace=workspace,
@@ -628,6 +655,7 @@ def _copy(
     workspace: Path,
     runtime: _Runtime,
     limits: ResourceLimits,
+    executable: _PinnedPondExecutable,
 ) -> PondProcessResult:
     return _copy_command(
         dependencies,
@@ -636,6 +664,7 @@ def _copy(
         workspace,
         runtime,
         limits,
+        executable,
         verify=False,
     )
 
@@ -647,6 +676,7 @@ def _verify(
     workspace: Path,
     runtime: _Runtime,
     limits: ResourceLimits,
+    executable: _PinnedPondExecutable,
 ) -> PondProcessResult:
     return _copy_command(
         dependencies,
@@ -655,6 +685,7 @@ def _verify(
         workspace,
         runtime,
         limits,
+        executable,
         verify=True,
     )
 
@@ -666,6 +697,7 @@ def _copy_command(
     workspace: Path,
     runtime: _Runtime,
     limits: ResourceLimits,
+    executable: _PinnedPondExecutable,
     *,
     verify: bool,
 ) -> PondProcessResult:
@@ -688,7 +720,7 @@ def _copy_command(
     )
     try:
         result = dependencies.run_pond_process(
-            config.pond_binary,
+            executable,
             tuple(command),
             timeout_seconds=float(config.copy_timeout_seconds),
             run_directory=workspace,
@@ -992,16 +1024,29 @@ def _write_verified_receipt(
     dependencies: _BackupDependencies,
     config: BackupConfig,
     workspace: _PinnedRunWorkspace,
+    executable: _PinnedPondExecutable,
     receipt: BackupReceipt,
 ) -> None:
     try:
         dependencies.write_receipt(
             *workspace.receipt_binding(),
             receipt,
-            before_publish=workspace.prepare_publish,
+            before_publish=lambda: _prepare_terminal_publication(
+                workspace,
+                executable,
+            ),
         )
     except Exception:
         raise BackupRunError(_RECEIPT_ERROR) from None
+
+
+def _prepare_terminal_publication(
+    workspace: _PinnedRunWorkspace,
+    executable: _PinnedPondExecutable,
+) -> None:
+    """Run the final executable check inside the receipt's existing last gate."""
+    workspace.prepare_publish()
+    executable.require_same()
 
 
 def _runtime_category(error: BackupRuntimeError) -> str:

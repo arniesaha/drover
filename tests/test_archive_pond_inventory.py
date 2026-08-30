@@ -222,7 +222,7 @@ def fake_pond(tmp_path):
     binary.write_text(textwrap.dedent(_FAKE_POND), encoding="utf-8")
     binary.chmod(0o700)
     local_store = tmp_path / "local-store"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     control = tmp_path / "fake-control"
     control.mkdir()
     record = control / "calls.json"
@@ -392,6 +392,24 @@ def test_export_normalizes_datafusion_timestamps_and_returns_safe_summary(
         "empty_sessions": 1,
         "by_harness": {"claude-code": 1, "codex-cli": 1},
     }
+
+
+def test_export_preserves_allowed_claude_prefix_agent_identity(fake_pond, tmp_path):
+    prefix_agent = "claude-code/1.0.123"
+    prefix_row = dict(
+        _DEFAULT_ROWS[0],
+        session_id="claude-prefix-private",
+        source_agent=prefix_agent,
+    )
+
+    inventory, _ = _export(
+        fake_pond,
+        tmp_path / "pond.json",
+        FAKE_NDJSON=_ndjson((prefix_row,)),
+    )
+
+    assert inventory.records[0].source_agent == prefix_agent
+    assert pond_inventory_summary(inventory)["by_harness"] == {"claude-code": 1}
 
 
 def test_export_accepts_the_pinned_release_version_detail(fake_pond, tmp_path):
@@ -1240,7 +1258,7 @@ def test_export_invokes_binary_directly_without_a_shell(tmp_path):
     binary.write_text(textwrap.dedent(_FAKE_POND), encoding="utf-8")
     binary.chmod(0o700)
     local_store = tmp_path / "local store; still argv"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     control = tmp_path / "fake-control"
     control.mkdir()
     record = control / "calls.json"
@@ -1287,7 +1305,9 @@ def test_pond_inventory_preflight_sql_returns_only_conservative_aggregates():
            max(m.timestamp) AS last_message_at
     FROM sessions s
     LEFT JOIN messages m ON m.session_id = s.session_id
-    WHERE s.source_agent IN ('claude-code', 'codex-cli')
+    WHERE (s.source_agent = 'claude-code'
+           OR s.source_agent LIKE 'claude-code/%'
+           OR s.source_agent = 'codex-cli')
     GROUP BY s.session_id, s.source_agent, s.created_at
     ORDER BY s.source_agent, s.session_id
     LIMIT 100001
@@ -1314,7 +1334,9 @@ def test_pond_inventory_sql_selects_only_the_bounded_metadata_projection():
        max(m.timestamp) AS last_message_at
 FROM sessions s
 LEFT JOIN messages m ON m.session_id = s.session_id
-WHERE s.source_agent IN ('claude-code', 'codex-cli')
+WHERE (s.source_agent = 'claude-code'
+       OR s.source_agent LIKE 'claude-code/%'
+       OR s.source_agent = 'codex-cli')
 GROUP BY s.session_id, s.source_agent, s.created_at
 ORDER BY s.source_agent, s.session_id
 LIMIT 100001"""

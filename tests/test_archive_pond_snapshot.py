@@ -146,7 +146,7 @@ def pond_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     binary.write_text(textwrap.dedent(_FAKE_POND), encoding="utf-8")
     binary.chmod(0o700)
     local_store = tmp_path / "local-store-private"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     local_config = tmp_path / "local-config-private.toml"
     local_config.write_text("private-local-config", encoding="utf-8")
     local_config.chmod(0o600)
@@ -638,6 +638,32 @@ def test_unified_corpus_sql_keeps_timestamps_for_the_production_parser() -> None
     assert snapshot.counts == PondCorpusCounts(2, 1, 0, 0, 0, 0)
 
 
+def test_unified_corpus_sql_preserves_allowed_claude_prefix_agent_identity() -> None:
+    with duckdb.connect() as connection:
+        _create_corpus_schema(connection)
+        connection.execute("""INSERT INTO sessions VALUES
+               ('claude-prefix-private', 'claude-code/1.0.123',
+                TIMESTAMPTZ '2026-08-29 10:00:00+00:00')""")
+        connection.execute("""INSERT INTO messages VALUES
+               ('message-prefix-private', 'claude-prefix-private',
+                TIMESTAMPTZ '2026-08-29 10:01:00+00:00')""")
+        data = _pond_ndjson(connection.execute(POND_CORPUS_SNAPSHOT_SQL))
+
+    snapshot = _snapshot_from_corpus_ndjson(data)
+
+    assert snapshot.root_inventory.records == (
+        PondInventoryRecord(
+            session_id="claude-prefix-private",
+            source_agent="claude-code/1.0.123",
+            created_at="2026-08-29T10:00:00Z",
+            message_count=1,
+            first_message_at="2026-08-29T10:01:00Z",
+            last_message_at="2026-08-29T10:01:00Z",
+        ),
+    )
+    assert snapshot.counts == PondCorpusCounts(1, 1, 0, 0, 0, 0)
+
+
 def test_unified_corpus_sql_constructs_an_empty_snapshot() -> None:
     with duckdb.connect() as connection:
         _create_corpus_schema(connection)
@@ -801,6 +827,94 @@ def test_snapshot_requires_owner_only_workspace_and_config(pond_environment, tmp
             workspace=workspace,
             timeout_seconds=60,
         )
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o777])
+def test_snapshot_rejects_non_private_local_store_before_pond_runs(
+    mode, pond_environment, tmp_path
+):
+    binary, store, config, _, record = pond_environment
+    store.chmod(mode)
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        capture_pond_store_snapshot(
+            binary,
+            storage=LocalPondStore(store),
+            pond_config=config,
+            workspace=_workspace(tmp_path),
+            timeout_seconds=60,
+        )
+
+    assert not record.exists()
+
+
+def test_local_store_wrapper_rejects_wrong_owner_and_symlink(
+    pond_environment, monkeypatch
+):
+    snapshot_module = importlib.import_module("drover.server.archive.pond_snapshot")
+    _, store, _, _, _ = pond_environment
+    current_user = os.geteuid()
+    monkeypatch.setattr(snapshot_module.os, "geteuid", lambda: current_user + 1)
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        LocalPondStore(store)
+
+    monkeypatch.setattr(snapshot_module.os, "geteuid", lambda: current_user)
+    target = store.with_name("local-store-target-private")
+    store.rename(target)
+    store.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        LocalPondStore(store)
+
+
+def test_snapshot_rejects_same_mode_local_store_path_substitution_before_pond_runs(
+    pond_environment, tmp_path
+):
+    binary, store, config, _, record = pond_environment
+    storage = LocalPondStore(store)
+    moved = store.with_name("moved-local-store-private")
+    store.rename(moved)
+    store.mkdir(mode=0o700)
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        capture_pond_store_snapshot(
+            binary,
+            storage=storage,
+            pond_config=config,
+            workspace=_workspace(tmp_path),
+            timeout_seconds=60,
+        )
+
+    assert not record.exists()
+
+
+def test_snapshot_revalidates_local_store_after_release_before_corpus_read(
+    pond_environment, tmp_path
+):
+    binary, store, config, _, record = pond_environment
+    storage = LocalPondStore(store)
+    moved = store.with_name("moved-during-release-private")
+    swapped = False
+
+    def swap_after_release_sample() -> None:
+        nonlocal swapped
+        if not swapped:
+            store.rename(moved)
+            store.mkdir(mode=0o700)
+            swapped = True
+
+    with pytest.raises(ValueError, match=rf"^{_PRIVATE_ERROR}$"):
+        capture_pond_store_snapshot(
+            binary,
+            storage=storage,
+            pond_config=config,
+            workspace=_workspace(tmp_path),
+            timeout_seconds=60,
+            progress_callback=swap_after_release_sample,
+        )
+
+    calls = json.loads(record.read_text(encoding="utf-8"))
+    assert [call[1:] for call in calls] == [["--version"]]
 
 
 def test_snapshot_artifacts_are_private_and_bounded_to_the_supplied_workspace(

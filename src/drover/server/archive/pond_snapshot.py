@@ -25,7 +25,10 @@ from drover.server.archive.inventory import (
     _write_private_json_at,
     private_json_sha256,
 )
-from drover.server.archive.pond_inventory import _pond_record
+from drover.server.archive.pond_inventory import (
+    _pond_record,
+    _pond_source_agent_family,
+)
 from drover.server.archive.pond_process import (
     POND_VERSION,
     PondProcessError,
@@ -51,7 +54,9 @@ POND_CORPUS_SNAPSHOT_SQL = """WITH signatures AS (
     SELECT session_id, source_agent, created_at, message_count,
            first_message_at, last_message_at
     FROM signatures
-    WHERE source_agent IN ('claude-code', 'codex-cli')
+    WHERE (source_agent = 'claude-code'
+           OR source_agent LIKE 'claude-code/%'
+           OR source_agent = 'codex-cli')
     ORDER BY source_agent, session_id
     LIMIT 100001
 ), duplicate_groups AS (
@@ -126,7 +131,6 @@ _EMPTY_ROOT_ROW_COLUMNS = _ROOT_ROW_COLUMNS - {
     "last_message_at",
 }
 _AGGREGATE_ROW_COLUMNS = _ALL_COUNT_COLUMNS | {"row_kind"}
-_ROOT_AGENTS = frozenset({"claude-code", "codex-cli"})
 _R2_AUTHORITY = re.compile(r"\A[a-z0-9][a-z0-9-]*\.r2\.cloudflarestorage\.com\Z")
 _MAX_TIMEOUT_SECONDS = 1800
 
@@ -142,6 +146,7 @@ def _failure() -> _SnapshotError:
 @dataclass(frozen=True, slots=True, repr=False)
 class LocalPondStore:
     path: Path = field(repr=False)
+    _pinned_identity: tuple[int, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         try:
@@ -149,8 +154,18 @@ class LocalPondStore:
                 raise _failure()
             resolved = self.path.resolve(strict=True)
             metadata = self.path.lstat()
-            if resolved != self.path or not stat.S_ISDIR(metadata.st_mode):
+            if (
+                resolved != self.path
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
                 raise _failure()
+            object.__setattr__(
+                self,
+                "_pinned_identity",
+                _directory_identity(metadata),
+            )
         except _SnapshotError:
             raise
         except (OSError, RuntimeError, TypeError, ValueError):
@@ -232,7 +247,7 @@ class PondStoreSnapshot:
             if self.root_inventory.pond_version != POND_VERSION:
                 raise _failure()
             if any(
-                record.source_agent not in _ROOT_AGENTS
+                _pond_source_agent_family(record.source_agent) is None
                 for record in self.root_inventory.records
             ):
                 raise _failure()
@@ -313,7 +328,7 @@ def _capture_pond_store_snapshot(
     timeout_seconds: float,
     progress_callback: Callable[[], None] | None = None,
     resource_limits: ResourceLimits | None = None,
-    release_evidence: _PondReleaseEvidence | None,
+    release_evidence: _PondReleaseEvidence | None = None,
 ) -> PondStoreSnapshot:
     """Private corpus capture that can consume one already-proved release."""
     workspace_descriptor: int | None = None
@@ -342,6 +357,7 @@ def _capture_pond_store_snapshot(
         else:
             raise _failure()
 
+        _require_local_store_path(storage, store_descriptor, store_identity)
         corpus_data, corpus_result = _run_sql(
             binary,
             selector=selector,
@@ -625,7 +641,14 @@ def _storage_selector(
             storage.path, flags=_descriptor_flags(directory=True)
         )
         metadata = os.fstat(descriptor)
-        if not stat.S_ISDIR(metadata.st_mode):
+        path_metadata = storage.path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or _directory_identity(metadata) != storage._pinned_identity
+            or _directory_identity(path_metadata) != storage._pinned_identity
+        ):
             raise _failure()
         return str(storage.path), descriptor, _identity(metadata)
     except _SnapshotError:
@@ -666,6 +689,15 @@ def _require_local_store_path(
     if type(storage) is not LocalPondStore or descriptor is None or expected is None:
         raise _failure()
     _require_pinned_path(storage.path, descriptor, expected)
+    descriptor_metadata = os.fstat(descriptor)
+    path_metadata = storage.path.stat(follow_symlinks=False)
+    if (
+        descriptor_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_metadata.st_mode) != 0o700
+        or _directory_identity(descriptor_metadata) != storage._pinned_identity
+        or _directory_identity(path_metadata) != storage._pinned_identity
+    ):
+        raise _failure()
 
 
 def _require_workspace_same(path: Path, expected: tuple[int, ...]) -> None:

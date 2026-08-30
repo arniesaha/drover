@@ -14,7 +14,10 @@ from drover.server.archive.inventory import (
     PondInventory,
     SourceEligibilityReceipt,
 )
-from drover.server.archive.pond_inventory import POND_VERSION
+from drover.server.archive.pond_inventory import (
+    POND_VERSION,
+    _pond_source_agent_family,
+)
 
 _ROOT_SOURCE_AGENTS = frozenset({"claude-code", "codex-cli"})
 _REGISTRY_HARNESS_MAP = {
@@ -254,7 +257,10 @@ def _validated_pond(pond: PondInventory) -> PondInventory:
         raise _failure("pond inventory") from None
     if pond.pond_version != POND_VERSION:
         raise _failure("pond inventory")
-    if any(record.source_agent not in _ROOT_SOURCE_AGENTS for record in pond.records):
+    if any(
+        _pond_source_agent_family(record.source_agent) is None
+        for record in pond.records
+    ):
         raise _failure("pond inventory")
     return pond
 
@@ -347,11 +353,14 @@ def build_coverage_report(
         and candidate.harness not in _REGISTRY_HARNESS_MAP
     )
 
-    pond_by_identity = {
-        (record.source_agent, record.session_id): record
-        for record in archive.records
-        if record.source_agent in _ROOT_SOURCE_AGENTS
-    }
+    pond_by_identity = {}
+    for record in archive.records:
+        source_agent_family = _pond_source_agent_family(record.source_agent)
+        assert source_agent_family is not None
+        identity = (source_agent_family, record.session_id)
+        if identity in pond_by_identity:
+            raise _failure("pond inventory")
+        pond_by_identity[identity] = record
     current_by_host_identity = {
         (inventory.host_id, record.source_agent, record.session_id)
         for inventory in current
@@ -451,8 +460,9 @@ def build_coverage_report(
         for record in inventory.records:
             agents_by_native_id[record.session_id].add(record.source_agent)
     for record in archive.records:
-        if record.source_agent in _ROOT_SOURCE_AGENTS:
-            agents_by_native_id[record.session_id].add(record.source_agent)
+        source_agent_family = _pond_source_agent_family(record.source_agent)
+        assert source_agent_family is not None
+        agents_by_native_id[record.session_id].add(source_agent_family)
     cross_harness_native_id_groups = tuple(
         _CrossHarnessNativeIdGroup(native_session_id, tuple(sorted(source_agents)))
         for native_session_id, source_agents in sorted(agents_by_native_id.items())
@@ -464,8 +474,6 @@ def build_coverage_report(
     )
     signature_unverifiable: list[_ArchiveSignatureUnverifiable] = []
     for record in archive.records:
-        if record.source_agent not in _ROOT_SOURCE_AGENTS:
-            continue
         if record.message_count == 0:
             signature_unverifiable.append(
                 _ArchiveSignatureUnverifiable(record.source_agent, record.session_id)

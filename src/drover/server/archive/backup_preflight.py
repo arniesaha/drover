@@ -42,6 +42,7 @@ from drover.server.archive.pond_process import (
     PondResourceEvidence,
     ResourceLimits,
     _aggregate_resource_evidence,
+    _PinnedPondExecutable,
     _process_resource_evidence,
     run_pond_process,
 )
@@ -50,7 +51,7 @@ from drover.server.archive.pond_snapshot import (
     LocalPondStore,
     PondCorpusCounts,
     PondStoreSnapshot,
-    capture_pond_store_snapshot,
+    _capture_pond_store_snapshot,
 )
 from drover.server.db import control_plane_path
 
@@ -159,7 +160,7 @@ def _native_home() -> Path:
 _PRODUCTION_DEPENDENCIES = _PreflightDependencies(
     native_home=_native_home,
     discover_native_inventory=discover_native_history_inventory,
-    capture_pond_snapshot=capture_pond_store_snapshot,
+    capture_pond_snapshot=_capture_pond_store_snapshot,
     resolve_control_plane_path=control_plane_path,
     load_registry_candidates=load_registry_candidates,
     build_coverage_report=build_coverage_report,
@@ -184,6 +185,7 @@ def run_backup_preflight(
         drover_config,
         workspace,
         runtime_guard,
+        pond_executable=config.pond_binary,
         resource_limits=resource_limits,
         dependencies=_PRODUCTION_DEPENDENCIES,
     )
@@ -197,16 +199,21 @@ def _run_backup_preflight_at(
     *,
     receipt_directory_descriptor: int,
     receipt_directory_identity: tuple[int, ...],
+    pond_executable: _PinnedPondExecutable,
     resource_limits: ResourceLimits | None = None,
 ) -> BackupPreflightResult:
     """Run applied preflight against one lock-owned receipt-root duplicate."""
-    if type(runtime_guard) is not RuntimeGuard:
+    if (
+        type(runtime_guard) is not RuntimeGuard
+        or type(pond_executable) is not _PinnedPondExecutable
+    ):
         raise _failure()
     return _run_backup_preflight(
         config,
         drover_config,
         workspace,
         runtime_guard,
+        pond_executable=pond_executable,
         resource_limits=resource_limits,
         receipt_directory_descriptor=receipt_directory_descriptor,
         receipt_directory_identity=receipt_directory_identity,
@@ -221,6 +228,7 @@ def _run_backup_preflight(
     workspace: Path,
     runtime_guard: RuntimeGuard,
     *,
+    pond_executable: Path | _PinnedPondExecutable | None = None,
     resource_limits: ResourceLimits | None = None,
     receipt_directory_descriptor: int | None = None,
     receipt_directory_identity: tuple[int, ...] | None = None,
@@ -241,6 +249,11 @@ def _run_backup_preflight(
         ):
             raise _failure()
         deps = dependencies
+        executable = config.pond_binary if pond_executable is None else pond_executable
+        if not (
+            isinstance(executable, Path) or type(executable) is _PinnedPondExecutable
+        ):
+            raise _failure()
         workspace_path, workspace_descriptor, workspace_identity = _pin_workspace(
             workspace
         )
@@ -252,7 +265,7 @@ def _run_backup_preflight(
         store_descriptor, store_identity = _pin_path(
             config.local_store,
             directory=True,
-            private=False,
+            private=True,
         )
         host_id = runtime_guard.baseline_host_id()
         if not isinstance(host_id, str) or not host_id:
@@ -286,7 +299,7 @@ def _run_backup_preflight(
             directory=True,
         )
         pond_snapshot = deps.capture_pond_snapshot(
-            config.pond_binary,
+            executable,
             storage=LocalPondStore(config.local_store),
             pond_config=config.local_pond_config,
             workspace=workspace_path,
@@ -328,12 +341,19 @@ def _run_backup_preflight(
         _require_coverage_valid(canonical_summary)
         summary = _freeze_mapping(canonical_summary)
         _require_snapshot_valid(pond_snapshot)
+        _require_pinned_path(
+            config.local_store,
+            store_descriptor,
+            store_identity,
+            directory=True,
+        )
         dry_run_evidence = _require_local_dry_run(
             config,
             workspace_path,
             workspace_descriptor,
             runtime_guard,
             deps,
+            executable,
             resource_limits,
         )
         _write_workspace_json(
@@ -601,10 +621,11 @@ def _require_local_dry_run(
     workspace_descriptor: int,
     runtime_guard: RuntimeGuard,
     dependencies: _PreflightDependencies,
+    pond_executable: Path | _PinnedPondExecutable,
     resource_limits: ResourceLimits | None,
 ) -> PondResourceEvidence:
     result = dependencies.run_pond_process(
-        config.pond_binary,
+        pond_executable,
         (
             "--config-file",
             str(config.local_pond_config),
@@ -768,10 +789,11 @@ def _pin_path(
         )
         metadata = os.fstat(descriptor)
         expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        private_mode = 0o700 if directory else 0o600
         if (
             not expected_type(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
-            or (private and stat.S_IMODE(metadata.st_mode) != 0o600)
+            or (private and stat.S_IMODE(metadata.st_mode) != private_mode)
         ):
             raise _failure()
         identity = (

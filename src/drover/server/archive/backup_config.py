@@ -197,7 +197,9 @@ def _require_private_file(value: Any) -> Path:
 
 def _require_local_store(value: Any) -> Path:
     path = _canonical_existing_path(value)
-    _open_validated_path(path, directory=True)
+    metadata = _open_validated_path(path, directory=True)
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise _invalid()
     return path
 
 

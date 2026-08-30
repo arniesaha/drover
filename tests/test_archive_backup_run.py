@@ -69,8 +69,14 @@ from drover.server.archive.pond_process import (
     PondProcessResult,
     PondResourceEvidence,
     ResourceLimits,
+    _pin_pond_executable,
+    _PinnedPondExecutable,
 )
-from drover.server.archive.pond_snapshot import PondCorpusCounts, PondStoreSnapshot
+from drover.server.archive.pond_snapshot import (
+    PondCorpusCounts,
+    PondStoreSnapshot,
+    pond_inventory_content_sha256,
+)
 
 _GENERATION_ID = UUID("48d862c3-787a-4970-9a1c-842f9098473e")
 _PREVIOUS_ID = UUID("c632db33-0c57-4762-a42c-47b519c48a53")
@@ -107,7 +113,7 @@ def _config(tmp_path: Path, *, nested_receipt: bool = False) -> BackupConfig:
     local_config = _private_file(tmp_path / "local-private.toml")
     remote_config = _private_file(tmp_path / "remote-private.toml")
     local_store = tmp_path / "local-store-private"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     receipt_parent = tmp_path / "receipt-parent-private" if nested_receipt else tmp_path
     receipt_parent.mkdir(exist_ok=True)
     receipts = receipt_parent / "receipts-private"
@@ -203,6 +209,28 @@ def _snapshot(
             sessions_in_logical_duplicate_groups=0,
         ),
         resource_evidence or PondResourceEvidence(300, 600, 10),
+    )
+
+
+def _prefix_snapshot() -> PondStoreSnapshot:
+    base = _pond_inventory()
+    inventory = _pond_inventory(
+        records=(
+            base.records[0],
+            PondInventoryRecord(
+                session_id="claude-prefix-private",
+                source_agent="claude-code/1.0.123",
+                created_at="2026-08-29T10:30:00Z",
+                message_count=1,
+                first_message_at="2026-08-29T10:31:00Z",
+                last_message_at="2026-08-29T10:31:00Z",
+            ),
+            base.records[1],
+        ),
+    )
+    return _snapshot(
+        inventory=inventory,
+        counts=PondCorpusCounts(3, 3, 3, 0, 0, 0),
     )
 
 
@@ -365,6 +393,9 @@ class _Fixture:
     dependencies: _BackupDependencies | None = None
     previous: BackupReceipt | None = None
     swapped_paths: list[Path] | None = None
+    pond_phase_pins: list[tuple[str, object, Path, tuple[int, ...]]] | None = None
+    pinned_pond: _PinnedPondExecutable | None = None
+    binary_marker: Path | None = None
 
 
 _WORKSPACE_PHASES = (
@@ -375,6 +406,21 @@ _WORKSPACE_PHASES = (
     "verify",
     "after",
     "remote-after",
+)
+_POND_PROCESS_PHASES = (
+    "before-snapshot-version",
+    "before-corpus-snapshot",
+    "before-dry-run",
+    "storage-check",
+    "empty-snapshot-version",
+    "empty-corpus-snapshot",
+    "copy",
+    "verify-only",
+    "after-snapshot-version",
+    "after-corpus-snapshot",
+    "after-dry-run",
+    "final-snapshot-version",
+    "final-corpus-snapshot",
 )
 
 
@@ -424,7 +470,32 @@ def _maybe_replace_workspace(fixture: _Fixture, point: str) -> None:
 
 
 def _remote_snapshot_for_fault(fault: str | None) -> PondStoreSnapshot:
-    local = _snapshot()
+    local = _prefix_snapshot() if fault and fault.startswith("prefix-") else _snapshot()
+    if fault in {"prefix-agent-substitution", "prefix-session-substitution"}:
+        prefix = local.root_inventory.records[1]
+        changed = replace(
+            prefix,
+            source_agent=(
+                "claude-code/1.0.124"
+                if fault == "prefix-agent-substitution"
+                else prefix.source_agent
+            ),
+            session_id=(
+                "claude-prefix-replacement-private"
+                if fault == "prefix-session-substitution"
+                else prefix.session_id
+            ),
+        )
+        return _snapshot(
+            inventory=_pond_inventory(
+                records=(
+                    local.root_inventory.records[0],
+                    changed,
+                    local.root_inventory.records[2],
+                )
+            ),
+            counts=local.counts,
+        )
     if fault == "remote_missing":
         record = local.root_inventory.records[:1]
         return _snapshot(
@@ -472,6 +543,7 @@ def _fixture(
         written_receipts=[],
         applied_limits=[],
         swapped_paths=[],
+        pond_phase_pins=[],
     )
     fixture.runtime = _Runtime(fixture)
 
@@ -505,6 +577,12 @@ def _fixture(
         assert fixture.runtime is not None
         return fixture.runtime
 
+    def pin_pond_executable(binary: Path) -> _PinnedPondExecutable:
+        assert binary == config.pond_binary
+        executable = _pin_pond_executable(binary)
+        fixture.pinned_pond = executable
+        return executable
+
     def preflight(
         received_config,
         drover_config,
@@ -514,6 +592,7 @@ def _fixture(
         receipt_directory_descriptor=None,
         receipt_directory_identity=None,
         resource_limits=None,
+        pond_executable=None,
     ):
         assert received_config is config
         assert drover_config is fixture.drover_config
@@ -533,6 +612,12 @@ def _fixture(
         fixture.commands.append("local-sync-dry-run")
         prefix = "before" if before else "after"
         for subprocess_phase in ("snapshot-version", "corpus-snapshot", "dry-run"):
+            _record_pond_phase(
+                fixture,
+                f"{prefix}-{subprocess_phase}",
+                pond_executable or config.pond_binary,
+                Path(workspace),
+            )
             fixture.applied_limits.append(
                 (f"{prefix}-{subprocess_phase}", resource_limits)
             )
@@ -546,6 +631,11 @@ def _fixture(
                 raise PondProcessError("resource")
             return _preflight_result(
                 workspace,
+                snapshot=(
+                    _prefix_snapshot()
+                    if fault and fault.startswith("prefix-")
+                    else None
+                ),
                 artifact_fault="source" if fault == "before_source_artifact" else None,
                 resource_evidence=PondResourceEvidence(
                     900,
@@ -564,7 +654,9 @@ def _fixture(
             if fault == "source_fingerprint"
             else _native_inventory()
         )
-        local_snapshot = _snapshot()
+        local_snapshot = (
+            _prefix_snapshot() if fault and fault.startswith("prefix-") else _snapshot()
+        )
         if fault == "local_root":
             changed = replace(
                 local_snapshot.root_inventory.records[0],
@@ -614,7 +706,7 @@ def _fixture(
         label,
         **kwargs,
     ):
-        assert binary == config.pond_binary
+        _record_pond_phase(fixture, label, binary, Path(run_directory))
         fixture.commands.append(label)
         fixture.attempts[label] += 1
         fixture.active_phase = label
@@ -725,13 +817,24 @@ def _fixture(
         progress_callback=None,
         resource_limits=None,
     ):
-        assert binary == config.pond_binary
         assert pond_config == config.remote_pond_config
         assert timeout_seconds == config.copy_timeout_seconds
         assert progress_callback is not None
         remote_after = fixture.attempts["remote-empty-snapshot"] == 1
         label = "remote-postflight" if remote_after else "remote-empty-snapshot"
         prefix = "final" if remote_after else "empty"
+        _record_pond_phase(
+            fixture,
+            f"{prefix}-snapshot-version",
+            binary,
+            Path(workspace),
+        )
+        _record_pond_phase(
+            fixture,
+            f"{prefix}-corpus-snapshot",
+            binary,
+            Path(workspace),
+        )
         fixture.applied_limits.extend(
             (
                 (f"{prefix}-snapshot-version", resource_limits),
@@ -850,6 +953,7 @@ def _fixture(
         uuid4=lambda: _GENERATION_ID,
         runtime_guard=runtime_guard,
         run_preflight=preflight,
+        pin_pond_executable=pin_pond_executable,
         run_pond_process=run_process,
         capture_pond_snapshot=capture_snapshot,
         latest_receipt=latest_receipt,
@@ -857,6 +961,44 @@ def _fixture(
         now=lambda: datetime(2026, 8, 29, 12, 30, tzinfo=timezone.utc),
     )
     return fixture
+
+
+def _record_pond_phase(
+    fixture: _Fixture,
+    phase: str,
+    executable: object,
+    workspace: Path,
+) -> None:
+    if type(executable) is _PinnedPondExecutable:
+        executable.require_same()
+        artifact = executable.execution_path(workspace)
+        executable.require_same()
+    else:
+        artifact = Path(executable)
+    metadata = artifact.stat(follow_symlinks=False)
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    assert fixture.pond_phase_pins is not None
+    fixture.pond_phase_pins.append((phase, executable, artifact, identity))
+    if fixture.fault == f"binary-swap-after-{phase}":
+        moved = fixture.config.pond_binary.with_name(
+            f"approved-pond-moved-{phase.replace('/', '-')}-private"
+        )
+        fixture.config.pond_binary.rename(moved)
+        marker = fixture.config.pond_binary.with_name("unapproved-executed-private")
+        fixture.config.pond_binary.write_text(
+            f'#!/bin/sh\n/bin/touch "{marker}"\nexit 97\n',
+            encoding="utf-8",
+        )
+        fixture.config.pond_binary.chmod(0o700)
+        fixture.binary_marker = marker
 
 
 def _run(fixture: _Fixture) -> BackupReceipt:
@@ -900,6 +1042,7 @@ def test_production_dependency_construction_is_lazy_and_private() -> None:
         "uuid4",
         "runtime_guard",
         "run_preflight",
+        "pin_pond_executable",
         "run_pond_process",
         "capture_pond_snapshot",
         "latest_receipt",
@@ -1031,6 +1174,63 @@ def test_applied_backup_limits_all_thirteen_processes_and_aggregates_all_peaks(
     assert receipt.peak_rss_bytes == 900
     assert receipt.peak_physical_bytes == 1800
     assert receipt.swap_delta_bytes == 50
+
+
+def test_applied_backup_reuses_one_descriptor_derived_executable_for_all_processes(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    _run(fixture)
+
+    assert fixture.pond_phase_pins is not None
+    assert [phase for phase, *_ in fixture.pond_phase_pins] == list(
+        _POND_PROCESS_PHASES
+    )
+    pins = [pin for _, pin, _, _ in fixture.pond_phase_pins]
+    assert all(type(pin) is _PinnedPondExecutable for pin in pins)
+    assert len({id(pin) for pin in pins}) == 1
+    assert len({path for _, _, path, _ in fixture.pond_phase_pins}) == 1
+    assert len({identity for *_, identity in fixture.pond_phase_pins}) == 1
+    assert pins[0] is fixture.pinned_pond
+    with pytest.raises(PondProcessError, match=r"^binary$"):
+        pins[0].require_same()
+
+
+@pytest.mark.parametrize(
+    ("phase", "category"),
+    [
+        ("before-snapshot-version", "archive backup preflight failed"),
+        ("before-corpus-snapshot", "archive backup preflight failed"),
+        ("before-dry-run", "archive backup storage unavailable"),
+        ("storage-check", "archive backup storage unavailable"),
+        ("empty-snapshot-version", "archive backup storage unavailable"),
+        ("empty-corpus-snapshot", "archive backup copy failed"),
+        ("copy", "archive backup verify failed"),
+        ("verify-only", "archive backup local changed"),
+        ("after-snapshot-version", "archive backup local changed"),
+        ("after-corpus-snapshot", "archive backup local changed"),
+        ("after-dry-run", "archive backup verify failed"),
+        ("final-snapshot-version", "archive backup verify failed"),
+        ("final-corpus-snapshot", "archive backup receipt failed"),
+    ],
+)
+def test_applied_backup_rejects_binary_swap_after_every_retained_process(
+    tmp_path: Path,
+    phase: str,
+    category: str,
+) -> None:
+    fixture = _fixture(tmp_path, fault=f"binary-swap-after-{phase}")
+
+    with pytest.raises(BackupRunError, match=rf"^{category}$"):
+        _run(fixture)
+
+    assert fixture.binary_marker is not None
+    assert not fixture.binary_marker.exists()
+    assert not list(fixture.config.receipt_directory.glob("backup-*.json"))
+    assert fixture.pinned_pond is not None
+    with pytest.raises(PondProcessError, match=r"^binary$"):
+        fixture.pinned_pond.require_same()
 
 
 def test_applied_preflight_eligibility_uses_the_lock_owned_root_during_swaps(
@@ -1206,6 +1406,7 @@ def test_applied_preflight_eligibility_uses_the_lock_owned_root_during_swaps(
         *,
         receipt_directory_descriptor,
         receipt_directory_identity,
+        pond_executable,
         resource_limits=None,
     ):
         result = _run_backup_preflight(
@@ -1213,6 +1414,7 @@ def test_applied_preflight_eligibility_uses_the_lock_owned_root_during_swaps(
             drover_config,
             workspace,
             runtime_guard,
+            pond_executable=pond_executable,
             resource_limits=resource_limits,
             receipt_directory_descriptor=receipt_directory_descriptor,
             receipt_directory_identity=receipt_directory_identity,
@@ -1405,7 +1607,14 @@ def test_runtime_source_eligibility_and_local_mutation_fail_fixed(
 
 @pytest.mark.parametrize(
     "fault",
-    ["remote_missing", "remote_extra", "remote_disallowed", "remote_duplicate"],
+    [
+        "remote_missing",
+        "remote_extra",
+        "remote_disallowed",
+        "remote_duplicate",
+        "prefix-agent-substitution",
+        "prefix-session-substitution",
+    ],
 )
 def test_remote_generation_requires_exact_rows_counts_and_zero_safety_counters(
     tmp_path: Path, fault: str
@@ -1418,6 +1627,23 @@ def test_remote_generation_requires_exact_rows_counts_and_zero_safety_counters(
     assert fixture.attempts["remote-postflight"] == 1
     assert fixture.attempts["receipt-write"] == 0
     assert fixture.written_receipts == []
+
+
+def test_backup_accepts_exact_prefix_inventory_and_binds_it_into_receipt(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, fault="prefix-valid")
+
+    receipt = _run(fixture)
+
+    assert receipt.sessions == 3
+    assert receipt.messages == 3
+    assert receipt.parts == 3
+    assert receipt.local_pond_inventory_sha256 == pond_inventory_content_sha256(
+        _prefix_snapshot().root_inventory
+    )
+    assert receipt.remote_pond_inventory_sha256 == receipt.local_pond_inventory_sha256
+    assert fixture.attempts["receipt-write"] == 1
 
 
 @pytest.mark.parametrize(

@@ -17,8 +17,8 @@ All configured paths must be existing, canonical absolute paths with no
 symlinks. The current operator must own both Pond config files and the backup
 config at mode `0600`, and must own the receipt and eligibility directories at
 mode `0700`. The receipt directory's parent is also private at mode `0700`.
-The local store must be an existing directory. The Pond binary must be
-executable.
+The local store must be an existing directory owned by the current operator at
+exact mode `0700`. The Pond binary must be executable.
 
 Create the private directories outside Git. The angle-bracket values below are
 placeholders, not working values:
@@ -28,6 +28,7 @@ umask 077
 install -d -m 0700 <private-receipt-parent>
 install -d -m 0700 <private-receipt-parent>/<private-receipt-directory-name>
 install -d -m 0700 <private-receipt-directory>/eligibility
+chmod 0700 <absolute-path-to-existing-local-pond-store>
 chmod 0600 <local-pond-config>
 chmod 0600 <isolated-remote-pond-config>
 chmod 0600 <private-backup-config>

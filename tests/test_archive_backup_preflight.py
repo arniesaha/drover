@@ -47,6 +47,7 @@ from drover.server.archive.pond_process import (
     PondProcessResult,
     PondResourceEvidence,
     ResourceLimits,
+    _pin_pond_executable,
 )
 from drover.server.archive.pond_snapshot import PondCorpusCounts, PondStoreSnapshot
 from drover.server.harness import daemon as harness_daemon
@@ -198,9 +199,13 @@ def _root_inventory() -> PondInventory:
     )
 
 
-def _snapshot(*, counts: PondCorpusCounts | None = None) -> PondStoreSnapshot:
+def _snapshot(
+    *,
+    inventory: PondInventory | None = None,
+    counts: PondCorpusCounts | None = None,
+) -> PondStoreSnapshot:
     return PondStoreSnapshot(
-        root_inventory=_root_inventory(),
+        root_inventory=inventory or _root_inventory(),
         counts=counts
         or PondCorpusCounts(
             sessions=2,
@@ -209,6 +214,27 @@ def _snapshot(*, counts: PondCorpusCounts | None = None) -> PondStoreSnapshot:
             disallowed_sessions=0,
             logical_duplicate_groups=0,
             sessions_in_logical_duplicate_groups=0,
+        ),
+    )
+
+
+def _prefix_root_inventory() -> PondInventory:
+    base = _root_inventory()
+    return PondInventory(
+        schema_version=1,
+        captured_at=base.captured_at,
+        pond_version=base.pond_version,
+        records=(
+            base.records[0],
+            PondInventoryRecord(
+                session_id="claude-prefix-private",
+                source_agent="claude-code/1.0.123",
+                created_at="2026-08-29T10:30:00Z",
+                message_count=1,
+                first_message_at="2026-08-29T10:31:00Z",
+                last_message_at="2026-08-29T10:31:00Z",
+            ),
+            base.records[1],
         ),
     )
 
@@ -257,7 +283,7 @@ def _backup_config(tmp_path: Path) -> BackupConfig:
     local_config = _private_file(tmp_path / "local-config-private.toml")
     remote_config = _private_file(tmp_path / "remote-config-private.toml")
     local_store = tmp_path / "pond-store-private"
-    local_store.mkdir()
+    local_store.mkdir(mode=0o700)
     receipts = tmp_path / "receipts-private"
     receipts.mkdir(mode=0o700)
     return BackupConfig(
@@ -434,6 +460,20 @@ def test_archive_package_exports_only_the_completed_preflight_interfaces() -> No
 
     assert expected <= set(archive_package.__all__)
     assert all(hasattr(archive_package, name) for name in expected)
+
+
+def test_preflight_retains_every_allowed_claude_prefix_session(tmp_path: Path) -> None:
+    inventory = _prefix_root_inventory()
+    snapshot = _snapshot(
+        inventory=inventory,
+        counts=PondCorpusCounts(3, 3, 3, 0, 0, 0),
+    )
+
+    result, *_ = _run(tmp_path, snapshot=snapshot)
+
+    assert result.pond_snapshot.root_inventory.records == inventory.records
+    assert result.pond_snapshot.counts.sessions == len(inventory.records)
+    assert result.coverage.ready_for_next_writer is True
 
 
 def test_public_preflight_has_no_dependency_injection_bypass(tmp_path) -> None:
@@ -855,6 +895,58 @@ def test_applied_preflight_uses_only_the_supplied_receipt_root_descriptor(
     assert result.source_not_archive_eligible == 0
 
 
+@pytest.mark.parametrize("mode", [0o755, 0o777])
+def test_applied_preflight_rejects_non_private_local_store_before_pond_reads(
+    tmp_path: Path, mode: int
+) -> None:
+    config = _backup_config(tmp_path)
+    config.local_store.chmod(mode)
+    fixture = _dependencies(tmp_path, config)
+
+    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+        _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _runtime_guard(active=True),
+            dependencies=fixture.dependencies,
+        )
+
+    assert not any(call[0] in {"snapshot", "process"} for call in fixture.calls)
+
+
+def test_applied_preflight_revalidates_local_store_before_dry_run(
+    tmp_path: Path,
+) -> None:
+    config = _backup_config(tmp_path)
+    fixture = _dependencies(tmp_path, config)
+    capture_snapshot = fixture.dependencies.capture_pond_snapshot
+    moved = config.local_store.with_name("moved-local-store-private")
+
+    def capture_then_swap(*args, **kwargs):
+        snapshot = capture_snapshot(*args, **kwargs)
+        config.local_store.rename(moved)
+        config.local_store.mkdir(mode=0o700)
+        return snapshot
+
+    dependencies = replace(
+        fixture.dependencies,
+        capture_pond_snapshot=capture_then_swap,
+    )
+
+    with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+        _run_backup_preflight(
+            config,
+            replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
+            tmp_path / "workspace-private",
+            _runtime_guard(active=True),
+            dependencies=dependencies,
+        )
+
+    assert any(call[0] == "snapshot" for call in fixture.calls)
+    assert not any(call[0] == "process" for call in fixture.calls)
+
+
 def test_applied_preflight_rejects_a_mismatched_receipt_root_identity(
     tmp_path: Path,
 ) -> None:
@@ -931,15 +1023,20 @@ def test_lock_owned_applied_preflight_fails_closed_on_valid_not_ready_coverage(
     )
 
     try:
-        with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
-            _run_backup_preflight_at(
-                config,
-                replace(default_config(), duckdb_path=tmp_path / "ignored.duckdb"),
-                tmp_path / "workspace-private",
-                _runtime_guard(active=True),
-                receipt_directory_descriptor=descriptor,
-                receipt_directory_identity=identity,
-            )
+        with _pin_pond_executable(config.pond_binary) as executable:
+            with pytest.raises(ValueError, match=rf"^{_ERROR}$"):
+                _run_backup_preflight_at(
+                    config,
+                    replace(
+                        default_config(),
+                        duckdb_path=tmp_path / "ignored.duckdb",
+                    ),
+                    tmp_path / "workspace-private",
+                    _runtime_guard(active=True),
+                    receipt_directory_descriptor=descriptor,
+                    receipt_directory_identity=identity,
+                    pond_executable=executable,
+                )
     finally:
         os.close(descriptor)
 

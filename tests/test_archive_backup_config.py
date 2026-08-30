@@ -6,10 +6,12 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 
+import drover.server.archive.backup_config as backup_config_module
 from drover.server.archive.backup_config import (
     BackupConfig,
     generation_storage_url,
@@ -212,6 +214,43 @@ def test_backup_config_rejects_group_readable_pond_configs(tmp_path, target):
     values = _valid_config_values(tmp_path)
     Path(values[target]).chmod(0o640)
     config_path = _write_config(tmp_path / "backup.toml", values)
+
+    with pytest.raises(ValueError, match=r"^archive backup config failed$"):
+        load_backup_config(config_path)
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o777])
+def test_backup_config_rejects_non_private_local_store_modes(tmp_path, mode):
+    values = _valid_config_values(tmp_path)
+    Path(values["local_store"]).chmod(mode)
+    config_path = _write_config(tmp_path / "backup.toml", values)
+
+    with pytest.raises(ValueError, match=r"^archive backup config failed$"):
+        load_backup_config(config_path)
+
+
+def test_backup_config_rejects_local_store_not_owned_by_current_user(
+    tmp_path, monkeypatch
+):
+    values = _valid_config_values(tmp_path)
+    local_store = Path(values["local_store"])
+    config_path = _write_config(tmp_path / "backup.toml", values)
+    real_open = backup_config_module._open_validated_path
+
+    def open_with_wrong_store_owner(path, *, directory):
+        metadata = real_open(path, directory=directory)
+        if path == local_store:
+            return SimpleNamespace(
+                st_mode=metadata.st_mode,
+                st_uid=os.geteuid() + 1,
+            )
+        return metadata
+
+    monkeypatch.setattr(
+        backup_config_module,
+        "_open_validated_path",
+        open_with_wrong_store_owner,
+    )
 
     with pytest.raises(ValueError, match=r"^archive backup config failed$"):
         load_backup_config(config_path)

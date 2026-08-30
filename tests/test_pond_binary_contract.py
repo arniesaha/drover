@@ -229,6 +229,8 @@ def _seed_one_canonical_session(
     )
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     config.chmod(0o600)
+    source_store.mkdir(mode=0o700, exist_ok=True)
+    source_store.chmod(0o700)
 
     sync_directory = _private_directory(tmp_path / "sync-process")
     synced = run_pond_process(
@@ -292,6 +294,8 @@ def test_pinned_binary_copies_verifies_and_restores_one_generation(tmp_path):
     binary = Path(POND_BINARY)
     generation_store = tmp_path / "generation"
     restore_store = tmp_path / "restore"
+    generation_store.mkdir(mode=0o700)
+    restore_store.mkdir(mode=0o700)
 
     with _pin_pond_executable(binary) as executable:
         config, source_store = _seed_one_canonical_session(executable, tmp_path)

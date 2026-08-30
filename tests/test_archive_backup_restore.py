@@ -133,6 +133,24 @@ def _inventory(
     )
 
 
+def _prefix_inventory() -> PondInventory:
+    base = _inventory()
+    return _inventory(
+        records=(
+            base.records[0],
+            PondInventoryRecord(
+                session_id="claude-prefix-private",
+                source_agent="claude-code/1.0.123",
+                created_at="2026-08-29T10:30:00Z",
+                message_count=1,
+                first_message_at="2026-08-29T10:31:00Z",
+                last_message_at="2026-08-29T10:31:00Z",
+            ),
+            base.records[1],
+        )
+    )
+
+
 def _snapshot(
     *,
     inventory: PondInventory | None = None,
@@ -167,7 +185,14 @@ def _native_inventory(
     )
 
 
-def _receipt(config: BackupConfig, *, sessions: int = 2) -> BackupReceipt:
+def _receipt(
+    config: BackupConfig,
+    *,
+    inventory: PondInventory | None = None,
+    sessions: int = 2,
+    messages: int = 3,
+    parts: int = 5,
+) -> BackupReceipt:
     from drover.server.archive.pond_snapshot import pond_inventory_content_sha256
 
     return BackupReceipt(
@@ -179,11 +204,13 @@ def _receipt(config: BackupConfig, *, sessions: int = 2) -> BackupReceipt:
         previous_receipt_sha256=None,
         source_inventory_sha256="1" * 64,
         local_pond_inventory_sha256="2" * 64,
-        remote_pond_inventory_sha256=pond_inventory_content_sha256(_inventory()),
+        remote_pond_inventory_sha256=pond_inventory_content_sha256(
+            inventory or _inventory()
+        ),
         coverage_report_sha256="4" * 64,
         sessions=sessions,
-        messages=3,
-        parts=5,
+        messages=messages,
+        parts=parts,
         source_not_archive_eligible=0,
         collision_counts=CollisionCounts(0, 0, 0, 0),
         copy_duration_ms=10,
@@ -255,9 +282,17 @@ class _Fixture:
 
 def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
     config = _config(tmp_path)
+    prefix_case = fault is not None and fault.startswith("prefix-")
+    receipt_inventory = _prefix_inventory() if prefix_case else _inventory()
     receipt_path = write_backup_receipt(
         config.receipt_directory,
-        _receipt(config),
+        _receipt(
+            config,
+            inventory=receipt_inventory,
+            sessions=3 if prefix_case else 2,
+            messages=4 if prefix_case else 3,
+            parts=6 if prefix_case else 5,
+        ),
     )
     destination_parent = tmp_path / "restore-parent-private"
     destination_parent.mkdir(mode=0o700)
@@ -394,9 +429,31 @@ def _fixture(tmp_path: Path, *, fault: str | None = None) -> _Fixture:
             progress_callback()
             if fault == f"{phase}-resource":
                 raise PondProcessError("resource")
-        inventory = _inventory()
-        counts = PondCorpusCounts(2, 3, 5, 0, 0, 0)
+        inventory = _prefix_inventory() if prefix_case else _inventory()
+        counts = (
+            PondCorpusCounts(3, 4, 6, 0, 0, 0)
+            if prefix_case
+            else PondCorpusCounts(2, 3, 5, 0, 0, 0)
+        )
         resources = PondResourceEvidence(300, 900, 20)
+        if fault in {"prefix-agent-substitution", "prefix-session-substitution"}:
+            prefix = inventory.records[1]
+            changed = replace(
+                prefix,
+                source_agent=(
+                    "claude-code/1.0.124"
+                    if fault == "prefix-agent-substitution"
+                    else prefix.source_agent
+                ),
+                session_id=(
+                    "claude-prefix-replacement-private"
+                    if fault == "prefix-session-substitution"
+                    else prefix.session_id
+                ),
+            )
+            inventory = _inventory(
+                records=(inventory.records[0], changed, inventory.records[2])
+            )
         if fault == "inventory-digest":
             changed = replace(inventory.records[0], created_at="2026-08-29T09:59:00Z")
             inventory = _inventory(records=(changed, inventory.records[1]))
@@ -1126,6 +1183,34 @@ def test_restore_matches_receipt_and_leaves_store_stopped(tmp_path):
         "swap_delta_bytes": 20,
         "store_started": False,
     }
+
+
+def test_restore_accepts_exact_prefix_inventory_bound_by_receipt(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, fault="prefix-valid")
+
+    result = _restore(fixture)
+
+    assert (result.sessions, result.messages, result.parts) == (3, 4, 6)
+    assert result.verified is True
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["prefix-agent-substitution", "prefix-session-substitution"],
+)
+def test_restore_rejects_same_count_prefix_identity_substitution(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    fixture = _fixture(tmp_path, fault=fault)
+
+    with pytest.raises(BackupRestoreError, match=f"^{_RESTORE_ERROR}$"):
+        _restore(fixture)
+
+    assert fixture.attempts["snapshot-corpus"] == 1
+    assert fixture.attempts["runtime-finish"] == 0
 
 
 @pytest.mark.parametrize(
