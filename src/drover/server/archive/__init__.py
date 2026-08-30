@@ -1,5 +1,19 @@
 """Stable archive boundary for optional local Pond recall."""
 
+from drover.server.archive.backup_config import (
+    BackupConfig,
+    generation_storage_url,
+    load_backup_config,
+)
+from drover.server.archive.backup_receipt import (
+    BackupReceipt,
+    CollisionCounts,
+    backup_receipt_summary,
+    latest_backup_receipt,
+    load_backup_receipt,
+    load_backup_receipt_chain,
+    write_backup_receipt,
+)
 from drover.server.archive.coverage import (
     CoverageReport,
     RegistryCandidate,
@@ -23,9 +37,11 @@ from drover.server.archive.inventory import (
     PondInventory,
     PondInventoryRecord,
     SourceEligibilityReceipt,
+    canonical_private_json_bytes,
     load_native_inventory,
     load_pond_inventory,
     load_source_eligibility_receipt,
+    private_json_sha256,
     read_private_json,
     write_private_json,
 )
@@ -72,6 +88,9 @@ __all__ = [
     "ArchiveStorageUnavailable",
     "ArchiveTimeout",
     "ArchiveUnavailable",
+    "BackupConfig",
+    "BackupReceipt",
+    "CollisionCounts",
     "CoverageReport",
     "NativeInventory",
     "NativeInventoryRecord",
@@ -81,17 +100,26 @@ __all__ = [
     "RegistryCandidate",
     "SessionArchive",
     "build_coverage_report",
+    "backup_receipt_summary",
     "assess_metadata_only_source",
     "coverage_summary",
+    "canonical_private_json_bytes",
     "discover_native_history_inventory",
     "export_pond_inventory",
+    "generation_storage_url",
+    "latest_backup_receipt",
+    "load_backup_config",
+    "load_backup_receipt",
+    "load_backup_receipt_chain",
     "load_native_inventory",
     "load_pond_inventory",
     "load_source_eligibility_receipt",
     "load_registry_candidates",
     "native_inventory_summary",
     "pond_inventory_summary",
+    "private_json_sha256",
     "read_private_json",
     "source_eligibility_summary",
     "write_private_json",
+    "write_backup_receipt",
 ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -415,10 +416,16 @@ def _source_eligibility_receipt_from_wire(payload: Any) -> SourceEligibilityRece
     return receipt
 
 
-def _encode_private_json(payload: Any) -> bytes:
+def canonical_private_json_bytes(payload: Any) -> bytes:
+    """Encode one bounded private JSON document in its canonical wire form."""
     try:
         encoded = (
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                payload,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
             + b"\n"
         )
     except (TypeError, ValueError, UnicodeError):
@@ -426,6 +433,11 @@ def _encode_private_json(payload: Any) -> bytes:
     if len(encoded) > MAX_INVENTORY_BYTES:
         raise _error("output", "size")
     return encoded
+
+
+def private_json_sha256(payload: Any) -> str:
+    """Hash exactly the bytes written for a private JSON document."""
+    return hashlib.sha256(canonical_private_json_bytes(payload)).hexdigest()
 
 
 def _private_output_flags() -> int:
@@ -460,7 +472,7 @@ def _write_private_json_at(
     payload: Any,
 ) -> None:
     """Write one private manifest relative to an already-pinned directory."""
-    encoded = _encode_private_json(payload)
+    encoded = canonical_private_json_bytes(payload)
     if (
         not isinstance(name, str)
         or not name
@@ -482,7 +494,7 @@ def _write_private_json_at(
 
 def write_private_json(path: str | os.PathLike[str], payload: Any) -> None:
     """Write a new JSON file that only its owner can read or modify."""
-    encoded = _encode_private_json(payload)
+    encoded = canonical_private_json_bytes(payload)
     try:
         target = os.fspath(path)
         descriptor = os.open(target, _private_output_flags(), 0o600)
