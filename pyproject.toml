@@ -52,7 +52,9 @@ dev = [
     # see roadmap operations/2026-08-18-test-suite-cost-baseline.md.
     "pytest-xdist",
     "black",
-    "isort"
+    # CI installs this extra with pip while local verification uses uv.lock;
+    # keep both on the formatter version that defines the checked import shape.
+    "isort==8.0.1"
 ]
 redis = [
     "redis>=5.0",
