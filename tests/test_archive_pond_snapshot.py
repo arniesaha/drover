@@ -282,7 +282,14 @@ def test_snapshot_uses_exact_sql_and_argument_order_for_local_store(
 
     calls = json.loads(record.read_text(encoding="utf-8"))
     executables = [Path(call[0]) for call in calls]
-    assert all(path.parent == workspace for path in executables)
+    artifact_directories = {path.parent for path in executables}
+    assert len(artifact_directories) == 2
+    assert all(path.parent == workspace for path in artifact_directories)
+    assert all(
+        path.name.startswith(".drover-pond-tool-")
+        and stat.S_IMODE(path.stat().st_mode) == 0o700
+        for path in artifact_directories
+    )
     assert all(
         path.name.startswith(".drover-pond-executable-")
         and stat.S_IMODE(path.stat().st_mode) == 0o500
@@ -691,11 +698,23 @@ def test_snapshot_artifacts_are_private_and_bounded_to_the_supplied_workspace(
     names = {path.name for path in workspace.iterdir()}
     assert "pond-inventory.json" in names
     assert "corpus-snapshot.ndjson" in names
-    assert all(
-        path.is_file()
-        and stat.S_IMODE(path.stat().st_mode)
-        == (0o500 if path.name.startswith(".drover-pond-executable-") else 0o600)
+    artifact_directories = [
+        path
         for path in workspace.iterdir()
+        if path.name.startswith(".drover-pond-tool-")
+    ]
+    assert len(artifact_directories) == 2
+    assert all(
+        (path in artifact_directories and stat.S_IMODE(path.stat().st_mode) == 0o700)
+        or (path.is_file() and stat.S_IMODE(path.stat().st_mode) == 0o600)
+        for path in workspace.iterdir()
+    )
+    assert all(
+        len(children := list(directory.iterdir())) == 1
+        and children[0].name.startswith(".drover-pond-executable-")
+        and children[0].is_file()
+        and stat.S_IMODE(children[0].stat().st_mode) == 0o500
+        for directory in artifact_directories
     )
 
 

@@ -307,7 +307,8 @@ class _PinnedPondExecutable:
             raise ValueError
 
     def _create_execution_artifact(self, directory: Path) -> None:
-        directory_descriptor = -1
+        run_directory_descriptor = -1
+        artifact_directory_descriptor = -1
         writer = -1
         reader = -1
         try:
@@ -318,8 +319,8 @@ class _PinnedPondExecutable:
                 flags |= os.O_NOFOLLOW
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
-            directory_descriptor = os.open(directory, flags)
-            directory_opened = os.fstat(directory_descriptor)
+            run_directory_descriptor = os.open(directory, flags)
+            directory_opened = os.fstat(run_directory_descriptor)
             directory_lexical = os.stat(directory, follow_symlinks=False)
             if (
                 not stat.S_ISDIR(directory_opened.st_mode)
@@ -327,6 +328,38 @@ class _PinnedPondExecutable:
                 or stat.S_IMODE(directory_opened.st_mode) != 0o700
                 or (directory_opened.st_dev, directory_opened.st_ino)
                 != (directory_lexical.st_dev, directory_lexical.st_ino)
+            ):
+                raise ValueError
+            artifact_directory_name = f".drover-pond-tool-{secrets.token_hex(16)}"
+            os.mkdir(
+                artifact_directory_name,
+                0o700,
+                dir_fd=run_directory_descriptor,
+            )
+            artifact_directory_descriptor = os.open(
+                artifact_directory_name,
+                flags,
+                dir_fd=run_directory_descriptor,
+            )
+            os.fchmod(artifact_directory_descriptor, 0o700)
+            artifact_directory_opened = os.fstat(artifact_directory_descriptor)
+            artifact_directory_lexical = os.stat(
+                artifact_directory_name,
+                dir_fd=run_directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(artifact_directory_opened.st_mode)
+                or artifact_directory_opened.st_uid != os.geteuid()
+                or stat.S_IMODE(artifact_directory_opened.st_mode) != 0o700
+                or (
+                    artifact_directory_opened.st_dev,
+                    artifact_directory_opened.st_ino,
+                )
+                != (
+                    artifact_directory_lexical.st_dev,
+                    artifact_directory_lexical.st_ino,
+                )
             ):
                 raise ValueError
             name = f".drover-pond-executable-{secrets.token_hex(16)}"
@@ -339,7 +372,7 @@ class _PinnedPondExecutable:
                 name,
                 create_flags,
                 0o500,
-                dir_fd=directory_descriptor,
+                dir_fd=artifact_directory_descriptor,
             )
             os.fchmod(writer, 0o500)
             source = os.fstat(self._descriptor)
@@ -371,11 +404,11 @@ class _PinnedPondExecutable:
                 read_flags |= os.O_NOFOLLOW
             if hasattr(os, "O_CLOEXEC"):
                 read_flags |= os.O_CLOEXEC
-            reader = os.open(name, read_flags, dir_fd=directory_descriptor)
+            reader = os.open(name, read_flags, dir_fd=artifact_directory_descriptor)
             artifact = os.fstat(reader)
             lexical = os.stat(
                 name,
-                dir_fd=directory_descriptor,
+                dir_fd=artifact_directory_descriptor,
                 follow_symlinks=False,
             )
             identity = _executable_identity(artifact)
@@ -390,21 +423,26 @@ class _PinnedPondExecutable:
             ):
                 raise ValueError
             self._artifact_descriptor = reader
-            self._artifact_directory_descriptor = directory_descriptor
+            self._artifact_directory_descriptor = artifact_directory_descriptor
             self._artifact_directory_identity = (
-                directory_opened.st_dev,
-                directory_opened.st_ino,
-                directory_opened.st_uid,
-                directory_opened.st_gid,
+                artifact_directory_opened.st_dev,
+                artifact_directory_opened.st_ino,
+                artifact_directory_opened.st_uid,
+                artifact_directory_opened.st_gid,
             )
             self._artifact_identity = identity
-            self._artifact_path = directory / name
+            self._artifact_path = directory / artifact_directory_name / name
             reader = -1
-            directory_descriptor = -1
+            artifact_directory_descriptor = -1
         except (OSError, TypeError, ValueError):
             raise PondProcessError("binary") from None
         finally:
-            for descriptor in (reader, writer, directory_descriptor):
+            for descriptor in (
+                reader,
+                writer,
+                artifact_directory_descriptor,
+                run_directory_descriptor,
+            ):
                 if descriptor >= 0:
                     try:
                         os.close(descriptor)
@@ -601,8 +639,8 @@ def _run_pinned_pond_process(
         process: subprocess.Popen[bytes] | None = None
         try:
             binary.require_same()
-            binary.begin_spawn()
             try:
+                binary.begin_spawn()
                 process = subprocess.Popen(
                     (str(binary.path), *arguments_tuple),
                     executable=str(executable),

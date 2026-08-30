@@ -61,6 +61,8 @@ elif mode == "nonzero":
     print("private child stdout")
     print("private child stderr", file=sys.stderr)
     raise SystemExit(17)
+elif mode == "write_immediate":
+    Path(os.environ["FAKE_IMMEDIATE_OUTPUT"]).write_text("created", encoding="utf-8")
 elif mode == "overflow_stdout":
     sys.stdout.buffer.write(b"x" * (32 * 1024 * 1024 + 1))
     sys.stdout.buffer.flush()
@@ -172,7 +174,8 @@ def test_runner_uses_the_pinned_private_artifact_directly_in_a_new_process_group
     assert calls[0]["argv"][1:] == ["inspect", _PRIVATE_REMOTE]
     assert calls[0]["secret"] == _PRIVATE_ENVIRONMENT
     artifact = Path(calls[0]["argv"][0])
-    assert artifact.parent == run_directory
+    assert artifact.parent.parent == run_directory
+    assert artifact.parent.name.startswith(".drover-pond-tool-")
     assert artifact.name.startswith(".drover-pond-executable-")
     assert stat.S_IMODE(artifact.stat().st_mode) == 0o500
     assert observation["argv"] == calls[0]["argv"]
@@ -183,7 +186,41 @@ def test_runner_uses_the_pinned_private_artifact_directly_in_a_new_process_group
     assert stat.S_IMODE(result.stderr_path.stat().st_mode) == 0o600
 
 
-def test_runner_removes_artifact_parent_write_permission_during_spawn(
+def test_runner_keeps_output_directory_writable_during_spawn_handshake(
+    fake_pond: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary, record = fake_pond
+    run_directory = tmp_path / "immediate-output-run"
+    immediate_output = run_directory / "immediate-output.json"
+    real_popen = subprocess.Popen
+
+    def await_immediate_output(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        deadline = time.monotonic() + 1
+        while not immediate_output.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(pond_process_module.subprocess, "Popen", await_immediate_output)
+
+    result = run_pond_process(
+        binary,
+        ("write_immediate",),
+        timeout_seconds=5,
+        run_directory=run_directory,
+        label="copy",
+        env=_environment(record, FAKE_IMMEDIATE_OUTPUT=str(immediate_output)),
+        resource_sampler=lambda _process_group: ResourceSample(1, 2, 3),
+    )
+
+    assert result.returncode == 0
+    assert immediate_output.read_text(encoding="utf-8") == "created"
+    assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
+
+
+def test_runner_hardens_only_the_artifact_directory_during_spawn(
     fake_pond: tuple[Path, Path],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,10 +229,14 @@ def test_runner_removes_artifact_parent_write_permission_during_spawn(
     run_directory = tmp_path / "protected-spawn-run"
     real_popen = subprocess.Popen
     parent_modes: list[int] = []
+    run_modes: list[int] = []
+    artifact_directories: list[Path] = []
 
     def record_parent_mode(*args, **kwargs):
         artifact = Path(kwargs["executable"])
+        artifact_directories.append(artifact.parent)
         parent_modes.append(stat.S_IMODE(artifact.parent.stat().st_mode))
+        run_modes.append(stat.S_IMODE(run_directory.stat().st_mode))
         return real_popen(*args, **kwargs)
 
     monkeypatch.setattr(pond_process_module.subprocess, "Popen", record_parent_mode)
@@ -212,7 +253,109 @@ def test_runner_removes_artifact_parent_write_permission_during_spawn(
 
     assert result.returncode == 0
     assert parent_modes == [0o500]
+    assert run_modes == [0o700]
+    assert len(artifact_directories) == 1
+    assert artifact_directories[0].parent == run_directory
+    assert artifact_directories[0].name.startswith(".drover-pond-tool-")
+    assert stat.S_IMODE(artifact_directories[0].stat().st_mode) == 0o700
     assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
+
+
+def test_runner_restores_and_closes_artifact_directory_after_partial_begin_failure(
+    fake_pond: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary, record = fake_pond
+    run_directory = tmp_path / "partial-begin-run"
+    original = (
+        pond_process_module._PinnedPondExecutable._require_artifact_directory_mode
+    )
+    captured: list[tuple[int, Path]] = []
+
+    def fail_after_hardening(self, mode):
+        if mode == 0o500:
+            captured.append(
+                (self._artifact_directory_descriptor, self._artifact_path.parent)
+            )
+            raise OSError("private injected begin failure")
+        return original(self, mode)
+
+    monkeypatch.setattr(
+        pond_process_module._PinnedPondExecutable,
+        "_require_artifact_directory_mode",
+        fail_after_hardening,
+    )
+
+    with pytest.raises(PondProcessError, match=r"^binary$"):
+        run_pond_process(
+            binary,
+            ("inspect",),
+            timeout_seconds=5,
+            run_directory=run_directory,
+            label="copy",
+            env=_environment(record),
+        )
+
+    assert len(captured) == 1
+    descriptor, artifact_directory = captured[0]
+    assert stat.S_IMODE(run_directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(artifact_directory.stat().st_mode) == 0o700
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert not record.exists()
+
+
+def test_runner_restores_and_closes_artifact_directory_after_popen_error(
+    fake_pond: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary, record = fake_pond
+    run_directory = tmp_path / "popen-error-run"
+    captured: list[tuple[int, Path, int, int]] = []
+    original = pond_process_module._PinnedPondExecutable.begin_spawn
+
+    def capture_hardened_directory(self):
+        original(self)
+        captured.append(
+            (
+                self._artifact_directory_descriptor,
+                self._artifact_path.parent,
+                stat.S_IMODE(self._artifact_path.parent.stat().st_mode),
+                stat.S_IMODE(run_directory.stat().st_mode),
+            )
+        )
+
+    monkeypatch.setattr(
+        pond_process_module._PinnedPondExecutable,
+        "begin_spawn",
+        capture_hardened_directory,
+    )
+    monkeypatch.setattr(
+        pond_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("private injected")),
+    )
+
+    with pytest.raises(PondProcessError, match=r"^subprocess$"):
+        run_pond_process(
+            binary,
+            ("inspect",),
+            timeout_seconds=5,
+            run_directory=run_directory,
+            label="copy",
+            env=_environment(record),
+        )
+
+    assert len(captured) == 1
+    descriptor, artifact_directory, artifact_mode, run_mode = captured[0]
+    assert artifact_mode == 0o500
+    assert run_mode == 0o700
+    assert stat.S_IMODE(artifact_directory.stat().st_mode) == 0o700
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert not record.exists()
 
 
 def test_retained_executable_pin_detects_a_swap_restore_during_process(
@@ -306,7 +449,8 @@ def test_retained_executable_never_runs_a_path_swapped_at_spawn(
     assert calls[0]["argv"][1:] == ["inspect", _PRIVATE_REMOTE]
     assert calls[0]["secret"] == _PRIVATE_ENVIRONMENT
     artifact = Path(calls[0]["argv"][0])
-    assert artifact.parent == tmp_path / "spawn-pin-run"
+    assert artifact.parent.parent == tmp_path / "spawn-pin-run"
+    assert artifact.parent.name.startswith(".drover-pond-tool-")
     assert artifact.name.startswith(".drover-pond-executable-")
     assert stat.S_IMODE(artifact.stat().st_mode) == 0o500
 

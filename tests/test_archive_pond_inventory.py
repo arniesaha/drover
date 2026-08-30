@@ -284,9 +284,17 @@ def test_export_uses_exact_pinned_cli_contract_and_private_staging_target(
     snapshot_path = Path(calls[1]["argv"][2])
     executables = [Path(call["argv"][0]) for call in calls]
     assert len(set(executables)) == 3
-    assert len({path.parent for path in executables}) == 1
+    artifact_directories = {path.parent for path in executables}
+    assert len(artifact_directories) == 3
+    assert len({path.parent for path in artifact_directories}) == 1
     assert all(
-        path.name.startswith(".drover-pond-executable-") and not path.exists()
+        path.name.startswith(".drover-pond-tool-") and not path.exists()
+        for path in artifact_directories
+    )
+    assert all(
+        path.name.startswith(".drover-pond-executable-")
+        and path.parent in artifact_directories
+        and not path.exists()
         for path in executables
     )
     assert calls[0]["argv"][1:] == ["--version"]
