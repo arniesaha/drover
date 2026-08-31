@@ -469,6 +469,7 @@ struct ClientTests {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/insights")
         #expect(request.url?.query == "state=open&severity=high&confidence=confirmed&analyzer_class=deterministic&host=mac-mini&harness=codex&target_type=hook&target_id=mac-mini%2Fcodex%2Fpre%20tool&cursor=rank%2Btime%2Fnext%3D&limit=25")
+        #expect(request.timeoutInterval == 60)
         let cursorItems = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
             .queryItems?.filter { $0.name == "cursor" }
         #expect(cursorItems?.count == 1)
@@ -501,6 +502,7 @@ struct ClientTests {
         seen.append("\(request.httpMethod ?? "") \(encodedPath) \(bodyText)")
         switch encodedPath {
         case "/insights/finding%2Fone":
+            #expect(request.timeoutInterval == 60)
             return (200, insightDetailJSON)
         case "/insights/finding%2Fone/acknowledge", "/insights/finding%2Fone/dismiss":
             return (200, insightMutationJSON)

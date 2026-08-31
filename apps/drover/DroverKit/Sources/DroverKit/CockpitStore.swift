@@ -537,7 +537,9 @@ public final class CockpitStore {
         } catch {
             guard generation == insightsGeneration else { return }
             guard !Self.isCancellation(error) else { return }
-            insightsError = Self.errorMessage(error)
+            insightsError = Self.isTimeout(error)
+                ? "The hub is still waking up. Pull to refresh to try again."
+                : Self.errorMessage(error)
         }
     }
 
@@ -577,7 +579,9 @@ public final class CockpitStore {
                   insightFilters == baseFilters,
                   nextInsightsCursor == cursor else { return }
             guard !Self.isCancellation(error) else { return }
-            insightsError = Self.errorMessage(error)
+            insightsError = Self.isTimeout(error)
+                ? "The hub is still waking up. Pull to refresh to try again."
+                : Self.errorMessage(error)
         }
     }
 
@@ -669,6 +673,15 @@ public final class CockpitStore {
     private nonisolated static func isCancellation(_ error: Error) -> Bool {
         if let droverError = error as? DroverError { return droverError.isCancellation }
         return (error as? URLError)?.code == .cancelled || error is CancellationError
+    }
+
+    /// True for a request that ran past its deadline. Checks `DroverError`
+    /// first (what the real client throws, via `DroverClient.send`'s
+    /// `.timedOut` normalization) and falls back to a raw `URLError` for
+    /// test doubles that throw one directly.
+    private nonisolated static func isTimeout(_ error: Error) -> Bool {
+        if let droverError = error as? DroverError { return droverError.isTimeout }
+        return (error as? URLError)?.code == .timedOut
     }
 
     private nonisolated static func errorMessage(_ error: Error) -> String {
