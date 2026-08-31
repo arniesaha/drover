@@ -531,6 +531,7 @@ CREATE TABLE IF NOT EXISTS advisory_findings (
   dismissed_at            TIMESTAMPTZ,
   regressed_at            TIMESTAMPTZ,
   evaluated_content_hash  VARCHAR,
+  regression_count        INTEGER NOT NULL DEFAULT 0,
   latest_run_id           VARCHAR NOT NULL
 );
 """
@@ -1559,6 +1560,17 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         con.execute(_LIVE_SESSION_RECAPS_DDL)
         con.execute(_LIVE_RECAP_JOBS_DDL)
         bootstrap_harness_tables(con)
+        con.execute(_ADVISORY_FINDINGS_DDL)
+        con.execute(_ADVISORY_OCCURRENCES_DDL)
+        _ensure_table_columns(
+            con,
+            "advisory_findings",
+            {"regression_count": "INTEGER DEFAULT 0"},
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_advisory_findings_list "
+            "ON advisory_findings (state, severity, last_seen_at)"
+        )
     return registry_path
 
 
@@ -1917,8 +1929,6 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_JOB_ATTEMPTS_DDL)
         con.execute(_PIPELINE_ARTIFACTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
-        con.execute(_ADVISORY_FINDINGS_DDL)
-        con.execute(_ADVISORY_OCCURRENCES_DDL)
         bootstrap_control_plane_store(duckdb_path)
         migrate_control_plane_tables(con, duckdb_path)
         con.execute(_agent_events_view(parquet_dir))
