@@ -2338,7 +2338,7 @@ def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
         db_path,
         "deterministic.connector_freshness",
         "fleet",
-        analyzed_at=NOW + timedelta(minutes=17),
+        analyzed_at=NOW + timedelta(hours=7),
     )
     with duckdb.connect(str(db_path)) as con:
         con.execute(
@@ -2349,7 +2349,7 @@ def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
         db_path,
         "deterministic.connector_freshness",
         "fleet",
-        analyzed_at=NOW + timedelta(minutes=17),
+        analyzed_at=NOW + timedelta(hours=7),
     )
 
     assert heartbeat == first
@@ -2695,6 +2695,15 @@ def test_check_again_scopes_provider_finding_to_host_and_executes_current_facts(
             """,
             [NOW, NOW],
         )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_hosts (
+          host_id, display_name, kind, status, capabilities_json, last_seen_at, updated_at
+        ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', '{}', ?, ?)
+        """,
+        [NOW, NOW],
+    )
     repository = AdvisoryRepository(db_path)
     finding = repository.observe(
         FindingCandidate(

@@ -1139,16 +1139,19 @@ def _optional_aware(value: datetime | None) -> datetime | None:
 
 def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
     where, params = _host_filter(target_id)
+    provider_where, provider_params = _host_filter(target_id, alias="p")
     rows = con.execute(
         f"""
-        SELECT provider, account_label, host_id, enabled, last_attempt_at,
-               last_success_at, error_category, updated_at
-        FROM provider_connections
-        {where}
-        ORDER BY host_id, provider, account_label
+        SELECT p.provider, p.account_label, p.host_id, p.enabled,
+               p.last_attempt_at, p.last_success_at, p.error_category,
+               p.updated_at, CAST(hh.last_seen_at AS TIMESTAMPTZ)
+        FROM provider_connections p
+        LEFT JOIN harness_hosts hh ON hh.host_id = p.host_id
+        {provider_where}
+        ORDER BY p.host_id, p.provider, p.account_label
         LIMIT {MAX_SNAPSHOT_RECORDS}
         """,
-        params,
+        provider_params,
     ).fetchall()
     windows = con.execute(
         f"""
@@ -1220,6 +1223,7 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
                 (str(row[0]), str(row[1]), str(row[2])), False
             ),
             source_ref=f"provider_connections:{row[2]}/{row[0]}/{row[1]}",
+            host_last_seen_at=_optional_aware(row[8]),
         )
         for row in rows
     )

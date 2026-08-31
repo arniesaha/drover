@@ -61,6 +61,7 @@ def _provider(**overrides: object) -> ProviderConnectionObservation:
         "reset_windows": (),
         "reset_windows_complete": True,
         "source_ref": "provider_connections:openai/personal/mac-mini",
+        "host_last_seen_at": NOW - timedelta(minutes=1),
     }
     values.update(overrides)
     return ProviderConnectionObservation(**values)  # type: ignore[arg-type]
@@ -116,6 +117,7 @@ def test_stale_connector_is_confirmed_high_with_exact_age() -> None:
         "maximum_age_seconds": 900,
         "enabled": True,
         "status": "ok",
+        "host_last_seen_age_seconds": 60,
     }
     assert finding.remediation == (
         "Refresh the openai connector for account personal on host mac-mini, then run Check Again.",
@@ -130,7 +132,7 @@ def test_connector_error_reports_classification_and_attempt_age() -> None:
                 error_category="authentication",
                 observed_at=NOW,
                 last_attempt_at=NOW - timedelta(seconds=30),
-                last_success_at=NOW - timedelta(minutes=2),
+                last_success_at=NOW - timedelta(hours=1),
             ),
         )
     )
@@ -143,9 +145,10 @@ def test_connector_error_reports_classification_and_attempt_age() -> None:
     assert error.evidence[0].fields == {
         "error_category": "authentication",
         "attempt_age_seconds": 30,
-        "last_success_age_seconds": 120,
+        "last_success_age_seconds": 3600,
         "enabled": True,
         "status": "error",
+        "host_last_seen_age_seconds": 60,
     }
     assert "Review the authentication error" in error.remediation[0]
 
@@ -168,6 +171,55 @@ def test_provider_stale_status_is_a_finding_even_before_age_threshold() -> None:
 
     assert [item.rule_id for item in findings] == ["connector.stale"]
     assert findings[0].evidence[0].fields["age_seconds"] == 0
+
+
+def test_offline_host_produces_no_connector_findings() -> None:
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                status="error",
+                error_category="protocol_error",
+                last_success_at=NOW - timedelta(days=2),
+                host_last_seen_at=NOW - timedelta(hours=3),
+            ),
+        )
+    )
+    assert ConnectorFreshnessAnalyzer().analyze(snapshot) == []
+
+
+def test_error_right_after_a_success_stays_silent() -> None:
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                status="error",
+                error_category="unavailable",
+                last_success_at=NOW - timedelta(minutes=5),
+            ),
+        )
+    )
+    findings = ConnectorFreshnessAnalyzer().analyze(snapshot)
+    assert [f.rule_id for f in findings] == []
+
+
+def test_persistent_error_fires_with_default_thresholds() -> None:
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                status="error",
+                error_category="protocol_error",
+                last_success_at=NOW - timedelta(days=17),
+            ),
+        )
+    )
+    rules = [f.rule_id for f in ConnectorFreshnessAnalyzer().analyze(snapshot)]
+    assert rules == ["connector.error", "connector.stale"]
+
+
+def test_stale_default_is_six_hours() -> None:
+    snapshot = _snapshot(
+        providers=(_provider(last_success_at=NOW - timedelta(hours=2)),)
+    )
+    assert ConnectorFreshnessAnalyzer().analyze(snapshot) == []
 
 
 def test_contradictory_provider_reset_window_is_confirmed() -> None:
