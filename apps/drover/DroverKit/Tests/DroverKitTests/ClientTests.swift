@@ -491,6 +491,43 @@ struct ClientTests {
     ))
 }
 
+// Regression: DroverClient.send() wraps every URLSession error into
+// DroverError.transport before it reaches a caller, the same way it already
+// does for `.cancelled` (see StoreTests.swift's
+// `cancelledRefreshIsNotTreatedAsUnreachable`). Both new CockpitStore tests
+// for the waking-up copy go through `CockpitClientStub`, which throws its
+// injected error directly and never touches `send()` — so they cannot catch
+// a typo in the real `.timedOut` branch there. This test drives a genuine
+// `URLError(.timedOut)` through the real client to close that gap.
+@Test func insightsTimeoutIsWrappedAsADroverErrorTimeout() async throws {
+    MockURLProtocol.transportError = URLError(.timedOut)
+    defer { MockURLProtocol.transportError = nil }
+
+    do {
+        _ = try await client().insights(filters: InsightFilters())
+        Issue.record("expected insights() to throw")
+    } catch {
+        #expect(error as? DroverError == DroverError.transport(DroverError.timeoutDetail))
+        #expect((error as? DroverError)?.isTimeout == true)
+    }
+}
+
+// Same gap, one layer up: proves the real DroverClient's `.timedOut` mapping
+// actually reaches CockpitStore.loadInsights and produces the cold-hub copy,
+// rather than only the CockpitClientStub-based tests in CockpitStoreTests.swift.
+@Test @MainActor func insightsTimeoutThroughTheRealClientShowsWakingUpCopy() async throws {
+    let store = CockpitStore(client: client())
+    store.updateCapability(from: try HarnessSnapshot.decode(from: Data(
+        #"{"hosts":[],"sessions":[],"cockpit_api_version":1,"cockpit_sections":["insights"]}"#.utf8
+    )))
+    MockURLProtocol.transportError = URLError(.timedOut)
+    defer { MockURLProtocol.transportError = nil }
+
+    await store.loadInsights()
+
+    #expect(store.insightsError == "The hub is still waking up. Pull to refresh to try again.")
+}
+
 @Test func insightLifecycleAndPrivacyRoutesUseExpectedBodies() async throws {
     let seen = RequestLog()
     MockURLProtocol.handler = { request in
