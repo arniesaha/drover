@@ -22,7 +22,7 @@ from drover.server.advisory.types import (
     JSONValue,
     Severity,
 )
-from drover.server.db import open_duckdb_connection
+from drover.server.db import control_plane_connection, open_duckdb_connection
 
 MAX_EXCERPT_CHARS = 512
 MAX_EVIDENCE_RECORDS = 16
@@ -66,16 +66,14 @@ class AdvisoryRepository:
         self.duckdb_path = Path(duckdb_path)
 
     def observe(self, candidate: FindingCandidate, *, run_id: str) -> Finding:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            finding_id = self.observe_in_transaction(con, candidate, run_id=run_id)
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+        with control_plane_connection(self.duckdb_path) as con:
+            try:
+                con.execute("BEGIN TRANSACTION")
+                finding_id = self.observe_in_transaction(con, candidate, run_id=run_id)
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return self.get_finding(finding_id)
 
     def observe_in_transaction(
@@ -103,7 +101,8 @@ class AdvisoryRepository:
         )
         observed_at = max(item[0].observed_at for item in normalized)
         row = con.execute(
-            "SELECT finding_id, state, severity, evaluated_content_hash "
+            "SELECT finding_id, state, severity, evaluated_content_hash, "
+            "regressed_at, regression_count "
             "FROM advisory_findings WHERE fingerprint = ?",
             [fingerprint],
         ).fetchone()
@@ -153,6 +152,17 @@ class AdvisoryRepository:
                 material_hash=material_hash,
             )
             regressed_at = observed_at if old_state == FindingState.RESOLVED else None
+            previous_regressed_at = row[4]
+            previous_count = int(row[5] or 0)
+            if old_state == FindingState.RESOLVED:
+                recent = (
+                    previous_regressed_at is not None
+                    and (observed_at - _aware_ts(previous_regressed_at)).total_seconds()
+                    < 86400
+                )
+                regression_count = previous_count + 1 if recent else 1
+            else:
+                regression_count = previous_count
             clear_dismissal = (
                 old_state == FindingState.DISMISSED and state == FindingState.OPEN
             )
@@ -165,6 +175,7 @@ class AdvisoryRepository:
                   dismissed_at = CASE WHEN ? THEN NULL ELSE dismissed_at END,
                   resolved_at = CASE WHEN ? THEN NULL ELSE resolved_at END,
                   regressed_at = COALESCE(?, regressed_at),
+                  regression_count = ?,
                   last_seen_at = ?, evaluated_content_hash = ?, latest_run_id = ?
                 WHERE finding_id = ?
                 """,
@@ -180,6 +191,7 @@ class AdvisoryRepository:
                     clear_dismissal,
                     old_state == FindingState.RESOLVED,
                     regressed_at,
+                    regression_count,
                     observed_at,
                     candidate.content_hash,
                     run_id,
@@ -196,16 +208,14 @@ class AdvisoryRepository:
         return finding_id
 
     def mark_passing(self, finding_id: str, *, run_id: str) -> Finding:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            self.mark_passing_in_transaction(con, finding_id, run_id=run_id)
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+        with control_plane_connection(self.duckdb_path) as con:
+            try:
+                con.execute("BEGIN TRANSACTION")
+                self.mark_passing_in_transaction(con, finding_id, run_id=run_id)
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return self.get_finding(finding_id)
 
     def mark_passing_in_transaction(
@@ -221,14 +231,31 @@ class AdvisoryRepository:
             raise ValueError("run_id is required")
         now = datetime.now(timezone.utc)
         self._require_finding(con, finding_id)
-        con.execute(
-            """
-            UPDATE advisory_findings
-            SET state = ?, resolved_at = ?, latest_run_id = ?
-            WHERE finding_id = ?
-            """,
-            [FindingState.RESOLVED.value, now, run_id, finding_id],
+        row = con.execute(
+            "SELECT regression_count, regressed_at FROM advisory_findings "
+            "WHERE finding_id = ?",
+            [finding_id],
+        ).fetchone()
+        flapping = (
+            row is not None
+            and int(row[0] or 0) >= 3
+            and row[1] is not None
+            and (now - _aware_ts(row[1])).total_seconds() < 86400
         )
+        if flapping:
+            con.execute(
+                "UPDATE advisory_findings SET latest_run_id = ? WHERE finding_id = ?",
+                [run_id, finding_id],
+            )
+        else:
+            con.execute(
+                """
+                UPDATE advisory_findings
+                SET state = ?, resolved_at = ?, latest_run_id = ?
+                WHERE finding_id = ?
+                """,
+                [FindingState.RESOLVED.value, now, run_id, finding_id],
+            )
         con.execute(
             """
             INSERT INTO advisory_occurrences (
@@ -261,29 +288,19 @@ class AdvisoryRepository:
         )
 
     def list_findings(self) -> list[Finding]:
-        con = open_duckdb_connection(
-            self.duckdb_path, read_only=True, role="diagnostic"
-        )
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             rows = con.execute(
                 f"SELECT {_FINDING_COLUMNS} FROM advisory_findings "
                 "ORDER BY last_seen_at DESC, finding_id"
             ).fetchall()
-        finally:
-            con.close()
         return [_finding_from_row(row) for row in rows]
 
     def get_finding(self, finding_id: str) -> Finding:
-        con = open_duckdb_connection(
-            self.duckdb_path, read_only=True, role="diagnostic"
-        )
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             row = con.execute(
                 f"SELECT {_FINDING_COLUMNS} FROM advisory_findings WHERE finding_id = ?",
                 [finding_id],
             ).fetchone()
-        finally:
-            con.close()
         if row is None:
             raise KeyError(f"finding {finding_id!r} not found")
         return _finding_from_row(row)
@@ -354,42 +371,42 @@ class AdvisoryRepository:
         state: FindingState,
         reason: str | None = None,
     ) -> Finding:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            current = FindingState(self._require_finding(con, finding_id)[0])
-            if current not in allowed:
-                raise ValueError(
-                    f"cannot {state.value} finding in {current.value} state"
-                )
-            now = datetime.now(timezone.utc)
-            row = con.execute(
-                f"""
-                UPDATE advisory_findings
-                SET state = ?, dismissal_reason = ?,
-                    dismissed_at = CASE WHEN ? = 'dismissed' THEN ? ELSE dismissed_at END
-                WHERE finding_id = ? AND state = ?
-                RETURNING {_FINDING_COLUMNS}
-                """,
-                [state.value, reason, state.value, now, finding_id, current.value],
-            ).fetchone()
-            if row is None:
-                raise ValueError("finding state changed during lifecycle transition")
-            con.execute("COMMIT")
-            return _finding_from_row(row)
-        except duckdb.TransactionException as exc:
+        with control_plane_connection(self.duckdb_path) as con:
             try:
+                con.execute("BEGIN TRANSACTION")
+                current = FindingState(self._require_finding(con, finding_id)[0])
+                if current not in allowed:
+                    raise ValueError(
+                        f"cannot {state.value} finding in {current.value} state"
+                    )
+                now = datetime.now(timezone.utc)
+                row = con.execute(
+                    f"""
+                    UPDATE advisory_findings
+                    SET state = ?, dismissal_reason = ?,
+                        dismissed_at = CASE WHEN ? = 'dismissed' THEN ? ELSE dismissed_at END
+                    WHERE finding_id = ? AND state = ?
+                    RETURNING {_FINDING_COLUMNS}
+                    """,
+                    [state.value, reason, state.value, now, finding_id, current.value],
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        "finding state changed during lifecycle transition"
+                    )
+                con.execute("COMMIT")
+                return _finding_from_row(row)
+            except duckdb.TransactionException as exc:
+                try:
+                    con.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+                raise ValueError(
+                    "finding state changed during lifecycle transition"
+                ) from exc
+            except Exception:
                 con.execute("ROLLBACK")
-            except duckdb.Error:
-                pass
-            raise ValueError(
-                "finding state changed during lifecycle transition"
-            ) from exc
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+                raise
 
     @staticmethod
     def _require_finding(
@@ -409,6 +426,10 @@ analyzer_class, severity, confidence, title, impact, remediation_json, state,
 dismissal_reason, first_seen_at, last_seen_at, resolved_at, dismissed_at,
 regressed_at, evaluated_content_hash, latest_run_id
 """
+
+
+def _aware_ts(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _finding_from_row(row: Sequence[Any]) -> Finding:

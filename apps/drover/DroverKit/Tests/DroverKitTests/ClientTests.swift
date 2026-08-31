@@ -469,6 +469,7 @@ struct ClientTests {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/insights")
         #expect(request.url?.query == "state=open&severity=high&confidence=confirmed&analyzer_class=deterministic&host=mac-mini&harness=codex&target_type=hook&target_id=mac-mini%2Fcodex%2Fpre%20tool&cursor=rank%2Btime%2Fnext%3D&limit=25")
+        #expect(request.timeoutInterval == 60)
         let cursorItems = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
             .queryItems?.filter { $0.name == "cursor" }
         #expect(cursorItems?.count == 1)
@@ -490,6 +491,43 @@ struct ClientTests {
     ))
 }
 
+// Regression: DroverClient.send() wraps every URLSession error into
+// DroverError.transport before it reaches a caller, the same way it already
+// does for `.cancelled` (see StoreTests.swift's
+// `cancelledRefreshIsNotTreatedAsUnreachable`). Both new CockpitStore tests
+// for the waking-up copy go through `CockpitClientStub`, which throws its
+// injected error directly and never touches `send()` — so they cannot catch
+// a typo in the real `.timedOut` branch there. This test drives a genuine
+// `URLError(.timedOut)` through the real client to close that gap.
+@Test func insightsTimeoutIsWrappedAsADroverErrorTimeout() async throws {
+    MockURLProtocol.transportError = URLError(.timedOut)
+    defer { MockURLProtocol.transportError = nil }
+
+    do {
+        _ = try await client().insights(filters: InsightFilters())
+        Issue.record("expected insights() to throw")
+    } catch {
+        #expect(error as? DroverError == DroverError.transport(DroverError.timeoutDetail))
+        #expect((error as? DroverError)?.isTimeout == true)
+    }
+}
+
+// Same gap, one layer up: proves the real DroverClient's `.timedOut` mapping
+// actually reaches CockpitStore.loadInsights and produces the cold-hub copy,
+// rather than only the CockpitClientStub-based tests in CockpitStoreTests.swift.
+@Test @MainActor func insightsTimeoutThroughTheRealClientShowsWakingUpCopy() async throws {
+    let store = CockpitStore(client: client())
+    store.updateCapability(from: try HarnessSnapshot.decode(from: Data(
+        #"{"hosts":[],"sessions":[],"cockpit_api_version":1,"cockpit_sections":["insights"]}"#.utf8
+    )))
+    MockURLProtocol.transportError = URLError(.timedOut)
+    defer { MockURLProtocol.transportError = nil }
+
+    await store.loadInsights()
+
+    #expect(store.insightsError == "The hub is still waking up. Pull to refresh to try again.")
+}
+
 @Test func insightLifecycleAndPrivacyRoutesUseExpectedBodies() async throws {
     let seen = RequestLog()
     MockURLProtocol.handler = { request in
@@ -501,6 +539,7 @@ struct ClientTests {
         seen.append("\(request.httpMethod ?? "") \(encodedPath) \(bodyText)")
         switch encodedPath {
         case "/insights/finding%2Fone":
+            #expect(request.timeoutInterval == 60)
             return (200, insightDetailJSON)
         case "/insights/finding%2Fone/acknowledge", "/insights/finding%2Fone/dismiss":
             return (200, insightMutationJSON)

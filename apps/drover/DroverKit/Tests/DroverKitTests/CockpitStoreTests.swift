@@ -312,6 +312,30 @@ struct CockpitStoreTests {
         #expect(await client.requestedCursors == [nil, "page-2"])
     }
 
+    @Test @MainActor func insightsTimeoutShowsWakingUpCopy() async throws {
+        let client = CockpitClientStub(insightsError: URLError(.timedOut))
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        await store.loadInsights()
+
+        #expect(store.insightsError == "The hub is still waking up. Pull to refresh to try again.")
+    }
+
+    @Test @MainActor func loadMoreInsightsTimeoutShowsWakingUpCopy() async throws {
+        let client = CockpitClientStub(
+            insightPages: [try decodeInsightPage(ids: ["one"], nextCursor: "page-2")]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadInsights()
+        await client.setInsightsError(URLError(.timedOut))
+
+        await store.loadMoreInsights()
+
+        #expect(store.insightsError == "The hub is still waking up. Pull to refresh to try again.")
+    }
+
     @Test @MainActor func newerInsightFilterCancelsAndIgnoresOlderCompletion() async throws {
         let client = CockpitClientStub(
             insightsByHost: [
@@ -837,6 +861,7 @@ private actor CockpitClientStub: CockpitClient {
     private let insightsByCursor: [String: InsightPage]
     private let insightCursorDelays: [String: Duration]
     private let failingInsightHosts: Set<String>
+    private var insightsError: (any Error & Sendable)?
 
     private(set) var overviewRequestCount = 0
     private(set) var analyticsRequestCount = 0
@@ -867,6 +892,7 @@ private actor CockpitClientStub: CockpitClient {
         insightsByCursor: [String: InsightPage] = [:],
         insightCursorDelays: [String: Duration] = [:],
         failingInsightHosts: Set<String> = [],
+        insightsError: (any Error & Sendable)? = nil,
         acknowledgedFinding: InsightFinding? = nil,
         lifecycleError: DroverError? = nil,
         lifecycleDelay: Duration = .zero,
@@ -889,6 +915,7 @@ private actor CockpitClientStub: CockpitClient {
         self.insightsByCursor = insightsByCursor
         self.insightCursorDelays = insightCursorDelays
         self.failingInsightHosts = failingInsightHosts
+        self.insightsError = insightsError
         self.acknowledgedFinding = acknowledgedFinding
         self.lifecycleError = lifecycleError
         self.lifecycleDelay = lifecycleDelay
@@ -899,6 +926,8 @@ private actor CockpitClientStub: CockpitClient {
     }
 
     func setError(_ error: DroverError?) { refreshError = error }
+
+    func setInsightsError(_ error: (any Error & Sendable)?) { insightsError = error }
 
     func cockpitOverview(days: Int) async throws -> CockpitOverview {
         overviewRequestCount += 1
@@ -931,6 +960,7 @@ private actor CockpitClientStub: CockpitClient {
     func insights(filters: InsightFilters) async throws -> InsightPage {
         insightsRequestCount += 1
         requestedCursors.append(filters.cursor)
+        if let insightsError { throw insightsError }
         if let host = filters.host, let delay = insightDelaysByHost[host] {
             try? await Task.sleep(for: delay)
         }

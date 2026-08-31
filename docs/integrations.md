@@ -98,6 +98,10 @@ cache, delegation, and routing provenance when present. AgentWeave is one
 producer of those spans; Drover remains the durable local context and recall
 layer rather than a replacement tracing UI.
 
+Token, cost, and cache span attributes are populated only when an external
+OTLP producer is configured; harness-reported usage is the planned primary
+token source (a separate, later track of work).
+
 Historical spans may contain `nexus.*` attributes. Drover reads those values
 for compatibility. New integrations should emit Drover naming and stable
 OpenTelemetry or W3C provenance fields where possible.

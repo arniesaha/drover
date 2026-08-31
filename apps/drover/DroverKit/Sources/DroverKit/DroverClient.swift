@@ -21,11 +21,25 @@ public enum DroverError: Error, Equatable {
     /// `DroverClient` when it sees `URLError.cancelled`.
     public static let cancellationDetail = "cancelled"
 
+    /// Canonical detail string for a client-side timeout, set by
+    /// `DroverClient` when it sees `URLError.timedOut`. Kept as a stable
+    /// marker rather than `error.localizedDescription` for the same reason
+    /// as `cancellationDetail`: Foundation's timeout copy isn't consistent
+    /// enough across platforms to substring-match on downstream.
+    public static let timeoutDetail = "timed out"
+
     /// True for a request the app itself tore down — a superseded poll, a
     /// dismissed screen. Not a failure worth telling anyone about.
     public var isCancellation: Bool {
         guard case .transport(let detail) = self else { return false }
         return detail == Self.cancellationDetail
+    }
+
+    /// True for a request that ran past its deadline — the signal a cold,
+    /// still-waking hub gives before it can answer.
+    public var isTimeout: Bool {
+        guard case .transport(let detail) = self else { return false }
+        return detail == Self.timeoutDetail
     }
 }
 
@@ -219,13 +233,19 @@ public actor DroverClient {
             ("cursor", filters.cursor),
             ("limit", String(filters.limit)),
         ])
-        let data = try await request(url: url, method: "GET", body: nil)
+        let data = try await request(
+            url: url, method: "GET", body: nil,
+            timeout: Self.cockpitRequestTimeout
+        )
         return try decode(InsightPage.self, from: data)
     }
 
     public func insightDetail(findingID: String) async throws -> InsightDetail {
         let path = "/insights/\(encodePathComponent(findingID))"
-        let data = try await request(path: path, method: "GET", body: nil)
+        let data = try await request(
+            path: path, method: "GET", body: nil,
+            timeout: Self.cockpitRequestTimeout
+        )
         return try decode(InsightDetail.self, from: data)
     }
 
@@ -676,6 +696,9 @@ public actor DroverClient {
             // no substring test on it is reliable. The code always is.
             if (error as? URLError)?.code == .cancelled {
                 throw DroverError.transport(DroverError.cancellationDetail)
+            }
+            if (error as? URLError)?.code == .timedOut {
+                throw DroverError.transport(DroverError.timeoutDetail)
             }
             throw DroverError.transport(error.localizedDescription)
         }

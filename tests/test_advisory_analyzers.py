@@ -61,6 +61,7 @@ def _provider(**overrides: object) -> ProviderConnectionObservation:
         "reset_windows": (),
         "reset_windows_complete": True,
         "source_ref": "provider_connections:openai/personal/mac-mini",
+        "host_last_seen_at": NOW - timedelta(minutes=1),
     }
     values.update(overrides)
     return ProviderConnectionObservation(**values)  # type: ignore[arg-type]
@@ -82,6 +83,7 @@ def _telemetry(**overrides: object) -> TelemetryAggregate:
         "facts_complete": True,
         "input_span_records": 10,
         "source_ref": "analytics:mac-mini/codex/24h",
+        "latest_span_at": NOW - timedelta(minutes=30),
     }
     values.update(overrides)
     return TelemetryAggregate(**values)  # type: ignore[arg-type]
@@ -116,6 +118,7 @@ def test_stale_connector_is_confirmed_high_with_exact_age() -> None:
         "maximum_age_seconds": 900,
         "enabled": True,
         "status": "ok",
+        "host_last_seen_age_seconds": 60,
     }
     assert finding.remediation == (
         "Refresh the openai connector for account personal on host mac-mini, then run Check Again.",
@@ -130,7 +133,7 @@ def test_connector_error_reports_classification_and_attempt_age() -> None:
                 error_category="authentication",
                 observed_at=NOW,
                 last_attempt_at=NOW - timedelta(seconds=30),
-                last_success_at=NOW - timedelta(minutes=2),
+                last_success_at=NOW - timedelta(hours=1),
             ),
         )
     )
@@ -143,9 +146,10 @@ def test_connector_error_reports_classification_and_attempt_age() -> None:
     assert error.evidence[0].fields == {
         "error_category": "authentication",
         "attempt_age_seconds": 30,
-        "last_success_age_seconds": 120,
+        "last_success_age_seconds": 3600,
         "enabled": True,
         "status": "error",
+        "host_last_seen_age_seconds": 60,
     }
     assert "Review the authentication error" in error.remediation[0]
 
@@ -168,6 +172,55 @@ def test_provider_stale_status_is_a_finding_even_before_age_threshold() -> None:
 
     assert [item.rule_id for item in findings] == ["connector.stale"]
     assert findings[0].evidence[0].fields["age_seconds"] == 0
+
+
+def test_offline_host_produces_no_connector_findings() -> None:
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                status="error",
+                error_category="protocol_error",
+                last_success_at=NOW - timedelta(days=2),
+                host_last_seen_at=NOW - timedelta(hours=3),
+            ),
+        )
+    )
+    assert ConnectorFreshnessAnalyzer().analyze(snapshot) == []
+
+
+def test_error_right_after_a_success_stays_silent() -> None:
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                status="error",
+                error_category="unavailable",
+                last_success_at=NOW - timedelta(minutes=5),
+            ),
+        )
+    )
+    findings = ConnectorFreshnessAnalyzer().analyze(snapshot)
+    assert [f.rule_id for f in findings] == []
+
+
+def test_persistent_error_fires_with_default_thresholds() -> None:
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                status="error",
+                error_category="protocol_error",
+                last_success_at=NOW - timedelta(days=17),
+            ),
+        )
+    )
+    rules = [f.rule_id for f in ConnectorFreshnessAnalyzer().analyze(snapshot)]
+    assert rules == ["connector.error", "connector.stale"]
+
+
+def test_stale_default_is_six_hours() -> None:
+    snapshot = _snapshot(
+        providers=(_provider(last_success_at=NOW - timedelta(hours=2)),)
+    )
+    assert ConnectorFreshnessAnalyzer().analyze(snapshot) == []
 
 
 def test_contradictory_provider_reset_window_is_confirmed() -> None:
@@ -286,33 +339,64 @@ def test_hook_descriptor_rejects_non_allowlisted_or_noncanonical_input() -> None
         HookDescriptor(**(fields | {"enabled": "true"}))
 
 
-@pytest.mark.parametrize(
-    ("field", "rule_id", "coverage_field"),
-    [
-        ("sessions_with_spans", "telemetry.flow_coverage", "span_coverage_percent"),
-        (
-            "repository_attributed_sessions",
-            "telemetry.repository_attribution",
-            "coverage_percent",
-        ),
-        ("token_observed_sessions", "telemetry.token_coverage", "coverage_percent"),
-        ("cost_observed_sessions", "telemetry.cost_coverage", "coverage_percent"),
-    ],
-)
-def test_telemetry_coverage_rules_report_aggregate_percentages(
-    field: str, rule_id: str, coverage_field: str
-) -> None:
-    aggregate = _telemetry(**{field: 4})
-
-    findings = TelemetryCoverageAnalyzer(minimum_percent=80).analyze(
-        _snapshot(telemetry=(aggregate,))
+def test_silent_span_feed_is_one_fleet_finding() -> None:
+    snapshot = _snapshot(
+        telemetry=(
+            _telemetry(
+                sessions_with_spans=0,
+                token_observed_sessions=0,
+                cost_observed_sessions=0,
+                latest_span_at=None,
+            ),
+            _telemetry(
+                target_id="nas/claude-code",
+                host_id="nas",
+                harness_id="claude-code",
+                sessions_with_spans=0,
+                token_observed_sessions=0,
+                cost_observed_sessions=0,
+                latest_span_at=None,
+            ),
+        )
     )
-    finding = next(item for item in findings if item.rule_id == rule_id)
+    findings = TelemetryCoverageAnalyzer().analyze(snapshot)
+    silent = [f for f in findings if f.rule_id == "telemetry.span_feed_silent"]
+    assert len(silent) == 1
+    assert silent[0].target_id == "fleet"
+    assert silent[0].severity is Severity.LOW
 
-    assert finding.evidence[0].fields[coverage_field] == 40
-    assert finding.evidence[0].fields["covered_sessions"] == 4
-    assert finding.evidence[0].fields["total_sessions"] == 10
-    assert finding.evidence[0].fields["minimum_percent"] == 80
+
+def test_harness_with_no_token_source_is_one_finding_per_harness() -> None:
+    snapshot = _snapshot(
+        telemetry=(
+            _telemetry(
+                harness_id="agy", target_id="mac-mini/agy", token_observed_sessions=0
+            ),
+            _telemetry(
+                harness_id="agy",
+                target_id="nas/agy",
+                host_id="nas",
+                token_observed_sessions=0,
+            ),
+        )
+    )
+    findings = TelemetryCoverageAnalyzer().analyze(snapshot)
+    missing = [f for f in findings if f.rule_id == "telemetry.token_source_missing"]
+    assert [f.target_id for f in missing] == ["fleet/agy"]
+    assert missing[0].severity is Severity.MEDIUM
+
+
+def test_healthy_fleet_emits_no_telemetry_findings() -> None:
+    assert (
+        TelemetryCoverageAnalyzer().analyze(_snapshot(telemetry=(_telemetry(),))) == []
+    )
+
+
+def test_repository_attribution_stays_per_target() -> None:
+    snapshot = _snapshot(telemetry=(_telemetry(repository_attributed_sessions=1),))
+    findings = TelemetryCoverageAnalyzer().analyze(snapshot)
+    assert [f.rule_id for f in findings] == ["telemetry.repository_attribution"]
+    assert findings[0].target_id == "mac-mini/codex"
 
 
 def test_empty_telemetry_window_does_not_create_coverage_findings() -> None:
@@ -383,19 +467,19 @@ def test_routing_mismatch_frequency_is_confirmed() -> None:
 
 def test_analyzers_return_candidates_in_stable_target_order() -> None:
     later = _telemetry(
-        target_id="z-host/codex", host_id="z-host", token_observed_sessions=1
+        target_id="z-host/codex", host_id="z-host", repository_attributed_sessions=1
     )
     earlier = _telemetry(
-        target_id="a-host/codex", host_id="a-host", token_observed_sessions=1
+        target_id="a-host/codex", host_id="a-host", repository_attributed_sessions=1
     )
 
     findings = TelemetryCoverageAnalyzer(minimum_percent=80).analyze(
         _snapshot(telemetry=(later, earlier))
     )
 
-    token_targets = [
+    attribution_targets = [
         item.target_id
         for item in findings
-        if item.rule_id == "telemetry.token_coverage"
+        if item.rule_id == "telemetry.repository_attribution"
     ]
-    assert token_targets == ["a-host/codex", "z-host/codex"]
+    assert attribution_targets == ["a-host/codex", "z-host/codex"]

@@ -58,6 +58,7 @@ class ProviderConnectionObservation:
     reset_windows: tuple[ProviderResetWindow, ...]
     reset_windows_complete: bool
     source_ref: str
+    host_last_seen_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("provider", "account_label", "host_id", "source_ref"):
@@ -71,6 +72,8 @@ class ProviderConnectionObservation:
             _require_aware(self.last_attempt_at, "last_attempt_at")
         if self.last_success_at is not None:
             _require_aware(self.last_success_at, "last_success_at")
+        if self.host_last_seen_at is not None:
+            _require_aware(self.host_last_seen_at, "host_last_seen_at")
         windows = tuple(self.reset_windows)
         if len(windows) > MAX_SNAPSHOT_RECORDS:
             raise ValueError(f"reset_windows is bounded to {MAX_SNAPSHOT_RECORDS} rows")
@@ -97,6 +100,7 @@ class TelemetryAggregate:
     facts_complete: bool
     input_span_records: int
     source_ref: str
+    latest_span_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("target_id", "host_id", "harness_id", "source_ref"):
@@ -124,6 +128,8 @@ class TelemetryAggregate:
         ):
             if getattr(self, field_name) > self.total_sessions:
                 raise ValueError(f"{field_name} cannot exceed total_sessions")
+        if self.latest_span_at is not None:
+            _require_aware(self.latest_span_at, "latest_span_at")
 
 
 @dataclass(frozen=True)

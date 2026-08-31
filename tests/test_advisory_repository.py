@@ -28,7 +28,23 @@ from drover.server.advisory.types import (
     FindingState,
     Severity,
 )
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.content_consent import DurableContentConsent
+
+_LEGACY_FINDINGS_DDL = """
+CREATE TABLE advisory_findings (
+  finding_id VARCHAR PRIMARY KEY, fingerprint VARCHAR NOT NULL UNIQUE,
+  analyzer_id VARCHAR NOT NULL, rule_id VARCHAR NOT NULL,
+  target_type VARCHAR NOT NULL, target_id VARCHAR NOT NULL,
+  analyzer_class VARCHAR NOT NULL, severity VARCHAR NOT NULL,
+  confidence VARCHAR NOT NULL, title VARCHAR NOT NULL, impact VARCHAR NOT NULL,
+  remediation_json VARCHAR NOT NULL, state VARCHAR NOT NULL,
+  dismissal_reason VARCHAR, first_seen_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ NOT NULL, resolved_at TIMESTAMPTZ,
+  dismissed_at TIMESTAMPTZ, regressed_at TIMESTAMPTZ,
+  evaluated_content_hash VARCHAR, latest_run_id VARCHAR NOT NULL
+);
+"""
 
 
 @pytest.fixture
@@ -610,7 +626,9 @@ def test_purge_removes_excerpts_not_occurrence_metadata(
 
     assert service.purge_content_excerpts() == 2
 
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         rows = con.execute("""
             SELECT o.finding_id, o.run_id, o.observed_at, o.source_ref,
@@ -721,20 +739,17 @@ def test_acknowledge_and_dismiss_require_valid_transitions(repository, candidate
 
 
 def test_concurrent_dismissals_cannot_both_commit_or_overwrite_reason(
-    repository, candidate, monkeypatch
+    repository, candidate
 ):
+    """Two racing dismissals: exactly one wins, the loser cannot overwrite.
+
+    Control-plane windows are serialized by ``control_plane_lock`` since the
+    findings moved stores, so the race resolves as winner-then-invalid-state
+    rather than an optimistic write conflict. The guarantee is unchanged:
+    one dismissal persists, the other raises, the reason is never
+    overwritten.
+    """
     finding = repository.observe(candidate, run_id="run-1")
-    barrier = threading.Barrier(2)
-    original = AdvisoryRepository._require_finding
-
-    def synchronize_after_read(con, finding_id):
-        row = original(con, finding_id)
-        barrier.wait(timeout=2)
-        return row
-
-    monkeypatch.setattr(
-        AdvisoryRepository, "_require_finding", staticmethod(synchronize_after_read)
-    )
     outcomes: list[tuple[str, str]] = []
 
     def dismiss(reason: str) -> None:
@@ -753,7 +768,7 @@ def test_concurrent_dismissals_cannot_both_commit_or_overwrite_reason(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=3)
+        thread.join(timeout=5)
 
     assert all(not thread.is_alive() for thread in threads)
     assert sorted(kind for kind, _ in outcomes) == ["conflict", "ok"]
@@ -774,6 +789,38 @@ def test_mark_passing_is_the_only_resolution_path(repository, candidate):
         repository.acknowledge(finding.finding_id)
 
 
+def test_third_regression_in_a_day_holds_the_finding_open(repository, candidate):
+    recent = replace(
+        candidate,
+        evidence=(
+            replace(candidate.evidence[0], observed_at=datetime.now(timezone.utc)),
+        ),
+    )
+    run = "run-flap"
+    finding = repository.observe(recent, run_id=run)
+    for cycle in range(3):
+        repository.mark_passing(finding.finding_id, run_id=f"{run}-pass-{cycle}")
+        finding = repository.observe(recent, run_id=f"{run}-re-{cycle}")
+        assert finding.state == FindingState.REGRESSED
+    # Fourth recovery: held, not resolved.
+    held = repository.mark_passing(finding.finding_id, run_id=f"{run}-pass-3")
+    assert held.state == FindingState.REGRESSED
+
+
+def test_regression_count_resets_after_quiet(repository, candidate):
+    finding = repository.observe(candidate, run_id="r1")
+    repository.mark_passing(finding.finding_id, run_id="r2")
+    finding = repository.observe(candidate, run_id="r3")
+    with control_plane_connection(repository.duckdb_path) as con:
+        con.execute(
+            "UPDATE advisory_findings SET regression_count = 3, "
+            "regressed_at = now() - INTERVAL 25 HOUR WHERE finding_id = ?",
+            [finding.finding_id],
+        )
+    resolved = repository.mark_passing(finding.finding_id, run_id="r4")
+    assert resolved.state == FindingState.RESOLVED
+
+
 def test_observe_appends_bounded_redacted_occurrence_atomically(repository, candidate):
     secret_candidate = replace(
         candidate,
@@ -787,7 +834,9 @@ def test_observe_appends_bounded_redacted_occurrence_atomically(repository, cand
     )
     finding = repository.observe(secret_candidate, run_id="run-secret")
 
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         row = con.execute(
             "SELECT evidence_json, excerpt FROM advisory_occurrences "
@@ -823,7 +872,9 @@ def test_excerpt_redacts_basic_authorization_and_private_keys(repository, candid
     )
 
     finding = repository.observe(secret_candidate, run_id="run-secret-forms")
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         excerpt = con.execute(
             "SELECT excerpt FROM advisory_occurrences WHERE finding_id = ?",
@@ -881,7 +932,9 @@ def test_compound_sensitive_keys_are_redacted_everywhere(repository, candidate):
     )
 
     finding = repository.observe(secret_candidate, run_id="run-compound-secrets")
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         evidence_json, excerpt = con.execute(
             "SELECT evidence_json, excerpt FROM advisory_occurrences "
@@ -1055,3 +1108,49 @@ def test_harness_filter_only_matches_harness_bearing_targets(repository, candida
 
     assert [item["finding_id"] for item in codex["findings"]] == [hook.finding_id]
     assert openai["findings"] == []
+
+
+def test_advisory_tables_live_in_the_control_plane_store(tmp_path):
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    registry = duckdb.connect(str(control_plane_path(db_path)))
+    try:
+        tables = {
+            str(row[0])
+            for row in registry.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        }
+    finally:
+        registry.close()
+    assert {"advisory_findings", "advisory_occurrences"} <= tables
+
+
+def test_pre_split_advisory_rows_migrate_into_the_control_plane_store(tmp_path):
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    # A legacy table with real columns: easiest is to write one finding the
+    # pre-move way. Build the legacy shape directly.
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute("DROP TABLE IF EXISTS advisory_findings")
+        con.execute(_LEGACY_FINDINGS_DDL)
+        con.execute(
+            "INSERT INTO advisory_findings VALUES "
+            "('f1', 'fp1', 'deterministic.connector_freshness', 'connector.error', "
+            "'provider_connector', 'mac-mini/openai/personal', 'deterministic', "
+            "'high', 'confirmed', 't', 'i', '[]', 'open', NULL, now(), now(), "
+            "NULL, NULL, NULL, NULL, 'run1')"
+        )
+    finally:
+        con.close()
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    registry = duckdb.connect(str(control_plane_path(db_path)))
+    try:
+        count = registry.execute(
+            "SELECT count(*) FROM advisory_findings WHERE finding_id = 'f1'"
+        ).fetchone()[0]
+    finally:
+        registry.close()
+    assert count == 1

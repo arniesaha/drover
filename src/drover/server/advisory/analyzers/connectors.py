@@ -16,6 +16,12 @@ from drover.server.advisory.types import (
     Severity,
 )
 
+#: How long a host may go unheard-from before its connector findings are
+#: treated as unverifiable rather than passing or failing. Shared with
+#: ``worker._snapshot_covers_finding`` so the analyzer's gate and the
+#: resolve-on-pass coverage check can't drift apart.
+HOST_ABSENCE_DEFAULT = timedelta(minutes=10)
+
 
 def _age_seconds(now: datetime, then: datetime | None) -> int | None:
     if then is None:
@@ -30,10 +36,23 @@ def _target(connection: ProviderConnectionObservation) -> str:
 class ConnectorFreshnessAnalyzer:
     analyzer_id = "deterministic.connector_freshness"
 
-    def __init__(self, *, max_age: timedelta = timedelta(minutes=15)) -> None:
-        if max_age <= timedelta(0):
-            raise ValueError("max_age must be positive")
+    def __init__(
+        self,
+        *,
+        max_age: timedelta = timedelta(hours=6),
+        error_grace: timedelta = timedelta(minutes=30),
+        host_absence: timedelta = HOST_ABSENCE_DEFAULT,
+    ) -> None:
+        for name, value in (
+            ("max_age", max_age),
+            ("error_grace", error_grace),
+            ("host_absence", host_absence),
+        ):
+            if value <= timedelta(0):
+                raise ValueError(f"{name} must be positive")
         self.max_age = max_age
+        self.error_grace = error_grace
+        self.host_absence = host_absence
 
     def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
         findings: list[FindingCandidate] = []
@@ -43,7 +62,16 @@ class ConnectorFreshnessAnalyzer:
         ):
             if not connection.enabled:
                 continue
-            if connection.status == "error" or connection.error_category:
+            host_age = _age_seconds(snapshot.analyzed_at, connection.host_last_seen_at)
+            if host_age is None or host_age > self.host_absence.total_seconds():
+                continue
+            success_age = _age_seconds(snapshot.analyzed_at, connection.last_success_at)
+            error_is_persistent = success_age is None or (
+                success_age > self.error_grace.total_seconds()
+            )
+            if (
+                connection.status == "error" or connection.error_category
+            ) and error_is_persistent:
                 category = connection.error_category or "unknown"
                 findings.append(
                     FindingCandidate(
@@ -75,6 +103,7 @@ class ConnectorFreshnessAnalyzer:
                                     ),
                                     "enabled": connection.enabled,
                                     "status": connection.status,
+                                    "host_last_seen_age_seconds": host_age,
                                 },
                             ),
                         ),
@@ -109,6 +138,7 @@ class ConnectorFreshnessAnalyzer:
                                     "maximum_age_seconds": maximum_age_seconds,
                                     "enabled": connection.enabled,
                                     "status": connection.status,
+                                    "host_last_seen_age_seconds": host_age,
                                 },
                             ),
                         ),

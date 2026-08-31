@@ -382,7 +382,7 @@ def test_empty_snapshot_is_not_treated_as_passing_evidence(db_path: Path) -> Non
     assert AdvisoryRepository(db_path).list_findings()[0].state.value == "open"
 
 
-def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
+def test_ledger_completion_failure_persists_finding_and_retry_is_idempotent(
     db_path: Path, monkeypatch
 ) -> None:
     job = enqueue_advisory_check(
@@ -403,11 +403,18 @@ def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
 
     monkeypatch.setattr(Ledger, "succeed_job", fail_after_completion)
     assert worker.run_once([HealthyAnalyzer()]).failed == 1
-    with duckdb.connect(str(db_path), read_only=True) as con:
-        assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 0
+    # Findings commit to the control-plane store first; a crash inside the
+    # ledger phase (the analytical store) leaves the finding in place and
+    # the job leased for retry, not the finding rolled back with it.
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 1
         assert (
-            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 0
+            con.execute("SELECT state FROM advisory_findings").fetchone()[0] == "open"
         )
+        assert (
+            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 1
+        )
+    with duckdb.connect(str(db_path), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 0
         assert (
             con.execute(
@@ -418,11 +425,14 @@ def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
 
     monkeypatch.setattr(Ledger, "succeed_job", original)
     assert worker.run_once([HealthyAnalyzer()]).succeeded == 1
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    # The retry re-observes the same fingerprint idempotently: exactly one
+    # finding row, not a duplicate, and the ledger now succeeds.
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 1
         assert (
-            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 1
+            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 2
         )
+    with duckdb.connect(str(db_path), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 1
 
 
@@ -1115,15 +1125,16 @@ excerpt_max_chars = 320
             "SELECT status, latest_artifact_id FROM pipeline_jobs WHERE job_id = ?",
             [job.job_id],
         ).fetchone()
+        artifact_count = con.execute(
+            "SELECT count(*) FROM pipeline_artifacts WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone()[0]
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
         finding_count = con.execute(
             "SELECT count(*) FROM advisory_findings"
         ).fetchone()[0]
         occurrence_count = con.execute(
             "SELECT count(*) FROM advisory_occurrences"
-        ).fetchone()[0]
-        artifact_count = con.execute(
-            "SELECT count(*) FROM pipeline_artifacts WHERE job_id = ?",
-            [job.job_id],
         ).fetchone()[0]
     assert status == "cancelled"
     assert artifact_id is None
@@ -1548,12 +1559,12 @@ def test_content_worker_retries_when_bundle_changes_after_version_probe(
     assert fetches == ["fetch", "fetch"]
 
 
-def test_content_job_rolls_back_findings_when_ledger_completion_fails(
+def test_content_job_finding_persists_when_ledger_completion_fails_and_retry_is_idempotent(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     content = "Always inspect the repository. Always inspect the repository."
     bundle = _content_bundle(content)
-    enqueue_advisory_check(
+    job = enqueue_advisory_check(
         db_path,
         analyzer_id="model.configuration",
         target_id="mac-mini",
@@ -1579,20 +1590,53 @@ def test_content_job_rolls_back_findings_when_ledger_completion_fails(
                 }
             )
 
+    original = Ledger.succeed_job
+
     def fail_completion(self, *args, **kwargs):
         raise RuntimeError("injected artifact failure")
 
     monkeypatch.setattr(Ledger, "succeed_job", fail_completion)
+    repository = AdvisoryRepository(db_path)
     worker = ContentAnalysisWorker(
         consent_reader=lambda: _content_config(),
         bundle_fetcher=lambda _host, _targets: bundle,
         backend_factory=lambda _config: Backend(),
         duckdb_path=db_path,
-        repository=AdvisoryRepository(db_path),
+        repository=repository,
+        retry_delay=timedelta(0),
+        clock=lambda: NOW,
     )
 
+    # Findings commit to the control-plane store before the ledger runs, so
+    # a crash inside the ledger phase leaves the finding in place; the job
+    # stays leased for retry rather than the finding rolling back with it.
     assert worker.run_once().failed == 1
-    assert AdvisoryRepository(db_path).list_findings() == []
+    findings = repository.list_findings()
+    assert len(findings) == 1
+    assert findings[0].state.value == "open"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 0
+        assert (
+            con.execute(
+                "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+            ).fetchone()[0]
+            != "succeeded"
+        )
+
+    monkeypatch.setattr(Ledger, "succeed_job", original)
+    # The retry re-observes the same fingerprint idempotently: exactly one
+    # finding row, not a duplicate, and the ledger now succeeds.
+    assert worker.run_once().succeeded == 1
+    findings = repository.list_findings()
+    assert len(findings) == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 1
+        assert (
+            con.execute(
+                "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+            ).fetchone()[0]
+            == "succeeded"
+        )
 
 
 def test_clean_model_bundle_resolves_only_covered_nondismissed_targets(
@@ -1632,7 +1676,7 @@ def test_clean_model_bundle_resolves_only_covered_nondismissed_targets(
     assert repository.get_finding(covered.finding_id).state.value == "resolved"
     assert repository.get_finding(dismissed.finding_id).state.value == "dismissed"
     assert repository.get_finding(unrequested.finding_id).state.value == "open"
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
         passing = con.execute(
             "SELECT outcome FROM advisory_occurrences WHERE finding_id = ? "
             "ORDER BY recorded_at DESC LIMIT 1",
@@ -2256,6 +2300,129 @@ def test_truncated_span_facts_cannot_resolve_existing_cache_finding(
     assert repository.get_finding(existing.finding_id).state.value == "open"
 
 
+def test_fleet_scope_telemetry_job_resolves_legacy_flow_coverage_finding(
+    db_path: Path,
+) -> None:
+    """`telemetry.flow_coverage` was retired for the fleet-level rules.
+
+    A finding raised under the old rule can no longer be reproduced by the
+    analyzer, but the next fleet-scope telemetry job still has to resolve it
+    once current facts are complete for its target -- the per-target
+    ``_snapshot_covers_finding`` branch, unchanged by the fleet rewrite.
+    """
+
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.flow_coverage",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="Telemetry flow is incomplete",
+            impact="Observed latency, routing, token, cost, and cache analytics omit sessions without spans.",
+            remediation=("Verify the OTLP exporter, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="normalized-telemetry:mac-mini/codex",
+                    observed_at=NOW,
+                    fields={"span_coverage_percent": 0},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.telemetry_coverage",
+        target_id="fleet",
+        source_version="complete:v1",
+    )
+    complete = _telemetry_snapshot("complete:v1")
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: complete,
+    )
+
+    assert worker.run_once([operational_analyzers()[2]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "resolved"
+
+
+def test_offline_host_does_not_resolve_an_open_connector_finding(
+    db_path: Path,
+) -> None:
+    """A silent host is not passing evidence.
+
+    The analyzer's own host-absence gate makes it emit no candidate for a
+    connection whose host has gone quiet -- but that must not let
+    ``_snapshot_covers_finding`` read the connection's mere presence in facts
+    as proof the error passed. An open ``connector.error`` finding has to
+    stay open until a snapshot actually hears from the host again.
+    """
+
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.connector_freshness",
+            rule_id="connector.error",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI connector reports an error",
+            impact="Provider-reported subscription usage may be stale or unavailable until the connector succeeds.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=NOW,
+                    fields={"status": "error"},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.connector_freshness",
+        target_id="fleet",
+        source_version="host-offline:v2",
+    )
+    offline_host = AnalysisSnapshot(
+        source_version="host-offline:v2",
+        analyzed_at=NOW,
+        provider_connections=(
+            ProviderConnectionObservation(
+                provider="openai",
+                account_label="personal",
+                host_id="mac-mini",
+                enabled=True,
+                status="error",
+                observed_at=NOW,
+                last_attempt_at=NOW,
+                last_success_at=None,
+                error_category="auth",
+                reset_windows=(),
+                reset_windows_complete=True,
+                source_ref="provider_connections:mac-mini/openai/personal",
+                host_last_seen_at=NOW - timedelta(minutes=17),
+            ),
+        ),
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: offline_host,
+    )
+
+    assert worker.run_once([ConnectorFreshnessAnalyzer()]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "open"
+
+
 def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
     db_path: Path,
 ) -> None:
@@ -2294,7 +2461,7 @@ def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
         db_path,
         "deterministic.connector_freshness",
         "fleet",
-        analyzed_at=NOW + timedelta(minutes=17),
+        analyzed_at=NOW + timedelta(hours=7),
     )
     with duckdb.connect(str(db_path)) as con:
         con.execute(
@@ -2305,7 +2472,7 @@ def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
         db_path,
         "deterministic.connector_freshness",
         "fleet",
-        analyzed_at=NOW + timedelta(minutes=17),
+        analyzed_at=NOW + timedelta(hours=7),
     )
 
     assert heartbeat == first
@@ -2651,6 +2818,15 @@ def test_check_again_scopes_provider_finding_to_host_and_executes_current_facts(
             """,
             [NOW, NOW],
         )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_hosts (
+          host_id, display_name, kind, status, capabilities_json, last_seen_at, updated_at
+        ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', '{}', ?, ?)
+        """,
+        [NOW, NOW],
+    )
     repository = AdvisoryRepository(db_path)
     finding = repository.observe(
         FindingCandidate(
@@ -3073,6 +3249,147 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
         f"{item.host_id}/{item.harness_id}/{item.hook_id}"
         for item in scoped_hooks.hooks
     ] == ["mac-mini/codex/pre-tool"]
+
+
+def test_check_again_on_fleet_harness_finding_scopes_the_job_to_fleet(
+    db_path: Path,
+) -> None:
+    """A `fleet/{harness}` telemetry finding runs Check Again at fleet scope.
+
+    `_runtime_session_filter` treats any target_id other than the literal
+    string "fleet" as a host_id/harness filter -- passing "fleet/agy" through
+    unchanged would filter on host_id = "fleet", which matches nothing. The
+    enqueued job (and the scope probe that validates it) must both target
+    "fleet", not the finding's own target_id.
+    """
+
+    CURRENT = _current_moment()
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, model,
+          started_at, updated_at
+        ) VALUES ('agy-session', 'mac-mini', 'agy', 'agy', 'completed',
+                   'gemini-2', ?, ?)
+        """,
+        [CURRENT, CURRENT],
+    )
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.token_source_missing",
+            target_type="telemetry_source",
+            target_id="fleet/agy",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="No token source for agy",
+            impact="Sessions from this harness carry no token accounting, so fleet token totals under-count.",
+            remediation=("Enable usage reporting for agy, then run Check Again.",),
+            evidence=(
+                FindingEvidence("analytics:fleet/agy", CURRENT, {"total_sessions": 1}),
+            ),
+        ),
+        run_id="old",
+    )
+    service = InsightsService(db_path)
+
+    queued = service.check_again(finding.finding_id)
+
+    assert queued["status"] == "queued"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        job = con.execute(
+            "SELECT subject_key, status FROM pipeline_jobs WHERE job_id = ?",
+            [queued["job_id"]],
+        ).fetchone()
+    assert job == ("deterministic.telemetry_coverage:fleet", "pending")
+
+
+def test_check_again_on_bare_fleet_finding_scopes_the_job_to_fleet(
+    db_path: Path,
+) -> None:
+    CURRENT = _current_moment()
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, model,
+          started_at, updated_at
+        ) VALUES ('codex-session', 'mac-mini', 'codex', 'codex', 'completed',
+                   'gpt-5', ?, ?)
+        """,
+        [CURRENT, CURRENT],
+    )
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.span_feed_silent",
+            target_type="telemetry_source",
+            target_id="fleet",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.LOW,
+            confidence=Confidence.CONFIRMED,
+            title="Span feed is silent",
+            impact="Observed cost, latency, and routing enrichment are unavailable; token analytics fall back to harness-reported usage.",
+            remediation=(
+                "Configure an OTLP span producer, or accept span-derived "
+                "metrics as unavailable.",
+            ),
+            evidence=(
+                FindingEvidence("analytics:fleet", CURRENT, {"total_sessions": 1}),
+            ),
+        ),
+        run_id="old",
+    )
+    service = InsightsService(db_path)
+
+    queued = service.check_again(finding.finding_id)
+
+    assert queued["status"] == "queued"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        job = con.execute(
+            "SELECT subject_key, status FROM pipeline_jobs WHERE job_id = ?",
+            [queued["job_id"]],
+        ).fetchone()
+    assert job == ("deterministic.telemetry_coverage:fleet", "pending")
+
+
+def test_check_again_on_fleet_scoped_finding_is_unavailable_without_current_facts(
+    db_path: Path,
+) -> None:
+    """A fleet-scoped finding cannot Check Again against an empty fleet.
+
+    Fresh facts loaded at fleet scope come back with no telemetry rows at all
+    when the store has no recent harness_sessions, and the scope probe must
+    refuse rather than enqueue a job that will find nothing either.
+    """
+
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.token_source_missing",
+            target_type="telemetry_source",
+            target_id="fleet/agy",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="No token source for agy",
+            impact="Sessions from this harness carry no token accounting, so fleet token totals under-count.",
+            remediation=("Enable usage reporting for agy, then run Check Again.",),
+            evidence=(
+                FindingEvidence("analytics:fleet/agy", NOW, {"total_sessions": 1}),
+            ),
+        ),
+        run_id="old",
+    )
+    service = InsightsService(db_path)
+
+    with pytest.raises(InvalidInsightTransition, match="no current facts"):
+        service.check_again(finding.finding_id)
 
 
 def test_runtime_facts_do_not_depend_on_the_enrichment_view(db_path: Path) -> None:
