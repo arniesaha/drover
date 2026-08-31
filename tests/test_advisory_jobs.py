@@ -3251,6 +3251,147 @@ def test_check_again_supports_scoped_runtime_analyzers_with_current_facts(
     ] == ["mac-mini/codex/pre-tool"]
 
 
+def test_check_again_on_fleet_harness_finding_scopes_the_job_to_fleet(
+    db_path: Path,
+) -> None:
+    """A `fleet/{harness}` telemetry finding runs Check Again at fleet scope.
+
+    `_runtime_session_filter` treats any target_id other than the literal
+    string "fleet" as a host_id/harness filter -- passing "fleet/agy" through
+    unchanged would filter on host_id = "fleet", which matches nothing. The
+    enqueued job (and the scope probe that validates it) must both target
+    "fleet", not the finding's own target_id.
+    """
+
+    CURRENT = _current_moment()
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, model,
+          started_at, updated_at
+        ) VALUES ('agy-session', 'mac-mini', 'agy', 'agy', 'completed',
+                   'gemini-2', ?, ?)
+        """,
+        [CURRENT, CURRENT],
+    )
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.token_source_missing",
+            target_type="telemetry_source",
+            target_id="fleet/agy",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="No token source for agy",
+            impact="Sessions from this harness carry no token accounting, so fleet token totals under-count.",
+            remediation=("Enable usage reporting for agy, then run Check Again.",),
+            evidence=(
+                FindingEvidence("analytics:fleet/agy", CURRENT, {"total_sessions": 1}),
+            ),
+        ),
+        run_id="old",
+    )
+    service = InsightsService(db_path)
+
+    queued = service.check_again(finding.finding_id)
+
+    assert queued["status"] == "queued"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        job = con.execute(
+            "SELECT subject_key, status FROM pipeline_jobs WHERE job_id = ?",
+            [queued["job_id"]],
+        ).fetchone()
+    assert job == ("deterministic.telemetry_coverage:fleet", "pending")
+
+
+def test_check_again_on_bare_fleet_finding_scopes_the_job_to_fleet(
+    db_path: Path,
+) -> None:
+    CURRENT = _current_moment()
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, model,
+          started_at, updated_at
+        ) VALUES ('codex-session', 'mac-mini', 'codex', 'codex', 'completed',
+                   'gpt-5', ?, ?)
+        """,
+        [CURRENT, CURRENT],
+    )
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.span_feed_silent",
+            target_type="telemetry_source",
+            target_id="fleet",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.LOW,
+            confidence=Confidence.CONFIRMED,
+            title="Span feed is silent",
+            impact="Observed cost, latency, and routing enrichment are unavailable; token analytics fall back to harness-reported usage.",
+            remediation=(
+                "Configure an OTLP span producer, or accept span-derived "
+                "metrics as unavailable.",
+            ),
+            evidence=(
+                FindingEvidence("analytics:fleet", CURRENT, {"total_sessions": 1}),
+            ),
+        ),
+        run_id="old",
+    )
+    service = InsightsService(db_path)
+
+    queued = service.check_again(finding.finding_id)
+
+    assert queued["status"] == "queued"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        job = con.execute(
+            "SELECT subject_key, status FROM pipeline_jobs WHERE job_id = ?",
+            [queued["job_id"]],
+        ).fetchone()
+    assert job == ("deterministic.telemetry_coverage:fleet", "pending")
+
+
+def test_check_again_on_fleet_scoped_finding_is_unavailable_without_current_facts(
+    db_path: Path,
+) -> None:
+    """A fleet-scoped finding cannot Check Again against an empty fleet.
+
+    Fresh facts loaded at fleet scope come back with no telemetry rows at all
+    when the store has no recent harness_sessions, and the scope probe must
+    refuse rather than enqueue a job that will find nothing either.
+    """
+
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.token_source_missing",
+            target_type="telemetry_source",
+            target_id="fleet/agy",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="No token source for agy",
+            impact="Sessions from this harness carry no token accounting, so fleet token totals under-count.",
+            remediation=("Enable usage reporting for agy, then run Check Again.",),
+            evidence=(
+                FindingEvidence("analytics:fleet/agy", NOW, {"total_sessions": 1}),
+            ),
+        ),
+        run_id="old",
+    )
+    service = InsightsService(db_path)
+
+    with pytest.raises(InvalidInsightTransition, match="no current facts"):
+        service.check_again(finding.finding_id)
+
+
 def test_runtime_facts_do_not_depend_on_the_enrichment_view(db_path: Path) -> None:
     """The loaders read span-native columns, so the enrichment must be optional.
 
