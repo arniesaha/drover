@@ -64,15 +64,14 @@ EXPECTED_TABLES = (
     "pipeline_job_attempts",
     "pipeline_artifacts",
     "provider_connections",
-    "advisory_findings",
-    "advisory_occurrences",
     "span_partition_activity",
-    # `harness_*`, `live_recap_jobs` and `live_session_recaps` are deliberately
-    # absent: issue #95 moved them to the control-plane store, where they get a
-    # DuckDB instance the parquet scans cannot saturate. This tuple is what
+    # `harness_*`, `live_recap_jobs`, `live_session_recaps`, `advisory_findings`
+    # and `advisory_occurrences` are deliberately absent: these tables were moved
+    # to the control-plane store to isolate them from parquet scans that can
+    # saturate the analytical store's DuckDB instance. This tuple is what
     # `drover-server status` counts against the lakehouse, so leaving them here
     # would report an error on every healthy hub. `db.CONTROL_PLANE_TABLES` is
-    # the list for the other file.
+    # the list for the control-plane store.
 )
 EXPECTED_VIEWS = (
     "agent_events",

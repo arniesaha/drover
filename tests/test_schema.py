@@ -12,6 +12,7 @@ import pytest
 
 from drover.event_identity import canonical_agent_events_cte
 from drover.schema import EXPECTED_TABLES, EXPECTED_VIEWS, bootstrap
+from drover.server.db import control_plane_path
 
 
 @pytest.fixture
@@ -55,6 +56,7 @@ def test_bootstrap_creates_advisory_storage(tmp_lakehouse):
     parquet_dir, db_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
 
+    # Verify advisory tables are not in the analytical store (they moved to control-plane).
     con = duckdb.connect(str(db_path))
     try:
         tables = {
@@ -64,11 +66,26 @@ def test_bootstrap_creates_advisory_storage(tmp_lakehouse):
                 "WHERE table_type = 'BASE TABLE'"
             ).fetchall()
         }
-        assert {"advisory_findings", "advisory_occurrences"} <= tables
+        # Fresh bootstrap should not have advisory tables in the analytical store.
+        assert not ({"advisory_findings", "advisory_occurrences"} & tables)
+    finally:
+        con.close()
+
+    # Verify advisory tables exist in the control-plane store.
+    registry_con = duckdb.connect(str(control_plane_path(db_path)))
+    try:
+        registry_tables = {
+            row[0]
+            for row in registry_con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        }
+        assert {"advisory_findings", "advisory_occurrences"} <= registry_tables
 
         finding_columns = {
             row[0]
-            for row in con.execute(
+            for row in registry_con.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_name = 'advisory_findings'"
             ).fetchall()
@@ -94,10 +111,11 @@ def test_bootstrap_creates_advisory_storage(tmp_lakehouse):
             "dismissed_at",
             "regressed_at",
             "evaluated_content_hash",
+            "regression_count",
             "latest_run_id",
         } <= finding_columns
     finally:
-        con.close()
+        registry_con.close()
 
 
 def test_bootstrap_creates_expected_tables(tmp_lakehouse):
