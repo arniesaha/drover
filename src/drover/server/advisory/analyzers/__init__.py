@@ -100,6 +100,7 @@ class TelemetryAggregate:
     facts_complete: bool
     input_span_records: int
     source_ref: str
+    latest_span_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("target_id", "host_id", "harness_id", "source_ref"):
@@ -127,6 +128,8 @@ class TelemetryAggregate:
         ):
             if getattr(self, field_name) > self.total_sessions:
                 raise ValueError(f"{field_name} cannot exceed total_sessions")
+        if self.latest_span_at is not None:
+            _require_aware(self.latest_span_at, "latest_span_at")
 
 
 @dataclass(frozen=True)

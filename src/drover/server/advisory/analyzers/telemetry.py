@@ -31,39 +31,12 @@ class _CoverageRule:
 
 _COVERAGE_RULES = (
     _CoverageRule(
-        count_field="sessions_with_spans",
-        rule_id="telemetry.flow_coverage",
-        percentage_field="span_coverage_percent",
-        title="Telemetry flow is incomplete",
-        impact="Observed latency, routing, token, cost, and cache analytics omit sessions without spans.",
-        remediation="Verify the OTLP exporter and collector path for {target}, restore span delivery outside Drover, then run Check Again.",
-        severity=Severity.HIGH,
-    ),
-    _CoverageRule(
         count_field="repository_attributed_sessions",
         rule_id="telemetry.repository_attribution",
         percentage_field="coverage_percent",
         title="Repository attribution coverage is low",
         impact="Project rankings and repository drilldowns omit unattributed sessions.",
         remediation="Verify repository identity metadata for {target}, correct the emitting harness configuration outside Drover, then run Check Again.",
-        severity=Severity.MEDIUM,
-    ),
-    _CoverageRule(
-        count_field="token_observed_sessions",
-        rule_id="telemetry.token_coverage",
-        percentage_field="coverage_percent",
-        title="Token coverage is low",
-        impact="Token totals and token-ranked projects do not represent enough observed sessions.",
-        remediation="Verify token attributes from the model instrumentation for {target}, correct the exporter outside Drover, then run Check Again.",
-        severity=Severity.MEDIUM,
-    ),
-    _CoverageRule(
-        count_field="cost_observed_sessions",
-        rule_id="telemetry.cost_coverage",
-        percentage_field="coverage_percent",
-        title="Cost coverage is low",
-        impact="Observed API cost totals omit sessions that do not emit a cost field.",
-        remediation="Verify cost attributes from the model instrumentation for {target}, correct the exporter outside Drover, then run Check Again.",
         severity=Severity.MEDIUM,
     ),
 )
@@ -79,44 +52,116 @@ class TelemetryCoverageAnalyzer:
 
     def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
         findings: list[FindingCandidate] = []
-        for aggregate in sorted(snapshot.telemetry, key=lambda item: item.target_id):
-            if not aggregate.facts_complete:
-                continue
-            if aggregate.total_sessions == 0:
-                continue
-            for rule in _COVERAGE_RULES:
-                covered = getattr(aggregate, rule.count_field)
-                coverage = _percent(covered, aggregate.total_sessions)
-                if coverage >= self.minimum_percent:
-                    continue
+        active = [
+            a for a in snapshot.telemetry if a.facts_complete and a.total_sessions > 0
+        ]
+        if not active:
+            return findings
+
+        if sum(a.sessions_with_spans for a in active) == 0:
+            latest = max(
+                (a.latest_span_at for a in active if a.latest_span_at),
+                default=None,
+            )
+            findings.append(
+                FindingCandidate(
+                    analyzer_id=self.analyzer_id,
+                    rule_id="telemetry.span_feed_silent",
+                    target_type="telemetry_source",
+                    target_id="fleet",
+                    analyzer_class=AnalyzerClass.DETERMINISTIC,
+                    severity=Severity.LOW,
+                    confidence=Confidence.CONFIRMED,
+                    title="Span feed is silent",
+                    impact="Observed cost, latency, and routing enrichment are unavailable; token analytics fall back to harness-reported usage.",
+                    remediation=(
+                        "Configure an OTLP span producer (for example the "
+                        "tempo_relay section in collect.toml) or accept "
+                        "span-derived metrics as unavailable.",
+                    ),
+                    evidence=(
+                        FindingEvidence(
+                            source_ref="analytics:fleet",
+                            observed_at=snapshot.analyzed_at,
+                            fields={
+                                "total_sessions": sum(a.total_sessions for a in active),
+                                "latest_span_at": (
+                                    latest.isoformat() if latest else None
+                                ),
+                            },
+                        ),
+                    ),
+                )
+            )
+
+        by_harness: dict[str, list[TelemetryAggregate]] = {}
+        for aggregate in active:
+            by_harness.setdefault(aggregate.harness_id, []).append(aggregate)
+        for harness_id, items in sorted(by_harness.items()):
+            if sum(i.token_observed_sessions for i in items) == 0:
                 findings.append(
                     FindingCandidate(
                         analyzer_id=self.analyzer_id,
-                        rule_id=rule.rule_id,
+                        rule_id="telemetry.token_source_missing",
                         target_type="telemetry_source",
-                        target_id=aggregate.target_id,
+                        target_id=f"fleet/{harness_id}",
                         analyzer_class=AnalyzerClass.DETERMINISTIC,
-                        severity=rule.severity,
+                        severity=Severity.MEDIUM,
                         confidence=Confidence.CONFIRMED,
-                        title=rule.title,
-                        impact=rule.impact,
+                        title=f"No token source for {harness_id}",
+                        impact="Sessions from this harness carry no token accounting, so fleet token totals under-count.",
                         remediation=(
-                            rule.remediation.format(target=aggregate.target_id),
+                            f"The {harness_id} harness reports no usage in "
+                            "any recorded event; if it can emit usage, "
+                            "enable it, otherwise expect this gap.",
                         ),
                         evidence=(
                             FindingEvidence(
-                                source_ref=aggregate.source_ref,
-                                observed_at=aggregate.observed_at,
+                                source_ref=f"analytics:fleet/{harness_id}",
+                                observed_at=snapshot.analyzed_at,
                                 fields={
-                                    rule.percentage_field: coverage,
-                                    "covered_sessions": covered,
-                                    "total_sessions": aggregate.total_sessions,
-                                    "minimum_percent": self.minimum_percent,
+                                    "total_sessions": sum(
+                                        i.total_sessions for i in items
+                                    ),
+                                    "hosts": sorted({i.host_id for i in items}),
                                 },
                             ),
                         ),
                     )
                 )
+
+        rule = _COVERAGE_RULES[0]
+        for aggregate in sorted(active, key=lambda item: item.target_id):
+            covered = getattr(aggregate, rule.count_field)
+            coverage = _percent(covered, aggregate.total_sessions)
+            if coverage >= self.minimum_percent:
+                continue
+            findings.append(
+                FindingCandidate(
+                    analyzer_id=self.analyzer_id,
+                    rule_id=rule.rule_id,
+                    target_type="telemetry_source",
+                    target_id=aggregate.target_id,
+                    analyzer_class=AnalyzerClass.DETERMINISTIC,
+                    severity=rule.severity,
+                    confidence=Confidence.CONFIRMED,
+                    title=rule.title,
+                    impact=rule.impact,
+                    remediation=(rule.remediation.format(target=aggregate.target_id),),
+                    evidence=(
+                        FindingEvidence(
+                            source_ref=aggregate.source_ref,
+                            observed_at=aggregate.observed_at,
+                            fields={
+                                rule.percentage_field: coverage,
+                                "covered_sessions": covered,
+                                "total_sessions": aggregate.total_sessions,
+                                "minimum_percent": self.minimum_percent,
+                            },
+                        ),
+                    ),
+                )
+            )
         return findings
 
 

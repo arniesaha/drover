@@ -1010,6 +1010,14 @@ def _snapshot_covers_finding(
             for item in snapshot.provider_connections
         )
     if target_type == "telemetry_source":
+        if target_id == "fleet":
+            return any(item.facts_complete for item in snapshot.telemetry)
+        if target_id.startswith("fleet/"):
+            harness = target_id.split("/", 1)[1]
+            return any(
+                item.facts_complete and item.harness_id == harness
+                for item in snapshot.telemetry
+            )
         return any(
             item.target_id == target_id and item.facts_complete
             for item in snapshot.telemetry
@@ -1359,7 +1367,8 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                  OR any_value(bounds.global_spans_truncated)
                  OR COALESCE(bool_or(s.spans_truncated), FALSE)
                ),
-               any_value(raw_bounds.input_span_records)
+               any_value(raw_bounds.input_span_records),
+               max(s.observed_at)
         FROM bounded_sessions h
         LEFT JOIN span_sessions s USING (session_id)
         CROSS JOIN span_status bounds
@@ -1390,6 +1399,7 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
             facts_complete=bool(row[10]),
             input_span_records=int(row[11]),
             source_ref=f"normalized-telemetry:{row[0]}/{row[1]}",
+            latest_span_at=_optional_aware(row[12]),
         )
         for row in rows
     )

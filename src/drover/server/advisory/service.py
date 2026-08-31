@@ -924,10 +924,17 @@ class InsightsService:
         expected = operational_scopes.get(finding.analyzer_id)
         if expected is not None and finding.target_type == expected[0]:
             parts = finding.target_id.split("/")
-            if len(parts) != expected[1] or not all(parts):
+            fleet_scoped = (
+                expected[0] == "telemetry_source"
+                and parts[0] == "fleet"
+                and len(parts) in (1, 2)
+                and all(parts)
+            )
+            if not fleet_scoped and (len(parts) != expected[1] or not all(parts)):
                 raise InvalidInsightTransition(
                     "finding has no executable operational target scope"
                 )
+            snapshot_target = "fleet" if fleet_scoped else finding.target_id
             from drover.server.advisory.worker import (
                 load_operational_snapshot,
                 operational_snapshot_source_version,
@@ -936,7 +943,7 @@ class InsightsService:
             snapshot = load_operational_snapshot(
                 self.duckdb_path,
                 finding.analyzer_id,
-                finding.target_id,
+                snapshot_target,
                 "operational-facts:scope-probe",
                 connection_observer=self._observe_scope_connection,
             )
@@ -954,8 +961,8 @@ class InsightsService:
                     "Check Again is unavailable because no current facts exist "
                     "for this finding target."
                 )
-            return finding.target_id, operational_snapshot_source_version(
-                self.duckdb_path, finding.analyzer_id, finding.target_id
+            return snapshot_target, operational_snapshot_source_version(
+                self.duckdb_path, finding.analyzer_id, snapshot_target
             )
         raise InvalidInsightTransition(
             "scoped reanalysis is unavailable for this finding analyzer"

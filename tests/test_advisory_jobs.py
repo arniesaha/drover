@@ -2300,6 +2300,57 @@ def test_truncated_span_facts_cannot_resolve_existing_cache_finding(
     assert repository.get_finding(existing.finding_id).state.value == "open"
 
 
+def test_fleet_scope_telemetry_job_resolves_legacy_flow_coverage_finding(
+    db_path: Path,
+) -> None:
+    """`telemetry.flow_coverage` was retired for the fleet-level rules.
+
+    A finding raised under the old rule can no longer be reproduced by the
+    analyzer, but the next fleet-scope telemetry job still has to resolve it
+    once current facts are complete for its target -- the per-target
+    ``_snapshot_covers_finding`` branch, unchanged by the fleet rewrite.
+    """
+
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.flow_coverage",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="Telemetry flow is incomplete",
+            impact="Observed latency, routing, token, cost, and cache analytics omit sessions without spans.",
+            remediation=("Verify the OTLP exporter, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="normalized-telemetry:mac-mini/codex",
+                    observed_at=NOW,
+                    fields={"span_coverage_percent": 0},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.telemetry_coverage",
+        target_id="fleet",
+        source_version="complete:v1",
+    )
+    complete = _telemetry_snapshot("complete:v1")
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: complete,
+    )
+
+    assert worker.run_once([operational_analyzers()[2]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "resolved"
+
+
 def test_offline_host_does_not_resolve_an_open_connector_finding(
     db_path: Path,
 ) -> None:

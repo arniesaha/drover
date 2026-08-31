@@ -83,6 +83,7 @@ def _telemetry(**overrides: object) -> TelemetryAggregate:
         "facts_complete": True,
         "input_span_records": 10,
         "source_ref": "analytics:mac-mini/codex/24h",
+        "latest_span_at": NOW - timedelta(minutes=30),
     }
     values.update(overrides)
     return TelemetryAggregate(**values)  # type: ignore[arg-type]
@@ -338,33 +339,64 @@ def test_hook_descriptor_rejects_non_allowlisted_or_noncanonical_input() -> None
         HookDescriptor(**(fields | {"enabled": "true"}))
 
 
-@pytest.mark.parametrize(
-    ("field", "rule_id", "coverage_field"),
-    [
-        ("sessions_with_spans", "telemetry.flow_coverage", "span_coverage_percent"),
-        (
-            "repository_attributed_sessions",
-            "telemetry.repository_attribution",
-            "coverage_percent",
-        ),
-        ("token_observed_sessions", "telemetry.token_coverage", "coverage_percent"),
-        ("cost_observed_sessions", "telemetry.cost_coverage", "coverage_percent"),
-    ],
-)
-def test_telemetry_coverage_rules_report_aggregate_percentages(
-    field: str, rule_id: str, coverage_field: str
-) -> None:
-    aggregate = _telemetry(**{field: 4})
-
-    findings = TelemetryCoverageAnalyzer(minimum_percent=80).analyze(
-        _snapshot(telemetry=(aggregate,))
+def test_silent_span_feed_is_one_fleet_finding() -> None:
+    snapshot = _snapshot(
+        telemetry=(
+            _telemetry(
+                sessions_with_spans=0,
+                token_observed_sessions=0,
+                cost_observed_sessions=0,
+                latest_span_at=None,
+            ),
+            _telemetry(
+                target_id="nas/claude-code",
+                host_id="nas",
+                harness_id="claude-code",
+                sessions_with_spans=0,
+                token_observed_sessions=0,
+                cost_observed_sessions=0,
+                latest_span_at=None,
+            ),
+        )
     )
-    finding = next(item for item in findings if item.rule_id == rule_id)
+    findings = TelemetryCoverageAnalyzer().analyze(snapshot)
+    silent = [f for f in findings if f.rule_id == "telemetry.span_feed_silent"]
+    assert len(silent) == 1
+    assert silent[0].target_id == "fleet"
+    assert silent[0].severity is Severity.LOW
 
-    assert finding.evidence[0].fields[coverage_field] == 40
-    assert finding.evidence[0].fields["covered_sessions"] == 4
-    assert finding.evidence[0].fields["total_sessions"] == 10
-    assert finding.evidence[0].fields["minimum_percent"] == 80
+
+def test_harness_with_no_token_source_is_one_finding_per_harness() -> None:
+    snapshot = _snapshot(
+        telemetry=(
+            _telemetry(
+                harness_id="agy", target_id="mac-mini/agy", token_observed_sessions=0
+            ),
+            _telemetry(
+                harness_id="agy",
+                target_id="nas/agy",
+                host_id="nas",
+                token_observed_sessions=0,
+            ),
+        )
+    )
+    findings = TelemetryCoverageAnalyzer().analyze(snapshot)
+    missing = [f for f in findings if f.rule_id == "telemetry.token_source_missing"]
+    assert [f.target_id for f in missing] == ["fleet/agy"]
+    assert missing[0].severity is Severity.MEDIUM
+
+
+def test_healthy_fleet_emits_no_telemetry_findings() -> None:
+    assert (
+        TelemetryCoverageAnalyzer().analyze(_snapshot(telemetry=(_telemetry(),))) == []
+    )
+
+
+def test_repository_attribution_stays_per_target() -> None:
+    snapshot = _snapshot(telemetry=(_telemetry(repository_attributed_sessions=1),))
+    findings = TelemetryCoverageAnalyzer().analyze(snapshot)
+    assert [f.rule_id for f in findings] == ["telemetry.repository_attribution"]
+    assert findings[0].target_id == "mac-mini/codex"
 
 
 def test_empty_telemetry_window_does_not_create_coverage_findings() -> None:
@@ -435,19 +467,19 @@ def test_routing_mismatch_frequency_is_confirmed() -> None:
 
 def test_analyzers_return_candidates_in_stable_target_order() -> None:
     later = _telemetry(
-        target_id="z-host/codex", host_id="z-host", token_observed_sessions=1
+        target_id="z-host/codex", host_id="z-host", repository_attributed_sessions=1
     )
     earlier = _telemetry(
-        target_id="a-host/codex", host_id="a-host", token_observed_sessions=1
+        target_id="a-host/codex", host_id="a-host", repository_attributed_sessions=1
     )
 
     findings = TelemetryCoverageAnalyzer(minimum_percent=80).analyze(
         _snapshot(telemetry=(later, earlier))
     )
 
-    token_targets = [
+    attribution_targets = [
         item.target_id
         for item in findings
-        if item.rule_id == "telemetry.token_coverage"
+        if item.rule_id == "telemetry.repository_attribution"
     ]
-    assert token_targets == ["a-host/codex", "z-host/codex"]
+    assert attribution_targets == ["a-host/codex", "z-host/codex"]
