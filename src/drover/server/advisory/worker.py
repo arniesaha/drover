@@ -24,6 +24,7 @@ from drover.server.advisory.analyzers import (
     TelemetryAggregate,
 )
 from drover.server.advisory.analyzers.connectors import (
+    HOST_ABSENCE_DEFAULT,
     ConnectorFreshnessAnalyzer,
     ProviderResetWindowAnalyzer,
 )
@@ -974,6 +975,22 @@ class AdvisoryWorker:
             )
 
 
+def _host_is_present(
+    connection: ProviderConnectionObservation, analyzed_at: datetime
+) -> bool:
+    """A silent host is not passing evidence -- it is no evidence at all.
+
+    Mirrors ``ConnectorFreshnessAnalyzer``'s own host-absence gate so a
+    connector finding can only be resolved by a snapshot that actually heard
+    from the host, never by the host simply dropping off the network.
+    """
+
+    if connection.host_last_seen_at is None:
+        return False
+    age = analyzed_at - connection.host_last_seen_at
+    return age <= HOST_ABSENCE_DEFAULT
+
+
 def _snapshot_covers_finding(
     snapshot: AnalysisSnapshot,
     analyzer_id: str,
@@ -985,6 +1002,7 @@ def _snapshot_covers_finding(
     if target_type == "provider_connector":
         return any(
             f"{item.host_id}/{item.provider}/{item.account_label}" == target_id
+            and _host_is_present(item, snapshot.analyzed_at)
             and (
                 analyzer_id != ProviderResetWindowAnalyzer.analyzer_id
                 or item.reset_windows_complete
@@ -1143,8 +1161,10 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
     rows = con.execute(
         f"""
         SELECT p.provider, p.account_label, p.host_id, p.enabled,
-               p.last_attempt_at, p.last_success_at, p.error_category,
-               p.updated_at, CAST(hh.last_seen_at AS TIMESTAMPTZ)
+               CAST(p.last_attempt_at AS TIMESTAMPTZ),
+               CAST(p.last_success_at AS TIMESTAMPTZ), p.error_category,
+               CAST(p.updated_at AS TIMESTAMPTZ),
+               CAST(hh.last_seen_at AS TIMESTAMPTZ)
         FROM provider_connections p
         LEFT JOIN harness_hosts hh ON hh.host_id = p.host_id
         {provider_where}

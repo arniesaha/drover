@@ -16,6 +16,12 @@ from drover.server.advisory.types import (
     Severity,
 )
 
+#: How long a host may go unheard-from before its connector findings are
+#: treated as unverifiable rather than passing or failing. Shared with
+#: ``worker._snapshot_covers_finding`` so the analyzer's gate and the
+#: resolve-on-pass coverage check can't drift apart.
+HOST_ABSENCE_DEFAULT = timedelta(minutes=10)
+
 
 def _age_seconds(now: datetime, then: datetime | None) -> int | None:
     if then is None:
@@ -35,7 +41,7 @@ class ConnectorFreshnessAnalyzer:
         *,
         max_age: timedelta = timedelta(hours=6),
         error_grace: timedelta = timedelta(minutes=30),
-        host_absence: timedelta = timedelta(minutes=10),
+        host_absence: timedelta = HOST_ABSENCE_DEFAULT,
     ) -> None:
         for name, value in (
             ("max_age", max_age),

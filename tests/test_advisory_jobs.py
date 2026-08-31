@@ -2300,6 +2300,78 @@ def test_truncated_span_facts_cannot_resolve_existing_cache_finding(
     assert repository.get_finding(existing.finding_id).state.value == "open"
 
 
+def test_offline_host_does_not_resolve_an_open_connector_finding(
+    db_path: Path,
+) -> None:
+    """A silent host is not passing evidence.
+
+    The analyzer's own host-absence gate makes it emit no candidate for a
+    connection whose host has gone quiet -- but that must not let
+    ``_snapshot_covers_finding`` read the connection's mere presence in facts
+    as proof the error passed. An open ``connector.error`` finding has to
+    stay open until a snapshot actually hears from the host again.
+    """
+
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.connector_freshness",
+            rule_id="connector.error",
+            target_type="provider_connector",
+            target_id="mac-mini/openai/personal",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="OpenAI connector reports an error",
+            impact="Provider-reported subscription usage may be stale or unavailable until the connector succeeds.",
+            remediation=("Refresh the connector, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="provider_connections:mac-mini/openai/personal",
+                    observed_at=NOW,
+                    fields={"status": "error"},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.connector_freshness",
+        target_id="fleet",
+        source_version="host-offline:v2",
+    )
+    offline_host = AnalysisSnapshot(
+        source_version="host-offline:v2",
+        analyzed_at=NOW,
+        provider_connections=(
+            ProviderConnectionObservation(
+                provider="openai",
+                account_label="personal",
+                host_id="mac-mini",
+                enabled=True,
+                status="error",
+                observed_at=NOW,
+                last_attempt_at=NOW,
+                last_success_at=None,
+                error_category="auth",
+                reset_windows=(),
+                reset_windows_complete=True,
+                source_ref="provider_connections:mac-mini/openai/personal",
+                host_last_seen_at=NOW - timedelta(minutes=17),
+            ),
+        ),
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: offline_host,
+    )
+
+    assert worker.run_once([ConnectorFreshnessAnalyzer()]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "open"
+
+
 def test_connector_material_hash_coalesces_heartbeats_but_tracks_staleness(
     db_path: Path,
 ) -> None:
