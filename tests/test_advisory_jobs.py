@@ -382,7 +382,7 @@ def test_empty_snapshot_is_not_treated_as_passing_evidence(db_path: Path) -> Non
     assert AdvisoryRepository(db_path).list_findings()[0].state.value == "open"
 
 
-def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
+def test_ledger_completion_failure_persists_finding_and_retry_is_idempotent(
     db_path: Path, monkeypatch
 ) -> None:
     job = enqueue_advisory_check(
@@ -403,11 +403,18 @@ def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
 
     monkeypatch.setattr(Ledger, "succeed_job", fail_after_completion)
     assert worker.run_once([HealthyAnalyzer()]).failed == 1
-    with duckdb.connect(str(db_path), read_only=True) as con:
-        assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 0
+    # Findings commit to the control-plane store first; a crash inside the
+    # ledger phase (the analytical store) leaves the finding in place and
+    # the job leased for retry, not the finding rolled back with it.
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 1
         assert (
-            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 0
+            con.execute("SELECT state FROM advisory_findings").fetchone()[0] == "open"
         )
+        assert (
+            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 1
+        )
+    with duckdb.connect(str(db_path), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 0
         assert (
             con.execute(
@@ -418,11 +425,14 @@ def test_ledger_completion_failure_rolls_back_findings_and_retry_is_idempotent(
 
     monkeypatch.setattr(Ledger, "succeed_job", original)
     assert worker.run_once([HealthyAnalyzer()]).succeeded == 1
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    # The retry re-observes the same fingerprint idempotently: exactly one
+    # finding row, not a duplicate, and the ledger now succeeds.
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM advisory_findings").fetchone()[0] == 1
         assert (
-            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 1
+            con.execute("SELECT count(*) FROM advisory_occurrences").fetchone()[0] == 2
         )
+    with duckdb.connect(str(db_path), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 1
 
 
@@ -1115,15 +1125,16 @@ excerpt_max_chars = 320
             "SELECT status, latest_artifact_id FROM pipeline_jobs WHERE job_id = ?",
             [job.job_id],
         ).fetchone()
+        artifact_count = con.execute(
+            "SELECT count(*) FROM pipeline_artifacts WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone()[0]
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
         finding_count = con.execute(
             "SELECT count(*) FROM advisory_findings"
         ).fetchone()[0]
         occurrence_count = con.execute(
             "SELECT count(*) FROM advisory_occurrences"
-        ).fetchone()[0]
-        artifact_count = con.execute(
-            "SELECT count(*) FROM pipeline_artifacts WHERE job_id = ?",
-            [job.job_id],
         ).fetchone()[0]
     assert status == "cancelled"
     assert artifact_id is None
@@ -1548,12 +1559,12 @@ def test_content_worker_retries_when_bundle_changes_after_version_probe(
     assert fetches == ["fetch", "fetch"]
 
 
-def test_content_job_rolls_back_findings_when_ledger_completion_fails(
+def test_content_job_finding_persists_when_ledger_completion_fails_and_retry_is_idempotent(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     content = "Always inspect the repository. Always inspect the repository."
     bundle = _content_bundle(content)
-    enqueue_advisory_check(
+    job = enqueue_advisory_check(
         db_path,
         analyzer_id="model.configuration",
         target_id="mac-mini",
@@ -1579,20 +1590,53 @@ def test_content_job_rolls_back_findings_when_ledger_completion_fails(
                 }
             )
 
+    original = Ledger.succeed_job
+
     def fail_completion(self, *args, **kwargs):
         raise RuntimeError("injected artifact failure")
 
     monkeypatch.setattr(Ledger, "succeed_job", fail_completion)
+    repository = AdvisoryRepository(db_path)
     worker = ContentAnalysisWorker(
         consent_reader=lambda: _content_config(),
         bundle_fetcher=lambda _host, _targets: bundle,
         backend_factory=lambda _config: Backend(),
         duckdb_path=db_path,
-        repository=AdvisoryRepository(db_path),
+        repository=repository,
+        retry_delay=timedelta(0),
+        clock=lambda: NOW,
     )
 
+    # Findings commit to the control-plane store before the ledger runs, so
+    # a crash inside the ledger phase leaves the finding in place; the job
+    # stays leased for retry rather than the finding rolling back with it.
     assert worker.run_once().failed == 1
-    assert AdvisoryRepository(db_path).list_findings() == []
+    findings = repository.list_findings()
+    assert len(findings) == 1
+    assert findings[0].state.value == "open"
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 0
+        assert (
+            con.execute(
+                "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+            ).fetchone()[0]
+            != "succeeded"
+        )
+
+    monkeypatch.setattr(Ledger, "succeed_job", original)
+    # The retry re-observes the same fingerprint idempotently: exactly one
+    # finding row, not a duplicate, and the ledger now succeeds.
+    assert worker.run_once().succeeded == 1
+    findings = repository.list_findings()
+    assert len(findings) == 1
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM pipeline_artifacts").fetchone()[0] == 1
+        assert (
+            con.execute(
+                "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+            ).fetchone()[0]
+            == "succeeded"
+        )
 
 
 def test_clean_model_bundle_resolves_only_covered_nondismissed_targets(
@@ -1632,7 +1676,7 @@ def test_clean_model_bundle_resolves_only_covered_nondismissed_targets(
     assert repository.get_finding(covered.finding_id).state.value == "resolved"
     assert repository.get_finding(dismissed.finding_id).state.value == "dismissed"
     assert repository.get_finding(unrequested.finding_id).state.value == "open"
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    with duckdb.connect(str(control_plane_path(db_path)), read_only=True) as con:
         passing = con.execute(
             "SELECT outcome FROM advisory_occurrences WHERE finding_id = ? "
             "ORDER BY recorded_at DESC LIMIT 1",

@@ -52,7 +52,11 @@ from drover.server.advisory.model_analyzer import (
 )
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.types import FindingCandidate
-from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
+from drover.server.db import (
+    attached_control_plane_snapshot,
+    control_plane_connection,
+    open_duckdb_connection,
+)
 from drover.server.ledger import ArtifactSpec, Job, Ledger
 
 log = logging.getLogger("drover.advisory")
@@ -523,44 +527,58 @@ class ContentAnalysisWorker:
             raise ValueError(
                 "duckdb_path and repository are required to record a content job"
             )
+        # Same crash-ordering rationale as _execute: findings commit to the
+        # control plane first, the ledger to the analytical store second. A
+        # crash between the two leaves the job leased for a retry, and
+        # observe_in_transaction is idempotent on fingerprint, so nothing is
+        # lost and nothing double-counts.
+        run_id = job.latest_attempt_id or job.job_id
+        observed_fingerprints: set[str] = set()
+        finding_ids: list[str] = []
+        with control_plane_connection(self.duckdb_path) as plane:
+            try:
+                plane.execute("BEGIN TRANSACTION")
+                for candidate in candidates:
+                    finding_id = self.repository.observe_in_transaction(
+                        plane, candidate, run_id=run_id
+                    )
+                    fingerprint = plane.execute(
+                        "SELECT fingerprint FROM advisory_findings "
+                        "WHERE finding_id = ?",
+                        [finding_id],
+                    ).fetchone()[0]
+                    finding_ids.append(finding_id)
+                    observed_fingerprints.add(str(fingerprint))
+                if covered_target_ids:
+                    placeholders = ", ".join("?" for _ in covered_target_ids)
+                    existing = plane.execute(
+                        f"""
+                        SELECT finding_id, fingerprint
+                        FROM advisory_findings
+                        WHERE analyzer_id = ?
+                          AND target_type = 'configuration_target'
+                          AND state IN ('open', 'acknowledged', 'regressed')
+                          AND target_id IN ({placeholders})
+                        """,
+                        [MODEL_ANALYZER_ID, *covered_target_ids],
+                    ).fetchall()
+                    for finding_id, fingerprint in existing:
+                        if str(fingerprint) in observed_fingerprints:
+                            continue
+                        self.repository.mark_passing_in_transaction(
+                            plane, str(finding_id), run_id=run_id
+                        )
+                        finding_ids.append(str(finding_id))
+                plane.execute("COMMIT")
+            except Exception:
+                plane.execute("ROLLBACK")
+                raise
+
+        artifact = {**artifact_base, "finding_ids": finding_ids}
+        serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
             con.execute("BEGIN TRANSACTION")
-            run_id = job.latest_attempt_id or job.job_id
-            observed_fingerprints: set[str] = set()
-            finding_ids: list[str] = []
-            for candidate in candidates:
-                finding_id = self.repository.observe_in_transaction(
-                    con, candidate, run_id=run_id
-                )
-                fingerprint = con.execute(
-                    "SELECT fingerprint FROM advisory_findings WHERE finding_id = ?",
-                    [finding_id],
-                ).fetchone()[0]
-                finding_ids.append(finding_id)
-                observed_fingerprints.add(str(fingerprint))
-            if covered_target_ids:
-                placeholders = ", ".join("?" for _ in covered_target_ids)
-                existing = con.execute(
-                    f"""
-                    SELECT finding_id, fingerprint
-                    FROM advisory_findings
-                    WHERE analyzer_id = ?
-                      AND target_type = 'configuration_target'
-                      AND state IN ('open', 'acknowledged', 'regressed')
-                      AND target_id IN ({placeholders})
-                    """,
-                    [MODEL_ANALYZER_ID, *covered_target_ids],
-                ).fetchall()
-                for finding_id, fingerprint in existing:
-                    if str(fingerprint) in observed_fingerprints:
-                        continue
-                    self.repository.mark_passing_in_transaction(
-                        con, str(finding_id), run_id=run_id
-                    )
-                    finding_ids.append(str(finding_id))
-            artifact = {**artifact_base, "finding_ids": finding_ids}
-            serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
             ledger = Ledger(con)
             ledger.succeed_job(
                 job.job_id,
@@ -793,53 +811,67 @@ class AdvisoryWorker:
                 raise ValueError(
                     "analyzer emitted a candidate with another analyzer_id"
                 )
+        # Findings commit to the control plane first, the ledger to the
+        # analytical store second. If the process dies between the two, the
+        # job stays leased: lease expiry reclaims it, the retry re-runs the
+        # analyzer, and observe_in_transaction is idempotent on fingerprint,
+        # so the same findings are re-observed rather than duplicated and
+        # nothing the first attempt wrote is lost.
+        run_id = job.latest_attempt_id or job.job_id
+        affected: list[str] = []
+        observed_fingerprints: set[str] = set()
+        with control_plane_connection(self.duckdb_path) as plane:
+            try:
+                plane.execute("BEGIN TRANSACTION")
+                existing = plane.execute(
+                    """
+                    SELECT finding_id, fingerprint, target_type, target_id
+                    FROM advisory_findings
+                    WHERE analyzer_id = ? AND state NOT IN ('resolved', 'dismissed')
+                    """,
+                    [analyzer.analyzer_id],
+                ).fetchall()
+                for candidate in candidates:
+                    finding_id = self.repository.observe_in_transaction(
+                        plane, candidate, run_id=run_id
+                    )
+                    fingerprint = plane.execute(
+                        "SELECT fingerprint FROM advisory_findings "
+                        "WHERE finding_id = ?",
+                        [finding_id],
+                    ).fetchone()[0]
+                    affected.append(finding_id)
+                    observed_fingerprints.add(str(fingerprint))
+                for (
+                    finding_id,
+                    fingerprint,
+                    finding_target_type,
+                    finding_target_id,
+                ) in existing:
+                    if (
+                        _finding_in_job_scope(target_id, str(finding_target_id))
+                        and str(fingerprint) not in observed_fingerprints
+                        and _snapshot_covers_finding(
+                            snapshot,
+                            analyzer.analyzer_id,
+                            str(finding_target_type),
+                            str(finding_target_id),
+                        )
+                    ):
+                        self.repository.mark_passing_in_transaction(
+                            plane, str(finding_id), run_id=run_id
+                        )
+                        affected.append(str(finding_id))
+                plane.execute("COMMIT")
+            except Exception:
+                plane.execute("ROLLBACK")
+                raise
+
+        finding_ids = tuple(dict.fromkeys(affected))
+        payload = json.dumps(finding_ids, separators=(",", ":"))
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
             con.execute("BEGIN TRANSACTION")
-            run_id = job.latest_attempt_id or job.job_id
-            existing = con.execute(
-                """
-                SELECT finding_id, fingerprint, target_type, target_id
-                FROM advisory_findings
-                WHERE analyzer_id = ? AND state NOT IN ('resolved', 'dismissed')
-                """,
-                [analyzer.analyzer_id],
-            ).fetchall()
-            affected: list[str] = []
-            observed_fingerprints: set[str] = set()
-            for candidate in candidates:
-                finding_id = self.repository.observe_in_transaction(
-                    con, candidate, run_id=run_id
-                )
-                fingerprint = con.execute(
-                    "SELECT fingerprint FROM advisory_findings WHERE finding_id = ?",
-                    [finding_id],
-                ).fetchone()[0]
-                affected.append(finding_id)
-                observed_fingerprints.add(str(fingerprint))
-            for (
-                finding_id,
-                fingerprint,
-                finding_target_type,
-                finding_target_id,
-            ) in existing:
-                if (
-                    _finding_in_job_scope(target_id, str(finding_target_id))
-                    and str(fingerprint) not in observed_fingerprints
-                    and _snapshot_covers_finding(
-                        snapshot,
-                        analyzer.analyzer_id,
-                        str(finding_target_type),
-                        str(finding_target_id),
-                    )
-                ):
-                    self.repository.mark_passing_in_transaction(
-                        con, str(finding_id), run_id=run_id
-                    )
-                    affected.append(str(finding_id))
-
-            finding_ids = tuple(dict.fromkeys(affected))
-            payload = json.dumps(finding_ids, separators=(",", ":"))
             ledger = Ledger(con)
             ledger.succeed_job(
                 job.job_id,
