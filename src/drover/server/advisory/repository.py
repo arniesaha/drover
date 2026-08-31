@@ -22,7 +22,7 @@ from drover.server.advisory.types import (
     JSONValue,
     Severity,
 )
-from drover.server.db import open_duckdb_connection
+from drover.server.db import control_plane_connection, open_duckdb_connection
 
 MAX_EXCERPT_CHARS = 512
 MAX_EVIDENCE_RECORDS = 16
@@ -66,16 +66,14 @@ class AdvisoryRepository:
         self.duckdb_path = Path(duckdb_path)
 
     def observe(self, candidate: FindingCandidate, *, run_id: str) -> Finding:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            finding_id = self.observe_in_transaction(con, candidate, run_id=run_id)
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+        with control_plane_connection(self.duckdb_path) as con:
+            try:
+                con.execute("BEGIN TRANSACTION")
+                finding_id = self.observe_in_transaction(con, candidate, run_id=run_id)
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return self.get_finding(finding_id)
 
     def observe_in_transaction(
@@ -196,16 +194,14 @@ class AdvisoryRepository:
         return finding_id
 
     def mark_passing(self, finding_id: str, *, run_id: str) -> Finding:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            self.mark_passing_in_transaction(con, finding_id, run_id=run_id)
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+        with control_plane_connection(self.duckdb_path) as con:
+            try:
+                con.execute("BEGIN TRANSACTION")
+                self.mark_passing_in_transaction(con, finding_id, run_id=run_id)
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return self.get_finding(finding_id)
 
     def mark_passing_in_transaction(
@@ -261,29 +257,19 @@ class AdvisoryRepository:
         )
 
     def list_findings(self) -> list[Finding]:
-        con = open_duckdb_connection(
-            self.duckdb_path, read_only=True, role="diagnostic"
-        )
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             rows = con.execute(
                 f"SELECT {_FINDING_COLUMNS} FROM advisory_findings "
                 "ORDER BY last_seen_at DESC, finding_id"
             ).fetchall()
-        finally:
-            con.close()
         return [_finding_from_row(row) for row in rows]
 
     def get_finding(self, finding_id: str) -> Finding:
-        con = open_duckdb_connection(
-            self.duckdb_path, read_only=True, role="diagnostic"
-        )
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             row = con.execute(
                 f"SELECT {_FINDING_COLUMNS} FROM advisory_findings WHERE finding_id = ?",
                 [finding_id],
             ).fetchone()
-        finally:
-            con.close()
         if row is None:
             raise KeyError(f"finding {finding_id!r} not found")
         return _finding_from_row(row)
@@ -354,42 +340,42 @@ class AdvisoryRepository:
         state: FindingState,
         reason: str | None = None,
     ) -> Finding:
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            current = FindingState(self._require_finding(con, finding_id)[0])
-            if current not in allowed:
-                raise ValueError(
-                    f"cannot {state.value} finding in {current.value} state"
-                )
-            now = datetime.now(timezone.utc)
-            row = con.execute(
-                f"""
-                UPDATE advisory_findings
-                SET state = ?, dismissal_reason = ?,
-                    dismissed_at = CASE WHEN ? = 'dismissed' THEN ? ELSE dismissed_at END
-                WHERE finding_id = ? AND state = ?
-                RETURNING {_FINDING_COLUMNS}
-                """,
-                [state.value, reason, state.value, now, finding_id, current.value],
-            ).fetchone()
-            if row is None:
-                raise ValueError("finding state changed during lifecycle transition")
-            con.execute("COMMIT")
-            return _finding_from_row(row)
-        except duckdb.TransactionException as exc:
+        with control_plane_connection(self.duckdb_path) as con:
             try:
+                con.execute("BEGIN TRANSACTION")
+                current = FindingState(self._require_finding(con, finding_id)[0])
+                if current not in allowed:
+                    raise ValueError(
+                        f"cannot {state.value} finding in {current.value} state"
+                    )
+                now = datetime.now(timezone.utc)
+                row = con.execute(
+                    f"""
+                    UPDATE advisory_findings
+                    SET state = ?, dismissal_reason = ?,
+                        dismissed_at = CASE WHEN ? = 'dismissed' THEN ? ELSE dismissed_at END
+                    WHERE finding_id = ? AND state = ?
+                    RETURNING {_FINDING_COLUMNS}
+                    """,
+                    [state.value, reason, state.value, now, finding_id, current.value],
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        "finding state changed during lifecycle transition"
+                    )
+                con.execute("COMMIT")
+                return _finding_from_row(row)
+            except duckdb.TransactionException as exc:
+                try:
+                    con.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+                raise ValueError(
+                    "finding state changed during lifecycle transition"
+                ) from exc
+            except Exception:
                 con.execute("ROLLBACK")
-            except duckdb.Error:
-                pass
-            raise ValueError(
-                "finding state changed during lifecycle transition"
-            ) from exc
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+                raise
 
     @staticmethod
     def _require_finding(

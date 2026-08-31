@@ -33,7 +33,7 @@ from drover.server.advisory.types import (
     FindingState,
     Severity,
 )
-from drover.server.db import open_duckdb_connection
+from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.harness.content_consent import DurableContentConsent
 
 DEFAULT_PAGE_SIZE = 50
@@ -473,26 +473,24 @@ class InsightsService:
     def purge_content_excerpts(self) -> int:
         """Null only bounded excerpts, retaining all lifecycle evidence."""
 
-        con = open_duckdb_connection(self.duckdb_path, role="worker")
-        try:
-            con.execute("BEGIN TRANSACTION")
-            count = int(
+        with control_plane_connection(self.duckdb_path) as con:
+            try:
+                con.execute("BEGIN TRANSACTION")
+                count = int(
+                    con.execute(
+                        "SELECT count(*) FROM advisory_occurrences "
+                        "WHERE excerpt IS NOT NULL"
+                    ).fetchone()[0]
+                )
                 con.execute(
-                    "SELECT count(*) FROM advisory_occurrences "
+                    "UPDATE advisory_occurrences SET excerpt = NULL "
                     "WHERE excerpt IS NOT NULL"
-                ).fetchone()[0]
-            )
-            con.execute(
-                "UPDATE advisory_occurrences SET excerpt = NULL "
-                "WHERE excerpt IS NOT NULL"
-            )
-            con.execute("COMMIT")
-            return count
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+                )
+                con.execute("COMMIT")
+                return count
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
 
     def _cancel_pending_model_jobs(self) -> int:
         from drover.server.ledger import Ledger
@@ -622,10 +620,7 @@ class InsightsService:
             values.extend([rank, rank, last_seen, rank, last_seen, finding_id])
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        con = open_duckdb_connection(
-            self.duckdb_path, read_only=True, role="diagnostic"
-        )
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             rows = con.execute(
                 f"""
                 SELECT finding_id, analyzer_id, rule_id, target_type, target_id,
@@ -639,8 +634,6 @@ class InsightsService:
                 """,
                 [*values, filters.limit + 1],
             ).fetchall()
-        finally:
-            con.close()
 
         has_more = len(rows) > filters.limit
         page = rows[: filters.limit]
@@ -657,10 +650,7 @@ class InsightsService:
     def get_insight(self, finding_id: str) -> dict[str, Any]:
         finding_id = validate_finding_id(finding_id)
         finding = self.repository.get_finding(finding_id)
-        con = open_duckdb_connection(
-            self.duckdb_path, read_only=True, role="diagnostic"
-        )
-        try:
+        with control_plane_connection(self.duckdb_path) as con:
             rows = con.execute(
                 """
                 SELECT observed_at, source_ref, evidence_json, excerpt
@@ -671,8 +661,6 @@ class InsightsService:
                 """,
                 [finding_id, MAX_DETAIL_EVIDENCE],
             ).fetchall()
-        finally:
-            con.close()
         return {
             "finding": _serialize_finding(finding),
             "evidence": [

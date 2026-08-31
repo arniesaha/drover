@@ -626,7 +626,9 @@ def test_purge_removes_excerpts_not_occurrence_metadata(
 
     assert service.purge_content_excerpts() == 2
 
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         rows = con.execute("""
             SELECT o.finding_id, o.run_id, o.observed_at, o.source_ref,
@@ -737,20 +739,17 @@ def test_acknowledge_and_dismiss_require_valid_transitions(repository, candidate
 
 
 def test_concurrent_dismissals_cannot_both_commit_or_overwrite_reason(
-    repository, candidate, monkeypatch
+    repository, candidate
 ):
+    """Two racing dismissals: exactly one wins, the loser cannot overwrite.
+
+    Control-plane windows are serialized by ``control_plane_lock`` since the
+    findings moved stores, so the race resolves as winner-then-invalid-state
+    rather than an optimistic write conflict. The guarantee is unchanged:
+    one dismissal persists, the other raises, the reason is never
+    overwritten.
+    """
     finding = repository.observe(candidate, run_id="run-1")
-    barrier = threading.Barrier(2)
-    original = AdvisoryRepository._require_finding
-
-    def synchronize_after_read(con, finding_id):
-        row = original(con, finding_id)
-        barrier.wait(timeout=2)
-        return row
-
-    monkeypatch.setattr(
-        AdvisoryRepository, "_require_finding", staticmethod(synchronize_after_read)
-    )
     outcomes: list[tuple[str, str]] = []
 
     def dismiss(reason: str) -> None:
@@ -769,7 +768,7 @@ def test_concurrent_dismissals_cannot_both_commit_or_overwrite_reason(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=3)
+        thread.join(timeout=5)
 
     assert all(not thread.is_alive() for thread in threads)
     assert sorted(kind for kind, _ in outcomes) == ["conflict", "ok"]
@@ -803,7 +802,9 @@ def test_observe_appends_bounded_redacted_occurrence_atomically(repository, cand
     )
     finding = repository.observe(secret_candidate, run_id="run-secret")
 
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         row = con.execute(
             "SELECT evidence_json, excerpt FROM advisory_occurrences "
@@ -839,7 +840,9 @@ def test_excerpt_redacts_basic_authorization_and_private_keys(repository, candid
     )
 
     finding = repository.observe(secret_candidate, run_id="run-secret-forms")
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         excerpt = con.execute(
             "SELECT excerpt FROM advisory_occurrences WHERE finding_id = ?",
@@ -897,7 +900,9 @@ def test_compound_sensitive_keys_are_redacted_everywhere(repository, candidate):
     )
 
     finding = repository.observe(secret_candidate, run_id="run-compound-secrets")
-    con = duckdb.connect(str(repository.duckdb_path), read_only=True)
+    con = duckdb.connect(
+        str(control_plane_path(repository.duckdb_path)), read_only=True
+    )
     try:
         evidence_json, excerpt = con.execute(
             "SELECT evidence_json, excerpt FROM advisory_occurrences "
