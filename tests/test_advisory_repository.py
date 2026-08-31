@@ -28,7 +28,7 @@ from drover.server.advisory.types import (
     FindingState,
     Severity,
 )
-from drover.server.db import control_plane_path
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.content_consent import DurableContentConsent
 
 _LEGACY_FINDINGS_DDL = """
@@ -787,6 +787,38 @@ def test_mark_passing_is_the_only_resolution_path(repository, candidate):
     assert resolved.resolved_at is not None
     with pytest.raises(ValueError, match="cannot acknowledge"):
         repository.acknowledge(finding.finding_id)
+
+
+def test_third_regression_in_a_day_holds_the_finding_open(repository, candidate):
+    recent = replace(
+        candidate,
+        evidence=(
+            replace(candidate.evidence[0], observed_at=datetime.now(timezone.utc)),
+        ),
+    )
+    run = "run-flap"
+    finding = repository.observe(recent, run_id=run)
+    for cycle in range(3):
+        repository.mark_passing(finding.finding_id, run_id=f"{run}-pass-{cycle}")
+        finding = repository.observe(recent, run_id=f"{run}-re-{cycle}")
+        assert finding.state == FindingState.REGRESSED
+    # Fourth recovery: held, not resolved.
+    held = repository.mark_passing(finding.finding_id, run_id=f"{run}-pass-3")
+    assert held.state == FindingState.REGRESSED
+
+
+def test_regression_count_resets_after_quiet(repository, candidate):
+    finding = repository.observe(candidate, run_id="r1")
+    repository.mark_passing(finding.finding_id, run_id="r2")
+    finding = repository.observe(candidate, run_id="r3")
+    with control_plane_connection(repository.duckdb_path) as con:
+        con.execute(
+            "UPDATE advisory_findings SET regression_count = 3, "
+            "regressed_at = now() - INTERVAL 25 HOUR WHERE finding_id = ?",
+            [finding.finding_id],
+        )
+    resolved = repository.mark_passing(finding.finding_id, run_id="r4")
+    assert resolved.state == FindingState.RESOLVED
 
 
 def test_observe_appends_bounded_redacted_occurrence_atomically(repository, candidate):

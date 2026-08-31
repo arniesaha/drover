@@ -101,7 +101,8 @@ class AdvisoryRepository:
         )
         observed_at = max(item[0].observed_at for item in normalized)
         row = con.execute(
-            "SELECT finding_id, state, severity, evaluated_content_hash "
+            "SELECT finding_id, state, severity, evaluated_content_hash, "
+            "regressed_at, regression_count "
             "FROM advisory_findings WHERE fingerprint = ?",
             [fingerprint],
         ).fetchone()
@@ -151,6 +152,17 @@ class AdvisoryRepository:
                 material_hash=material_hash,
             )
             regressed_at = observed_at if old_state == FindingState.RESOLVED else None
+            previous_regressed_at = row[4]
+            previous_count = int(row[5] or 0)
+            if old_state == FindingState.RESOLVED:
+                recent = (
+                    previous_regressed_at is not None
+                    and (observed_at - _aware_ts(previous_regressed_at)).total_seconds()
+                    < 86400
+                )
+                regression_count = previous_count + 1 if recent else 1
+            else:
+                regression_count = previous_count
             clear_dismissal = (
                 old_state == FindingState.DISMISSED and state == FindingState.OPEN
             )
@@ -163,6 +175,7 @@ class AdvisoryRepository:
                   dismissed_at = CASE WHEN ? THEN NULL ELSE dismissed_at END,
                   resolved_at = CASE WHEN ? THEN NULL ELSE resolved_at END,
                   regressed_at = COALESCE(?, regressed_at),
+                  regression_count = ?,
                   last_seen_at = ?, evaluated_content_hash = ?, latest_run_id = ?
                 WHERE finding_id = ?
                 """,
@@ -178,6 +191,7 @@ class AdvisoryRepository:
                     clear_dismissal,
                     old_state == FindingState.RESOLVED,
                     regressed_at,
+                    regression_count,
                     observed_at,
                     candidate.content_hash,
                     run_id,
@@ -217,14 +231,31 @@ class AdvisoryRepository:
             raise ValueError("run_id is required")
         now = datetime.now(timezone.utc)
         self._require_finding(con, finding_id)
-        con.execute(
-            """
-            UPDATE advisory_findings
-            SET state = ?, resolved_at = ?, latest_run_id = ?
-            WHERE finding_id = ?
-            """,
-            [FindingState.RESOLVED.value, now, run_id, finding_id],
+        row = con.execute(
+            "SELECT regression_count, regressed_at FROM advisory_findings "
+            "WHERE finding_id = ?",
+            [finding_id],
+        ).fetchone()
+        flapping = (
+            row is not None
+            and int(row[0] or 0) >= 3
+            and row[1] is not None
+            and (now - _aware_ts(row[1])).total_seconds() < 86400
         )
+        if flapping:
+            con.execute(
+                "UPDATE advisory_findings SET latest_run_id = ? WHERE finding_id = ?",
+                [run_id, finding_id],
+            )
+        else:
+            con.execute(
+                """
+                UPDATE advisory_findings
+                SET state = ?, resolved_at = ?, latest_run_id = ?
+                WHERE finding_id = ?
+                """,
+                [FindingState.RESOLVED.value, now, run_id, finding_id],
+            )
         con.execute(
             """
             INSERT INTO advisory_occurrences (
@@ -395,6 +426,10 @@ analyzer_class, severity, confidence, title, impact, remediation_json, state,
 dismissal_reason, first_seen_at, last_seen_at, resolved_at, dismissed_at,
 regressed_at, evaluated_content_hash, latest_run_id
 """
+
+
+def _aware_ts(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _finding_from_row(row: Sequence[Any]) -> Finding:
