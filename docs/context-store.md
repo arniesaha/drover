@@ -34,6 +34,10 @@ Partitioned Parquet is the system of record for append-oriented telemetry:
 | `pr_events` | Pull-request lifecycle facts |
 | `routing` | Model or harness routing observations |
 
+Spans, and their token, cost, and cache attributes, are populated only when an
+external OTLP producer is configured. Harness-reported usage is the planned
+primary token source (a separate, later track of work).
+
 DuckDB creates normalized views over those files: `agent_events`, `spans`,
 `spans_enriched`, `pr_events`, and `routing`. The `sessions`,
 `active_sessions`, `session_links`, and `openclaw_span_links` views derive
@@ -43,7 +47,8 @@ cross-source relationships without rewriting the fact rows.
 - Events are append-only and partitioned by date and agent_id
 - Each event has a `dedup_key` - a canonical identifier across sources
 - Tool use blocks track file edits, code execution, and other actions
-- Spans capture trace-level data with model tokens, costs, and cache info
+- Spans capture trace-level data with model tokens, costs, and cache info when
+  an external OTLP producer is configured
 
 ### 2. Operational State
 

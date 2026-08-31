@@ -24,7 +24,8 @@ the authority for processes and filesystem access on its machine.
 
 The context plane turns local agent activity into durable, queryable memory:
 
-1. `drover-collect`, hooks, and OTLP producers emit agent events and spans.
+1. `drover-collect` and hooks emit agent events. Spans arrive only when an
+   external OTLP producer is configured.
 2. Ingest normalizes identifiers, attributes repository context, deduplicates
    records, and writes partitioned Parquet facts.
 3. DuckDB views expose normalized events, spans, sessions, links, pull-request
