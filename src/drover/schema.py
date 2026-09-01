@@ -1561,6 +1561,10 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         bootstrap_harness_tables(con)
         con.execute(_ADVISORY_FINDINGS_DDL)
         con.execute(_ADVISORY_OCCURRENCES_DDL)
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_advisory_occurrences_finding "
+            "ON advisory_occurrences (finding_id, outcome, recorded_at)"
+        )
         _ensure_table_columns(
             con,
             "advisory_findings",

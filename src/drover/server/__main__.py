@@ -2432,6 +2432,7 @@ def run(
         # it, and the audit copies grew without bound (9.7GB on this hub).
         retention_days=cfg.processed_retention_days,
         receipt_retention_days=cfg.receipt_retention_days,
+        advisory_occurrence_retention_days=cfg.advisory_occurrence_retention_days,
     )
     watcher.start()
 
