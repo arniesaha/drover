@@ -23,7 +23,7 @@ import duckdb
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from drover.server.db import open_duckdb_connection
+from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.ingest import ingest_file
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.summarizer.jobs import (
@@ -371,6 +371,77 @@ def sweep_receipts(duckdb_path: Path, *, retention_days: int) -> ReceiptSweepRes
     return ReceiptSweepResult(receipts=count)
 
 
+@dataclass(frozen=True)
+class OccurrenceSweepResult:
+    """What one advisory-occurrence retention pass removed."""
+
+    occurrences: int = 0
+
+
+def sweep_advisory_occurrences(
+    duckdb_path: Path, *, retention_days: int
+) -> OccurrenceSweepResult:
+    """Reclaim ``advisory_occurrences`` rows older than ``retention_days`` (#302).
+
+    Findings and occurrences moved into the control-plane store, which has no
+    retention pass of its own; every occurrence a run has ever produced piles
+    up forever. This mirrors `sweep_receipts`'s shape but opens the
+    control-plane store -- `control_plane_connection` resolves the analytical
+    path handed in here to the registry file itself -- rather than a bare
+    `duckdb.connect`.
+
+    One safety property, not a size target: never a finding's newest failing
+    occurrence, whatever its age. `AdvisoryRepository._next_observed_state`
+    (repository.py's dismissal-regression check) and its material-change
+    detection both read the latest failing row per finding to decide whether
+    a dismissed finding should reopen; sweeping that row out from under them
+    would make every dismissed finding look untouched forever. A row is
+    deleted only when it is both older than the cutoff *and* superseded by a
+    later (or same-instant, larger `occurrence_id`) failing row of the same
+    finding -- so the newest failing row always survives, and a finding with
+    only passing rows keeps them unless a later failing row exists to
+    supersede them, which is acceptable: nothing reads a passing-only
+    finding's occurrence history for the dismissal-regression check.
+
+    Zero (or negative) declines rather than deleting everything, matching
+    `sweep_receipts`: zero is what an operator reaches for meaning "keep
+    nothing", and equally what a malformed setting parses to.
+
+    **This does not shrink the file.** Same caveat as `sweep_receipts`: the
+    row count falls, the file does not, until something compacts it.
+    """
+
+    if retention_days <= 0:
+        return OccurrenceSweepResult()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    with control_plane_connection(duckdb_path) as con:
+        removed = con.execute(
+            """
+            DELETE FROM advisory_occurrences o
+            WHERE o.recorded_at < ?
+              AND EXISTS (
+                  SELECT 1 FROM advisory_occurrences newer
+                   WHERE newer.finding_id = o.finding_id AND newer.outcome = 'failing'
+                     AND (newer.recorded_at > o.recorded_at
+                          OR (newer.recorded_at = o.recorded_at
+                              AND newer.occurrence_id > o.occurrence_id))
+              )
+            """,
+            [cutoff],
+        ).fetchone()
+
+    count = int(removed[0]) if removed and removed[0] is not None else 0
+    if count:
+        log.info(
+            "reclaimed %d advisory occurrence(s) older than %d day(s); the file "
+            "does not shrink until it is compacted",
+            count,
+            retention_days,
+        )
+    return OccurrenceSweepResult(occurrences=count)
+
+
 class IncomingWatcher:
     """Run a watchdog observer over <incoming_dir> and ingest JSONL files."""
 
@@ -384,10 +455,14 @@ class IncomingWatcher:
         summarize_job_stream: object | None = None,
         retention_days: int = 0,
         receipt_retention_days: int = 0,
+        advisory_occurrence_retention_days: int = 0,
     ):
         self._incoming = Path(incoming_dir)
         self._retention_days = int(retention_days)
         self._receipt_retention_days = int(receipt_retention_days)
+        self._advisory_occurrence_retention_days = int(
+            advisory_occurrence_retention_days
+        )
         self._sweeper: threading.Thread | None = None
         self._stopping = threading.Event()
         self._parquet_dir = Path(parquet_dir)
@@ -420,7 +495,11 @@ class IncomingWatcher:
         measured in days: anything finer would just walk the tree for nothing.
         """
 
-        if self._retention_days <= 0 and self._receipt_retention_days <= 0:
+        if (
+            self._retention_days <= 0
+            and self._receipt_retention_days <= 0
+            and self._advisory_occurrence_retention_days <= 0
+        ):
             return
 
         def loop() -> None:
@@ -436,6 +515,13 @@ class IncomingWatcher:
                     )
                 except Exception as exc:  # noqa: BLE001 - never kill the watcher
                     log.warning("receipt sweep failed: %s", exc)
+                try:
+                    sweep_advisory_occurrences(
+                        self._duckdb_path,
+                        retention_days=self._advisory_occurrence_retention_days,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                    log.warning("advisory occurrence sweep failed: %s", exc)
                 self._stopping.wait(_SWEEP_INTERVAL_SECONDS)
 
         self._sweeper = threading.Thread(

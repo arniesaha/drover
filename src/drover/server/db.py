@@ -79,18 +79,30 @@ def snapshot_thread_default(cpu_count: int) -> int:
 
 
 ROLE_DEFAULTS: dict[str, dict[str, str]] = {
+    # Analytical roles sized for the post-#249/#260 loaders: 2GB was sized for
+    # the pre-#249 advisory loaders (routing loader peaked at 2210 MB); #249
+    # dropped those to ~300 MB, and the #260 fix (raw_data kept out of the
+    # cockpit dedup window) brought the worst remaining query, the 30-day
+    # cockpit activity build, to ~9-11s at ~1.6-1.7 GB RSS at both 2GB and 1GB
+    # limits (measured 2026-08-31 on a production-store copy; 512MB OOMs, so
+    # 1GB is the floor with headroom). DuckDB spills to <dbfile>.tmp (on the
+    # external data volume via the ~/.drover symlink), so an underestimate
+    # degrades to disk, not OOM-crash. Note the env override footgun in one
+    # line: `DROVER_DUCKDB_WORKER_MEMORY_LIMIT` covers worker+summarizer only;
+    # `diagnostic`/`snapshot` need their own `DROVER_DUCKDB_DIAGNOSTIC_*`/
+    # `DROVER_DUCKDB_SNAPSHOT_*` vars (see `_apply_role_settings`).
     "worker": {
-        "memory_limit": "2GB",
+        "memory_limit": "1GB",
         "threads": "2",
         "preserve_insertion_order": "false",
     },
     "summarizer": {
-        "memory_limit": "2GB",
+        "memory_limit": "1GB",
         "threads": "1",
         "preserve_insertion_order": "false",
     },
     "diagnostic": {
-        "memory_limit": "2GB",
+        "memory_limit": "1GB",
         "threads": "1",
         "preserve_insertion_order": "false",
     },
@@ -106,7 +118,7 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     #
     # Do NOT point a `snapshot` connection at the live database.
     "snapshot": {
-        "memory_limit": "2GB",
+        "memory_limit": "1GB",
         "threads": str(snapshot_thread_default(os.cpu_count() or 1)),
         "preserve_insertion_order": "false",
     },

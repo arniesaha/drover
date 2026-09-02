@@ -437,8 +437,34 @@ def _session_facts_sql(
     where: list[str] = []
     params: list[Any] = [snapshot_at, filters.days]
     if event_dates:
+        # The dedup window below (canonical_agent_events_cte) sorts every
+        # column it is fed, and raw_data is a multi-KB JSON blob per row
+        # (measured ~40% of this statement's runtime on a ~2.15M-event
+        # 30-day window). The only downstream consumer of raw_data is
+        # session_base's is_claude_mem_observer check, which only needs a
+        # single resolved cwd string. Pre-extract that cwd here, before the
+        # window, and carry a tiny synthetic raw_data instead of the
+        # original blob.
+        per_date_source = """
+          SELECT id, dedup_key, session_id, agent_id, timestamp,
+                 repo_owner, repo_name, branch, date,
+                 CASE WHEN json_valid(raw_data) THEN to_json(struct_pack(cwd :=
+                   COALESCE(
+                     NULLIF(trim(json_extract_string(raw_data, '$.cwd')), ''),
+                     NULLIF(trim(json_extract_string(
+                       raw_data, '$.currentWorkingDirectory'
+                     )), ''),
+                     NULLIF(trim(json_extract_string(
+                       raw_data, '$.working_directory'
+                     )), ''),
+                     NULLIF(trim(json_extract_string(raw_data, '$.workspaceDir')), ''),
+                     ''
+                   )))::VARCHAR
+                 ELSE NULL END AS raw_data
+          FROM agent_events_for_date(?)
+        """
         event_source = "\nUNION ALL BY NAME\n".join(
-            "SELECT * FROM agent_events_for_date(?)" for _ in event_dates
+            per_date_source for _ in event_dates
         )
         params.extend(event_dates)
     else:
@@ -497,15 +523,6 @@ def _session_facts_sql(
                 WHEN json_valid(raw_data) THEN ends_with(
                   rtrim(COALESCE(
                     NULLIF(trim(json_extract_string(raw_data, '$.cwd')), ''),
-                    NULLIF(trim(json_extract_string(
-                      raw_data, '$.currentWorkingDirectory'
-                    )), ''),
-                    NULLIF(trim(json_extract_string(
-                      raw_data, '$.working_directory'
-                    )), ''),
-                    NULLIF(trim(json_extract_string(
-                      raw_data, '$.workspaceDir'
-                    )), ''),
                     ''
                   ), '/'),
                   '/claude/mem/observer/sessions'

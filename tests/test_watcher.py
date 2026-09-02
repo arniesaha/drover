@@ -11,7 +11,13 @@ import duckdb
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.watcher import IncomingWatcher, _Handler, sweep_receipts
+from drover.server.db import control_plane_path
+from drover.server.watcher import (
+    IncomingWatcher,
+    _Handler,
+    sweep_advisory_occurrences,
+    sweep_receipts,
+)
 
 
 @pytest.fixture
@@ -685,3 +691,153 @@ def test_receipt_sweep_declines_rather_than_deleting_everything(tmp_path: Path) 
     assert sweep_receipts(duckdb_path, retention_days=0).receipts == 0
     assert sweep_receipts(duckdb_path, retention_days=-1).receipts == 0
     assert _receipt_ids(duckdb_path) == before
+
+
+def _seeded_occurrence_store(tmp_path: Path):
+    """A control-plane store holding occurrences of varying age per finding."""
+    from drover.schema import bootstrap
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ancient = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    recent = datetime.now(timezone.utc)
+
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        rows = [
+            # finding-a: an old passing row and no failing row at all for
+            # this finding -- nothing supersedes it, so it survives even
+            # though it is beyond the cutoff (acceptable: nothing reads a
+            # passing-only finding's occurrence history for the
+            # dismissal-regression check).
+            ("occ-a-old-passing", "finding-a", "run-1", "passing", old, old),
+            # finding-b: an ancient failing row that is the *newest* failing
+            # row for finding-b -- survives however old it is, because the
+            # dismissal-regression check and material-change detection read
+            # the latest failing row per finding.
+            (
+                "occ-b-ancient-failing",
+                "finding-b",
+                "run-1",
+                "failing",
+                ancient,
+                ancient,
+            ),
+            # finding-c: an old failing row superseded by a newer failing
+            # row of the same finding -- beyond the cutoff and superseded.
+            ("occ-c-old-failing", "finding-c", "run-1", "failing", old, old),
+            ("occ-c-new-failing", "finding-c", "run-2", "failing", recent, recent),
+            # finding-d: recorded well within the retention window --
+            # untouched regardless of outcome.
+            ("occ-d-recent", "finding-d", "run-1", "passing", recent, recent),
+        ]
+        for (
+            occurrence_id,
+            finding_id,
+            run_id,
+            outcome,
+            observed_at,
+            recorded_at,
+        ) in rows:
+            con.execute(
+                "INSERT INTO advisory_occurrences (occurrence_id, finding_id, "
+                "run_id, outcome, observed_at, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at],
+            )
+    finally:
+        con.close()
+    return duckdb_path
+
+
+def _occurrence_ids(duckdb_path: Path) -> set:
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        return {
+            r[0]
+            for r in con.execute(
+                "SELECT occurrence_id FROM advisory_occurrences"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+
+
+def test_advisory_occurrence_sweep_reclaims_old_superseded_rows(tmp_path: Path) -> None:
+    """A row is only reclaimed when it is both beyond the cutoff *and*
+    superseded by a later failing occurrence of the same finding.
+
+    ``occ-c-old-failing`` is the only row here that is both: beyond the
+    cutoff, and superseded by ``occ-c-new-failing``. ``occ-a-old-passing``
+    is beyond the cutoff too, but nothing supersedes it (its finding has no
+    failing row at all), so it survives.
+    """
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+
+    result = sweep_advisory_occurrences(duckdb_path, retention_days=7)
+
+    assert result.occurrences == 1
+    assert _occurrence_ids(duckdb_path) == {
+        "occ-a-old-passing",
+        "occ-b-ancient-failing",
+        "occ-c-new-failing",
+        "occ-d-recent",
+    }
+
+
+def test_advisory_occurrence_sweep_keeps_newest_failing_occurrence_however_old(
+    tmp_path: Path,
+) -> None:
+    """The dismissal-regression check and material-change detection both read
+    the latest failing occurrence per finding (repository.py's
+    ``_next_observed_state``), so it must never be swept regardless of age.
+    """
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+
+    sweep_advisory_occurrences(duckdb_path, retention_days=7)
+
+    assert "occ-b-ancient-failing" in _occurrence_ids(duckdb_path)
+
+
+def test_advisory_occurrence_sweep_leaves_rows_younger_than_cutoff(
+    tmp_path: Path,
+) -> None:
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+
+    sweep_advisory_occurrences(duckdb_path, retention_days=7)
+
+    assert "occ-d-recent" in _occurrence_ids(duckdb_path)
+
+
+def test_advisory_occurrence_sweep_declines_rather_than_deleting_everything(
+    tmp_path: Path,
+) -> None:
+    """Zero (and a malformed negative) means keep, matching `sweep_receipts`."""
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+    before = _occurrence_ids(duckdb_path)
+
+    assert sweep_advisory_occurrences(duckdb_path, retention_days=0).occurrences == 0
+    assert sweep_advisory_occurrences(duckdb_path, retention_days=-1).occurrences == 0
+    assert _occurrence_ids(duckdb_path) == before
+
+
+def test_bootstrap_control_plane_store_indexes_advisory_occurrences(
+    tmp_path: Path,
+) -> None:
+    from drover.schema import bootstrap
+
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=duckdb_path)
+
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        names = {
+            r[0]
+            for r in con.execute(
+                "SELECT index_name FROM duckdb_indexes() "
+                "WHERE table_name = 'advisory_occurrences'"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert "idx_advisory_occurrences_finding" in names

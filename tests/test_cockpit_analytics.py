@@ -522,6 +522,39 @@ def test_analytics_excludes_event_only_claude_mem_observer_sessions():
     assert result.projects[0].session_count == 1
 
 
+def test_analytics_excludes_workspace_dir_only_claude_mem_observer_session():
+    # Regression for #260: the dedup-window narrowing in _session_facts_sql
+    # pre-extracts a single resolved cwd from raw_data before the window,
+    # falling back through $.cwd, $.currentWorkingDirectory,
+    # $.working_directory, $.workspaceDir. This pins that a session whose
+    # ONLY cwd signal is $.workspaceDir (no $.cwd key at all) is still
+    # recognized as a claude-mem observer session and excluded, while a
+    # sibling session with a normal cwd is still counted.
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    workspace_dir_only_raw = json.dumps(
+        {"workspaceDir": "/Users/test/claude/mem/observer/sessions"}
+    )
+    normal_raw = json.dumps({"cwd": "/Users/test/projects/drover"})
+    con.executemany(
+        """
+        INSERT INTO sessions VALUES (?, 'macmini-claude', NULL, ?, ?,
+          'arniesaha', 'drover', 'main', ?)
+        """,
+        [
+            ("observer-workspace-dir-only", now, now, workspace_dir_only_raw),
+            ("legitimate-session", now, now, normal_raw),
+        ],
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 1
+    assert result.projects[0].session_count == 1
+
+
 def test_dimension_coverage_uses_every_displayed_session():
     con = _analytics_connection()
     now = datetime.now(timezone.utc) - timedelta(minutes=5)

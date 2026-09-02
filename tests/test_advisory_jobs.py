@@ -50,6 +50,8 @@ from drover.server.advisory.worker import (
     load_operational_snapshot,
     operational_analyzers,
     operational_snapshot_source_version,
+    plane_window_stats,
+    reset_plane_window_stats,
 )
 from drover.server.cockpit.service import ProviderRefreshLoop
 from drover.server.db import control_plane_path
@@ -289,6 +291,7 @@ def test_same_target_hash_coalesces_to_one_job(db_path: Path) -> None:
 
 
 def test_new_source_version_replays_completed_subject(db_path: Path) -> None:
+    reset_plane_window_stats()
     first = enqueue_advisory_check(
         db_path, analyzer_id="healthy", target_id="mac-mini", source_version="v1"
     )
@@ -300,12 +303,39 @@ def test_new_source_version_replays_completed_subject(db_path: Path) -> None:
     )
     assert worker.run_once([HealthyAnalyzer()]).succeeded == 1
 
+    # #303: _execute's control-plane window (the findings-commit phase) now
+    # times itself and records the duration through the same accessor the
+    # metrics endpoint reads.
+    last_seconds, max_seconds, windows_total = plane_window_stats()
+    assert windows_total >= 1
+    assert last_seconds > 0
+    assert max_seconds >= last_seconds
+
     second = enqueue_advisory_check(
         db_path, analyzer_id="healthy", target_id="mac-mini", source_version="v2"
     )
 
     assert second.job_id != first.job_id
     assert second.status == "pending"
+
+
+def test_plane_window_stats_reset_clears_last_max_and_count(db_path: Path) -> None:
+    reset_plane_window_stats()
+    enqueue_advisory_check(
+        db_path, analyzer_id="healthy", target_id="mac-mini", source_version="v1"
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda _analyzer, _target, version: _snapshot(version),
+        worker_id="test-worker",
+    )
+    assert worker.run_once([HealthyAnalyzer()]).succeeded == 1
+    assert plane_window_stats()[2] >= 1
+
+    reset_plane_window_stats()
+
+    assert plane_window_stats() == (0.0, 0.0, 0)
 
 
 def test_failed_analyzer_does_not_block_next_analyzer(db_path: Path) -> None:
@@ -1885,6 +1915,66 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
     assert findings["deterministic.telemetry_coverage"]
     assert findings["deterministic.cache_read_efficiency"]
     assert findings["deterministic.hook_validity"]
+
+
+def test_load_hook_facts_returns_aware_utc_timestamps(db_path: Path) -> None:
+    """harness_hosts.updated_at/last_seen_at are naive TIMESTAMP columns.
+
+    DuckDB stores a tz-aware datetime as local wall clock, so reading the
+    naive column straight back and doing ``.replace(tzinfo=utc)`` (what
+    ``_aware`` does for a still-naive value) silently shifts the time by the
+    reading session's UTC offset. ``_load_hook_facts`` now CASTs both columns
+    to TIMESTAMPTZ, like ``_load_provider_facts`` already does. Pin the
+    session to a non-UTC zone on both the write and the read side so the
+    assertion does not depend on the machine running the suite.
+    """
+    descriptor = {
+        "advisory": {
+            "hooks": [
+                {
+                    "hook_id": "session-start",
+                    "harness_id": "codex",
+                    "canonical_config_path": "/Users/operator/.codex/config.toml",
+                    "canonical_executable_path": "/opt/drover/bin/drover-hook",
+                    "enabled": True,
+                    "executable_exists": True,
+                    "executable_is_file": True,
+                    "executable_is_executable": True,
+                    "target_hash": "sha256:abc",
+                    "allowlisted": True,
+                }
+            ]
+        }
+    }
+    with duckdb.connect(str(control_plane_path(db_path))) as con:
+        con.execute("SET TimeZone='America/New_York'")
+        con.execute(
+            """
+            INSERT INTO harness_hosts (
+              host_id, display_name, kind, status, capabilities_json,
+              last_seen_at, updated_at
+            ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', ?, ?, ?)
+            """,
+            [json.dumps(descriptor), NOW, NOW],
+        )
+
+    def pin_timezone(con) -> None:
+        if con is not None:
+            con.execute("SET TimeZone='America/New_York'")
+
+    snapshot = load_operational_snapshot(
+        db_path,
+        "deterministic.hook_validity",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+        connection_observer=pin_timezone,
+    )
+
+    assert len(snapshot.hooks) == 1
+    observed = snapshot.hooks[0].observed_at
+    assert observed.tzinfo is not None
+    assert observed == NOW
 
 
 def test_operational_fact_hash_coalesces_unchanged_rows(db_path: Path) -> None:

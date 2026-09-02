@@ -72,6 +72,45 @@ MAX_RESET_WINDOWS_PER_CONNECTION = 32
 OPERATIONAL_SPAN_LOOKBACK = timedelta(days=7)
 
 
+# How long a control-plane window (the findings-commit phase of _execute and
+# _record_success) actually takes. #303: the analytical store's slow queries
+# are visible in metrics already; the control plane's own window was not,
+# even though it holds `control_plane_lock` for its whole duration and every
+# other window on the process queues behind it. Recorded in a `finally` so a
+# rolled-back window still counts -- a failing window is exactly the one an
+# operator most wants to see.
+_plane_window_last_seconds = 0.0
+_plane_window_max_seconds = 0.0
+_plane_window_count = 0
+_plane_window_lock = threading.Lock()
+
+
+def record_plane_window(seconds: float) -> None:
+    global _plane_window_last_seconds, _plane_window_max_seconds, _plane_window_count
+    with _plane_window_lock:
+        _plane_window_last_seconds = seconds
+        _plane_window_max_seconds = max(_plane_window_max_seconds, seconds)
+        _plane_window_count += 1
+
+
+def plane_window_stats() -> tuple[float, float, int]:
+    """(last, max, count) -- last and max in seconds."""
+    with _plane_window_lock:
+        return (
+            _plane_window_last_seconds,
+            _plane_window_max_seconds,
+            _plane_window_count,
+        )
+
+
+def reset_plane_window_stats() -> None:
+    global _plane_window_last_seconds, _plane_window_max_seconds, _plane_window_count
+    with _plane_window_lock:
+        _plane_window_last_seconds = 0.0
+        _plane_window_max_seconds = 0.0
+        _plane_window_count = 0
+
+
 def _is_sha256(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -536,44 +575,48 @@ class ContentAnalysisWorker:
         run_id = job.latest_attempt_id or job.job_id
         observed_fingerprints: set[str] = set()
         finding_ids: list[str] = []
-        with control_plane_connection(self.duckdb_path) as plane:
-            try:
-                plane.execute("BEGIN TRANSACTION")
-                for candidate in candidates:
-                    finding_id = self.repository.observe_in_transaction(
-                        plane, candidate, run_id=run_id
-                    )
-                    fingerprint = plane.execute(
-                        "SELECT fingerprint FROM advisory_findings "
-                        "WHERE finding_id = ?",
-                        [finding_id],
-                    ).fetchone()[0]
-                    finding_ids.append(finding_id)
-                    observed_fingerprints.add(str(fingerprint))
-                if covered_target_ids:
-                    placeholders = ", ".join("?" for _ in covered_target_ids)
-                    existing = plane.execute(
-                        f"""
-                        SELECT finding_id, fingerprint
-                        FROM advisory_findings
-                        WHERE analyzer_id = ?
-                          AND target_type = 'configuration_target'
-                          AND state IN ('open', 'acknowledged', 'regressed')
-                          AND target_id IN ({placeholders})
-                        """,
-                        [MODEL_ANALYZER_ID, *covered_target_ids],
-                    ).fetchall()
-                    for finding_id, fingerprint in existing:
-                        if str(fingerprint) in observed_fingerprints:
-                            continue
-                        self.repository.mark_passing_in_transaction(
-                            plane, str(finding_id), run_id=run_id
+        plane_started = time.monotonic()
+        try:
+            with control_plane_connection(self.duckdb_path) as plane:
+                try:
+                    plane.execute("BEGIN TRANSACTION")
+                    for candidate in candidates:
+                        finding_id = self.repository.observe_in_transaction(
+                            plane, candidate, run_id=run_id
                         )
-                        finding_ids.append(str(finding_id))
-                plane.execute("COMMIT")
-            except Exception:
-                plane.execute("ROLLBACK")
-                raise
+                        fingerprint = plane.execute(
+                            "SELECT fingerprint FROM advisory_findings "
+                            "WHERE finding_id = ?",
+                            [finding_id],
+                        ).fetchone()[0]
+                        finding_ids.append(finding_id)
+                        observed_fingerprints.add(str(fingerprint))
+                    if covered_target_ids:
+                        placeholders = ", ".join("?" for _ in covered_target_ids)
+                        existing = plane.execute(
+                            f"""
+                            SELECT finding_id, fingerprint
+                            FROM advisory_findings
+                            WHERE analyzer_id = ?
+                              AND target_type = 'configuration_target'
+                              AND state IN ('open', 'acknowledged', 'regressed')
+                              AND target_id IN ({placeholders})
+                            """,
+                            [MODEL_ANALYZER_ID, *covered_target_ids],
+                        ).fetchall()
+                        for finding_id, fingerprint in existing:
+                            if str(fingerprint) in observed_fingerprints:
+                                continue
+                            self.repository.mark_passing_in_transaction(
+                                plane, str(finding_id), run_id=run_id
+                            )
+                            finding_ids.append(str(finding_id))
+                    plane.execute("COMMIT")
+                except Exception:
+                    plane.execute("ROLLBACK")
+                    raise
+        finally:
+            record_plane_window(time.monotonic() - plane_started)
 
         artifact = {**artifact_base, "finding_ids": finding_ids}
         serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"))
@@ -821,52 +864,56 @@ class AdvisoryWorker:
         run_id = job.latest_attempt_id or job.job_id
         affected: list[str] = []
         observed_fingerprints: set[str] = set()
-        with control_plane_connection(self.duckdb_path) as plane:
-            try:
-                plane.execute("BEGIN TRANSACTION")
-                existing = plane.execute(
-                    """
-                    SELECT finding_id, fingerprint, target_type, target_id
-                    FROM advisory_findings
-                    WHERE analyzer_id = ? AND state NOT IN ('resolved', 'dismissed')
-                    """,
-                    [analyzer.analyzer_id],
-                ).fetchall()
-                for candidate in candidates:
-                    finding_id = self.repository.observe_in_transaction(
-                        plane, candidate, run_id=run_id
-                    )
-                    fingerprint = plane.execute(
-                        "SELECT fingerprint FROM advisory_findings "
-                        "WHERE finding_id = ?",
-                        [finding_id],
-                    ).fetchone()[0]
-                    affected.append(finding_id)
-                    observed_fingerprints.add(str(fingerprint))
-                for (
-                    finding_id,
-                    fingerprint,
-                    finding_target_type,
-                    finding_target_id,
-                ) in existing:
-                    if (
-                        _finding_in_job_scope(target_id, str(finding_target_id))
-                        and str(fingerprint) not in observed_fingerprints
-                        and _snapshot_covers_finding(
-                            snapshot,
-                            analyzer.analyzer_id,
-                            str(finding_target_type),
-                            str(finding_target_id),
+        plane_started = time.monotonic()
+        try:
+            with control_plane_connection(self.duckdb_path) as plane:
+                try:
+                    plane.execute("BEGIN TRANSACTION")
+                    existing = plane.execute(
+                        """
+                        SELECT finding_id, fingerprint, target_type, target_id
+                        FROM advisory_findings
+                        WHERE analyzer_id = ? AND state NOT IN ('resolved', 'dismissed')
+                        """,
+                        [analyzer.analyzer_id],
+                    ).fetchall()
+                    for candidate in candidates:
+                        finding_id = self.repository.observe_in_transaction(
+                            plane, candidate, run_id=run_id
                         )
-                    ):
-                        self.repository.mark_passing_in_transaction(
-                            plane, str(finding_id), run_id=run_id
-                        )
-                        affected.append(str(finding_id))
-                plane.execute("COMMIT")
-            except Exception:
-                plane.execute("ROLLBACK")
-                raise
+                        fingerprint = plane.execute(
+                            "SELECT fingerprint FROM advisory_findings "
+                            "WHERE finding_id = ?",
+                            [finding_id],
+                        ).fetchone()[0]
+                        affected.append(finding_id)
+                        observed_fingerprints.add(str(fingerprint))
+                    for (
+                        finding_id,
+                        fingerprint,
+                        finding_target_type,
+                        finding_target_id,
+                    ) in existing:
+                        if (
+                            _finding_in_job_scope(target_id, str(finding_target_id))
+                            and str(fingerprint) not in observed_fingerprints
+                            and _snapshot_covers_finding(
+                                snapshot,
+                                analyzer.analyzer_id,
+                                str(finding_target_type),
+                                str(finding_target_id),
+                            )
+                        ):
+                            self.repository.mark_passing_in_transaction(
+                                plane, str(finding_id), run_id=run_id
+                            )
+                            affected.append(str(finding_id))
+                    plane.execute("COMMIT")
+                except Exception:
+                    plane.execute("ROLLBACK")
+                    raise
+        finally:
+            record_plane_window(time.monotonic() - plane_started)
 
         finding_ids = tuple(dict.fromkeys(affected))
         payload = json.dumps(finding_ids, separators=(",", ":"))
@@ -976,7 +1023,9 @@ class AdvisoryWorker:
 
 
 def _host_is_present(
-    connection: ProviderConnectionObservation, analyzed_at: datetime
+    connection: ProviderConnectionObservation,
+    analyzed_at: datetime,
+    absence: timedelta = HOST_ABSENCE_DEFAULT,
 ) -> bool:
     """A silent host is not passing evidence -- it is no evidence at all.
 
@@ -988,7 +1037,7 @@ def _host_is_present(
     if connection.host_last_seen_at is None:
         return False
     age = analyzed_at - connection.host_last_seen_at
-    return age <= HOST_ABSENCE_DEFAULT
+    return age <= absence
 
 
 def _snapshot_covers_finding(
@@ -1538,9 +1587,15 @@ def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
     harness_scope = parts[1] if len(parts) == 3 else None
     hook_scope = parts[2] if len(parts) == 3 else None
     where, params = _host_filter(host_scope)
+    # Cast to TIMESTAMPTZ like _load_provider_facts: harness_hosts.updated_at
+    # and last_seen_at are naive TIMESTAMP columns, and a UTC-aware datetime
+    # written into a naive column round-trips incorrectly on a non-UTC host
+    # otherwise (the naive value comes back unadjusted through the attached
+    # copy, unlike same-catalog columns).
     rows = con.execute(
         f"""
-        SELECT host_id, capabilities_json, updated_at, last_seen_at
+        SELECT host_id, capabilities_json,
+               CAST(updated_at AS TIMESTAMPTZ), CAST(last_seen_at AS TIMESTAMPTZ)
         FROM harness_hosts
         {where}
         ORDER BY host_id

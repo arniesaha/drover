@@ -539,6 +539,33 @@ def _append_harness_metrics(lines: list[str]) -> None:
     )
 
 
+def _append_advisory_metrics(lines: list[str]) -> None:
+    # #303: the control-plane window (the findings-commit phase of
+    # AdvisoryWorker._execute / ContentAnalysisWorker._record_success) holds
+    # control_plane_lock for its whole duration, and every other window on
+    # the process queues behind it -- but nothing exported how long it
+    # actually takes.
+    from drover.server.advisory.worker import plane_window_stats
+
+    last_seconds, max_seconds, windows_total = plane_window_stats()
+    lines.extend(
+        [
+            "# HELP drover_advisory_plane_window_seconds "
+            "Duration of the most recent advisory control-plane window.",
+            "# TYPE drover_advisory_plane_window_seconds gauge",
+            f"drover_advisory_plane_window_seconds {last_seconds}",
+            "# HELP drover_advisory_plane_window_max_seconds "
+            "Longest advisory control-plane window observed so far.",
+            "# TYPE drover_advisory_plane_window_max_seconds gauge",
+            f"drover_advisory_plane_window_max_seconds {max_seconds}",
+            "# HELP drover_advisory_plane_windows_total "
+            "Advisory control-plane windows completed, successful or not.",
+            "# TYPE drover_advisory_plane_windows_total counter",
+            f"drover_advisory_plane_windows_total {windows_total}",
+        ]
+    )
+
+
 def _append_redis_metrics(
     lines: list[str], job_streams: Mapping[str, RedisJobStream]
 ) -> None:
@@ -2395,6 +2422,7 @@ class MetricsCollector:
         _append_redis_metrics(lines, self.job_streams)
         _append_adoption_metrics(lines, snapshot)
         _append_harness_metrics(lines)
+        _append_advisory_metrics(lines)
         observatory = self._observatory_snapshot(snapshot)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"
