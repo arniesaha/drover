@@ -27,6 +27,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dry-run and health gates, retained diagnostics, read-only restore drills, and
   manual Cloudflare cost and lifecycle evidence.
 
+## [0.4.1] - 2026-09-01
+
+### Changed
+
+- The 30-day cockpit activity build keeps `raw_data` out of the event dedup
+  window; measured 22.6-27.7s down to 9.1-11.1s on a production-store copy,
+  with peak RSS down from ~2.5GB to ~1.6GB (#260).
+- Analytical DuckDB roles run with a 1GB `memory_limit`, sized for the
+  post-#249/#260 loaders; 512MB was measured below the floor (#259).
+
+### Added
+
+- A daily retention sweep bounds `advisory_occurrences` in the control-plane
+  store (default 30 days, `advisory_occurrence_retention_days`); a finding's
+  newest failing occurrence always survives (#302).
+- The advisory worker's control-plane window duration is exported as
+  `drover_advisory_plane_window_seconds`, `_max_seconds`, and
+  `_windows_total` (#303).
+
+### Fixed
+
+- Hook facts read timestamps through `CAST(... AS TIMESTAMPTZ)`, closing the
+  same non-UTC shift fixed for provider facts (#303).
+
 ## [0.4.0] - 2026-08-28
 
 ### Added
