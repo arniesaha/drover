@@ -236,3 +236,17 @@ def session_totals(
                 continue
             sums[field] = (sums[field] or 0) + value
     return TokenTotals(exact=exact, **sums)  # type: ignore[arg-type]
+
+
+def usage_turn_count(events: Iterable[Mapping[str, Any]]) -> int:
+    """How many usage-bearing records the session carried, after dedup."""
+    records = _usage_records(events)
+    seen: set[str] = set()
+    count = 0
+    for identity, _has_native_id, _usage in records:
+        if identity:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        count += 1
+    return count
