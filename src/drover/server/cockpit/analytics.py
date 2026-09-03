@@ -15,6 +15,7 @@ from typing import Any, Literal
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.harness.usage import CACHE_INSIDE_INPUT_HARNESSES
 
 _MAX_DAYS = 365
 _MAX_BREAKDOWNS = 100
@@ -578,9 +579,12 @@ def _session_facts_sql(
         else """(
           SELECT NULL::VARCHAR AS session_id, NULL::BIGINT AS input_tokens,
                  NULL::BIGINT AS output_tokens, NULL::BIGINT AS cache_read_tokens,
-                 NULL::BIGINT AS cache_write_tokens
+                 NULL::BIGINT AS cache_write_tokens, NULL::VARCHAR AS harness
           WHERE FALSE
         )"""
+    )
+    cache_inside_input_harnesses_sql = ", ".join(
+        "'" + name + "'" for name in sorted(CACHE_INSIDE_INPUT_HARNESSES)
     )
     return (
         f"""
@@ -734,8 +738,15 @@ def _session_facts_sql(
             session_id,
             CASE
               WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL
-                THEN COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
-                   + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)
+                THEN
+                  CASE
+                    WHEN harness IN ({cache_inside_input_harnesses_sql})
+                      THEN COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+                    ELSE
+                      COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+                        + COALESCE(cache_read_tokens, 0)
+                        + COALESCE(cache_write_tokens, 0)
+                  END
               ELSE NULL
             END AS total_tokens,
             cache_read_tokens,

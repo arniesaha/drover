@@ -58,6 +58,10 @@ from typing import Any, Iterable, Mapping, Optional
 #: Harnesses whose usage is a running total rather than a per-message delta.
 CUMULATIVE_HARNESSES = frozenset({"codex"})
 
+#: Harnesses whose cached_input_tokens is a subset of input_tokens, so cache
+#: must not be added on top of input when computing a total.
+CACHE_INSIDE_INPUT_HARNESSES = frozenset({"codex"})
+
 _INPUT_KEYS = ("input_tokens", "inputTokens", "prompt_tokens")
 _OUTPUT_KEYS = ("output_tokens", "outputTokens", "completion_tokens")
 _CACHE_READ_KEYS = ("cache_read_input_tokens", "cached_input_tokens")

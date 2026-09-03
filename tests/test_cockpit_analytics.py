@@ -213,15 +213,16 @@ def _insert_usage(
     out: int | None,
     cache_read: int | None = None,
     cache_write: int | None = None,
+    harness: str = "claude-code",
 ) -> None:
     con.execute(
         """
         INSERT INTO session_usage VALUES (
-          ?, 'mac-mini', 'claude-code', ?, ?, ?, ?, NULL, 1, TRUE,
+          ?, 'mac-mini', ?, ?, ?, ?, ?, NULL, 1, TRUE,
           'harness_events', 1, 1, now()
         )
         """,
-        [session_id, inp, out, cache_read, cache_write],
+        [session_id, harness, inp, out, cache_read, cache_write],
     )
 
 
@@ -1728,7 +1729,9 @@ def test_cockpit_totals_equal_rollup_sums_when_there_are_no_spans():
     con = _analytics_connection()
     try:
         expected = 0
-        for index, (inp, out) in enumerate(((100, 10), (200, 20), (300, 30)), start=1):
+        for index, (inp, out, cached) in enumerate(
+            ((100, 10, 30), (200, 20, 60), (300, 30, 90)), start=1
+        ):
             _insert_session(
                 con,
                 session_id=f"s-{index}",
@@ -1737,17 +1740,49 @@ def test_cockpit_totals_equal_rollup_sums_when_there_are_no_spans():
                 harness="codex",
                 tokens=None,
             )
-            _insert_usage(con, session_id=f"s-{index}", inp=inp, out=out)
+            # cache_read is non-zero here to prove codex totals do NOT add it
+            # on top of input -- cached_input_tokens is a subset of
+            # input_tokens for codex, unlike Anthropic's cache_read.
+            _insert_usage(
+                con,
+                session_id=f"s-{index}",
+                inp=inp,
+                out=out,
+                cache_read=cached,
+                harness="codex",
+            )
             expected += inp + out
+
+        _insert_session(
+            con,
+            session_id="claude-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=None,
+        )
+        _insert_usage(
+            con,
+            session_id="claude-1",
+            inp=100,
+            out=10,
+            cache_read=40,
+            harness="claude-code",
+        )
+
         result = activity_analytics(con, AnalyticsFilters(days=7))
     finally:
         con.close()
 
-    assert result.totals.total_tokens == expected
+    assert result.totals.total_tokens == expected + (100 + 10 + 40)
     assert result.coverage.sources.tokens.spans_percent == 0.0
     assert result.coverage.sources.tokens.usage_percent == 100.0
-    assert result.harnesses[0].total_tokens == expected
-    assert result.harnesses[0].metadata.coverage.sources is None
+    codex_harness = next(h for h in result.harnesses if h.key == "codex")
+    assert codex_harness.total_tokens == expected
+    assert codex_harness.metadata.coverage.sources is None
+    claude_harness = next(h for h in result.harnesses if h.key == "claude-code")
+    # claude-code's total DOES add cache_read on top of input + output.
+    assert claude_harness.total_tokens == 100 + 10 + 40
 
 
 def test_unobserved_usage_rows_fall_back_to_spans():
