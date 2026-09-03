@@ -98,9 +98,10 @@ cache, delegation, and routing provenance when present. AgentWeave is one
 producer of those spans; Drover remains the durable local context and recall
 layer rather than a replacement tracing UI.
 
-Token, cost, and cache span attributes are populated only when an external
-OTLP producer is configured; harness-reported usage is the planned primary
-token source (a separate, later track of work).
+Token and cache numbers come from the harness event stream, rolled up per
+session into the control-plane `session_usage` table. OTLP spans supply cost
+and latency, and fill in tokens only for sessions the harness stream did not
+report.
 
 Historical spans may contain `nexus.*` attributes. Drover reads those values
 for compatibility. New integrations should emit Drover naming and stable
