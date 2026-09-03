@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-03
+
 ### Added
 
+- Token and cache numbers on the cockpit now come from the harness event
+  stream. A `UsageRollupWorker` rolls `harness_events` usage up to one
+  `session_usage` row per session in the control-plane store (claude-code
+  per-message, codex cumulative; harnesses that report nothing stay
+  truthfully unobserved rather than zero), and the activity analytics read
+  that row before OTLP spans, per metric. Coverage gains an additive
+  `sources` block naming which source supplied tokens and cache, and projects
+  rank by tokens only when one source alone covers 80 percent of sessions
+  (#309, closes #17).
+- Three `/metrics` lines for the rollup: `drover_usage_rollup_sessions_total`,
+  `drover_usage_rollup_malformed_payloads_total`, and
+  `drover_usage_rollup_last_pass_seconds` (#309).
 - Four local-only, read-only archive inventory commands capture private
   native and Pond identity manifests and compare candidate coverage. They
   create only new owner-readable `0600` artifacts, refuse unsafe inputs and
@@ -26,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall and sync target. The operator runbook covers private configuration,
   dry-run and health gates, retained diagnostics, read-only restore drills, and
   manual Cloudflare cost and lifecycle evidence.
+
+### Changed
+
+- `docs/integrations.md` and `docs/context-store.md` now say tokens come from
+  the harness stream and OTLP spans add cost and latency (#309).
 
 ## [0.4.1] - 2026-09-01
 
