@@ -16,12 +16,15 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import duckdb
 
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.usage import session_totals, usage_turn_count
 
 log = logging.getLogger("drover.harness.usage_rollup")
@@ -203,3 +206,77 @@ def rollup_pending_sessions(
         rolled=len(candidates),
         malformed_events=malformed_total,
     )
+
+
+_last_pass_lock = threading.Lock()
+_last_pass_seconds: float | None = None
+
+
+def last_pass_seconds() -> float | None:
+    with _last_pass_lock:
+        return _last_pass_seconds
+
+
+class UsageRollupWorker:
+    """Periodically roll new harness usage into ``session_usage``.
+
+    Same shape as ``LiveRecapWorker``: one daemon thread, one short
+    control-plane window per pass, a pass that raises never kills the loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        duckdb_path: Path,
+        poll_interval_s: float = 60.0,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+    ) -> None:
+        self.duckdb_path = Path(duckdb_path)
+        self.poll_interval_s = poll_interval_s
+        self.batch_size = batch_size
+        self.last_pass_seconds: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="drover-usage-rollup", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+        self._thread = None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.drain_once()
+            except Exception:  # noqa: BLE001 - the next pass must still run.
+                log.exception("usage rollup pass crashed")
+            self._stop.wait(self.poll_interval_s)
+
+    def drain_once(self) -> RollupReport:
+        global _last_pass_seconds
+        started = time.monotonic()
+        registry_path = control_plane_path(self.duckdb_path)
+        with control_plane_connection(registry_path) as con:
+            report = rollup_pending_sessions(con, limit=self.batch_size)
+        elapsed = time.monotonic() - started
+        self.last_pass_seconds = elapsed
+        with _last_pass_lock:
+            _last_pass_seconds = elapsed
+        if report.rolled:
+            log.info(
+                "usage rollup: %d session(s) in %.2fs (%d malformed payload(s))",
+                report.rolled,
+                elapsed,
+                report.malformed_events,
+            )
+        return report

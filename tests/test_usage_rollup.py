@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import duckdb
@@ -210,3 +211,46 @@ def test_batch_limit_bounds_one_pass(tmp_path):
     second = rollup_pending_sessions(con, limit=2)
 
     assert (first.rolled, second.rolled) == (2, 1)
+
+
+def test_worker_drains_through_its_own_control_plane_window(tmp_path):
+    from drover.server.harness.usage_rollup import UsageRollupWorker
+
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(control_plane_path(db))) as con:
+        add_session(con, "c1", "claude-code")
+        add_event(con, "c1", 1, claude_usage("m1", inp=7, out=3))
+
+    worker = UsageRollupWorker(duckdb_path=db, poll_interval_s=0.01)
+    report = worker.drain_once()
+
+    assert report.rolled == 1
+    with duckdb.connect(str(control_plane_path(db))) as con:
+        assert usage_row(con, "c1")[:2] == (7, 3)
+    assert worker.last_pass_seconds is not None
+
+
+def test_worker_thread_starts_stops_and_survives_a_bad_pass(tmp_path, monkeypatch):
+    from drover.server.harness import usage_rollup
+
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    calls = []
+
+    def explode(con, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return usage_rollup.RollupReport(0, 0, 0)
+
+    monkeypatch.setattr(usage_rollup, "rollup_pending_sessions", explode)
+    worker = usage_rollup.UsageRollupWorker(duckdb_path=db, poll_interval_s=0.01)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        worker.stop()
+    assert len(calls) >= 2

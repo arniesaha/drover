@@ -5331,3 +5331,18 @@ def test_metrics_http_server_proxies_fs_exists(tmp_path):
     assert json.loads(_FakeFsHandler.requests[0]["body"]) == {
         "paths": ["/tmp", "/nope"]
     }
+
+
+def test_usage_rollup_metrics_render_counters_and_last_pass():
+    from drover.server.harness import usage_rollup
+    from drover.server.metrics import _append_usage_rollup_metrics
+
+    usage_rollup.reset_counters_for_tests()
+    usage_rollup._bump(3, 1)
+    lines: list[str] = []
+    _append_usage_rollup_metrics(lines)
+    text = "\n".join(lines)
+    assert "drover_usage_rollup_sessions_total 3" in text
+    assert "drover_usage_rollup_malformed_payloads_total 1" in text
+    assert "# TYPE drover_usage_rollup_last_pass_seconds gauge" in text
+    usage_rollup.reset_counters_for_tests()
