@@ -2834,6 +2834,8 @@ def run(
             summarizer.stop()
         if live_recap is not None:
             live_recap.stop()
+        if usage_rollup is not None:
+            usage_rollup.stop()
         if metrics_server is not None:
             metrics_server.shutdown()
         if receiver is not None:
