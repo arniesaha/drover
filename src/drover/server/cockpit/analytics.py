@@ -15,6 +15,7 @@ from typing import Any, Literal
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.harness.usage import CACHE_INSIDE_INPUT_HARNESSES
 
 _MAX_DAYS = 365
 _MAX_BREAKDOWNS = 100
@@ -68,12 +69,32 @@ class ActivityTotals:
 
 
 @dataclass(frozen=True)
+class MetricSources:
+    """Which sources could supply one metric, as a share of attributable sessions.
+
+    ``usage_percent`` is ``None`` (never zero) when the ``session_usage``
+    relation is not reachable on this connection; ``status`` says so.
+    """
+
+    usage_percent: float | None
+    spans_percent: float
+    status: Literal["ok", "unavailable"]
+
+
+@dataclass(frozen=True)
+class CoverageSources:
+    tokens: MetricSources
+    cache: MetricSources
+
+
+@dataclass(frozen=True)
 class Coverage:
     attributable_session_percent: float
     token_percent: float
     cost_percent: float
     cache_percent: float
     latency_percent: float
+    sources: CoverageSources | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +244,20 @@ def _connection_has_active_transaction(con: duckdb.DuckDBPyConnection) -> bool:
     return first[0] == second[0]
 
 
+def _session_usage_available(con: duckdb.DuckDBPyConnection) -> bool:
+    """True when ``session_usage`` resolves as a table or (temp) view here."""
+    row = con.execute("""
+        SELECT 1 FROM (
+          SELECT table_name AS name FROM information_schema.tables
+          UNION ALL
+          SELECT view_name AS name FROM duckdb_views()
+        )
+        WHERE name = 'session_usage'
+        LIMIT 1
+        """).fetchone()
+    return row is not None
+
+
 def _activity_analytics_in_snapshot(
     con: duckdb.DuckDBPyConnection,
     filters: AnalyticsFilters,
@@ -232,9 +267,18 @@ def _activity_analytics_in_snapshot(
     """Run every analytics statement inside the caller's current snapshot."""
     codec = cursor_codec or _DEFAULT_CURSOR_CODEC
     snapshot_at, cursor_snapshot = _cursor_snapshot_context(codec, filters)
-    with _materialized_session_facts(con, filters, snapshot_at) as facts:
+    usage_available = _session_usage_available(con)
+    with _materialized_session_facts(
+        con, filters, snapshot_at, usage_available=usage_available
+    ) as facts:
         return _activity_analytics_from_facts(
-            con, filters, codec, snapshot_at, cursor_snapshot, facts
+            con,
+            filters,
+            codec,
+            snapshot_at,
+            cursor_snapshot,
+            facts,
+            usage_available=usage_available,
         )
 
 
@@ -243,12 +287,16 @@ def _materialized_session_facts(
     con: duckdb.DuckDBPyConnection,
     filters: AnalyticsFilters,
     snapshot_at: datetime,
+    *,
+    usage_available: bool = False,
 ):
     """Yield one connection-scoped copy of the normalized request facts."""
     relation = f"analytics_session_facts_{secrets.token_hex(8)}"
     span_dates = _span_partition_dates(con, filters, snapshot_at)
     event_dates = _agent_event_partition_dates(con, filters, snapshot_at, span_dates)
-    base_sql, params = _session_facts_sql(filters, snapshot_at, span_dates, event_dates)
+    base_sql, params = _session_facts_sql(
+        filters, snapshot_at, span_dates, event_dates, usage_available=usage_available
+    )
     con.execute(
         f"CREATE TEMP TABLE {relation} AS {base_sql} SELECT * FROM filtered_sessions",
         params,
@@ -327,6 +375,8 @@ def _activity_analytics_from_facts(
     snapshot_at: datetime,
     cursor_snapshot: str | None,
     facts: str,
+    *,
+    usage_available: bool = False,
 ) -> ActivityAnalytics:
     snapshot_version = _snapshot_fingerprint(con, facts, snapshot_at)
     if cursor_snapshot is not None and cursor_snapshot != snapshot_version:
@@ -345,22 +395,43 @@ def _activity_analytics_from_facts(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cost) AS cost_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
-          max(latest_activity_at) AS observed_at
+          max(latest_activity_at) AS observed_at,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND usage_has_tokens) AS usage_token_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND span_has_tokens) AS span_token_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND usage_has_cache) AS usage_cache_sessions,
+          count(*) FILTER (WHERE project_key IS NOT NULL AND span_has_cache) AS span_cache_sessions
         FROM {facts}
         """).fetchone()
     assert aggregate is not None
     session_count = int(aggregate[0] or 0)
     attributable_sessions = int(aggregate[7] or 0)
+    status: Literal["ok", "unavailable"] = "ok" if usage_available else "unavailable"
+    usage_token_pct = (
+        _percent(int(aggregate[13] or 0), session_count) if usage_available else None
+    )
+    span_token_pct = _percent(int(aggregate[14] or 0), session_count)
+    usage_cache_pct = (
+        _percent(int(aggregate[15] or 0), session_count) if usage_available else None
+    )
+    span_cache_pct = _percent(int(aggregate[16] or 0), session_count)
     coverage = Coverage(
         attributable_session_percent=_percent(attributable_sessions, session_count),
         token_percent=_percent(int(aggregate[8] or 0), session_count),
         cost_percent=_percent(int(aggregate[9] or 0), session_count),
         cache_percent=_percent(int(aggregate[10] or 0), session_count),
         latency_percent=_percent(int(aggregate[11] or 0), session_count),
+        sources=CoverageSources(
+            tokens=MetricSources(usage_token_pct, span_token_pct, status),
+            cache=MetricSources(usage_cache_pct, span_cache_pct, status),
+        ),
     )
     metadata = _aggregate_metadata(coverage, aggregate[12])
+    # Spec, Track 3: rank projects by tokens only when one source alone covers
+    # enough sessions to trust. A union of two thin sources is not that.
     project_metric: Literal["tokens", "sessions"] = (
-        "tokens" if coverage.token_percent >= _TOKEN_COVERAGE_THRESHOLD else "sessions"
+        "tokens"
+        if max(usage_token_pct or 0.0, span_token_pct) >= _TOKEN_COVERAGE_THRESHOLD
+        else "sessions"
     )
     totals = ActivityTotals(
         session_count=session_count,
@@ -433,6 +504,8 @@ def _session_facts_sql(
     snapshot_at: datetime,
     span_dates: tuple[str, ...],
     event_dates: tuple[str, ...],
+    *,
+    usage_available: bool = False,
 ) -> tuple[str, list[Any]]:
     where: list[str] = []
     params: list[Any] = [snapshot_at, filters.days]
@@ -500,6 +573,19 @@ def _session_facts_sql(
             where.append(f"{column} = ?")
             params.append(value)
     filter_sql = " AND ".join(where) if where else "TRUE"
+    usage_source = (
+        "session_usage"
+        if usage_available
+        else """(
+          SELECT NULL::VARCHAR AS session_id, NULL::BIGINT AS input_tokens,
+                 NULL::BIGINT AS output_tokens, NULL::BIGINT AS cache_read_tokens,
+                 NULL::BIGINT AS cache_write_tokens, NULL::VARCHAR AS harness
+          WHERE FALSE
+        )"""
+    )
+    cache_inside_input_harnesses_sql = ", ".join(
+        "'" + name + "'" for name in sorted(CACHE_INSIDE_INPUT_HARNESSES)
+    )
     return (
         f"""
         WITH bounds AS (
@@ -647,6 +733,29 @@ def _session_facts_sql(
                 >= bounds.cutoff
           GROUP BY session_id
         ),
+        usage_sessions AS (
+          SELECT
+            session_id,
+            CASE
+              WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL
+                THEN
+                  CASE
+                    WHEN harness IN ({cache_inside_input_harnesses_sql})
+                      THEN COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+                    ELSE
+                      COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+                        + COALESCE(cache_read_tokens, 0)
+                        + COALESCE(cache_write_tokens, 0)
+                  END
+              ELSE NULL
+            END AS total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) AS has_tokens,
+            (cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL)
+              AS has_cache
+          FROM {usage_source}
+        ),
         harness_base AS (
           SELECT hs.*
           FROM harness_sessions hs, bounds
@@ -707,19 +816,26 @@ def _session_facts_sql(
                 ELSE NULL
               END
             ) AS project_key,
-            ss.total_tokens,
+            COALESCE(us.total_tokens, ss.total_tokens) AS total_tokens,
             ss.cost_usd,
-            ss.cache_read_tokens,
-            ss.cache_write_tokens,
+            COALESCE(us.cache_read_tokens, ss.cache_read_tokens) AS cache_read_tokens,
+            COALESCE(us.cache_write_tokens, ss.cache_write_tokens) AS cache_write_tokens,
             ss.total_latency_ms,
-            COALESCE(ss.has_tokens, FALSE) AS has_tokens,
+            (COALESCE(us.has_tokens, FALSE) OR COALESCE(ss.has_tokens, FALSE))
+              AS has_tokens,
             COALESCE(ss.has_cost, FALSE) AS has_cost,
-            COALESCE(ss.has_cache, FALSE) AS has_cache,
-            COALESCE(ss.has_latency, FALSE) AS has_latency
+            (COALESCE(us.has_cache, FALSE) OR COALESCE(ss.has_cache, FALSE))
+              AS has_cache,
+            COALESCE(ss.has_latency, FALSE) AS has_latency,
+            COALESCE(us.has_tokens, FALSE) AS usage_has_tokens,
+            COALESCE(ss.has_tokens, FALSE) AS span_has_tokens,
+            COALESCE(us.has_cache, FALSE) AS usage_has_cache,
+            COALESCE(ss.has_cache, FALSE) AS span_has_cache
           FROM session_ids ids
           LEFT JOIN harness_base hs USING (session_id)
           LEFT JOIN span_sessions ss USING (session_id)
           LEFT JOIN session_base sb USING (session_id)
+          LEFT JOIN usage_sessions us USING (session_id)
         ),
         filtered_sessions AS (
           SELECT * FROM session_facts WHERE {filter_sql}
@@ -1001,7 +1117,11 @@ def _snapshot_fingerprint(
             has_tokens := has_tokens,
             has_cost := has_cost,
             has_cache := has_cache,
-            has_latency := has_latency
+            has_latency := has_latency,
+            usage_has_tokens := usage_has_tokens,
+            span_has_tokens := span_has_tokens,
+            usage_has_cache := usage_has_cache,
+            span_has_cache := span_has_cache
           )) AS body
           FROM {facts}
         )

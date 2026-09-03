@@ -550,6 +550,25 @@ CREATE TABLE IF NOT EXISTS advisory_occurrences (
 );
 """
 
+_SESSION_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS session_usage (
+  session_id          VARCHAR PRIMARY KEY,
+  host_id             VARCHAR,
+  harness             VARCHAR,
+  input_tokens        BIGINT,
+  output_tokens       BIGINT,
+  cache_read_tokens   BIGINT,
+  cache_write_tokens  BIGINT,
+  reasoning_tokens    BIGINT,
+  turn_count          INTEGER NOT NULL DEFAULT 0,
+  exact               BOOLEAN NOT NULL DEFAULT TRUE,
+  source              VARCHAR NOT NULL,
+  source_seq          INTEGER NOT NULL,
+  source_event_count  INTEGER NOT NULL,
+  observed_at         TIMESTAMP NOT NULL DEFAULT now()
+);
+"""
+
 
 def _agent_events_view(parquet_dir: Path) -> str:
     return f"""
@@ -1574,6 +1593,11 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
             "CREATE INDEX IF NOT EXISTS idx_advisory_findings_list "
             "ON advisory_findings (state, severity, last_seen_at)"
         )
+        # Track 3 slice 1: one row per session, rolled up from harness_events
+        # by UsageRollupWorker. Lives here because its only writer and its
+        # source table are both control-plane, and the cockpit already reads
+        # this store through attached_control_plane_snapshot.
+        con.execute(_SESSION_USAGE_DDL)
     return registry_path
 
 

@@ -121,6 +121,7 @@ from drover.server.harness.schema import (
     bootstrap_harness_tables,
     migrate_duplicate_harness_events,
 )
+from drover.server.harness.usage_rollup import UsageRollupWorker
 from drover.server.jobs import RedisJobStream, RedisJobStreamConfig
 from drover.server.mcp import tools as mcp_tools
 from drover.server.mcp.server import build_mcp_server
@@ -2468,6 +2469,17 @@ def run(
         log.exception("advisory worker failed to start; continuing without it")
         advisory_worker = None
 
+    usage_rollup: UsageRollupWorker | None = None
+    try:
+        usage_rollup = UsageRollupWorker(duckdb_path=cfg.duckdb_path)
+        usage_rollup.start()
+        log.info(
+            "usage rollup worker ready (interval=%.0fs)", usage_rollup.poll_interval_s
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("usage rollup worker failed to start; continuing without it")
+        usage_rollup = None
+
     receiver: OTLPReceiver | None = None
     if not no_otlp:
         try:
@@ -2822,6 +2834,8 @@ def run(
             summarizer.stop()
         if live_recap is not None:
             live_recap.stop()
+        if usage_rollup is not None:
+            usage_rollup.stop()
         if metrics_server is not None:
             metrics_server.shutdown()
         if receiver is not None:

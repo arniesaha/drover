@@ -141,3 +141,15 @@ def test_a_subagents_own_running_cost_is_not_the_sessions():
 
     assert totals.input_tokens == 2
     assert totals.output_tokens == 121
+
+
+def test_usage_turn_count_counts_usage_bearing_records_only():
+    from drover.server.harness.usage import usage_turn_count
+
+    events = [
+        _claude_event("m1", inp=1, out=1),
+        {"payload": {"text": "no usage"}},
+        _claude_event("m2", inp=1, out=1),
+    ]
+    assert usage_turn_count(events) == 2
+    assert usage_turn_count([]) == 0

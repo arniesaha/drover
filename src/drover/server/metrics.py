@@ -566,6 +566,35 @@ def _append_advisory_metrics(lines: list[str]) -> None:
     )
 
 
+def _append_usage_rollup_metrics(lines: list[str]) -> None:
+    # Track 3 slice 1. The counters live on the rollup module so the worker
+    # and this scrape never share a connection; the gauge is the last pass's
+    # control-plane window, the number #303 asks every new writer to expose.
+    from drover.server.harness.usage_rollup import (
+        last_pass_seconds,
+        malformed_payload_count,
+        rolled_session_count,
+    )
+
+    last_pass = last_pass_seconds()
+    lines.extend(
+        [
+            "# HELP drover_usage_rollup_sessions_total "
+            "Sessions re-rolled into session_usage since the server started.",
+            "# TYPE drover_usage_rollup_sessions_total counter",
+            f"drover_usage_rollup_sessions_total {rolled_session_count()}",
+            "# HELP drover_usage_rollup_malformed_payloads_total "
+            "harness_events payloads the rollup skipped as unparseable.",
+            "# TYPE drover_usage_rollup_malformed_payloads_total counter",
+            f"drover_usage_rollup_malformed_payloads_total {malformed_payload_count()}",
+            "# HELP drover_usage_rollup_last_pass_seconds "
+            "Duration of the most recent rollup pass (control-plane window).",
+            "# TYPE drover_usage_rollup_last_pass_seconds gauge",
+            f"drover_usage_rollup_last_pass_seconds {last_pass if last_pass is not None else 0}",
+        ]
+    )
+
+
 def _append_redis_metrics(
     lines: list[str], job_streams: Mapping[str, RedisJobStream]
 ) -> None:
@@ -2423,6 +2452,7 @@ class MetricsCollector:
         _append_adoption_metrics(lines, snapshot)
         _append_harness_metrics(lines)
         _append_advisory_metrics(lines)
+        _append_usage_rollup_metrics(lines)
         observatory = self._observatory_snapshot(snapshot)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"
