@@ -34,6 +34,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.db import (
+    CONTROL_PLANE_PRIMARY_KEYS,
     CONTROL_PLANE_TABLES,
     ROLE_DEFAULTS,
     ControlPlaneBusy,
@@ -551,3 +552,47 @@ def test_the_snapshot_is_released_when_the_reader_is_done(tmp_path):
         con.close()
 
     assert after < attached
+
+
+def test_session_usage_lives_in_the_control_plane_store(tmp_path):
+    """Track 3 slice 1: the rollup table is bootstrapped next to harness_events."""
+    duckdb_path = _db(tmp_path)
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        columns = {
+            row[0]: row[1]
+            for row in con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = 'session_usage'"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert columns["session_id"] == "VARCHAR"
+    assert columns["input_tokens"] == "BIGINT"
+    assert columns["source_seq"] == "INTEGER"
+    assert columns["source_event_count"] == "INTEGER"
+    assert columns["exact"] == "BOOLEAN"
+    assert "session_usage" in CONTROL_PLANE_TABLES
+    assert CONTROL_PLANE_PRIMARY_KEYS["session_usage"] == "session_id"
+
+
+def test_session_usage_is_visible_through_the_attached_snapshot(tmp_path):
+    """The cockpit reads control-plane tables through temp views over a copy."""
+    duckdb_path = _db(tmp_path)
+    with duckdb.connect(str(control_plane_path(duckdb_path))) as registry:
+        registry.execute("""INSERT INTO session_usage
+               (session_id, host_id, harness, input_tokens, output_tokens,
+                turn_count, exact, source, source_seq, source_event_count)
+               VALUES ('s1', 'mac-mini', 'claude-code', 10, 5, 1, TRUE,
+                       'harness_events', 3, 3)""")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        with attached_control_plane_snapshot(con, duckdb_path):
+            row = con.execute(
+                "SELECT input_tokens, output_tokens FROM session_usage "
+                "WHERE session_id = 's1'"
+            ).fetchone()
+    finally:
+        con.close()
+    assert row == (10, 5)
