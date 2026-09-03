@@ -1106,7 +1106,11 @@ def _snapshot_fingerprint(
             has_tokens := has_tokens,
             has_cost := has_cost,
             has_cache := has_cache,
-            has_latency := has_latency
+            has_latency := has_latency,
+            usage_has_tokens := usage_has_tokens,
+            span_has_tokens := span_has_tokens,
+            usage_has_cache := usage_has_cache,
+            span_has_cache := span_has_cache
           )) AS body
           FROM {facts}
         )

@@ -1835,3 +1835,25 @@ def test_missing_session_usage_relation_reports_unavailable_not_zero():
     assert result.coverage.sources.tokens.spans_percent == 100.0
     assert result.coverage.sources.cache.status == "unavailable"
     assert result.project_metric == "tokens"
+
+
+def test_snapshot_fingerprint_changes_when_a_usage_row_lands_with_same_totals():
+    con = _analytics_connection()
+    try:
+        _insert_session(
+            con,
+            session_id="alpha-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=100,
+        )
+        first = activity_analytics(con, AnalyticsFilters(days=7))
+        # Usage lands with the exact same total the span already reported, so
+        # no hashed numeric column changes -- only usage_has_tokens flips.
+        _insert_usage(con, session_id="alpha-1", inp=100, out=0)
+        second = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert first.snapshot_version != second.snapshot_version
