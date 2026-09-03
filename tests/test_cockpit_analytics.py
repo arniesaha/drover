@@ -77,6 +77,22 @@ def _analytics_connection(
           ended_at TIMESTAMPTZ,
           updated_at TIMESTAMPTZ
         );
+        CREATE TABLE session_usage (
+          session_id VARCHAR PRIMARY KEY,
+          host_id VARCHAR,
+          harness VARCHAR,
+          input_tokens BIGINT,
+          output_tokens BIGINT,
+          cache_read_tokens BIGINT,
+          cache_write_tokens BIGINT,
+          reasoning_tokens BIGINT,
+          turn_count INTEGER,
+          exact BOOLEAN,
+          source VARCHAR,
+          source_seq INTEGER,
+          source_event_count INTEGER,
+          observed_at TIMESTAMP
+        );
         CREATE VIEW agent_events AS
           SELECT
             'start-' || session_id AS id,
@@ -186,6 +202,26 @@ def _insert_session(
             cache_read,
             None,
         ],
+    )
+
+
+def _insert_usage(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    session_id: str,
+    inp: int | None,
+    out: int | None,
+    cache_read: int | None = None,
+    cache_write: int | None = None,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO session_usage VALUES (
+          ?, 'mac-mini', 'claude-code', ?, ?, ?, ?, NULL, 1, TRUE,
+          'harness_events', 1, 1, now()
+        )
+        """,
+        [session_id, inp, out, cache_read, cache_write],
     )
 
 
@@ -1644,3 +1680,158 @@ def test_a_busy_slot_serves_the_last_good_activity_instead_of_nothing(
     ), "a held slot must not blank the charts when a recent answer exists"
     assert blocked["activity"]["status"] == "stale"
     assert blocked["activity"]["data"] == first["activity"]["data"]
+
+
+def test_usage_rows_replace_span_tokens_and_fill_sessions_without_spans():
+    con = _analytics_connection()
+    try:
+        # alpha-1 has spans (100 tokens) AND usage (300 + 20 + 50 + 0 = 370).
+        _insert_session(
+            con,
+            session_id="alpha-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=100,
+            cache_read=5,
+        )
+        _insert_usage(con, session_id="alpha-1", inp=300, out=20, cache_read=50)
+        # alpha-2 has no span tokens at all; usage supplies them.
+        _insert_session(
+            con,
+            session_id="alpha-2",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=None,
+        )
+        _insert_usage(con, session_id="alpha-2", inp=10, out=5)
+
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.total_tokens == 370 + 15
+    assert result.totals.cache_read_tokens == 50
+    assert result.coverage.token_percent == 100.0
+    assert result.coverage.sources is not None
+    assert result.coverage.sources.tokens.usage_percent == 100.0
+    assert result.coverage.sources.tokens.spans_percent == 50.0
+    assert result.coverage.sources.tokens.status == "ok"
+    assert result.coverage.sources.cache.usage_percent == 50.0
+    assert result.coverage.sources.cache.spans_percent == 50.0
+    assert result.project_metric == "tokens"
+    assert result.projects[0].total_tokens == 385
+
+
+def test_cockpit_totals_equal_rollup_sums_when_there_are_no_spans():
+    con = _analytics_connection()
+    try:
+        expected = 0
+        for index, (inp, out) in enumerate(((100, 10), (200, 20), (300, 30)), start=1):
+            _insert_session(
+                con,
+                session_id=f"s-{index}",
+                project="acme/alpha",
+                host="nas",
+                harness="codex",
+                tokens=None,
+            )
+            _insert_usage(con, session_id=f"s-{index}", inp=inp, out=out)
+            expected += inp + out
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.total_tokens == expected
+    assert result.coverage.sources.tokens.spans_percent == 0.0
+    assert result.coverage.sources.tokens.usage_percent == 100.0
+    assert result.harnesses[0].total_tokens == expected
+    assert result.harnesses[0].metadata.coverage.sources is None
+
+
+def test_unobserved_usage_rows_fall_back_to_spans():
+    con = _analytics_connection()
+    try:
+        _insert_session(
+            con,
+            session_id="a-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="agy",
+            tokens=40,
+        )
+        con.execute("""INSERT INTO session_usage VALUES
+               ('a-1', 'mac-mini', 'agy', NULL, NULL, NULL, NULL, NULL, 0, TRUE,
+                'unobserved', 1, 1, now())""")
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.total_tokens == 40
+    assert result.coverage.sources.tokens.usage_percent == 0.0
+    assert result.coverage.sources.tokens.spans_percent == 100.0
+
+
+def test_project_metric_needs_one_source_at_eighty_percent_not_the_union():
+    con = _analytics_connection()
+    try:
+        # 5 sessions: 3 covered by usage only, 1 by spans only, 1 by nothing.
+        for index in range(1, 4):
+            _insert_session(
+                con,
+                session_id=f"u-{index}",
+                project="acme/alpha",
+                host="mac-mini",
+                harness="claude-code",
+                tokens=None,
+            )
+            _insert_usage(con, session_id=f"u-{index}", inp=10, out=1)
+        _insert_session(
+            con,
+            session_id="sp-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=10,
+        )
+        _insert_session(
+            con,
+            session_id="none-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=None,
+        )
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.coverage.token_percent == 80.0
+    assert result.coverage.sources.tokens.usage_percent == 60.0
+    assert result.coverage.sources.tokens.spans_percent == 20.0
+    assert result.project_metric == "sessions"
+
+
+def test_missing_session_usage_relation_reports_unavailable_not_zero():
+    con = _analytics_connection()
+    try:
+        con.execute("DROP TABLE session_usage")
+        _insert_session(
+            con,
+            session_id="alpha-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=100,
+        )
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.total_tokens == 100
+    assert result.coverage.sources.tokens.status == "unavailable"
+    assert result.coverage.sources.tokens.usage_percent is None
+    assert result.coverage.sources.tokens.spans_percent == 100.0
+    assert result.coverage.sources.cache.status == "unavailable"
+    assert result.project_metric == "tokens"
