@@ -231,6 +231,61 @@ def test_worker_drains_through_its_own_control_plane_window(tmp_path):
     assert worker.last_pass_seconds is not None
 
 
+def envelope(seq: int, inner: dict, event_type: str = "assistant") -> dict:
+    return {
+        "event_id": f"evt-{seq}",
+        "type": event_type,
+        "seq": seq,
+        "session_id": "ignored-by-rollup",
+        "role": "assistant",
+        "text": "",
+        "ts": "2026-09-02T00:00:00Z",
+        "turn_id": f"turn-{seq}",
+        "payload": inner,
+    }
+
+
+def test_registry_envelopes_are_read_as_stored(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "c1", "claude-code")
+    add_event(
+        con, "c1", 1, envelope(1, claude_usage("m1", inp=100, out=10, cache_read=40))
+    )
+    add_event(con, "c1", 2, envelope(2, claude_usage("m2", inp=50, out=5)))
+    rollup_pending_sessions(con)
+    row = usage_row(con, "c1")
+    assert row[:3] == (150, 15, 40)
+    assert row[6] == SOURCE_HARNESS_EVENTS
+
+
+def test_codex_envelopes_take_the_last_running_total(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "x1", "codex")
+    add_event(con, "x1", 1, envelope(1, codex_usage(inp=1000, out=20, cached=300)))
+    add_event(con, "x1", 2, envelope(2, codex_usage(inp=1800, out=45, cached=900)))
+    rollup_pending_sessions(con)
+    row = usage_row(con, "x1")
+    assert row[:3] == (1800, 45, 900)
+    assert row[6] == SOURCE_HARNESS_EVENTS
+
+
+def test_envelope_without_seq_dedups_on_column_seq(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "c2", "claude-code")
+    inner_1 = claude_usage("m1", inp=100, out=10, cache_read=40)
+    inner_2 = claude_usage("m1", inp=100, out=10, cache_read=40)  # duplicate id
+    env_1 = envelope(1, inner_1)
+    env_2 = envelope(2, inner_2)
+    del env_1["seq"]
+    del env_2["seq"]
+    add_event(con, "c2", 1, env_1)
+    add_event(con, "c2", 2, env_2)
+    rollup_pending_sessions(con)
+    row = usage_row(con, "c2")
+    assert row[:3] == (100, 10, 40)
+    assert row[6] == SOURCE_HARNESS_EVENTS
+
+
 def test_worker_thread_starts_stops_and_survives_a_bad_pass(tmp_path, monkeypatch):
     from drover.server.harness import usage_rollup
 

@@ -130,7 +130,16 @@ ON CONFLICT (session_id) DO UPDATE SET
 def _load_events(
     con: duckdb.DuckDBPyConnection, session_id: str
 ) -> tuple[list[dict[str, Any]], int]:
-    """Return ``{"seq", "payload"}`` records and the malformed-payload count."""
+    """Return registry event envelopes (column ``seq`` wins) and the malformed count.
+
+    ``harness_events.payload_json`` already stores the whole event envelope
+    (``{"payload": {...usage...}, "seq": ..., "type": ..., ...}``), so the
+    parsed JSON is passed through as-is rather than re-nested under another
+    ``payload`` key -- that used to shadow the real ``$.payload.usage`` path
+    that ``_usage_records`` (``usage.py``) looks for. The ``seq`` column is
+    spread in last because many rows carry a column value but no envelope
+    ``seq`` at all.
+    """
     events: list[dict[str, Any]] = []
     malformed = 0
     for seq, payload_json in con.execute(_EVENTS_SQL, [session_id]).fetchall():
@@ -142,7 +151,7 @@ def _load_events(
         if not isinstance(payload, dict):
             malformed += 1
             continue
-        events.append({"seq": seq, "payload": payload})
+        events.append({**payload, "seq": seq})
     return events, malformed
 
 
