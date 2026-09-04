@@ -294,6 +294,44 @@ public struct ObservedAggregateMetadata: Decodable, Sendable, Equatable {
     }
 }
 
+public enum AnalyticsProjectionStatus: String, Decodable, Sendable, Equatable {
+    case ready
+    case catchingUp = "catching_up"
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: raw) ?? .unknown
+    }
+}
+
+public struct AnalyticsProjectionMetadata: Decodable, Sendable, Equatable {
+    public let status: AnalyticsProjectionStatus
+    public let completedPartitionCount: Int
+    public let totalPartitionCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case completedPartitionCount = "completed_partition_count"
+        case totalPartitionCount = "total_partition_count"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Every field degrades rather than throws. A decode failure here does not
+        // cost the banner, it costs the whole Analytics screen: this type is
+        // nested inside ActivitySummary, so one malformed field blanks the
+        // aggregates the user actually came for. The same reasoning already
+        // makes `status` fall back to `.unknown` on a string it has never seen.
+        status =
+            (try? container.decode(AnalyticsProjectionStatus.self, forKey: .status)) ?? .unknown
+        completedPartitionCount =
+            (try? container.decodeIfPresent(Int.self, forKey: .completedPartitionCount)) ?? 0
+        totalPartitionCount =
+            (try? container.decodeIfPresent(Int.self, forKey: .totalPartitionCount)) ?? 0
+    }
+}
+
 public struct AnalyticsPageMetadata: Decodable, Sendable, Equatable {
     public let limit: Int
     public let nextCursor: String?
@@ -376,10 +414,11 @@ public struct ActivitySummary: Decodable, Sendable, Equatable {
     public let projectMetric: PopularProjectMetric
     public let coverage: Coverage
     public let metadata: ObservedAggregateMetadata?
+    public let projection: AnalyticsProjectionMetadata?
     public let pagination: AnalyticsPagination
 
     private enum CodingKeys: String, CodingKey {
-        case totals, projects, harnesses, hosts, models, coverage, metadata, pagination
+        case totals, projects, harnesses, hosts, models, coverage, metadata, projection, pagination
         case projectMetric = "project_metric"
     }
 
@@ -393,6 +432,7 @@ public struct ActivitySummary: Decodable, Sendable, Equatable {
         projectMetric = try container.decode(PopularProjectMetric.self, forKey: .projectMetric)
         coverage = try container.decode(Coverage.self, forKey: .coverage)
         metadata = try container.decodeIfPresent(ObservedAggregateMetadata.self, forKey: .metadata)
+        projection = try container.decodeIfPresent(AnalyticsProjectionMetadata.self, forKey: .projection)
         pagination = try container.decodeIfPresent(AnalyticsPagination.self, forKey: .pagination) ?? .empty
     }
 }

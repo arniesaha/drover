@@ -42,6 +42,7 @@ public final class CockpitStore {
     private var stateOverrides: [String: InsightState] = [:]
     private var refreshGeneration = 0
     private var analyticsGeneration = 0
+    private var loadingAnalyticsGeneration: Int?
     private var analyticsFilters = AnalyticsFilters()
     private var analyticsCursors: [AnalyticsDimension: String] = [:]
     private var loadingAnalyticsDimensions: [AnalyticsDimension: Int] = [:]
@@ -65,6 +66,7 @@ public final class CockpitStore {
     public private(set) var analytics: AnalyticsSnapshot?
     public private(set) var analyticsError: String?
     public private(set) var analyticsRefreshNotice: String?
+    public private(set) var analyticsProjectionNotice: String?
     public private(set) var analyticsProjects: [ProjectActivity] = []
     public private(set) var analyticsHarnesses: [ActivityBreakdown] = []
     public private(set) var analyticsHosts: [ActivityBreakdown] = []
@@ -90,6 +92,7 @@ public final class CockpitStore {
     public var isUpdatingContentConsent: Bool { updatingContentConsentCount > 0 }
     public var isRevokingContentAnalysis: Bool { revokingContentAnalysisCount > 0 }
     public private(set) var isPurgingContentExcerpts = false
+    public var isLoadingAnalytics: Bool { loadingAnalyticsGeneration != nil }
 
     public static let cloudDisclosureRequiredMessage =
         "Review and accept the external analysis disclosure."
@@ -127,6 +130,9 @@ public final class CockpitStore {
             providerError = nil
             activityError = nil
             analyticsError = nil
+            analyticsGeneration &+= 1
+            loadingAnalyticsGeneration = nil
+            analyticsProjectionNotice = nil
             insightsError = nil
             lifecycleError = nil
             insightsGeneration &+= 1
@@ -379,6 +385,12 @@ public final class CockpitStore {
         guard isCockpitAvailable else { return }
         analyticsGeneration &+= 1
         let generation = analyticsGeneration
+        loadingAnalyticsGeneration = generation
+        defer {
+            if loadingAnalyticsGeneration == generation {
+                loadingAnalyticsGeneration = nil
+            }
+        }
         var firstPage = filters
         firstPage.projectCursor = nil
         firstPage.harnessCursor = nil
@@ -389,6 +401,7 @@ public final class CockpitStore {
         analyticsPageErrors = [:]
         loadingAnalyticsDimensions = [:]
         analyticsRefreshNotice = nil
+        analyticsProjectionNotice = nil
         do {
             let fresh = try await client.analytics(filters: firstPage)
             guard generation == analyticsGeneration else { return }
@@ -401,6 +414,9 @@ public final class CockpitStore {
                 setAnalyticsCursors(data.pagination)
             }
             analyticsError = nil
+            analyticsProjectionNotice = Self.projectionNotice(
+                fresh.activity.data?.projection
+            )
         } catch {
             guard generation == analyticsGeneration else { return }
             guard !Self.isCancellation(error) else { return }
@@ -483,6 +499,16 @@ public final class CockpitStore {
 
     private func setCursor(_ cursor: String?, for dimension: AnalyticsDimension) {
         analyticsCursors[dimension] = cursor
+    }
+
+    private static func projectionNotice(
+        _ projection: AnalyticsProjectionMetadata?
+    ) -> String? {
+        guard projection?.status == .catchingUp,
+              let projection,
+              projection.totalPartitionCount > 0 else { return nil }
+        return "Historical activity is catching up (\(projection.completedPartitionCount) "
+            + "of \(projection.totalPartitionCount) dates complete)."
     }
 
     private func deduplicating(
