@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,7 @@ EXPECTED_TABLES = (
     "pipeline_artifacts",
     "provider_connections",
     "span_partition_activity",
+    "agent_event_partition_activity",
     # `harness_*`, `live_recap_jobs`, `live_session_recaps`, `advisory_findings`
     # and `advisory_occurrences` are deliberately absent: these tables were moved
     # to the control-plane store to isolate them from parquet scans that can
@@ -108,6 +110,13 @@ _SPAN_PARTITION_ACTIVITY_DDL = """
 CREATE TABLE IF NOT EXISTS span_partition_activity (
   date VARCHAR PRIMARY KEY,
   latest_activity_at TIMESTAMPTZ NOT NULL
+);
+"""
+
+_AGENT_EVENT_PARTITION_ACTIVITY_DDL = """
+CREATE TABLE IF NOT EXISTS agent_event_partition_activity (
+  date VARCHAR PRIMARY KEY,
+  latest_ingested_at TIMESTAMP NOT NULL
 );
 """
 
@@ -591,6 +600,32 @@ CREATE TABLE IF NOT EXISTS session_usage_sources (
 );
 """
 
+_NATIVE_USAGE_PARTITION_TOTALS_DDL = """
+CREATE TABLE IF NOT EXISTS native_usage_partition_totals (
+  native_usage_partition_id  VARCHAR PRIMARY KEY,
+  session_id                 VARCHAR NOT NULL,
+  partition_date             VARCHAR NOT NULL,
+  input_tokens               BIGINT,
+  output_tokens              BIGINT,
+  cache_read_tokens          BIGINT,
+  cache_write_tokens         BIGINT,
+  reasoning_tokens           BIGINT,
+  turn_count                 INTEGER NOT NULL,
+  event_count                INTEGER NOT NULL,
+  exact                      BOOLEAN NOT NULL,
+  observed_at                TIMESTAMP NOT NULL,
+  UNIQUE (session_id, partition_date)
+);
+"""
+
+_NATIVE_USAGE_PARTITION_WATERMARKS_DDL = """
+CREATE TABLE IF NOT EXISTS native_usage_partition_watermarks (
+  partition_date       VARCHAR PRIMARY KEY,
+  source_activity_at   TIMESTAMP NOT NULL,
+  rolled_at            TIMESTAMP NOT NULL DEFAULT now()
+);
+"""
+
 
 def _backfill_session_usage_sources(con: duckdb.DuckDBPyConnection) -> None:
     """Retain pre-ledger compatibility rows as their harness-source history."""
@@ -988,6 +1023,39 @@ def _refresh_span_partition_activity(con: duckdb.DuckDBPyConnection) -> None:
         ON CONFLICT (date) DO UPDATE SET
           latest_activity_at = EXCLUDED.latest_activity_at
         """)
+
+
+def _refresh_agent_event_partition_activity(
+    con: duckdb.DuckDBPyConnection, parquet_dir: Path
+) -> None:
+    """Index native-event partitions from file metadata, not a parquet scan."""
+    latest_by_date: dict[str, int] = {}
+    root = parquet_dir / "agent_events"
+    for part in root.glob("date=*/agent_id=*/*.parquet"):
+        date_dir = part.parent.parent.name
+        if not date_dir.startswith("date="):
+            continue
+        partition_date = date_dir.removeprefix("date=")
+        if partition_date == "_seed":
+            continue
+        latest_by_date[partition_date] = max(
+            latest_by_date.get(partition_date, 0), part.stat().st_mtime_ns
+        )
+    for partition_date, modified_ns in latest_by_date.items():
+        latest_ingested_at = datetime.fromtimestamp(
+            modified_ns / 1_000_000_000, tz=timezone.utc
+        ).replace(tzinfo=None)
+        con.execute(
+            """
+            INSERT INTO agent_event_partition_activity VALUES (?, ?)
+            ON CONFLICT (date) DO UPDATE SET
+              latest_ingested_at = greatest(
+                agent_event_partition_activity.latest_ingested_at,
+                EXCLUDED.latest_ingested_at
+              )
+            """,
+            [partition_date, latest_ingested_at],
+        )
 
 
 def _pr_events_view(parquet_dir: Path) -> str:
@@ -1649,6 +1717,8 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         # this store through attached_control_plane_snapshot.
         con.execute(_SESSION_USAGE_DDL)
         con.execute(_SESSION_USAGE_SOURCES_DDL)
+        con.execute(_NATIVE_USAGE_PARTITION_TOTALS_DDL)
+        con.execute(_NATIVE_USAGE_PARTITION_WATERMARKS_DDL)
         _backfill_session_usage_sources(con)
     return registry_path
 
@@ -1985,6 +2055,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
     try:
         con.execute(_TASKS_DDL)
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
+        con.execute(_AGENT_EVENT_PARTITION_ACTIVITY_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
@@ -2019,6 +2090,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_spans_view(parquet_dir))
         con.execute(_span_query_macros(parquet_dir))
         _refresh_span_partition_activity(con)
+        _refresh_agent_event_partition_activity(con, parquet_dir)
         con.execute(_SESSION_LINKS_VIEW)
         con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
         con.execute(_pr_events_view(parquet_dir))

@@ -165,6 +165,8 @@ CONTROL_PLANE_TABLES = (
     "advisory_occurrences",
     "session_usage",
     "session_usage_sources",
+    "native_usage_partition_totals",
+    "native_usage_partition_watermarks",
 )
 
 #: Primary keys, used by the migration to copy without duplicating.
@@ -178,6 +180,8 @@ CONTROL_PLANE_PRIMARY_KEYS = {
     "advisory_occurrences": "occurrence_id",
     "session_usage": "session_id",
     "session_usage_sources": "source_usage_id",
+    "native_usage_partition_totals": "native_usage_partition_id",
+    "native_usage_partition_watermarks": "partition_date",
 }
 
 #: Appended to the analytical store's stem, so ``drover.duckdb`` is joined by

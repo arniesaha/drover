@@ -1917,6 +1917,70 @@ def test_runtime_snapshot_populates_bounded_normalized_facts_without_content(
     assert findings["deterministic.hook_validity"]
 
 
+def test_runtime_telemetry_prefers_exact_session_usage_over_span_token_fallback(
+    db_path: Path,
+) -> None:
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
+        con.execute("""
+            CREATE TABLE spans (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              prompt_tokens BIGINT, total_tokens BIGINT,
+              cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO spans VALUES
+              ('span-native', 'native-backed', ?, 90, 100, 4, 1.0),
+              ('span-fallback', 'span-backed', ?, 30, 40, 2, 0.5)
+            """,
+            [NOW, NOW],
+        )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, started_at, updated_at
+        ) VALUES
+          ('native-backed', 'mac-mini', 'claude-code', 'claude', 'completed', ?, ?),
+          ('span-backed', 'mac-mini', 'claude-code', 'claude', 'completed', ?, ?)
+        """,
+        [NOW, NOW, NOW, NOW],
+    )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO session_usage (
+          session_id, host_id, harness, input_tokens, output_tokens,
+          cache_read_tokens, cache_write_tokens, reasoning_tokens, turn_count,
+          exact, source, source_seq, source_event_count, observed_at
+        ) VALUES
+          ('native-backed', NULL, NULL, 100, 10, 7, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?),
+          ('native-only', NULL, NULL, 999, 99, 88, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?)
+        """,
+        [NOW, NOW],
+    )
+
+    snapshot = load_operational_snapshot(
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+
+    assert len(snapshot.telemetry) == 1
+    telemetry = snapshot.telemetry[0]
+    assert telemetry.total_sessions == 2
+    assert telemetry.token_observed_sessions == 2
+    assert telemetry.prompt_tokens == 130
+    assert telemetry.cache_read_tokens == 9
+
+
 def test_load_hook_facts_returns_aware_utc_timestamps(db_path: Path) -> None:
     """harness_hosts.updated_at/last_seen_at are naive TIMESTAMP columns.
 

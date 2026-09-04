@@ -17,6 +17,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Set
 
@@ -338,6 +339,19 @@ def ingest_file(
         if new_rows:
             _propagate_unique_session_repo(new_rows, env_task_id)
             _write_partition(new_rows, parquet_dir)
+            ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            for date in sorted({str(row["date"]) for row in new_rows}):
+                con.execute(
+                    """
+                    INSERT INTO agent_event_partition_activity VALUES (?, ?)
+                    ON CONFLICT (date) DO UPDATE SET
+                      latest_ingested_at = greatest(
+                        agent_event_partition_activity.latest_ingested_at,
+                        EXCLUDED.latest_ingested_at
+                      )
+                    """,
+                    [date, ingested_at],
+                )
             _upsert_tasks(con, new_rows)
             rollup_tasks(
                 con,

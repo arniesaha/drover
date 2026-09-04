@@ -1398,32 +1398,62 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                  ) AS spans_truncated
           FROM bounded_spans s
           GROUP BY s.session_id
+        ),
+        session_facts AS (
+          SELECT h.session_id, h.host_id, h.harness, h.repo_owner, h.repo_name,
+                 GREATEST(s.observed_at, h.updated_at, h.ended_at, h.started_at)
+                   AS observed_at,
+                 COALESCE(s.has_spans, FALSE) AS has_spans,
+                 (
+                   COALESCE(s.has_tokens, FALSE)
+                   OR COALESCE(
+                     u.input_tokens IS NOT NULL
+                     OR u.output_tokens IS NOT NULL
+                     OR u.cache_read_tokens IS NOT NULL
+                     OR u.cache_write_tokens IS NOT NULL
+                     OR u.reasoning_tokens IS NOT NULL,
+                     FALSE
+                   )
+                 ) AS has_tokens,
+                 COALESCE(s.has_cost, FALSE) AS has_cost,
+                 COALESCE(u.input_tokens, s.prompt_tokens, 0)::BIGINT
+                   AS prompt_tokens,
+                 COALESCE(u.cache_read_tokens, s.cache_read_tokens, 0)::BIGINT
+                   AS cache_read_tokens,
+                 COALESCE(s.spans_truncated, FALSE) AS spans_truncated,
+                 h.snapshot_session_count
+          FROM bounded_sessions h
+          LEFT JOIN span_sessions s USING (session_id)
+          -- ``session_usage`` is the source-precedence projection. Joining it
+          -- by the exact session id lets native history improve coverage for
+          -- a known harness session, while a native-only session remains
+          -- deliberately unattributed.
+          LEFT JOIN session_usage u USING (session_id)
         )
-        SELECT h.host_id, h.harness,
-               max(GREATEST(s.observed_at, h.updated_at, h.ended_at, h.started_at)),
-               count(DISTINCT h.session_id),
-               count(DISTINCT h.session_id) FILTER (WHERE s.has_spans),
-               count(DISTINCT h.session_id) FILTER (
-                 WHERE h.repo_owner IS NOT NULL AND h.repo_name IS NOT NULL
+        SELECT f.host_id, f.harness,
+               max(f.observed_at),
+               count(DISTINCT f.session_id),
+               count(DISTINCT f.session_id) FILTER (WHERE f.has_spans),
+               count(DISTINCT f.session_id) FILTER (
+                 WHERE f.repo_owner IS NOT NULL AND f.repo_name IS NOT NULL
                ),
-               count(DISTINCT h.session_id) FILTER (WHERE s.has_tokens),
-               count(DISTINCT h.session_id) FILTER (WHERE s.has_cost),
-               COALESCE(sum(s.prompt_tokens), 0)::BIGINT,
-               COALESCE(sum(s.cache_read_tokens), 0)::BIGINT,
+               count(DISTINCT f.session_id) FILTER (WHERE f.has_tokens),
+               count(DISTINCT f.session_id) FILTER (WHERE f.has_cost),
+               COALESCE(sum(f.prompt_tokens), 0)::BIGINT,
+               COALESCE(sum(f.cache_read_tokens), 0)::BIGINT,
                NOT (
-                 max(h.snapshot_session_count) > {MAX_SNAPSHOT_RECORDS}
+                 max(f.snapshot_session_count) > {MAX_SNAPSHOT_RECORDS}
                  OR any_value(raw_bounds.raw_spans_truncated)
                  OR any_value(bounds.global_spans_truncated)
-                 OR COALESCE(bool_or(s.spans_truncated), FALSE)
+                 OR COALESCE(bool_or(f.spans_truncated), FALSE)
                ),
                any_value(raw_bounds.input_span_records),
-               max(s.observed_at)
-        FROM bounded_sessions h
-        LEFT JOIN span_sessions s USING (session_id)
+               max(f.observed_at) FILTER (WHERE f.has_spans)
+        FROM session_facts f
         CROSS JOIN span_status bounds
         CROSS JOIN raw_span_status raw_bounds
-        GROUP BY h.host_id, h.harness
-        ORDER BY h.host_id, h.harness
+        GROUP BY f.host_id, f.harness
+        ORDER BY f.host_id, f.harness
         LIMIT {MAX_SNAPSHOT_RECORDS}
         """,
         [
