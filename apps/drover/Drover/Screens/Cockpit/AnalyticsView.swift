@@ -164,6 +164,7 @@ struct AnalyticsView: View {
                 let totals = ActivityTotalsPresentation(
                     totals: activity.totals, coverage: activity.coverage
                 )
+                let sources = CoverageSourcesPresentation(coverage: activity.coverage)
                 // Said once, here, instead of on every row below. Coverage
                 // comes from the totals presentation rather than the aggregate
                 // one because this heading sits above a cost figure and the
@@ -174,6 +175,12 @@ struct AnalyticsView: View {
                 Text("\(metadata.freshnessText) · \(totals.coverageText)")
                     .droverText(.subtitle)
                     .fixedSize(horizontal: false, vertical: true)
+                if let sourceText = sources.text {
+                    Text(sourceText)
+                        .droverText(.subtitle)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel(sources.accessibilityText ?? sourceText)
+                }
                 CockpitCard {
                     // A wider minimum than the old 88pt: at accessibility
                     // sizes three columns crushed the longest metric label

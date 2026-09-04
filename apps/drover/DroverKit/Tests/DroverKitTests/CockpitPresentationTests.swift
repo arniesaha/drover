@@ -287,6 +287,20 @@ import Testing
     #expect(value.coverageText == "75% token coverage")
 }
 
+@Test func sourceCoveragePresentationNamesUnavailableUsageWithoutCallingItZero() throws {
+    let coverage = try JSONDecoder().decode(Coverage.self, from: Data(#"""
+    {"sources":{
+      "tokens":{"usage_percent":null,"span_percent":33.3,"status":"unavailable"},
+      "cache":{"usage_percent":null,"span_percent":0,"status":"unavailable"}
+    }}
+    """#.utf8))
+
+    let value = CoverageSourcesPresentation(coverage: coverage)
+
+    #expect(value.text == "Token sources: usage unavailable; spans 33.3% · Cache sources: usage unavailable; spans 0%")
+    #expect(value.accessibilityText == "Token sources: usage unavailable; spans 33.3%. Cache sources: usage unavailable; spans 0%.")
+}
+
 // MARK: - Activity totals (#150)
 
 /// The numbers behind the fixtures below are the ones from #150's 7-day
