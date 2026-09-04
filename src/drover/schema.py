@@ -34,6 +34,7 @@ from drover.server.db import (
 )
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
+from drover.server.parquet_io import atomic_write_table
 
 log = logging.getLogger("drover.schema")
 
@@ -1517,8 +1518,12 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
     ae_seed_dir.mkdir(parents=True, exist_ok=True)
     ae_seed_file = ae_seed_dir / "empty.parquet"
     # Refresh the empty seed so new nullable native-usage columns are visible
-    # before a real partition containing them has been written.
-    pq.write_table(ae_empty, ae_seed_file)
+    # before a real partition containing them has been written. Atomically:
+    # this file sits inside the ``*.parquet`` glob every reader scans, and
+    # bootstrap() runs from harnessd startup and from CLI entry points that can
+    # fire while a live server is mid-query. A direct write would let that
+    # reader observe a half-written file ("too small to be a Parquet file").
+    atomic_write_table(ae_empty, ae_seed_file)
 
     # Spans seed — hive-partitioned (date=) with the columns the OTLP ingest writes.
     spans_seed_schema = pa.schema(
