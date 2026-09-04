@@ -1372,6 +1372,11 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
             ("repo_name", pa.string()),
             ("branch", pa.string()),
             ("principal_id", pa.string()),
+            ("input_tokens", pa.int64()),
+            ("output_tokens", pa.int64()),
+            ("cache_read_tokens", pa.int64()),
+            ("cache_write_tokens", pa.int64()),
+            ("reasoning_tokens", pa.int64()),
             ("dedup_key", pa.string()),
             ("raw_data", pa.string()),
         ]
@@ -1390,6 +1395,11 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
             "repo_name": pa.array([], type=pa.string()),
             "branch": pa.array([], type=pa.string()),
             "principal_id": pa.array([], type=pa.string()),
+            "input_tokens": pa.array([], type=pa.int64()),
+            "output_tokens": pa.array([], type=pa.int64()),
+            "cache_read_tokens": pa.array([], type=pa.int64()),
+            "cache_write_tokens": pa.array([], type=pa.int64()),
+            "reasoning_tokens": pa.array([], type=pa.int64()),
             "dedup_key": pa.array([], type=pa.string()),
             "raw_data": pa.array([], type=pa.string()),
         },
@@ -1399,8 +1409,9 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
     ae_seed_dir = parquet_dir / "agent_events" / "date=_seed" / "agent_id=_seed"
     ae_seed_dir.mkdir(parents=True, exist_ok=True)
     ae_seed_file = ae_seed_dir / "empty.parquet"
-    if not ae_seed_file.exists():
-        pq.write_table(ae_empty, ae_seed_file)
+    # Refresh the empty seed so new nullable native-usage columns are visible
+    # before a real partition containing them has been written.
+    pq.write_table(ae_empty, ae_seed_file)
 
     # Spans seed — hive-partitioned (date=) with the columns the OTLP ingest writes.
     spans_seed_schema = pa.schema(
