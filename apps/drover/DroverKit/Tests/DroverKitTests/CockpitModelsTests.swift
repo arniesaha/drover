@@ -112,6 +112,38 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     #expect(unknown.status == .unknown)
 }
 
+@Test func malformedProjectionMetadataDegradesInsteadOfBlankingAnalytics() throws {
+    // A projection object the client cannot fully read must cost the banner,
+    // not the screen: this type is nested inside the activity payload, so a
+    // throw here takes the aggregates down with it.
+    let missingCounts = try JSONDecoder().decode(
+        AnalyticsProjectionMetadata.self,
+        from: Data(#"""
+        {"status":"catching_up"}
+        """#.utf8)
+    )
+    let wrongTypes = try JSONDecoder().decode(
+        AnalyticsProjectionMetadata.self,
+        from: Data(#"""
+        {"status":"catching_up","completed_partition_count":"2","total_partition_count":null}
+        """#.utf8)
+    )
+    let missingStatus = try JSONDecoder().decode(
+        AnalyticsProjectionMetadata.self,
+        from: Data(#"""
+        {"completed_partition_count":1,"total_partition_count":3}
+        """#.utf8)
+    )
+
+    #expect(missingCounts.status == .catchingUp)
+    #expect(missingCounts.completedPartitionCount == 0)
+    #expect(missingCounts.totalPartitionCount == 0)
+    #expect(wrongTypes.completedPartitionCount == 0)
+    #expect(wrongTypes.totalPartitionCount == 0)
+    #expect(missingStatus.status == .unknown)
+    #expect(missingStatus.totalPartitionCount == 3)
+}
+
 @Test func analyticsDecodesMetricSourceCoverageWithoutInventingUsage() throws {
     let coverage = try JSONDecoder().decode(Coverage.self, from: Data(#"""
     {"token_percent":33.3,"sources":{

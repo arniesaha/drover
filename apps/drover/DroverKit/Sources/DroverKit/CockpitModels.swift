@@ -318,9 +318,17 @@ public struct AnalyticsProjectionMetadata: Decodable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        status = try container.decode(AnalyticsProjectionStatus.self, forKey: .status)
-        completedPartitionCount = try container.decode(Int.self, forKey: .completedPartitionCount)
-        totalPartitionCount = try container.decode(Int.self, forKey: .totalPartitionCount)
+        // Every field degrades rather than throws. A decode failure here does not
+        // cost the banner, it costs the whole Analytics screen: this type is
+        // nested inside ActivitySummary, so one malformed field blanks the
+        // aggregates the user actually came for. The same reasoning already
+        // makes `status` fall back to `.unknown` on a string it has never seen.
+        status =
+            (try? container.decode(AnalyticsProjectionStatus.self, forKey: .status)) ?? .unknown
+        completedPartitionCount =
+            (try? container.decodeIfPresent(Int.self, forKey: .completedPartitionCount)) ?? 0
+        totalPartitionCount =
+            (try? container.decodeIfPresent(Int.self, forKey: .totalPartitionCount)) ?? 0
     }
 }
 

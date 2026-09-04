@@ -27,12 +27,16 @@ struct AnalyticsView: View {
                     AnalyticsProjectionBanner(message: notice)
                 }
 
-                if let error = store.analyticsError {
+                // Hidden while a reload is in flight: showing a failure and a
+                // spinner at once reads as "it failed again", and a Retry that
+                // stays tappable mid-request just queues duplicate work.
+                if let error = store.analyticsError, !store.isLoadingAnalytics {
                     VStack(alignment: .leading, spacing: 8) {
                         Label(error, systemImage: "exclamationmark.circle")
                             .droverText(.nested, accented: true)
                         Button("Retry") { Task { await reload() } }
                             .accessibilityIdentifier(AnalyticsRetryPresentation.identifier)
+                            .disabled(store.isLoadingAnalytics)
                     }
                 }
 
