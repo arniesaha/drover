@@ -108,6 +108,45 @@ def test_ingest_returns_new_session_ids(tmp_lh):
     assert stats.new_session_ids == {"sess-A", "sess-B"}
 
 
+def test_ingest_persists_normalized_native_usage_columns(tmp_lh, tmp_path):
+    """Imported Claude usage must be queryable without decoding raw JSON."""
+    parquet_dir, db_path = tmp_lh
+    incoming = tmp_path / "claude_usage.jsonl"
+    incoming.write_text(
+        json.dumps(
+            {
+                "id": "claude-usage-1",
+                "session_id": "claude-native-session",
+                "timestamp": "2026-09-04T12:00:00Z",
+                "agent_id": "claude-code",
+                "event_type": "assistant_message",
+                "message": {"role": "assistant", "content": "Done."},
+                "token_usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "cache_read_input_tokens": 80,
+                    "cache_creation_input_tokens": 10,
+                    "reasoning_output_tokens": 5,
+                },
+                "raw_data": {},
+            }
+        )
+        + "\n"
+    )
+
+    stats = ingest_file(incoming, parquet_dir=parquet_dir, duckdb_path=db_path)
+
+    assert stats.inserted == 1
+    with duckdb.connect(str(db_path)) as con:
+        row = con.execute("""
+            SELECT input_tokens, output_tokens, cache_read_tokens,
+                   cache_write_tokens, reasoning_tokens
+            FROM agent_events
+            WHERE id = 'claude-usage-1'
+            """).fetchone()
+    assert row == (120, 30, 80, 10, 5)
+
+
 def test_ingest_new_session_ids_empty_on_reingest(tmp_lh):
     """Re-ingesting the same file must produce no new session ids (all dupes)."""
     parquet_dir, db_path = tmp_lh

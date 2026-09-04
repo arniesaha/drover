@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,7 @@ EXPECTED_TABLES = (
     "pipeline_artifacts",
     "provider_connections",
     "span_partition_activity",
+    "agent_event_partition_activity",
     # `harness_*`, `live_recap_jobs`, `live_session_recaps`, `advisory_findings`
     # and `advisory_occurrences` are deliberately absent: these tables were moved
     # to the control-plane store to isolate them from parquet scans that can
@@ -108,6 +110,13 @@ _SPAN_PARTITION_ACTIVITY_DDL = """
 CREATE TABLE IF NOT EXISTS span_partition_activity (
   date VARCHAR PRIMARY KEY,
   latest_activity_at TIMESTAMPTZ NOT NULL
+);
+"""
+
+_AGENT_EVENT_PARTITION_ACTIVITY_DDL = """
+CREATE TABLE IF NOT EXISTS agent_event_partition_activity (
+  date VARCHAR PRIMARY KEY,
+  latest_ingested_at TIMESTAMP NOT NULL
 );
 """
 
@@ -569,6 +578,71 @@ CREATE TABLE IF NOT EXISTS session_usage (
 );
 """
 
+_SESSION_USAGE_SOURCES_DDL = """
+CREATE TABLE IF NOT EXISTS session_usage_sources (
+  source_usage_id     VARCHAR PRIMARY KEY,
+  session_id          VARCHAR NOT NULL,
+  source              VARCHAR NOT NULL,
+  host_id             VARCHAR,
+  harness             VARCHAR,
+  input_tokens        BIGINT,
+  output_tokens       BIGINT,
+  cache_read_tokens   BIGINT,
+  cache_write_tokens  BIGINT,
+  reasoning_tokens    BIGINT,
+  turn_count          INTEGER NOT NULL DEFAULT 0,
+  exact               BOOLEAN NOT NULL DEFAULT TRUE,
+  usage_observed      BOOLEAN NOT NULL DEFAULT FALSE,
+  source_seq          INTEGER NOT NULL,
+  source_event_count  INTEGER NOT NULL,
+  observed_at         TIMESTAMP NOT NULL DEFAULT now(),
+  UNIQUE (session_id, source)
+);
+"""
+
+_NATIVE_USAGE_PARTITION_TOTALS_DDL = """
+CREATE TABLE IF NOT EXISTS native_usage_partition_totals (
+  native_usage_partition_id  VARCHAR PRIMARY KEY,
+  session_id                 VARCHAR NOT NULL,
+  partition_date             VARCHAR NOT NULL,
+  input_tokens               BIGINT,
+  output_tokens              BIGINT,
+  cache_read_tokens          BIGINT,
+  cache_write_tokens         BIGINT,
+  reasoning_tokens           BIGINT,
+  turn_count                 INTEGER NOT NULL,
+  event_count                INTEGER NOT NULL,
+  exact                      BOOLEAN NOT NULL,
+  observed_at                TIMESTAMP NOT NULL,
+  UNIQUE (session_id, partition_date)
+);
+"""
+
+_NATIVE_USAGE_PARTITION_WATERMARKS_DDL = """
+CREATE TABLE IF NOT EXISTS native_usage_partition_watermarks (
+  partition_date       VARCHAR PRIMARY KEY,
+  source_activity_at   TIMESTAMP NOT NULL,
+  rolled_at            TIMESTAMP NOT NULL DEFAULT now()
+);
+"""
+
+
+def _backfill_session_usage_sources(con: duckdb.DuckDBPyConnection) -> None:
+    """Retain pre-ledger compatibility rows as their harness-source history."""
+    con.execute("""
+        INSERT INTO session_usage_sources
+          (source_usage_id, session_id, source, host_id, harness, input_tokens,
+           output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+           turn_count, exact, usage_observed, source_seq, source_event_count,
+           observed_at)
+        SELECT 'harness_events:' || session_id, session_id, 'harness_events',
+               host_id, harness, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, reasoning_tokens, turn_count, exact,
+               source = 'harness_events', source_seq, source_event_count, observed_at
+        FROM session_usage
+        ON CONFLICT (source_usage_id) DO NOTHING
+        """)
+
 
 def _agent_events_view(parquet_dir: Path) -> str:
     return f"""
@@ -949,6 +1023,39 @@ def _refresh_span_partition_activity(con: duckdb.DuckDBPyConnection) -> None:
         ON CONFLICT (date) DO UPDATE SET
           latest_activity_at = EXCLUDED.latest_activity_at
         """)
+
+
+def _refresh_agent_event_partition_activity(
+    con: duckdb.DuckDBPyConnection, parquet_dir: Path
+) -> None:
+    """Index native-event partitions from file metadata, not a parquet scan."""
+    latest_by_date: dict[str, int] = {}
+    root = parquet_dir / "agent_events"
+    for part in root.glob("date=*/agent_id=*/*.parquet"):
+        date_dir = part.parent.parent.name
+        if not date_dir.startswith("date="):
+            continue
+        partition_date = date_dir.removeprefix("date=")
+        if partition_date == "_seed":
+            continue
+        latest_by_date[partition_date] = max(
+            latest_by_date.get(partition_date, 0), part.stat().st_mtime_ns
+        )
+    for partition_date, modified_ns in latest_by_date.items():
+        latest_ingested_at = datetime.fromtimestamp(
+            modified_ns / 1_000_000_000, tz=timezone.utc
+        ).replace(tzinfo=None)
+        con.execute(
+            """
+            INSERT INTO agent_event_partition_activity VALUES (?, ?)
+            ON CONFLICT (date) DO UPDATE SET
+              latest_ingested_at = greatest(
+                agent_event_partition_activity.latest_ingested_at,
+                EXCLUDED.latest_ingested_at
+              )
+            """,
+            [partition_date, latest_ingested_at],
+        )
 
 
 def _pr_events_view(parquet_dir: Path) -> str:
@@ -1354,6 +1461,11 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    # Imported here, not at module scope: this module is on harnessd's import
+    # path, and test_skinny_harnessd_import_avoids_server_wide_modules keeps
+    # pyarrow off it. parquet_io imports pyarrow.
+    from drover.server.parquet_io import atomic_write_table
+
     # agent_events seed: placed in a hive-partitioned directory so DuckDB
     # doesn't raise a partition mismatch when real data arrives.  Also
     # includes dedup_key so _existing_dedup_keys() can query it immediately,
@@ -1372,6 +1484,11 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
             ("repo_name", pa.string()),
             ("branch", pa.string()),
             ("principal_id", pa.string()),
+            ("input_tokens", pa.int64()),
+            ("output_tokens", pa.int64()),
+            ("cache_read_tokens", pa.int64()),
+            ("cache_write_tokens", pa.int64()),
+            ("reasoning_tokens", pa.int64()),
             ("dedup_key", pa.string()),
             ("raw_data", pa.string()),
         ]
@@ -1390,6 +1507,11 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
             "repo_name": pa.array([], type=pa.string()),
             "branch": pa.array([], type=pa.string()),
             "principal_id": pa.array([], type=pa.string()),
+            "input_tokens": pa.array([], type=pa.int64()),
+            "output_tokens": pa.array([], type=pa.int64()),
+            "cache_read_tokens": pa.array([], type=pa.int64()),
+            "cache_write_tokens": pa.array([], type=pa.int64()),
+            "reasoning_tokens": pa.array([], type=pa.int64()),
             "dedup_key": pa.array([], type=pa.string()),
             "raw_data": pa.array([], type=pa.string()),
         },
@@ -1399,8 +1521,13 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
     ae_seed_dir = parquet_dir / "agent_events" / "date=_seed" / "agent_id=_seed"
     ae_seed_dir.mkdir(parents=True, exist_ok=True)
     ae_seed_file = ae_seed_dir / "empty.parquet"
-    if not ae_seed_file.exists():
-        pq.write_table(ae_empty, ae_seed_file)
+    # Refresh the empty seed so new nullable native-usage columns are visible
+    # before a real partition containing them has been written. Atomically:
+    # this file sits inside the ``*.parquet`` glob every reader scans, and
+    # bootstrap() runs from harnessd startup and from CLI entry points that can
+    # fire while a live server is mid-query. A direct write would let that
+    # reader observe a half-written file ("too small to be a Parquet file").
+    atomic_write_table(ae_empty, ae_seed_file)
 
     # Spans seed — hive-partitioned (date=) with the columns the OTLP ingest writes.
     spans_seed_schema = pa.schema(
@@ -1598,6 +1725,10 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         # source table are both control-plane, and the cockpit already reads
         # this store through attached_control_plane_snapshot.
         con.execute(_SESSION_USAGE_DDL)
+        con.execute(_SESSION_USAGE_SOURCES_DDL)
+        con.execute(_NATIVE_USAGE_PARTITION_TOTALS_DDL)
+        con.execute(_NATIVE_USAGE_PARTITION_WATERMARKS_DDL)
+        _backfill_session_usage_sources(con)
     return registry_path
 
 
@@ -1933,6 +2064,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
     try:
         con.execute(_TASKS_DDL)
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
+        con.execute(_AGENT_EVENT_PARTITION_ACTIVITY_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
@@ -1957,11 +2089,17 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_ARTIFACTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
         bootstrap_control_plane_store(duckdb_path)
-        migrate_control_plane_tables(con, duckdb_path)
+        copied_control_plane_rows = migrate_control_plane_tables(con, duckdb_path)
+        if copied_control_plane_rows.get("session_usage"):
+            # The first control-plane bootstrap runs before migration. Reopen
+            # it only when a legacy compatibility row was copied so the
+            # source ledger receives that row in this same startup.
+            bootstrap_control_plane_store(duckdb_path)
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))
         con.execute(_span_query_macros(parquet_dir))
         _refresh_span_partition_activity(con)
+        _refresh_agent_event_partition_activity(con, parquet_dir)
         con.execute(_SESSION_LINKS_VIEW)
         con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
         con.execute(_pr_events_view(parquet_dir))

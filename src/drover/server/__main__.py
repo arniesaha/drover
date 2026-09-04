@@ -130,6 +130,7 @@ from drover.server.metrics import (
     sequence_health_report,
     start_metrics_server,
 )
+from drover.server.native_usage_rollup import NativeUsageRollupWorker
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.otlp.receiver import OTLPReceiver
 from drover.server.providers.service import ProviderUsageService
@@ -2480,6 +2481,20 @@ def run(
         log.exception("usage rollup worker failed to start; continuing without it")
         usage_rollup = None
 
+    native_usage_rollup: NativeUsageRollupWorker | None = None
+    try:
+        native_usage_rollup = NativeUsageRollupWorker(duckdb_path=cfg.duckdb_path)
+        native_usage_rollup.start()
+        log.info(
+            "native usage rollup worker ready (interval=%.0fs)",
+            native_usage_rollup.poll_interval_s,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "native usage rollup worker failed to start; continuing without it"
+        )
+        native_usage_rollup = None
+
     receiver: OTLPReceiver | None = None
     if not no_otlp:
         try:
@@ -2836,6 +2851,8 @@ def run(
             live_recap.stop()
         if usage_rollup is not None:
             usage_rollup.stop()
+        if native_usage_rollup is not None:
+            native_usage_rollup.stop()
         if metrics_server is not None:
             metrics_server.shutdown()
         if receiver is not None:

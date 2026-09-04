@@ -17,6 +17,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Set
 
@@ -29,6 +30,7 @@ from drover.dedup import make_dedup_key
 from drover.models import AgentEvent
 from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
+from drover.server.harness.usage import session_totals
 from drover.server.parquet_io import atomic_write_table
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.rollup import rollup_tasks
@@ -67,6 +69,11 @@ def _row_from_event(ev: AgentEvent, env_task_id: Optional[str]) -> dict:
     repo_name = rd.get("_repo_name")
     branch = rd.get("gitBranch") or rd.get("git_branch")
     content = _extract_content(ev)
+    usage = (
+        session_totals(None, [{"usage": ev.token_usage}])
+        if ev.token_usage is not None
+        else None
+    )
 
     return {
         "id": ev.id,
@@ -82,6 +89,11 @@ def _row_from_event(ev: AgentEvent, env_task_id: Optional[str]) -> dict:
         "branch": branch,
         "task_id": compute_task_id(env_task_id, repo_owner, repo_name, branch),
         "principal_id": rd.get("_principal_id"),
+        "input_tokens": usage.input_tokens if usage else None,
+        "output_tokens": usage.output_tokens if usage else None,
+        "cache_read_tokens": usage.cache_read_tokens if usage else None,
+        "cache_write_tokens": usage.cache_write_tokens if usage else None,
+        "reasoning_tokens": usage.reasoning_tokens if usage else None,
         "dedup_key": make_dedup_key(
             ev.timestamp.isoformat(),
             ev.agent_id,
@@ -327,6 +339,19 @@ def ingest_file(
         if new_rows:
             _propagate_unique_session_repo(new_rows, env_task_id)
             _write_partition(new_rows, parquet_dir)
+            ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            for date in sorted({str(row["date"]) for row in new_rows}):
+                con.execute(
+                    """
+                    INSERT INTO agent_event_partition_activity VALUES (?, ?)
+                    ON CONFLICT (date) DO UPDATE SET
+                      latest_ingested_at = greatest(
+                        agent_event_partition_activity.latest_ingested_at,
+                        EXCLUDED.latest_ingested_at
+                      )
+                    """,
+                    [date, ingested_at],
+                )
             _upsert_tasks(con, new_rows)
             rollup_tasks(
                 con,
