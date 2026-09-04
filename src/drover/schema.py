@@ -34,7 +34,6 @@ from drover.server.db import (
 )
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
-from drover.server.parquet_io import atomic_write_table
 
 log = logging.getLogger("drover.schema")
 
@@ -1461,6 +1460,11 @@ def _ensure_seed_parquet(parquet_dir: Path) -> None:
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
+
+    # Imported here, not at module scope: this module is on harnessd's import
+    # path, and test_skinny_harnessd_import_avoids_server_wide_modules keeps
+    # pyarrow off it. parquet_io imports pyarrow.
+    from drover.server.parquet_io import atomic_write_table
 
     # agent_events seed: placed in a hive-partitioned directory so DuckDB
     # doesn't raise a partition mismatch when real data arrives.  Also
