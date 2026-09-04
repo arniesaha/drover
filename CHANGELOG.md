@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-04
+
+### Added
+
+- Imported native-history events now carry typed token columns, and a second
+  rollup source folds them into `session_usage` behind a per-source ledger
+  with its own watermark, so sessions on hosts without harnessd get real
+  token numbers too. Precedence is winner-take-one per session, never a sum,
+  and each native date partition is written in one transaction that leaves
+  the watermark unadvanced if it fails (#318, closes #311).
+- The advisory telemetry aggregate prefers exact session usage over span
+  values, falling back to spans when usage is absent (#318).
+
+### Fixed
+
+- `coverage.sources` percentages count every session in the window, so the
+  cockpit reports where its numbers came from even when the token-bearing
+  sessions carry no repository. Project ranking keeps its own
+  attributed-only gate, so the projects list is never ordered by a column
+  that is zero for every project (#317, closes #316).
+- The iOS client decodes and shows the source coverage block (#317,
+  closes #312).
+- The empty `agent_events` seed parquet is rewritten atomically, so a
+  concurrent reader cannot observe a half-written file (#318).
+
 ## [0.4.2] - 2026-09-03
 
 ### Added
