@@ -600,6 +600,44 @@ def test_bootstrap_backfills_legacy_session_usage_as_a_harness_source(tmp_path):
             """).fetchone() == ("harness_events", 12, 3, True, 4, 4)
 
 
+def test_bootstrap_backfills_legacy_usage_after_control_plane_migration(tmp_path):
+    """The first post-split bootstrap must seed sources after copying legacy rows."""
+    duckdb_path = _db(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute("""
+            CREATE TABLE session_usage (
+              session_id VARCHAR PRIMARY KEY,
+              host_id VARCHAR,
+              harness VARCHAR,
+              input_tokens BIGINT,
+              output_tokens BIGINT,
+              cache_read_tokens BIGINT,
+              cache_write_tokens BIGINT,
+              reasoning_tokens BIGINT,
+              turn_count INTEGER,
+              exact BOOLEAN,
+              source VARCHAR,
+              source_seq INTEGER,
+              source_event_count INTEGER,
+              observed_at TIMESTAMP
+            )
+            """)
+        con.execute("""
+            INSERT INTO session_usage VALUES
+              ('migrated-session', 'mac-mini', 'claude-code', 21, 5,
+               NULL, NULL, NULL, 1, TRUE, 'harness_events', 7, 7, now())
+            """)
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+
+    with duckdb.connect(str(control_plane_path(duckdb_path))) as con:
+        assert con.execute("""
+            SELECT source, input_tokens, source_seq, source_event_count
+            FROM session_usage_sources
+            WHERE session_id = 'migrated-session'
+            """).fetchone() == ("harness_events", 21, 7, 7)
+
+
 def test_session_usage_is_visible_through_the_attached_snapshot(tmp_path):
     """The cockpit reads control-plane tables through temp views over a copy."""
     duckdb_path = _db(tmp_path)

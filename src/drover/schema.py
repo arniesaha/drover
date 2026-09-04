@@ -2009,7 +2009,12 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_ARTIFACTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
         bootstrap_control_plane_store(duckdb_path)
-        migrate_control_plane_tables(con, duckdb_path)
+        copied_control_plane_rows = migrate_control_plane_tables(con, duckdb_path)
+        if copied_control_plane_rows.get("session_usage"):
+            # The first control-plane bootstrap runs before migration. Reopen
+            # it only when a legacy compatibility row was copied so the
+            # source ledger receives that row in this same startup.
+            bootstrap_control_plane_store(duckdb_path)
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))
         con.execute(_span_query_macros(parquet_dir))
