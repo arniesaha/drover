@@ -120,6 +120,15 @@ class AnalyticsPagination:
 
 
 @dataclass(frozen=True)
+class AnalyticsProjectionMetadata:
+    """Completeness of compact historical span facts for this response."""
+
+    status: Literal["ready", "catching_up"]
+    completed_partition_count: int
+    total_partition_count: int
+
+
+@dataclass(frozen=True)
 class ActivityBreakdown:
     key: str
     session_count: int
@@ -161,6 +170,7 @@ class ActivityAnalytics:
     project_metric: Literal["tokens", "sessions"]
     coverage: Coverage
     metadata: AggregateMetadata
+    projection: AnalyticsProjectionMetadata
     pagination: AnalyticsPagination
 
 
@@ -258,6 +268,17 @@ def _session_usage_available(con: duckdb.DuckDBPyConnection) -> bool:
     return row is not None
 
 
+def _span_projection_available(con: duckdb.DuckDBPyConnection) -> bool:
+    """True once this store has the additive span projection relation."""
+    row = con.execute("""
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_name = 'analytics_span_partition_totals'
+        LIMIT 1
+        """).fetchone()
+    return row is not None
+
+
 def _activity_analytics_in_snapshot(
     con: duckdb.DuckDBPyConnection,
     filters: AnalyticsFilters,
@@ -268,6 +289,7 @@ def _activity_analytics_in_snapshot(
     codec = cursor_codec or _DEFAULT_CURSOR_CODEC
     snapshot_at, cursor_snapshot = _cursor_snapshot_context(codec, filters)
     usage_available = _session_usage_available(con)
+    projection = _analytics_projection_metadata(con)
     with _materialized_session_facts(
         con, filters, snapshot_at, usage_available=usage_available
     ) as facts:
@@ -279,6 +301,7 @@ def _activity_analytics_in_snapshot(
             cursor_snapshot,
             facts,
             usage_available=usage_available,
+            projection=projection,
         )
 
 
@@ -292,10 +315,24 @@ def _materialized_session_facts(
 ):
     """Yield one connection-scoped copy of the normalized request facts."""
     relation = f"analytics_session_facts_{secrets.token_hex(8)}"
-    span_dates = _span_partition_dates(con, filters, snapshot_at)
+    projection_available = _span_projection_available(con)
+    span_dates = (
+        _recent_span_partition_dates(con, filters, snapshot_at)
+        if projection_available
+        else _span_partition_dates(con, filters, snapshot_at)
+    )
     event_dates = _agent_event_partition_dates(con, filters, snapshot_at, span_dates)
     base_sql, params = _session_facts_sql(
-        filters, snapshot_at, span_dates, event_dates, usage_available=usage_available
+        filters,
+        snapshot_at,
+        span_dates,
+        event_dates,
+        usage_available=usage_available,
+        historical_projection_start_date=(
+            (snapshot_at - timedelta(days=filters.days)).date().isoformat()
+            if projection_available
+            else None
+        ),
     )
     con.execute(
         f"CREATE TEMP TABLE {relation} AS {base_sql} SELECT * FROM filtered_sessions",
@@ -310,6 +347,43 @@ def _materialized_session_facts(
             # Preserve the query failure that caused cleanup to run. A failed
             # transaction removes the request-scoped table when it rolls back.
             pass
+
+
+def _analytics_projection_metadata(
+    con: duckdb.DuckDBPyConnection,
+) -> AnalyticsProjectionMetadata:
+    """Count catch-up state from small metadata tables only.
+
+    A pre-projection in-memory fixture remains a ready empty source.  A
+    bootstrapped analytical store always has both relations, and counts a date
+    complete only when its replacement watermark is at least as new as the
+    source-activity index.
+    """
+    if not _span_projection_available(con):
+        return AnalyticsProjectionMetadata("ready", 0, 0)
+    try:
+        row = con.execute("""
+            SELECT
+              count(*) AS total_partition_count,
+              count(*) FILTER (
+                WHERE watermark.source_activity_at >= activity.latest_activity_at
+              ) AS completed_partition_count
+            FROM span_partition_activity AS activity
+            LEFT JOIN analytics_span_partition_watermarks AS watermark
+              ON watermark.partition_date = activity.date
+            """).fetchone()
+    except duckdb.CatalogException:
+        # Tests and old callers can provide a projection relation in isolation;
+        # only bootstrapped stores advertise a meaningful catch-up count.
+        return AnalyticsProjectionMetadata("ready", 0, 0)
+    assert row is not None
+    total = int(row[0] or 0)
+    completed = int(row[1] or 0)
+    return AnalyticsProjectionMetadata(
+        "ready" if completed == total else "catching_up",
+        completed,
+        total,
+    )
 
 
 def _span_partition_dates(
@@ -336,6 +410,32 @@ def _span_partition_dates(
         [snapshot_at, filters.days],
     ).fetchall()
     return tuple(str(row[0]) for row in rows)
+
+
+def _recent_span_partition_dates(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    snapshot_at: datetime,
+) -> tuple[str, ...]:
+    """Return physical raw partitions in the request's recent calendar range.
+
+    Historical dates are intentionally absent here: their compact projection
+    rows are selected directly by ``_session_facts_sql``.  Intersecting a
+    generated, bounded date range with the partition inventory avoids calling
+    a DuckDB date macro for a physical directory that does not exist.
+    """
+    cutoff_date = (snapshot_at - timedelta(days=filters.days)).date()
+    current_date = snapshot_at.date()
+    candidates = {
+        (cutoff_date + timedelta(days=offset)).isoformat()
+        for offset in range((current_date - cutoff_date).days + 1)
+    }
+    available = {str(row[0]) for row in con.execute("""
+            SELECT date
+            FROM span_partitions
+            WHERE date IS NOT NULL AND date <> '_seed'
+            """).fetchall()}
+    return tuple(sorted(candidates & available))
 
 
 def _agent_event_partition_dates(
@@ -377,6 +477,7 @@ def _activity_analytics_from_facts(
     facts: str,
     *,
     usage_available: bool = False,
+    projection: AnalyticsProjectionMetadata,
 ) -> ActivityAnalytics:
     snapshot_version = _snapshot_fingerprint(con, facts, snapshot_at)
     if cursor_snapshot is not None and cursor_snapshot != snapshot_version:
@@ -508,6 +609,7 @@ def _activity_analytics_from_facts(
         project_metric=project_metric,
         coverage=coverage,
         metadata=metadata,
+        projection=projection,
         pagination=AnalyticsPagination(
             projects=projects_page,
             harnesses=harnesses_page,
@@ -524,6 +626,7 @@ def _session_facts_sql(
     event_dates: tuple[str, ...],
     *,
     usage_available: bool = False,
+    historical_projection_start_date: str | None = None,
 ) -> tuple[str, list[Any]]:
     where: list[str] = []
     params: list[Any] = [snapshot_at, filters.days]
@@ -580,6 +683,8 @@ def _session_facts_sql(
         params.extend(span_dates)
     else:
         span_source = "SELECT * FROM spans_for_date('_seed')"
+    if historical_projection_start_date is not None:
+        params.append(historical_projection_start_date)
     for column, value in (
         ("host_id", filters.host_id),
         ("harness", filters.harness),
@@ -604,6 +709,182 @@ def _session_facts_sql(
     cache_inside_input_harnesses_sql = ", ".join(
         "'" + name + "'" for name in sorted(CACHE_INSIDE_INPUT_HARNESSES)
     )
+    if historical_projection_start_date is None:
+        span_session_ctes = """
+        span_sessions AS (
+          SELECT
+            session_id,
+            min(start_time) AS started_at,
+            max(
+              COALESCE(GREATEST(end_time, start_time), end_time, start_time)
+            ) AS latest_activity_at,
+            any_value(harness) FILTER (WHERE harness IS NOT NULL) AS harness,
+            any_value(llm_provider) FILTER (WHERE llm_provider IS NOT NULL) AS provider,
+            COALESCE(
+              any_value(llm_model) FILTER (WHERE llm_model IS NOT NULL),
+              any_value(agent_model) FILTER (WHERE agent_model IS NOT NULL)
+            ) AS model,
+            mode(repo_owner || '/' || repo_name) FILTER (
+              WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
+            ) AS project_key,
+            sum(
+              CASE
+                WHEN total_tokens IS NOT NULL THEN total_tokens
+                WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL
+                  THEN COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)
+                ELSE NULL
+              END
+            ) AS total_tokens,
+            sum(cost_usd) AS cost_usd,
+            sum(cache_read_tokens) AS cache_read_tokens,
+            sum(cache_write_tokens) AS cache_write_tokens,
+            sum(duration_ms) AS total_latency_ms,
+            bool_or(
+              total_tokens IS NOT NULL
+              OR prompt_tokens IS NOT NULL
+              OR completion_tokens IS NOT NULL
+            ) AS has_tokens,
+            bool_or(cost_usd IS NOT NULL) AS has_cost,
+            bool_or(
+              cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
+            ) AS has_cache,
+            bool_or(duration_ms IS NOT NULL) AS has_latency
+          FROM enriched_spans, bounds
+          WHERE session_id IS NOT NULL
+            AND COALESCE(GREATEST(end_time, start_time), end_time, start_time)
+                >= bounds.cutoff
+          GROUP BY session_id
+        )
+        """
+    else:
+        # Old source partitions are represented by their compact atoms.  The
+        # raw relation contains only recent calendar partitions, so this path
+        # cannot fan out across historic Parquet even for a long-running span.
+        span_session_ctes = """
+        current_span_atoms AS (
+          SELECT
+            session_id,
+            min(start_time) AS started_at,
+            max(
+              COALESCE(GREATEST(end_time, start_time), end_time, start_time)
+            ) AS latest_activity_at,
+            harness,
+            llm_provider AS provider,
+            COALESCE(llm_model, agent_model) AS model,
+            CASE
+              WHEN repo_owner IS NOT NULL AND repo_name IS NOT NULL
+                THEN repo_owner || '/' || repo_name
+              ELSE NULL
+            END AS project_key,
+            sum(
+              CASE
+                WHEN total_tokens IS NOT NULL THEN total_tokens
+                WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL
+                  THEN COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)
+                ELSE NULL
+              END
+            ) AS total_tokens,
+            sum(cost_usd) AS cost_usd,
+            sum(cache_read_tokens) AS cache_read_tokens,
+            sum(cache_write_tokens) AS cache_write_tokens,
+            sum(duration_ms) AS total_latency_ms,
+            bool_or(
+              total_tokens IS NOT NULL
+              OR prompt_tokens IS NOT NULL
+              OR completion_tokens IS NOT NULL
+            ) AS has_tokens,
+            bool_or(cost_usd IS NOT NULL) AS has_cost,
+            bool_or(
+              cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
+            ) AS has_cache,
+            bool_or(duration_ms IS NOT NULL) AS has_latency,
+            count(*)::BIGINT AS source_row_count
+          FROM enriched_spans, bounds
+          WHERE session_id IS NOT NULL
+            AND COALESCE(GREATEST(end_time, start_time), end_time, start_time)
+                >= bounds.cutoff
+          GROUP BY
+            session_id,
+            harness,
+            llm_provider,
+            COALESCE(llm_model, agent_model),
+            repo_owner,
+            repo_name
+        ),
+        historical_span_atoms AS (
+          SELECT
+            session_id,
+            started_at,
+            latest_activity_at,
+            harness,
+            provider,
+            model,
+            project_key,
+            total_tokens,
+            cost_usd,
+            cache_read_tokens,
+            cache_write_tokens,
+            total_latency_ms,
+            has_tokens,
+            has_cost,
+            has_cache,
+            has_latency,
+            source_row_count
+          FROM analytics_span_partition_totals, bounds
+          WHERE partition_date < ?
+            AND latest_activity_at >= bounds.cutoff
+        ),
+        span_atoms AS (
+          SELECT * FROM current_span_atoms
+          UNION ALL BY NAME
+          SELECT * FROM historical_span_atoms
+        ),
+        project_counts AS (
+          SELECT session_id, project_key, sum(source_row_count) AS row_count
+          FROM span_atoms
+          WHERE project_key IS NOT NULL
+          GROUP BY session_id, project_key
+        ),
+        project_choices AS (
+          SELECT session_id, project_key
+          FROM (
+            SELECT
+              session_id,
+              project_key,
+              row_number() OVER (
+                PARTITION BY session_id
+                ORDER BY row_count DESC, project_key
+              ) AS rn
+            FROM project_counts
+          )
+          WHERE rn = 1
+        ),
+        span_session_values AS (
+          SELECT
+            session_id,
+            min(started_at) AS started_at,
+            max(latest_activity_at) AS latest_activity_at,
+            any_value(harness) FILTER (WHERE harness IS NOT NULL) AS harness,
+            any_value(provider) FILTER (WHERE provider IS NOT NULL) AS provider,
+            any_value(model) FILTER (WHERE model IS NOT NULL) AS model,
+            sum(total_tokens) AS total_tokens,
+            sum(cost_usd) AS cost_usd,
+            sum(cache_read_tokens) AS cache_read_tokens,
+            sum(cache_write_tokens) AS cache_write_tokens,
+            sum(total_latency_ms) AS total_latency_ms,
+            bool_or(has_tokens) AS has_tokens,
+            bool_or(has_cost) AS has_cost,
+            bool_or(has_cache) AS has_cache,
+            bool_or(has_latency) AS has_latency
+          FROM span_atoms
+          GROUP BY session_id
+        ),
+        span_sessions AS (
+          SELECT values.*, choices.project_key
+          FROM span_session_values AS values
+          LEFT JOIN project_choices AS choices USING (session_id)
+        )
+        """
     return (
         f"""
         WITH bounds AS (
@@ -707,50 +988,7 @@ def _session_facts_sql(
           LEFT JOIN agent_day_repos adr
             ON s.agent_id = adr.agent_id AND s.date = adr.date
         ),
-        span_sessions AS (
-          SELECT
-            session_id,
-            min(start_time) AS started_at,
-            max(
-              COALESCE(GREATEST(end_time, start_time), end_time, start_time)
-            ) AS latest_activity_at,
-            any_value(harness) FILTER (WHERE harness IS NOT NULL) AS harness,
-            any_value(llm_provider) FILTER (WHERE llm_provider IS NOT NULL) AS provider,
-            COALESCE(
-              any_value(llm_model) FILTER (WHERE llm_model IS NOT NULL),
-              any_value(agent_model) FILTER (WHERE agent_model IS NOT NULL)
-            ) AS model,
-            mode(repo_owner || '/' || repo_name) FILTER (
-              WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
-            ) AS project_key,
-            sum(
-              CASE
-                WHEN total_tokens IS NOT NULL THEN total_tokens
-                WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL
-                  THEN COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)
-                ELSE NULL
-              END
-            ) AS total_tokens,
-            sum(cost_usd) AS cost_usd,
-            sum(cache_read_tokens) AS cache_read_tokens,
-            sum(cache_write_tokens) AS cache_write_tokens,
-            sum(duration_ms) AS total_latency_ms,
-            bool_or(
-              total_tokens IS NOT NULL
-              OR prompt_tokens IS NOT NULL
-              OR completion_tokens IS NOT NULL
-            ) AS has_tokens,
-            bool_or(cost_usd IS NOT NULL) AS has_cost,
-            bool_or(
-              cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
-            ) AS has_cache,
-            bool_or(duration_ms IS NOT NULL) AS has_latency
-          FROM enriched_spans, bounds
-          WHERE session_id IS NOT NULL
-            AND COALESCE(GREATEST(end_time, start_time), end_time, start_time)
-                >= bounds.cutoff
-          GROUP BY session_id
-        ),
+        {span_session_ctes},
         usage_sessions AS (
           SELECT
             session_id,

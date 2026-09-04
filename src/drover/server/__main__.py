@@ -53,6 +53,7 @@ from drover.server.advisory.worker import (
     operational_analyzers,
     operational_snapshot_source_version,
 )
+from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
 from drover.server.archive import (
     BackupConfig,
     PondArchiveClient,
@@ -138,6 +139,7 @@ from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
 from drover.server.runtime import RuntimeLayout
 from drover.server.session_graph import format_ascii, format_dot, session_graph_payload
+from drover.server.span_analytics_rollup import SpanAnalyticsRollupWorker
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.summarizer.diagnostics import summarize_backend_auth
 from drover.server.summarizer.retry import retry_errored_jobs
@@ -2481,19 +2483,13 @@ def run(
         log.exception("usage rollup worker failed to start; continuing without it")
         usage_rollup = None
 
+    # Foreground Analytics admits itself before opening DuckDB, and both
+    # historical workers use this same gate.  A request in flight therefore
+    # prevents either maintenance scan from beginning a competing read.
+    analytics_maintenance_gate = AnalyticalMaintenanceGate()
+
     native_usage_rollup: NativeUsageRollupWorker | None = None
-    try:
-        native_usage_rollup = NativeUsageRollupWorker(duckdb_path=cfg.duckdb_path)
-        native_usage_rollup.start()
-        log.info(
-            "native usage rollup worker ready (interval=%.0fs)",
-            native_usage_rollup.poll_interval_s,
-        )
-    except Exception:  # noqa: BLE001
-        log.exception(
-            "native usage rollup worker failed to start; continuing without it"
-        )
-        native_usage_rollup = None
+    span_analytics_rollup: SpanAnalyticsRollupWorker | None = None
 
     receiver: OTLPReceiver | None = None
     if not no_otlp:
@@ -2586,6 +2582,7 @@ def run(
             metrics_collector.cockpit_service = CockpitService(
                 duckdb_path=cfg.duckdb_path,
                 provider_usage=provider_usage,
+                maintenance_gate=analytics_maintenance_gate,
             )
             # The first cockpit request after a restart pays to open DuckDB and
             # read the parquet views' metadata: measured at 15.6s cold against
@@ -2643,6 +2640,40 @@ def run(
         except Exception:  # noqa: BLE001
             log.exception("metrics server failed to start; continuing without it")
             metrics_server = None
+
+    # Start historical analytical maintenance only after the cockpit service
+    # and its warmup have had a chance to claim the shared foreground gate.
+    try:
+        native_usage_rollup = NativeUsageRollupWorker(
+            duckdb_path=cfg.duckdb_path,
+            maintenance_gate=analytics_maintenance_gate,
+        )
+        native_usage_rollup.start()
+        log.info(
+            "native usage rollup worker ready (interval=%.0fs)",
+            native_usage_rollup.poll_interval_s,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "native usage rollup worker failed to start; continuing without it"
+        )
+        native_usage_rollup = None
+
+    try:
+        span_analytics_rollup = SpanAnalyticsRollupWorker(
+            duckdb_path=cfg.duckdb_path,
+            maintenance_gate=analytics_maintenance_gate,
+        )
+        span_analytics_rollup.start()
+        log.info(
+            "span analytics rollup worker ready (interval=%.0fs)",
+            span_analytics_rollup.poll_interval_s,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "span analytics rollup worker failed to start; continuing without it"
+        )
+        span_analytics_rollup = None
 
     content_advisory_worker: ContentAnalysisWorker | None = None
     try:
@@ -2853,6 +2884,8 @@ def run(
             usage_rollup.stop()
         if native_usage_rollup is not None:
             native_usage_rollup.stop()
+        if span_analytics_rollup is not None:
+            span_analytics_rollup.stop()
         if metrics_server is not None:
             metrics_server.shutdown()
         if receiver is not None:

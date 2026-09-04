@@ -784,6 +784,109 @@ def test_analytics_freshness_uses_recent_span_end_for_old_started_session():
     assert result.metadata.freshness == "fresh"
 
 
+def test_analytics_reads_recent_old_span_activity_from_projection_not_raw_partition():
+    """A long-running old span is served by its compact row, not a raw scan."""
+    con = _analytics_connection()
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+    current = datetime.now(timezone.utc) - timedelta(minutes=1)
+    old_date = old.date().isoformat()
+    current_date = current.date().isoformat()
+    con.execute("""
+        CREATE TABLE analytics_span_partition_totals (
+          span_partition_total_id VARCHAR PRIMARY KEY,
+          session_id VARCHAR,
+          partition_date VARCHAR,
+          started_at TIMESTAMPTZ,
+          latest_activity_at TIMESTAMPTZ,
+          harness VARCHAR,
+          provider VARCHAR,
+          model VARCHAR,
+          project_key VARCHAR,
+          total_tokens BIGINT,
+          cost_usd DOUBLE,
+          cache_read_tokens BIGINT,
+          cache_write_tokens BIGINT,
+          total_latency_ms DOUBLE,
+          has_tokens BOOLEAN,
+          has_cost BOOLEAN,
+          has_cache BOOLEAN,
+          has_latency BOOLEAN,
+          source_row_count BIGINT
+        )
+        """)
+    con.execute("""
+        CREATE TABLE analytics_span_partition_watermarks (
+          partition_date VARCHAR PRIMARY KEY,
+          source_activity_at TIMESTAMPTZ
+        )
+        """)
+    con.execute(
+        """
+        INSERT INTO analytics_span_partition_totals VALUES (
+          'projected-long-span', 'long-span', ?, ?, ?, 'codex', 'openai',
+          'gpt-5', 'acme/long-span', 42, 0.25, 4, 0, 100, TRUE, TRUE, TRUE,
+          TRUE, 1
+        )
+        """,
+        [old_date, old, recent],
+    )
+    # Keep a matching raw row present to prove that a foreground request does
+    # not bind this historical physical partition once the projection exists.
+    con.execute(
+        """
+        INSERT INTO spans_enriched VALUES (
+          'old-raw', 'long-span', ?, ?, 100, 'codex', 'openai', 'gpt-5',
+          NULL, 'acme', 'long-span', 42, NULL, NULL, 0.25, 4, 0
+        )
+        """,
+        [old, recent],
+    )
+    con.execute(
+        """
+        INSERT INTO spans_enriched VALUES (
+          'current-raw', 'long-span', ?, ?, 20, 'codex', 'openai', 'gpt-5',
+          NULL, 'acme', 'long-span', 8, NULL, NULL, 0.1, 1, 0
+        )
+        """,
+        [current, current],
+    )
+
+    raw_span_dates: list[str] = []
+
+    class NoHistoricalRawPartition:
+        def execute(self, sql, parameters=None):
+            if "spans_for_date" in str(sql):
+                raw_span_dates.extend(
+                    value
+                    for value in (parameters or [])
+                    if isinstance(value, str) and len(value) == 10
+                )
+            if "spans_for_date" in str(sql) and old_date in (parameters or []):
+                pytest.fail(
+                    "foreground analytics must not open an old raw span partition"
+                )
+            if parameters is None:
+                return con.execute(sql)
+            return con.execute(sql, parameters)
+
+    try:
+        result = activity_analytics(
+            NoHistoricalRawPartition(), AnalyticsFilters(days=7)
+        )
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 1
+    assert result.totals.total_tokens == 50
+    assert result.projects[0].project_key == "acme/long-span"
+    assert current_date in raw_span_dates
+    assert old_date not in raw_span_dates
+    assert result.projection.status == "catching_up"
+    assert result.projection.completed_partition_count == 0
+    assert result.projection.total_partition_count == 2
+
+
 def test_paginated_dimension_freshness_uses_harness_and_session_latest_activity():
     con = _analytics_connection()
     old = datetime.now(timezone.utc) - timedelta(days=2)
@@ -1224,6 +1327,51 @@ def test_cockpit_analytics_isolates_activity_failure():
     assert payload["provider_capacity"]["status"] == "unavailable"
     assert payload["activity"]["status"] == "error"
     assert payload["activity"]["data"] is None
+
+
+def test_foreground_activity_registers_before_opening_analytics_store(
+    low_coverage_analytics_db,
+):
+    """A request blocks new maintenance admission before it reaches DuckDB."""
+    from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
+
+    gate = AnalyticalMaintenanceGate()
+    connect_started = threading.Event()
+    release_connect = threading.Event()
+    payload: dict[str, object] = {}
+
+    def connect():
+        connect_started.set()
+        assert release_connect.wait(5)
+        return low_coverage_analytics_db
+
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=None,
+        connect=connect,
+        maintenance_gate=gate,
+    )
+    request = threading.Thread(
+        target=lambda: payload.setdefault(
+            "value", service.analytics(AnalyticsFilters())
+        )
+    )
+    request.start()
+    assert connect_started.wait(5)
+
+    assert gate.stats().foreground_waiters == 1
+    assert gate.try_begin_maintenance() is False
+
+    release_connect.set()
+    request.join(timeout=5)
+
+    assert not request.is_alive()
+    assert payload["value"]["activity"]["status"] == "ok"
+    assert payload["value"]["activity"]["data"]["projection"] == {
+        "status": "ready",
+        "completed_partition_count": 0,
+        "total_partition_count": 0,
+    }
 
 
 def test_cockpit_overview_counts_actionable_insights_by_severity(tmp_path):

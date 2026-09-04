@@ -67,6 +67,10 @@ EXPECTED_TABLES = (
     "provider_connections",
     "span_partition_activity",
     "agent_event_partition_activity",
+    "analytics_span_partition_totals",
+    "analytics_span_sessions",
+    "analytics_span_partition_watermarks",
+    "analytics_span_projection_state",
     # `harness_*`, `live_recap_jobs`, `live_session_recaps`, `advisory_findings`
     # and `advisory_occurrences` are deliberately absent: these tables were moved
     # to the control-plane store to isolate them from parquet scans that can
@@ -117,6 +121,70 @@ _AGENT_EVENT_PARTITION_ACTIVITY_DDL = """
 CREATE TABLE IF NOT EXISTS agent_event_partition_activity (
   date VARCHAR PRIMARY KEY,
   latest_ingested_at TIMESTAMP NOT NULL
+);
+"""
+
+_ANALYTICS_SPAN_PARTITION_TOTALS_DDL = """
+CREATE TABLE IF NOT EXISTS analytics_span_partition_totals (
+  span_partition_total_id VARCHAR PRIMARY KEY,
+  session_id              VARCHAR NOT NULL,
+  partition_date          VARCHAR NOT NULL,
+  started_at              TIMESTAMPTZ NOT NULL,
+  latest_activity_at      TIMESTAMPTZ NOT NULL,
+  harness                 VARCHAR,
+  provider                VARCHAR,
+  model                   VARCHAR,
+  project_key             VARCHAR,
+  total_tokens            BIGINT,
+  cost_usd                DOUBLE,
+  cache_read_tokens       BIGINT,
+  cache_write_tokens      BIGINT,
+  total_latency_ms        DOUBLE,
+  has_tokens              BOOLEAN NOT NULL,
+  has_cost                BOOLEAN NOT NULL,
+  has_cache               BOOLEAN NOT NULL,
+  has_latency             BOOLEAN NOT NULL,
+  source_row_count        BIGINT NOT NULL,
+  rolled_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+_ANALYTICS_SPAN_SESSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS analytics_span_sessions (
+  session_id         VARCHAR PRIMARY KEY,
+  started_at         TIMESTAMPTZ NOT NULL,
+  latest_activity_at TIMESTAMPTZ NOT NULL,
+  harness            VARCHAR,
+  provider           VARCHAR,
+  model              VARCHAR,
+  project_key        VARCHAR,
+  total_tokens       BIGINT,
+  cost_usd           DOUBLE,
+  cache_read_tokens  BIGINT,
+  cache_write_tokens BIGINT,
+  total_latency_ms   DOUBLE,
+  has_tokens         BOOLEAN NOT NULL,
+  has_cost           BOOLEAN NOT NULL,
+  has_cache          BOOLEAN NOT NULL,
+  has_latency        BOOLEAN NOT NULL,
+  rolled_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+_ANALYTICS_SPAN_PARTITION_WATERMARKS_DDL = """
+CREATE TABLE IF NOT EXISTS analytics_span_partition_watermarks (
+  partition_date     VARCHAR PRIMARY KEY,
+  source_activity_at TIMESTAMPTZ NOT NULL,
+  rolled_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+_ANALYTICS_SPAN_PROJECTION_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS analytics_span_projection_state (
+  projection_name        VARCHAR PRIMARY KEY,
+  inventory_complete     BOOLEAN NOT NULL DEFAULT FALSE,
+  inventory_completed_at TIMESTAMPTZ,
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
@@ -1003,26 +1071,36 @@ LEFT JOIN agent_day_repos adr
 """
 
 
-def _refresh_span_partition_activity(con: duckdb.DuckDBPyConnection) -> None:
-    """Refresh the small request-time index of span partition activity."""
-    con.execute("""
-        DELETE FROM span_partition_activity
-        WHERE date NOT IN (
-          SELECT date FROM span_partitions WHERE date <> '_seed'
+def _discover_span_partition_activity(
+    con: duckdb.DuckDBPyConnection, parquet_dir: Path
+) -> None:
+    """Inventory span date directories without binding the global spans view.
+
+    Freshly ingested spans advance their own activity watermark in the OTLP
+    writer. Existing partitions have no equivalent row on their first upgrade,
+    so discovery inserts them once with a conservative current watermark. The
+    bounded projection worker then reads and replaces one source date at a
+    time; a later direct ingest supplies the precise newer activity time.
+    """
+    root = parquet_dir / "spans"
+    discovered = {
+        part.parent.name.removeprefix("date=")
+        for part in root.glob("date=*/*.parquet")
+        if part.parent.name != "date=_seed"
+    }
+    existing = {
+        str(row[0])
+        for row in con.execute("SELECT date FROM span_partition_activity").fetchall()
+    }
+    for partition_date in sorted(existing - discovered):
+        con.execute(
+            "DELETE FROM span_partition_activity WHERE date = ?", [partition_date]
         )
-        """)
-    con.execute("""
-        INSERT INTO span_partition_activity BY NAME
-        SELECT
-          date,
-          max(COALESCE(GREATEST(end_time, start_time), end_time, start_time))
-            AS latest_activity_at
-        FROM spans
-        WHERE date IS NOT NULL AND date <> '_seed'
-        GROUP BY date
-        ON CONFLICT (date) DO UPDATE SET
-          latest_activity_at = EXCLUDED.latest_activity_at
-        """)
+    for partition_date in sorted(discovered - existing):
+        con.execute(
+            "INSERT INTO span_partition_activity VALUES (?, now())",
+            [partition_date],
+        )
 
 
 def _refresh_agent_event_partition_activity(
@@ -2065,6 +2143,10 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_TASKS_DDL)
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
         con.execute(_AGENT_EVENT_PARTITION_ACTIVITY_DDL)
+        con.execute(_ANALYTICS_SPAN_PARTITION_TOTALS_DDL)
+        con.execute(_ANALYTICS_SPAN_SESSIONS_DDL)
+        con.execute(_ANALYTICS_SPAN_PARTITION_WATERMARKS_DDL)
+        con.execute(_ANALYTICS_SPAN_PROJECTION_STATE_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
@@ -2098,7 +2180,16 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_agent_events_view(parquet_dir))
         con.execute(_spans_view(parquet_dir))
         con.execute(_span_query_macros(parquet_dir))
-        _refresh_span_partition_activity(con)
+        _discover_span_partition_activity(con, parquet_dir)
+        con.execute("""
+            INSERT INTO analytics_span_projection_state (
+              projection_name, inventory_complete, inventory_completed_at
+            ) VALUES ('span_analytics', TRUE, now())
+            ON CONFLICT (projection_name) DO UPDATE SET
+              inventory_complete = TRUE,
+              inventory_completed_at = excluded.inventory_completed_at,
+              updated_at = now()
+            """)
         _refresh_agent_event_partition_activity(con, parquet_dir)
         con.execute(_SESSION_LINKS_VIEW)
         con.execute(_OPENCLAW_SPAN_LINKS_VIEW)

@@ -595,6 +595,53 @@ def _append_usage_rollup_metrics(lines: list[str]) -> None:
     )
 
 
+def _append_span_analytics_rollup_metrics(lines: list[str]) -> None:
+    """Expose bounded projection health without coupling scrapes to DuckDB."""
+    from drover.server.span_analytics_rollup import rollup_metrics
+
+    partitions, sessions, pending, last_pass = rollup_metrics()
+    lines.extend(
+        [
+            "# HELP drover_span_analytics_rollup_partitions_total "
+            "Source partitions materialized into Analytics projection rows.",
+            "# TYPE drover_span_analytics_rollup_partitions_total counter",
+            f"drover_span_analytics_rollup_partitions_total {partitions}",
+            "# HELP drover_span_analytics_rollup_sessions_total "
+            "Sessions re-materialized from bounded span partition atoms.",
+            "# TYPE drover_span_analytics_rollup_sessions_total counter",
+            f"drover_span_analytics_rollup_sessions_total {sessions}",
+            "# HELP drover_span_analytics_projection_pending_partitions "
+            "Known span partitions still waiting for projection materialization.",
+            "# TYPE drover_span_analytics_projection_pending_partitions gauge",
+            f"drover_span_analytics_projection_pending_partitions {pending}",
+            "# HELP drover_span_analytics_rollup_last_pass_seconds "
+            "Duration of the most recent bounded span projection pass.",
+            "# TYPE drover_span_analytics_rollup_last_pass_seconds gauge",
+            "drover_span_analytics_rollup_last_pass_seconds "
+            f"{last_pass if last_pass is not None else 0}",
+        ]
+    )
+
+
+def _append_analytics_maintenance_metrics(lines: list[str]) -> None:
+    """Render the process-local analytical gate without opening DuckDB."""
+    from drover.server.analytics_maintenance import latest_maintenance_gate_stats
+
+    stats = latest_maintenance_gate_stats()
+    lines.extend(
+        [
+            "# HELP drover_analytics_maintenance_active "
+            "Whether an analytical maintenance pass currently owns the gate.",
+            "# TYPE drover_analytics_maintenance_active gauge",
+            "drover_analytics_maintenance_active " f"{int(stats.maintenance_active)}",
+            "# HELP drover_analytics_foreground_waiters "
+            "Foreground analytics requests admitted before store access.",
+            "# TYPE drover_analytics_foreground_waiters gauge",
+            f"drover_analytics_foreground_waiters {stats.foreground_waiters}",
+        ]
+    )
+
+
 def _append_redis_metrics(
     lines: list[str], job_streams: Mapping[str, RedisJobStream]
 ) -> None:
@@ -2453,6 +2500,8 @@ class MetricsCollector:
         _append_harness_metrics(lines)
         _append_advisory_metrics(lines)
         _append_usage_rollup_metrics(lines)
+        _append_span_analytics_rollup_metrics(lines)
+        _append_analytics_maintenance_metrics(lines)
         observatory = self._observatory_snapshot(snapshot)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"

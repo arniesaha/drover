@@ -6,11 +6,13 @@ import logging
 import secrets
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
 from drover.server.cockpit.analytics import (
     ActivityAnalytics,
     AnalyticsCursorCodec,
@@ -60,10 +62,12 @@ class CockpitService:
         connect: Callable[[], Any] | None = None,
         advisory_repository: Any | None = None,
         cursor_secret: bytes | None = None,
+        maintenance_gate: AnalyticalMaintenanceGate | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
         self._connect = connect
+        self._maintenance_gate = maintenance_gate
         if advisory_repository is None and self.duckdb_path is not None:
             from drover.server.advisory.repository import AdvisoryRepository
 
@@ -267,33 +271,39 @@ class CockpitService:
             con = None
             owns_connection = self._connect is None
             try:
-                if self._connect is not None:
-                    con = self._connect()
-                elif self.duckdb_path is not None:
-                    con = open_duckdb_connection(
-                        self.duckdb_path, read_only=True, role="diagnostic"
-                    )
-                else:
-                    raise RuntimeError("activity store is unavailable")
-                outcome["connection"] = con
-                if owns_connection and self.duckdb_path is not None:
-                    # `harness_sessions` lives in the control-plane store since
-                    # #95. Attach a private copy so this query -- the one that
-                    # was in flight during the 2026-08-11 19:45 wedge -- keeps
-                    # correlating fleet sessions with span sessions without
-                    # reading anything the control plane is writing.
-                    #
-                    # Only for a connection this service opened itself: a
-                    # caller-supplied one is not necessarily on `duckdb_path`
-                    # and brings whatever control-plane tables it wants.
-                    with attached_control_plane_snapshot(con, self.duckdb_path):
+                foreground = (
+                    self._maintenance_gate.foreground()
+                    if self._maintenance_gate is not None
+                    else nullcontext()
+                )
+                with foreground:
+                    if self._connect is not None:
+                        con = self._connect()
+                    elif self.duckdb_path is not None:
+                        con = open_duckdb_connection(
+                            self.duckdb_path, read_only=True, role="diagnostic"
+                        )
+                    else:
+                        raise RuntimeError("activity store is unavailable")
+                    outcome["connection"] = con
+                    if owns_connection and self.duckdb_path is not None:
+                        # `harness_sessions` lives in the control-plane store since
+                        # #95. Attach a private copy so this query -- the one that
+                        # was in flight during the 2026-08-11 19:45 wedge -- keeps
+                        # correlating fleet sessions with span sessions without
+                        # reading anything the control plane is writing.
+                        #
+                        # Only for a connection this service opened itself: a
+                        # caller-supplied one is not necessarily on `duckdb_path`
+                        # and brings whatever control-plane tables it wants.
+                        with attached_control_plane_snapshot(con, self.duckdb_path):
+                            outcome["result"] = activity_analytics(
+                                con, filters, cursor_codec=self._cursor_codec
+                            )
+                    else:
                         outcome["result"] = activity_analytics(
                             con, filters, cursor_codec=self._cursor_codec
                         )
-                else:
-                    outcome["result"] = activity_analytics(
-                        con, filters, cursor_codec=self._cursor_codec
-                    )
             except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
                 outcome["error"] = exc
             finally:

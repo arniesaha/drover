@@ -7,6 +7,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 
@@ -17,6 +18,9 @@ from drover.server.harness.usage_sources import (
     SOURCE_NATIVE_AGENT_EVENTS,
     upsert_source_usage,
 )
+
+if TYPE_CHECKING:
+    from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
 
 log = logging.getLogger("drover.native_usage_rollup")
 
@@ -200,49 +204,65 @@ def _rebuild_partition(
 
 
 def rollup_pending_native_usage(
-    duckdb_path: Path, *, limit: int = DEFAULT_PARTITION_LIMIT
+    duckdb_path: Path,
+    *,
+    limit: int = DEFAULT_PARTITION_LIMIT,
+    maintenance_gate: AnalyticalMaintenanceGate | None = None,
 ) -> NativeUsageRollupReport:
     """Apply changed native-event partitions, one bounded partition at a time."""
     duckdb_path = Path(duckdb_path)
-    pending = _pending_partitions(duckdb_path, limit=limit)
-    if not pending:
+    if maintenance_gate is not None and not maintenance_gate.try_begin_maintenance():
         return NativeUsageRollupReport(partitions=0, sessions=0)
-    with open_duckdb_connection(duckdb_path, role="worker") as analytical:
-        loaded = [
-            (
-                partition_date,
-                activity_at,
-                _load_partition_totals(analytical, partition_date),
-            )
-            for partition_date, activity_at in pending
-        ]
-    sessions = 0
-    with control_plane_connection(duckdb_path) as control:
-        for partition_date, activity_at, totals in loaded:
-            # The partition totals, source projection, and watermark are one
-            # unit. Advancing the watermark first would turn an interrupted
-            # materialization into a permanently missed partition.
-            control.execute("BEGIN TRANSACTION")
-            try:
-                sessions += _rebuild_partition(
-                    control,
-                    partition_date=partition_date,
-                    source_activity_at=activity_at,
-                    totals=totals,
+    try:
+        pending = _pending_partitions(duckdb_path, limit=limit)
+        if not pending:
+            return NativeUsageRollupReport(partitions=0, sessions=0)
+        with open_duckdb_connection(duckdb_path, role="worker") as analytical:
+            loaded = [
+                (
+                    partition_date,
+                    activity_at,
+                    _load_partition_totals(analytical, partition_date),
                 )
-            except BaseException:
-                control.execute("ROLLBACK")
-                raise
-            else:
-                control.execute("COMMIT")
-    return NativeUsageRollupReport(partitions=len(loaded), sessions=sessions)
+                for partition_date, activity_at in pending
+            ]
+        sessions = 0
+        with control_plane_connection(duckdb_path) as control:
+            for partition_date, activity_at, totals in loaded:
+                # The partition totals, source projection, and watermark are one
+                # unit. Advancing the watermark first would turn an interrupted
+                # materialization into a permanently missed partition.
+                control.execute("BEGIN TRANSACTION")
+                try:
+                    sessions += _rebuild_partition(
+                        control,
+                        partition_date=partition_date,
+                        source_activity_at=activity_at,
+                        totals=totals,
+                    )
+                except BaseException:
+                    control.execute("ROLLBACK")
+                    raise
+                else:
+                    control.execute("COMMIT")
+        return NativeUsageRollupReport(partitions=len(loaded), sessions=sessions)
+    finally:
+        if maintenance_gate is not None:
+            maintenance_gate.end_maintenance()
 
 
 class NativeUsageRollupWorker:
     """Periodically repair native usage after an import or an interrupted write."""
 
-    def __init__(self, *, duckdb_path: Path, poll_interval_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        duckdb_path: Path,
+        maintenance_gate: AnalyticalMaintenanceGate | None = None,
+        poll_interval_s: float = 60.0,
+    ) -> None:
         self.duckdb_path = Path(duckdb_path)
+        self.maintenance_gate = maintenance_gate
         self.poll_interval_s = poll_interval_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -272,4 +292,6 @@ class NativeUsageRollupWorker:
             self._stop.wait(self.poll_interval_s)
 
     def drain_once(self) -> NativeUsageRollupReport:
-        return rollup_pending_native_usage(self.duckdb_path)
+        return rollup_pending_native_usage(
+            self.duckdb_path, maintenance_gate=self.maintenance_gate
+        )

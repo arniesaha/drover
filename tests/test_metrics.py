@@ -5346,3 +5346,39 @@ def test_usage_rollup_metrics_render_counters_and_last_pass():
     assert "drover_usage_rollup_malformed_payloads_total 1" in text
     assert "# TYPE drover_usage_rollup_last_pass_seconds gauge" in text
     usage_rollup.reset_counters_for_tests()
+
+
+def test_span_analytics_rollup_metrics_render_progress_and_backlog():
+    from drover.server import span_analytics_rollup
+    from drover.server.metrics import _append_span_analytics_rollup_metrics
+
+    span_analytics_rollup.reset_metrics_for_tests()
+    span_analytics_rollup._record_rollup_pass(
+        span_analytics_rollup.SpanAnalyticsRollupReport(
+            partitions=1, sessions=2, pending=3
+        ),
+        elapsed_seconds=0.25,
+    )
+    lines: list[str] = []
+    _append_span_analytics_rollup_metrics(lines)
+    text = "\n".join(lines)
+    assert "drover_span_analytics_rollup_partitions_total 1" in text
+    assert "drover_span_analytics_rollup_sessions_total 2" in text
+    assert "drover_span_analytics_projection_pending_partitions 3" in text
+    assert "drover_span_analytics_rollup_last_pass_seconds 0.25" in text
+    span_analytics_rollup.reset_metrics_for_tests()
+
+
+def test_analytics_maintenance_metrics_render_active_gate_without_store_access():
+    from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
+    from drover.server.metrics import _append_analytics_maintenance_metrics
+
+    gate = AnalyticalMaintenanceGate()
+    assert gate.try_begin_maintenance() is True
+    try:
+        lines: list[str] = []
+        _append_analytics_maintenance_metrics(lines)
+    finally:
+        gate.end_maintenance()
+
+    assert "drover_analytics_maintenance_active 1" in "\n".join(lines)
