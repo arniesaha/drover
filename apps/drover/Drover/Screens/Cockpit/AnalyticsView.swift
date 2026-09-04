@@ -23,15 +23,27 @@ struct AnalyticsView: View {
                     AnalyticsRefreshBanner(message: notice)
                 }
 
-                if let error = store.analyticsError {
-                    Label(error, systemImage: "exclamationmark.circle")
-                        .droverText(.nested, accented: true)
+                if let notice = store.analyticsProjectionNotice {
+                    AnalyticsProjectionBanner(message: notice)
+                }
+
+                // Hidden while a reload is in flight: showing a failure and a
+                // spinner at once reads as "it failed again", and a Retry that
+                // stays tappable mid-request just queues duplicate work.
+                if let error = store.analyticsError, !store.isLoadingAnalytics {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(error, systemImage: "exclamationmark.circle")
+                            .droverText(.nested, accented: true)
+                        Button("Retry") { Task { await reload() } }
+                            .accessibilityIdentifier(AnalyticsRetryPresentation.identifier)
+                            .disabled(store.isLoadingAnalytics)
+                    }
                 }
 
                 if let snapshot = store.analytics {
                     providerSection(snapshot)
                     observedSection(snapshot)
-                } else if store.analyticsError == nil {
+                } else if store.isLoadingAnalytics {
                     ProgressView("Loading analytics…")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 50)
@@ -415,6 +427,36 @@ struct AnalyticsRefreshBannerPresentation: Equatable {
     static let identifier = "analytics-refresh-notice"
     let message: String
     var accessibilityLabel: String { message }
+}
+
+struct AnalyticsProjectionBanner: View {
+    let message: String
+
+    var body: some View {
+        Label(message, systemImage: "clock.arrow.circlepath")
+            .droverText(.nested)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier(AnalyticsProjectionBannerPresentation.identifier)
+    }
+
+    private var presentation: AnalyticsProjectionBannerPresentation {
+        AnalyticsProjectionBannerPresentation(message: message)
+    }
+}
+
+struct AnalyticsProjectionBannerPresentation: Equatable {
+    static let identifier = "analytics-projection-notice"
+    let message: String
+    var accessibilityLabel: String { message }
+}
+
+struct AnalyticsRetryPresentation: Equatable {
+    static let identifier = "analytics-retry"
 }
 
 private struct AnalyticsFilterMenu: View {

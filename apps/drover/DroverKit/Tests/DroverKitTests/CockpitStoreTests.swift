@@ -135,6 +135,31 @@ struct CockpitStoreTests {
         #expect(store.insights.map(\.findingID) == ["one"])
     }
 
+    @Test @MainActor func analyticsInitialFailureClearsLoadingAndRetryShowsCatchUp() async throws {
+        let client = CockpitClientStub(
+            analyticsPages: [try decodeAnalytics(
+                projection: "{\"status\":\"catching_up\",\"completed_partition_count\":2,\"total_partition_count\":5}"
+            )],
+            analyticsErrors: [URLError(.timedOut)]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+
+        await store.loadAnalytics()
+
+        #expect(!store.isLoadingAnalytics)
+        #expect(store.analytics == nil)
+        #expect(store.analyticsError != nil)
+        #expect(store.analyticsProjectionNotice == nil)
+
+        await store.loadAnalytics()
+
+        #expect(!store.isLoadingAnalytics)
+        #expect(store.analytics?.activity.data?.projection?.status == .catchingUp)
+        #expect(store.analyticsProjectionNotice ==
+            "Historical activity is catching up (2 of 5 dates complete).")
+    }
+
     @Test @MainActor func analyticsDimensionsPageIndependentlyAndDedupeRows() async throws {
         let client = CockpitClientStub(analyticsPages: [
             try decodeAnalyticsPage(projects: ["one", "two"], hosts: ["mac"],
@@ -246,17 +271,23 @@ struct CockpitStoreTests {
                 30: try decodeAnalyticsPage(projects: ["new"], hosts: [],
                                             projectCursor: nil, hostCursor: nil),
             ],
-            analyticsDelays: [7: .milliseconds(80)]
+            analyticsDelays: [7: .milliseconds(80), 30: .milliseconds(200)]
         )
         let store = CockpitStore(client: client)
         store.updateCapability(from: try capableSnapshot())
 
         let old = Task { await store.loadAnalytics(filters: AnalyticsFilters(days: 7)) }
         try await Task.sleep(for: .milliseconds(10))
-        await store.loadAnalytics(filters: AnalyticsFilters(days: 30))
+        let new = Task { await store.loadAnalytics(filters: AnalyticsFilters(days: 30)) }
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(100))
         await old.value
 
+        #expect(store.isLoadingAnalytics)
+        await new.value
+
         #expect(store.analyticsProjects.map(\.projectKey) == ["new"])
+        #expect(!store.isLoadingAnalytics)
     }
 
     @Test @MainActor func stalePageCompletionDoesNotClearNewGenerationLoadingState() async throws {
@@ -851,6 +882,7 @@ private actor CockpitClientStub: CockpitClient {
     private let purgedExcerptCount: Int
     private var refreshError: DroverError?
     private let failingAnalyticsCursors: Set<String>
+    private var analyticsErrors: [any Error & Sendable]
     private let snapshotChangedAnalyticsCursors: Set<String>
     private let analyticsByDays: [Int: AnalyticsSnapshot]
     private let analyticsDelays: [Int: Duration]
@@ -880,6 +912,7 @@ private actor CockpitClientStub: CockpitClient {
         overviews: [CockpitOverview] = [],
         analytics: AnalyticsSnapshot? = nil,
         analyticsPages: [AnalyticsSnapshot] = [],
+        analyticsErrors: [any Error & Sendable] = [],
         failingAnalyticsCursors: Set<String> = [],
         snapshotChangedAnalyticsCursors: Set<String> = [],
         analyticsByDays: [Int: AnalyticsSnapshot] = [:],
@@ -903,6 +936,7 @@ private actor CockpitClientStub: CockpitClient {
     ) {
         self.overviews = overviews
         self.analyticsValues = analyticsPages.isEmpty ? analytics.map { [$0] } ?? [] : analyticsPages
+        self.analyticsErrors = analyticsErrors
         self.failingAnalyticsCursors = failingAnalyticsCursors
         self.snapshotChangedAnalyticsCursors = snapshotChangedAnalyticsCursors
         self.analyticsByDays = analyticsByDays
@@ -939,6 +973,7 @@ private actor CockpitClientStub: CockpitClient {
     func analytics(filters: AnalyticsFilters) async throws -> AnalyticsSnapshot {
         analyticsRequestCount += 1
         requestedAnalyticsFilters.append(filters)
+        if !analyticsErrors.isEmpty { throw analyticsErrors.removeFirst() }
         if let delay = analyticsDelays[filters.days] { try await Task.sleep(for: delay) }
         let cursor = filters.projectCursor ?? filters.harnessCursor
             ?? filters.hostCursor ?? filters.modelCursor
@@ -1251,12 +1286,12 @@ private func decodeOverview(providerStatus: String, activitySessions: Int) throw
     """.utf8))
 }
 
-private func decodeAnalytics() throws -> AnalyticsSnapshot {
+private func decodeAnalytics(projection: String? = nil) throws -> AnalyticsSnapshot {
     try JSONDecoder().decode(AnalyticsSnapshot.self, from: Data("""
     {"cockpit_api_version":1,"filters":{"days":7},
      "provider_capacity":{"status":"ok","data":[]},
      "activity":{"status":"ok","coverage":{"token_percent":90},
-       "data":\(activityJSON(sessions: 22))}}
+       "data":\(activityJSON(sessions: 22, projection: projection))}}
     """.utf8))
 }
 
@@ -1284,12 +1319,13 @@ private func decodeAnalyticsPage(
     """.utf8))
 }
 
-private func activityJSON(sessions: Int) -> String {
-    """
+private func activityJSON(sessions: Int, projection: String? = nil) -> String {
+    let projectionJSON = projection.map { ",\"projection\":\($0)" } ?? ""
+    return """
     {"totals":{"session_count":\(sessions),"total_tokens":1000,"cost_usd":1.0,
       "cache_read_tokens":100,"cache_write_tokens":10,"total_latency_ms":500,
       "average_latency_ms":25},"projects":[],"harnesses":[],"hosts":[],"models":[],
-      "project_metric":"sessions","coverage":{"token_percent":42}}
+      "project_metric":"sessions","coverage":{"token_percent":42}\(projectionJSON)}
     """
 }
 
