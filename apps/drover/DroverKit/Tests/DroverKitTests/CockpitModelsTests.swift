@@ -84,6 +84,21 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     #expect(snapshot.activity.data?.pagination.hosts.nextCursor == "next-host")
 }
 
+@Test func analyticsDecodesMetricSourceCoverageWithoutInventingUsage() throws {
+    let coverage = try JSONDecoder().decode(Coverage.self, from: Data(#"""
+    {"token_percent":33.3,"sources":{
+      "tokens":{"usage_percent":null,"span_percent":33.3,"status":"unavailable"},
+      "cache":{"usage_percent":0,"span_percent":0,"status":"ok"}
+    }}
+    """#.utf8))
+
+    #expect(coverage.sources?.tokens.usagePercent == nil)
+    #expect(coverage.sources?.tokens.spansPercent == 33.3)
+    #expect(coverage.sources?.tokens.status == .unavailable)
+    #expect(coverage.sources?.cache.usagePercent == 0)
+    #expect(coverage.sources?.cache.status == .ok)
+}
+
 @Test func analyticsDecodesProjectContributorAttributionCounts() throws {
     let project = try JSONDecoder().decode(ProjectActivity.self, from: Data(#"""
     {"project_key":"arniesaha/drover","session_count":3,"total_tokens":0,

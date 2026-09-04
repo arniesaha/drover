@@ -11,6 +11,30 @@ public enum DataStatus: String, Decodable, Sendable, Equatable {
     }
 }
 
+public struct MetricSources: Decodable, Sendable, Equatable {
+    public let usagePercent: Double?
+    public let spansPercent: Double?
+    public let status: DataStatus
+
+    private enum CodingKeys: String, CodingKey {
+        case usagePercent = "usage_percent"
+        case spansPercent = "span_percent"
+        case status
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        usagePercent = try? container.decodeIfPresent(Double.self, forKey: .usagePercent)
+        spansPercent = try? container.decodeIfPresent(Double.self, forKey: .spansPercent)
+        status = (try? container.decode(DataStatus.self, forKey: .status)) ?? .unknown
+    }
+}
+
+public struct CoverageSources: Decodable, Sendable, Equatable {
+    public let tokens: MetricSources
+    public let cache: MetricSources
+}
+
 public struct Coverage: Decodable, Sendable, Equatable {
     public let source: String?
     public let accountCount: Int?
@@ -19,6 +43,7 @@ public struct Coverage: Decodable, Sendable, Equatable {
     public let costPercent: Double?
     public let cachePercent: Double?
     public let latencyPercent: Double?
+    public let sources: CoverageSources?
 
     private enum CodingKeys: String, CodingKey {
         case source
@@ -28,6 +53,7 @@ public struct Coverage: Decodable, Sendable, Equatable {
         case costPercent = "cost_percent"
         case cachePercent = "cache_percent"
         case latencyPercent = "latency_percent"
+        case sources
     }
 }
 
