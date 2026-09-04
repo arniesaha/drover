@@ -82,6 +82,34 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     #expect(snapshot.activity.data?.totals.metadata?.coverage.tokenPercent == 80)
     #expect(snapshot.activity.data?.pagination.projects.nextCursor == "next-project")
     #expect(snapshot.activity.data?.pagination.hosts.nextCursor == "next-host")
+    #expect(snapshot.activity.data?.projection == nil)
+}
+
+@Test func analyticsProjectionMetadataDecodesReadyCatchUpAndUnknownStates() throws {
+    let ready = try JSONDecoder().decode(
+        AnalyticsProjectionMetadata.self,
+        from: Data(#"""
+        {"status":"ready","completed_partition_count":5,"total_partition_count":5}
+        """#.utf8)
+    )
+    let catchingUp = try JSONDecoder().decode(
+        AnalyticsProjectionMetadata.self,
+        from: Data(#"""
+        {"status":"catching_up","completed_partition_count":2,"total_partition_count":5}
+        """#.utf8)
+    )
+    let unknown = try JSONDecoder().decode(
+        AnalyticsProjectionMetadata.self,
+        from: Data(#"""
+        {"status":"future_state","completed_partition_count":0,"total_partition_count":0}
+        """#.utf8)
+    )
+
+    #expect(ready.status == .ready)
+    #expect(catchingUp.status == .catchingUp)
+    #expect(catchingUp.completedPartitionCount == 2)
+    #expect(catchingUp.totalPartitionCount == 5)
+    #expect(unknown.status == .unknown)
 }
 
 @Test func analyticsDecodesMetricSourceCoverageWithoutInventingUsage() throws {
