@@ -577,6 +577,29 @@ def test_session_usage_lives_in_the_control_plane_store(tmp_path):
     assert CONTROL_PLANE_PRIMARY_KEYS["session_usage"] == "session_id"
 
 
+def test_bootstrap_backfills_legacy_session_usage_as_a_harness_source(tmp_path):
+    """Upgrading cannot discard the compatibility row's producer watermark."""
+    duckdb_path = _db(tmp_path)
+    with duckdb.connect(str(control_plane_path(duckdb_path))) as con:
+        con.execute("""
+            INSERT INTO session_usage
+              (session_id, host_id, harness, input_tokens, output_tokens,
+               turn_count, exact, source, source_seq, source_event_count)
+            VALUES ('legacy-session', 'mac-mini', 'claude-code', 12, 3,
+                    1, TRUE, 'harness_events', 4, 4)
+            """)
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+
+    with duckdb.connect(str(control_plane_path(duckdb_path))) as con:
+        assert con.execute("""
+            SELECT source, input_tokens, output_tokens, usage_observed,
+                   source_seq, source_event_count
+            FROM session_usage_sources
+            WHERE session_id = 'legacy-session'
+            """).fetchone() == ("harness_events", 12, 3, True, 4, 4)
+
+
 def test_session_usage_is_visible_through_the_attached_snapshot(tmp_path):
     """The cockpit reads control-plane tables through temp views over a copy."""
     duckdb_path = _db(tmp_path)

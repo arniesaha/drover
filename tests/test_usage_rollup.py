@@ -11,6 +11,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.db import control_plane_path
+from drover.server.harness.usage import TokenTotals
 from drover.server.harness.usage_rollup import (
     SOURCE_HARNESS_EVENTS,
     SOURCE_UNOBSERVED,
@@ -18,6 +19,10 @@ from drover.server.harness.usage_rollup import (
     reset_counters_for_tests,
     rolled_session_count,
     rollup_pending_sessions,
+)
+from drover.server.harness.usage_sources import (
+    SOURCE_NATIVE_AGENT_EVENTS,
+    upsert_source_usage,
 )
 
 
@@ -156,6 +161,88 @@ def test_unreporting_harnesses_get_an_unobserved_row_not_zeros(tmp_path):
     assert row[7:9] == (1, 1)
     # Second pass: nothing changed, so nothing is rescanned.
     assert rollup_pending_sessions(con).candidates == 0
+
+
+def test_source_ledger_preserves_native_usage_until_harness_observes_it(tmp_path):
+    """A no-usage harness update must not erase another source's measured usage."""
+    con = registry(tmp_path)
+    upsert_source_usage(
+        con,
+        session_id="shared-session",
+        source=SOURCE_NATIVE_AGENT_EVENTS,
+        usage=TokenTotals(input_tokens=10, output_tokens=2, cache_read_tokens=4),
+        turn_count=1,
+        exact=True,
+        source_seq=2,
+        source_event_count=2,
+    )
+    assert usage_row(con, "shared-session")[:9] == (
+        10,
+        2,
+        4,
+        None,
+        1,
+        True,
+        SOURCE_NATIVE_AGENT_EVENTS,
+        2,
+        2,
+    )
+
+    upsert_source_usage(
+        con,
+        session_id="shared-session",
+        source=SOURCE_HARNESS_EVENTS,
+        usage=TokenTotals(),
+        turn_count=0,
+        exact=True,
+        source_seq=3,
+        source_event_count=3,
+        host_id="mac-mini",
+        harness="claude-code",
+    )
+    assert usage_row(con, "shared-session")[6:9] == (
+        SOURCE_NATIVE_AGENT_EVENTS,
+        2,
+        2,
+    )
+
+    upsert_source_usage(
+        con,
+        session_id="shared-session",
+        source=SOURCE_HARNESS_EVENTS,
+        usage=TokenTotals(input_tokens=40, output_tokens=8, cache_read_tokens=16),
+        turn_count=2,
+        exact=True,
+        source_seq=5,
+        source_event_count=5,
+        host_id="mac-mini",
+        harness="claude-code",
+    )
+    assert usage_row(con, "shared-session")[:11] == (
+        40,
+        8,
+        16,
+        None,
+        2,
+        True,
+        SOURCE_HARNESS_EVENTS,
+        5,
+        5,
+        "claude-code",
+        "mac-mini",
+    )
+    assert (
+        con.execute("""
+        SELECT source, input_tokens, usage_observed, source_seq, source_event_count
+        FROM session_usage_sources
+        WHERE session_id = 'shared-session'
+        ORDER BY source
+        """).fetchall()
+        == [
+            (SOURCE_HARNESS_EVENTS, 40, True, 5, 5),
+            (SOURCE_NATIVE_AGENT_EVENTS, 10, True, 2, 2),
+        ]
+    )
 
 
 def test_rollup_is_idempotent_and_reacts_only_to_new_events(tmp_path):

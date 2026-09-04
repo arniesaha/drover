@@ -569,6 +569,45 @@ CREATE TABLE IF NOT EXISTS session_usage (
 );
 """
 
+_SESSION_USAGE_SOURCES_DDL = """
+CREATE TABLE IF NOT EXISTS session_usage_sources (
+  source_usage_id     VARCHAR PRIMARY KEY,
+  session_id          VARCHAR NOT NULL,
+  source              VARCHAR NOT NULL,
+  host_id             VARCHAR,
+  harness             VARCHAR,
+  input_tokens        BIGINT,
+  output_tokens       BIGINT,
+  cache_read_tokens   BIGINT,
+  cache_write_tokens  BIGINT,
+  reasoning_tokens    BIGINT,
+  turn_count          INTEGER NOT NULL DEFAULT 0,
+  exact               BOOLEAN NOT NULL DEFAULT TRUE,
+  usage_observed      BOOLEAN NOT NULL DEFAULT FALSE,
+  source_seq          INTEGER NOT NULL,
+  source_event_count  INTEGER NOT NULL,
+  observed_at         TIMESTAMP NOT NULL DEFAULT now(),
+  UNIQUE (session_id, source)
+);
+"""
+
+
+def _backfill_session_usage_sources(con: duckdb.DuckDBPyConnection) -> None:
+    """Retain pre-ledger compatibility rows as their harness-source history."""
+    con.execute("""
+        INSERT INTO session_usage_sources
+          (source_usage_id, session_id, source, host_id, harness, input_tokens,
+           output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+           turn_count, exact, usage_observed, source_seq, source_event_count,
+           observed_at)
+        SELECT 'harness_events:' || session_id, session_id, 'harness_events',
+               host_id, harness, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, reasoning_tokens, turn_count, exact,
+               source = 'harness_events', source_seq, source_event_count, observed_at
+        FROM session_usage
+        ON CONFLICT (source_usage_id) DO NOTHING
+        """)
+
 
 def _agent_events_view(parquet_dir: Path) -> str:
     return f"""
@@ -1609,6 +1648,8 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         # source table are both control-plane, and the cockpit already reads
         # this store through attached_control_plane_snapshot.
         con.execute(_SESSION_USAGE_DDL)
+        con.execute(_SESSION_USAGE_SOURCES_DDL)
+        _backfill_session_usage_sources(con)
     return registry_path
 
 

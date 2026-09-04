@@ -26,10 +26,13 @@ import duckdb
 
 from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.usage import session_totals, usage_turn_count
+from drover.server.harness.usage_sources import (
+    SOURCE_HARNESS_EVENTS,
+    upsert_source_usage,
+)
 
 log = logging.getLogger("drover.harness.usage_rollup")
 
-SOURCE_HARNESS_EVENTS = "harness_events"
 SOURCE_UNOBSERVED = "unobserved"
 DEFAULT_BATCH_SIZE = 200
 
@@ -89,7 +92,8 @@ WITH per_session AS (
 SELECT p.session_id, s.host_id, s.harness, p.event_count, p.max_seq
 FROM per_session p
 JOIN harness_sessions s USING (session_id)
-LEFT JOIN session_usage u USING (session_id)
+LEFT JOIN session_usage_sources u
+  ON u.session_id = p.session_id AND u.source = 'harness_events'
 WHERE u.session_id IS NULL
    OR p.event_count <> u.source_event_count
    OR p.max_seq <> u.source_seq
@@ -102,28 +106,6 @@ SELECT seq, payload_json
 FROM harness_events
 WHERE session_id = ?
 ORDER BY COALESCE(seq, 0), created_at, event_id
-"""
-
-_UPSERT_SQL = """
-INSERT INTO session_usage
-  (session_id, host_id, harness, input_tokens, output_tokens,
-   cache_read_tokens, cache_write_tokens, reasoning_tokens, turn_count,
-   exact, source, source_seq, source_event_count, observed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT (session_id) DO UPDATE SET
-  host_id = excluded.host_id,
-  harness = excluded.harness,
-  input_tokens = excluded.input_tokens,
-  output_tokens = excluded.output_tokens,
-  cache_read_tokens = excluded.cache_read_tokens,
-  cache_write_tokens = excluded.cache_write_tokens,
-  reasoning_tokens = excluded.reasoning_tokens,
-  turn_count = excluded.turn_count,
-  exact = excluded.exact,
-  source = excluded.source,
-  source_seq = excluded.source_seq,
-  source_event_count = excluded.source_event_count,
-  observed_at = excluded.observed_at
 """
 
 
@@ -160,25 +142,18 @@ def _rollup_one(
 ) -> int:
     events, malformed = _load_events(con, candidate.session_id)
     totals = session_totals(candidate.harness, events)
-    observed = totals.observed
-    con.execute(
-        _UPSERT_SQL,
-        [
-            candidate.session_id,
-            candidate.host_id,
-            candidate.harness,
-            totals.input_tokens,
-            totals.output_tokens,
-            totals.cache_read_tokens,
-            totals.cache_write_tokens,
-            totals.reasoning_tokens,
-            usage_turn_count(events),
-            bool(totals.exact) and malformed == 0,
-            SOURCE_HARNESS_EVENTS if observed else SOURCE_UNOBSERVED,
-            candidate.max_seq,
-            candidate.event_count,
-            now,
-        ],
+    upsert_source_usage(
+        con,
+        session_id=candidate.session_id,
+        source=SOURCE_HARNESS_EVENTS,
+        usage=totals,
+        turn_count=usage_turn_count(events),
+        exact=bool(totals.exact) and malformed == 0,
+        source_seq=candidate.max_seq,
+        source_event_count=candidate.event_count,
+        host_id=candidate.host_id,
+        harness=candidate.harness,
+        observed_at=now,
     )
     if malformed:
         log.warning(

@@ -164,6 +164,7 @@ CONTROL_PLANE_TABLES = (
     "advisory_findings",
     "advisory_occurrences",
     "session_usage",
+    "session_usage_sources",
 )
 
 #: Primary keys, used by the migration to copy without duplicating.
@@ -176,6 +177,7 @@ CONTROL_PLANE_PRIMARY_KEYS = {
     "advisory_findings": "finding_id",
     "advisory_occurrences": "occurrence_id",
     "session_usage": "session_id",
+    "session_usage_sources": "source_usage_id",
 }
 
 #: Appended to the analytical store's stem, so ``drover.duckdb`` is joined by
