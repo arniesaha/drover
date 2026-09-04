@@ -1808,6 +1808,52 @@ def test_unobserved_usage_rows_fall_back_to_spans():
     assert result.coverage.sources.tokens.spans_percent == 100.0
 
 
+def test_project_ranking_ignores_tokens_that_belong_to_no_project():
+    """Provenance counts the whole window; ranking counts only what it ranks.
+
+    Window-wide source coverage can clear the threshold while every project in
+    the breakdown has zero tokens, which is the live hub's shape: harness
+    sessions started from a bare cwd resolve to no repository. Ranking on that
+    would order projects by an all-zero column.
+    """
+    con = _analytics_connection()
+    try:
+        for index in range(1, 5):
+            session_id = f"unattributed-{index}"
+            _insert_session(
+                con,
+                session_id=session_id,
+                project="placeholder/repo",
+                host="mac-mini",
+                harness="claude-code",
+                tokens=None,
+            )
+            for table in ("harness_sessions", "sessions", "spans_enriched"):
+                con.execute(
+                    f"UPDATE {table} SET repo_owner = NULL, repo_name = NULL "
+                    "WHERE session_id = ?",
+                    [session_id],
+                )
+            _insert_usage(con, session_id=session_id, inp=1000, out=100)
+        _insert_session(
+            con,
+            session_id="attributed-1",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=None,
+        )
+
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.coverage.sources.tokens.usage_percent == 80.0
+    assert result.coverage.token_percent == 0.0
+    assert result.project_metric == "sessions"
+    assert [project.project_key for project in result.projects] == ["acme/alpha"]
+
+
 def test_source_coverage_counts_unattributed_sessions_without_attributing_them():
     con = _analytics_connection()
     now = datetime.now(timezone.utc) - timedelta(hours=1)
