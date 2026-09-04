@@ -68,6 +68,36 @@ enum CoveragePercent {
     }
 }
 
+public struct CoverageSourcesPresentation: Sendable, Equatable {
+    public let text: String?
+    public let accessibilityText: String?
+
+    public init(coverage: Coverage) {
+        guard let sources = coverage.sources else {
+            text = nil
+            accessibilityText = nil
+            return
+        }
+        let token = Self.metricText(label: "Token", sources: sources.tokens)
+        let cache = Self.metricText(label: "Cache", sources: sources.cache)
+        text = "\(token) · \(cache)"
+        accessibilityText = "\(token). \(cache)."
+    }
+
+    private static func metricText(label: String, sources: MetricSources) -> String {
+        let usage: String
+        if sources.status == .ok, let percent = sources.usagePercent {
+            usage = "usage \(CoveragePercent.text(percent))%"
+        } else {
+            usage = "usage unavailable"
+        }
+        let spans = sources.spansPercent.map {
+            "spans \(CoveragePercent.text($0))%"
+        } ?? "spans unavailable"
+        return "\(label) sources: \(usage); \(spans)"
+    }
+}
+
 /// The activity totals, worded once for every screen that shows them.
 ///
 /// The cockpit card and the analytics screen render the same three figures off

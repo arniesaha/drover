@@ -70,7 +70,7 @@ class ActivityTotals:
 
 @dataclass(frozen=True)
 class MetricSources:
-    """Which sources could supply one metric, as a share of attributable sessions.
+    """Which sources could supply one metric, as a share of window sessions.
 
     ``usage_percent`` is ``None`` (never zero) when the ``session_usage``
     relation is not reachable on this connection; ``status`` says so.
@@ -396,10 +396,10 @@ def _activity_analytics_from_facts(
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_cache) AS cache_sessions,
           count(*) FILTER (WHERE project_key IS NOT NULL AND has_latency) AS latency_sessions,
           max(latest_activity_at) AS observed_at,
-          count(*) FILTER (WHERE project_key IS NOT NULL AND usage_has_tokens) AS usage_token_sessions,
-          count(*) FILTER (WHERE project_key IS NOT NULL AND span_has_tokens) AS span_token_sessions,
-          count(*) FILTER (WHERE project_key IS NOT NULL AND usage_has_cache) AS usage_cache_sessions,
-          count(*) FILTER (WHERE project_key IS NOT NULL AND span_has_cache) AS span_cache_sessions
+          count(*) FILTER (WHERE usage_has_tokens) AS usage_token_sessions,
+          count(*) FILTER (WHERE span_has_tokens) AS span_token_sessions,
+          count(*) FILTER (WHERE usage_has_cache) AS usage_cache_sessions,
+          count(*) FILTER (WHERE span_has_cache) AS span_cache_sessions
         FROM {facts}
         """).fetchone()
     assert aggregate is not None

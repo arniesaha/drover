@@ -1808,6 +1808,65 @@ def test_unobserved_usage_rows_fall_back_to_spans():
     assert result.coverage.sources.tokens.spans_percent == 100.0
 
 
+def test_source_coverage_counts_unattributed_sessions_without_attributing_them():
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc) - timedelta(hours=1)
+    try:
+        # The one attributed session contributes to both project-token coverage
+        # and usage source availability.
+        _insert_session(
+            con,
+            session_id="attributed-usage",
+            project="acme/alpha",
+            host="mac-mini",
+            harness="claude-code",
+            tokens=None,
+        )
+        _insert_usage(con, session_id="attributed-usage", inp=10, out=1, cache_read=2)
+
+        # These sessions have canonical session identity but no canonical
+        # repository identity. They must count toward source availability, not
+        # become project-attributed as a side effect of the calculation.
+        con.execute(
+            """INSERT INTO harness_sessions VALUES
+                ('unattributed-usage', 'mac-mini', 'claude-code', NULL, NULL,
+                 'model-a', ?, ?, ?),
+                ('unattributed-span', 'mac-mini', 'claude-code', NULL, NULL,
+                 'model-a', ?, ?, ?)
+            """,
+            [now, now, now, now, now, now],
+        )
+        con.execute(
+            """INSERT INTO sessions (session_id, agent_id, task_id, started_at, ended_at)
+                VALUES ('unattributed-usage', 'agent-mac-mini', NULL, ?, ?),
+                       ('unattributed-span', 'agent-mac-mini', NULL, ?, ?)
+            """,
+            [now, now, now, now],
+        )
+        _insert_usage(con, session_id="unattributed-usage", inp=20, out=2, cache_read=4)
+        con.execute(
+            """INSERT INTO spans_enriched VALUES
+                ('span-unattributed', 'unattributed-span', ?, ?, 100,
+                 'claude-code', 'anthropic', 'model-a', NULL, NULL, NULL,
+                 30, NULL, NULL, NULL, 6, NULL)
+            """,
+            [now, now],
+        )
+
+        result = activity_analytics(con, AnalyticsFilters(days=7))
+    finally:
+        con.close()
+
+    assert result.totals.session_count == 3
+    assert result.coverage.attributable_session_percent == pytest.approx(100 / 3)
+    assert result.coverage.token_percent == pytest.approx(100 / 3)
+    assert result.coverage.sources.tokens.usage_percent == pytest.approx(200 / 3)
+    assert result.coverage.sources.tokens.spans_percent == pytest.approx(100 / 3)
+    assert result.coverage.sources.cache.usage_percent == pytest.approx(200 / 3)
+    assert result.coverage.sources.cache.spans_percent == pytest.approx(100 / 3)
+    assert [project.project_key for project in result.projects] == ["acme/alpha"]
+
+
 def test_project_metric_needs_one_source_at_eighty_percent_not_the_union():
     con = _analytics_connection()
     try:
