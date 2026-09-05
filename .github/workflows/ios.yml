@@ -56,6 +56,10 @@ jobs:
       if: steps.scope.outputs.ios == 'true'
       run: xcodegen generate
 
+    - name: Run DroverKit package tests
+      if: steps.scope.outputs.ios == 'true'
+      run: swift test --package-path DroverKit
+
     - name: Select iPhone simulator
       if: steps.scope.outputs.ios == 'true'
       run: |
@@ -75,7 +79,7 @@ jobs:
           -scheme Drover \
           -resolvePackageDependencies
 
-    - name: Run unit tests
+    - name: Run app unit tests
       if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
@@ -85,15 +89,16 @@ jobs:
           -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
           test
 
-    - name: Build UI test bundle
+    - name: Run deterministic UI journey
       if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
         xcodebuild -project Drover.xcodeproj \
           -scheme DroverUITests \
           -destination "$SIMULATOR_DESTINATION" \
-          -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
-          build-for-testing
+          -only-testing:DroverUITests/DeterministicJourneyUITests \
+          -resultBundlePath "$RUNNER_TEMP/DeterministicJourneyUITests.xcresult" \
+          test
 
     - name: Upload unit test result bundle
       if: failure() && steps.scope.outputs.ios == 'true'
@@ -103,10 +108,10 @@ jobs:
         path: ${{ runner.temp }}/DroverTests.xcresult
         if-no-files-found: ignore
 
-    - name: Upload UI build result bundle
+    - name: Upload deterministic UI test result bundle
       if: failure() && steps.scope.outputs.ios == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: DroverUITests.xcresult
-        path: ${{ runner.temp }}/DroverUITests.xcresult
+        name: DeterministicJourneyUITests.xcresult
+        path: ${{ runner.temp }}/DeterministicJourneyUITests.xcresult
         if-no-files-found: ignore
