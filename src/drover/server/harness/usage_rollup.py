@@ -122,9 +122,22 @@ def _load_events(
     spread in last because many rows carry a column value but no envelope
     ``seq`` at all.
     """
+    return _parse_event_rows(con.execute(_EVENTS_SQL, [session_id]).fetchall())
+
+
+def _parse_event_rows(
+    rows: list[tuple[Any, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Parse fetched rows. Pure, so a caller can run it off the lock.
+
+    This is the expensive half: one ``json.loads`` per event, and a busy
+    session has tens of thousands. Running it inside a control-plane window
+    is what let a single rollup pass hold the lock for 238 seconds while
+    ``/harness`` waited behind it (#334).
+    """
     events: list[dict[str, Any]] = []
     malformed = 0
-    for seq, payload_json in con.execute(_EVENTS_SQL, [session_id]).fetchall():
+    for seq, payload_json in rows:
         try:
             payload = json.loads(payload_json) if payload_json else {}
         except (TypeError, ValueError):
@@ -162,6 +175,53 @@ def _rollup_one(
             candidate.session_id,
         )
     return malformed
+
+
+def load_pending_candidates(
+    con: duckdb.DuckDBPyConnection, *, limit: int = DEFAULT_BATCH_SIZE
+) -> list["_Candidate"]:
+    """Candidates only. One short read, so the lock is released before work."""
+    rows = con.execute(_CANDIDATES_SQL, [limit]).fetchall()
+    return [
+        _Candidate(str(r[0]), str(r[1]), str(r[2]), int(r[3]), int(r[4])) for r in rows
+    ]
+
+
+def fetch_event_rows(
+    con: duckdb.DuckDBPyConnection, session_id: str
+) -> list[tuple[Any, Any]]:
+    """The session's raw event rows, unparsed."""
+    return con.execute(_EVENTS_SQL, [session_id]).fetchall()
+
+
+def store_rolled_usage(
+    con: duckdb.DuckDBPyConnection,
+    candidate: "_Candidate",
+    events: list[dict[str, Any]],
+    malformed: int,
+    now: datetime,
+) -> None:
+    """Write one session's totals. One short write, off the parsing path."""
+    totals = session_totals(candidate.harness, events)
+    upsert_source_usage(
+        con,
+        session_id=candidate.session_id,
+        source=SOURCE_HARNESS_EVENTS,
+        usage=totals,
+        turn_count=usage_turn_count(events),
+        exact=bool(totals.exact) and malformed == 0,
+        source_seq=candidate.max_seq,
+        source_event_count=candidate.event_count,
+        host_id=candidate.host_id,
+        harness=candidate.harness,
+        observed_at=now,
+    )
+    if malformed:
+        log.warning(
+            "usage rollup skipped %d malformed payload(s) in session %s",
+            malformed,
+            candidate.session_id,
+        )
 
 
 def rollup_pending_sessions(
@@ -250,8 +310,33 @@ class UsageRollupWorker:
         global _last_pass_seconds
         started = time.monotonic()
         registry_path = control_plane_path(self.duckdb_path)
+        rollup_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # One short window per step instead of one window for the whole pass.
+        # `/harness` needs this same lock, so the old shape made the fleet
+        # endpoint wait for however long it took to parse every event of every
+        # candidate: measured at 47s and 238s on this hub while a session was
+        # busy, which is exactly when someone is watching it (#334).
         with control_plane_connection(registry_path) as con:
-            report = rollup_pending_sessions(con, limit=self.batch_size)
+            candidates = load_pending_candidates(con, limit=self.batch_size)
+
+        malformed_total = 0
+        for candidate in candidates:
+            with control_plane_connection(registry_path) as con:
+                rows = fetch_event_rows(con, candidate.session_id)
+            # Off the lock: one json.loads per event, and a busy session has
+            # tens of thousands of them.
+            events, malformed = _parse_event_rows(rows)
+            malformed_total += malformed
+            with control_plane_connection(registry_path) as con:
+                store_rolled_usage(con, candidate, events, malformed, rollup_at)
+
+        _bump(len(candidates), malformed_total)
+        report = RollupReport(
+            candidates=len(candidates),
+            rolled=len(candidates),
+            malformed_events=malformed_total,
+        )
         elapsed = time.monotonic() - started
         self.last_pass_seconds = elapsed
         with _last_pass_lock:
