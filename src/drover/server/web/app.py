@@ -2017,6 +2017,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         route_class: str | None = None,
     ) -> None:
         started = time.monotonic()
+        # Every JSON response is compressible, and the ones the phone polls
+        # are the largest things this server sends: the fleet listing is about
+        # 41 KB and is fetched every few seconds. Only `session_messages` had
+        # opted in, so everything else went out raw. Compression is negotiated
+        # -- it applies only when the client offered `Accept-Encoding: gzip`
+        # and the body is over the threshold -- so this cannot surprise a
+        # client that cannot decode it (#224).
+        allow_gzip = allow_gzip or content_type.startswith("application/json")
         payload = body.encode("utf-8")
         uncompressed_bytes = len(payload)
         headers = getattr(self, "headers", {})
