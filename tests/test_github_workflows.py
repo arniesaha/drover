@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 WORKFLOWS_DIR = Path(__file__).parents[1] / ".github" / "workflows"
@@ -176,6 +177,33 @@ def test_macos_python_runs_each_test_module_in_a_fresh_process() -> None:
         '        print("::endgroup::", flush=True)\n'
         "PY\n"
     )
+
+
+def test_distribution_workflow_is_manual_and_uses_the_documented_xcode() -> None:
+    workflow_path = WORKFLOWS_DIR / "ios-distribution.yml"
+    if not workflow_path.exists():
+        pytest.fail(".github/workflows/ios-distribution.yml has not been created")
+    workflow = load_workflow("ios-distribution.yml")
+
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["on"]["workflow_dispatch"]["inputs"]) == {
+        "version",
+        "build",
+    }
+
+    job = workflow["jobs"]["archive"]
+    assert job["runs-on"] == "macos-26"
+    assert job["environment"] == "ios-distribution"
+    assert (
+        job["env"]["DEVELOPER_DIR"] == "/Applications/Xcode_26.6.app/Contents/Developer"
+    )
+    assert job["env"]["DROVER_IOS_ARTIFACT_ROOT"] == "${{ runner.temp }}"
+    steps = job["steps"]
+    commands = "\n".join(step.get("run", "") for step in steps)
+    assert "xcodebuild -version" in commands
+    assert "xcrun --sdk iphoneos --show-sdk-version" in commands
+    assert "scripts/ios/archive.sh" in commands
 
 
 def test_release_workflow_is_tag_triggered_and_publishes_three_artifacts() -> None:

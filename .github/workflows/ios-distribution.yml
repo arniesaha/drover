@@ -1,0 +1,94 @@
+name: iOS distribution archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Approved CFBundleShortVersionString"
+        required: true
+        type: string
+      build:
+        description: "Approved CFBundleVersion"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    name: Archive signed iOS candidate
+    # Configure this as a protected GitHub environment before dispatching.
+    # It is the only place distribution credentials and profiles may be made
+    # available; this workflow never runs on a pull request.
+    environment: ios-distribution
+    runs-on: macos-26
+    env:
+      # GitHub's macOS 26 image currently documents this installed Xcode path.
+      # Keep it explicit so an image-default change cannot alter the SDK used
+      # for an App Store candidate without a reviewed workflow change.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DROVER_IOS_ARTIFACT_ROOT: ${{ runner.temp }}
+      CANDIDATE_VERSION: ${{ github.event.inputs.version }}
+      CANDIDATE_BUILD: ${{ github.event.inputs.build }}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Report the selected Xcode and iPhoneOS SDK
+      run: |
+        test -d "$DEVELOPER_DIR" || {
+          echo "selected Xcode is not installed on this runner" >&2
+          exit 1
+        }
+        xcode-select -p
+        xcodebuild -version
+        SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
+        echo "iPhoneOS SDK $SDK"
+        case "$SDK" in
+          26|26.*|2[7-9]|[3-9][0-9]*) ;;
+          *) echo "iPhoneOS SDK 26.0 or later is required" >&2; exit 1 ;;
+        esac
+
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Check distribution signing prerequisites
+      run: |
+        # Only report whether a distribution identity exists. Do not print an
+        # identity, profile, keychain path, provisioning profile or secret.
+        if ! security find-identity -v -p codesigning 2>/dev/null \
+             | grep -q 'Apple Distribution'; then
+          echo "Apple Distribution signing identity is unavailable in ios-distribution" >&2
+          exit 1
+        fi
+        (cd apps/drover && xcodegen generate)
+        xcodebuild -project apps/drover/Drover.xcodeproj \
+          -scheme DroverAppStore -configuration StoreRelease -showBuildSettings \
+          | grep -q 'CODE_SIGN_ENTITLEMENTS.*Drover-AppStore.entitlements' \
+          || {
+            echo "StoreRelease does not select App Store entitlements" >&2
+            exit 1
+          }
+
+    - name: Archive and verify the approved candidate
+      run: |
+        scripts/ios/archive.sh \
+          --version "$CANDIDATE_VERSION" \
+          --build "$CANDIDATE_BUILD" \
+          --output "$RUNNER_TEMP/drover-ios-$CANDIDATE_VERSION-$CANDIDATE_BUILD"
+
+    - name: Upload archive record and candidate package
+      uses: actions/upload-artifact@v4
+      with:
+        name: drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}
+        path: |
+          ${{ runner.temp }}/drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}/archive-record.json
+          ${{ runner.temp }}/drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}/Drover.xcarchive.zip
+        if-no-files-found: error
