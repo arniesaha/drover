@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-04
+
+### Fixed
+
+- A chat turn is no longer lost or sent twice when delivery is uncertain.
+  The composer clears immediately and the message appears as a local pending
+  bubble; structured turn submission is idempotent on a client-supplied turn
+  id, so replaying an ambiguous send returns the original turn instead of
+  dispatching a second one. Attachment persistence and session-preference
+  updates sit inside that boundary, and the accepted-id map is rebuilt from
+  the event ledger after a daemon restart (#326).
+- An accepted turn whose stream echo never arrives now becomes retryable
+  instead of leaving the composer disabled indefinitely, and the Retry
+  control survives an approval, interrupt, or terminate clearing the
+  transient hint (#326).
+
+### Added
+
+- The Analytics screen decodes optional projection completeness from the
+  server, shows a catch-up notice while historical data is still rebuilding,
+  and offers Retry instead of an indefinite loader when the first load fails.
+  Malformed or absent projection metadata degrades to no notice rather than
+  blanking the screen (#325).
+
 ## [0.4.3] - 2026-09-04
 
 ### Added
