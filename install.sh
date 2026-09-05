@@ -21,6 +21,27 @@ success() { printf '%s✓ %s%s\n' "$GREEN" "$1" "$NC"; }
 warn()    { printf '%s⚠ %s%s\n' "$YELLOW" "$1" "$NC"; }
 fail()    { printf '%s✗ %s%s\n' "$RED" "$1" "$NC" >&2; exit 1; }
 
+validate_explicit_port() {
+  [ -n "$EXPLICIT_URL" ] || return 0
+  local address port port_value
+  address="${EXPLICIT_URL#http://}"; address="${address#https://}"
+  case "$address" in
+    *:*)
+      port="${address#*:}"
+      # A TOML integer cannot preserve a leading-zero port, and a port outside
+      # this range cannot name the listener that the config and unit advertise.
+      case "$port" in
+        ''|0|0[0-9]*|*[!0-9]*|??????*)
+          fail "--url port must be an integer from 1 to 65535 (got: $port)" ;;
+      esac
+      port_value=$((10#$port))
+      if [ "$port_value" -gt 65535 ]; then
+        fail "--url port must be an integer from 1 to 65535 (got: $port)"
+      fi
+      ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --join)    JOIN_URL="${2:-}"; shift 2 ;;
@@ -35,6 +56,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Port syntax needs no helper library. Check it before a piped installer would
+# fetch or source helpers, so an invalid invocation is deterministic offline.
+validate_explicit_port
+
 OS="${DROVER_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 case "$OS" in
   darwin|linux) ;;
@@ -42,10 +67,16 @@ case "$OS" in
 esac
 
 # When piped from curl there is no checkout on disk, so fetch the helpers.
+# `BASH_SOURCE[0]` is unset for stdin on Bash 3.2; do not turn that into the
+# current directory, which could make a piped install source unrelated files.
 # When run from a checkout, prefer the local copies so the shell tests
 # exercise exactly what is committed rather than what is published.
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -r "$SELF_DIR/scripts/lib/verify.sh" ]; then
+SELF_SOURCE="${BASH_SOURCE[0]:-}"
+SELF_DIR=""
+if [ -n "$SELF_SOURCE" ] && [ -f "$SELF_SOURCE" ]; then
+  SELF_DIR="$(cd "$(dirname "$SELF_SOURCE")" && pwd)"
+fi
+if [ -n "$SELF_DIR" ] && [ -r "$SELF_DIR/scripts/lib/verify.sh" ]; then
   . "$SELF_DIR/scripts/lib/verify.sh"
   . "$SELF_DIR/scripts/lib/detect.sh"
   . "$SELF_DIR/scripts/lib/health.sh"
@@ -284,7 +315,7 @@ install_runtime() {
 
 # --- config ------------------------------------------------------------------
 write_config() {
-  local address="$1" host="${1%%:*}"
+  local address="$1" host="${1%%:*}" port="${1##*:}"
   [ -f "$DROVER_HOME/config.toml" ] \
     || "$DROVER_HOME/runtime/current/bin/drover-server" init >/dev/null 2>&1 || true
   # The bind and the advertised address live in config, never only in a unit's
@@ -292,9 +323,9 @@ write_config() {
   # server to loopback, which has happened before and is invisible until the
   # app stops loading.
   "$DROVER_HOME/runtime/current/bin/python" - "$DROVER_HOME/config.toml" \
-    "$address" "$host" <<'PY'
+    "$address" "$host" "$port" <<'PY'
 import re, sys
-path, advertised, host = sys.argv[1], sys.argv[2], sys.argv[3]
+path, advertised, host, port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
     text = open(path, encoding="utf-8").read()
 except OSError:
@@ -303,12 +334,13 @@ if "[server]" not in text:
     text += "\n[server]\n"
 def upsert(text, key, value):
     pattern = re.compile(rf'^{key}\s*=.*$', re.MULTILINE)
-    line = f'{key} = "{value}"'
+    line = f'{key} = {value}'
     if pattern.search(text):
         return pattern.sub(line, text)
     return re.sub(r'^\[server\]$', f'[server]\n{line}', text, count=1, flags=re.MULTILINE)
-text = upsert(text, "advertised_url", advertised)
-text = upsert(text, "metrics_host", host)
+text = upsert(text, "advertised_url", f'"{advertised}"')
+text = upsert(text, "metrics_host", f'"{host}"')
+text = upsert(text, "metrics_http_port", port)
 open(path, "w", encoding="utf-8").write(text)
 PY
   success "config.toml points at $address"
@@ -528,7 +560,7 @@ if [ -n "$JOIN_URL" ]; then
   info "It will appear in the app shortly."
 else
   write_config "$ADDRESS"
-  install_units fleet "http://127.0.0.1:7080"
+  install_units fleet "http://${ADDRESS}"
   if wait_for_health "$ADDRESS"; then
     success "drover-server is up"
   else
