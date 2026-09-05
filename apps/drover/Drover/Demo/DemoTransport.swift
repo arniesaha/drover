@@ -380,9 +380,30 @@ fileprivate final class DemoTransportState: @unchecked Sendable {
 
 private extension URLRequest {
     var jsonObject: [String: Any]? {
-        guard let httpBody,
-              let value = try? JSONSerialization.jsonObject(with: httpBody) as? [String: Any]
+        guard let body = bodyData,
+              let value = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
         else { return nil }
         return value
+    }
+
+    /// `httpBody` is nil for every request that reaches a `URLProtocol`:
+    /// URLSession hands the body over as `httpBodyStream` instead. Reading
+    /// only `httpBody` made every POST body here invisible, so the approval
+    /// route rejected a perfectly good payload as "invalid local demo
+    /// approval".
+    private var bodyData: Data? {
+        if let httpBody { return httpBody }
+        guard let stream = httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        let bufferSize = 4096
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: bufferSize)
+            guard read > 0 else { break }
+            data.append(buffer, count: read)
+        }
+        return data.isEmpty ? nil : data
     }
 }

@@ -66,12 +66,26 @@ private actor DemoRecoveryStore: ChatRecoveryPersisting {
     }
 
     func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
-        let bytes = snapshot.draftText.lengthOfBytes(using: .utf8)
-            + snapshot.draftAttachments.reduce(0) { $0 + $1.data.count }
-            + (snapshot.deferredTurn?.text.lengthOfBytes(using: .utf8) ?? 0)
-            + (snapshot.deferredTurn?.attachments.reduce(0) { $0 + $1.data.count } ?? 0)
-            + (snapshot.pendingTurn?.text.lengthOfBytes(using: .utf8) ?? 0)
-            + (snapshot.pendingTurn?.attachments.reduce(0) { $0 + $1.data.count } ?? 0)
+        // Accumulated rather than written as one six-term sum: that form
+        // mixed optional chaining, `??` and two `reduce` closures in a single
+        // expression, and the type checker gave up on it ("unable to
+        // type-check this expression in reasonable time").
+        var bytes = snapshot.draftText.lengthOfBytes(using: .utf8)
+        for attachment in snapshot.draftAttachments {
+            bytes += attachment.data.count
+        }
+        if let deferred = snapshot.deferredTurn {
+            bytes += deferred.text.lengthOfBytes(using: .utf8)
+            for attachment in deferred.attachments {
+                bytes += attachment.data.count
+            }
+        }
+        if let pending = snapshot.pendingTurn {
+            bytes += pending.text.lengthOfBytes(using: .utf8)
+            for attachment in pending.attachments {
+                bytes += attachment.data.count
+            }
+        }
         guard bytes <= Self.maximumBytes else { throw ChatRecoveryError.quotaExceeded }
         guard snapshots[key] != nil || snapshots.count < Self.maximumRecords else {
             throw ChatRecoveryError.quotaExceeded
