@@ -4,6 +4,10 @@ options:
   deploymentTarget:
     iOS: "18.0"
   createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+  StoreRelease: release
 packages:
   DroverKit:
     path: DroverKit
@@ -26,13 +30,22 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # Release automation supplies these two values at build time. Keep
+        # development defaults usable, but never write a candidate version or
+        # build number into source without checking App Store Connect first.
         CURRENT_PROJECT_VERSION: 1
-        MARKETING_VERSION: 0.1.0
+        MARKETING_VERSION: "0.1.0"
         SWIFT_VERSION: 6.0
+      configs:
+        # Development configurations keep the development APNs entitlement
+        # from `base`; only the distribution configuration selects production.
+        StoreRelease:
+          CODE_SIGN_ENTITLEMENTS: Drover/Drover-AppStore.entitlements
     info:
       path: Drover/Info.plist
       properties:
-        CFBundleShortVersionString: "0.1.0"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         # Required on physical devices to reach the central server over the
@@ -105,3 +118,11 @@ schemes:
         DroverUITests: all
     test:
       targets: [DroverUITests]
+  # Distribution-only scheme. `archive.config` is deliberately explicit so an
+  # archive cannot silently inherit the development Release configuration.
+  DroverAppStore:
+    build:
+      targets:
+        Drover: all
+    archive:
+      config: StoreRelease
