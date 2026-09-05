@@ -197,6 +197,18 @@ class ExplodingAnalyzer:
         raise RuntimeError("isolated analyzer failure")
 
 
+class MemoryStarvedAnalyzer:
+    """Fails the way a saturated host does, not the way a broken analyzer does."""
+
+    analyzer_id = "exploding"
+
+    def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
+        raise duckdb.OutOfMemoryException(
+            "Out of Memory Error: failed to pin block of size 4.0 KiB "
+            "(962.8 MiB/953.6 MiB used)"
+        )
+
+
 class PassingAnalyzer:
     analyzer_id = "healthy"
 
@@ -522,6 +534,97 @@ def test_stale_lease_is_reclaimed_before_analyzer_runs(db_path: Path) -> None:
                 [job.job_id],
             ).fetchall()
         ] == ["retryable_failed", "succeeded"]
+
+
+def test_memory_exhaustion_never_dead_letters_an_analyzer(db_path: Path) -> None:
+    """A busy host must not retire a healthy analyzer.
+
+    Attempts are counted on claim, so before #328 five unlucky sweeps during
+    heavy cockpit use dead-lettered the job permanently and nothing
+    re-enqueued it.
+    """
+    job = enqueue_advisory_check(
+        db_path,
+        analyzer_id="exploding",
+        target_id="mac-mini",
+        source_version="snapshot-v1",
+        max_attempts=1,
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda _analyzer, _target, version: _snapshot(version),
+        worker_id="test-worker",
+    )
+
+    result = worker.run_once([MemoryStarvedAnalyzer()])
+
+    assert result.failed == 1
+    with duckdb.connect(str(db_path)) as con:
+        assert con.execute(
+            "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+        ).fetchone() == ("retry_wait",)
+        assert con.execute(
+            "SELECT result, error_category FROM pipeline_job_attempts "
+            "WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone() == ("retryable_failed", "resource_exhausted")
+
+
+def test_a_genuinely_broken_analyzer_is_still_dead_lettered(db_path: Path) -> None:
+    """The exhaustion carve-out must not blunt the cap for real bugs."""
+    job = enqueue_advisory_check(
+        db_path,
+        analyzer_id="exploding",
+        target_id="mac-mini",
+        source_version="snapshot-v1",
+        max_attempts=1,
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda _analyzer, _target, version: _snapshot(version),
+        worker_id="test-worker",
+    )
+
+    worker.run_once([ExplodingAnalyzer()])
+
+    with duckdb.connect(str(db_path)) as con:
+        assert con.execute(
+            "SELECT status FROM pipeline_jobs WHERE job_id = ?", [job.job_id]
+        ).fetchone() == ("dead_lettered",)
+
+
+def test_failing_to_record_a_failure_does_not_abandon_the_sweep(
+    db_path: Path, monkeypatch
+) -> None:
+    """Bookkeeping opens its own connection, so it can fail under the same
+    pressure that failed the analyzer. That must not skip every analyzer
+    queued behind this one."""
+    for analyzer_id in ("exploding", "healthy"):
+        enqueue_advisory_check(
+            db_path,
+            analyzer_id=analyzer_id,
+            target_id="mac-mini",
+            source_version="snapshot-v1",
+        )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda _analyzer, _target, version: _snapshot(version),
+        worker_id="test-worker",
+    )
+    monkeypatch.setattr(
+        worker,
+        "_record_failure",
+        lambda job, exc: (_ for _ in ()).throw(
+            duckdb.OutOfMemoryException("Out of Memory Error: pool exhausted")
+        ),
+    )
+
+    result = worker.run_once([MemoryStarvedAnalyzer(), HealthyAnalyzer()])
+
+    assert (result.failed, result.succeeded) == (1, 1)
 
 
 def test_expired_lease_at_attempt_cap_is_dead_lettered(db_path: Path) -> None:

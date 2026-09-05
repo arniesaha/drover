@@ -88,6 +88,8 @@ class CockpitService:
         # immediately retries is worse than no budget at all.
         self._activity_lock = threading.Lock()
         self._activity_cache: tuple[Any, dict[str, Any], float] | None = None
+        self._provider_lock = threading.Lock()
+        self._provider_cache: tuple[Any, dict[str, Any]] | None = None
         self._activity_quiet_until = 0.0
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
@@ -119,6 +121,7 @@ class CockpitService:
     def _provider_capacity(self, filters: AnalyticsFilters) -> dict[str, Any]:
         if self.provider_usage is None:
             return _section("unavailable", data=[], coverage=None)
+        cache_key = (filters.host_id, filters.provider)
         try:
             accounts = [
                 account
@@ -147,15 +150,39 @@ class CockpitService:
                 )
                 else "stale"
             )
-            return _section(
+            section = _section(
                 status,
                 data=data,
                 observed_at=observed_at,
                 coverage={"source": "provider_reported", "account_count": len(data)},
             )
+            with self._provider_lock:
+                self._provider_cache = (cache_key, section)
+            return section
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render provider capacity: %s", exc)
+            # An empty `error` section draws as "no accounts", which is a
+            # different and worse claim than "these numbers are a minute old".
+            # This section shares one DuckDB instance with the activity build,
+            # so a concurrent foreground query can exhaust the pool and fail
+            # this render on data that was fine moments ago (#328). The
+            # activity section already answers that with its last good value;
+            # capacity now does the same.
+            stale = self._last_good_provider_capacity(cache_key)
+            if stale is not None:
+                return stale
             return _section("error", data=[], coverage=None)
+
+    def _last_good_provider_capacity(self, cache_key: Any) -> dict[str, Any] | None:
+        with self._provider_lock:
+            cached = self._provider_cache
+        if cached is None or cached[0] != cache_key:
+            return None
+        section = dict(cached[1])
+        if not section.get("data"):
+            return None
+        section["status"] = "stale"
+        return section
 
     def _last_good_activity(self, cache_key: dict[str, Any]) -> dict[str, Any] | None:
         """The last section we computed for these filters, marked stale.

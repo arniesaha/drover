@@ -1192,6 +1192,79 @@ class _FailingProviderService:
         raise RuntimeError("provider offline")
 
 
+class _FlakyProviderService:
+    """Answers once, then fails the way a saturated analytical pool does."""
+
+    def __init__(self, account):
+        self._account = account
+        self.calls = 0
+
+    def latest_accounts(self):
+        self.calls += 1
+        if self.calls == 1:
+            return [self._account]
+        raise duckdb.OutOfMemoryException(
+            "Out of Memory Error: failed to pin block of size 4.0 KiB"
+        )
+
+
+def _provider_account():
+    from drover.server.providers.types import ProviderAccountSnapshot
+
+    return ProviderAccountSnapshot(
+        snapshot_id="snap-1",
+        dedup_key="dedup-1",
+        provider="anthropic",
+        account_label="work",
+        plan_label="max",
+        host_id="mac-mini",
+        status="ok",
+        observed_at=datetime.now(timezone.utc),
+        windows=(),
+        source="provider_reported",
+    )
+
+
+def test_capacity_serves_its_last_good_answer_when_the_pool_is_exhausted(
+    low_coverage_analytics_db,
+):
+    """A concurrent activity build can exhaust the shared instance and fail
+    this render on data that was fine a moment ago (#328). An empty `error`
+    section draws as "no accounts", which claims something different and
+    worse than "a minute old"."""
+    provider = _FlakyProviderService(_provider_account())
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=provider,
+        connect=lambda: low_coverage_analytics_db,
+    )
+
+    first = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
+    second = service.overview(AnalyticsFilters(days=7))["provider_capacity"]
+
+    assert first["status"] == "ok"
+    assert len(first["data"]) == 1
+    assert second["status"] == "stale"
+    assert second["data"] == first["data"]
+    assert provider.calls == 2
+
+
+def test_capacity_still_reports_error_when_it_never_succeeded(
+    low_coverage_analytics_db,
+):
+    """Without a good answer to fall back on, the honest report is an error,
+    not an invented empty list dressed up as stale."""
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=_FailingProviderService(),
+        connect=lambda: low_coverage_analytics_db,
+    )
+
+    payload = service.overview(AnalyticsFilters(days=7))
+
+    assert payload["provider_capacity"]["status"] == "error"
+
+
 def test_cockpit_overview_isolates_provider_failure(low_coverage_analytics_db):
     service = CockpitService(
         duckdb_path=None,
