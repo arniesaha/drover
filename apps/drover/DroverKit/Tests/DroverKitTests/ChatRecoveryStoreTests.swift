@@ -99,6 +99,158 @@ struct ChatRecoveryStoreTests {
         #expect(try recordURLs(in: root).isEmpty)
     }
 
+    @Test func unreadableIndexPreservesPendingRecoveryBytes() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        let key = recoveryKey()
+        let pending = RecoveredPendingTurn(clientTurnID: UUID(), text: "synthetic pending")
+        try await store.save(ChatRecoverySnapshot(draftText: "", pendingTurn: pending), for: key)
+        let record = try #require(try recordURLs(in: root).first)
+        let index = root.appendingPathComponent("recovery-index.json")
+        try FileManager.default.removeItem(at: index)
+        try FileManager.default.createDirectory(at: index, withIntermediateDirectories: false)
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.load(for: key)
+        }
+        #expect(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    @Test func corruptIndexPreservesPendingRecoveryBytes() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        let key = recoveryKey()
+        let pending = RecoveredPendingTurn(clientTurnID: UUID(), text: "synthetic pending")
+        try await store.save(ChatRecoverySnapshot(draftText: "", pendingTurn: pending), for: key)
+        let record = try #require(try recordURLs(in: root).first)
+        let index = root.appendingPathComponent("recovery-index.json")
+        try Data("corrupt index".utf8).write(to: index)
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.load(for: key)
+        }
+        #expect(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    @Test func indexWriteFailureAfterRecordCommitKeepsCompleteReplacement() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let faults = ChatRecoveryStoreFaults()
+        let store = ChatRecoveryStore(root: root, faults: faults)
+        let key = recoveryKey()
+        let old = ChatRecoverySnapshot(
+            draftText: "old",
+            draftAttachments: [.init(mediaType: "image/jpeg", data: Data([0x01]))]
+        )
+        let replacement = ChatRecoverySnapshot(
+            draftText: "replacement",
+            draftAttachments: [.init(mediaType: "image/jpeg", data: Data([0x02, 0x03]))]
+        )
+        try await store.save(old, for: key)
+        faults.failNextAfterIndexWrite()
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.save(replacement, for: key)
+        }
+
+        #expect(try await store.load(for: key) == replacement)
+        #expect(try attachmentURLs(in: root).contains { url in
+            try Data(contentsOf: url) == Data([0x02, 0x03])
+        })
+    }
+
+    @Test func recordCommitFailureKeepsCompleteReplacement() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let faults = ChatRecoveryStoreFaults()
+        let store = ChatRecoveryStore(root: root, faults: faults)
+        let key = recoveryKey()
+        let old = ChatRecoverySnapshot(
+            draftText: "old",
+            draftAttachments: [.init(mediaType: "image/jpeg", data: Data([0x01]))]
+        )
+        let replacement = ChatRecoverySnapshot(
+            draftText: "replacement",
+            draftAttachments: [.init(mediaType: "image/jpeg", data: Data([0x02, 0x03]))]
+        )
+        try await store.save(old, for: key)
+        faults.failNextAfterRecordCommit()
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.save(replacement, for: key)
+        }
+
+        #expect(try await store.load(for: key) == replacement)
+        #expect(try attachmentURLs(in: root).contains { url in
+            try Data(contentsOf: url) == Data([0x02, 0x03])
+        })
+    }
+
+    @Test func postTemporaryWriteFailureRemovesTemporaryPayload() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let faults = ChatRecoveryStoreFaults()
+        let store = ChatRecoveryStore(root: root, faults: faults)
+        faults.failNextAfterTemporaryWrite()
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.save(.draft("must not persist"), for: recoveryKey())
+        }
+
+        #expect(try filenames(in: root).allSatisfy { !$0.hasSuffix(".tmp") })
+        #expect(try await store.load(for: recoveryKey()) == nil)
+    }
+
+    @Test func orphanedTemporaryBytesAreAccountedAndSwept() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        try await store.save(.draft("seed"), for: recoveryKey())
+        let temporary = root.appendingPathComponent(".orphan.tmp")
+        let orphanData = Data(repeating: 0xA5, count: 1_024)
+        try orphanData.write(to: temporary)
+
+        #expect(try await store.onDiskByteCount() >= orphanData.count)
+        try await store.sweep(keeping: [])
+        #expect(!FileManager.default.fileExists(atPath: temporary.path))
+    }
+
+    @Test func missingAttachmentIsDiscardedAsCorruptRecovery() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        let snapshot = ChatRecoverySnapshot(
+            draftText: "caption",
+            draftAttachments: [.init(mediaType: "image/jpeg", data: Data([0x01]))]
+        )
+        try await store.save(snapshot, for: recoveryKey())
+        let attachment = try #require(try attachmentURLs(in: root).first)
+        try FileManager.default.removeItem(at: attachment)
+
+        #expect(try await store.load(for: recoveryKey()) == nil)
+        #expect(try recordURLs(in: root).isEmpty)
+        #expect(try attachmentURLs(in: root).isEmpty)
+    }
+
+    @Test func oversizedAttachmentIsDiscardedAsCorruptRecovery() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        let snapshot = ChatRecoverySnapshot(
+            draftText: "caption",
+            draftAttachments: [.init(mediaType: "image/jpeg", data: Data([0x01]))]
+        )
+        try await store.save(snapshot, for: recoveryKey())
+        let attachment = try #require(try attachmentURLs(in: root).first)
+        try Data(repeating: 0xEF, count: 6 * 1024 * 1024 + 1).write(to: attachment)
+
+        #expect(try await store.load(for: recoveryKey()) == nil)
+        #expect(try recordURLs(in: root).isEmpty)
+        #expect(try attachmentURLs(in: root).isEmpty)
+    }
+
     @Test func staleDraftsEvictButUnresolvedTurnsSurviveTheSweep() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -126,6 +278,38 @@ struct ChatRecoveryStoreTests {
         #expect(try await store.load(for: pendingKey)?.pendingTurn == pending)
     }
 
+    @Test func upgradingADraftCannotCreateAFourthPendingTurn() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        let binding = UUID()
+        let draftKey = recoveryKey(binding: binding, sessionID: "draft-to-upgrade")
+        try await store.save(.draft("draft"), for: draftKey)
+        for sessionID in ["pending-one", "pending-two", "pending-three"] {
+            try await store.save(pendingSnapshot(), for: recoveryKey(binding: binding, sessionID: sessionID))
+        }
+
+        await #expect(throws: ChatRecoveryError.quotaExceeded) {
+            try await store.save(pendingSnapshot(), for: draftKey)
+        }
+        #expect(try await store.load(for: draftKey)?.pendingTurn == nil)
+    }
+
+    @Test func draftOnlyRecordsDoNotConsumeTheFirstPendingSlot() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatRecoveryStore(root: root)
+        let binding = UUID()
+        for sessionID in ["draft-one", "draft-two", "draft-three"] {
+            try await store.save(.draft(sessionID), for: recoveryKey(binding: binding, sessionID: sessionID))
+        }
+        let pendingKey = recoveryKey(binding: binding, sessionID: "first-pending")
+
+        try await store.save(pendingSnapshot(), for: pendingKey)
+
+        #expect(try await store.load(for: pendingKey)?.pendingTurn != nil)
+    }
+
     @Test func purgeAndSweepOnlyRemoveBindingsOutsideTheKeptSet() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -151,6 +335,13 @@ private extension ChatRecoverySnapshot {
     static func draft(_ text: String, updatedAt: Date = .now) -> Self {
         Self(draftText: text, updatedAt: updatedAt)
     }
+}
+
+private func pendingSnapshot() -> ChatRecoverySnapshot {
+    ChatRecoverySnapshot(
+        draftText: "",
+        pendingTurn: RecoveredPendingTurn(clientTurnID: UUID(), text: "synthetic pending")
+    )
 }
 
 private extension ChatRecoveryLimits {
@@ -192,4 +383,9 @@ private func filenames(in root: URL) throws -> [String] {
 private func recordURLs(in root: URL) throws -> [URL] {
     try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
         .filter { $0.pathExtension == "record" }
+}
+
+private func attachmentURLs(in root: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "attachment" }
 }

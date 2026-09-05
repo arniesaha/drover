@@ -10,9 +10,18 @@ public struct TokenStore: Sendable {
     public static let defaultService = "com.arnab.drover.token"
     public let service: String
     private static let account = "api-token"
+    private let updateStatusOverride: OSStatus?
 
     public init(service: String = Self.defaultService) {
         self.service = service
+        updateStatusOverride = nil
+    }
+
+    /// Test-only fault seam. Production callers use the public initializer,
+    /// which always invokes Security directly.
+    init(service: String, updateStatusOverride: OSStatus?) {
+        self.service = service
+        self.updateStatusOverride = updateStatusOverride
     }
 
     private func baseQuery() -> [String: Any] {
@@ -34,7 +43,7 @@ public struct TokenStore: Sendable {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        let updateStatus = SecItemUpdate(
+        let updateStatus = updateStatusOverride ?? SecItemUpdate(
             baseQuery() as CFDictionary,
             updateAttributes as CFDictionary
         )

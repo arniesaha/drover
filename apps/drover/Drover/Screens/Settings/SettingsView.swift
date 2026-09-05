@@ -250,7 +250,7 @@ struct SettingsView: View {
                 }
         }
         .buttonStyle(.plain)
-        .disabled(isSigningOut)
+        .disabled(isSigningOut || isValidating)
         .accessibilityIdentifier("settings-sign-out")
         .confirmationDialog(
             "Sign out of this fleet?",
@@ -260,7 +260,7 @@ struct SettingsView: View {
             Button("Sign Out", role: .destructive) {
                 Task { await performSignOut() }
             }
-            .disabled(isSigningOut)
+            .disabled(isSigningOut || isValidating)
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(

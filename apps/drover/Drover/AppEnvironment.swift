@@ -55,12 +55,18 @@ final class AppEnvironment {
     private let tokenStore: TokenStore
     private let recoveryBindingStore: RecoveryBindingStore
     private let recoveryStore: (any ChatRecoveryPersisting)?
+    private let validator: @Sendable (ServerConfig, String) async -> String?
+    private var operationEpoch = 0
+    private var pendingCleanupBindingIDs = Set<UUID>()
 
     init(
         defaults: UserDefaults = .standard,
         tokenStore: TokenStore = TokenStore(),
         recoveryBindingStore: RecoveryBindingStore? = nil,
         recoveryStore: (any ChatRecoveryPersisting)? = nil,
+        validator: @escaping @Sendable (ServerConfig, String) async -> String? = { config, token in
+            await ClientFactory.validate(config: config, token: token)
+        },
         launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.defaults = defaults
@@ -69,6 +75,7 @@ final class AppEnvironment {
             ?? RecoveryBindingStore(service: tokenStore.service)
         self.recoveryBindingStore = resolvedBindingStore
         self.recoveryStore = recoveryStore ?? Self.defaultRecoveryStore()
+        self.validator = validator
         if UITestOverrides.shouldResetAuthentication(environment: launchEnvironment) {
             try? tokenStore.delete()
             try? resolvedBindingStore.clear()
@@ -120,6 +127,13 @@ final class AppEnvironment {
         tokenStore.load() != nil
     }
 
+    /// Q2 injects this exact actor into every foreground ChatModel. It must
+    /// not create a second store for the same directory, because temporary
+    /// cleanup and index writes are serialized by this actor instance.
+    var chatRecoveryStore: (any ChatRecoveryPersisting)? {
+        recoveryStore
+    }
+
     enum ConfigureOutcome {
         case success
         case failure(String)
@@ -138,10 +152,16 @@ final class AppEnvironment {
             return .failure("Enter the API token.")
         }
 
+        operationEpoch &+= 1
+        let expectedOperationEpoch = operationEpoch
+
         // Server-checking logic lives in DroverKit so it's unit-testable;
         // this stays a thin caller.
-        if let failure = await ClientFactory.validate(config: newConfig, token: trimmedToken) {
+        if let failure = await validator(newConfig, trimmedToken) {
             return .failure(failure)
+        }
+        guard expectedOperationEpoch == operationEpoch else {
+            return .failure("Configuration was cancelled.")
         }
 
         do {
@@ -183,13 +203,23 @@ final class AppEnvironment {
             credentialBindingID: bindingID
         )
         generation += 1
+        var retryBindings = pendingCleanupBindingIDs
         if let oldBindingID, oldBindingID != bindingID {
+            retryBindings.insert(oldBindingID)
+        }
+        var failedBindings = Set<UUID>()
+        for oldBindingID in retryBindings {
             do {
                 try await recoveryStore?.purge(bindingID: oldBindingID)
+                pendingCleanupBindingIDs.remove(oldBindingID)
             } catch {
-                hasPendingLocalCleanup = true
-                recoveryStatusMessage = "Connected, but previous chat recovery is still pending local cleanup."
+                failedBindings.insert(oldBindingID)
             }
+        }
+        pendingCleanupBindingIDs.formUnion(failedBindings)
+        hasPendingLocalCleanup = !pendingCleanupBindingIDs.isEmpty
+        if hasPendingLocalCleanup {
+            recoveryStatusMessage = "Connected, but previous chat recovery is still pending local cleanup."
         }
         return .success
     }
@@ -207,6 +237,7 @@ final class AppEnvironment {
     /// Everything a fresh install lacks is cleared, so the next pairing
     /// cannot inherit half the old configuration.
     func signOut() async throws {
+        operationEpoch &+= 1
         let previousConfig = config
         let previousBindingID = client?.credentialBindingID
         // Drop the app's foreground connection before its first suspension so
@@ -237,16 +268,28 @@ final class AppEnvironment {
         if let previousBindingID {
             bindingsToPurge.insert(previousBindingID)
         }
+        var failedBindings = Set<UUID>()
         for bindingID in bindingsToPurge {
             do {
                 try await recoveryStore?.purge(bindingID: bindingID)
+                pendingCleanupBindingIDs.remove(bindingID)
             } catch {
                 cleanupFailed = true
+                failedBindings.insert(bindingID)
             }
         }
 
+        // After raw credential deletion, no binding can legitimately retain
+        // recovery. This covers an unknown stale namespace from an interrupted
+        // replacement as well as crash-left temporary files.
+        do {
+            try await recoveryStore?.sweep(keeping: [])
+        } catch {
+            cleanupFailed = true
+        }
+
         if cleanupFailed {
-            pendingCleanupBindingIDs = bindingsToPurge
+            pendingCleanupBindingIDs.formUnion(failedBindings)
             hasPendingLocalCleanup = true
             recoveryStatusMessage = "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
             throw SignOutError.localCleanupPending
@@ -256,8 +299,6 @@ final class AppEnvironment {
         hasPendingLocalCleanup = false
         recoveryStatusMessage = nil
     }
-
-    private var pendingCleanupBindingIDs = Set<UUID>()
 
     private static func defaultRecoveryStore() -> (any ChatRecoveryPersisting)? {
         guard let applicationSupport = try? FileManager.default.url(
