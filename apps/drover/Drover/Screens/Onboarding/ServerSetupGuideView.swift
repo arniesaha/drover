@@ -62,9 +62,24 @@ enum ServerSetupMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// Reusable setup instructions for Primary Hub (first machine) and Worker Host (additional machines).
+enum ServerSetupContext: Sendable {
+    case firstComputer
+    case connectedFleet
+
+    var allowedModes: [ServerSetupMode] {
+        switch self {
+        case .firstComputer:
+            return [.hub]
+        case .connectedFleet:
+            return [.host]
+        }
+    }
+}
+
+/// Reusable setup instructions for a first computer or an additional host.
 /// Styled strictly with `DroverColor` and `DroverText`.
 struct ServerSetupContent: View {
+    let context: ServerSetupContext
     @Binding var selectedMode: ServerSetupMode
 
     @State private var hasCopied = false
@@ -73,7 +88,7 @@ struct ServerSetupContent: View {
         VStack(alignment: .leading, spacing: 20) {
             // Mode selector
             HStack(spacing: 10) {
-                ForEach(ServerSetupMode.allCases) { mode in
+                ForEach(context.allowedModes) { mode in
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             selectedMode = mode
@@ -226,16 +241,21 @@ struct ServerSetupContent: View {
 struct ServerSetupGuideView: View {
     @Environment(\.dismiss) private var dismiss
 
+    let context: ServerSetupContext
     @State private var selectedMode: ServerSetupMode
 
-    init(initialMode: ServerSetupMode = .hub) {
+    init(
+        context: ServerSetupContext = .firstComputer,
+        initialMode: ServerSetupMode = .hub
+    ) {
+        self.context = context
         _selectedMode = State(initialValue: initialMode)
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                ServerSetupContent(selectedMode: $selectedMode)
+                ServerSetupContent(context: context, selectedMode: $selectedMode)
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)

@@ -73,7 +73,10 @@ struct SettingsView: View {
                     .accessibilityIdentifier("settings-server-setup-guide")
                     .sheet(isPresented: $showServerSetupGuide) {
                         NavigationStack {
-                            ServerSetupGuideView(initialMode: .host)
+                            ServerSetupGuideView(
+                                context: .connectedFleet,
+                                initialMode: .host
+                            )
                         }
                         .presentationCornerRadius(24)
                     }
