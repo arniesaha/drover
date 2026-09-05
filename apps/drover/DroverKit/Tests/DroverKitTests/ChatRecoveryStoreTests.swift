@@ -55,6 +55,39 @@ struct ChatRecoveryStoreTests {
         #expect(try await store.load(for: key) == nil)
     }
 
+    @Test func replacementRejectsTemporaryPeakAndPreservesPreviousSnapshot() async throws {
+        let root = try temporaryDirectory()
+        let comparisonRoot = try temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: comparisonRoot)
+        }
+        let key = recoveryKey()
+        let old = ChatRecoverySnapshot(
+            draftText: String(repeating: "a", count: 1_024),
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let replacement = ChatRecoverySnapshot(
+            draftText: String(repeating: "b", count: 1_024),
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let durableStore = ChatRecoveryStore(root: root)
+        let comparisonStore = ChatRecoveryStore(root: comparisonRoot)
+        try await durableStore.save(old, for: key)
+        try await comparisonStore.save(replacement, for: key)
+        let finalBytes = try await comparisonStore.onDiskByteCount()
+        let constrainedStore = ChatRecoveryStore(
+            root: root,
+            limits: .fixture(totalBytes: finalBytes)
+        )
+
+        await #expect(throws: ChatRecoveryError.quotaExceeded) {
+            try await constrainedStore.save(replacement, for: key)
+        }
+
+        #expect(try await durableStore.load(for: key) == old)
+    }
+
     @Test func storageFailureLeavesNoRecordAtBlockedRoot() async throws {
         let parent = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: parent) }

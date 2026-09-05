@@ -351,17 +351,20 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
 
         let existingBytes = try totalRecoveryBytes()
         let replacedRecordBytes = try fileBytes(recordURL(filename))
-        let indexBytes = try fileBytes(indexURL)
         let expiredBytes = try expired.reduce(0) { partial, staleFilename in
             partial + (try recordBytes(staleFilename))
         }
-        // Do not subtract old attachments from the reservation. If post-index
-        // pruning fails, keeping those protected bytes is safer than leaving a
-        // record that references a removed sibling, and this conservative
-        // calculation still preserves the real on-disk 24 MiB bound.
-        let proposedBytes = encodedSnapshot.count + newlyRequiredAttachmentBytes + encodedIndex.count
-        guard existingBytes - replacedRecordBytes - indexBytes - expiredBytes + proposedBytes
-            <= limits.maximumTotalBytes else {
+        // Do not subtract old attachments: pruning only happens after the
+        // record and index commit. Also reserve the temporary-file peaks:
+        // record replacement holds its old destination and its new protected
+        // temporary file, then index replacement holds the new record plus
+        // both old index and new protected temporary index bytes.
+        let retainedBytes = existingBytes - expiredBytes
+        let bytesAfterNewAttachments = retainedBytes + newlyRequiredAttachmentBytes
+        let recordReplacementPeak = bytesAfterNewAttachments + encodedSnapshot.count
+        let indexReplacementPeak = bytesAfterNewAttachments - replacedRecordBytes
+            + encodedSnapshot.count + encodedIndex.count
+        guard max(recordReplacementPeak, indexReplacementPeak) <= limits.maximumTotalBytes else {
             throw ChatRecoveryError.quotaExceeded
         }
 
