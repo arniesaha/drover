@@ -25,6 +25,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.arnab.drover
+        # Without this, a device build fails with "No Accounts: Add a new
+        # account in Accounts settings" unless the team is passed on the
+        # command line, because automatic signing has nothing to resolve the
+        # bundle id against. The cached profile for this bundle id belongs to
+        # this team, so pinning it makes a device build reproducible from a
+        # clean checkout.
+        DEVELOPMENT_TEAM: DK2PC4RH5G
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: Drover/Drover.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -45,6 +52,10 @@ targets:
       path: Drover/Info.plist
       properties:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        # Asked on every App Store Connect upload otherwise, which stalls a
+        # TestFlight submission until someone answers it by hand. Drover uses
+        # only HTTPS/TLS through the system frameworks, which is exempt.
+        ITSAppUsesNonExemptEncryption: false
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
