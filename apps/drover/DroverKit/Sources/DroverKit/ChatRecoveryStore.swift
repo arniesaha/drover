@@ -45,6 +45,8 @@ final class ChatRecoveryStoreFaults: @unchecked Sendable {
     private var indexWriteFailures = 0
     private var postIndexWriteFailures = 0
     private var postRecordCommitFailures = 0
+    private var eraseAllFailures = 0
+    private var recoveryFileRemovalFailures = 0
 
     func failNextAfterTemporaryWrite() {
         lock.withLock { temporaryWriteFailures += 1 }
@@ -60,6 +62,14 @@ final class ChatRecoveryStoreFaults: @unchecked Sendable {
 
     func failNextAfterRecordCommit() {
         lock.withLock { postRecordCommitFailures += 1 }
+    }
+
+    func failNextEraseAll() {
+        lock.withLock { eraseAllFailures += 1 }
+    }
+
+    func failNextRecoveryFileRemoval() {
+        lock.withLock { recoveryFileRemovalFailures += 1 }
     }
 
     fileprivate func consumeTemporaryWriteFailure() -> Bool {
@@ -90,6 +100,22 @@ final class ChatRecoveryStoreFaults: @unchecked Sendable {
         lock.withLock {
             guard postRecordCommitFailures > 0 else { return false }
             postRecordCommitFailures -= 1
+            return true
+        }
+    }
+
+    fileprivate func consumeEraseAllFailure() -> Bool {
+        lock.withLock {
+            guard eraseAllFailures > 0 else { return false }
+            eraseAllFailures -= 1
+            return true
+        }
+    }
+
+    fileprivate func consumeRecoveryFileRemovalFailure() -> Bool {
+        lock.withLock {
+            guard recoveryFileRemovalFailures > 0 else { return false }
+            recoveryFileRemovalFailures -= 1
             return true
         }
     }
@@ -229,6 +255,9 @@ public protocol ChatRecoveryPersisting: Sendable {
     func remove(for key: ChatRecoveryKey) async throws
     func purge(bindingID: UUID) async throws
     func sweep(keeping bindingIDs: Set<UUID>) async throws
+    /// Destructively removes the entire store only after raw credential
+    /// deletion has made every recovery binding unauthorized.
+    func eraseAllAfterCredentialDeletion() async throws
 }
 
 /// A bounded, protected local store. It has no server identity in filenames or
@@ -351,25 +380,18 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
 
         let existingBytes = try totalRecoveryBytes()
         let replacedRecordBytes = try fileBytes(recordURL(filename))
-        let expiredBytes = try expired.reduce(0) { partial, staleFilename in
-            partial + (try recordBytes(staleFilename))
-        }
         // Do not subtract old attachments: pruning only happens after the
-        // record and index commit. Also reserve the temporary-file peaks:
+        // record and index commit. Expired records are also retained until
+        // their index removal commits. Also reserve the temporary-file peaks:
         // record replacement holds its old destination and its new protected
         // temporary file, then index replacement holds the new record plus
         // both old index and new protected temporary index bytes.
-        let retainedBytes = existingBytes - expiredBytes
-        let bytesAfterNewAttachments = retainedBytes + newlyRequiredAttachmentBytes
+        let bytesAfterNewAttachments = existingBytes + newlyRequiredAttachmentBytes
         let recordReplacementPeak = bytesAfterNewAttachments + encodedSnapshot.count
         let indexReplacementPeak = bytesAfterNewAttachments - replacedRecordBytes
             + encodedSnapshot.count + encodedIndex.count
         guard max(recordReplacementPeak, indexReplacementPeak) <= limits.maximumTotalBytes else {
             throw ChatRecoveryError.quotaExceeded
-        }
-
-        for staleFilename in expired {
-            try removeRecordFiles(staleFilename)
         }
 
         let hadIndexedRecord = index.records[filename] != nil
@@ -391,6 +413,13 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
             try writeProtected(encodedSnapshot, to: recordURL(filename))
             recordWasCommitted = true
             try writeIndex(index)
+            // Index removal commits before physical expiry cleanup. If the
+            // latter cannot run, the unindexed draft stays protected and
+            // accounted for, rather than leaving a live index entry that
+            // references a missing record.
+            for staleFilename in expired {
+                try? removeRecordFiles(staleFilename)
+            }
             // Cleanup is after both authoritative files are durable. A
             // failure here may retain stale protected bytes, but never makes
             // a complete snapshot unreadable; the reservation above accounts
@@ -427,9 +456,9 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
         try prepareRoot()
         var index = try loadIndex()
         let filename = key.filename
-        try removeRecordFiles(filename)
         index.records.removeValue(forKey: filename)
         try writeIndex(index)
+        try removeRecordFiles(filename)
     }
 
     public func purge(bindingID: UUID) async throws {
@@ -438,11 +467,9 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
         let filenames = index.records.compactMap { filename, entry in
             entry.bindingID == bindingID ? filename : nil
         }
-        for filename in filenames {
-            try removeRecordFiles(filename)
-            index.records.removeValue(forKey: filename)
-        }
+        for filename in filenames { index.records.removeValue(forKey: filename) }
         try writeIndex(index)
+        try removeUnindexedRecoveryFiles(keeping: Set(index.records.keys))
     }
 
     public func sweep(keeping bindingIDs: Set<UUID>) async throws {
@@ -452,12 +479,22 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
         let staleBindings = index.records.compactMap { filename, entry in
             bindingIDs.contains(entry.bindingID) ? nil : filename
         }
-        for filename in Set(expired).union(staleBindings) {
-            try removeRecordFiles(filename)
-            index.records.removeValue(forKey: filename)
-        }
+        let filenames = Set(expired).union(staleBindings)
+        for filename in filenames { index.records.removeValue(forKey: filename) }
         try writeIndex(index)
         try removeUnindexedRecoveryFiles(keeping: Set(index.records.keys))
+    }
+
+    public func eraseAllAfterCredentialDeletion() async throws {
+        do {
+            if faults?.consumeEraseAllFailure() == true {
+                throw ChatRecoveryError.storageUnavailable
+            }
+            guard fileManager.fileExists(atPath: root.path) else { return }
+            try fileManager.removeItem(at: root)
+        } catch {
+            throw ChatRecoveryError.storageUnavailable
+        }
     }
 
     private func prepareRoot() throws {
@@ -524,10 +561,6 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
         snapshot.draftAttachments
             + (snapshot.deferredTurn?.attachments ?? [])
             + (snapshot.pendingTurn?.attachments ?? [])
-    }
-
-    private func attachmentBytes(in snapshot: ChatRecoverySnapshot) -> Int {
-        allAttachments(in: snapshot).reduce(0) { $0 + $1.data.count }
     }
 
     private func expiredDraftFilenames(
@@ -668,20 +701,20 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
     }
 
     private func removeRecord(_ filename: String, from index: inout RecoveryIndex) throws {
-        try removeRecordFiles(filename)
         index.records.removeValue(forKey: filename)
         try writeIndex(index)
+        try removeRecordFiles(filename)
     }
 
     private func removeRecordFiles(_ filename: String) throws {
         let record = recordURL(filename)
         if fileManager.fileExists(atPath: record.path) {
-            try fileManager.removeItem(at: record)
+            try removeRecoveryFile(record)
         }
         let attachments = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("\(filename)-") && $0.pathExtension == Self.attachmentExtension }
         for attachment in attachments {
-            try fileManager.removeItem(at: attachment)
+            try removeRecoveryFile(attachment)
         }
     }
 
@@ -704,7 +737,7 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
                 ? file.deletingPathExtension().lastPathComponent
                 : String(file.lastPathComponent.prefix(64))
             if !filenames.contains(candidate) {
-                try fileManager.removeItem(at: file)
+                try removeRecoveryFile(file)
             }
         }
     }
@@ -716,6 +749,13 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
         }
     }
 
+    private func removeRecoveryFile(_ url: URL) throws {
+        if faults?.consumeRecoveryFileRemovalFailure() == true {
+            throw ChatRecoveryError.storageUnavailable
+        }
+        try fileManager.removeItem(at: url)
+    }
+
     private func totalRecoveryBytes() throws -> Int {
         try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey])
             .reduce(0) { partial, url in
@@ -725,16 +765,6 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
 
     func onDiskByteCount() throws -> Int {
         try totalRecoveryBytes()
-    }
-
-    private func recordBytes(_ filename: String) throws -> Int {
-        try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey])
-            .filter { $0.lastPathComponent == "\(filename).\(Self.recordExtension)"
-                || ($0.lastPathComponent.hasPrefix("\(filename)-")
-                    && $0.pathExtension == Self.attachmentExtension) }
-            .reduce(0) { partial, url in
-                partial + (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
-            }
     }
 
     private func fileBytes(_ url: URL) throws -> Int {

@@ -38,6 +38,8 @@ enum UITestOverrides {
 @MainActor
 @Observable
 final class AppEnvironment {
+    private static let recoveryRootCleanupPendingDefaultsKey = "drover.chat-recovery-cleanup-pending"
+
     private(set) var client: DroverClient?
     private(set) var config: ServerConfig?
 
@@ -116,7 +118,30 @@ final class AppEnvironment {
             config = built.config
         }
         let bindings = client?.credentialBindingID.map { Set([$0]) } ?? []
-        if shouldSweepRecovery, let recoveryStore = self.recoveryStore {
+        let hasDurableRecoveryRootCleanup = defaults.bool(
+            forKey: Self.recoveryRootCleanupPendingDefaultsKey
+        )
+        if hasDurableRecoveryRootCleanup, savedConfig == nil, savedToken == nil {
+            hasPendingLocalCleanup = true
+            recoveryStatusMessage = "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
+            // This marker is written only after raw credential deletion. A
+            // launch retry may therefore erase a corrupt authorization index
+            // without weakening normal load/sweep fail-closed behavior.
+            if let recoveryStore = self.recoveryStore {
+                Task { @MainActor [weak self] in
+                    do {
+                        try await recoveryStore.eraseAllAfterCredentialDeletion()
+                        guard let self else { return }
+                        self.defaults.removeObject(forKey: Self.recoveryRootCleanupPendingDefaultsKey)
+                        self.hasPendingLocalCleanup = false
+                        self.recoveryStatusMessage = nil
+                    } catch {
+                        // Keep the durable marker and actionable state for the
+                        // next launch or a repeated sign-out attempt.
+                    }
+                }
+            }
+        } else if shouldSweepRecovery, let recoveryStore = self.recoveryStore {
             Task {
                 try? await recoveryStore.sweep(keeping: bindings)
             }
@@ -239,7 +264,6 @@ final class AppEnvironment {
     func signOut() async throws {
         operationEpoch &+= 1
         let previousConfig = config
-        let previousBindingID = client?.credentialBindingID
         // Drop the app's foreground connection before its first suspension so
         // no visible UI or new background work can use this credential.
         client = nil
@@ -257,6 +281,11 @@ final class AppEnvironment {
         }
 
         defaults.removeObject(forKey: ServerConfig.defaultsKey)
+        // Persist the destructive cleanup intent before the first cleanup
+        // suspension. A process death while the store waits on protected I/O
+        // must still authorize the next uncredentialed launch to remove a
+        // corrupt index and its recovery bytes.
+        defaults.set(true, forKey: Self.recoveryRootCleanupPendingDefaultsKey)
         var cleanupFailed = false
         do {
             try recoveryBindingStore.clear()
@@ -264,32 +293,21 @@ final class AppEnvironment {
             cleanupFailed = true
         }
 
-        var bindingsToPurge = pendingCleanupBindingIDs
-        if let previousBindingID {
-            bindingsToPurge.insert(previousBindingID)
-        }
-        var failedBindings = Set<UUID>()
-        for bindingID in bindingsToPurge {
-            do {
-                try await recoveryStore?.purge(bindingID: bindingID)
-                pendingCleanupBindingIDs.remove(bindingID)
-            } catch {
-                cleanupFailed = true
-                failedBindings.insert(bindingID)
-            }
-        }
-
         // After raw credential deletion, no binding can legitimately retain
-        // recovery. This covers an unknown stale namespace from an interrupted
-        // replacement as well as crash-left temporary files.
+        // recovery. This deliberately bypasses the normal fail-closed index
+        // path so a corrupt index cannot strand protected bytes forever.
         do {
-            try await recoveryStore?.sweep(keeping: [])
+            guard let recoveryStore else {
+                throw ChatRecoveryError.storageUnavailable
+            }
+            try await recoveryStore.eraseAllAfterCredentialDeletion()
+            defaults.removeObject(forKey: Self.recoveryRootCleanupPendingDefaultsKey)
         } catch {
             cleanupFailed = true
         }
 
         if cleanupFailed {
-            pendingCleanupBindingIDs.formUnion(failedBindings)
+            pendingCleanupBindingIDs.removeAll()
             hasPendingLocalCleanup = true
             recoveryStatusMessage = "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
             throw SignOutError.localCleanupPending

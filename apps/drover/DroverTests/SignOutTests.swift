@@ -151,6 +151,30 @@ final class SignOutTests: XCTestCase {
         }
     }
 
+    func testSignOutErasesCorruptRecoveryAfterCredentialDeletion() async throws {
+        try await withEnvironment { environment, _, _, recovery, root in
+            let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
+            let key = ChatRecoveryKey(
+                serverURL: URL(string: "http://127.0.0.1:7080")!,
+                credentialBindingID: bindingID,
+                sessionID: "corrupt-index"
+            )
+            let pending = RecoveredPendingTurn(clientTurnID: UUID(), text: "synthetic pending")
+            try await recovery.save(ChatRecoverySnapshot(draftText: "", pendingTurn: pending), for: key)
+            let index = root.appendingPathComponent("recovery-index.json")
+            try Data("corrupt index".utf8).write(to: index)
+            let crashTemporary = root.appendingPathComponent(".synthetic-crash.tmp")
+            try Data("synthetic temporary payload".utf8).write(to: crashTemporary)
+
+            try await environment.signOut()
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: crashTemporary.path))
+            let restored = try await recovery.load(for: key)
+            XCTAssertNil(restored)
+        }
+    }
+
     func testRecoveryFilesAreNoBackupAndCompleteProtection() async throws {
         try await withEnvironment { environment, _, _, recovery, root in
             let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
@@ -211,6 +235,117 @@ final class SignOutTests: XCTestCase {
                 "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
             )
         }
+    }
+
+    func testLaunchRetriesDurableRecoveryRootCleanupAfterEraseFailure() async throws {
+        let suiteName = "drover.signout.erase-retry.\(UUID().uuidString)"
+        let service = "drover-signout-erase-retry-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let root = try temporaryRecoveryRoot()
+        let faults = ChatRecoveryStoreFaults()
+        let recovery = ChatRecoveryStore(root: root, faults: faults)
+        defer {
+            try? tokenStore.delete()
+            try? bindingStore.clear()
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try tokenStore.save("existing-token")
+        let config = ServerConfig(urlString: "http://127.0.0.1:7080")!
+        config.save(defaults: defaults)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recovery,
+            launchEnvironment: [:]
+        )
+        let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
+        let key = ChatRecoveryKey(
+            serverURL: config.baseURL,
+            credentialBindingID: bindingID,
+            sessionID: "erase-retry"
+        )
+        try await recovery.save(.init(draftText: "synthetic draft"), for: key)
+        faults.failNextEraseAll()
+
+        do {
+            try await environment.signOut()
+            XCTFail("sign out must report failed local cleanup")
+        } catch {
+        }
+        XCTAssertTrue(environment.hasPendingLocalCleanup)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+
+        let relaunched = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recovery,
+            launchEnvironment: [:]
+        )
+        await waitUntil { !FileManager.default.fileExists(atPath: root.path) }
+
+        XCTAssertFalse(relaunched.hasPendingLocalCleanup)
+        XCTAssertNil(relaunched.recoveryStatusMessage)
+    }
+
+    func testSignOutPersistsRootEraseIntentBeforeCleanupSuspends() async throws {
+        let suiteName = "drover.signout.erase-intent.\(UUID().uuidString)"
+        let service = "drover-signout-erase-intent-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let root = try temporaryRecoveryRoot()
+        let durableStore = ChatRecoveryStore(root: root)
+        let suspendedStore = SuspendedEraseRecoveryStore()
+        defer {
+            try? tokenStore.delete()
+            try? bindingStore.clear()
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try tokenStore.save("existing-token")
+        let config = ServerConfig(urlString: "http://127.0.0.1:7080")!
+        config.save(defaults: defaults)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: suspendedStore,
+            launchEnvironment: [:]
+        )
+        let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
+        let key = ChatRecoveryKey(
+            serverURL: config.baseURL,
+            credentialBindingID: bindingID,
+            sessionID: "erase-intent"
+        )
+        let pending = RecoveredPendingTurn(clientTurnID: UUID(), text: "synthetic pending")
+        try await durableStore.save(.init(draftText: "", pendingTurn: pending), for: key)
+        try Data("corrupt index".utf8).write(to: root.appendingPathComponent("recovery-index.json"))
+
+        let signOut = Task { @MainActor in
+            try? await environment.signOut()
+        }
+        await suspendedStore.waitUntilEraseStarted()
+        XCTAssertNil(tokenStore.load())
+        XCTAssertNil(ServerConfig.load(defaults: defaults))
+
+        let relaunched = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: durableStore,
+            launchEnvironment: [:]
+        )
+        await waitUntil { !FileManager.default.fileExists(atPath: root.path) }
+
+        XCTAssertFalse(relaunched.hasPendingLocalCleanup)
+        await suspendedStore.releaseErase()
+        _ = await signOut.value
     }
 
     func testSignOutInvalidatesDelayedConfigurationBeforeItCanCommit() async throws {
@@ -306,6 +441,71 @@ final class SignOutTests: XCTestCase {
         let restored = try await durableStore.load(for: oldKey)
         XCTAssertNil(restored)
     }
+
+    func testConfigureRetriesAnUnindexedRecordAfterPostIndexPurgeFailure() async throws {
+        let suiteName = "drover.signout.purge-retry.\(UUID().uuidString)"
+        let service = "drover-signout-purge-retry-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let root = try temporaryRecoveryRoot()
+        let faults = ChatRecoveryStoreFaults()
+        let recovery = ChatRecoveryStore(root: root, faults: faults)
+        defer {
+            try? tokenStore.delete()
+            try? bindingStore.clear()
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let initialCredential = "synthetic-initial-value"
+        try tokenStore.save(initialCredential)
+        let config = ServerConfig(urlString: "http://127.0.0.1:7080")!
+        config.save(defaults: defaults)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recovery,
+            validator: { _, _ in nil },
+            launchEnvironment: [:]
+        )
+        let oldBinding = try XCTUnwrap(environment.client?.credentialBindingID)
+        let oldKey = ChatRecoveryKey(
+            serverURL: config.baseURL,
+            credentialBindingID: oldBinding,
+            sessionID: "post-index-purge"
+        )
+        try await recovery.save(.init(draftText: "synthetic old draft"), for: oldKey)
+        faults.failNextRecoveryFileRemoval()
+
+        let replacementCredential = "synthetic-replacement-value"
+        let firstOutcome = await environment.configure(
+            urlString: config.baseURL.absoluteString,
+            token: replacementCredential
+        )
+        guard case .success = firstOutcome else {
+            return XCTFail("replacement configuration should validate")
+        }
+        XCTAssertTrue(environment.hasPendingLocalCleanup)
+        let retainedRecords = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "record" }
+        XCTAssertEqual(retainedRecords.count, 1)
+
+        let retryCredential = "synthetic-retry-value"
+        let retryOutcome = await environment.configure(
+            urlString: config.baseURL.absoluteString,
+            token: retryCredential
+        )
+        guard case .success = retryOutcome else {
+            return XCTFail("retry configuration should validate")
+        }
+
+        XCTAssertFalse(environment.hasPendingLocalCleanup)
+        let restored = try await recovery.load(for: oldKey)
+        XCTAssertNil(restored)
+    }
 }
 
 private func temporaryRecoveryRoot() throws -> URL {
@@ -332,6 +532,19 @@ private func hasRecoveryBindingMetadata(service: String) throws -> Bool {
     }
     guard status == errSecSuccess else { throw KeychainError.osStatus(status) }
     return true
+}
+
+@MainActor
+private func waitUntil(
+    _ condition: @MainActor () -> Bool,
+    timeout: Duration = .seconds(2)
+) async {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while !condition() && clock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    XCTAssertTrue(condition(), "condition did not become true before timeout")
 }
 
 private actor DelayedValidator {
@@ -365,12 +578,49 @@ private actor DelayedValidator {
     }
 }
 
+private actor SuspendedEraseRecoveryStore: ChatRecoveryPersisting {
+    private var eraseStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? { nil }
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {}
+    func remove(for key: ChatRecoveryKey) async throws {}
+    func purge(bindingID: UUID) async throws {}
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {}
+
+    func eraseAllAfterCredentialDeletion() async throws {
+        eraseStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilEraseStarted() async {
+        guard !eraseStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func releaseErase() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor FailingPurgeRecoveryStore: ChatRecoveryPersisting {
     func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? { nil }
     func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {}
     func remove(for key: ChatRecoveryKey) async throws {}
     func purge(bindingID: UUID) async throws { throw ChatRecoveryError.storageUnavailable }
     func sweep(keeping bindingIDs: Set<UUID>) async throws {}
+    func eraseAllAfterCredentialDeletion() async throws { throw ChatRecoveryError.storageUnavailable }
 }
 
 private actor FailOncePurgeRecoveryStore: ChatRecoveryPersisting {
@@ -403,5 +653,9 @@ private actor FailOncePurgeRecoveryStore: ChatRecoveryPersisting {
 
     func sweep(keeping bindingIDs: Set<UUID>) async throws {
         try await store.sweep(keeping: bindingIDs)
+    }
+
+    func eraseAllAfterCredentialDeletion() async throws {
+        try await store.eraseAllAfterCredentialDeletion()
     }
 }

@@ -88,6 +88,61 @@ struct ChatRecoveryStoreTests {
         #expect(try await durableStore.load(for: key) == old)
     }
 
+    @Test func preIndexFailurePreservesExpiredFilesUntilTheirIndexRemovalCommits() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let binding = UUID()
+        let oldDate = Date.now.addingTimeInterval(-8 * 24 * 60 * 60)
+        let seedStore = ChatRecoveryStore(
+            root: root,
+            limits: .fixture(maximumDraftAge: 365 * 24 * 60 * 60)
+        )
+        for sessionID in ["stale-one", "stale-two", "stale-three"] {
+            try await seedStore.save(
+                .draft(sessionID, updatedAt: oldDate),
+                for: recoveryKey(binding: binding, sessionID: sessionID)
+            )
+        }
+        let targetKey = recoveryKey(binding: binding, sessionID: "target")
+        try await seedStore.save(.draft("target"), for: targetKey)
+        let faults = ChatRecoveryStoreFaults()
+        let store = ChatRecoveryStore(root: root, faults: faults)
+        faults.failNextIndexWrite()
+        let replacement = ChatRecoverySnapshot(draftText: "replacement")
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.save(replacement, for: targetKey)
+        }
+
+        let pendingKey = recoveryKey(binding: binding, sessionID: "new-pending")
+        try await store.save(pendingSnapshot(), for: pendingKey)
+
+        #expect(try await store.load(for: targetKey) == replacement)
+        #expect(try await store.load(for: pendingKey)?.pendingTurn != nil)
+        #expect(try recordURLs(in: root).count == 2)
+        #expect(try await store.onDiskByteCount() <= ChatRecoveryLimits.default.maximumTotalBytes)
+    }
+
+    @Test func purgeRetriesUnindexedFilesAfterPostIndexRemovalFailure() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let faults = ChatRecoveryStoreFaults()
+        let store = ChatRecoveryStore(root: root, faults: faults)
+        let key = recoveryKey(binding: UUID(), sessionID: "purge-retry")
+        try await store.save(.draft("synthetic draft"), for: key)
+        faults.failNextRecoveryFileRemoval()
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.purge(bindingID: key.credentialBindingID)
+        }
+        #expect(try recordURLs(in: root).count == 1)
+
+        try await store.purge(bindingID: key.credentialBindingID)
+
+        #expect(try recordURLs(in: root).isEmpty)
+        #expect(try await store.load(for: key) == nil)
+    }
+
     @Test func storageFailureLeavesNoRecordAtBlockedRoot() async throws {
         let parent = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: parent) }
@@ -378,13 +433,16 @@ private func pendingSnapshot() -> ChatRecoverySnapshot {
 }
 
 private extension ChatRecoveryLimits {
-    static func fixture(totalBytes: Int) -> Self {
+    static func fixture(
+        totalBytes: Int = 24 * 1024 * 1024,
+        maximumDraftAge: TimeInterval = 7 * 24 * 60 * 60
+    ) -> Self {
         Self(
             maximumDraftBytes: 64 * 1024,
             maximumCompositionAttachmentBytes: 6 * 1024 * 1024,
             maximumTotalBytes: totalBytes,
             maximumUnresolvedRecords: 3,
-            maximumDraftAge: 7 * 24 * 60 * 60
+            maximumDraftAge: maximumDraftAge
         )
     }
 }
