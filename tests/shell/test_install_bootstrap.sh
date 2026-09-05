@@ -37,9 +37,10 @@ check_contains() {
 
 REMOTE="$WORK/remote"
 FAKE_BIN="$REMOTE/bin"
+OFFLINE_BIN="$REMOTE/offline bin"
 HOME_DIR="$REMOTE/home dir"
 UNRELATED="$REMOTE/unrelated checkout"
-mkdir -p "$FAKE_BIN" "$HOME_DIR/.drover" "$UNRELATED/scripts/lib"
+mkdir -p "$FAKE_BIN" "$OFFLINE_BIN" "$HOME_DIR/.drover" "$UNRELATED/scripts/lib"
 
 # A piped script must not treat this working directory as its own checkout.
 printf '%s\n' '#!/usr/bin/env bash' 'exit 99' > "$UNRELATED/scripts/lib/verify.sh"
@@ -83,6 +84,15 @@ printf '%s\n' \
   'esac' > "$FAKE_BIN/curl"
 chmod +x "$FAKE_BIN/curl"
 
+# Invalid explicit ports must fail before helper resolution. This offline curl
+# records any mistaken helper download rather than allowing test fixtures to
+# hide an ordering regression.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "curl %s\\n" "$*" >> "$FIXTURE_OFFLINE_CURL_LOG"' \
+  'exit 97' > "$OFFLINE_BIN/curl"
+chmod +x "$OFFLINE_BIN/curl"
+
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -eu' \
@@ -121,8 +131,8 @@ printf '%s\n' \
   'metrics_http_port = 7080' > "$HOME_DIR/.drover/config.toml"
 
 run_piped_install() {
-  local home="$1" url="$2"
-  /bin/cat "$REPO/install.sh" | HOME="$home" PATH="$FAKE_BIN:$PATH" \
+  local home="$1" url="$2" bin="${3:-$FAKE_BIN}"
+  /bin/cat "$REPO/install.sh" | HOME="$home" PATH="$bin:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS=linux \
     bash -s -- --version 0.0.0 --url "$url" 2>&1
 }
@@ -150,14 +160,18 @@ check_invalid_port() {
   local port="$1" label="$2"
   local home="$REMOTE/invalid port $label home"
   local uv_log="$REMOTE/invalid port $label uv.log"
+  local curl_log="$REMOTE/invalid port $label curl.log"
   local output result
   mkdir -p "$home"
   export FIXTURE_UV_LOG="$uv_log"
-  output="$(cd "$UNRELATED" && run_piped_install "$home" "100.64.0.10:$port")"
+  export FIXTURE_OFFLINE_CURL_LOG="$curl_log"
+  output="$(cd "$UNRELATED" && run_piped_install "$home" "100.64.0.10:$port" "$OFFLINE_BIN")"
   result=$?
   check_status "invalid $label port is rejected" "$result" "1"
   check_contains "invalid $label port explains the accepted range" \
     <(printf '%s' "$output") 'integer from 1 to 65535'
+  check_absent "invalid $label port does not attempt an offline helper download" \
+    "$( [ -e "$curl_log" ] && echo exists || echo absent )" 'exists'
   check_absent "invalid $label port does not create a runtime" \
     "$( [ -e "$home/.drover/runtime" ] && echo exists || echo absent )" 'exists'
   check_absent "invalid $label port does not write config" \

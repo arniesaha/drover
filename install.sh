@@ -21,6 +21,27 @@ success() { printf '%s✓ %s%s\n' "$GREEN" "$1" "$NC"; }
 warn()    { printf '%s⚠ %s%s\n' "$YELLOW" "$1" "$NC"; }
 fail()    { printf '%s✗ %s%s\n' "$RED" "$1" "$NC" >&2; exit 1; }
 
+validate_explicit_port() {
+  [ -n "$EXPLICIT_URL" ] || return 0
+  local address port port_value
+  address="${EXPLICIT_URL#http://}"; address="${address#https://}"
+  case "$address" in
+    *:*)
+      port="${address#*:}"
+      # A TOML integer cannot preserve a leading-zero port, and a port outside
+      # this range cannot name the listener that the config and unit advertise.
+      case "$port" in
+        ''|0|0[0-9]*|*[!0-9]*|??????*)
+          fail "--url port must be an integer from 1 to 65535 (got: $port)" ;;
+      esac
+      port_value=$((10#$port))
+      if [ "$port_value" -gt 65535 ]; then
+        fail "--url port must be an integer from 1 to 65535 (got: $port)"
+      fi
+      ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --join)    JOIN_URL="${2:-}"; shift 2 ;;
@@ -34,6 +55,10 @@ while [ $# -gt 0 ]; do
     *) fail "unknown flag: $1" ;;
   esac
 done
+
+# Port syntax needs no helper library. Check it before a piped installer would
+# fetch or source helpers, so an invalid invocation is deterministic offline.
+validate_explicit_port
 
 OS="${DROVER_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 case "$OS" in
@@ -139,25 +164,9 @@ parse_join_url() {
 # refusal would print and the install would carry on with a public address.
 validate_explicit_url() {
   [ -n "$EXPLICIT_URL" ] || return 0
-  local address host port port_value
+  local address host
   address="${EXPLICIT_URL#http://}"; address="${address#https://}"
-  case "$address" in
-    *:*)
-      host="${address%%:*}"
-      port="${address#*:}"
-      # A TOML integer cannot preserve a leading-zero port, and a port outside
-      # this range cannot name the listener that the config and unit advertise.
-      case "$port" in
-        ''|0|0[0-9]*|*[!0-9]*|??????*)
-          fail "--url port must be an integer from 1 to 65535 (got: $port)" ;;
-      esac
-      port_value=$((10#$port))
-      if [ "$port_value" -gt 65535 ]; then
-        fail "--url port must be an integer from 1 to 65535 (got: $port)"
-      fi
-      ;;
-    *) host="$address" ;;
-  esac
+  host="${address%%:*}"
   is_private_address "$host" \
     || fail "$host is not a private address; Drover must not be published publicly"
 }
