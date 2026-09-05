@@ -938,6 +938,121 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
     } == existing_children
 
 
+def test_setup_check_bounds_large_request_transfer_before_child_receive(
+    tmp_path, monkeypatch, capsys
+):
+    """A child delayed before receive cannot block private request transfer past timeout."""
+    marker = tmp_path / "receive-started"
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        textwrap.dedent("""\
+            import os
+            import sys
+            import time
+            from pathlib import Path
+
+            if os.environ.get("DROVER_SETUP_CHECK_DELAY_STDIN") == "1":
+                marker = Path(os.environ["DROVER_SETUP_CHECK_STDIN_MARKER"])
+                original_stdin = sys.stdin
+
+                class DelayedBuffer:
+                    def read(self, *args, **kwargs):
+                        marker.write_text(str(os.getpid()), encoding="utf-8")
+                        time.sleep(2)
+                        return original_stdin.buffer.read(*args, **kwargs)
+
+                class DelayedStdin:
+                    buffer = DelayedBuffer()
+
+                sys.stdin = DelayedStdin()
+            """),
+        encoding="utf-8",
+    )
+    private_body = b"private-request-body-" + (b"x" * (24 * 1024))
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))),
+    )
+    monkeypatch.setenv("DROVER_SETUP_CHECK_DELAY_STDIN", "1")
+    monkeypatch.setenv("DROVER_SETUP_CHECK_STDIN_MARKER", str(marker))
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        server_main._setup_check_http_request(
+            "http://127.0.0.1:1/private-request-url",
+            "POST",
+            private_body,
+            {"Authorization": "Bearer private-request-token"},
+            deadline=started + 0.5,
+            max_response_bytes=None,
+        )
+
+    assert marker.exists()
+    assert time.monotonic() - started < 0.8
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text(encoding="utf-8")), 0)
+    captured = capsys.readouterr()
+    assert "private-request-body" not in captured.out + captured.err
+    assert "private-request-token" not in captured.out + captured.err
+
+
+def test_setup_check_rejects_oversized_private_request_before_starting_worker(
+    capsys,
+):
+    """Pathological request bytes are classified before any worker input can block."""
+    private_body = b"private-request-body-" + (b"x" * (64 * 1024))
+    started = time.monotonic()
+
+    with pytest.raises(ValueError, match="request exceeds"):
+        server_main._setup_check_http_request(
+            "http://127.0.0.1:1/private-request-url",
+            "POST",
+            private_body,
+            {"Authorization": "Bearer private-request-token"},
+            deadline=started + 0.5,
+            max_response_bytes=None,
+        )
+
+    assert time.monotonic() - started < 0.1
+    captured = capsys.readouterr()
+    assert "private-request-body" not in captured.out + captured.err
+    assert "private-request-token" not in captured.out + captured.err
+
+
+def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch):
+    """An oversized configured token becomes the fixed report without a subprocess."""
+    cfg = replace(
+        default_config(),
+        auth_api_token="private-token-" + ("x" * (64 * 1024)),
+    )
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        server_main, "_setup_check_liveness", lambda *args, **kwargs: True
+    )
+    started = time.monotonic()
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "codex",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert time.monotonic() - started < 0.3
+    assert json.loads(result.output)["ready"] is False
+    assert "private-token" not in result.output
+    assert "private-host" not in result.output
+    assert "/private/project" not in result.output
+
+
 def test_setup_check_control_redirect_does_not_reach_second_origin():
     """A redirect response cannot forward the local API credential to another host."""
     redirect_origin_headers: list[dict[str, str]] = []
