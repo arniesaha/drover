@@ -15,6 +15,7 @@ import DroverKit
 /// everything else.
 struct SettingsView: View {
     var environment: AppEnvironment
+    var onTryDemo: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
 
     @State private var urlString = ""
@@ -109,6 +110,7 @@ struct SettingsView: View {
                 }
 
                 saveButton
+                demoButton
                 supportLinks
 
                 // Credential-deletion and local-cleanup failures retain an
@@ -234,6 +236,32 @@ struct SettingsView: View {
         .buttonStyle(.plain)
         .disabled(!canSave)
         .accessibilityIdentifier("settings-save")
+    }
+
+    private var demoButton: some View {
+        Button(action: onTryDemo) {
+            HStack(spacing: 9) {
+                Image(systemName: "play.circle")
+                    .font(.system(size: 15, weight: .medium))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Try Demo").droverText(.h3)
+                    Text("Explore a local sample fleet without changing this connection.")
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.faint)
+                }
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(DroverColor.accentHi)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.line, lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("settings-try-demo")
     }
 
     /// Public policy and support are available before a host is configured,

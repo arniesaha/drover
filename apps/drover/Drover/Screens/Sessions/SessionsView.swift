@@ -33,6 +33,9 @@ struct SessionsView: View {
     private let chatModelFactory: ChatModelFactory?
     private let defaults: UserDefaults
     private let onOpenSettings: () -> Void
+    /// A demo may display synthetic session IDs that collide with a pending
+    /// real push route. Leave the shared route untouched while isolated.
+    private let notificationRoutingEnabled: Bool
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
     @State private var showLaunch = false
@@ -49,6 +52,7 @@ struct SessionsView: View {
         recoveryGeneration: Int,
         chatModelFactory: ChatModelFactory? = nil,
         defaults: UserDefaults = .standard,
+        notificationRoutingEnabled: Bool = true,
         onOpenSettings: @escaping () -> Void = {}
     ) {
         self.client = client
@@ -58,6 +62,7 @@ struct SessionsView: View {
         self.recoveryGeneration = recoveryGeneration
         self.chatModelFactory = chatModelFactory
         self.defaults = defaults
+        self.notificationRoutingEnabled = notificationRoutingEnabled
         self.onOpenSettings = onOpenSettings
         _store = State(initialValue: SessionStore(client: client))
         _cockpitStore = State(initialValue: CockpitStore(client: client))
@@ -461,6 +466,7 @@ struct SessionsView: View {
     /// snapshot: a cold launch delivers the tap before the first poll returns,
     /// and dropping it there would strand the user on the list.
     private func openSessionFromNotification() {
+        guard notificationRoutingEnabled else { return }
         guard let pending = NotificationRoute.shared.pendingSessionID else { return }
         guard let session = store.snapshot?.sessions.first(where: { $0.id == pending }) else {
             return

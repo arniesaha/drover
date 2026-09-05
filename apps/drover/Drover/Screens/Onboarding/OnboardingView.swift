@@ -22,6 +22,7 @@ enum OnboardingStep: Int, CaseIterable, Identifiable, Sendable {
 struct OnboardingView: View {
     var environment: AppEnvironment
     var onFinished: () -> Void = {}
+    var onTryDemo: () -> Void = {}
 
     @State private var step: OnboardingStep = .welcome
     @State private var selectedSetupMode: ServerSetupMode = .hub
@@ -158,6 +159,26 @@ struct OnboardingView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("onboarding-setup-drover-button")
+
+                    Button(action: onTryDemo) {
+                        VStack(spacing: 4) {
+                            Text("Try Demo")
+                                .font(.system(.subheadline, design: .default, weight: .medium))
+                            Text("Explore a local sample fleet. No account or server is used.")
+                                .font(.system(.caption, design: .default))
+                                .multilineTextAlignment(.center)
+                        }
+                        .foregroundStyle(DroverColor.accentHi)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(DroverColor.line, lineWidth: 1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("onboarding-try-demo")
 
                     Button {
                         withAnimation(.easeInOut(duration: 0.25)) {
