@@ -20,6 +20,7 @@ struct SettingsView: View {
     @State private var urlString = ""
     @State private var token = ""
     @State private var isValidating = false
+    @State private var isSigningOut = false
     @State private var statusMessage: String?
     @State private var statusIsError = false
     @State private var showSignOutConfirmation = false
@@ -106,8 +107,10 @@ struct SettingsView: View {
 
                 saveButton
 
-                // Only offered once there is something to sign out of.
-                if environment.client != nil {
+                // Credential-deletion and local-cleanup failures retain an
+                // explicit retry path even after the app disconnects.
+                if environment.client != nil || environment.hasTokenConfigured
+                    || environment.hasPendingLocalCleanup {
                     signOutButton
                 }
             }
@@ -247,6 +250,7 @@ struct SettingsView: View {
                 }
         }
         .buttonStyle(.plain)
+        .disabled(isSigningOut)
         .accessibilityIdentifier("settings-sign-out")
         .confirmationDialog(
             "Sign out of this fleet?",
@@ -254,12 +258,9 @@ struct SettingsView: View {
             titleVisibility: .visible
         ) {
             Button("Sign Out", role: .destructive) {
-                environment.signOut()
-                token = ""
-                urlString = ""
-                statusMessage = nil
-                dismiss()
+                Task { await performSignOut() }
             }
+            .disabled(isSigningOut)
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
@@ -271,7 +272,7 @@ struct SettingsView: View {
     }
 
     private var canSave: Bool {
-        !isValidating && !urlString.isEmpty && !token.isEmpty
+        !isValidating && !isSigningOut && !urlString.isEmpty && !token.isEmpty
     }
 
     private func testAndSave() async {
@@ -281,13 +282,34 @@ struct SettingsView: View {
         isValidating = false
         switch outcome {
         case .success:
-            statusIsError = false
-            statusMessage = "Saved."
             token = ""
-            dismiss()
+            if let recoveryStatusMessage = environment.recoveryStatusMessage {
+                statusIsError = true
+                statusMessage = recoveryStatusMessage
+            } else {
+                statusIsError = false
+                statusMessage = "Saved."
+                dismiss()
+            }
         case .failure(let message):
             statusIsError = true
             statusMessage = message
+        }
+    }
+
+    private func performSignOut() async {
+        isSigningOut = true
+        statusMessage = nil
+        do {
+            try await environment.signOut()
+            isSigningOut = false
+            token = ""
+            urlString = ""
+            dismiss()
+        } catch {
+            isSigningOut = false
+            statusIsError = true
+            statusMessage = environment.recoveryStatusMessage ?? error.localizedDescription
         }
     }
 }

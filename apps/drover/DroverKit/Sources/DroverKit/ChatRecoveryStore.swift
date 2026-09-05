@@ -1,0 +1,560 @@
+import CryptoKit
+import Foundation
+
+public struct ChatRecoveryLimits: Sendable, Equatable {
+    public let maximumDraftBytes: Int
+    public let maximumCompositionAttachmentBytes: Int
+    public let maximumTotalBytes: Int
+    public let maximumUnresolvedRecords: Int
+    public let maximumDraftAge: TimeInterval
+
+    public init(
+        maximumDraftBytes: Int,
+        maximumCompositionAttachmentBytes: Int,
+        maximumTotalBytes: Int,
+        maximumUnresolvedRecords: Int,
+        maximumDraftAge: TimeInterval
+    ) {
+        self.maximumDraftBytes = maximumDraftBytes
+        self.maximumCompositionAttachmentBytes = maximumCompositionAttachmentBytes
+        self.maximumTotalBytes = maximumTotalBytes
+        self.maximumUnresolvedRecords = maximumUnresolvedRecords
+        self.maximumDraftAge = maximumDraftAge
+    }
+
+    public static let `default` = ChatRecoveryLimits(
+        maximumDraftBytes: 64 * 1024,
+        maximumCompositionAttachmentBytes: 6 * 1024 * 1024,
+        maximumTotalBytes: 24 * 1024 * 1024,
+        maximumUnresolvedRecords: 3,
+        maximumDraftAge: 7 * 24 * 60 * 60
+    )
+}
+
+public enum ChatRecoveryError: Error, Equatable, Sendable {
+    case quotaExceeded
+    case storageUnavailable
+    case invalidRecord
+}
+
+/// Exact recovery scope. Only a digest of this value reaches the filesystem.
+public struct ChatRecoveryKey: Sendable, Equatable, Hashable {
+    public let credentialBindingID: UUID
+    public let sessionID: String
+    private let normalizedServerURL: String
+
+    public init(serverURL: URL, credentialBindingID: UUID, sessionID: String) {
+        self.credentialBindingID = credentialBindingID
+        self.sessionID = sessionID
+        normalizedServerURL = RecoveryBindingStore.normalizedServerURL(serverURL)
+    }
+
+    fileprivate var filename: String {
+        let scope = "\(normalizedServerURL)\u{1F}\(credentialBindingID.uuidString)\u{1F}\(sessionID)"
+        return SHA256.hash(data: Data(scope.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// A recovery attachment keeps its raw bytes in memory only. Codable metadata
+/// contains the opaque ID and MIME type; `ChatRecoveryStore` writes the bytes
+/// to a protected sibling file and rehydrates them on load.
+public struct RecoveredTurnAttachment: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let mediaType: String
+    public var data: Data
+
+    public init(id: UUID = UUID(), mediaType: String, data: Data) {
+        self.id = id
+        self.mediaType = mediaType
+        self.data = data
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case mediaType
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        mediaType = try container.decode(String.self, forKey: .mediaType)
+        data = Data()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(mediaType, forKey: .mediaType)
+    }
+}
+
+public struct RecoveredDeferredTurn: Codable, Equatable, Sendable {
+    public var text: String
+    public var attachments: [RecoveredTurnAttachment]
+
+    public init(text: String, attachments: [RecoveredTurnAttachment] = []) {
+        self.text = text
+        self.attachments = attachments
+    }
+}
+
+public struct RecoveredPendingTurn: Codable, Equatable, Sendable {
+    public var clientTurnID: UUID
+    public var text: String
+    public var attachments: [RecoveredTurnAttachment]
+
+    public init(clientTurnID: UUID, text: String, attachments: [RecoveredTurnAttachment] = []) {
+        self.clientTurnID = clientTurnID
+        self.text = text
+        self.attachments = attachments
+    }
+}
+
+public struct ChatRecoverySnapshot: Codable, Equatable, Sendable {
+    private static let version = 1
+
+    public var draftText: String
+    public var draftAttachments: [RecoveredTurnAttachment]
+    public var deferredTurn: RecoveredDeferredTurn?
+    public var pendingTurn: RecoveredPendingTurn?
+    public var updatedAt: Date
+
+    public init(
+        draftText: String,
+        draftAttachments: [RecoveredTurnAttachment] = [],
+        deferredTurn: RecoveredDeferredTurn? = nil,
+        pendingTurn: RecoveredPendingTurn? = nil,
+        updatedAt: Date = .now
+    ) {
+        self.draftText = draftText
+        self.draftAttachments = draftAttachments
+        self.deferredTurn = deferredTurn
+        self.pendingTurn = pendingTurn
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case draftText
+        case draftAttachments
+        case deferredTurn
+        case pendingTurn
+        case updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        guard try container.decode(Int.self, forKey: .version) == Self.version else {
+            throw ChatRecoveryError.invalidRecord
+        }
+        draftText = try container.decode(String.self, forKey: .draftText)
+        draftAttachments = try container.decode([RecoveredTurnAttachment].self, forKey: .draftAttachments)
+        deferredTurn = try container.decodeIfPresent(RecoveredDeferredTurn.self, forKey: .deferredTurn)
+        pendingTurn = try container.decodeIfPresent(RecoveredPendingTurn.self, forKey: .pendingTurn)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(Self.version, forKey: .version)
+        try container.encode(draftText, forKey: .draftText)
+        try container.encode(draftAttachments, forKey: .draftAttachments)
+        try container.encodeIfPresent(deferredTurn, forKey: .deferredTurn)
+        try container.encodeIfPresent(pendingTurn, forKey: .pendingTurn)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
+}
+
+public protocol ChatRecoveryPersisting: Sendable {
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot?
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws
+    func remove(for key: ChatRecoveryKey) async throws
+    func purge(bindingID: UUID) async throws
+    func sweep(keeping bindingIDs: Set<UUID>) async throws
+}
+
+/// A bounded, protected local store. It has no server identity in filenames or
+/// record bodies; a private index maps opaque record digests to a binding UUID
+/// solely so disconnect and orphan cleanup can be exact.
+public actor ChatRecoveryStore: ChatRecoveryPersisting {
+    private static let indexFilename = "recovery-index.json"
+    private static let recordExtension = "record"
+    private static let attachmentExtension = "attachment"
+    private static let indexVersion = 1
+
+    private let root: URL
+    private let limits: ChatRecoveryLimits
+    private let fileManager = FileManager.default
+
+    public init(root: URL, limits: ChatRecoveryLimits = .default) {
+        self.root = root
+        self.limits = limits
+    }
+
+    public func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? {
+        try prepareRoot()
+        let filename = key.filename
+        var index = try loadIndexOrReset()
+        guard let entry = index.records[filename], entry.bindingID == key.credentialBindingID else {
+            return nil
+        }
+
+        do {
+            let data = try Data(contentsOf: recordURL(filename))
+            var snapshot = try JSONDecoder().decode(ChatRecoverySnapshot.self, from: data)
+            try hydrate(&snapshot, filename: filename)
+            try validate(snapshot)
+            return snapshot
+        } catch is DecodingError {
+            try removeRecord(filename, from: &index)
+            return nil
+        } catch ChatRecoveryError.invalidRecord {
+            try removeRecord(filename, from: &index)
+            return nil
+        } catch {
+            throw ChatRecoveryError.storageUnavailable
+        }
+    }
+
+    public func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
+        try prepareRoot()
+        try validate(snapshot)
+        var index = try loadIndexOrReset()
+        let filename = key.filename
+        let encodedSnapshot: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            encodedSnapshot = try encoder.encode(snapshot)
+        } catch {
+            throw ChatRecoveryError.invalidRecord
+        }
+
+        let expired = expiredDraftFilenames(in: index, excluding: filename)
+        let pendingCount = index.records.reduce(into: 0) { count, element in
+            let (existingFilename, entry) = element
+            if existingFilename != filename,
+               !expired.contains(existingFilename),
+               entry.bindingID == key.credentialBindingID,
+               entry.hasPendingTurn {
+                count += 1
+            }
+        } + (snapshot.pendingTurn == nil ? 0 : 1)
+        guard pendingCount <= limits.maximumUnresolvedRecords else {
+            throw ChatRecoveryError.quotaExceeded
+        }
+
+        let existingBytes = try totalRecoveryBytes()
+        let replacedBytes = try recordBytes(filename)
+        let expiredBytes = try expired.reduce(0) { partial, staleFilename in
+            partial + (try recordBytes(staleFilename))
+        }
+        let proposedBytes = encodedSnapshot.count + attachmentBytes(in: snapshot)
+        guard existingBytes - replacedBytes - expiredBytes + proposedBytes <= limits.maximumTotalBytes else {
+            throw ChatRecoveryError.quotaExceeded
+        }
+
+        for staleFilename in expired {
+            try removeRecordFiles(staleFilename)
+            index.records.removeValue(forKey: staleFilename)
+        }
+
+        let attachments = allAttachments(in: snapshot)
+        var newlyWrittenAttachments: [URL] = []
+        do {
+            for attachment in attachments {
+                let url = attachmentURL(filename, attachmentID: attachment.id)
+                if fileManager.fileExists(atPath: url.path) {
+                    guard try Data(contentsOf: url) == attachment.data else {
+                        throw ChatRecoveryError.invalidRecord
+                    }
+                } else {
+                    try writeProtected(attachment.data, to: url)
+                    newlyWrittenAttachments.append(url)
+                }
+            }
+            try writeProtected(encodedSnapshot, to: recordURL(filename))
+            index.records[filename] = RecoveryIndexEntry(
+                bindingID: key.credentialBindingID,
+                updatedAt: snapshot.updatedAt,
+                hasPendingTurn: snapshot.pendingTurn != nil
+            )
+            try writeIndex(index)
+            try removeUnusedAttachments(filename, keeping: Set(attachments.map(\.id)))
+        } catch let error as ChatRecoveryError {
+            for url in newlyWrittenAttachments {
+                try? fileManager.removeItem(at: url)
+            }
+            throw error
+        } catch {
+            for url in newlyWrittenAttachments {
+                try? fileManager.removeItem(at: url)
+            }
+            throw ChatRecoveryError.storageUnavailable
+        }
+    }
+
+    public func remove(for key: ChatRecoveryKey) async throws {
+        try prepareRoot()
+        var index = try loadIndexOrReset()
+        let filename = key.filename
+        try removeRecordFiles(filename)
+        index.records.removeValue(forKey: filename)
+        try writeIndex(index)
+    }
+
+    public func purge(bindingID: UUID) async throws {
+        try prepareRoot()
+        var index = try loadIndexOrReset()
+        let filenames = index.records.compactMap { filename, entry in
+            entry.bindingID == bindingID ? filename : nil
+        }
+        for filename in filenames {
+            try removeRecordFiles(filename)
+            index.records.removeValue(forKey: filename)
+        }
+        try writeIndex(index)
+    }
+
+    public func sweep(keeping bindingIDs: Set<UUID>) async throws {
+        try prepareRoot()
+        var index = try loadIndexOrReset()
+        let expired = expiredDraftFilenames(in: index, excluding: nil)
+        let staleBindings = index.records.compactMap { filename, entry in
+            bindingIDs.contains(entry.bindingID) ? nil : filename
+        }
+        for filename in Set(expired).union(staleBindings) {
+            try removeRecordFiles(filename)
+            index.records.removeValue(forKey: filename)
+        }
+        try writeIndex(index)
+        try removeUnindexedRecoveryFiles(keeping: Set(index.records.keys))
+    }
+
+    private func prepareRoot() throws {
+        do {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+            try protect(root)
+        } catch {
+            throw ChatRecoveryError.storageUnavailable
+        }
+    }
+
+    private func validate(_ snapshot: ChatRecoverySnapshot) throws {
+        let editableIsPresent = !snapshot.draftText.isEmpty || !snapshot.draftAttachments.isEmpty
+        guard !(editableIsPresent && snapshot.deferredTurn != nil) else {
+            throw ChatRecoveryError.invalidRecord
+        }
+        try validateComposition(text: snapshot.draftText, attachments: snapshot.draftAttachments)
+        if let deferredTurn = snapshot.deferredTurn {
+            try validateComposition(text: deferredTurn.text, attachments: deferredTurn.attachments)
+        }
+        if let pendingTurn = snapshot.pendingTurn {
+            try validateComposition(text: pendingTurn.text, attachments: pendingTurn.attachments)
+        }
+        let ids = allAttachments(in: snapshot).map(\.id)
+        guard Set(ids).count == ids.count else {
+            throw ChatRecoveryError.invalidRecord
+        }
+    }
+
+    private func validateComposition(text: String, attachments: [RecoveredTurnAttachment]) throws {
+        guard text.lengthOfBytes(using: .utf8) <= limits.maximumDraftBytes,
+              attachments.count <= 4,
+              attachments.reduce(0, { $0 + $1.data.count }) <= limits.maximumCompositionAttachmentBytes else {
+            throw ChatRecoveryError.quotaExceeded
+        }
+    }
+
+    private func hydrate(_ snapshot: inout ChatRecoverySnapshot, filename: String) throws {
+        try hydrate(&snapshot.draftAttachments, filename: filename)
+        if snapshot.deferredTurn != nil {
+            try hydrate(&snapshot.deferredTurn!.attachments, filename: filename)
+        }
+        if snapshot.pendingTurn != nil {
+            try hydrate(&snapshot.pendingTurn!.attachments, filename: filename)
+        }
+    }
+
+    private func hydrate(_ attachments: inout [RecoveredTurnAttachment], filename: String) throws {
+        for index in attachments.indices {
+            let data = try Data(contentsOf: attachmentURL(filename, attachmentID: attachments[index].id))
+            attachments[index].data = data
+        }
+    }
+
+    private func allAttachments(in snapshot: ChatRecoverySnapshot) -> [RecoveredTurnAttachment] {
+        snapshot.draftAttachments
+            + (snapshot.deferredTurn?.attachments ?? [])
+            + (snapshot.pendingTurn?.attachments ?? [])
+    }
+
+    private func attachmentBytes(in snapshot: ChatRecoverySnapshot) -> Int {
+        allAttachments(in: snapshot).reduce(0) { $0 + $1.data.count }
+    }
+
+    private func expiredDraftFilenames(
+        in index: RecoveryIndex,
+        excluding excludedFilename: String?
+    ) -> Set<String> {
+        let cutoff = Date.now.addingTimeInterval(-limits.maximumDraftAge)
+        return Set(index.records.compactMap { filename, entry in
+            guard filename != excludedFilename,
+                  !entry.hasPendingTurn,
+                  entry.updatedAt < cutoff else {
+                return nil
+            }
+            return filename
+        })
+    }
+
+    private func loadIndexOrReset() throws -> RecoveryIndex {
+        let url = root.appendingPathComponent(Self.indexFilename)
+        guard fileManager.fileExists(atPath: url.path) else {
+            return RecoveryIndex(version: Self.indexVersion, records: [:])
+        }
+        do {
+            let index = try JSONDecoder().decode(RecoveryIndex.self, from: Data(contentsOf: url))
+            guard index.version == Self.indexVersion else { throw ChatRecoveryError.invalidRecord }
+            return index
+        } catch {
+            try removeAllRecoveryFiles()
+            return RecoveryIndex(version: Self.indexVersion, records: [:])
+        }
+    }
+
+    private func writeIndex(_ index: RecoveryIndex) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do {
+            try writeProtected(encoder.encode(index), to: root.appendingPathComponent(Self.indexFilename))
+        } catch let error as ChatRecoveryError {
+            throw error
+        } catch {
+            throw ChatRecoveryError.storageUnavailable
+        }
+    }
+
+    private func writeProtected(_ data: Data, to url: URL) throws {
+        let temporaryURL = root.appendingPathComponent(".\(UUID().uuidString).tmp")
+        do {
+            var options: Data.WritingOptions = [.withoutOverwriting]
+#if os(iOS)
+            // This applies NSFileProtectionComplete as the temporary file is
+            // created, before the payload bytes are written.
+            options.insert(.completeFileProtection)
+#endif
+            try data.write(to: temporaryURL, options: options)
+            try protect(temporaryURL)
+            if fileManager.fileExists(atPath: url.path) {
+                _ = try fileManager.replaceItemAt(url, withItemAt: temporaryURL)
+            } else {
+                try fileManager.moveItem(at: temporaryURL, to: url)
+            }
+            try protect(url)
+        } catch {
+            try? fileManager.removeItem(at: temporaryURL)
+            throw ChatRecoveryError.storageUnavailable
+        }
+    }
+
+    private func protect(_ url: URL) throws {
+        var protectedURL = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try protectedURL.setResourceValues(values)
+#if os(iOS)
+        try fileManager.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: url.path
+        )
+#endif
+    }
+
+    private func removeRecord(_ filename: String, from index: inout RecoveryIndex) throws {
+        try removeRecordFiles(filename)
+        index.records.removeValue(forKey: filename)
+        try writeIndex(index)
+    }
+
+    private func removeRecordFiles(_ filename: String) throws {
+        let record = recordURL(filename)
+        if fileManager.fileExists(atPath: record.path) {
+            try fileManager.removeItem(at: record)
+        }
+        let attachments = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("\(filename)-") && $0.pathExtension == Self.attachmentExtension }
+        for attachment in attachments {
+            try fileManager.removeItem(at: attachment)
+        }
+    }
+
+    private func removeUnusedAttachments(_ filename: String, keeping attachmentIDs: Set<UUID>) throws {
+        let attachments = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("\(filename)-") && $0.pathExtension == Self.attachmentExtension }
+        for attachment in attachments {
+            let idString = attachment.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "\(filename)-", with: "")
+            if UUID(uuidString: idString).map({ attachmentIDs.contains($0) }) != true {
+                try fileManager.removeItem(at: attachment)
+            }
+        }
+    }
+
+    private func removeUnindexedRecoveryFiles(keeping filenames: Set<String>) throws {
+        let files = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        for file in files where file.pathExtension == Self.recordExtension || file.pathExtension == Self.attachmentExtension {
+            let candidate = file.pathExtension == Self.recordExtension
+                ? file.deletingPathExtension().lastPathComponent
+                : String(file.lastPathComponent.prefix(64))
+            if !filenames.contains(candidate) {
+                try fileManager.removeItem(at: file)
+            }
+        }
+    }
+
+    private func removeAllRecoveryFiles() throws {
+        let files = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        for file in files {
+            try fileManager.removeItem(at: file)
+        }
+    }
+
+    private func totalRecoveryBytes() throws -> Int {
+        try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey])
+            .filter { $0.pathExtension == Self.recordExtension || $0.pathExtension == Self.attachmentExtension }
+            .reduce(0) { partial, url in
+                partial + (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+            }
+    }
+
+    private func recordBytes(_ filename: String) throws -> Int {
+        try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey])
+            .filter { $0.lastPathComponent == "\(filename).\(Self.recordExtension)"
+                || ($0.lastPathComponent.hasPrefix("\(filename)-")
+                    && $0.pathExtension == Self.attachmentExtension) }
+            .reduce(0) { partial, url in
+                partial + (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+            }
+    }
+
+    private func recordURL(_ filename: String) -> URL {
+        root.appendingPathComponent(filename).appendingPathExtension(Self.recordExtension)
+    }
+
+    private func attachmentURL(_ filename: String, attachmentID: UUID) -> URL {
+        root.appendingPathComponent("\(filename)-\(attachmentID.uuidString)")
+            .appendingPathExtension(Self.attachmentExtension)
+    }
+}
+
+private struct RecoveryIndex: Codable, Sendable {
+    let version: Int
+    var records: [String: RecoveryIndexEntry]
+}
+
+private struct RecoveryIndexEntry: Codable, Sendable {
+    let bindingID: UUID
+    let updatedAt: Date
+    let hasPendingTurn: Bool
+}

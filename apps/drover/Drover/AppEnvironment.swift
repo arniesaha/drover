@@ -45,24 +45,74 @@ final class AppEnvironment {
     /// `SessionStore` built from `client` can force-recreate it (SwiftUI
     /// `.id(_:)`) even when a client already existed before reconfiguring.
     private(set) var generation = 0
+    /// A non-secret local state for Settings. Connectivity remains available
+    /// when recovery metadata cannot be maintained, but the app must not
+    /// imply that drafts or unresolved deliveries will survive recreation.
+    private(set) var recoveryStatusMessage: String?
+    private(set) var hasPendingLocalCleanup = false
 
     private let defaults: UserDefaults
     private let tokenStore: TokenStore
+    private let recoveryBindingStore: RecoveryBindingStore
+    private let recoveryStore: (any ChatRecoveryPersisting)?
 
     init(
         defaults: UserDefaults = .standard,
         tokenStore: TokenStore = TokenStore(),
+        recoveryBindingStore: RecoveryBindingStore? = nil,
+        recoveryStore: (any ChatRecoveryPersisting)? = nil,
         launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.defaults = defaults
         self.tokenStore = tokenStore
+        let resolvedBindingStore = recoveryBindingStore
+            ?? RecoveryBindingStore(service: tokenStore.service)
+        self.recoveryBindingStore = resolvedBindingStore
+        self.recoveryStore = recoveryStore ?? Self.defaultRecoveryStore()
         if UITestOverrides.shouldResetAuthentication(environment: launchEnvironment) {
             try? tokenStore.delete()
+            try? resolvedBindingStore.clear()
             defaults.removeObject(forKey: ServerConfig.defaultsKey)
         }
-        if let built = ClientFactory.make(defaults: defaults, tokenStore: tokenStore) {
+        let savedConfig = ServerConfig.load(defaults: defaults)
+        let savedToken = tokenStore.load()
+        let startupBindingID: UUID?
+        let shouldSweepRecovery: Bool
+        if let savedConfig, let savedToken {
+            do {
+                startupBindingID = try resolvedBindingStore.binding(
+                    forToken: savedToken,
+                    serverURL: savedConfig.baseURL,
+                    rotate: false
+                )
+                shouldSweepRecovery = true
+            } catch {
+                // Keychain access can be unavailable while the device is
+                // locked. Preserve recovery files until this foreground path
+                // can authenticate their binding again.
+                startupBindingID = nil
+                shouldSweepRecovery = false
+                recoveryStatusMessage = "Chat recovery is unavailable until protected local storage can be read."
+            }
+        } else {
+            startupBindingID = nil
+            // A saved endpoint without a readable token is ambiguous (for
+            // example, a locked Keychain), so it must not orphan-purge files.
+            shouldSweepRecovery = savedConfig == nil
+        }
+        if let built = ClientFactory.make(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            credentialBindingID: startupBindingID
+        ) {
             client = built.client
             config = built.config
+        }
+        let bindings = client?.credentialBindingID.map { Set([$0]) } ?? []
+        if shouldSweepRecovery, let recoveryStore = self.recoveryStore {
+            Task {
+                try? await recoveryStore.sweep(keeping: bindings)
+            }
         }
     }
 
@@ -94,16 +144,53 @@ final class AppEnvironment {
             return .failure(failure)
         }
 
-        newConfig.save(defaults: defaults)
         do {
             try tokenStore.save(trimmedToken)
         } catch {
             return .failure("Could not save token to Keychain.")
         }
 
+        let oldBindingID = client?.credentialBindingID
+        let bindingID: UUID?
+        do {
+            let createdBindingID = try recoveryBindingStore.binding(
+                forToken: trimmedToken,
+                serverURL: newConfig.baseURL,
+                rotate: true
+            )
+            guard try recoveryBindingStore.binding(
+                forToken: trimmedToken,
+                serverURL: newConfig.baseURL,
+                rotate: false
+            ) == createdBindingID else {
+                throw ChatRecoveryError.storageUnavailable
+            }
+            bindingID = createdBindingID
+            recoveryStatusMessage = nil
+        } catch {
+            // Do not retain a prior namespace for an explicitly reconfigured
+            // credential. Normal requests remain available without a binding.
+            try? recoveryBindingStore.clear()
+            bindingID = nil
+            recoveryStatusMessage = "Chat recovery is unavailable until local storage can be repaired."
+        }
+
+        newConfig.save(defaults: defaults)
         config = newConfig
-        client = DroverClient(config: newConfig, token: trimmedToken)
+        client = DroverClient(
+            config: newConfig,
+            token: trimmedToken,
+            credentialBindingID: bindingID
+        )
         generation += 1
+        if let oldBindingID, oldBindingID != bindingID {
+            do {
+                try await recoveryStore?.purge(bindingID: oldBindingID)
+            } catch {
+                hasPendingLocalCleanup = true
+                recoveryStatusMessage = "Connected, but previous chat recovery is still pending local cleanup."
+            }
+        }
         return .success
     }
 
@@ -119,13 +206,86 @@ final class AppEnvironment {
     ///
     /// Everything a fresh install lacks is cleared, so the next pairing
     /// cannot inherit half the old configuration.
-    func signOut() {
-        try? tokenStore.delete()
-        defaults.removeObject(forKey: ServerConfig.defaultsKey)
+    func signOut() async throws {
+        let previousConfig = config
+        let previousBindingID = client?.credentialBindingID
+        // Drop the app's foreground connection before its first suspension so
+        // no visible UI or new background work can use this credential.
         client = nil
         config = nil
-        // Bump so a view holding a store built from the old client rebuilds
-        // rather than rendering against a dead one.
         generation += 1
+
+        do {
+            try tokenStore.delete()
+        } catch {
+            // Keep the server endpoint for a truthful retry path. The client
+            // stays disconnected until the credential deletion succeeds.
+            config = previousConfig
+            recoveryStatusMessage = "Could not remove the token from the Keychain. Sign out is incomplete; try again."
+            throw SignOutError.credentialDeletion
+        }
+
+        defaults.removeObject(forKey: ServerConfig.defaultsKey)
+        var cleanupFailed = false
+        do {
+            try recoveryBindingStore.clear()
+        } catch {
+            cleanupFailed = true
+        }
+
+        var bindingsToPurge = pendingCleanupBindingIDs
+        if let previousBindingID {
+            bindingsToPurge.insert(previousBindingID)
+        }
+        for bindingID in bindingsToPurge {
+            do {
+                try await recoveryStore?.purge(bindingID: bindingID)
+            } catch {
+                cleanupFailed = true
+            }
+        }
+
+        if cleanupFailed {
+            pendingCleanupBindingIDs = bindingsToPurge
+            hasPendingLocalCleanup = true
+            recoveryStatusMessage = "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
+            throw SignOutError.localCleanupPending
+        }
+
+        pendingCleanupBindingIDs.removeAll()
+        hasPendingLocalCleanup = false
+        recoveryStatusMessage = nil
+    }
+
+    private var pendingCleanupBindingIDs = Set<UUID>()
+
+    private static func defaultRecoveryStore() -> (any ChatRecoveryPersisting)? {
+        guard let applicationSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else {
+            return nil
+        }
+        return ChatRecoveryStore(
+            root: applicationSupport
+                .appendingPathComponent("Drover", isDirectory: true)
+                .appendingPathComponent("ChatRecovery", isDirectory: true)
+        )
+    }
+}
+
+private enum SignOutError: LocalizedError {
+    case credentialDeletion
+    case localCleanupPending
+
+    var errorDescription: String? {
+        switch self {
+        case .credentialDeletion:
+            return "Could not remove the token from the Keychain. Sign out is incomplete; try again."
+        case .localCleanupPending:
+            return "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
+        }
     }
 }

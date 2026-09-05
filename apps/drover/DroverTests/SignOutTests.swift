@@ -20,15 +20,26 @@ final class SignOutTests: XCTestCase {
     private func withEnvironment(
         configured: Bool = true,
         launchEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        _ body: (AppEnvironment, TokenStore, UserDefaults) throws -> Void
-    ) rethrows {
+        _ body: @MainActor (AppEnvironment, TokenStore, UserDefaults, ChatRecoveryStore, URL) async throws -> Void
+    ) async throws {
         let suiteName = "drover.signout.\(UUID().uuidString)"
         let service = "drover-signout-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         let store = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let root = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("DroverSignOutTests-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let recovery = ChatRecoveryStore(root: root)
         defer {
             try? store.delete()
+            try? bindingStore.clear()
             defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
         }
 
         if configured {
@@ -38,30 +49,32 @@ final class SignOutTests: XCTestCase {
         let environment = AppEnvironment(
             defaults: defaults,
             tokenStore: store,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recovery,
             launchEnvironment: launchEnvironment
         )
-        try body(environment, store, defaults)
+        try await body(environment, store, defaults, recovery, root)
     }
 
-    func testSignOutClearsTheToken() throws {
-        try withEnvironment { environment, store, _ in
+    func testSignOutClearsTheToken() async throws {
+        try await withEnvironment { environment, store, _, _, _ in
             try XCTSkipUnless(
                 environment.hasTokenConfigured,
                 "Keychain unavailable in this test host"
             )
 
-            environment.signOut()
+            try await environment.signOut()
 
             XCTAssertNil(store.load())
             XCTAssertFalse(environment.hasTokenConfigured)
         }
     }
 
-    func testSignOutDropsTheClientSoTheAppReturnsToOnboarding() throws {
-        try withEnvironment { environment, _, _ in
+    func testSignOutDropsTheClientSoTheAppReturnsToOnboarding() async throws {
+        try await withEnvironment { environment, _, _, _, _ in
             try XCTSkipUnless(environment.client != nil, "Keychain unavailable")
 
-            environment.signOut()
+            try await environment.signOut()
 
             XCTAssertNil(
                 environment.client, "a live client would keep the inbox showing"
@@ -70,28 +83,28 @@ final class SignOutTests: XCTestCase {
         }
     }
 
-    func testSignOutForgetsTheServerURL() {
-        withEnvironment { environment, _, defaults in
+    func testSignOutForgetsTheServerURL() async throws {
+        try await withEnvironment { environment, _, defaults, _, _ in
             XCTAssertNotNil(ServerConfig.load(defaults: defaults))
 
-            environment.signOut()
+            try await environment.signOut()
 
             XCTAssertNil(ServerConfig.load(defaults: defaults))
         }
     }
 
-    func testSignOutBumpsGenerationSoViewsRebuild() {
-        withEnvironment { environment, _, _ in
+    func testSignOutBumpsGenerationSoViewsRebuild() async throws {
+        try await withEnvironment { environment, _, _, _, _ in
             let before = environment.generation
-            environment.signOut()
+            try await environment.signOut()
             XCTAssertGreaterThan(environment.generation, before)
         }
     }
 
-    func testSignOutIsIdempotent() {
-        withEnvironment { environment, _, defaults in
-            environment.signOut()
-            environment.signOut()
+    func testSignOutIsIdempotent() async throws {
+        try await withEnvironment { environment, _, defaults, _, _ in
+            try await environment.signOut()
+            try await environment.signOut()
 
             XCTAssertNil(environment.client)
             XCTAssertNil(ServerConfig.load(defaults: defaults))
@@ -99,21 +112,108 @@ final class SignOutTests: XCTestCase {
         }
     }
 
-    func testSignOutOnAnUnconfiguredAppIsHarmless() {
-        withEnvironment(configured: false) { environment, _, _ in
-            environment.signOut()
+    func testSignOutOnAnUnconfiguredAppIsHarmless() async throws {
+        try await withEnvironment(configured: false) { environment, _, _, _, _ in
+            try await environment.signOut()
             XCTAssertNil(environment.client)
         }
     }
 
-    func testUITestResetLaunchClearsPersistedAuthenticationBeforeLoading() throws {
-        try withEnvironment(
+    func testUITestResetLaunchClearsPersistedAuthenticationBeforeLoading() async throws {
+        try await withEnvironment(
             launchEnvironment: ["DROVER_UI_TEST_RESET_AUTH": "1"]
-        ) { environment, store, defaults in
+        ) { environment, store, defaults, _, _ in
             XCTAssertNil(store.load(), "the UI-test credential must leave Keychain at launch")
             XCTAssertNil(ServerConfig.load(defaults: defaults))
             XCTAssertNil(environment.client)
             XCTAssertNil(environment.config)
         }
     }
+
+    func testSignOutPurgesOnlyTheOldCredentialBinding() async throws {
+        try await withEnvironment { environment, _, _, recovery, _ in
+            let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
+            let key = ChatRecoveryKey(
+                serverURL: URL(string: "http://127.0.0.1:7080")!,
+                credentialBindingID: bindingID,
+                sessionID: "synthetic-session"
+            )
+            try await recovery.save(ChatRecoverySnapshot(draftText: "synthetic draft"), for: key)
+
+            try await environment.signOut()
+
+            let restored = try await recovery.load(for: key)
+            XCTAssertNil(restored)
+        }
+    }
+
+    func testRecoveryFilesAreNoBackupAndCompleteProtection() async throws {
+        try await withEnvironment { environment, _, _, recovery, root in
+            let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
+            let key = ChatRecoveryKey(
+                serverURL: URL(string: "http://127.0.0.1:7080")!,
+                credentialBindingID: bindingID,
+                sessionID: "synthetic-session"
+            )
+            try await recovery.save(ChatRecoverySnapshot(draftText: "synthetic draft"), for: key)
+            let children = try FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: nil
+            )
+            let protectedURLs = [root] + children
+            for url in protectedURLs {
+                let resources = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
+                XCTAssertEqual(resources.isExcludedFromBackup, true, url.lastPathComponent)
+#if !targetEnvironment(simulator)
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                XCTAssertEqual(attributes[.protectionKey] as? FileProtectionType, .complete, url.lastPathComponent)
+#endif
+            }
+        }
+    }
+
+    func testSignOutReportsPendingCleanupAfterPurgeFailure() async throws {
+        let suiteName = "drover.signout.failure.\(UUID().uuidString)"
+        let service = "drover-signout-failure-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let recoveryStore = FailingPurgeRecoveryStore()
+        defer {
+            try? tokenStore.delete()
+            try? bindingStore.clear()
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        try tokenStore.save("existing-token")
+        ServerConfig(urlString: "http://127.0.0.1:7080")!.save(defaults: defaults)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recoveryStore,
+            launchEnvironment: [:]
+        )
+        try XCTSkipUnless(environment.client?.credentialBindingID != nil, "Keychain unavailable")
+
+        do {
+            try await environment.signOut()
+            XCTFail("sign out must report failed local cleanup")
+        } catch {
+            XCTAssertNil(environment.client)
+            XCTAssertFalse(environment.hasTokenConfigured)
+            XCTAssertTrue(environment.hasPendingLocalCleanup)
+            XCTAssertEqual(
+                environment.recoveryStatusMessage,
+                "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
+            )
+        }
+    }
+}
+
+private actor FailingPurgeRecoveryStore: ChatRecoveryPersisting {
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? { nil }
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {}
+    func remove(for key: ChatRecoveryKey) async throws {}
+    func purge(bindingID: UUID) async throws { throw ChatRecoveryError.storageUnavailable }
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {}
 }

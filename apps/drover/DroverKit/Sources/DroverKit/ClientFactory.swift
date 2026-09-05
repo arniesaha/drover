@@ -7,9 +7,11 @@ public enum ClientFactory {
     /// DEBUG env override wins (simulator smoke tests supply
     /// `DROVER_BASE_URL`/`DROVER_TOKEN` so no credentials need to be typed);
     /// otherwise the persisted `ServerConfig` plus the Keychain token are
-    /// used. Returns `nil` when neither source has both a URL and a token.
+    /// used. Background callers leave `credentialBindingID` nil: this factory
+    /// never reads or writes foreground recovery metadata.
     public static func make(defaults: UserDefaults = .standard,
-                             tokenStore: TokenStore = TokenStore())
+                             tokenStore: TokenStore = TokenStore(),
+                             credentialBindingID: UUID? = nil)
         -> (client: DroverClient, config: ServerConfig)? {
         if let override = ServerConfig.debugOverride() {
             return (DroverClient(config: override.config, token: override.token), override.config)
@@ -19,7 +21,14 @@ public enum ClientFactory {
         else {
             return nil
         }
-        return (DroverClient(config: config, token: token), config)
+        return (
+            DroverClient(
+                config: config,
+                token: token,
+                credentialBindingID: credentialBindingID
+            ),
+            config
+        )
     }
 
     /// Checks a candidate server + token against the live server: `healthz()`
