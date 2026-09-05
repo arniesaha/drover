@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The server can bind the private address selected during installation.  A
 # loopback health check then reports a failure even though the phone can reach
-# Drover.  Cover the bounded probe itself and the installer call that supplies
-# its address.  The latter runs in a disposable home with a fake release so it
-# never fetches software or touches a real service.
+# Drover.  Cover the bounded probe against a local HTTP fixture and the
+# installer call that supplies its address.  The latter runs in a disposable
+# home with a fake release so it never fetches software or touches a real
+# service.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -31,36 +32,91 @@ check_contains() {
   fi
 }
 
-# A successful request must use the supplied private address, including when
-# callers carry a trailing slash from a URL-like configuration value.
-HEALTH_LOG="$WORK/health-success.log"
-(
-  . "$REPO/scripts/lib/health.sh"
-  curl() {
-    [ "$1" = '-fsS' ] && [ "$2" = '--max-time' ] && [ "$3" = '2' ] || return 97
-    printf '%s\n' "$4" >> "$HEALTH_LOG"
-    return 0
-  }
-  sleep() { :; }
-  wait_for_health '100.64.0.10:7080/'
-)
-check_status "configured-address probe succeeds" "$?" "0"
-check_equal "configured-address probe removes one trailing slash" \
-  "$(/bin/cat "$HEALTH_LOG")" 'http://100.64.0.10:7080/healthz'
+# A real local server distinguishes curl's transport result from the HTTP
+# status.  For 302, /healthz redirects to /ready, which returns 204: following
+# redirects would therefore hide the redirect from the probe.
+PYTHON="$(command -v python3)"
+run_http_health_case() {
+  local response_code="$1"
+  local expected="$2"
+  local name="$3"
+  local port_file="$WORK/http-$response_code.port"
+  local server_pid
+  local port
+  local result
 
-# A client failure must not look healthy and must preserve the existing retry
-# budget.  curl -f makes non-2xx responses take this same failure path.
-ATTEMPT_LOG="$WORK/health-failure.log"
+  "$PYTHON" - "$response_code" "$port_file" <<'PY' &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+response_code = int(sys.argv[1])
+port_file = Path(sys.argv[2])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz" and response_code == 302:
+            self.send_response(302)
+            self.send_header("Location", "/ready")
+        elif self.path == "/healthz":
+            self.send_response(response_code)
+        else:
+            self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port_file.write_text(str(server.server_port))
+server.serve_forever()
+PY
+  server_pid=$!
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$port_file" ] && break
+    /bin/sleep 0.1
+  done
+  if [ ! -s "$port_file" ]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    fail "$name (local HTTP fixture did not start)"
+    return
+  fi
+  port="$(/bin/cat "$port_file")"
+
+  (
+    . "$REPO/scripts/lib/health.sh"
+    sleep() { :; }
+    if [ "$expected" = success ]; then
+      wait_for_health "127.0.0.1:${port}/"
+    elif wait_for_health "127.0.0.1:${port}"; then
+      exit 1
+    fi
+  )
+  result=$?
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  check_status "$name" "$result" "0"
+}
+
+run_http_health_case 204 success "2xx health response succeeds"
+run_http_health_case 302 failure "3xx health redirect is rejected"
+run_http_health_case 404 failure "4xx health response is rejected"
+run_http_health_case 500 failure "5xx health response is rejected"
+
+# A transport failure must remain a bounded failed probe.
+ATTEMPT_LOG="$WORK/health-transport.log"
 (
   . "$REPO/scripts/lib/health.sh"
-  curl() { printf 'curl\n' >> "$ATTEMPT_LOG"; return 22; }
+  curl() { printf 'curl\n' >> "$ATTEMPT_LOG"; return 7; }
   sleep() { printf '%s\n' "$1" >> "$ATTEMPT_LOG"; }
   if wait_for_health '100.64.0.10:7080'; then exit 1; fi
 )
-check_status "failed health probe returns failure" "$?" "0"
-check_equal "failed health probe keeps fifteen attempts and two-second waits" \
+check_status "transport failure returns failure" "$?" "0"
+check_equal "transport failure keeps fifteen attempts and two-second waits" \
   "$(/usr/bin/wc -l < "$ATTEMPT_LOG" | /usr/bin/tr -d ' ')" "30"
-check_equal "failed health probe waits two seconds after every attempt" \
+check_equal "transport failure waits two seconds after every attempt" \
   "$(/usr/bin/grep -c '^2$' "$ATTEMPT_LOG")" "15"
 
 # Exercise the copied-script path used by `curl ... | bash`.  The fakes only
@@ -105,6 +161,7 @@ printf '%s\n' \
   '  */requirements.lock.txt) printf "%s" "$FIXTURE_LOCK_CONTENT" > "$output" ;;' \
   '  http://100.64.0.10:7080/healthz)' \
   '    printf "%s\n" "$url" >> "$FIXTURE_CURL_LOG"' \
+  '    printf 204' \
   '    ;;' \
   '  *) exit 1 ;;' \
   'esac' > "$FAKE_BIN/curl"
