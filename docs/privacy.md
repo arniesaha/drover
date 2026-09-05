@@ -59,9 +59,10 @@ on a lock screen or notification surface.
 
 Notifications are best effort. They are not a guarantee of timely delivery,
 and the app remains usable without them. Turn notifications off in iOS if you
-do not want alert content displayed. Signing out attempts to remove the phone's
-APNs registration from the hub; revoking the device credential on the hub also
-clears its stored registration.
+do not want alert content displayed. Signing out removes the phone's local
+connection but currently leaves its server credential and APNs registration in
+place. Revoke the device credential on the hub to clear its stored registration
+and stop hub-sent alerts for that credential.
 
 ## Optional integrations
 
