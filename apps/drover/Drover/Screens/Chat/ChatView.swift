@@ -1,6 +1,8 @@
 import SwiftUI
 import DroverKit
 
+typealias ChatModelFactory = @MainActor (DroverClient, String, String?) -> ChatModel
+
 /// A view-only ID namespace keeps the post-clearance destination impossible
 /// to confuse with a raw or folded transcript row ID (both are strings).
 enum ChatTranscriptScrollTarget: Hashable {
@@ -44,6 +46,7 @@ struct ChatView: View {
     private let recoveryStore: (any ChatRecoveryPersisting)?
     private let recoveryWriteGate: ChatRecoveryWriteGate
     private let recoveryGeneration: Int
+    private let chatModelFactory: ChatModelFactory?
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
     @State private var showDiscardPendingConfirm = false
@@ -72,13 +75,15 @@ struct ChatView: View {
         recapSourceSeq: Int? = nil,
         recoveryStore: (any ChatRecoveryPersisting)?,
         recoveryWriteGate: ChatRecoveryWriteGate,
-        recoveryGeneration: Int
+        recoveryGeneration: Int,
+        chatModelFactory: ChatModelFactory? = nil
     ) {
         self.client = client
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
         self.recoveryGeneration = recoveryGeneration
-        _model = State(initialValue: ChatModel(
+        self.chatModelFactory = chatModelFactory
+        _model = State(initialValue: chatModelFactory?(client, sessionID, harness) ?? ChatModel(
             client: client,
             sessionID: sessionID,
             harness: harness,
@@ -245,7 +250,8 @@ struct ChatView: View {
                     harness: handoff.harness,
                     recoveryStore: recoveryStore,
                     recoveryWriteGate: recoveryWriteGate,
-                    recoveryGeneration: recoveryGeneration
+                    recoveryGeneration: recoveryGeneration,
+                    chatModelFactory: chatModelFactory
                 )
             } else {
                 TerminalScreen(client: client, sessionID: handoff.id, harness: handoff.harness)

@@ -60,9 +60,12 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
 
 @main
 struct DroverApp: App {
-    @State private var environment = AppEnvironment()
+    @State private var environment: AppEnvironment
     @Environment(\.scenePhase) private var scenePhase
-    private let notifier: Notifying = LocalNotifier()
+    private let notifier: Notifying
+#if DEBUG
+    private let testScenario: UITestScenario?
+#endif
     // The notification center holds its delegate weakly — keep it alive for
     // the app's lifetime.
     private let notificationPresenter = ForegroundNotificationPresenter()
@@ -71,6 +74,19 @@ struct DroverApp: App {
     @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var pushDelegate
 
     init() {
+#if DEBUG
+        // Select the fixture before constructing anything that reads the
+        // operator's saved connection, recovery files, or preferences.
+        let scenario = UITestScenario()
+        self.testScenario = scenario
+        if let scenario {
+            _environment = State(initialValue: scenario.environment)
+            notifier = FixtureNotifier()
+            return
+        }
+#endif
+        _environment = State(initialValue: AppEnvironment())
+        notifier = LocalNotifier()
         // Must happen before the app finishes launching, so this lives in
         // `init()` rather than an `.onAppear`/`.task` (BGTaskScheduler's
         // documented requirement).
@@ -81,7 +97,9 @@ struct DroverApp: App {
     var body: some Scene {
         WindowGroup {
 #if DEBUG
-            if ProcessInfo.processInfo.environment[
+            if let testScenario {
+                FixturePreparedRoot(scenario: testScenario, notifier: notifier)
+            } else if ProcessInfo.processInfo.environment[
                 "DROVER_UI_TEST_CHAT_HEADER_FIXTURE"
             ] == "1" {
                 ChatHeaderFixtureRoot()
@@ -93,6 +111,9 @@ struct DroverApp: App {
 #endif
         }
         .onChange(of: scenePhase) { _, phase in
+#if DEBUG
+            guard testScenario == nil else { return }
+#endif
             if phase == .background {
                 BackgroundRefresh.schedule()
             }
@@ -149,7 +170,22 @@ private struct RootView: View {
     var environment: AppEnvironment
     let notifier: Notifying
     @State private var showSettings = false
-    @State private var appearance = AppearanceStore()
+    @State private var appearance: AppearanceStore
+    private let defaults: UserDefaults
+    private let chatModelFactory: ChatModelFactory?
+    private let backgroundActivityEnabled: Bool
+
+    init(environment: AppEnvironment, notifier: Notifying,
+         defaults: UserDefaults = .standard,
+         chatModelFactory: ChatModelFactory? = nil,
+         backgroundActivityEnabled: Bool = true) {
+        self.environment = environment
+        self.notifier = notifier
+        self.defaults = defaults
+        self.chatModelFactory = chatModelFactory
+        self.backgroundActivityEnabled = backgroundActivityEnabled
+        _appearance = State(initialValue: AppearanceStore(defaults: defaults))
+    }
 
     var body: some View {
         Group {
@@ -161,6 +197,8 @@ private struct RootView: View {
                         recoveryStore: environment.chatRecoveryStore,
                         recoveryWriteGate: environment.chatRecoveryWriteGate,
                         recoveryGeneration: environment.chatRecoveryGeneration,
+                        chatModelFactory: chatModelFactory,
+                        defaults: defaults,
                         onOpenSettings: { showSettings = true }
                     )
                 }
@@ -186,6 +224,7 @@ private struct RootView: View {
         // harmless — the system only prompts the user once and just returns
         // the existing authorization afterward.
         .task {
+            guard backgroundActivityEnabled else { return }
             await requestNotificationPermissionIfConfigured()
             // Keep a refresh request pending from launch, not just from the
             // next background transition — a force-quit cancels pending
@@ -200,6 +239,7 @@ private struct RootView: View {
     }
 
     private func requestNotificationPermissionIfConfigured() async {
+        guard backgroundActivityEnabled else { return }
         guard let client = environment.client else { return }
         let granted = (try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .badge, .sound])) ?? false
@@ -217,3 +257,46 @@ private struct RootView: View {
         PushRegistrar.shared.requestTokenFromSystem()
     }
 }
+
+#if DEBUG
+private struct FixturePreparedRoot: View {
+    let scenario: UITestScenario
+    let notifier: Notifying
+    @State private var isPrepared = false
+
+    var body: some View {
+        Group {
+            if isPrepared {
+                RootView(
+                    environment: scenario.environment, notifier: notifier,
+                    defaults: scenario.defaults,
+                    chatModelFactory: scenario.makeClient().chatModelFactory,
+                    backgroundActivityEnabled: false
+                )
+                .overlay(alignment: .topTrailing) {
+                    TimelineView(.periodic(from: .now, by: 0.2)) { _ in
+                        VStack {
+                            Text(String(scenario.transport.receiptState.receiptCount))
+                                .accessibilityIdentifier("fixture-turn-receipt-count")
+                            Text(String(scenario.transport.receiptState.submissionCount))
+                                .accessibilityIdentifier("fixture-turn-submission-count")
+                        }
+                        .font(.caption2)
+                        .allowsHitTesting(false)
+                    }
+                }
+            } else {
+                ProgressView("Preparing synthetic journey")
+            }
+        }
+        .task {
+            do {
+                try await scenario.prepare()
+                isPrepared = true
+            } catch {
+                preconditionFailure("Could not prepare isolated synthetic journey")
+            }
+        }
+    }
+}
+#endif

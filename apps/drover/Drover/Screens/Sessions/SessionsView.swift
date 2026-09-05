@@ -30,6 +30,8 @@ struct SessionsView: View {
     private let recoveryStore: (any ChatRecoveryPersisting)?
     private let recoveryWriteGate: ChatRecoveryWriteGate
     private let recoveryGeneration: Int
+    private let chatModelFactory: ChatModelFactory?
+    private let defaults: UserDefaults
     private let onOpenSettings: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
@@ -45,6 +47,8 @@ struct SessionsView: View {
         recoveryStore: (any ChatRecoveryPersisting)?,
         recoveryWriteGate: ChatRecoveryWriteGate,
         recoveryGeneration: Int,
+        chatModelFactory: ChatModelFactory? = nil,
+        defaults: UserDefaults = .standard,
         onOpenSettings: @escaping () -> Void = {}
     ) {
         self.client = client
@@ -52,6 +56,8 @@ struct SessionsView: View {
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
         self.recoveryGeneration = recoveryGeneration
+        self.chatModelFactory = chatModelFactory
+        self.defaults = defaults
         self.onOpenSettings = onOpenSettings
         _store = State(initialValue: SessionStore(client: client))
         _cockpitStore = State(initialValue: CockpitStore(client: client))
@@ -212,7 +218,7 @@ struct SessionsView: View {
         // each pushed alert was followed by a second, generic, local one.
         .onChange(of: store.needsYou) { _, _ in
             guard let snapshot = store.snapshot else { return }
-            let watcher = AttentionWatcher(notifier: notifier)
+            let watcher = AttentionWatcher(notifier: notifier, seenStore: defaults)
             Task { await watcher.evaluate(snapshot) }
         }
         // A tapped alert names one session; open that session rather than
@@ -228,7 +234,10 @@ struct SessionsView: View {
         .onAppear { openSessionFromNotification() }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
-                LaunchView(client: client, snapshot: store.snapshot) { sessionID, isStructured, harness in
+                LaunchView(
+                    client: client, snapshot: store.snapshot,
+                    catalogStore: HarnessModelCatalogStore(defaults: defaults)
+                ) { sessionID, isStructured, harness in
                     launchedSession = LaunchedSession(
                         id: sessionID,
                         isStructured: isStructured,
@@ -247,7 +256,8 @@ struct SessionsView: View {
                     harness: launched.harness,
                     recoveryStore: recoveryStore,
                     recoveryWriteGate: recoveryWriteGate,
-                    recoveryGeneration: recoveryGeneration
+                    recoveryGeneration: recoveryGeneration,
+                    chatModelFactory: chatModelFactory
                 )
             } else {
                 TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
@@ -398,7 +408,8 @@ struct SessionsView: View {
                         recapSourceSeq: session.recapSourceSeq,
                         recoveryStore: recoveryStore,
                         recoveryWriteGate: recoveryWriteGate,
-                        recoveryGeneration: recoveryGeneration
+                        recoveryGeneration: recoveryGeneration,
+                        chatModelFactory: chatModelFactory
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
@@ -464,7 +475,7 @@ struct SessionsView: View {
 
     private func markRead(_ session: SessionSummary) async {
         guard let snapshot = store.snapshot else { return }
-        await AttentionWatcher(notifier: notifier).markRead(session.id, in: snapshot)
+        await AttentionWatcher(notifier: notifier, seenStore: defaults).markRead(session.id, in: snapshot)
     }
 
     /// Host id → display title from the fleet snapshot, so provider cards can
