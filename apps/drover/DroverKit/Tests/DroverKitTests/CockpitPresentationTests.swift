@@ -229,6 +229,54 @@ import Testing
     #expect(value.uncertaintyText != nil)
 }
 
+@Test func insightEvidenceValuesUseHumanReadableJSONFormatting() {
+    #expect(InsightEvidencePresentation.valueText(.number(20)) == "20")
+    #expect(InsightEvidencePresentation.valueText(.string("host")) == "host")
+    #expect(InsightEvidencePresentation.valueText(.array([.string("codex"), .number(20)])) == "[codex, 20]")
+    #expect(InsightEvidencePresentation.valueText(.null) == "Not reported")
+    #expect(InsightEvidencePresentation.valueText(nil) == "Not reported")
+    #expect(InsightEvidencePresentation.label(for: "source_ref") == "Source Ref")
+}
+
+@Test func insightCheckStatePreventsDuplicateRequestsUntilItIsAcknowledgedOrFails() {
+    var state = InsightCheckActionState.ready
+
+    let started = state.begin()
+    #expect(started)
+    #expect(state.isPending)
+    let repeated = state.begin()
+    #expect(!repeated)
+
+    state.finish(accepted: true)
+    #expect(!state.isPending)
+    #expect(state.notice == "Reanalysis queued. Refresh to view the latest result.")
+
+    let restarted = state.begin()
+    #expect(restarted)
+    state.finish(accepted: false, error: "The request timed out.")
+    #expect(!state.isPending)
+    #expect(state.notice == "The request timed out.")
+}
+
+@Test func insightLifecycleControlsRespectTheCurrentDisposition() {
+    let open = InsightLifecycleActionsPresentation(state: .open, checkAgainAvailable: true)
+    #expect(open.canCheckAgain)
+    #expect(open.canAcknowledge)
+    #expect(open.canDismiss)
+
+    let acknowledged = InsightLifecycleActionsPresentation(
+        state: .acknowledged, checkAgainAvailable: true
+    )
+    #expect(acknowledged.canCheckAgain)
+    #expect(!acknowledged.canAcknowledge)
+    #expect(acknowledged.canDismiss)
+
+    let resolved = InsightLifecycleActionsPresentation(state: .resolved, checkAgainAvailable: true)
+    #expect(resolved.canCheckAgain)
+    #expect(!resolved.canAcknowledge)
+    #expect(!resolved.canDismiss)
+}
+
 @Test func staleProviderAccountNamesFreshnessAndSourceClass() throws {
     let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(#"""
     {"snapshot_id":"snapshot-1","dedup_key":"codex:personal","provider":"openai",

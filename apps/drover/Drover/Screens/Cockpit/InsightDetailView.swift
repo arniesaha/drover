@@ -10,16 +10,20 @@ struct InsightDetailView: View {
     @State private var showDismiss = false
     @State private var dismissalReason = ""
     @State private var actionMessage: String?
+    @State private var checkState = InsightCheckActionState.ready
+    @State private var evidenceExpanded = false
+    @State private var currentState: InsightState?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if let detail {
-                    findingHeader(detail.finding)
+                    let state = currentState ?? detail.finding.state
+                    findingHeader(detail.finding, state: state, evidence: detail.evidence)
                     impactSection(detail.finding)
-                    evidenceSection(detail.evidence)
+                    actionSection(detail, state: state)
                     remediationSection(detail.finding)
-                    actionSection(detail)
+                    evidenceSection(detail.evidence)
                 } else if let loadError {
                     ContentUnavailableView(
                         "Insight unavailable", systemImage: "exclamationmark.triangle",
@@ -41,12 +45,16 @@ struct InsightDetailView: View {
         .sheet(isPresented: $showDismiss) { dismissalSheet }
     }
 
-    private func findingHeader(_ finding: InsightFinding) -> some View {
+    private func findingHeader(
+        _ finding: InsightFinding, state: InsightState, evidence: [InsightEvidence]
+    ) -> some View {
         let value = InsightPresentation(insight: finding)
         return CockpitCard {
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 7) {
+                FlowLayout(spacing: 7, lineSpacing: 4) {
                     Text(value.severityText).droverText(.marker)
+                    Text("Status: \(InsightEvidencePresentation.label(for: state.rawValue))")
+                        .droverText(.subtitle)
                     Text(value.sourceText).droverText(.subtitle)
                     Text(value.confidenceText).droverText(.subtitle)
                 }
@@ -54,6 +62,8 @@ struct InsightDetailView: View {
                 Text("\(finding.targetType.replacingOccurrences(of: "_", with: " ")) · \(finding.targetID)")
                     .droverText(.mono)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(evidenceSummaryText(evidence))
+                    .droverText(.nested)
                 if let uncertainty = value.uncertaintyText {
                     Text(uncertainty).droverText(.nested)
                 }
@@ -69,27 +79,40 @@ struct InsightDetailView: View {
         }
     }
 
+    private func evidenceSummaryText(_ evidence: [InsightEvidence]) -> String {
+        let latest = evidence.map(\.observedAt).max()
+        let count = evidence.count
+        let countText = "\(count) observation\(count == 1 ? "" : "s")"
+        guard let latest else { return "Evidence: \(countText) · latest observation unavailable" }
+        return "Evidence: \(countText) · latest \(latest.formatted(date: .abbreviated, time: .shortened))"
+    }
+
     @ViewBuilder
     private func evidenceSection(_ evidence: [InsightEvidence]) -> some View {
         if !evidence.isEmpty {
-            detailSection("Evidence") {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(Array(evidence.enumerated()), id: \.offset) { _, item in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(item.sourceReference).droverText(.mono)
-                            Text(item.observedAt.formatted(date: .abbreviated, time: .shortened))
-                                .droverText(.subtitle)
-                            ForEach(item.fields.keys.sorted(), id: \.self) { key in
-                                Text("\(key.replacingOccurrences(of: "_", with: " ").capitalized): \(String(describing: item.fields[key]!))")
-                                    .droverText(.nested)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            if let excerpt = item.excerpt {
-                                Text(excerpt)
-                                    .droverText(.nested)
-                                    .padding(8)
-                                    .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 8))
-                                    .fixedSize(horizontal: false, vertical: true)
+            detailSection("Evidence details") {
+                DisclosureGroup(
+                    "Show evidence details",
+                    isExpanded: $evidenceExpanded
+                ) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(Array(evidence.enumerated()), id: \.offset) { _, item in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Source reference: \(item.sourceReference)").droverText(.mono)
+                                Text(item.observedAt.formatted(date: .abbreviated, time: .shortened))
+                                    .droverText(.subtitle)
+                                ForEach(item.fields.keys.sorted(), id: \.self) { key in
+                                    Text("\(InsightEvidencePresentation.label(for: key)): \(InsightEvidencePresentation.valueText(item.fields[key]))")
+                                        .droverText(.nested)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                if let excerpt = item.excerpt {
+                                    Text(excerpt)
+                                        .droverText(.nested)
+                                        .padding(8)
+                                        .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 8))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                         }
                     }
@@ -111,43 +134,66 @@ struct InsightDetailView: View {
         }
     }
 
-    private func actionSection(_ detail: InsightDetail) -> some View {
+    private func actionSection(_ detail: InsightDetail, state: InsightState) -> some View {
         let finding = detail.finding
+        let actions = InsightLifecycleActionsPresentation(
+            state: state, checkAgainAvailable: detail.actions.checkAgain.available
+        )
         return VStack(alignment: .leading, spacing: 10) {
-            if let message = actionMessage ?? store.lifecycleError {
-                Text(message)
+            if actions.canCheckAgain {
+                Text("Checking reruns analysis. It does not apply configuration changes.")
                     .droverText(.nested)
-                    .foregroundStyle(store.lifecycleError == nil ? DroverColor.muted : DroverColor.accentHi)
-            }
-            Button("Check Again (reanalysis)") {
-                Task {
-                    actionMessage = await store.checkInsight(findingID: finding.findingID)
-                        ? "Reanalysis queued."
-                        : nil
+                    .foregroundStyle(DroverColor.muted)
+                Button {
+                    guard checkState.begin() else { return }
+                    Task {
+                        let accepted = await store.checkInsight(findingID: finding.findingID)
+                        checkState.finish(accepted: accepted, error: store.lifecycleError)
+                    }
+                } label: {
+                    Text(checkState.isPending ? "Checking…" : "Check Again (reanalysis)")
                 }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(!detail.actions.checkAgain.available)
-            .accessibilityHint("Reruns analysis only; it does not change configuration")
-            .accessibilityIdentifier("insight-check-again")
+                .buttonStyle(.borderedProminent)
+                .disabled(checkState.isPending)
+                .accessibilityHint("Reruns analysis only; it does not change configuration")
+                .accessibilityIdentifier("insight-check-again")
 
-            if !detail.actions.checkAgain.available {
+                if let message = checkState.notice {
+                    Text(message)
+                        .droverText(.nested)
+                        .foregroundStyle(checkState.isFailure ? DroverColor.accentHi : DroverColor.muted)
+                }
+            } else if !detail.actions.checkAgain.available {
                 Text(detail.actions.checkAgain.reason ?? "Scoped reanalysis is unavailable.")
                     .droverText(.nested)
                     .foregroundStyle(DroverColor.muted)
             }
 
-            HStack {
-                Button("Acknowledge") {
-                    Task {
-                        actionMessage = await store.acknowledgeInsight(findingID: finding.findingID)
-                            ? "Insight acknowledged."
-                            : nil
+            if actions.canAcknowledge || actions.canDismiss {
+                HStack {
+                    if actions.canAcknowledge {
+                        Button("Acknowledge") {
+                            Task {
+                                if await store.acknowledgeInsight(findingID: finding.findingID) {
+                                    currentState = store.state(forFindingID: finding.findingID)
+                                        ?? currentState
+                                    actionMessage = "Insight acknowledged."
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    if actions.canDismiss {
+                        Button("Dismiss…") { showDismiss = true }
+                            .buttonStyle(.bordered)
                     }
                 }
-                .buttonStyle(.bordered)
-                Button("Dismiss…") { showDismiss = true }
-                    .buttonStyle(.bordered)
+            }
+            let lifecycleMessage = store.lifecycleError ?? actionMessage
+            if let message = lifecycleMessage, message != checkState.notice {
+                Text(message)
+                    .droverText(.nested)
+                    .foregroundStyle(store.lifecycleError == nil ? DroverColor.muted : DroverColor.accentHi)
             }
         }
     }
@@ -189,6 +235,8 @@ struct InsightDetailView: View {
                             if await store.dismissInsight(
                                 findingID: summary.findingID, reason: dismissalReason
                             ) {
+                                currentState = store.state(forFindingID: summary.findingID)
+                                    ?? currentState
                                 actionMessage = "Insight dismissed."
                                 showDismiss = false
                                 dismissalReason = ""
@@ -204,10 +252,19 @@ struct InsightDetailView: View {
 
     private func load() async {
         do {
-            detail = try await client.insightDetail(findingID: summary.findingID)
+            let loadedDetail = try await client.insightDetail(findingID: summary.findingID)
+            detail = loadedDetail
+            currentState = loadedDetail.finding.state
             loadError = nil
         } catch {
             loadError = (error as NSError).localizedDescription
         }
+    }
+}
+
+private extension InsightCheckActionState {
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
     }
 }
