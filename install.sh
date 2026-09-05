@@ -48,10 +48,11 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -r "$SELF_DIR/scripts/lib/verify.sh" ]; then
   . "$SELF_DIR/scripts/lib/verify.sh"
   . "$SELF_DIR/scripts/lib/detect.sh"
+  . "$SELF_DIR/scripts/lib/health.sh"
 else
   LIB_TMP="$(mktemp -d)"
   trap 'rm -rf "$LIB_TMP"' EXIT
-  for lib in verify detect; do
+  for lib in verify detect health; do
     curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/lib/${lib}.sh" \
       -o "$LIB_TMP/${lib}.sh" || fail "could not fetch scripts/lib/${lib}.sh"
     . "$LIB_TMP/${lib}.sh"
@@ -510,17 +511,6 @@ EOF
   success "joined $HUB_ADDRESS as $host_id"
 }
 
-wait_for_health() {
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    if curl -fsS --max-time 2 "http://127.0.0.1:7080/healthz" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
 ensure_uv
 VERSION="$(resolve_version)"
 info "  version:   $VERSION"
@@ -539,7 +529,7 @@ if [ -n "$JOIN_URL" ]; then
 else
   write_config "$ADDRESS"
   install_units fleet "http://127.0.0.1:7080"
-  if wait_for_health; then
+  if wait_for_health "$ADDRESS"; then
     success "drover-server is up"
   else
     warn "drover-server did not answer /healthz yet; check the logs before pairing"
