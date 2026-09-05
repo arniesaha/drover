@@ -135,8 +135,12 @@ jobs:
 
     - name: Run install.sh exactly as a user would
       run: |
-        set -x
-        bash install.sh --version "${{ github.event.inputs.ref || github.ref_name }}"
+        if ! bash install.sh --no-start \
+          --version "${{ github.event.inputs.ref || github.ref_name }}" \
+          > "$RUNNER_TEMP/drover-install.log" 2>&1; then
+          echo "install stage failed" >&2
+          exit 1
+        fi
 
     - name: The runtime is laid out and activated
       run: |
@@ -176,48 +180,75 @@ jobs:
       run: |
         grep -q '^advertised_url' "$HOME/.drover/config.toml"
         grep -q '^metrics_host' "$HOME/.drover/config.toml"
-        cat "$HOME/.drover/config.toml"
 
     - name: Service units point at current and set PATH explicitly
       run: |
         UNIT="$HOME/.config/systemd/user/drover-server.service"
         test -f "$UNIT" || { echo "no server unit written" >&2; exit 1; }
         test -f "$HOME/.config/systemd/user/drover-harnessd.service"
-        cat "$UNIT"
         # Both properties have silently broken real hosts before.
         grep -q 'Environment=PATH=' "$UNIT"
         grep -q 'runtime/current/bin' "$UNIT"
         grep -qv 'runtime/0\.' "$UNIT"
 
-    - name: The server actually serves, and pairing prints a QR
+    - name: The installed server accepts a paired device
       run: |
         # Started directly rather than through systemd: `systemctl --user`
-        # is not reliably available on a hosted runner, and install.sh
-        # tolerates that by design. What matters here is that the installed
-        # build works, not which supervisor started it.
-        pkill -f 'drover-server run' || true
-        "$HOME/.drover/runtime/current/bin/drover-server" run &
+        # is not reliably available on a hosted runner. install.sh --no-start
+        # wrote the normal config and unit definitions, but did not claim the
+        # install is first-use ready; this step owns only its direct process.
+        BIN="$HOME/.drover/runtime/current/bin"
+        "$BIN/drover-server" run > "$RUNNER_TEMP/drover-server.log" 2>&1 &
+        SERVER_PID=$!
+        cleanup_server() {
+          kill "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" 2>/dev/null || true
+        }
+        trap cleanup_server EXIT
 
         # The server binds [server].metrics_host, which install.sh sets to the
-        # address it detected for the phone. Curling loopback regardless is
-        # what made this step fail for v0.2.0 and v0.3.0 against an install
-        # that was working: the server was serving on the LAN address the
-        # config named. Ask the config, the way the CLI now does.
-        # No heredoc: its body would have to start at column 0, which ends the
-        # YAML block scalar this step is written in and makes the whole file
-        # unparseable.
+        # address it detected for the phone. Read that address and configured
+        # port rather than assuming loopback or the default listener.
         HOST="$(sed -n 's/^[[:space:]]*metrics_host[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
           "$HOME/.drover/config.toml" | head -1)"
+        PORT="$(sed -n 's/^[[:space:]]*metrics_http_port[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' \
+          "$HOME/.drover/config.toml" | head -1)"
         case "$HOST" in ""|"0.0.0.0"|"::"|"*") HOST="127.0.0.1" ;; esac
-        echo "probing the address the install configured: $HOST"
+        case "$PORT" in ""|*[!0-9]*) echo "configured-address stage failed" >&2; exit 1 ;; esac
         for _ in $(seq 1 30); do
-          curl -fsS --max-time 2 "http://$HOST:7080/healthz" && break
+          curl -fsS --max-time 2 "http://$HOST:$PORT/healthz" > /dev/null && break
           sleep 2
         done
-        curl -fsS --max-time 5 "http://$HOST:7080/healthz"
+        curl -fsS --max-time 5 "http://$HOST:$PORT/healthz" > /dev/null \
+          || { echo "server health stage failed" >&2; exit 1; }
 
-        OUT="$("$HOME/.drover/runtime/current/bin/drover-server" pair)"
-        echo "$OUT"
-        echo "$OUT" | grep -q 'drover://' || { echo "no pairing URL" >&2; exit 1; }
-        echo "$OUT" | grep -q '█' || { echo "no QR rendered" >&2; exit 1; }
-        pkill -f 'drover-server run' || true
+        PAIR_OUTPUT="$("$BIN/drover-server" pair 2> "$RUNNER_TEMP/drover-pair.log")" \
+          || { echo "pairing stage failed" >&2; exit 1; }
+        PAIR_CODE="$(printf '%s\n' "$PAIR_OUTPUT" \
+          | sed -n 's/.*[?&]code=\([^&[:space:]]*\).*/\1/p' | head -1)"
+        [ -n "$PAIR_CODE" ] || { echo "pairing stage failed" >&2; exit 1; }
+        if ! curl -fsS --max-time 10 -X POST \
+          -H 'Content-Type: application/json' \
+          -d "{\"code\":\"$PAIR_CODE\",\"device_name\":\"release-artifact-check\"}" \
+          "http://$HOST:$PORT/auth/pair" \
+          > "$RUNNER_TEMP/drover-pair-response.json"; then
+          echo "pairing redemption stage failed" >&2
+          exit 1
+        fi
+        DEVICE_TOKEN="$("$BIN/python" -c \
+          'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["token"])' \
+          "$RUNNER_TEMP/drover-pair-response.json")" \
+          || { echo "pairing redemption stage failed" >&2; exit 1; }
+        [ -n "$DEVICE_TOKEN" ] || { echo "pairing redemption stage failed" >&2; exit 1; }
+        if ! curl -fsS --max-time 10 \
+          -H "Authorization: Bearer $DEVICE_TOKEN" \
+          "http://$HOST:$PORT/harness/hosts" \
+          > "$RUNNER_TEMP/drover-hosts.json"; then
+          echo "paired control-access stage failed" >&2
+          exit 1
+        fi
+        "$BIN/python" -c \
+          'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))["hosts"]' \
+          "$RUNNER_TEMP/drover-hosts.json" \
+          || { echo "paired control-access stage failed" >&2; exit 1; }
+        unset PAIR_OUTPUT PAIR_CODE DEVICE_TOKEN

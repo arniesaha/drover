@@ -181,17 +181,18 @@ run_new_fleet() {
   os="$1"
   health_mode="$2"
   address="$3"
+  shift 3
   /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS="$os" DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
     USER=installer FIXTURE_HEALTH_MODE="$health_mode" \
-    bash -s -- --version 0.0.0 --url "$address" 2>&1
+    bash -s -- --version 0.0.0 --url "$address" "$@" 2>&1
 }
 
 run_join() {
   /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
     USER=installer FIXTURE_HEALTH_MODE=fail \
-    bash -s -- --version 0.0.0 --join 'drover://100.64.0.10:7099?v=1&code=JOIN-CODE' 2>&1
+    bash -s -- --version 0.0.0 --join 'drover://100.64.0.10:7099?v=1&code=JOIN-CODE' "$@" 2>&1
 }
 
 run_order_case() {
@@ -242,6 +243,23 @@ run_order_case darwin launchd
 run_failure_case linux systemd
 run_failure_case darwin launchd
 
+new_case no-start
+OUT="$(run_new_fleet linux fail '100.64.0.10:7099' --no-start)"
+RESULT=$?
+check_status "no-start install succeeds without a ready hub" "$RESULT" "0"
+check_contains "no-start writes the configured server address" \
+  "$HOME_DIR/.drover/config.toml" 'metrics_host = "100.64.0.10"'
+check_status "no-start renders the server service definition" \
+  "$([ -f "$HOME_DIR/.config/systemd/user/drover-server.service" ] && echo present || echo absent)" "present"
+check_status "no-start renders the harness service definition" \
+  "$([ -f "$HOME_DIR/.config/systemd/user/drover-harnessd.service" ] && echo present || echo absent)" "present"
+check_contains "no-start says first-use readiness was skipped" <(printf '%s' "$OUT") \
+  'automation mode'
+check_event_absent "no-start does not start the hub" "$EVENT_LOG" 'server-start'
+check_event_absent "no-start does not start the harness" "$EVENT_LOG" 'harness-start'
+check_event_absent "no-start does not check hub readiness" "$EVENT_LOG" 'health '
+check_event_absent "no-start does not print pairing" "$EVENT_LOG" 'pair'
+
 new_case join
 OUT="$(run_join)"
 RESULT=$?
@@ -249,6 +267,13 @@ check_status "join install succeeds without a hub health gate" "$RESULT" "0"
 check_event_absent "join does not start a local hub" "$EVENT_LOG" 'server-start'
 check_event_absent "join does not probe the hub health endpoint" "$EVENT_LOG" 'health '
 check_contains "join starts only its harness" "$EVENT_LOG" 'harness-start'
+
+new_case no-start-join
+OUT="$(run_join --no-start)"
+RESULT=$?
+check_status "no-start refuses a join install" "$RESULT" "1"
+check_contains "no-start join refusal explains the incompatible flags" <(printf '%s' "$OUT") \
+  '--no-start cannot be used with --join'
 
 [ "$FAILURES" -eq 0 ] || exit 1
 echo "all install-startup checks passed"

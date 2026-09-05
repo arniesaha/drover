@@ -209,6 +209,29 @@ def test_release_workflow_never_runs_on_pull_requests() -> None:
     assert "pull_request_target" not in workflow["on"]
 
 
+def test_clean_install_uses_configured_address_and_keeps_pairing_private() -> None:
+    """The published-artifact smoke must not disturb another runner process.
+
+    A green loopback health probe only proves a listener exists. The installer's
+    configured private address and port are the address a paired device uses,
+    and pairing output is itself a short-lived credential.
+    """
+    steps = "\n".join(
+        step.get("run", "")
+        for step in load_workflow("release.yml")["jobs"]["verify-install"]["steps"]
+    )
+
+    assert "install.sh --no-start" in steps
+    assert '"http://$HOST:$PORT/healthz"' in steps
+    assert "SERVER_PID=$!" in steps
+    assert 'kill "$SERVER_PID"' in steps
+    assert "/auth/pair" in steps
+    assert "/harness/hosts" in steps
+    assert "pkill -f 'drover-server run'" not in steps
+    assert "set -x" not in steps
+    assert 'echo "$PAIR_OUTPUT"' not in steps
+
+
 def test_ci_runs_the_shell_tests() -> None:
     """The installer is shell, so pytest alone would leave it unguarded."""
     steps = " ".join(
@@ -307,7 +330,8 @@ def test_release_verifies_the_published_artifact_end_to_end() -> None:
     assert "--version" in steps, "must assert the smoke gate v0.1.1 failed"
     assert "runtime/current" in steps
     assert "healthz" in steps, "must prove the installed build actually serves"
-    assert "drover://" in steps, "must prove pairing works after install"
+    assert "/auth/pair" in steps, "must prove pairing works after install"
+    assert "/harness/hosts" in steps, "must prove a paired device has control access"
     # Every other assertion in that job runs the binary by absolute path,
     # which is how "installed but not a command" survived: the runtime lives
     # under ~/.drover, which is on nobody's PATH.
