@@ -93,12 +93,12 @@ The `DroverKit` package has a separate test target. Run its full deterministic
 suite directly so its recovery and bounded-work tests execute:
 
 ```bash
-swift test --package-path apps/drover/DroverKit
+swift test --package-path apps/drover/DroverKit --jobs 2
 ```
 
-The credential-free deterministic journey exercises the app's real navigation
-against the synthetic `core-journey` fixture. It does not need a server URL,
-token, or network access:
+The credential-free deterministic journey and its Accessibility XXXL companion
+exercise the app's real navigation against the synthetic `core-journey`
+fixture. They do not need a server URL, token, or network access:
 
 ```bash
 DROVER_SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
@@ -106,6 +106,7 @@ test -n "$DROVER_SIMULATOR_ID"
 xcodebuild -project apps/drover/Drover.xcodeproj -scheme DroverUITests \
   -destination "id=$DROVER_SIMULATOR_ID" \
   -only-testing:DroverUITests/DeterministicJourneyUITests \
+  -only-testing:DroverUITests/AccessibilityJourneyUITests \
   test
 ```
 

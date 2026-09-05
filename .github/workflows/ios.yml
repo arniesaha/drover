@@ -58,7 +58,7 @@ jobs:
 
     - name: Run DroverKit package tests
       if: steps.scope.outputs.ios == 'true'
-      run: swift test --package-path DroverKit
+      run: swift test --package-path DroverKit --jobs 2
 
     - name: Select iPhone simulator
       if: steps.scope.outputs.ios == 'true'
@@ -97,6 +97,7 @@ jobs:
           -scheme DroverUITests \
           -destination "$SIMULATOR_DESTINATION" \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
+          -only-testing:DroverUITests/AccessibilityJourneyUITests \
           -resultBundlePath "$RUNNER_TEMP/DeterministicJourneyUITests.xcresult" \
           test
 
