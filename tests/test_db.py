@@ -68,7 +68,9 @@ def test_threads_is_instance_wide_so_a_shared_file_leaks_it(tmp_path, monkeypatc
 
     live = open_duckdb_connection(shared, role="worker")
     try:
-        assert live.execute("SELECT current_setting('threads')").fetchone() == (2,)
+        assert live.execute("SELECT current_setting('threads')").fetchone() == (
+            int(ROLE_DEFAULTS["worker"]["threads"]),
+        )
         greedy = open_duckdb_connection(shared, role="snapshot")
         try:
             assert live.execute("SELECT current_setting('threads')").fetchone() == (4,)
@@ -91,7 +93,9 @@ def test_a_snapshot_of_a_copy_cannot_change_the_live_instance(tmp_path, monkeypa
         copy = open_duckdb_connection(tmp_path / "copy.duckdb", role="snapshot")
         try:
             assert copy.execute("SELECT current_setting('threads')").fetchone() == (4,)
-            assert live.execute("SELECT current_setting('threads')").fetchone() == (2,)
+            assert live.execute("SELECT current_setting('threads')").fetchone() == (
+                int(ROLE_DEFAULTS["worker"]["threads"]),
+            )
         finally:
             copy.close()
     finally:
@@ -126,7 +130,7 @@ def test_open_duckdb_connection_applies_settings_without_config_conflict(tmp_pat
         try:
             assert worker.execute("SELECT count(*) FROM items").fetchone() == (1,)
             assert worker.execute("SELECT current_setting('threads')").fetchone() == (
-                2,
+                int(ROLE_DEFAULTS["worker"]["threads"]),
             )
         finally:
             worker.close()
@@ -381,3 +385,34 @@ def test_orphaned_snapshot_scratch_is_swept_but_live_work_is_kept(tmp_path):
 
     assert not stale.exists()
     assert fresh.exists()
+
+
+def test_a_background_pass_cannot_raise_parallelism_under_a_foreground_reader(
+    tmp_path,
+):
+    """The regression guard for #331.
+
+    ``threads`` is instance-wide, so a background ``worker`` connection used
+    to double it for a cockpit build already running at the ``diagnostic``
+    setting. On 2026-09-04 that concurrency put the server at 374 percent CPU
+    and starved the control plane until a restart. A maintenance role must
+    never ask for more parallelism than the foreground reader it shares an
+    instance with.
+    """
+    shared = tmp_path / "live.duckdb"
+
+    foreground = open_duckdb_connection(shared, role="diagnostic")
+    try:
+        before = foreground.execute("SELECT current_setting('threads')").fetchone()
+        background = open_duckdb_connection(shared, role="worker")
+        try:
+            after = foreground.execute("SELECT current_setting('threads')").fetchone()
+        finally:
+            background.close()
+    finally:
+        foreground.close()
+
+    assert after == before
+    assert int(ROLE_DEFAULTS["worker"]["threads"]) <= int(
+        ROLE_DEFAULTS["diagnostic"]["threads"]
+    )

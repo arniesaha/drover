@@ -11,6 +11,10 @@ from pathlib import Path
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.analytics_maintenance import (
+    AnalyticalMaintenanceGate,
+    MaintenanceAdmission,
+)
 from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.harness.usage import TokenTotals
 from drover.server.harness.usage_sources import (
@@ -241,11 +245,29 @@ def rollup_pending_native_usage(
 class NativeUsageRollupWorker:
     """Periodically repair native usage after an import or an interrupted write."""
 
-    def __init__(self, *, duckdb_path: Path, poll_interval_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        duckdb_path: Path,
+        poll_interval_s: float = 60.0,
+        maintenance_gate: "AnalyticalMaintenanceGate | None" = None,
+        max_consecutive_skips: int = 10,
+    ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.poll_interval_s = poll_interval_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # This pass scans a parquet partition on the shared analytical
+        # instance, whose threads and memory are instance-wide, so running it
+        # beside a cockpit build makes that build slower and can starve the
+        # control plane of CPU (#331). Stand aside, but not forever.
+        self._admission = MaintenanceAdmission(
+            maintenance_gate, max_consecutive_skips=max_consecutive_skips
+        )
+
+    @property
+    def deferred_passes(self) -> int:
+        return self._admission.skipped_total
 
     def start(self) -> None:
         if self._thread is not None:
@@ -272,4 +294,8 @@ class NativeUsageRollupWorker:
             self._stop.wait(self.poll_interval_s)
 
     def drain_once(self) -> NativeUsageRollupReport:
-        return rollup_pending_native_usage(self.duckdb_path)
+        with self._admission.admit() as admitted:
+            if not admitted:
+                log.debug("native usage rollup deferred: a request is in flight")
+                return NativeUsageRollupReport(partitions=0, sessions=0)
+            return rollup_pending_native_usage(self.duckdb_path)
