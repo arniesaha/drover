@@ -36,6 +36,7 @@ final class InsightDetailFixtureUITests: XCTestCase {
         addScreenshot(named: "insight-detail-standard-expanded", app: app)
     }
 
+    @MainActor
     private func addScreenshot(named name: String, app: XCUIApplication) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
