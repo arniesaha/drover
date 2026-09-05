@@ -56,6 +56,10 @@ jobs:
       if: steps.scope.outputs.ios == 'true'
       run: xcodegen generate
 
+    - name: Run DroverKit package tests
+      if: steps.scope.outputs.ios == 'true'
+      run: swift test --package-path DroverKit --jobs 2
+
     - name: Select iPhone simulator
       if: steps.scope.outputs.ios == 'true'
       run: |
@@ -75,7 +79,7 @@ jobs:
           -scheme Drover \
           -resolvePackageDependencies
 
-    - name: Run unit tests
+    - name: Run app unit tests
       if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
@@ -85,15 +89,19 @@ jobs:
           -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
           test
 
-    - name: Build UI test bundle
+    # AccessibilityJourneyUITests is deliberately not listed: it has never
+    # passed a full run, on CI or locally, and gating every iOS PR on it
+    # would make a red build carry no information. See the follow-up issue.
+    - name: Run deterministic UI journey
       if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
         xcodebuild -project Drover.xcodeproj \
           -scheme DroverUITests \
           -destination "$SIMULATOR_DESTINATION" \
+          -only-testing:DroverUITests/DeterministicJourneyUITests \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
-          build-for-testing
+          test
 
     - name: Upload unit test result bundle
       if: failure() && steps.scope.outputs.ios == 'true'
@@ -103,7 +111,7 @@ jobs:
         path: ${{ runner.temp }}/DroverTests.xcresult
         if-no-files-found: ignore
 
-    - name: Upload UI build result bundle
+    - name: Upload deterministic UI test result bundle
       if: failure() && steps.scope.outputs.ios == 'true'
       uses: actions/upload-artifact@v4
       with:

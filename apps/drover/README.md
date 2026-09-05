@@ -71,24 +71,78 @@ directly to the public internet. See [Security](../../docs/security.md) and
 
 ## Test
 
-Generate the project, then run the unit and integration suite:
+Run these commands from the repository root. Generate the project before
+running an Xcode suite:
 
 ```bash
-xcodebuild -project Drover.xcodeproj -scheme Drover \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+(cd apps/drover && xcodegen generate)
+```
+
+The `Drover` scheme selects the `DroverTests` target. Run it with an installed
+iPhone simulator:
+
+```bash
+DROVER_SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+test -n "$DROVER_SIMULATOR_ID"
+xcodebuild -project apps/drover/Drover.xcodeproj -scheme Drover \
+  -destination "id=$DROVER_SIMULATOR_ID" \
   test
 ```
 
-The current suite contains 269 Swift Testing tests across 23 suites, plus the
-XCTest cases bundled in `DroverTests`.
-
-Build the UI-test bundle separately:
+The `DroverKit` package has a separate test target. Run its full deterministic
+suite directly so its recovery and bounded-work tests execute:
 
 ```bash
-xcodebuild -project Drover.xcodeproj -scheme DroverUITests \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
-  build-for-testing
+swift test --package-path apps/drover/DroverKit --jobs 2
 ```
+
+The credential-free deterministic journey and its Accessibility XXXL companion
+exercise the app's real navigation against the synthetic `core-journey`
+fixture. They do not need a server URL, token, or network access:
+
+```bash
+DROVER_SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+test -n "$DROVER_SIMULATOR_ID"
+xcodebuild -project apps/drover/Drover.xcodeproj -scheme DroverUITests \
+  -destination "id=$DROVER_SIMULATOR_ID" \
+  -only-testing:DroverUITests/DeterministicJourneyUITests \
+  -only-testing:DroverUITests/AccessibilityJourneyUITests \
+  test
+```
+
+Live UI checks stay opt-in. Run `E2EValidationUITests` only when a developer
+has supplied a disposable live server and credential through local environment
+variables. Pass them to the test runner without printing their values:
+
+```bash
+: "${DROVER_SMOKE_URL:?set a disposable live server URL}"
+: "${DROVER_SMOKE_TOKEN:?set a disposable live-server token}"
+DROVER_SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+test -n "$DROVER_SIMULATOR_ID"
+xcodebuild -project apps/drover/Drover.xcodeproj -scheme DroverUITests \
+  -destination "id=$DROVER_SIMULATOR_ID" \
+  TEST_RUNNER_DROVER_SMOKE_URL="$DROVER_SMOKE_URL" \
+  TEST_RUNNER_DROVER_SMOKE_TOKEN="$DROVER_SMOKE_TOKEN" \
+  -only-testing:DroverUITests/E2EValidationUITests \
+  test
+```
+
+`SettingsSmokeUITests` is also manual-only. Do not add either live class to
+the required CI selection.
+
+## Release-device evidence
+
+Root records this evidence before release on the smallest supported physical
+iPhone. Record the reference iPhone model and OS, app build, local network,
+and data fixture. Exercise light and dark appearance, the largest Dynamic
+Type size, VoiceOver, Reduce Motion, keyboard and paste, camera pairing,
+background and foreground, a development-account notification tap, and a
+long-code or diff session.
+
+Measure cached-screen, latest-page, and send-acknowledgement behavior on that
+device before comparing the results with the 1 s, 3 s, and 1.5 s targets.
+Record an unavailable measurement as unavailable. These observations are
+physical-device release evidence, not simulator timings or phone p95 claims.
 
 ## Project Layout
 
