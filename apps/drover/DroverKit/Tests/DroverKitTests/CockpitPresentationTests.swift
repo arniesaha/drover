@@ -238,6 +238,20 @@ import Testing
     #expect(InsightEvidencePresentation.label(for: "source_ref") == "Source Ref")
 }
 
+@Test func insightDetailHeaderAccessibilityIncludesStatusAndEvidenceSummary() {
+    let label = InsightDetailHeaderPresentation.accessibilityLabel(
+        severity: "High",
+        status: "Status: Resolved",
+        confidence: "Confirmed",
+        source: "Deterministic check",
+        title: "Hook is missing",
+        targetID: "mac-mini/codex/pre-tool",
+        evidenceSummary: "Evidence: 2 observations · latest Aug 8, 2026 at 6:01 PM"
+    )
+
+    #expect(label == "High, Status: Resolved, Deterministic check, Confirmed, Hook is missing, target mac-mini/codex/pre-tool, Evidence: 2 observations · latest Aug 8, 2026 at 6:01 PM")
+}
+
 @Test func insightCheckStatePreventsDuplicateRequestsUntilItIsAcknowledgedOrFails() {
     var state = InsightCheckActionState.ready
 

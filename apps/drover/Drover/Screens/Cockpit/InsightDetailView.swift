@@ -49,11 +49,13 @@ struct InsightDetailView: View {
         _ finding: InsightFinding, state: InsightState, evidence: [InsightEvidence]
     ) -> some View {
         let value = InsightPresentation(insight: finding)
+        let statusText = "Status: \(InsightEvidencePresentation.label(for: state.rawValue))"
+        let evidenceSummary = evidenceSummaryText(evidence)
         return CockpitCard {
             VStack(alignment: .leading, spacing: 8) {
                 FlowLayout(spacing: 7, lineSpacing: 4) {
                     Text(value.severityText).droverText(.marker)
-                    Text("Status: \(InsightEvidencePresentation.label(for: state.rawValue))")
+                    Text(statusText)
                         .droverText(.subtitle)
                     Text(value.sourceText).droverText(.subtitle)
                     Text(value.confidenceText).droverText(.subtitle)
@@ -62,7 +64,7 @@ struct InsightDetailView: View {
                 Text("\(finding.targetType.replacingOccurrences(of: "_", with: " ")) · \(finding.targetID)")
                     .droverText(.mono)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(evidenceSummaryText(evidence))
+                Text(evidenceSummary)
                     .droverText(.nested)
                 if let uncertainty = value.uncertaintyText {
                     Text(uncertainty).droverText(.nested)
@@ -70,7 +72,16 @@ struct InsightDetailView: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(value.severityText), \(value.confidenceText), \(value.sourceText), \(finding.title), target \(finding.targetID)")
+        .accessibilityLabel(InsightDetailHeaderPresentation.accessibilityLabel(
+            severity: value.severityText,
+            status: statusText,
+            confidence: value.confidenceText,
+            source: value.sourceText,
+            title: finding.title,
+            targetID: finding.targetID,
+            evidenceSummary: evidenceSummary,
+            uncertainty: value.uncertaintyText
+        ))
     }
 
     private func impactSection(_ finding: InsightFinding) -> some View {

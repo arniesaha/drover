@@ -694,6 +694,26 @@ public enum InsightEvidencePresentation {
     }
 }
 
+/// One spoken description for the detail header after SwiftUI combines its
+/// children. Keep the status and compact evidence metadata here so they do
+/// not disappear for VoiceOver when the visible chips wrap across lines.
+public enum InsightDetailHeaderPresentation {
+    public static func accessibilityLabel(
+        severity: String,
+        status: String,
+        confidence: String,
+        source: String,
+        title: String,
+        targetID: String,
+        evidenceSummary: String,
+        uncertainty: String? = nil
+    ) -> String {
+        var parts = [severity, status, source, confidence, title, "target \(targetID)", evidenceSummary]
+        if let uncertainty { parts.append(uncertainty) }
+        return parts.joined(separator: ", ")
+    }
+}
+
 /// Local UI state for a reanalysis request. A successful request only means
 /// the work was accepted; a later refresh supplies any changed disposition.
 public enum InsightCheckActionState: Sendable, Equatable {
