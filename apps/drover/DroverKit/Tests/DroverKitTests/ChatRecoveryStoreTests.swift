@@ -123,6 +123,31 @@ struct ChatRecoveryStoreTests {
         #expect(try await store.onDiskByteCount() <= ChatRecoveryLimits.default.maximumTotalBytes)
     }
 
+    @Test func sweepKeepsARefreshedDraftAfterItsIndexWriteFails() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let faults = ChatRecoveryStoreFaults()
+        let store = ChatRecoveryStore(root: root, faults: faults)
+        let binding = UUID()
+        let key = recoveryKey(binding: binding, sessionID: "stale-target")
+        let stale = ChatRecoverySnapshot(
+            draftText: "stale draft",
+            updatedAt: Date.now.addingTimeInterval(-8 * 24 * 60 * 60)
+        )
+        let refreshed = ChatRecoverySnapshot(draftText: "fresh draft")
+        try await store.save(stale, for: key)
+        faults.failNextIndexWrite()
+
+        await #expect(throws: ChatRecoveryError.storageUnavailable) {
+            try await store.save(refreshed, for: key)
+        }
+
+        let reloadedStore = ChatRecoveryStore(root: root)
+        try await reloadedStore.sweep(keeping: [binding])
+
+        #expect(try await reloadedStore.load(for: key) == refreshed)
+    }
+
     @Test func purgeRetriesUnindexedFilesAfterPostIndexRemovalFailure() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -568,27 +568,33 @@ public actor ChatRecoveryStore: ChatRecoveryPersisting {
         excluding excludedFilename: String?
     ) -> Set<String> {
         let cutoff = Date.now.addingTimeInterval(-limits.maximumDraftAge)
-        return Set(index.records.compactMap { filename, entry in
+        return Set(index.records.compactMap { filename, _ in
             guard filename != excludedFilename,
-                  !entry.hasPendingTurn,
-                  entry.updatedAt < cutoff,
-                  snapshotIsConfirmedDraftOnly(filename) else {
+                  isConfirmedExpiredDraft(filename, before: cutoff) else {
                 return nil
             }
             return filename
         })
     }
 
-    private func snapshotIsConfirmedDraftOnly(_ filename: String) -> Bool {
+    private func isConfirmedExpiredDraft(_ filename: String, before cutoff: Date) -> Bool {
         do {
-            let snapshot = try JSONDecoder().decode(
+            var snapshot = try JSONDecoder().decode(
                 ChatRecoverySnapshot.self,
                 from: Data(contentsOf: recordURL(filename))
             )
-            return snapshot.pendingTurn == nil
+            guard snapshot.pendingTurn == nil,
+                  snapshot.deferredTurn == nil,
+                  snapshot.updatedAt < cutoff else {
+                return false
+            }
+            try hydrate(&snapshot, filename: filename)
+            try validate(snapshot)
+            return snapshot.updatedAt < cutoff
         } catch {
-            // A stale index must not authorize deleting data we cannot decode
-            // or read. Preserve it until a scoped recovery path can handle it.
+            // Stale index metadata must not authorize deleting data whose
+            // current record cannot be decoded and validated. A committed
+            // record is authoritative when an earlier index write failed.
             return false
         }
     }
