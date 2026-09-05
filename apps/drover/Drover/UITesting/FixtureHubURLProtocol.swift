@@ -142,7 +142,7 @@ final class FixtureHubURLProtocol: URLProtocol {
         switch (request.httpMethod, path) {
         case ("GET", "/harness"):
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
-        case ("GET", let path) where path.contains("/model-catalog"):
+        case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/model-catalog":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.modelCatalogData())
         case ("POST", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/sessions":
             return .json(status: 201, [
