@@ -2,6 +2,9 @@
 
 import json
 import logging
+import multiprocessing
+import os
+import socket
 import subprocess
 import sys
 import textwrap
@@ -774,6 +777,7 @@ def test_setup_check_bounds_authenticated_response_bytes():
 
 def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypatch):
     """Bytes arriving before socket inactivity timeout cannot extend a control read."""
+    request_started = threading.Event()
     completed = threading.Event()
     body = b'{"hosts":[],"padding":"' + (b"x" * 80) + b'"}'
 
@@ -781,6 +785,7 @@ def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypat
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:
+            request_started.set()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Transfer-Encoding", "chunked")
@@ -801,7 +806,7 @@ def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypat
             pass
 
     with _serve_setup_check_http(DripHandler) as server:
-        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.12)
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.5)
         cfg = replace(
             default_config(),
             auth_api_token="test-token",
@@ -815,14 +820,20 @@ def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypat
                 "GET",
                 "/harness/hosts",
                 None,
-                deadline=started + 0.5,
+                deadline=started + 1,
             )
-        assert time.monotonic() - started < 0.3
-        assert completed.wait(timeout=0.4)
+        assert time.monotonic() - started < 0.7
+        assert request_started.wait(timeout=0.5)
+        assert not any(
+            child.name == "drover-setup-check-request"
+            for child in multiprocessing.active_children()
+        )
+        assert completed.wait(timeout=2)
 
 
 def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch):
     """Health headers arriving in fragments cannot extend the listener probe."""
+    request_started = threading.Event()
     completed = threading.Event()
     raw_headers = b"Content-Length: 0\r\nX-Delayed: true\r\n\r\n"
 
@@ -830,6 +841,7 @@ def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:
+            request_started.set()
             try:
                 self.connection.sendall(b"HTTP/1.1 200 OK\r\n")
                 for byte in raw_headers:
@@ -844,17 +856,86 @@ def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch
             pass
 
     with _serve_setup_check_http(DripHandler) as server:
-        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.12)
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.5)
         started = time.monotonic()
         assert (
             server_main._setup_check_liveness(
                 f"http://127.0.0.1:{server.server_port}/healthz",
-                deadline=started + 0.5,
+                deadline=started + 1,
             )
             is False
         )
-        assert time.monotonic() - started < 0.3
-        assert completed.wait(timeout=1)
+        assert time.monotonic() - started < 0.7
+        assert request_started.wait(timeout=0.5)
+        assert not any(
+            child.name == "drover-setup-check-request"
+            for child in multiprocessing.active_children()
+        )
+        assert completed.wait(timeout=1.5)
+
+
+def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
+    tmp_path, monkeypatch
+):
+    """A resolver stalled in an executor cannot keep setup-check past its deadline."""
+    marker = tmp_path / "resolver-started"
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        textwrap.dedent("""\
+            import os
+            import socket
+            import time
+            from pathlib import Path
+
+            if os.environ.get("DROVER_SETUP_CHECK_DELAY_RESOLVER") == "1":
+                marker = Path(os.environ["DROVER_SETUP_CHECK_RESOLVER_MARKER"])
+
+                def delayed_resolver(*args, **kwargs):
+                    marker.write_text("started", encoding="utf-8")
+                    time.sleep(2)
+                    raise socket.gaierror("synthetic resolver delay")
+
+                socket.getaddrinfo = delayed_resolver
+            """),
+        encoding="utf-8",
+    )
+
+    def delayed_resolver(*args, **kwargs):
+        marker.write_text("started", encoding="utf-8")
+        time.sleep(2)
+        raise socket.gaierror("synthetic resolver delay")
+
+    monkeypatch.setattr(socket, "getaddrinfo", delayed_resolver)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))),
+    )
+    monkeypatch.setenv("DROVER_SETUP_CHECK_DELAY_RESOLVER", "1")
+    monkeypatch.setenv("DROVER_SETUP_CHECK_RESOLVER_MARKER", str(marker))
+    existing_children = {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.name == "drover-setup-check-request"
+    }
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        server_main._setup_check_http_request(
+            "http://resolver-delay.invalid/healthz",
+            "GET",
+            None,
+            {},
+            deadline=started + 1,
+            max_response_bytes=None,
+        )
+
+    assert marker.exists()
+    assert time.monotonic() - started < 1.4
+    assert {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.name == "drover-setup-check-request"
+    } == existing_children
 
 
 def test_setup_check_control_redirect_does_not_reach_second_origin():
@@ -1137,6 +1218,110 @@ def test_setup_check_verbose_suppresses_transport_log_details(monkeypatch, caplo
         "/private/project",
     ):
         assert private_text not in output
+
+
+def test_setup_check_module_entrypoint_uses_spawn_safe_transport(tmp_path):
+    """The installed module entrypoint can complete checks that spawn worker processes."""
+    requested_paths: list[str] = []
+
+    class ReadyHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requested_paths.append(self.path)
+            if self.path == "/healthz":
+                self.send_response(204)
+                self.end_headers()
+                return
+            if self.path == "/harness/hosts":
+                body = json.dumps(
+                    {
+                        "hosts": [
+                            {
+                                "host_id": "subprocess-host",
+                                "status": "online",
+                                "capabilities": {
+                                    "harnesses": [{"name": "codex", "enabled": True}]
+                                },
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+            elif self.path == "/harness/hosts/subprocess-host/auth/codex/status":
+                body = b'{"state":"authenticated"}'
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            requested_paths.append(self.path)
+            assert self.path == "/harness/hosts/subprocess-host/fs/exists"
+            body = b'{"exists":{"/private/subprocess-project":true}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(ReadyHandler) as server:
+        config_path = tmp_path / "setup-check-subprocess.toml"
+        config_path.write_text(
+            textwrap.dedent(f"""\
+                [server]
+                metrics_http_port = {server.server_port}
+                metrics_host = "127.0.0.1"
+                advertised_url = "http://127.0.0.1:{server.server_port}"
+
+                [auth]
+                api_token = "subprocess-test-token"
+                """),
+            encoding="utf-8",
+        )
+        root = Path(__file__).parents[1]
+        environment = os.environ | {
+            "PYTHONPATH": str(root / "src"),
+            "DROVER_API_TOKEN": "subprocess-test-token",
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "drover.server",
+                "--config",
+                str(config_path),
+                "setup-check",
+                "--host",
+                "subprocess-host",
+                "--harness",
+                "codex",
+                "--project",
+                "/private/subprocess-project",
+                "--json",
+            ],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["ready"] is True
+    assert requested_paths == [
+        "/healthz",
+        "/healthz",
+        "/harness/hosts",
+        "/harness/hosts/subprocess-host/auth/codex/status",
+        "/harness/hosts/subprocess-host/fs/exists",
+    ]
+    assert "subprocess-test-token" not in result.stdout + result.stderr
 
 
 def test_archive_help_preserves_existing_commands_and_adds_backup():

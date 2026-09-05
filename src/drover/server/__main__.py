@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import math
@@ -21,7 +20,6 @@ from typing import Any, Callable, Mapping, Optional
 
 import click
 import duckdb
-import httpx
 from mcp.server.fastmcp import FastMCP
 
 import drover
@@ -42,6 +40,10 @@ from drover.schema import (
     prune_legacy_control_plane_tables,
 )
 from drover.server import ledger_shadow
+from drover.server.setup_readiness_transport import (
+    run_setup_check_http_request,
+    suppress_setup_check_transport_logs,
+)
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
@@ -509,7 +511,7 @@ def _setup_check_liveness(url: str, *, deadline: float) -> bool:
             url, "GET", None, {}, deadline=deadline, max_response_bytes=None
         )
         return 200 <= status < 300
-    except (OSError, RuntimeError, ValueError, TimeoutError, httpx.HTTPError):
+    except (OSError, RuntimeError, ValueError, TimeoutError):
         return False
 
 
@@ -556,83 +558,14 @@ def _setup_check_http_request(
     max_response_bytes: int | None,
 ) -> tuple[int, bytes]:
     """Perform one no-redirect request within the shared setup-check deadline."""
-    return asyncio.run(
-        _setup_check_http_request_async(
-            url,
-            method,
-            data,
-            headers,
-            deadline=deadline,
-            max_response_bytes=max_response_bytes,
-        )
+    return run_setup_check_http_request(
+        url,
+        method,
+        data,
+        headers,
+        timeout=_setup_check_timeout(deadline),
+        max_response_bytes=max_response_bytes,
     )
-
-
-async def _setup_check_http_request_async(
-    url: str,
-    method: str,
-    data: bytes | None,
-    headers: dict[str, str],
-    *,
-    deadline: float,
-    max_response_bytes: int | None,
-) -> tuple[int, bytes]:
-    timeout = _setup_check_timeout(deadline)
-    async with asyncio.timeout(timeout):
-        async with httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=httpx.Timeout(timeout),
-            trust_env=False,
-        ) as client:
-            async with client.stream(
-                method, url, content=data, headers=headers
-            ) as response:
-                status = response.status_code
-                if not 200 <= status < 300 or max_response_bytes is None:
-                    return status, b""
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    if len(body) + len(chunk) > max_response_bytes:
-                        raise ValueError(
-                            "setup-check response exceeds the configured bound"
-                        )
-                    body.extend(chunk)
-                return status, bytes(body)
-
-
-@contextmanager
-def _suppress_setup_check_transport_logs():
-    """Keep setup-check transport details out of its public CLI boundary."""
-    logger_dict = logging.Logger.manager.loggerDict
-    loggers = [
-        logger
-        for name, logger in logger_dict.items()
-        if isinstance(logger, logging.Logger)
-        and (
-            name == "httpx"
-            or name.startswith("httpx.")
-            or name == "httpcore"
-            or name.startswith("httpcore.")
-        )
-    ]
-    for name in ("httpx", "httpcore"):
-        logger = logging.getLogger(name)
-        if logger not in loggers:
-            loggers.append(logger)
-    previous = [
-        (logger, tuple(logger.handlers), logger.propagate) for logger in loggers
-    ]
-    try:
-        for logger, _, _ in previous:
-            logger.handlers.clear()
-            logger.addHandler(logging.NullHandler())
-            logger.propagate = False
-        yield
-    finally:
-        for logger, handlers, propagate in previous:
-            logger.handlers.clear()
-            logger.handlers.extend(handlers)
-            logger.propagate = propagate
 
 
 def _bootstrap_if_missing(cfg: DroverConfig) -> None:
@@ -919,7 +852,7 @@ def setup_check(
     try:
         cfg = _resolve_config(ctx.obj["config_path"])
         deadline = time.monotonic() + _SETUP_CHECK_TOTAL_TIMEOUT_SECONDS
-        with _suppress_setup_check_transport_logs():
+        with suppress_setup_check_transport_logs():
             report = evaluate_setup(
                 cfg,
                 SetupTarget(host_id=host_id, harness=harness, project=project),
