@@ -42,6 +42,8 @@ class _StubDriver:
         self.sent_images: list = []
         self.answered: list[tuple[str, str, str | None]] = []
         self.send_turn_error: Exception | None = None
+        self.send_turn_started: threading.Event | None = None
+        self.release_send_turn: threading.Event | None = None
         self.answer_permission_error: Exception | None = None
 
     def start(self) -> None:
@@ -61,6 +63,10 @@ class _StubDriver:
         del model, thinking_effort
         if self.send_turn_error is not None:
             raise self.send_turn_error
+        if self.send_turn_started is not None:
+            self.send_turn_started.set()
+            assert self.release_send_turn is not None
+            assert self.release_send_turn.wait(timeout=2)
         self.sent_turns.append((text, turn_id))
         self.sent_images.append(images)
 
@@ -237,6 +243,110 @@ def test_send_turn_preserves_the_client_turn_id_in_the_echo(monkeypatch, tmp_pat
         event for _session_id, event in on_messages if event["type"] == "user_input"
     )
     assert user_input["turn_id"] == client_turn_id
+
+
+def test_replayed_client_turn_id_does_not_dispatch_or_record_a_second_turn(
+    monkeypatch, tmp_path
+):
+    mgr, driver, registry, on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
+
+    first = mgr.send_turn("sess-1", "hello", client_turn_id=client_turn_id)
+    replay = mgr.send_turn("sess-1", "hello", client_turn_id=client_turn_id)
+
+    assert replay == first == client_turn_id
+    assert driver.sent_turns == [("hello", client_turn_id)]
+    assert sum(event["type"] == "user_input" for _sid, event in on_messages) == 1
+    assert (
+        sum(
+            event.event_type == "user_input" for event in registry.list_events("sess-1")
+        )
+        == 1
+    )
+
+
+def test_replayed_client_turn_id_is_restored_after_manager_restart(
+    monkeypatch, tmp_path
+):
+    mgr, driver, registry, on_messages, finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
+
+    first = mgr.send_turn("sess-1", "hello", client_turn_id=client_turn_id)
+    mgr.close("sess-1")
+    mgr.start(
+        "sess-1",
+        harness="stub",
+        cwd=None,
+        command=None,
+        registry=registry,
+        on_message=lambda sid, evt: on_messages.append((sid, evt)),
+        finalize=lambda sid, rc: finalized.append((sid, rc)),
+    )
+    recovered_driver = mgr._require_entry("sess-1").driver
+
+    replay = mgr.send_turn("sess-1", "hello", client_turn_id=client_turn_id)
+
+    assert replay == first == client_turn_id
+    assert driver.sent_turns == [("hello", client_turn_id)]
+    assert recovered_driver.sent_turns == []
+    assert sum(event["type"] == "user_input" for _sid, event in on_messages) == 1
+
+
+def test_concurrent_duplicate_client_turn_id_dispatches_only_once(
+    monkeypatch, tmp_path
+):
+    mgr, driver, _registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
+    driver.send_turn_started = threading.Event()
+    driver.release_send_turn = threading.Event()
+    results: list[str] = []
+
+    def submit() -> None:
+        results.append(mgr.send_turn("sess-1", "hello", client_turn_id=client_turn_id))
+
+    first = threading.Thread(target=submit)
+    second = threading.Thread(target=submit)
+    first.start()
+    assert driver.send_turn_started.wait(timeout=2)
+    second.start()
+    driver.release_send_turn.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == [client_turn_id, client_turn_id]
+    assert driver.sent_turns == [("hello", client_turn_id)]
+
+
+def test_replayed_submission_skips_preparation_side_effects(monkeypatch, tmp_path):
+    mgr, driver, _registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
+    preparations: list[str] = []
+
+    def prepare() -> tuple[str, list[dict[str, str]]]:
+        preparations.append("prepared")
+        return "hello", [{"path": "/tmp/a.png", "media_type": "image/png"}]
+
+    first, first_replayed = mgr.submit_turn(
+        "sess-1", prepare=prepare, client_turn_id=client_turn_id
+    )
+    replay, replayed = mgr.submit_turn(
+        "sess-1", prepare=prepare, client_turn_id=client_turn_id
+    )
+
+    assert (first, first_replayed) == (client_turn_id, False)
+    assert (replay, replayed) == (client_turn_id, True)
+    assert preparations == ["prepared"]
+    assert driver.sent_turns == [("hello", client_turn_id)]
 
 
 def test_send_turn_forwards_images_and_records_attachments(monkeypatch, tmp_path):

@@ -214,6 +214,42 @@ struct MessageBubble: View {
     }
 }
 
+/// A local user turn has already left the composer, but only the stream echo
+/// makes it part of the durable transcript. Rendering it in the same place as
+/// a normal user bubble makes a slow or lost HTTP response feel acknowledged
+/// without pretending that delivery is complete.
+struct PendingTurnBubble: View {
+    let pendingTurn: ChatPendingTurn
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 32)
+            VStack(alignment: .trailing, spacing: 5) {
+                if !pendingTurn.text.isEmpty || pendingTurn.attachments.isEmpty {
+                    Text(pendingTurn.text)
+                }
+                if !pendingTurn.attachments.isEmpty {
+                    Label(
+                        pendingTurn.attachments.count == 1
+                            ? "1 image" : "\(pendingTurn.attachments.count) images",
+                        systemImage: "paperclip"
+                    )
+                    .font(.caption2)
+                }
+                Label(pendingTurn.statusText, systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .padding(10)
+            .foregroundStyle(.white)
+            .background(.tint.opacity(0.72), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(pendingTurn.text), \(pendingTurn.statusText)")
+        .accessibilityIdentifier("chat-pending-turn")
+    }
+}
+
 /// Compact card shared by tool calls and approval prompts: an SF Symbol, a
 /// title, and detail behind a disclosure so long tool input doesn't dominate
 /// the transcript. claude-code Edit/MultiEdit payloads show a real diff

@@ -5,9 +5,13 @@ import DroverKit
 /// to confuse with a raw or folded transcript row ID (both are strings).
 enum ChatTranscriptScrollTarget: Hashable {
     case visualTail
+    case pendingTurn
 
-    static func bottomDestination(for items: [TranscriptItem]) -> AnyHashable? {
-        items.isEmpty ? nil : AnyHashable(Self.visualTail)
+    static func bottomDestination(
+        for items: [TranscriptItem], hasPendingTurn: Bool = false
+    ) -> AnyHashable? {
+        if hasPendingTurn { return AnyHashable(Self.pendingTurn) }
+        return items.isEmpty ? nil : AnyHashable(Self.visualTail)
     }
 }
 
@@ -137,7 +141,14 @@ struct ChatView: View {
                 )
             }
 
-            if let hint = model.hint {
+            // Deliberately not gated on `hint`: approve, interrupt, terminate
+            // and an unauthorized stream event all clear it, and an
+            // unconfirmed delivery must keep its Retry through any of them.
+            if let pendingTurn = model.pendingTurn, pendingTurn.canRetry {
+                ChatHintBanner(model.hint ?? pendingTurn.retryMessage, actionTitle: "Retry") {
+                    Task { await model.retryPendingTurn() }
+                }
+            } else if let hint = model.hint {
                 ChatHintBanner(hint)
             }
         }
@@ -146,7 +157,8 @@ struct ChatView: View {
                      attachments: $model.pendingAttachments,
                      runPreferences: model.runPreferences,
                      harness: model.harnessPresentation.harness,
-                     isSending: model.isSending) {
+                     isSending: model.isSending,
+                     canSend: model.canSendTurn) {
                 Task { await model.sendTurn() }
             }
         }
@@ -196,7 +208,9 @@ struct ChatView: View {
             // there — re-folding here meant a full pass over every message
             // on each scroll-phase change.
             let items = model.items
-            let visualTailID = ChatTranscriptScrollTarget.bottomDestination(for: items)
+            let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                for: items, hasPendingTurn: model.pendingTurn != nil
+            )
             ScrollView {
                 // Cold open is bounded to the newest 200 raw messages, which
                 // fold to substantially fewer rows. Keep that bounded tail
@@ -267,6 +281,10 @@ struct ChatView: View {
                             .id(item.id)
                     }
 
+                    if let pendingTurn = model.pendingTurn {
+                        PendingTurnBubble(pendingTurn: pendingTurn)
+                    }
+
                     // The ID belongs to the bottom of the clearance, not the
                     // final transcript row. `scrollTo(..., anchor: .bottom)`
                     // therefore keeps this 24pt gap visible above the composer.
@@ -332,6 +350,10 @@ struct ChatView: View {
                 guard newestID != nil, isPinnedToBottom else { return }
                 scheduleScroll(with: proxy)
             }
+            .onChange(of: model.pendingTurn?.clientTurnID) { _, _ in
+                guard isPinnedToBottom else { return }
+                scheduleScroll(with: proxy)
+            }
             .defaultScrollAnchor(.bottom)
             .onDisappear {
                 pendingScroll?.cancel()
@@ -362,7 +384,7 @@ struct ChatView: View {
         Button {
             cancelPrependScroll()
             guard let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
-                for: model.items
+                for: model.items, hasPendingTurn: model.pendingTurn != nil
             ) else { return }
             withAnimation(.snappy) {
                 isPinnedToBottom = true
@@ -393,7 +415,7 @@ struct ChatView: View {
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, isPinnedToBottom,
                   let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
-                    for: model.items
+                    for: model.items, hasPendingTurn: model.pendingTurn != nil
                   ) else {
                 pendingScroll = nil
                 return
@@ -405,7 +427,7 @@ struct ChatView: View {
             pendingScroll = nil
             guard !Task.isCancelled, isPinnedToBottom,
                   let settledVisualTailID = ChatTranscriptScrollTarget.bottomDestination(
-                    for: model.items
+                    for: model.items, hasPendingTurn: model.pendingTurn != nil
                   ) else { return }
             proxy.scrollTo(settledVisualTailID, anchor: .bottom)
         }
