@@ -41,8 +41,12 @@ struct ChatHeaderContent: View {
 /// calls are delegated to `ChatModel` — this view only renders it.
 struct ChatView: View {
     private let client: DroverClient
+    private let recoveryStore: (any ChatRecoveryPersisting)?
+    private let recoveryWriteGate: ChatRecoveryWriteGate
+    private let recoveryGeneration: Int
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
+    @State private var showDiscardPendingConfirm = false
     @State private var handoffSession: HandoffSession?
     @State private var pendingScroll: Task<Void, Never>?
     @State private var pendingPrependScroll: Task<Void, Never>?
@@ -58,21 +62,31 @@ struct ChatView: View {
     /// Flipped by a timer once the cold open has lasted long enough to be
     /// worth acknowledging. A local open beats it and the screen stays quiet.
     @State private var coldOpenIsSlow = false
+    @Environment(\.scenePhase) private var scenePhase
 
     init(
         client: DroverClient,
         sessionID: String,
         harness: String? = nil,
         recap: String? = nil,
-        recapSourceSeq: Int? = nil
+        recapSourceSeq: Int? = nil,
+        recoveryStore: (any ChatRecoveryPersisting)?,
+        recoveryWriteGate: ChatRecoveryWriteGate,
+        recoveryGeneration: Int
     ) {
         self.client = client
+        self.recoveryStore = recoveryStore
+        self.recoveryWriteGate = recoveryWriteGate
+        self.recoveryGeneration = recoveryGeneration
         _model = State(initialValue: ChatModel(
             client: client,
             sessionID: sessionID,
             harness: harness,
             recap: recap,
-            recapSourceSeq: recapSourceSeq
+            recapSourceSeq: recapSourceSeq,
+            recoveryStore: recoveryStore,
+            recoveryWriteGate: recoveryWriteGate,
+            recoveryGeneration: recoveryGeneration
         ))
     }
 
@@ -148,6 +162,9 @@ struct ChatView: View {
                 ChatHintBanner(model.hint ?? pendingTurn.retryMessage, actionTitle: "Retry") {
                     Task { await model.retryPendingTurn() }
                 }
+            } else if let pendingTurn = model.pendingTurn,
+                      pendingTurn.deliveryState == .needsManualReview {
+                pendingDeliveryReview(pendingTurn)
             } else if let hint = model.hint {
                 ChatHintBanner(hint)
             }
@@ -158,7 +175,10 @@ struct ChatView: View {
                      runPreferences: model.runPreferences,
                      harness: model.harnessPresentation.harness,
                      isSending: model.isSending,
-                     canSend: model.canSendTurn) {
+                     canSend: model.canSendTurn,
+                     onAddAttachment: { attachment in
+                         await model.addAttachmentIfRecoverable(attachment)
+                     }) {
                 Task { await model.sendTurn() }
             }
         }
@@ -176,7 +196,20 @@ struct ChatView: View {
                 Task { await model.terminate() }
             }
         }
+        .confirmationDialog(
+            "Discard this local delivery?",
+            isPresented: $showDiscardPendingConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Discard locally", role: .destructive) {
+                Task { await model.discardPendingTurn() }
+            }
+            .accessibilityIdentifier("chat-discard-pending-confirm")
+        } message: {
+            Text("This removes only the saved local delivery record.")
+        }
         .task {
+            await model.restoreRecovery()
             model.start()
             await model.loadSessionMetadata()
         }
@@ -188,17 +221,54 @@ struct ChatView: View {
             guard !Task.isCancelled else { return }
             coldOpenIsSlow = true
         }
-        .onDisappear { model.stop() }
+        .onDisappear {
+            Task { await model.prepareForDeparture() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            Task { await model.flushRecoveryCheckpoint() }
+        }
         // A handoff (`/continue`) creates a structured session for
         // structured-capable targets (chat UI, handoff context as the first
         // turn) and a seeded PTY for shell/native-resume — navigate to
         // whichever the server actually created.
         .navigationDestination(item: $handoffSession) { handoff in
             if handoff.isStructured {
-                ChatView(client: client, sessionID: handoff.id, harness: handoff.harness)
+                ChatView(
+                    client: client,
+                    sessionID: handoff.id,
+                    harness: handoff.harness,
+                    recoveryStore: recoveryStore,
+                    recoveryWriteGate: recoveryWriteGate,
+                    recoveryGeneration: recoveryGeneration
+                )
             } else {
                 TerminalScreen(client: client, sessionID: handoff.id, harness: handoff.harness)
             }
+        }
+    }
+
+    private func pendingDeliveryReview(_ pendingTurn: ChatPendingTurn) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ChatHintBanner(pendingTurn.manualReviewMessage)
+            HStack(spacing: 12) {
+                Button("Check delivery") {
+                    model.checkPendingDelivery()
+                }
+                .accessibilityIdentifier("chat-check-delivery")
+
+                Button("Copy to draft") {
+                    Task { await model.copyPendingTurnToDraft() }
+                }
+                .accessibilityIdentifier("chat-copy-pending-to-draft")
+
+                Button("Discard locally", role: .destructive) {
+                    showDiscardPendingConfirm = true
+                }
+                .accessibilityIdentifier("chat-discard-pending")
+            }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 16)
         }
     }
 

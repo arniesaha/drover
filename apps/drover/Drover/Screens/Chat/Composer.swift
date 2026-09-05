@@ -12,6 +12,7 @@ struct Composer: View {
     let harness: String
     let isSending: Bool
     let canSend: Bool
+    let onAddAttachment: (TurnAttachment) async -> Bool
     let onSend: () -> Void
 
     @State private var pickerItems: [PhotosPickerItem] = []
@@ -59,8 +60,12 @@ struct Composer: View {
             guard let raw = try? await item.loadTransferable(type: Data.self),
                   let jpeg = ImageDownscaler.jpegData(from: raw) else { continue }
             let combined = attachments.reduce(0) { $0 + $1.data.count }
-            guard combined + jpeg.count <= Self.maxCombinedBytes else { continue }
-            attachments.append(TurnAttachment(mediaType: "image/jpeg", data: jpeg))
+            guard attachments.count < 4,
+                  combined + jpeg.count <= Self.maxCombinedBytes
+            else { continue }
+            guard await onAddAttachment(
+                TurnAttachment(mediaType: "image/jpeg", data: jpeg)
+            ) else { return }
         }
     }
 

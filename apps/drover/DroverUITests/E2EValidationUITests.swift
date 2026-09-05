@@ -218,7 +218,7 @@ final class E2EValidationUITests: XCTestCase {
         cwdField.tap()
         cwdField.typeText(cwd)
 
-        let promptEditor = app.textFields["prompt-input"]
+        let promptEditor = app.textFields["composer-input"]
         XCTAssertTrue(promptEditor.waitForExistence(timeout: 5),
                       "structured harness should show the starting-prompt editor")
         promptEditor.tap()
@@ -243,7 +243,7 @@ final class E2EValidationUITests: XCTestCase {
         shoot(app, "05-chat-first-reply")
 
         // ── 4. A follow-up turn through the composer ──────────────────────
-        let composer = app.textFields["prompt-input"]
+        let composer = app.textFields["composer-input"]
         XCTAssertTrue(composer.waitForExistence(timeout: 5))
         composer.tap()
         composer.typeText("How many legs does a spider have? Reply with only the number.")

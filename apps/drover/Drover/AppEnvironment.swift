@@ -57,9 +57,14 @@ final class AppEnvironment {
     private let tokenStore: TokenStore
     private let recoveryBindingStore: RecoveryBindingStore
     private let recoveryStore: (any ChatRecoveryPersisting)?
+    /// The one app-owned recovery writer boundary. Every foreground chat
+    /// receives this exact instance so sign out can drain writes already
+    /// admitted to the recovery actor before it erases their namespace.
+    private let recoveryWriteGate = ChatRecoveryWriteGate()
     private let validator: @Sendable (ServerConfig, String) async -> String?
     private var operationEpoch = 0
     private var pendingCleanupBindingIDs = Set<UUID>()
+    private var isPerformingRecoveryRootCleanup = false
 
     init(
         defaults: UserDefaults = .standard,
@@ -159,6 +164,14 @@ final class AppEnvironment {
         recoveryStore
     }
 
+    var chatRecoveryWriteGate: ChatRecoveryWriteGate {
+        recoveryWriteGate
+    }
+
+    var chatRecoveryGeneration: Int {
+        recoveryWriteGate.generation
+    }
+
     enum ConfigureOutcome {
         case success
         case failure(String)
@@ -169,6 +182,9 @@ final class AppEnvironment {
     /// persist the URL to `UserDefaults`, save the token to the Keychain, and
     /// swap in the new client.
     func configure(urlString: String, token: String) async -> ConfigureOutcome {
+        guard !isPerformingRecoveryRootCleanup else {
+            return .failure("Local chat recovery cleanup is still in progress. Wait for Sign Out to finish.")
+        }
         guard let newConfig = ServerConfig(urlString: urlString) else {
             return .failure("Enter a valid server URL.")
         }
@@ -195,6 +211,11 @@ final class AppEnvironment {
             return .failure("Could not save token to Keychain.")
         }
 
+        // A successful raw-token replacement is the point at which the old
+        // recovery namespace stops being authorized. Do not invalidate before
+        // `save`: a failed Keychain replacement must leave the working old
+        // connection and its recovery writer intact.
+        let retiredRecoveryGeneration = recoveryWriteGate.invalidate()
         let oldBindingID = client?.credentialBindingID
         let bindingID: UUID?
         do {
@@ -228,6 +249,7 @@ final class AppEnvironment {
             credentialBindingID: bindingID
         )
         generation += 1
+        await recoveryWriteGate.drain(retiredRecoveryGeneration)
         var retryBindings = pendingCleanupBindingIDs
         if let oldBindingID, oldBindingID != bindingID {
             retryBindings.insert(oldBindingID)
@@ -263,6 +285,9 @@ final class AppEnvironment {
     /// cannot inherit half the old configuration.
     func signOut() async throws {
         operationEpoch &+= 1
+        isPerformingRecoveryRootCleanup = true
+        defer { isPerformingRecoveryRootCleanup = false }
+        let retiredRecoveryGeneration = recoveryWriteGate.invalidate()
         let previousConfig = config
         // Drop the app's foreground connection before its first suspension so
         // no visible UI or new background work can use this credential.
@@ -292,6 +317,11 @@ final class AppEnvironment {
         } catch {
             cleanupFailed = true
         }
+
+        // The marker above survives process termination while this waits for
+        // a write admitted before invalidation. Only after that write has
+        // completed can cleanup erase its namespace without a late recreate.
+        await recoveryWriteGate.drainAllRetired()
 
         // After raw credential deletion, no binding can legitimately retain
         // recovery. This deliberately bypasses the normal fail-closed index

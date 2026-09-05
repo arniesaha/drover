@@ -246,7 +246,10 @@ struct PendingTurnBubble: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(pendingTurn.text), \(pendingTurn.statusText)")
-        .accessibilityIdentifier("chat-pending-turn")
+        .accessibilityIdentifier(
+            pendingTurn.deliveryState == .needsManualReview
+                ? "chat-delivery-manual-review" : "chat-delivery-awaiting"
+        )
     }
 }
 

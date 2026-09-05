@@ -506,6 +506,146 @@ final class SignOutTests: XCTestCase {
         let restored = try await recovery.load(for: oldKey)
         XCTAssertNil(restored)
     }
+
+    func testSignOutDrainsAnAdmittedRecoveryWriteBeforeErasingItsBinding() async throws {
+        let suiteName = "drover.signout.recovery-drain.\(UUID().uuidString)"
+        let service = "drover-signout-recovery-drain-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let recoveryStore = BlockingSignOutRecoveryStore()
+        defer {
+            try? tokenStore.delete()
+            try? bindingStore.clear()
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        try? tokenStore.save("synthetic-drain-token")
+        let config = ServerConfig(urlString: "http://127.0.0.1:7080")!
+        config.save(defaults: defaults)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recoveryStore,
+            launchEnvironment: [:]
+        )
+        try XCTSkipUnless(environment.client?.credentialBindingID != nil, "Keychain unavailable")
+        let client = try XCTUnwrap(environment.client)
+        let bindingID = try XCTUnwrap(client.credentialBindingID)
+        let key = ChatRecoveryKey(
+            serverURL: config.baseURL,
+            credentialBindingID: bindingID,
+            sessionID: "admitted-write"
+        )
+        let model = ChatModel(
+            client: client,
+            sessionID: "admitted-write",
+            recoveryStore: environment.chatRecoveryStore,
+            recoveryWriteGate: environment.chatRecoveryWriteGate,
+            recoveryGeneration: environment.chatRecoveryGeneration
+        )
+        model.composerText = "must not survive sign out"
+        await recoveryStore.waitUntilSaveStarted()
+
+        let signingOut = Task { @MainActor in
+            try? await environment.signOut()
+        }
+        await waitUntil {
+            tokenStore.load() == nil
+                && defaults.bool(forKey: "drover.chat-recovery-cleanup-pending")
+        }
+        let competingCredential = "synthetic-competing-value"
+        let configureDuringCleanup = await environment.configure(
+            urlString: "http://127.0.0.1:7080",
+            token: competingCredential
+        )
+        guard case let .failure(message) = configureDuringCleanup else {
+            return XCTFail("configuration must wait for root cleanup")
+        }
+        XCTAssertEqual(
+            message,
+            "Local chat recovery cleanup is still in progress. Wait for Sign Out to finish."
+        )
+        let erasedBeforeDrain = await recoveryStore.wasErased
+        XCTAssertFalse(erasedBeforeDrain)
+
+        await recoveryStore.releaseSave()
+        _ = await signingOut.value
+
+        let restored = try await recoveryStore.load(for: key)
+        XCTAssertNil(restored)
+    }
+
+    func testSignOutDrainsAnOlderReplacementWriteBeforeRootErase() async throws {
+        let suiteName = "drover.signout.replacement-drain.\(UUID().uuidString)"
+        let service = "drover-signout-replacement-drain-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        let bindingStore = RecoveryBindingStore(service: service)
+        let recoveryStore = BlockingSignOutRecoveryStore()
+        defer {
+            try? tokenStore.delete()
+            try? bindingStore.clear()
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        try? tokenStore.save("synthetic-original-token")
+        let config = ServerConfig(urlString: "http://127.0.0.1:7080")!
+        config.save(defaults: defaults)
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            recoveryBindingStore: bindingStore,
+            recoveryStore: recoveryStore,
+            validator: { _, _ in nil },
+            launchEnvironment: [:]
+        )
+        try XCTSkipUnless(environment.client?.credentialBindingID != nil, "Keychain unavailable")
+        let oldClient = try XCTUnwrap(environment.client)
+        let oldBindingID = try XCTUnwrap(oldClient.credentialBindingID)
+        let oldKey = ChatRecoveryKey(
+            serverURL: config.baseURL,
+            credentialBindingID: oldBindingID,
+            sessionID: "replacement-drain"
+        )
+        let model = ChatModel(
+            client: oldClient,
+            sessionID: "replacement-drain",
+            recoveryStore: environment.chatRecoveryStore,
+            recoveryWriteGate: environment.chatRecoveryWriteGate,
+            recoveryGeneration: environment.chatRecoveryGeneration
+        )
+        model.composerText = "cannot outlive replacement and sign out"
+        await recoveryStore.waitUntilSaveStarted()
+
+        let replacementCredential = "synthetic-replacement-value"
+        let replacing = Task { @MainActor in
+            await environment.configure(
+                urlString: config.baseURL.absoluteString,
+                token: replacementCredential
+            )
+        }
+        await waitUntil { environment.generation == 1 }
+
+        let signingOut = Task { @MainActor in
+            try? await environment.signOut()
+        }
+        await waitUntil {
+            tokenStore.load() == nil
+                && defaults.bool(forKey: "drover.chat-recovery-cleanup-pending")
+        }
+        let erasedBeforeOldWriteFinished = await recoveryStore.wasErased
+        XCTAssertFalse(erasedBeforeOldWriteFinished)
+
+        await recoveryStore.releaseSave()
+        _ = await replacing.value
+        _ = await signingOut.value
+
+        let restored = try await recoveryStore.load(for: oldKey)
+        XCTAssertNil(restored)
+        XCTAssertNil(environment.client)
+        XCTAssertNil(environment.config)
+        XCTAssertNil(tokenStore.load())
+    }
 }
 
 private func temporaryRecoveryRoot() throws -> URL {
@@ -611,6 +751,59 @@ private actor SuspendedEraseRecoveryStore: ChatRecoveryPersisting {
     func releaseErase() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private actor BlockingSignOutRecoveryStore: ChatRecoveryPersisting {
+    private var snapshots: [ChatRecoveryKey: ChatRecoverySnapshot] = [:]
+    private var saveStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private(set) var wasErased = false
+
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? {
+        snapshots[key]
+    }
+
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
+        saveStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        snapshots[key] = snapshot
+    }
+
+    func remove(for key: ChatRecoveryKey) async throws {
+        snapshots.removeValue(forKey: key)
+    }
+
+    func purge(bindingID: UUID) async throws {
+        snapshots = snapshots.filter { $0.key.credentialBindingID != bindingID }
+    }
+
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {
+        snapshots = snapshots.filter { bindingIDs.contains($0.key.credentialBindingID) }
+    }
+
+    func eraseAllAfterCredentialDeletion() async throws {
+        wasErased = true
+        snapshots.removeAll()
+    }
+
+    func waitUntilSaveStarted() async {
+        guard !saveStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func releaseSave() {
+        let continuation = releaseContinuation
+        releaseContinuation = nil
+        continuation?.resume()
     }
 }
 
