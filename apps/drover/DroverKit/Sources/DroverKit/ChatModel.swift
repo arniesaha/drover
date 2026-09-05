@@ -942,14 +942,15 @@ public final class ChatModel {
     /// confirmation that removes the local pending row. Text matches are not
     /// enough: another device may have sent identical words.
     private func confirmPendingTurn(_ message: HarnessMessage) {
-        guard message.type == .userInput,
-              let pendingTurn,
+        guard message.type == .userInput else { return }
+        if isCommittingPendingDeliveryAction,
+           let actionClientTurnID = pendingDeliveryActionClientTurnID,
+           message.turnID == actionClientTurnID {
+            acknowledgedPendingDeliveryActionClientTurnID = actionClientTurnID
+        }
+        guard let pendingTurn,
               message.turnID == pendingTurn.clientTurnID
         else { return }
-        if isCommittingPendingDeliveryAction,
-           pendingDeliveryActionClientTurnID == pendingTurn.clientTurnID {
-            acknowledgedPendingDeliveryActionClientTurnID = pendingTurn.clientTurnID
-        }
         self.pendingTurn = nil
         cancelDeliveryConfirmationTimeout()
         hint = nil

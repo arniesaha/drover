@@ -475,6 +475,124 @@ struct ChatRecoveryModelTests {
         #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
     }
 
+    @Test @MainActor func exactAcknowledgmentDuringCopyPhaseTwoNeverResurrectsItsManualDelivery() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = PhaseTwoFailingRecoveryStore()
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xA5, 0xA6]))
+        let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xB5, 0xB6]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let copying = Task { @MainActor in
+            await model.copyPendingTurnToDraft()
+        }
+        await recovery.waitUntilPhaseTwoStarted()
+        model.composerText = "newer B"
+        model.pendingAttachments = [newerImage]
+        model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "older A", turnID: originalID.uuidString)))
+        await recovery.failPhaseTwo()
+        await copying.value
+
+        #expect(model.pendingTurn == nil)
+        #expect(model.composerText == "newer B")
+        #expect(model.pendingAttachments == [newerImage])
+        await model.retryRecoverySave()
+        await model.prepareForDeparture()
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.pendingTurn == nil)
+        #expect(recreated.composerText == "newer B")
+        #expect(recreated.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
+    @Test @MainActor func exactAcknowledgmentDuringDiscardPhaseTwoNeverResurrectsItsManualDelivery() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = PhaseTwoFailingRecoveryStore()
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xC5, 0xC6]))
+        let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xD5, 0xD6]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+        model.composerText = "newer B"
+        model.pendingAttachments = [newerImage]
+
+        let discarding = Task { @MainActor in
+            await model.discardPendingTurn()
+        }
+        await recovery.waitUntilPhaseTwoStarted()
+        model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "older A", turnID: originalID.uuidString)))
+        await recovery.failPhaseTwo()
+        await discarding.value
+
+        #expect(model.pendingTurn == nil)
+        #expect(model.composerText == "newer B")
+        #expect(model.pendingAttachments == [newerImage])
+        await model.retryRecoverySave()
+        await model.prepareForDeparture()
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.pendingTurn == nil)
+        #expect(recreated.composerText == "newer B")
+        #expect(recreated.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
+    @Test @MainActor func unrelatedAcknowledgmentDuringCopyPhaseTwoDoesNotConfirmItsManualDelivery() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = PhaseTwoFailingRecoveryStore()
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let unrelatedID = UUID(uuidString: "00000000-0000-4000-8000-000000000043")!
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(clientTurnID: originalID, text: "older A")
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let copying = Task { @MainActor in
+            await model.copyPendingTurnToDraft()
+        }
+        await recovery.waitUntilPhaseTwoStarted()
+        model.ingest(.message(.fixture(seq: 10, type: .userInput, text: "older A", turnID: unrelatedID.uuidString)))
+        await recovery.failPhaseTwo()
+        await copying.value
+
+        #expect(model.pendingTurn?.clientTurnID == originalID.uuidString)
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
     @Test @MainActor func failedRecoveryReadCannotRetrySavingOrReplaceTheUnreadRecord() async throws {
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let original = ChatRecoverySnapshot(draftText: "unread saved draft")
@@ -1387,6 +1505,66 @@ private actor PhaseOneThenFailPhaseTwoRecoveryStore: ChatRecoveryPersisting {
             phaseOneRelease.resume()
         } else {
             releaseRequested = true
+        }
+    }
+}
+
+private actor PhaseTwoFailingRecoveryStore: ChatRecoveryPersisting {
+    private var saveCount = 0
+    private var phaseTwoStarted = false
+    private var phaseTwoWaiters: [CheckedContinuation<Void, Never>] = []
+    private var phaseTwoFailure: CheckedContinuation<Void, Never>?
+    private var failureRequested = false
+    private var snapshots: [ChatRecoveryKey: ChatRecoverySnapshot] = [:]
+
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? {
+        snapshots[key]
+    }
+
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
+        saveCount += 1
+        switch saveCount {
+        case 1, 2:
+            snapshots[key] = snapshot
+        case 3:
+            phaseTwoStarted = true
+            let waiters = phaseTwoWaiters
+            phaseTwoWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { continuation in
+                if failureRequested {
+                    failureRequested = false
+                    continuation.resume()
+                } else {
+                    phaseTwoFailure = continuation
+                }
+            }
+            throw ChatRecoveryError.storageUnavailable
+        default:
+            snapshots[key] = snapshot
+        }
+    }
+
+    func remove(for key: ChatRecoveryKey) async throws {
+        snapshots.removeValue(forKey: key)
+    }
+    func purge(bindingID: UUID) async throws {}
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {}
+    func eraseAllAfterCredentialDeletion() async throws {}
+
+    func waitUntilPhaseTwoStarted() async {
+        guard !phaseTwoStarted else { return }
+        await withCheckedContinuation { continuation in
+            phaseTwoWaiters.append(continuation)
+        }
+    }
+
+    func failPhaseTwo() {
+        if let phaseTwoFailure {
+            self.phaseTwoFailure = nil
+            phaseTwoFailure.resume()
+        } else {
+            failureRequested = true
         }
     }
 }
