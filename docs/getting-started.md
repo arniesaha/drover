@@ -1,8 +1,8 @@
 # Getting Started
 
-The first supported setup runs `drover-server`, `drover-harnessd`, and the
-agent CLI on one machine. Add other trusted machines only after the local path
-works.
+The first supported setup runs `drover-server`, `drover-harnessd`, and an
+authenticated supported agent CLI on one computer. Add other trusted machines
+only after you can complete a small task in a project the agent can read.
 
 ## Install
 
@@ -10,21 +10,20 @@ works.
 curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
 ```
 
-That installs a verified release into `~/.drover/runtime/<version>`, starts
-both services, detects an address your phone can reach, and prints a QR code
-to pair with. It refuses to run if it finds a Drover service it did not
-create; pass `--adopt` to migrate an existing source install.
+That installs a verified release into `~/.drover/runtime/<version>`, starts the
+hub and local harness, detects a private address your phone can reach, and
+prints a QR code to pair with. It refuses to run if it finds a Drover service
+it did not create; pass `--adopt` to migrate an existing source install.
 
 Useful flags:
 
 - `--dry-run` prints exactly what it would do and changes nothing.
 - `--url <host:port>` overrides address detection. Private addresses only.
 - `--version vX.Y.Z` pins a release instead of taking the latest.
-- `--join <drover://...>` adds this machine to an existing fleet. See
-  [Multi-Host](multi-host.md).
 
-Adding a second machine is one pasted command, printed by
-`drover-server pair-host` on the machine that already runs the hub.
+Add a second machine only after this first-computer path works. The existing
+hub prints its one pasted setup command with `drover-server pair-host`; see
+[Multi-Host](multi-host.md).
 
 ## Prerequisites
 
@@ -117,9 +116,9 @@ pair it:
 uv run drover-server pair
 ```
 
-Scan the QR code with the app. The app receives its own token and stores it in
-the iOS Keychain. Nothing is typed by hand. The code is single use and expires
-after ten minutes.
+Scan the QR code with the app. The app receives its own credential and stores
+it in the iOS Keychain. Nothing is typed by hand. The code is single use and
+expires after ten minutes.
 
 The QR points at `[server] advertised_url` from `~/.drover/config.toml`. Set
 that to a private LAN address or a private Tailscale address before pairing a
@@ -127,8 +126,20 @@ physical iPhone. While it is unset, the command prints the loopback address and
 warns that only the simulator on this Mac can reach it. Do not use Tailscale
 Funnel.
 
-Manual URL and token entry stays available in app settings as the recovery path
-for when a camera is unavailable.
+If the camera is unavailable, use **Or enter it by hand** in **Pair & Connect**
+and enter the server URL and pairing code from `drover-server pair`. This keeps
+manual pairing as the recovery path without copying a shared bearer token.
+
+After pairing, choose an authenticated supported agent and a readable project,
+then send a small task. If that journey is not ready, run this optional
+terminal-side diagnosis after selecting the host, harness, and project:
+
+```bash
+drover-server setup-check --host HOST --harness HARNESS --project PROJECT
+```
+
+It reports bounded, read-only recovery categories and actions. Add `--json`
+when a structured result is useful; it does not change services or credentials.
 
 ## Add Private Tailscale Access
 

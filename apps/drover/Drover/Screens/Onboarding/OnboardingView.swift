@@ -18,7 +18,7 @@ enum OnboardingStep: Int, CaseIterable, Identifiable, Sendable {
 }
 
 /// The multi-step first-launch onboarding experience for Drover.
-/// Guides the user through fleet overview, server setup (Hub vs Host), and instant QR / manual pairing.
+/// Guides the user through first-computer setup and QR or manual pairing recovery.
 struct OnboardingView: View {
     var environment: AppEnvironment
     var onFinished: () -> Void = {}
@@ -184,7 +184,10 @@ struct OnboardingView: View {
     private var serverSetupStep: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                ServerSetupContent(selectedMode: $selectedSetupMode)
+                ServerSetupContent(
+                    context: .firstComputer,
+                    selectedMode: $selectedSetupMode
+                )
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.25)) {

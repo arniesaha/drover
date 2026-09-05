@@ -61,10 +61,16 @@ final class OnboardingTests: XCTestCase {
     }
 
     func testServerSetupGuideViewInstantiates() {
-        let guideHub = ServerSetupGuideView(initialMode: .hub)
+        let guideHub = ServerSetupGuideView(
+            context: .firstComputer,
+            initialMode: .hub
+        )
         XCTAssertNotNil(guideHub)
 
-        let guideHost = ServerSetupGuideView(initialMode: .host)
+        let guideHost = ServerSetupGuideView(
+            context: .connectedFleet,
+            initialMode: .host
+        )
         XCTAssertNotNil(guideHost)
     }
 
