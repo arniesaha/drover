@@ -396,12 +396,16 @@ else:
         print(str(target / f"drover-{short}.service"))
 PY
 
-  local shorts="harnessd"
-  [ "$mode" = "fleet" ] && shorts="server harnessd"
+  success "service definitions installed"
+}
 
+# Start units after their definitions have been installed. A new fleet starts
+# its hub by itself first so the local harness cannot read api_token before the
+# hub writes it. Joined hosts call this with harnessd only.
+start_units() {
+  local short
   if [ "$OS" = "darwin" ]; then
-    local short
-    for short in $shorts; do
+    for short in "$@"; do
       local plist="$HOME/Library/LaunchAgents/com.drover.$short.plist"
       launchctl unload "$plist" 2>/dev/null || true
       launchctl load -w "$plist" 2>/dev/null || true
@@ -411,12 +415,11 @@ PY
     # reboot, which is the difference between a fleet host and a laptop.
     loginctl enable-linger "$USER" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
-    local short
-    for short in $shorts; do
+    for short in "$@"; do
       systemctl --user enable --now "drover-$short.service" 2>/dev/null || true
     done
   fi
-  success "services installed and started"
+  success "services started"
 }
 
 # --- CLI on PATH -------------------------------------------------------------
@@ -540,6 +543,7 @@ EOF
 
   # Rewrite the harnessd unit with the connection mode the probe chose.
   install_units "$listen_args" "http://${HUB_ADDRESS}"
+  start_units harnessd
   success "joined $HUB_ADDRESS as $host_id"
 }
 
@@ -561,10 +565,12 @@ if [ -n "$JOIN_URL" ]; then
 else
   write_config "$ADDRESS"
   install_units fleet "http://${ADDRESS}"
+  start_units server
   if wait_for_health "$ADDRESS"; then
     success "drover-server is up"
+    start_units harnessd
   else
-    warn "drover-server did not answer /healthz yet; check the logs before pairing"
+    fail "drover-server did not answer /healthz at http://${ADDRESS}; harnessd was not started. Check the server logs and rerun after the hub is healthy"
   fi
   echo
   # Run through the link when it resolves, so the QR is printed by the same
