@@ -6,7 +6,6 @@ import plistlib
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -479,52 +478,54 @@ def test_verify_app_rejects_a_mismatched_export_after_a_valid_archive(
         )
 
 
-def test_archive_wrapper_refuses_an_existing_output_before_archiving() -> None:
+def test_archive_wrapper_refuses_an_existing_output_before_archiving(
+    tmp_path: Path,
+) -> None:
     if not ARCHIVE_SCRIPT_PATH.exists():
         pytest.fail("scripts/ios/archive.sh has not been created")
-    with tempfile.TemporaryDirectory(dir="/Volumes/M2 1") as workspace:
-        output = Path(workspace) / "candidate"
-        output.mkdir()
+    output = tmp_path / "candidate"
+    output.mkdir()
 
-        result = subprocess.run(
-            [
-                "bash",
-                str(ARCHIVE_SCRIPT_PATH),
-                "--version",
-                "1.2.3",
-                "--build",
-                "42",
-                "--output",
-                str(output),
-            ],
-            cwd=ARCHIVE_SCRIPT_PATH.parents[2],
-            capture_output=True,
-            text=True,
-        )
+    result = subprocess.run(
+        [
+            "bash",
+            str(ARCHIVE_SCRIPT_PATH),
+            "--version",
+            "1.2.3",
+            "--build",
+            "42",
+            "--output",
+            str(output),
+        ],
+        cwd=ARCHIVE_SCRIPT_PATH.parents[2],
+        capture_output=True,
+        text=True,
+    )
 
     assert result.returncode != 0
     assert "already exists" in result.stderr
 
 
-def test_archive_wrapper_rejects_unexpanded_values_before_archiving() -> None:
-    with tempfile.TemporaryDirectory(dir="/Volumes/M2 1") as workspace:
-        output = Path(workspace) / "candidate"
+def test_archive_wrapper_rejects_unexpanded_values_before_archiving(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "candidate"
 
-        result = subprocess.run(
-            [
-                "bash",
-                str(ARCHIVE_SCRIPT_PATH),
-                "--version",
-                "$(MARKETING_VERSION)",
-                "--build",
-                "42",
-                "--output",
-                str(output),
-            ],
-            cwd=ARCHIVE_SCRIPT_PATH.parents[2],
-            capture_output=True,
-            text=True,
-        )
+    result = subprocess.run(
+        [
+            "bash",
+            str(ARCHIVE_SCRIPT_PATH),
+            "--version",
+            "$(MARKETING_VERSION)",
+            "--build",
+            "42",
+            "--output",
+            str(output),
+        ],
+        cwd=ARCHIVE_SCRIPT_PATH.parents[2],
+        capture_output=True,
+        text=True,
+    )
 
     assert result.returncode != 0
     assert "expanded numeric" in result.stderr
