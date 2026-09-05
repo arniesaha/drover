@@ -783,17 +783,61 @@ _DRIP_MAX_MEASURABLE_TIMEOUT_SECONDS = 15.0
 # budget has to cover spawning a fresh interpreter as well as the request itself.
 # Widening a test's deadline past 5 s therefore changes nothing: the cap still
 # applies, and a spawn spike walks straight through it. Tests whose subject is not
-# the deadline raise the cap instead, so a slow spawn cannot turn their assertion
-# into a timeout and quietly stop testing what they name.
-_INCIDENTAL_TIMEOUT_HEADROOM = 10
+# the deadline replace the cap outright, so a slow spawn cannot turn their
+# assertion into a timeout and quietly stop testing what they name.
+#
+# Calibrating this to a measured spawn cost was tried and is worthless here: at a
+# normal 0.05 s, ten times that is under the 5 s the cap already allows, so on
+# every healthy machine the fixture raised nothing at all. A budget that only
+# helps where the problem does not exist is not a budget.
 
 
 @pytest.fixture
-def generous_request_timeout(monkeypatch, worker_spawn_seconds) -> float:
-    """Raise the per-request cap past what a worker spawn costs on this machine."""
-    budget = max(5.0, worker_spawn_seconds * _INCIDENTAL_TIMEOUT_HEADROOM)
-    monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: budget)
-    return budget
+def generous_request_timeout(monkeypatch) -> float:
+    """Replace the per-request cap with one a slow worker spawn cannot exhaust."""
+    monkeypatch.setattr(
+        server_main, "_setup_check_timeout", lambda _: _SPAWN_HANG_GUARD_SECONDS
+    )
+    return _SPAWN_HANG_GUARD_SECONDS
+
+
+class _PopenShim:
+    """The transport's view of ``subprocess`` with only Popen replaced.
+
+    ``transport_module.subprocess`` is the shared stdlib module, so setting Popen
+    on it would change every spawn in the process. This stands in front of it and
+    forwards everything else, so the transport still finds SubprocessError, PIPE
+    and the rest.
+    """
+
+    def __init__(self, module, popen):
+        self._module = module
+        self.Popen = popen
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+@pytest.fixture
+def spawn_attempts(monkeypatch) -> list:
+    """Record every worker spawn the transport attempts, without preventing one.
+
+    A missing stall marker has two very different causes. If a worker was started
+    and was simply too slow to get there, nothing was observed and the test should
+    retry. If no worker was started at all, setup-check is broken and the test must
+    say so -- skipping there would keep the suite green over a real defect.
+    """
+    attempts: list = []
+    real_subprocess = transport_module.subprocess
+
+    def recording_popen(*args, **kwargs):
+        attempts.append(args)
+        return real_subprocess.Popen(*args, **kwargs)
+
+    monkeypatch.setattr(
+        transport_module, "subprocess", _PopenShim(real_subprocess, recording_popen)
+    )
+    return attempts
 
 
 @pytest.fixture
@@ -828,7 +872,7 @@ def _drip_budget(worker_spawn_seconds: float) -> tuple[float, float]:
 # elapses when the reaping is broken; a working deadline kills the child long
 # before it, so it costs nothing on a passing run.
 _REAP_SPAWN_HEADROOM = 5
-_REAP_BOUND_MULTIPLE = 5
+_REAP_BOUND_MULTIPLE = 3
 _SYNTHETIC_STALL_SECONDS = 60.0
 _REAP_MAX_MEASURABLE_DEADLINE_SECONDS = 6.0
 
@@ -1034,7 +1078,7 @@ def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(
 
 @_retry_when_inconclusive
 def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
-    tmp_path, monkeypatch, worker_spawn_seconds
+    tmp_path, monkeypatch, worker_spawn_seconds, spawn_attempts
 ):
     """A resolver stalled in an executor cannot keep setup-check past its deadline."""
     reap_deadline, reap_bound = _reap_budget(worker_spawn_seconds)
@@ -1060,12 +1104,14 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
         encoding="utf-8",
     )
 
-    def delayed_resolver(*args, **kwargs):
-        marker.write_text("started", encoding="utf-8")
-        time.sleep(_SYNTHETIC_STALL_SECONDS)
+    # The request runs in the worker, so this parent-side stub only guards against
+    # the test process resolving on its own. It must not write the worker's marker
+    # -- that file is what proves the worker ran -- and it must not hold the suite
+    # for the worker's stall.
+    def parent_resolver(*args, **kwargs):
         raise socket.gaierror("synthetic resolver delay")
 
-    monkeypatch.setattr(socket, "getaddrinfo", delayed_resolver)
+    monkeypatch.setattr(socket, "getaddrinfo", parent_resolver)
     monkeypatch.setenv(
         "PYTHONPATH",
         os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))),
@@ -1090,6 +1136,7 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
         )
 
     if not marker.exists():
+        assert spawn_attempts, "setup-check started no worker at all"
         raise _Inconclusive("the worker never reached the synthetic stall")
     assert time.monotonic() - started < reap_bound
     assert {
@@ -1101,7 +1148,7 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
 
 @_retry_when_inconclusive
 def test_setup_check_bounds_large_request_transfer_before_child_receive(
-    tmp_path, monkeypatch, capsys, worker_spawn_seconds
+    tmp_path, monkeypatch, capsys, worker_spawn_seconds, spawn_attempts
 ):
     """A child delayed before receive cannot block private request transfer past timeout."""
     reap_deadline, reap_bound = _reap_budget(worker_spawn_seconds)
@@ -1151,6 +1198,7 @@ def test_setup_check_bounds_large_request_transfer_before_child_receive(
         )
 
     if not marker.exists():
+        assert spawn_attempts, "setup-check started no worker at all"
         raise _Inconclusive("the worker never reached the synthetic stall")
     assert time.monotonic() - started < reap_bound
     with pytest.raises(ProcessLookupError):
@@ -1171,7 +1219,14 @@ def test_setup_check_rejects_oversized_private_request_before_starting_worker(
         spawns.append(args)
         raise AssertionError("oversized request reached the worker")
 
-    monkeypatch.setattr(transport_module.subprocess, "Popen", record_spawn)
+    # Patch the transport's view of subprocess, not the stdlib module itself:
+    # ``transport_module.subprocess`` is the shared singleton, so setting Popen on
+    # it would break every other spawn in the process for the duration.
+    monkeypatch.setattr(
+        transport_module,
+        "subprocess",
+        _PopenShim(transport_module.subprocess, record_spawn),
+    )
 
     with pytest.raises(ValueError, match="request exceeds"):
         server_main._setup_check_http_request(
@@ -1189,7 +1244,9 @@ def test_setup_check_rejects_oversized_private_request_before_starting_worker(
     assert "private-request-token" not in captured.out + captured.err
 
 
-def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch):
+def test_setup_check_sanitizes_oversized_config_token_before_worker(
+    monkeypatch, spawn_attempts
+):
     """An oversized configured token becomes the fixed report without a subprocess."""
     cfg = replace(
         default_config(),
@@ -1199,7 +1256,6 @@ def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch)
     monkeypatch.setattr(
         server_main, "_setup_check_liveness", lambda *args, **kwargs: True
     )
-    started = time.monotonic()
 
     result = CliRunner().invoke(
         main,
@@ -1216,7 +1272,7 @@ def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch)
     )
 
     assert result.exit_code == 2, result.output
-    assert time.monotonic() - started < 0.3
+    assert spawn_attempts == []
     assert json.loads(result.output)["ready"] is False
     assert "private-token" not in result.output
     assert "private-host" not in result.output
@@ -1276,9 +1332,14 @@ def test_setup_check_control_redirect_does_not_reach_second_origin(
                         deadline=time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
                     )
             except TimeoutError:
+                # Whatever the second origin already saw is evidence, and a leak
+                # that then timed out is still a leak. Check it before deciding
+                # nothing was observed.
+                assert second_origin_headers == []
                 raise _Inconclusive("the redirect was never requested") from None
 
     if not redirect_origin_headers:
+        assert second_origin_headers == []
         raise _Inconclusive("the redirect was never requested")
     assert len(redirect_origin_headers) == 1
     assert redirect_origin_headers[0]["Authorization"] == "Bearer private-bearer-token"
@@ -1289,6 +1350,7 @@ def test_setup_check_control_redirect_does_not_reach_second_origin(
 def test_setup_check_liveness_rejects_redirect(generous_request_timeout):
     """A redirected health response is not evidence for the configured listener."""
     second_origin_requests: list[str] = []
+    redirect_origin_requests: list[str] = []
 
     class SecondOriginHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1304,6 +1366,7 @@ def test_setup_check_liveness_rejects_redirect(generous_request_timeout):
 
         class RedirectHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                redirect_origin_requests.append(self.path)
                 self.send_response(307)
                 self.send_header(
                     "Location", f"http://{second_host}:{second_port}/healthy"
@@ -1315,15 +1378,21 @@ def test_setup_check_liveness_rejects_redirect(generous_request_timeout):
                 pass
 
         with _serve_setup_check_http(RedirectHandler) as redirect_origin:
-            assert (
-                server_main._setup_check_liveness(
-                    f"http://127.0.0.1:{redirect_origin.server_port}/healthz",
-                    deadline=time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
-                )
-                is False
+            liveness = server_main._setup_check_liveness(
+                f"http://127.0.0.1:{redirect_origin.server_port}/healthz",
+                deadline=time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
             )
 
+    # _setup_check_liveness catches TimeoutError and returns False, so a False
+    # here is not by itself evidence: on a slow spawn the worker is killed before
+    # it asks for anything, and both assertions below would hold having tested
+    # nothing. The redirect origin having been reached is what makes them mean
+    # something. The second origin is still checked first, because a redirect that
+    # was followed is a failure however the call ended.
     assert second_origin_requests == []
+    if not redirect_origin_requests:
+        raise _Inconclusive("the redirect was never requested")
+    assert liveness is False
 
 
 def test_setup_check_sanitizes_config_failure_before_evaluation(monkeypatch):
@@ -1618,7 +1687,6 @@ def test_setup_check_module_entrypoint_uses_spawn_safe_transport(tmp_path):
             )
             if result.returncode == 0 or not remaining:
                 break
-            requested_paths.clear()
 
     assert result.returncode == 0, (
         "setup-check did not complete in "
@@ -1628,13 +1696,17 @@ def test_setup_check_module_entrypoint_uses_spawn_safe_transport(tmp_path):
         + result.stderr
     )
     assert json.loads(result.stdout)["ready"] is True
-    assert requested_paths == [
+    # Compare the tail rather than the whole list, and do not clear between
+    # attempts: an abandoned attempt can leave a worker that connects later, and
+    # clearing would let its path land in the middle of the next attempt's run.
+    expected_paths = [
         "/healthz",
         "/healthz",
         "/harness/hosts",
         "/harness/hosts/subprocess-host/auth/codex/status",
         "/harness/hosts/subprocess-host/fs/exists",
     ]
+    assert requested_paths[-len(expected_paths) :] == expected_paths
     assert "subprocess-test-token" not in result.stdout + result.stderr
 
 
