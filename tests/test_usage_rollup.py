@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
+from unittest import mock
 
 import duckdb
 import pytest
 
 from drover.schema import bootstrap
+from drover.server import harness as _harness_pkg  # noqa: F401
 from drover.server.db import control_plane_path
+from drover.server.harness import usage_rollup as usage_rollup_module
 from drover.server.harness.usage import TokenTotals
 from drover.server.harness.usage_rollup import (
     SOURCE_HARNESS_EVENTS,
@@ -384,9 +388,10 @@ def test_worker_thread_starts_stops_and_survives_a_bad_pass(tmp_path, monkeypatc
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("boom")
-        return usage_rollup.RollupReport(0, 0, 0)
+        return []
 
-    monkeypatch.setattr(usage_rollup, "rollup_pending_sessions", explode)
+    # The first call of a pass, so a failure here is a failed pass.
+    monkeypatch.setattr(usage_rollup, "load_pending_candidates", explode)
     worker = usage_rollup.UsageRollupWorker(duckdb_path=db, poll_interval_s=0.01)
     worker.start()
     try:
@@ -396,3 +401,47 @@ def test_worker_thread_starts_stops_and_survives_a_bad_pass(tmp_path, monkeypatc
     finally:
         worker.stop()
     assert len(calls) >= 2
+
+
+def test_a_pass_does_not_hold_the_control_plane_across_its_parsing(tmp_path):
+    """/harness needs this same lock.
+
+    Holding it for the whole pass made the fleet endpoint wait for however
+    long it took to parse every event of every candidate: 47s and 238s
+    measured on the hub while a session was busy, which is precisely when
+    someone is looking at it (#334).
+    """
+    import drover.server.db as dbmod
+
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(control_plane_path(db))) as con:
+        add_session(con, "c1", "claude-code")
+        for seq in range(1, 12):
+            add_event(con, "c1", seq, claude_usage(f"m{seq}", inp=10, out=1))
+
+    depth = 0
+    peak = 0
+    real = dbmod.control_plane_connection
+
+    @contextlib.contextmanager
+    def counting(*args, **kwargs):
+        nonlocal depth, peak
+        with real(*args, **kwargs) as con:
+            depth += 1
+            peak = max(peak, depth)
+            try:
+                yield con
+            finally:
+                depth -= 1
+
+    worker = usage_rollup_module.UsageRollupWorker(duckdb_path=db)
+    with mock.patch.object(usage_rollup_module, "control_plane_connection", counting):
+        report = worker.drain_once()
+
+    assert report.rolled == 1
+    # Three short windows: candidates, this session's rows, its upsert. Never
+    # nested, and never spanning the parse between them.
+    assert peak == 1
+    with duckdb.connect(str(control_plane_path(db))) as con:
+        assert usage_row(con, "c1")[:2] == (110, 11)
