@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
+import duckdb
+
 from drover.config import AdvisoryContentConfig
 from drover.server.advisory.analyzers import (
     MAX_SNAPSHOT_RECORDS,
@@ -730,7 +732,18 @@ class AdvisoryWorker:
                 succeeded += 1
             except Exception as exc:  # noqa: BLE001 - isolate analyzer failures
                 failed += 1
-                self._record_failure(job, exc)
+                try:
+                    self._record_failure(job, exc)
+                except Exception:  # noqa: BLE001 - bookkeeping is not the sweep
+                    # Recording a failure opens its own analytical connection,
+                    # so under the memory pressure that caused `exc` it can
+                    # fail too. Letting that escape abandons every analyzer
+                    # after this one in the same sweep (#328); the job stays
+                    # leased and is reclaimed by the stale-lease sweep.
+                    log.exception(
+                        "could not record the failure of advisory analyzer %s",
+                        analyzer.analyzer_id,
+                    )
                 log.warning(
                     "advisory analyzer %s failed for %s: %s",
                     analyzer.analyzer_id,
@@ -952,6 +965,23 @@ class AdvisoryWorker:
             con.close()
         self._enqueue_newer_source(job, source_version)
 
+    @staticmethod
+    def _is_resource_exhaustion(exc: BaseException) -> bool:
+        """Whether the host ran out of room, rather than the analyzer being wrong.
+
+        The analytical store is one DuckDB instance with an instance-wide
+        ``memory_limit`` shared by the cockpit's activity build, the usage
+        rollups and this worker (#328). A foreground query can exhaust the
+        pool and fail an analyzer that would have succeeded a second earlier,
+        which says nothing about the analyzer.
+        """
+        if isinstance(exc, duckdb.OutOfMemoryException):
+            return True
+        # DuckDB does not always surface the typed exception through every
+        # call path, and the message is stable across those that raise a
+        # generic Error.
+        return "out of memory error" in str(exc).lower()
+
     def _record_failure(self, job: Job, exc: Exception) -> None:
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:
@@ -959,7 +989,12 @@ class AdvisoryWorker:
             current = ledger.latest_job(ADVISORY_JOB_KIND, job.subject_key)
             if current is None or current.status != "leased":
                 return
-            if current.attempt_count >= current.max_attempts:
+            exhausted = self._is_resource_exhaustion(exc)
+            # Dead-lettering is for an analyzer that cannot succeed. A busy
+            # host is not that: attempts are counted on claim, so five
+            # unlucky sweeps during heavy cockpit use would retire a healthy
+            # analyzer permanently, and nothing re-enqueues it (#328).
+            if not exhausted and current.attempt_count >= current.max_attempts:
                 ledger.fail_job(
                     current.job_id,
                     error_category="analyzer_error",
@@ -969,9 +1004,12 @@ class AdvisoryWorker:
             else:
                 ledger.retry_job(
                     current.job_id,
-                    error_category="analyzer_error",
+                    error_category=(
+                        "resource_exhausted" if exhausted else "analyzer_error"
+                    ),
                     error_message=str(exc),
-                    next_run_at=self.clock() + self.retry_delay,
+                    next_run_at=self.clock()
+                    + (self.retry_delay * 2 if exhausted else self.retry_delay),
                 )
         finally:
             con.close()
