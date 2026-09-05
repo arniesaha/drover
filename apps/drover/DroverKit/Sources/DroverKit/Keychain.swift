@@ -7,11 +7,21 @@ import Security
 ///
 /// The token is never written to `UserDefaults` or logged.
 public struct TokenStore: Sendable {
-    private let service: String
+    public static let defaultService = "com.arnab.drover.token"
+    public let service: String
     private static let account = "api-token"
+    private let updateStatusOverride: OSStatus?
 
-    public init(service: String = "com.arnab.drover.token") {
+    public init(service: String = Self.defaultService) {
         self.service = service
+        updateStatusOverride = nil
+    }
+
+    /// Test-only fault seam. Production callers use the public initializer,
+    /// which always invokes Security directly.
+    init(service: String, updateStatusOverride: OSStatus?) {
+        self.service = service
+        self.updateStatusOverride = updateStatusOverride
     }
 
     private func baseQuery() -> [String: Any] {
@@ -22,17 +32,26 @@ public struct TokenStore: Sendable {
         ]
     }
 
-    /// Upserts the token (delete-then-add).
+    /// Upserts the raw UTF-8 token. Existing credentials are updated in place
+    /// so a failed replacement leaves the working item untouched.
     public func save(_ token: String) throws {
         guard let data = token.data(using: .utf8) else {
             throw KeychainError.encodingFailed
         }
 
-        // Upsert: remove any existing item first, then add fresh. Ignore
-        // errSecItemNotFound since that just means there was nothing to delete.
-        let deleteStatus = SecItemDelete(baseQuery() as CFDictionary)
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            throw KeychainError.osStatus(deleteStatus)
+        let updateAttributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        ]
+        let updateStatus = updateStatusOverride ?? SecItemUpdate(
+            baseQuery() as CFDictionary,
+            updateAttributes as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return
+        }
+        guard updateStatus == errSecItemNotFound else {
+            throw KeychainError.osStatus(updateStatus)
         }
 
         var addQuery = baseQuery()

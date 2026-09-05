@@ -126,11 +126,20 @@ public actor DroverClient {
     /// anything longer than this is the hub or the network, not the listing.
     private static let pathRequestTimeout: TimeInterval = 10
     public nonisolated let config: ServerConfig
+    /// Foreground-only recovery scope. A client without a verified binding can
+    /// still make normal authenticated requests, but cannot restore chat data.
+    public nonisolated let credentialBindingID: UUID?
     private let token: String
     private let session: URLSession
 
-    public init(config: ServerConfig, token: String, session: URLSession = .shared) {
+    public init(
+        config: ServerConfig,
+        token: String,
+        credentialBindingID: UUID? = nil,
+        session: URLSession = .shared
+    ) {
         self.config = config
+        self.credentialBindingID = credentialBindingID
         self.token = token
         self.session = session
     }

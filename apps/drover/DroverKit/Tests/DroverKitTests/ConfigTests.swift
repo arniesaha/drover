@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import Testing
 @testable import DroverKit
 
@@ -11,6 +12,41 @@ import Testing
     #expect(store.load() == "secret-token-2")
     try store.delete()
     #expect(store.load() == nil)
+}
+
+@Test func failedTokenUpdatePreservesLegacyRawUTF8Bytes() throws {
+    let service = "com.arnab.drover.test-\(UUID().uuidString)"
+    let legacyToken = "synthetic-legacy-π"
+    let original = TokenStore(service: service)
+    defer { try? original.delete() }
+    try original.save(legacyToken)
+    let failingReplacement = TokenStore(
+        service: service,
+        updateStatusOverride: errSecAuthFailed
+    )
+
+    #expect(throws: KeychainError.osStatus(errSecAuthFailed)) {
+        try failingReplacement.save("synthetic-replacement")
+    }
+
+    #expect(original.load() == legacyToken)
+    #expect(try rawTokenData(service: service) == Data(legacyToken.utf8))
+}
+
+private func rawTokenData(service: String) throws -> Data {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: "api-token",
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var result: AnyObject?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess, let data = result as? Data else {
+        throw KeychainError.osStatus(status)
+    }
+    return data
 }
 
 @Test func serverConfigParsing() {
