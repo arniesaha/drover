@@ -3923,6 +3923,59 @@ def test_messages_endpoint_selectively_gzips_large_pages(tmp_path):
         server.shutdown()
 
 
+def test_the_fleet_listing_is_compressed_when_the_client_offers_it(tmp_path):
+    """The phone polls this every few seconds and it is the largest thing the
+    server sends. Only `session_messages` used to opt in, so the fleet
+    listing went out raw (#224)."""
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        url = f"http://127.0.0.1:{port}/harness"
+        # A one-session fixture is under the compression threshold, which is
+        # the point of the threshold. A real fleet is not: the hub's listing
+        # was about 41 KB when this was written.
+        registry = HarnessRegistry(collector.duckdb_path)
+        for _ in range(30):
+            registry.create_session(
+                host_id="mac-mini",
+                harness="claude-code",
+                command="claude",
+                status="running",
+                cwd="/Volumes/workspace/a/reasonably/long/path/for/realism",
+            )
+
+        with _authed_get(url) as response:
+            identity = response.read()
+        with _authed_get(url, headers={"Accept-Encoding": "gzip"}) as response:
+            compressed = response.read()
+            assert response.headers["Content-Encoding"] == "gzip"
+            assert response.headers["Vary"] == "Accept-Encoding"
+
+        assert gzip.decompress(compressed) == identity
+        assert len(compressed) < len(identity)
+    finally:
+        server.shutdown()
+
+
+def test_a_client_that_cannot_decode_gzip_still_gets_plain_json(tmp_path):
+    """Compression is negotiated, so enabling it by default for JSON cannot
+    break a client that never asked for it."""
+    collector = _make_collector(tmp_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        port = server.server_address[1]
+        with _authed_get(f"http://127.0.0.1:{port}/harness") as response:
+            assert response.headers.get("Content-Encoding") is None
+            json.loads(response.read())
+    finally:
+        server.shutdown()
+
+
 def test_messages_endpoint_keeps_small_page_uncompressed(tmp_path):
     collector = _make_collector(tmp_path)
     server = start_metrics_server(
