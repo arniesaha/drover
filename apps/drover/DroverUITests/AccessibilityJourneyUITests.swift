@@ -68,6 +68,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
         ])
     }
 
+    @MainActor
     private func coreJourneyApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
@@ -79,9 +80,19 @@ final class AccessibilityJourneyUITests: XCTestCase {
         return app
     }
 
+    @MainActor
     private func openFixtureChat(in app: XCUIApplication) {
         let session = app.buttons["fixture-session"]
         XCTAssertTrue(session.waitForExistence(timeout: timeout))
+
+        // XXXL can place this particular fixture row just above the viewport.
+        // Walk the real fleet list back toward its start, with a fixed bound,
+        // then retain the reachability assertion below.
+        let fleet = app.scrollViews.firstMatch
+        XCTAssertTrue(fleet.exists, "the fleet list should remain scrollable at XXXL")
+        for _ in 0..<2 where !session.isHittable {
+            fleet.swipeDown()
+        }
         XCTAssertTrue(session.isHittable, "the fleet session should remain reachable at XXXL")
         session.tap()
 
@@ -90,6 +101,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertTrue(composer.isHittable, "the composer should remain reachable at XXXL")
     }
 
+    @MainActor
     private func sendFixtureMessage(in app: XCUIApplication) {
         let composer = app.textFields["composer-input"]
         composer.tap()
@@ -101,6 +113,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
         send.tap()
     }
 
+    @MainActor
     private func showRecoveryControls(in app: XCUIApplication) {
         openFixtureChat(in: app)
         XCTAssertTrue(
