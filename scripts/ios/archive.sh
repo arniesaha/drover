@@ -42,8 +42,14 @@ version_at_least() {
   (( actual_patch >= required_patch ))
 }
 
+is_safe_xcconfig_path() {
+  local path="$1"
+  [[ "$path" = /* && "$path" != *$'\n'* && "$path" != *$'\r'* \
+    && "$path" != *\\* && "$path" != *'$'* && "$path" != *'"'* ]]
+}
+
 validate_signing_config() {
-  local line code_sign_style="" team_id="" identity_name="" profile_uuid="" keychain_path=""
+  local line code_sign_style="" team_id="" identity_name="" profile_uuid="" keychain_path="" raw_flags=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
       "CODE_SIGN_STYLE = Manual")
@@ -69,8 +75,11 @@ validate_signing_config() {
         ;;
       "OTHER_CODE_SIGN_FLAGS = --keychain "*)
         [[ -z "$keychain_path" ]] || fail "signing configuration is invalid"
-        keychain_path="${line#OTHER_CODE_SIGN_FLAGS = --keychain }"
-        [[ "$keychain_path" = /* && -f "$keychain_path" ]] \
+        raw_flags="${line#OTHER_CODE_SIGN_FLAGS = --keychain }"
+        [[ ${#raw_flags} -ge 3 && "${raw_flags:0:1}" = '"' \
+          && "${raw_flags: -1}" = '"' ]] || fail "signing configuration is invalid"
+        keychain_path="${raw_flags:1:${#raw_flags}-2}"
+        is_safe_xcconfig_path "$keychain_path" && [[ -f "$keychain_path" && ! -L "$keychain_path" ]] \
           || fail "signing configuration is invalid"
         ;;
       *) fail "signing configuration is invalid" ;;

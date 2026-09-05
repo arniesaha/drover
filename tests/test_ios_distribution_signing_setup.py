@@ -1,6 +1,7 @@
 """Contracts for isolated, deterministic iOS distribution-signing setup."""
 
 import os
+import shlex
 import stat
 import subprocess
 from pathlib import Path
@@ -24,7 +25,7 @@ def test_setup_creates_a_private_deterministic_signing_configuration(
         pytest.fail("scripts/ios/setup_distribution_signing.sh has not been created")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    workspace = tmp_path / "workspace"
+    workspace = tmp_path / "workspace with spaces"
     swift_args = tmp_path / "swift-args"
     keychain = workspace / "distribution.keychain-db"
     profile_uuid = "11111111-2222-3333-4444-555555555555"
@@ -115,11 +116,41 @@ def test_setup_creates_a_private_deterministic_signing_configuration(
         "DEVELOPMENT_TEAM = TEAMID1234\n"
         f"CODE_SIGN_IDENTITY = {identity_name}\n"
         f"PROVISIONING_PROFILE_SPECIFIER = {profile_uuid}\n"
-        f"OTHER_CODE_SIGN_FLAGS = --keychain {keychain}\n"
+        f'OTHER_CODE_SIGN_FLAGS = --keychain "{keychain}"\n'
     )
+    flags = next(
+        line.removeprefix("OTHER_CODE_SIGN_FLAGS = ")
+        for line in signing_config.read_text(encoding="utf-8").splitlines()
+        if line.startswith("OTHER_CODE_SIGN_FLAGS = ")
+    )
+    assert shlex.split(flags) == ["--keychain", str(keychain)]
     assert Path(outputs["keychain_path"]) == keychain
     assert Path(outputs["profile_path"]).name == f"{profile_uuid}.mobileprovision"
     assert Path(outputs["state_file"]).is_file()
+
+
+def test_setup_rejects_an_xcconfig_expansion_in_the_workspace_path(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace $(untrusted)"
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(SETUP_SCRIPT),
+            "--workspace",
+            str(workspace),
+            "--github-output",
+            str(tmp_path / "github-output"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "workspace path contains unsupported characters" in result.stderr
+    assert not workspace.exists()
 
 
 def test_setup_refuses_to_replace_an_existing_provisioning_profile(

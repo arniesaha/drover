@@ -23,6 +23,12 @@ require_environment() {
   printf '%s' "$value"
 }
 
+is_safe_xcconfig_path() {
+  local path="$1"
+  [[ "$path" = /* && "$path" != *$'\n'* && "$path" != *$'\r'* \
+    && "$path" != *\\* && "$path" != *'$'* && "$path" != *'"'* ]]
+}
+
 WORKSPACE=""
 GITHUB_OUTPUT_FILE=""
 while [[ $# -gt 0 ]]; do
@@ -49,6 +55,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$WORKSPACE" = /* ]] || fail "workspace must be an absolute path"
+is_safe_xcconfig_path "$WORKSPACE" \
+  || fail "workspace path contains unsupported characters"
 [[ -n "$GITHUB_OUTPUT_FILE" ]] || fail "--github-output is required"
 [[ ! -e "$WORKSPACE" && ! -L "$WORKSPACE" ]] || fail "workspace already exists"
 
@@ -137,7 +145,7 @@ printf '%s\n' \
   "DEVELOPMENT_TEAM = $TEAM_ID" \
   "CODE_SIGN_IDENTITY = $IDENTITY_NAME" \
   "PROVISIONING_PROFILE_SPECIFIER = $PROFILE_UUID" \
-  "OTHER_CODE_SIGN_FLAGS = --keychain $KEYCHAIN_PATH" \
+  "OTHER_CODE_SIGN_FLAGS = --keychain \"$KEYCHAIN_PATH\"" \
   > "$SIGNING_CONFIG"
 printf '%s\n' \
   "workspace=$WORKSPACE" \

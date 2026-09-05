@@ -61,6 +61,7 @@ def write_executable(path: Path, content: str) -> None:
 
 
 def write_signing_config(directory: Path, *, keychain: Path) -> Path:
+    keychain.parent.mkdir(parents=True, exist_ok=True)
     keychain.touch()
     config = directory / "signing.xcconfig"
     config.write_text(
@@ -68,7 +69,7 @@ def write_signing_config(directory: Path, *, keychain: Path) -> Path:
         "DEVELOPMENT_TEAM = TEAMID1234\n"
         "CODE_SIGN_IDENTITY = Apple Distribution: Example Organization (TEAMID1234)\n"
         "PROVISIONING_PROFILE_SPECIFIER = 11111111-2222-3333-4444-555555555555\n"
-        f"OTHER_CODE_SIGN_FLAGS = --keychain {keychain}\n",
+        f'OTHER_CODE_SIGN_FLAGS = --keychain "{keychain}"\n',
         encoding="utf-8",
     )
     return config
@@ -542,6 +543,40 @@ def test_archive_wrapper_requires_a_private_explicit_signing_configuration() -> 
     assert "-allowProvisioningUpdates" not in script
 
 
+def test_archive_wrapper_rejects_an_unquoted_keychain_option_path(
+    tmp_path: Path,
+) -> None:
+    keychain = tmp_path / "temporary keychain" / "distribution.keychain-db"
+    signing_config = write_signing_config(tmp_path, keychain=keychain)
+    signing_config.write_text(
+        signing_config.read_text(encoding="utf-8").replace(
+            f'--keychain "{keychain}"', f"--keychain {keychain}"
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ARCHIVE_SCRIPT_PATH),
+            "--version",
+            "1.2.3",
+            "--build",
+            "42",
+            "--output",
+            str(tmp_path / "candidate"),
+            "--signing-config",
+            str(signing_config),
+        ],
+        cwd=ARCHIVE_SCRIPT_PATH.parents[2],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "signing configuration is invalid" in result.stderr
+
+
 def test_archive_wrapper_uses_environment_selected_xcode_with_portable_output(
     tmp_path: Path,
 ) -> None:
@@ -553,7 +588,8 @@ def test_archive_wrapper_uses_environment_selected_xcode_with_portable_output(
     effective_developer_dir = tmp_path / "selected-xcode"
     effective_developer_dir.mkdir()
     signing_config = write_signing_config(
-        tmp_path, keychain=tmp_path / "distribution.keychain-db"
+        tmp_path,
+        keychain=tmp_path / "temporary keychain" / "distribution.keychain-db",
     )
     output = tmp_path / "portable-output"
 
