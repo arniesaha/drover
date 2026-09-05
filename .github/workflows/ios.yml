@@ -98,7 +98,7 @@ jobs:
           -destination "$SIMULATOR_DESTINATION" \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
           -only-testing:DroverUITests/AccessibilityJourneyUITests \
-          -resultBundlePath "$RUNNER_TEMP/DeterministicJourneyUITests.xcresult" \
+          -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test
 
     - name: Upload unit test result bundle
@@ -113,6 +113,6 @@ jobs:
       if: failure() && steps.scope.outputs.ios == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: DeterministicJourneyUITests.xcresult
-        path: ${{ runner.temp }}/DeterministicJourneyUITests.xcresult
+        name: DroverUITests.xcresult
+        path: ${{ runner.temp }}/DroverUITests.xcresult
         if-no-files-found: ignore
