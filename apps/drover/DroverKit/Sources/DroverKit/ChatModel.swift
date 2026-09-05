@@ -33,6 +33,14 @@ public struct ChatPendingTurn: Sendable, Equatable {
     public var canRetry: Bool {
         deliveryState == .awaitingConfirmation
     }
+
+    /// Shown beside Retry. Carried here rather than in the shared `hint`
+    /// because approve, interrupt, terminate and an unauthorized stream event
+    /// all clear that field; a delivery the user still has to resolve must
+    /// outlive them.
+    public var retryMessage: String {
+        "Couldn’t confirm delivery. Retry is safe."
+    }
 }
 
 /// All chat logic for one structured-session conversation: ingesting the
@@ -203,6 +211,9 @@ public final class ChatModel {
     private var hasInitializedRunPreferences = false
     private let recapPollInterval: Duration
     private let recapPollAttempts: Int
+    /// How long an accepted turn may sit unechoed before the UI offers Retry.
+    private let deliveryConfirmationTimeout: Duration
+    private nonisolated(unsafe) var deliveryTimeoutTask: Task<Void, Never>?
 
     public convenience init(
         client: DroverClient,
@@ -213,6 +224,7 @@ public final class ChatModel {
         recapSourceSeq: Int? = nil,
         recapPollInterval: Duration = .seconds(1),
         recapPollAttempts: Int = 30,
+        deliveryConfirmationTimeout: Duration = .seconds(20),
         streamFactory: ((DroverClient, String) -> MessageStream)? = nil
     ) {
         self.init(
@@ -225,6 +237,7 @@ public final class ChatModel {
             recapSourceSeq: recapSourceSeq,
             recapPollInterval: recapPollInterval,
             recapPollAttempts: recapPollAttempts,
+            deliveryConfirmationTimeout: deliveryConfirmationTimeout,
             streamFactory: streamFactory
         )
     }
@@ -242,6 +255,7 @@ public final class ChatModel {
         recapSourceSeq: Int? = nil,
         recapPollInterval: Duration = .seconds(1),
         recapPollAttempts: Int = 30,
+        deliveryConfirmationTimeout: Duration = .seconds(20),
         streamFactory: ((DroverClient, String) -> MessageStream)? = nil
     ) {
         self.client = client
@@ -253,6 +267,7 @@ public final class ChatModel {
         self.recapSourceSeq = recapSourceSeq
         self.recapPollInterval = recapPollInterval
         self.recapPollAttempts = recapPollAttempts
+        self.deliveryConfirmationTimeout = deliveryConfirmationTimeout
         let factory = streamFactory ?? { c, s in MessageStream(client: c, sessionID: s) }
         self.stream = factory(client, sessionID)
         rebuildApprovals()
@@ -521,6 +536,7 @@ public final class ChatModel {
         guard var pendingTurn, pendingTurn.canRetry, !isSending else { return }
         pendingTurn.deliveryState = .sending
         self.pendingTurn = pendingTurn
+        cancelDeliveryConfirmationTimeout()
         hint = nil
         await submitPendingTurn(pendingTurn)
     }
@@ -534,7 +550,39 @@ public final class ChatModel {
               message.turnID == pendingTurn.clientTurnID
         else { return }
         self.pendingTurn = nil
+        cancelDeliveryConfirmationTimeout()
         hint = nil
+    }
+
+    /// The hub accepting the POST is not delivery: the echo that clears the
+    /// pending row travels harnessd to hub to socket, and every hop can drop
+    /// it. Without this the composer stays gated on a turn nothing will ever
+    /// resolve, and the only recovery is killing the app. Degrading to
+    /// `.awaitingConfirmation` costs at worst one replayed submission, which
+    /// the server treats as an idempotent no-op.
+    private func startDeliveryConfirmationTimeout(for clientTurnID: String) {
+        cancelDeliveryConfirmationTimeout()
+        let timeout = deliveryConfirmationTimeout
+        deliveryTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            await self?.markDeliveryUnconfirmed(clientTurnID)
+        }
+    }
+
+    private func cancelDeliveryConfirmationTimeout() {
+        deliveryTimeoutTask?.cancel()
+        deliveryTimeoutTask = nil
+    }
+
+    private func markDeliveryUnconfirmed(_ clientTurnID: String) {
+        guard var turn = pendingTurn,
+              turn.clientTurnID == clientTurnID,
+              turn.deliveryState == .sending,
+              !isSending
+        else { return }
+        turn.deliveryState = .awaitingConfirmation
+        pendingTurn = turn
     }
 
     private func submitPendingTurn(_ turn: ChatPendingTurn) async {
@@ -555,10 +603,12 @@ public final class ChatModel {
             // restore the already-confirmed pending row in that race.
             if pendingTurn?.clientTurnID == turn.clientTurnID {
                 hint = nil
+                startDeliveryConfirmationTimeout(for: turn.clientTurnID)
             }
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             guard pendingTurn?.clientTurnID == turn.clientTurnID else { return }
             pendingTurn = nil
+            cancelDeliveryConfirmationTimeout()
             queue(turn)
         } catch {
             guard pendingTurn?.clientTurnID == turn.clientTurnID else { return }
@@ -567,6 +617,7 @@ public final class ChatModel {
                 hint = "Couldn’t confirm delivery. Retry is safe."
             } else {
                 pendingTurn = nil
+                cancelDeliveryConfirmationTimeout()
                 restoreRejectedTurn(turn)
                 applyHint(for: error, action: "send")
             }

@@ -1437,6 +1437,84 @@ struct ChatModelTests {
     #expect(model.pendingTurn?.text == "Yes looks good")
 }
 
+@Test @MainActor func acceptedTurnWhoseEchoNeverArrivesBecomesRetryable() async throws {
+    // The hub accepting the POST is not delivery. If the echo is dropped on
+    // any hop, the composer must not stay gated on a turn nothing will
+    // resolve; it degrades to a retryable state instead.
+    MockURLProtocol.handler = { _ in (202, Data(#"{"status": "accepted"}"#.utf8)) }
+    defer { MockURLProtocol.handler = nil }
+    let model = ChatModel(
+        client: client(),
+        sessionID: "s1",
+        deliveryConfirmationTimeout: .milliseconds(20)
+    )
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+
+    // The composer is gated the moment the turn is pending, whichever side
+    // of the timeout this observation lands on.
+    #expect(model.canSendTurn == false)
+
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(model.pendingTurn?.deliveryState == .awaitingConfirmation)
+    #expect(model.pendingTurn?.canRetry == true)
+    #expect(model.pendingTurn?.text == "Yes looks good")
+}
+
+@Test @MainActor func aConfirmedTurnIsNeverMarkedUnconfirmedLater() async throws {
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        turnID = clientTurnID(in: request)
+        return (202, Data(#"{"status": "accepted"}"#.utf8))
+    }
+    defer { MockURLProtocol.handler = nil }
+    let model = ChatModel(
+        client: client(),
+        sessionID: "s1",
+        deliveryConfirmationTimeout: .milliseconds(20)
+    )
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+    let confirmedTurnID = try #require(turnID)
+
+    model.ingest(.message(.fixture(
+        seq: 10,
+        type: .userInput,
+        text: "Yes looks good",
+        turnID: confirmedTurnID
+    )))
+    #expect(model.pendingTurn == nil)
+
+    // The timer from the accepted POST must not resurrect a pending row.
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(model.pendingTurn == nil)
+    #expect(model.canSendTurn == true)
+}
+
+@Test @MainActor func retryStaysOfferedAfterAnotherActionClearsTheHint() async throws {
+    // approve/interrupt/terminate all clear `hint`. The retry affordance is
+    // driven by the pending turn, so it has to survive them.
+    MockURLProtocol.transportError = URLError(.networkConnectionLost)
+    defer { MockURLProtocol.transportError = nil }
+    let model = ChatModel(client: client(), sessionID: "s1")
+    model.composerText = "Yes looks good"
+    await model.sendTurn()
+
+    #expect(model.pendingTurn?.canRetry == true)
+    #expect(model.hint != nil)
+
+    // A successful interrupt clears `hint`, and used to take the only Retry
+    // affordance with it while the delivery stayed unresolved.
+    MockURLProtocol.transportError = nil
+    MockURLProtocol.handler = { _ in (200, Data(#"{"status": "ok"}"#.utf8)) }
+    await model.interrupt()
+
+    #expect(model.hint == nil)
+    #expect(model.pendingTurn?.canRetry == true)
+    #expect(model.pendingTurn?.retryMessage.isEmpty == false)
+}
+
 @Test @MainActor func matchingTextFromAnotherClientDoesNotConfirmPendingDelivery() async throws {
     nonisolated(unsafe) var localTurnID: String?
     MockURLProtocol.transportError = nil

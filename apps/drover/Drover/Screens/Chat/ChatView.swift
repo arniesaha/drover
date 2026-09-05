@@ -141,10 +141,11 @@ struct ChatView: View {
                 )
             }
 
-            if let pendingTurn = model.pendingTurn,
-               pendingTurn.canRetry,
-               let hint = model.hint {
-                ChatHintBanner(hint, actionTitle: "Retry") {
+            // Deliberately not gated on `hint`: approve, interrupt, terminate
+            // and an unauthorized stream event all clear it, and an
+            // unconfirmed delivery must keep its Retry through any of them.
+            if let pendingTurn = model.pendingTurn, pendingTurn.canRetry {
+                ChatHintBanner(model.hint ?? pendingTurn.retryMessage, actionTitle: "Retry") {
                     Task { await model.retryPendingTurn() }
                 }
             } else if let hint = model.hint {
