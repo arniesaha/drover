@@ -66,6 +66,21 @@ final class AppEnvironment {
     private var pendingCleanupBindingIDs = Set<UUID>()
     private var isPerformingRecoveryRootCleanup = false
 
+#if DEBUG
+    /// A separate initializer deliberately bypasses all normal startup reads,
+    /// including ClientFactory's live DEBUG overrides and the default Keychain.
+    init(fixtureClient: DroverClient?, defaults: UserDefaults,
+         tokenStore: TokenStore, recoveryStore: any ChatRecoveryPersisting) {
+        self.defaults = defaults
+        self.tokenStore = tokenStore
+        self.recoveryBindingStore = RecoveryBindingStore(service: tokenStore.service)
+        self.recoveryStore = recoveryStore
+        self.validator = { _, _ in "Connection changes are disabled in this synthetic fixture." }
+        self.client = fixtureClient
+        self.config = fixtureClient?.config
+    }
+#endif
+
     init(
         defaults: UserDefaults = .standard,
         tokenStore: TokenStore = TokenStore(),

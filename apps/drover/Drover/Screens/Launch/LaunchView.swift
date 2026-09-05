@@ -20,8 +20,10 @@ struct LaunchView: View {
     /// the selected harness for the destination title/icon.
     let onLaunched: (String, Bool, String) -> Void
 
-    init(client: DroverClient, snapshot: HarnessSnapshot?, onLaunched: @escaping (String, Bool, String) -> Void) {
-        _model = State(initialValue: LaunchModel(client: client, snapshot: snapshot))
+    init(client: DroverClient, snapshot: HarnessSnapshot?,
+         catalogStore: HarnessModelCatalogStore = HarnessModelCatalogStore(),
+         onLaunched: @escaping (String, Bool, String) -> Void) {
+        _model = State(initialValue: LaunchModel(client: client, snapshot: snapshot, store: catalogStore))
         self.client = client
         self.onLaunched = onLaunched
     }
