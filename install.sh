@@ -3,6 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
 #   curl -fsSL … | bash -s -- --join 'drover://100.64.0.10:7080?v=1&code=H3TW-9KQ2'
+#   bash install.sh --no-start --version v0.0.0  # automation: install only
 #
 # Targets bash 3.2, the version macOS ships: no associative arrays, no ${x^^},
 # no mapfile. Every path is quoted, because a home or checkout containing a
@@ -12,7 +13,7 @@ set -euo pipefail
 
 REPO="arniesaha/drover"
 DROVER_HOME="${HOME}/.drover"
-JOIN_URL="" EXPLICIT_URL="" ADOPT=0 DRY_RUN=0 WANT_VERSION=""
+JOIN_URL="" EXPLICIT_URL="" ADOPT=0 DRY_RUN=0 NO_START=0 WANT_VERSION=""
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'; NC=$'\033[0m'
@@ -49,12 +50,16 @@ while [ $# -gt 0 ]; do
     --version) WANT_VERSION="${2:-}"; shift 2 ;;
     --adopt)   ADOPT=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --no-start) NO_START=1; shift ;;
     -h|--help)
       sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) fail "unknown flag: $1" ;;
   esac
 done
+
+[ "$NO_START" -eq 1 ] && [ -n "$JOIN_URL" ] \
+  && fail "--no-start cannot be used with --join"
 
 # Port syntax needs no helper library. Check it before a piped installer would
 # fetch or source helpers, so an invalid invocation is deterministic offline.
@@ -222,6 +227,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
     # until it is redeemed or expires.
     info "  would join hub $HUB_ADDRESS with a single-use code"
     info "  would probe reachability, then register as direct or relay"
+  elif [ "$NO_START" -eq 1 ]; then
+    info "  automation mode would not start services, wait for readiness, or pair"
   else
     info "  would run: drover-server pair"
   fi
@@ -396,12 +403,16 @@ else:
         print(str(target / f"drover-{short}.service"))
 PY
 
-  local shorts="harnessd"
-  [ "$mode" = "fleet" ] && shorts="server harnessd"
+  success "service definitions installed"
+}
 
+# Start units after their definitions have been installed. A new fleet starts
+# its hub by itself first so the local harness cannot read api_token before the
+# hub writes it. Joined hosts call this with harnessd only.
+start_units() {
+  local short
   if [ "$OS" = "darwin" ]; then
-    local short
-    for short in $shorts; do
+    for short in "$@"; do
       local plist="$HOME/Library/LaunchAgents/com.drover.$short.plist"
       launchctl unload "$plist" 2>/dev/null || true
       launchctl load -w "$plist" 2>/dev/null || true
@@ -411,12 +422,11 @@ PY
     # reboot, which is the difference between a fleet host and a laptop.
     loginctl enable-linger "$USER" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
-    local short
-    for short in $shorts; do
+    for short in "$@"; do
       systemctl --user enable --now "drover-$short.service" 2>/dev/null || true
     done
   fi
-  success "services installed and started"
+  success "services started"
 }
 
 # --- CLI on PATH -------------------------------------------------------------
@@ -540,6 +550,7 @@ EOF
 
   # Rewrite the harnessd unit with the connection mode the probe chose.
   install_units "$listen_args" "http://${HUB_ADDRESS}"
+  start_units harnessd
   success "joined $HUB_ADDRESS as $host_id"
 }
 
@@ -561,18 +572,24 @@ if [ -n "$JOIN_URL" ]; then
 else
   write_config "$ADDRESS"
   install_units fleet "http://${ADDRESS}"
-  if wait_for_health "$ADDRESS"; then
-    success "drover-server is up"
+  if [ "$NO_START" -eq 1 ]; then
+    info "automation mode: service definitions were written but services were not started; hub readiness and pairing were not checked"
   else
-    warn "drover-server did not answer /healthz yet; check the logs before pairing"
-  fi
-  echo
-  # Run through the link when it resolves, so the QR is printed by the same
-  # command the user was just told they have. Falling back to the absolute
-  # path keeps pairing working when ~/.local/bin is not on PATH yet.
-  if command -v drover-server >/dev/null 2>&1; then
-    drover-server pair || true
-  else
-    "$DROVER_HOME/runtime/current/bin/drover-server" pair || true
+    start_units server
+    if wait_for_health "$ADDRESS"; then
+      success "drover-server is up"
+      start_units harnessd
+    else
+      fail "drover-server did not answer /healthz at http://${ADDRESS}; harnessd was not started. Check the server logs and rerun after the hub is healthy"
+    fi
+    echo
+    # Run through the link when it resolves, so the QR is printed by the same
+    # command the user was just told they have. Falling back to the absolute
+    # path keeps pairing working when ~/.local/bin is not on PATH yet.
+    if command -v drover-server >/dev/null 2>&1; then
+      drover-server pair || true
+    else
+      "$DROVER_HOME/runtime/current/bin/drover-server" pair || true
+    fi
   fi
 fi
