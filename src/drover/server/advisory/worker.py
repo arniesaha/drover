@@ -55,6 +55,10 @@ from drover.server.advisory.model_analyzer import (
 )
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.types import FindingCandidate
+from drover.server.analytics_maintenance import (
+    AnalyticalMaintenanceGate,
+    MaintenanceAdmission,
+)
 from drover.server.db import (
     attached_control_plane_snapshot,
     control_plane_connection,
@@ -708,12 +712,21 @@ class AdvisoryWorker:
         retry_delay: timedelta = timedelta(seconds=30),
         lease_duration: timedelta = timedelta(minutes=5),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        maintenance_gate: AnalyticalMaintenanceGate | None = None,
+        max_consecutive_skips: int = 10,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.repository = repository
         self.snapshot_factory = snapshot_factory
         self.worker_id = worker_id
         self.retry_delay = retry_delay
+        # Analyzer snapshots read the shared analytical instance, so a sweep
+        # beside a cockpit build competes for the same instance-wide threads
+        # and memory (#331). Stand aside while a request is in flight, but
+        # never indefinitely: findings that stop refreshing are their own bug.
+        self._admission = MaintenanceAdmission(
+            maintenance_gate, max_consecutive_skips=max_consecutive_skips
+        )
         if lease_duration <= timedelta(0):
             raise ValueError("lease duration must be positive")
         self.lease_duration = lease_duration
@@ -721,6 +734,17 @@ class AdvisoryWorker:
         self._thread: threading.Thread | None = None
 
     def run_once(self, analyzers: Iterable[Analyzer]) -> AdvisoryRunResult:
+        with self._admission.admit() as admitted:
+            if not admitted:
+                log.debug("advisory sweep deferred: a request is in flight")
+                return AdvisoryRunResult(succeeded=0, failed=0, skipped=0)
+            return self._run_once_admitted(analyzers)
+
+    @property
+    def deferred_sweeps(self) -> int:
+        return self._admission.skipped_total
+
+    def _run_once_admitted(self, analyzers: Iterable[Analyzer]) -> AdvisoryRunResult:
         succeeded = failed = skipped = 0
         for analyzer in analyzers:
             job = self._claim_for_analyzer(analyzer.analyzer_id)

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-09-04
+
+### Fixed
+
+- Background analytical work no longer starves the control plane of CPU.
+  A maintenance connection used to raise DuckDB's instance-wide thread count
+  for a cockpit build already running, and nothing arbitrated between them;
+  on 2026-09-04 that left the server at 374 percent CPU with every
+  `/harness*` endpoint timing out while `/healthz` answered in
+  milliseconds, and the client's retries sustained it until a restart. The
+  advisory sweep and the native usage rollup now stand aside while a request
+  is in flight, bounded so a polled hub still makes progress, and background
+  roles can no longer ask for more parallelism than the foreground reader
+  they share an instance with (#331).
+
 ## [0.4.5] - 2026-09-04
 
 ### Fixed

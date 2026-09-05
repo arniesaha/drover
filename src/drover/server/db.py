@@ -91,9 +91,16 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     # line: `DROVER_DUCKDB_WORKER_MEMORY_LIMIT` covers worker+summarizer only;
     # `diagnostic`/`snapshot` need their own `DROVER_DUCKDB_DIAGNOSTIC_*`/
     # `DROVER_DUCKDB_SNAPSHOT_*` vars (see `_apply_role_settings`).
+    # One thread, not two: `threads` is instance-wide, so a background pass
+    # opening a `worker` connection raises parallelism for every other reader
+    # on that instance, including a cockpit build already running at the
+    # `diagnostic` setting of 1. On 2026-09-04 concurrent analytical work put
+    # the server at 374 percent CPU and starved the control plane until a
+    # restart (#331). These passes are seconds long and not latency-critical;
+    # the foreground query is.
     "worker": {
         "memory_limit": "1GB",
-        "threads": "2",
+        "threads": "1",
         "preserve_insertion_order": "false",
     },
     "summarizer": {
