@@ -40,10 +40,6 @@ from drover.schema import (
     prune_legacy_control_plane_tables,
 )
 from drover.server import ledger_shadow
-from drover.server.setup_readiness_transport import (
-    run_setup_check_http_request,
-    suppress_setup_check_transport_logs,
-)
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
@@ -147,6 +143,10 @@ from drover.server.setup_readiness import (
     SetupTarget,
     evaluate_setup,
     unavailable_setup_report,
+)
+from drover.server.setup_readiness_transport import (
+    run_setup_check_http_request,
+    suppress_setup_check_transport_logs,
 )
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.summarizer.diagnostics import summarize_backend_auth

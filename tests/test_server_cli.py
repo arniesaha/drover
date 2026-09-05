@@ -34,11 +34,11 @@ from drover.server.__main__ import (
     _summarizer_backend_available,
     main,
 )
-from drover.server.setup_readiness import SetupCheck, SetupReadinessReport
 from drover.server.db import control_plane_path
 from drover.server.harness import cli as harness_cli
 from drover.server.harness.recap_jobs import enqueue_live_recap
 from drover.server.ledger import ArtifactSpec, Ledger
+from drover.server.setup_readiness import SetupCheck, SetupReadinessReport
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig
 
