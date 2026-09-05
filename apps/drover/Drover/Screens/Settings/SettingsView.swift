@@ -332,10 +332,15 @@ struct SettingsView: View {
         !isValidating && !isSigningOut && !urlString.isEmpty && !token.isEmpty
     }
 
-    private static let privacyURL = URL(
+    // Internal rather than private so a test can pin them: these are the only
+    // two URLs the app hands to the system browser, and a typo here is a
+    // dead end for someone trying to read the privacy policy before they
+    // trust the app with a token. Both were confirmed to resolve when this
+    // shipped; the test guards the shape, not the network.
+    static let privacyURL = URL(
         string: "https://github.com/arniesaha/drover/blob/main/docs/privacy.md"
     )!
-    private static let supportURL = URL(
+    static let supportURL = URL(
         string: "https://github.com/arniesaha/drover/blob/main/docs/support.md"
     )!
 
