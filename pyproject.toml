@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drover"
-version = "0.4.6"
+version = "0.4.7"
 description = "Drover — local-first cockpit and context layer for driving a personal fleet of CLI coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
