@@ -53,6 +53,7 @@ from drover.server.advisory.worker import (
     operational_analyzers,
     operational_snapshot_source_version,
 )
+from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
 from drover.server.archive import (
     BackupConfig,
     PondArchiveClient,
@@ -2438,6 +2439,9 @@ def run(
     )
     watcher.start()
 
+    # One gate per process, shared by the foreground cockpit build and every
+    # background analytical pass (#331).
+    analytics_gate = AnalyticalMaintenanceGate()
     advisory_worker: AdvisoryWorker | None = None
     try:
         advisory_analyzers = operational_analyzers()
@@ -2451,6 +2455,7 @@ def run(
         )
         advisory_worker = AdvisoryWorker(
             duckdb_path=cfg.duckdb_path,
+            maintenance_gate=analytics_gate,
             repository=AdvisoryRepository(cfg.duckdb_path),
             snapshot_factory=lambda analyzer_id, target_id, source_version: load_operational_snapshot(
                 cfg.duckdb_path, analyzer_id, target_id, source_version
@@ -2483,7 +2488,9 @@ def run(
 
     native_usage_rollup: NativeUsageRollupWorker | None = None
     try:
-        native_usage_rollup = NativeUsageRollupWorker(duckdb_path=cfg.duckdb_path)
+        native_usage_rollup = NativeUsageRollupWorker(
+            duckdb_path=cfg.duckdb_path, maintenance_gate=analytics_gate
+        )
         native_usage_rollup.start()
         log.info(
             "native usage rollup worker ready (interval=%.0fs)",
@@ -2586,6 +2593,7 @@ def run(
             metrics_collector.cockpit_service = CockpitService(
                 duckdb_path=cfg.duckdb_path,
                 provider_usage=provider_usage,
+                maintenance_gate=analytics_gate,
             )
             # The first cockpit request after a restart pays to open DuckDB and
             # read the parquet views' metadata: measured at 15.6s cold against

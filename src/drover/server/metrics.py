@@ -566,6 +566,26 @@ def _append_advisory_metrics(lines: list[str]) -> None:
     )
 
 
+def _append_analytics_gate_metrics(lines: list[str]) -> None:
+    # Without these, "the rollups stood aside" and "the rollups are broken"
+    # look identical from outside the process (#331).
+    from drover.server.analytics_maintenance import latest_maintenance_gate_stats
+
+    stats = latest_maintenance_gate_stats()
+    lines.extend(
+        [
+            "# HELP drover_analytics_foreground_requests "
+            "Cockpit analytics builds currently in flight.",
+            "# TYPE drover_analytics_foreground_requests gauge",
+            f"drover_analytics_foreground_requests {stats.foreground_waiters}",
+            "# HELP drover_analytics_maintenance_active "
+            "Whether a background analytical pass holds the maintenance slot.",
+            "# TYPE drover_analytics_maintenance_active gauge",
+            f"drover_analytics_maintenance_active {int(stats.maintenance_active)}",
+        ]
+    )
+
+
 def _append_usage_rollup_metrics(lines: list[str]) -> None:
     # Track 3 slice 1. The counters live on the rollup module so the worker
     # and this scrape never share a connection; the gauge is the last pass's
@@ -2453,6 +2473,7 @@ class MetricsCollector:
         _append_harness_metrics(lines)
         _append_advisory_metrics(lines)
         _append_usage_rollup_metrics(lines)
+        _append_analytics_gate_metrics(lines)
         observatory = self._observatory_snapshot(snapshot)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"

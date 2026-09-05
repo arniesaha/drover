@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import secrets
 import threading
@@ -11,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
 from drover.server.cockpit.analytics import (
     ActivityAnalytics,
     AnalyticsCursorCodec,
@@ -60,7 +62,12 @@ class CockpitService:
         connect: Callable[[], Any] | None = None,
         advisory_repository: Any | None = None,
         cursor_secret: bytes | None = None,
+        maintenance_gate: AnalyticalMaintenanceGate | None = None,
     ) -> None:
+        # Background analytical passes stand aside while this is in flight
+        # (#331). Optional so the many tests that build a service by hand keep
+        # working unchanged; the server always supplies one.
+        self.maintenance_gate = maintenance_gate
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
         self._connect = connect
@@ -293,7 +300,12 @@ class CockpitService:
         def run() -> None:
             con = None
             owns_connection = self._connect is None
+            gate = self.maintenance_gate
+            foreground = (
+                gate.foreground() if gate is not None else contextlib.nullcontext()
+            )
             try:
+                foreground.__enter__()
                 if self._connect is not None:
                     con = self._connect()
                 elif self.duckdb_path is not None:
@@ -330,6 +342,14 @@ class CockpitService:
                         con.close()
                     except Exception:  # noqa: BLE001 - closing is best effort
                         pass
+                # Released here, not when the caller gives up at its budget:
+                # an abandoned query keeps running and keeps consuming the
+                # instance, so it is still foreground as far as the gate is
+                # concerned.
+                try:
+                    foreground.__exit__(None, None, None)
+                except Exception:  # noqa: BLE001 - the gate must not fail a request
+                    log.exception("could not release the analytics foreground slot")
                 released.set()
                 self._activity_slot.release()
 
