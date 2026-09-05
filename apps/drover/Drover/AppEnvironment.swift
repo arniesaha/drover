@@ -57,6 +57,10 @@ final class AppEnvironment {
     private let tokenStore: TokenStore
     private let recoveryBindingStore: RecoveryBindingStore
     private let recoveryStore: (any ChatRecoveryPersisting)?
+    /// A demo owns a separate client and recovery actor. It must never consult
+    /// the saved Keychain credential or allow normal configuration actions to
+    /// turn that isolated session into a real connection.
+    private let isIsolatedEnvironment: Bool
     /// The one app-owned recovery writer boundary. Every foreground chat
     /// receives this exact instance so sign out can drain writes already
     /// admitted to the recovery actor before it erases their namespace.
@@ -66,20 +70,21 @@ final class AppEnvironment {
     private var pendingCleanupBindingIDs = Set<UUID>()
     private var isPerformingRecoveryRootCleanup = false
 
-#if DEBUG
-    /// A separate initializer deliberately bypasses all normal startup reads,
-    /// including ClientFactory's live DEBUG overrides and the default Keychain.
-    init(fixtureClient: DroverClient?, defaults: UserDefaults,
+    /// Bypasses all normal startup reads, including ClientFactory's saved
+    /// configuration and the default Keychain. The release evaluation demo
+    /// and DEBUG fixture call this only after their local transport and
+    /// recovery store already exist.
+    init(isolatedClient: DroverClient?, defaults: UserDefaults,
          tokenStore: TokenStore, recoveryStore: any ChatRecoveryPersisting) {
         self.defaults = defaults
         self.tokenStore = tokenStore
         self.recoveryBindingStore = RecoveryBindingStore(service: tokenStore.service)
         self.recoveryStore = recoveryStore
-        self.validator = { _, _ in "Connection changes are disabled in this synthetic fixture." }
-        self.client = fixtureClient
-        self.config = fixtureClient?.config
+        self.isIsolatedEnvironment = true
+        self.validator = { _, _ in "Connection changes are disabled in the local demo." }
+        self.client = isolatedClient
+        self.config = isolatedClient?.config
     }
-#endif
 
     init(
         defaults: UserDefaults = .standard,
@@ -97,6 +102,7 @@ final class AppEnvironment {
             ?? RecoveryBindingStore(service: tokenStore.service)
         self.recoveryBindingStore = resolvedBindingStore
         self.recoveryStore = recoveryStore ?? Self.defaultRecoveryStore()
+        self.isIsolatedEnvironment = false
         self.validator = validator
         if UITestOverrides.shouldResetAuthentication(environment: launchEnvironment) {
             try? tokenStore.delete()
@@ -169,7 +175,7 @@ final class AppEnvironment {
     }
 
     var hasTokenConfigured: Bool {
-        tokenStore.load() != nil
+        !isIsolatedEnvironment && tokenStore.load() != nil
     }
 
     /// Q2 injects this exact actor into every foreground ChatModel. It must
@@ -197,6 +203,9 @@ final class AppEnvironment {
     /// persist the URL to `UserDefaults`, save the token to the Keychain, and
     /// swap in the new client.
     func configure(urlString: String, token: String) async -> ConfigureOutcome {
+        guard !isIsolatedEnvironment else {
+            return .failure("Connection changes are unavailable in the demo.")
+        }
         guard !isPerformingRecoveryRootCleanup else {
             return .failure("Local chat recovery cleanup is still in progress. Wait for Sign Out to finish.")
         }
@@ -299,6 +308,9 @@ final class AppEnvironment {
     /// Everything a fresh install lacks is cleared, so the next pairing
     /// cannot inherit half the old configuration.
     func signOut() async throws {
+        guard !isIsolatedEnvironment else {
+            throw SignOutError.isolatedEnvironment
+        }
         operationEpoch &+= 1
         isPerformingRecoveryRootCleanup = true
         defer { isPerformingRecoveryRootCleanup = false }
@@ -383,6 +395,7 @@ final class AppEnvironment {
 private enum SignOutError: LocalizedError {
     case credentialDeletion
     case localCleanupPending
+    case isolatedEnvironment
 
     var errorDescription: String? {
         switch self {
@@ -390,6 +403,8 @@ private enum SignOutError: LocalizedError {
             return "Could not remove the token from the Keychain. Sign out is incomplete; try again."
         case .localCleanupPending:
             return "Disconnected, but local chat recovery cleanup is still pending. Try Sign Out again."
+        case .isolatedEnvironment:
+            return "Signing out is unavailable in the demo."
         }
     }
 }

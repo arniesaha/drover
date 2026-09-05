@@ -15,6 +15,7 @@ import DroverKit
 /// everything else.
 struct SettingsView: View {
     var environment: AppEnvironment
+    var onTryDemo: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
 
     @State private var urlString = ""
@@ -109,6 +110,8 @@ struct SettingsView: View {
                 }
 
                 saveButton
+                demoButton
+                supportLinks
 
                 // Credential-deletion and local-cleanup failures retain an
                 // explicit retry path even after the app disconnects.
@@ -235,6 +238,85 @@ struct SettingsView: View {
         .accessibilityIdentifier("settings-save")
     }
 
+    private var demoButton: some View {
+        Button(action: onTryDemo) {
+            HStack(spacing: 9) {
+                Image(systemName: "play.circle")
+                    .font(.system(size: 15, weight: .medium))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Try Demo").droverText(.h3)
+                    Text("Explore a local sample fleet without changing this connection.")
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.faint)
+                }
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(DroverColor.accentHi)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.line, lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("settings-try-demo")
+    }
+
+    /// Public policy and support are available before a host is configured,
+    /// so someone can review them without entering a server URL or token.
+    private var supportLinks: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Help").droverText(.h3)
+
+            VStack(spacing: 0) {
+                supportLink(
+                    label: "Privacy",
+                    destination: Self.privacyURL,
+                    identifier: "settings-privacy-link"
+                )
+
+                Divider()
+                    .overlay(DroverColor.line)
+
+                supportLink(
+                    label: "Support",
+                    destination: Self.supportURL,
+                    identifier: "settings-support-link"
+                )
+            }
+            .background(DroverColor.surface,
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.line, lineWidth: 1)
+            }
+        }
+    }
+
+    private func supportLink(
+        label: String,
+        destination: URL,
+        identifier: String
+    ) -> some View {
+        Link(destination: destination) {
+            HStack(spacing: 9) {
+                Text(label).droverText(.h3)
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 14, weight: .medium))
+            }
+            .foregroundStyle(DroverColor.accentHi)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityIdentifier(identifier)
+        .accessibilityLabel(label)
+        .accessibilityHint("Opens the Drover \(label.lowercased()) page.")
+    }
+
     /// Quieter than "Test & Save": this is a recovery action, not the primary
     /// one, and it should not compete with it for attention. Confirmed
     /// first, because the token is not recoverable from the app afterwards.
@@ -277,6 +359,13 @@ struct SettingsView: View {
     private var canSave: Bool {
         !isValidating && !isSigningOut && !urlString.isEmpty && !token.isEmpty
     }
+
+    private static let privacyURL = URL(
+        string: "https://github.com/arniesaha/drover/blob/main/docs/privacy.md"
+    )!
+    private static let supportURL = URL(
+        string: "https://github.com/arniesaha/drover/blob/main/docs/support.md"
+    )!
 
     private func testAndSave() async {
         isValidating = true

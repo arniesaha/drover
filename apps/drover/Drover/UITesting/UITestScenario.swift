@@ -67,7 +67,7 @@ struct UITestScenario {
         self.catalogStore = HarnessModelCatalogStore(defaults: defaults)
         self.recoveryStore = ChatRecoveryStore(root: root)
         self.environment = AppEnvironment(
-            fixtureClient: launchEnvironment["DROVER_UI_TEST_START_UNPAIRED"] == "1" ? nil : transport.client,
+            isolatedClient: launchEnvironment["DROVER_UI_TEST_START_UNPAIRED"] == "1" ? nil : transport.client,
             defaults: defaults,
             tokenStore: TokenStore(service: "com.arnab.drover.ui-fixture.\(transport.runID)"),
             recoveryStore: recoveryStore

@@ -18,6 +18,12 @@ import DroverKit
 /// the app: three crash reports on device in one afternoon, all SIGABRT, all
 /// faulting in `didReceive` on `com.apple.root.user-initiated-qos.cooperative`.
 private final class ForegroundNotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
+    private let gate: DemoActivityGate
+
+    init(gate: DemoActivityGate = .shared) {
+        self.gate = gate
+    }
+
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
@@ -25,6 +31,10 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
             UNNotificationPresentationOptions
         ) -> Void
     ) {
+        guard !gate.isActive else {
+            completionHandler([])
+            return
+        }
         completionHandler([.banner, .sound, .badge])
     }
 
@@ -37,6 +47,10 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
+        guard !gate.isActive else {
+            completionHandler()
+            return
+        }
         let request = response.notification.request
         // Parsed here: pure, and it keeps the non-Sendable response off the
         // hop below.
@@ -61,6 +75,7 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
 @main
 struct DroverApp: App {
     @State private var environment: AppEnvironment
+    @State private var demoSession: DemoSession?
     @Environment(\.scenePhase) private var scenePhase
     private let notifier: Notifying
 #if DEBUG
@@ -98,26 +113,79 @@ struct DroverApp: App {
         WindowGroup {
 #if DEBUG
             if let testScenario {
-                FixturePreparedRoot(scenario: testScenario, notifier: notifier)
+                if let demoSession {
+                    DemoRoot(session: demoSession, onReset: resetDemo, onExit: exitDemo)
+                } else {
+                    FixturePreparedRoot(
+                        scenario: testScenario,
+                        notifier: notifier,
+                        onTryDemo: enterDemo
+                    )
+                }
             } else if ProcessInfo.processInfo.environment[
                 "DROVER_UI_TEST_CHAT_HEADER_FIXTURE"
             ] == "1" {
                 ChatHeaderFixtureRoot()
             } else {
-                RootView(environment: environment, notifier: notifier)
+                appRoot
             }
 #else
-            RootView(environment: environment, notifier: notifier)
+            appRoot
 #endif
         }
         .onChange(of: scenePhase) { _, phase in
 #if DEBUG
             guard testScenario == nil else { return }
 #endif
+            guard demoSession == nil else { return }
             if phase == .background {
                 BackgroundRefresh.schedule()
             }
         }
+    }
+
+    @ViewBuilder
+    private var appRoot: some View {
+        if let demoSession {
+            DemoRoot(session: demoSession, onReset: resetDemo, onExit: exitDemo)
+        } else {
+            RootView(
+                environment: environment,
+                notifier: notifier,
+                onTryDemo: enterDemo
+            )
+        }
+    }
+
+    @MainActor
+    private func enterDemo() {
+        guard demoSession == nil, let session = try? DemoSession() else { return }
+        // Set every external-operation gate before the demo root is made
+        // visible. The existing production environment remains allocated and
+        // untouched behind this replacement view.
+        DemoActivityGate.shared.activate()
+        BackgroundRefresh.cancelActiveWorkForDemo()
+        PushRegistrar.shared.setDemoSuspended(true)
+        demoSession = session
+    }
+
+    @MainActor
+    private func exitDemo() {
+        guard let demoSession else { return }
+        demoSession.end()
+        self.demoSession = nil
+        DemoActivityGate.shared.deactivate()
+        PushRegistrar.shared.setDemoSuspended(false)
+    }
+
+    @MainActor
+    private func resetDemo() {
+        guard let previous = demoSession, let replacement = try? DemoSession() else { return }
+        // Replacing the isolated environment also strands any departing
+        // ChatModel's debounced write in its old in-memory recovery actor.
+        // The new tree therefore starts from a genuinely empty local state.
+        previous.end()
+        demoSession = replacement
     }
 }
 
@@ -174,16 +242,28 @@ private struct RootView: View {
     private let defaults: UserDefaults
     private let chatModelFactory: ChatModelFactory?
     private let backgroundActivityEnabled: Bool
+    private let onTryDemo: () -> Void
+    private let demoSession: DemoSession?
+    private let onResetDemo: () -> Void
+    private let onExitDemo: () -> Void
 
     init(environment: AppEnvironment, notifier: Notifying,
          defaults: UserDefaults = .standard,
          chatModelFactory: ChatModelFactory? = nil,
-         backgroundActivityEnabled: Bool = true) {
+         backgroundActivityEnabled: Bool = true,
+         onTryDemo: @escaping () -> Void = {},
+         demoSession: DemoSession? = nil,
+         onResetDemo: @escaping () -> Void = {},
+         onExitDemo: @escaping () -> Void = {}) {
         self.environment = environment
         self.notifier = notifier
         self.defaults = defaults
         self.chatModelFactory = chatModelFactory
         self.backgroundActivityEnabled = backgroundActivityEnabled
+        self.onTryDemo = onTryDemo
+        self.demoSession = demoSession
+        self.onResetDemo = onResetDemo
+        self.onExitDemo = onExitDemo
         _appearance = State(initialValue: AppearanceStore(defaults: defaults))
     }
 
@@ -199,19 +279,28 @@ private struct RootView: View {
                         recoveryGeneration: environment.chatRecoveryGeneration,
                         chatModelFactory: chatModelFactory,
                         defaults: defaults,
+                        notificationRoutingEnabled: demoSession == nil,
                         onOpenSettings: { showSettings = true }
                     )
                 }
                 .id(environment.generation)
                 .sheet(isPresented: $showSettings) {
                     NavigationStack {
-                        SettingsView(environment: environment)
+                        if let demoSession {
+                            DemoSettingsView(
+                                session: demoSession,
+                                onReset: onResetDemo,
+                                onExit: onExitDemo
+                            )
+                        } else {
+                            SettingsView(environment: environment, onTryDemo: onTryDemo)
+                        }
                     }
                     .presentationCornerRadius(24)
                 }
             } else {
                 NavigationStack {
-                    OnboardingView(environment: environment)
+                    OnboardingView(environment: environment, onTryDemo: onTryDemo)
                 }
             }
         }
@@ -258,10 +347,61 @@ private struct RootView: View {
     }
 }
 
+/// A compact, persistent disclosure and escape hatch sits above the real
+/// fleet/chat/launch views for the full demo visit. It is intentionally not a
+/// mock screen: Reset rebuilds the same local SessionStore tree from bounded
+/// state, and Exit restores the original environment still held by DroverApp.
+private struct DemoRoot: View {
+    let session: DemoSession
+    let onReset: () -> Void
+    let onExit: () -> Void
+
+    var body: some View {
+        RootView(
+            environment: session.environment,
+            notifier: DemoNotifier(),
+            defaults: session.defaults,
+            chatModelFactory: session.chatModelFactory,
+            backgroundActivityEnabled: false,
+            demoSession: session,
+            onResetDemo: onReset,
+            onExitDemo: onExit
+        )
+        .id(ObjectIdentifier(session))
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "play.circle.fill")
+                Text("Demo")
+                    .font(.caption.weight(.semibold))
+                    .accessibilityIdentifier("demo-mode-label")
+                Text("All actions run locally")
+                    .font(.caption2)
+                    .foregroundStyle(DroverColor.muted)
+                Spacer(minLength: 0)
+                Button("Reset", action: onReset)
+                .font(.caption.weight(.semibold))
+                .accessibilityIdentifier("demo-reset")
+                Button("Reconnect") { session.simulateReconnect() }
+                    .font(.caption.weight(.semibold))
+                    .accessibilityIdentifier("demo-reconnect")
+                Button("Exit") { onExit() }
+                    .font(.caption.weight(.semibold))
+                    .accessibilityIdentifier("demo-exit")
+            }
+            .foregroundStyle(DroverColor.accentHi)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(DroverColor.surface)
+            .overlay(alignment: .bottom) { Divider().overlay(DroverColor.line) }
+        }
+    }
+}
+
 #if DEBUG
 private struct FixturePreparedRoot: View {
     let scenario: UITestScenario
     let notifier: Notifying
+    let onTryDemo: () -> Void
     @State private var isPrepared = false
 
     var body: some View {
@@ -271,7 +411,8 @@ private struct FixturePreparedRoot: View {
                     environment: scenario.environment, notifier: notifier,
                     defaults: scenario.defaults,
                     chatModelFactory: scenario.makeClient().chatModelFactory,
-                    backgroundActivityEnabled: false
+                    backgroundActivityEnabled: false,
+                    onTryDemo: onTryDemo
                 )
                 .overlay(alignment: .topTrailing) {
                     TimelineView(.periodic(from: .now, by: 0.2)) { _ in
