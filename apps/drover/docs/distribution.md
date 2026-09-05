@@ -82,8 +82,9 @@ selects `Drover/Drover-AppStore.entitlements`, which changes only APNs to
 and the checked-in `Info.plist`. The defaults (`0.1.0` and `1`) are for
 development. The release owner must choose the submission values from verified
 App Store Connect state; for a given marketing version, the selected build
-number must exceed every uploaded build. This task intentionally provides no
-archive, signing, or upload command.
+number must exceed every uploaded build. Archive tooling accepts those values
+only as explicit inputs. It does not choose a candidate version, signing
+identity, team, profile, or upload destination.
 
 Generate and inspect configuration locally from the repository root:
 
@@ -106,3 +107,109 @@ xcodebuild -project apps/drover/Drover.xcodeproj -scheme DroverAppStore \
 
 Those example values do not assert upload eligibility or select a release
 candidate; they only demonstrate that build settings reach the product.
+
+## Archive and signed-artifact verification
+
+Use a fresh, approved version and build number. The output directory must be an
+absolute path that does not already exist. The wrapper is portable and accepts
+any such output parent. For this release program, the release owner retains
+local candidates under the M2 artifact volume by setting the explicit path
+below. The wrapper creates the archive directory, a zip of that archive, and
+`archive-record.json`. The record binds the candidate to its commit,
+clean-tree state, effective Xcode developer directory and iPhoneOS SDK,
+version, build, and SHA-256 hash of the archive zip.
+
+The archive command also needs an explicit private signing configuration. The
+configuration is generated from the reviewed distribution identity, team, and
+provisioning profile. It pins manual signing, the approved certificate common
+name after an exact SHA-1 preflight, the team, the profile UUID, and the
+temporary keychain path. Keep it outside the repository and do not print it.
+The wrapper rejects an incomplete, ambient, or automatic signing configuration;
+it never selects the first identity that a machine happens to have.
+
+```sh
+export DROVER_APP_VERSION="<approved-version>"
+export DROVER_APP_BUILD="<approved-build>"
+export DROVER_IOS_OUTPUT="/Volumes/M2 1/drover-data/ios-candidates/<candidate>"
+export DROVER_IOS_SIGNING_CONFIG="<private-reviewed-signing-config>"
+
+scripts/ios/archive.sh --version "$DROVER_APP_VERSION" \
+  --build "$DROVER_APP_BUILD" --output "$DROVER_IOS_OUTPUT" \
+  --signing-config "$DROVER_IOS_SIGNING_CONFIG"
+```
+
+`archive.sh` uses the effective `DEVELOPER_DIR` when one is set, otherwise the
+selected Xcode. It requires Xcode 26 and iPhoneOS SDK 26.0 or later, generates
+the project, and archives the `DroverAppStore` scheme with the supplied build
+settings and private configuration. It records the working-tree state rather
+than silently changing it. It does not pass a signing identity, team, profile,
+or secret on a command line. Build and signing output stay in a temporary
+directory and are deleted after the command; failures use short sanitized
+messages.
+
+The wrapper calls the verifier on the archive before it records a candidate.
+The verifier may also be used on the application unpacked from a reviewed IPA:
+
+```sh
+scripts/ios/verify_archive.py --app "$DROVER_IOS_OUTPUT/Drover.xcarchive" \
+  --expected-version "$DROVER_APP_VERSION" --expected-build "$DROVER_APP_BUILD"
+
+ditto -x -k "$DROVER_EXPORTED_IPA" "$DROVER_EXPORTED_IPA_DIRECTORY"
+scripts/ios/verify_archive.py \
+  --app "$DROVER_EXPORTED_IPA_DIRECTORY/Payload/Drover.app" \
+  --expected-version "$DROVER_APP_VERSION" --expected-build "$DROVER_APP_BUILD"
+```
+
+The verifier requires an iPhoneOS product and exact bundle identifier, version,
+build, iPhoneOS SDK, and embedded privacy manifest. It invokes `codesign` to
+verify the signed bundle, read its certificate authorities, and read its
+signed entitlements. It requires an Apple Distribution authority, production
+APNs, and `get-task-allow=false`. A simulator product, development APNs, a
+development debugger entitlement, absent or malformed signing evidence,
+unexpanded build settings, or a source entitlement file cannot make a
+candidate pass. The source entitlement file is never used as signed evidence.
+
+Before an authorized export or upload, validate both the archive and the
+unpacked IPA with the same expected values. The release owner creates and
+reviews the Xcode-generated App Store Connect export configuration, then
+inspects the archive privacy report and dependency contents. The release owner
+also verifies App Store Connect access and agreements, app identity, and
+distribution provisioning. A working development installation is not evidence
+that these distribution prerequisites are available.
+
+## Protected manual CI archive
+
+`.github/workflows/ios-distribution.yml` is dispatch-only and uses the
+protected `ios-distribution` environment. Its job is restricted to `main`
+before that environment is entered and checks out the exact `github.sha` that
+GitHub reviewed for the dispatch. It does not run for pull requests or execute
+a selected feature branch with distribution inputs.
+
+Before enabling it, the release owner configures required reviewers and the
+seven protected signing inputs named in the workflow: a base64 PKCS#12 bundle
+and its password, a base64 provisioning profile, the approved team ID, profile
+UUID, certificate SHA-1, and certificate common name. The setup script creates
+a fresh temporary keychain and imports the PKCS#12 material without placing
+its password in command arguments. It installs and verifies the exact profile,
+checks the exact
+certificate SHA-1 in that keychain, and writes the private manual signing
+configuration. It removes the temporary keychain, profile, and configuration
+after the archive step. A missing or mismatched prerequisite fails before an
+archive is attempted.
+
+The workflow reports its selected Xcode and SDK, runs the archive wrapper, and
+uploads only sanitized metadata (`archive-record.json`). The signed archive,
+its zip, exported IPA, and provisioning profile are not uploaded to GitHub
+Actions because protected environments do not make Actions artifact downloads
+private. Retain any signed candidate locally under the explicit root-owned
+output path after the release owner has completed the signing evidence review.
+
+The workflow selects `macos-26` and
+`/Applications/Xcode_26.6.app/Contents/Developer`. That path and its iPhoneOS
+26.5 SDK were listed in the current GitHub runner image documentation when this
+workflow was added. GitHub updates runner images regularly, so a missing path
+fails clearly instead of silently using another Xcode. Recheck the
+[GitHub macOS 26 image inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-26-Readme.md)
+and [Apple's submission requirements](https://developer.apple.com/app-store/submitting/)
+when dispatching a candidate. Apple currently requires iOS uploads to use the
+iOS 26 SDK or later; this does not raise the app's iOS 18.0 deployment target.
