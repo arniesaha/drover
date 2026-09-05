@@ -72,6 +72,7 @@ struct InsightDetailView: View {
             }
         }
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("insight-detail-header")
         .accessibilityLabel(InsightDetailHeaderPresentation.accessibilityLabel(
             severity: value.severityText,
             status: statusText,
