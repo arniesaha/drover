@@ -27,6 +27,9 @@ struct SessionsView: View {
     @State private var cockpitStore: CockpitStore
     private let client: DroverClient
     private let notifier: Notifying
+    private let recoveryStore: (any ChatRecoveryPersisting)?
+    private let recoveryWriteGate: ChatRecoveryWriteGate
+    private let recoveryGeneration: Int
     private let onOpenSettings: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
@@ -39,10 +42,16 @@ struct SessionsView: View {
     init(
         client: DroverClient,
         notifier: Notifying = LocalNotifier(),
+        recoveryStore: (any ChatRecoveryPersisting)?,
+        recoveryWriteGate: ChatRecoveryWriteGate,
+        recoveryGeneration: Int,
         onOpenSettings: @escaping () -> Void = {}
     ) {
         self.client = client
         self.notifier = notifier
+        self.recoveryStore = recoveryStore
+        self.recoveryWriteGate = recoveryWriteGate
+        self.recoveryGeneration = recoveryGeneration
         self.onOpenSettings = onOpenSettings
         _store = State(initialValue: SessionStore(client: client))
         _cockpitStore = State(initialValue: CockpitStore(client: client))
@@ -232,7 +241,14 @@ struct SessionsView: View {
         }
         .navigationDestination(item: $launchedSession) { launched in
             if launched.isStructured {
-                ChatView(client: client, sessionID: launched.id, harness: launched.harness)
+                ChatView(
+                    client: client,
+                    sessionID: launched.id,
+                    harness: launched.harness,
+                    recoveryStore: recoveryStore,
+                    recoveryWriteGate: recoveryWriteGate,
+                    recoveryGeneration: recoveryGeneration
+                )
             } else {
                 TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
             }
@@ -379,7 +395,10 @@ struct SessionsView: View {
                         sessionID: session.id,
                         harness: session.harness,
                         recap: session.recap ?? session.preview,
-                        recapSourceSeq: session.recapSourceSeq
+                        recapSourceSeq: session.recapSourceSeq,
+                        recoveryStore: recoveryStore,
+                        recoveryWriteGate: recoveryWriteGate,
+                        recoveryGeneration: recoveryGeneration
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: session.id, harness: session.harness)

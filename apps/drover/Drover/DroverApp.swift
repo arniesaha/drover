@@ -158,6 +158,9 @@ private struct RootView: View {
                     SessionsView(
                         client: client,
                         notifier: notifier,
+                        recoveryStore: environment.chatRecoveryStore,
+                        recoveryWriteGate: environment.chatRecoveryWriteGate,
+                        recoveryGeneration: environment.chatRecoveryGeneration,
                         onOpenSettings: { showSettings = true }
                     )
                 }

@@ -17,6 +17,21 @@ final class MockFlag: @unchecked Sendable {
 final class MockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
 
+    /// A deliberately narrow request trace for recovery tests. It retains
+    /// correlation IDs only, never a prompt or attachment payload.
+    private static let sentClientTurnIDsLock = NSLock()
+    nonisolated(unsafe) private static var recordedClientTurnIDs: [String] = []
+
+    static var sentClientTurnIDs: [String] {
+        sentClientTurnIDsLock.withLock { recordedClientTurnIDs }
+    }
+
+    static func resetRecordedRequests() {
+        sentClientTurnIDsLock.withLock {
+            recordedClientTurnIDs.removeAll(keepingCapacity: true)
+        }
+    }
+
     /// Fail the request at the transport layer instead of answering it, so
     /// tests can exercise the `DroverError.transport` path (offline hub,
     /// cancelled poll) that no (status, body) pair can represent. Takes
@@ -42,6 +57,7 @@ final class MockURLProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        Self.recordClientTurnID(in: request)
         if let transportError = Self.transportError {
             client?.urlProtocol(self, didFailWithError: transportError)
             return
@@ -73,6 +89,18 @@ final class MockURLProtocol: URLProtocol {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [MockURLProtocol.self]
         return URLSession(configuration: cfg)
+    }
+
+    private static func recordClientTurnID(in request: URLRequest) {
+        guard request.httpMethod == "POST",
+              request.url?.path.hasSuffix("/turns") == true,
+              let object = try? JSONSerialization.jsonObject(with: request.bodyStreamData())
+                as? [String: Any],
+              let clientTurnID = object["client_turn_id"] as? String
+        else { return }
+        sentClientTurnIDsLock.withLock {
+            recordedClientTurnIDs.append(clientTurnID)
+        }
     }
 }
 

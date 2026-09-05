@@ -163,11 +163,76 @@ let fleetSnapshotJSON = Data("""
 
 // MARK: - DroverClient test factory (Task 4+)
 
+let testRecoveryBindingID = UUID(uuidString: "00000000-0000-4000-8000-000000000101")!
+
+private actor TestChatRecoveryStore: ChatRecoveryPersisting {
+    private var snapshots: [ChatRecoveryKey: ChatRecoverySnapshot] = [:]
+
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? {
+        snapshots[key]
+    }
+
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
+        snapshots[key] = snapshot
+    }
+
+    func remove(for key: ChatRecoveryKey) async throws {
+        snapshots.removeValue(forKey: key)
+    }
+
+    func purge(bindingID: UUID) async throws {
+        snapshots = snapshots.filter { $0.key.credentialBindingID != bindingID }
+    }
+
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {
+        snapshots = snapshots.filter { bindingIDs.contains($0.key.credentialBindingID) }
+    }
+
+    func eraseAllAfterCredentialDeletion() async throws {
+        snapshots.removeAll()
+    }
+}
+
 /// Shared `DroverClient` factory wired to `MockURLProtocol` so Tasks 4-10 all
 /// build clients the same way instead of redefining this per-file.
 func client() -> DroverClient {
     DroverClient(config: ServerConfig(urlString: "http://test.local:7080")!,
-                token: "test-token", session: MockURLProtocol.session())
+                token: "test-token",
+                credentialBindingID: testRecoveryBindingID,
+                session: MockURLProtocol.session())
+}
+
+@MainActor
+func recoveryChatModel(
+    client: DroverClient,
+    sessionID: String,
+    harness: String? = nil,
+    store: HarnessModelCatalogStore = HarnessModelCatalogStore(),
+    initialMessages: [HarnessMessage] = [],
+    recap: String? = nil,
+    recapSourceSeq: Int? = nil,
+    recapPollInterval: Duration = .seconds(1),
+    recapPollAttempts: Int = 30,
+    deliveryConfirmationTimeout: Duration = .seconds(20),
+    streamFactory: ((DroverClient, String) -> MessageStream)? = nil
+) -> ChatModel {
+    let recoveryWriteGate = ChatRecoveryWriteGate()
+    return ChatModel(
+        client: client,
+        sessionID: sessionID,
+        harness: harness,
+        store: store,
+        initialMessages: initialMessages,
+        recap: recap,
+        recapSourceSeq: recapSourceSeq,
+        recapPollInterval: recapPollInterval,
+        recapPollAttempts: recapPollAttempts,
+        deliveryConfirmationTimeout: deliveryConfirmationTimeout,
+        recoveryStore: TestChatRecoveryStore(),
+        recoveryWriteGate: recoveryWriteGate,
+        recoveryGeneration: recoveryWriteGate.generation,
+        streamFactory: streamFactory
+    )
 }
 
 // MARK: - HarnessMessage/ChatModel test factories (Task 7+)
@@ -193,6 +258,10 @@ extension ChatModel {
     /// in tests, no `MockURLProtocol.handler` needed unless the test also
     /// calls a network action (`sendTurn`/`approve`/etc.).
     static func fixture(messages: [HarnessMessage] = []) -> ChatModel {
-        ChatModel(client: client(), sessionID: "fixture-session", initialMessages: messages)
+        recoveryChatModel(
+            client: client(),
+            sessionID: "fixture-session",
+            initialMessages: messages
+        )
     }
 }

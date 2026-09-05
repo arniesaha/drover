@@ -38,6 +38,7 @@ private final class SnapshotClient: @unchecked Sendable {
     let client = DroverClient(
         config: ServerConfig(urlString: "http://test.local:7080")!,
         token: "test-token",
+        credentialBindingID: testRecoveryBindingID,
         session: MockURLProtocol.session()
     )
 
@@ -158,20 +159,20 @@ extension MockNetworkTests {
 struct ChatModelTests {
 
 @Test @MainActor func initialRecapBecomesHeaderTitle() {
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Improving previews; awaiting tests.", recapSourceSeq: 8)
 
     #expect(model.headerTitle == "Improving previews; awaiting tests.")
 }
 
 @Test @MainActor func missingContextUsesHarnessOnlyHeaderMetadata() {
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex")
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex")
 
     #expect(model.headerMetadata == "Codex")
 }
 
 @Test @MainActor func headerMetadataJoinsHarnessAndContextGauge() {
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "codex",
         initialMessages: [.fixture(
             seq: 12, type: .status,
@@ -192,7 +193,7 @@ struct ChatModelTests {
         sessionJSON(recap: "Old", source: 8),
         sessionJSON(recap: "New", source: 12),
     ])
-    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
                           recap: "Old", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 3)
 
@@ -213,7 +214,7 @@ struct ChatModelTests {
         }
         return (200, sessionJSON(recap: "Recovered", source: 12))
     }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Old", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 3)
 
@@ -235,7 +236,7 @@ struct ChatModelTests {
         }
         return (200, target.waitForRelease())
     }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Old", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 3)
 
@@ -269,7 +270,7 @@ struct ChatModelTests {
         #expect(request.url?.path == "/harness")
         return (200, delayed.waitForRelease())
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "codex", store: store,
         recap: "Old", recapSourceSeq: 8,
         recapPollInterval: .zero, recapPollAttempts: 1
@@ -292,7 +293,7 @@ struct ChatModelTests {
 
 @Test @MainActor func recapPollStopsAfterConfiguredAttemptsAndKeepsLastGoodText() async {
     let snapshots = snapshotClient(repeating: sessionJSON(recap: "Old", source: 8))
-    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
                           recap: "Old", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 3)
 
@@ -304,7 +305,7 @@ struct ChatModelTests {
 
 @Test @MainActor func missingGeneratedRecapDoesNotReplaceCurrentTextWithPreview() async {
     let snapshots = snapshotClient(responses: [sessionJSON(preview: "Fallback preview")])
-    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
                           recap: "Current", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 1)
 
@@ -317,7 +318,7 @@ struct ChatModelTests {
 
 @Test @MainActor func olderGeneratedRecapDoesNotReplaceNewerState() async {
     let snapshots = snapshotClient(responses: [sessionJSON(recap: "Stale", source: 7)])
-    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
                           recap: "Current", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 1)
 
@@ -331,7 +332,7 @@ struct ChatModelTests {
 @Test @MainActor func recapTransportFailureKeepsCurrentText() async throws {
     MockURLProtocol.transportError = URLError(.notConnectedToInternet)
     defer { MockURLProtocol.transportError = nil }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Current", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 1)
 
@@ -344,7 +345,7 @@ struct ChatModelTests {
 
 @Test @MainActor func stopCancelsPendingRecapPoll() async throws {
     let snapshots = snapshotClient(repeating: sessionJSON(recap: "Old", source: 8))
-    let model = ChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: snapshots.client, sessionID: "s1", harness: "codex",
                           recap: "Old", recapSourceSeq: 8,
                           recapPollInterval: .seconds(1), recapPollAttempts: 3)
 
@@ -362,7 +363,7 @@ struct ChatModelTests {
         #expect(request.url?.path == "/harness")
         return (200, delayed.waitForRelease())
     }
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex",
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Current", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 1)
 
@@ -393,7 +394,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in
         (409, Data(#"{"error": "session is terminating"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "next thing"
     await model.sendTurn()
     #expect(model.hint == "session is terminating")
@@ -409,7 +410,7 @@ struct ChatModelTests {
         Thread.sleep(forTimeInterval: 0.3)   // hold the request in flight
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes"
 
     async let first: Void = model.sendTurn()
@@ -430,7 +431,7 @@ struct ChatModelTests {
         if firstTurnID == nil { firstTurnID = clientTurnID(in: request) }
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "first"
     await model.sendTurn()
     model.ingest(.message(.fixture(
@@ -447,7 +448,7 @@ struct ChatModelTests {
 @Test @MainActor func failedSendLeavesARetryablePendingDelivery() async throws {
     MockURLProtocol.transportError = URLError(.notConnectedToInternet)
     defer { MockURLProtocol.transportError = nil }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes"
     await model.sendTurn()
     #expect(model.composerText.isEmpty)
@@ -460,7 +461,7 @@ struct ChatModelTests {
     MockURLProtocol.transportError = URLError(.notConnectedToInternet)
     defer { MockURLProtocol.transportError = nil }
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes"
     model.pendingAttachments = [attachment]
 
@@ -478,7 +479,7 @@ struct ChatModelTests {
         (400, Data(#"{"error": "message is not accepted"}"#.utf8))
     }
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes"
     model.pendingAttachments = [attachment]
 
@@ -496,7 +497,7 @@ struct ChatModelTests {
         #expect(request.url?.path == "/harness/sessions/s1/continue")
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     let continued = await model.handOff()
     #expect(continued?.sessionID == "harness-continued")
     #expect(continued?.isStructured == false)
@@ -507,7 +508,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in
         (201, Data(#"{"session_id": "harness-continued", "mode": "structured"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     let continued = await model.handOff(targetHarness: "codex")
     #expect(continued?.isStructured == true)
 }
@@ -520,21 +521,21 @@ struct ChatModelTests {
         sentTarget = body["target_harness"] as? String
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     let continued = await model.handOff(targetHarness: "codex")
     #expect(continued?.sessionID == "harness-continued")
     #expect(sentTarget == "codex")
 }
 
 @Test @MainActor func initUsesProvidedHarnessForPresentation() async throws {
-    let model = ChatModel(client: client(), sessionID: "s1", harness: "codex")
+    let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex")
     #expect(model.harnessPresentation.name == "Codex")
     #expect(model.harnessPresentation.symbolName == "chevron.left.forwardslash.chevron.right")
 }
 
 @Test @MainActor func loadSessionMetadataUpdatesHarnessPresentation() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
-    let model = ChatModel(client: client(), sessionID: "harness-1", harness: "codex")
+    let model = recoveryChatModel(client: client(), sessionID: "harness-1", harness: "codex")
     #expect(model.harnessPresentation.name == "Codex")
     await model.loadSessionMetadata()
     #expect(model.harnessPresentation.name == "Antigravity")
@@ -543,7 +544,7 @@ struct ChatModelTests {
 
 @Test @MainActor func loadSessionMetadataListsHostHarnesses() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
-    let model = ChatModel(client: client(), sessionID: "harness-1")
+    let model = recoveryChatModel(client: client(), sessionID: "harness-1")
     #expect(model.handoffHarnesses.isEmpty)
     await model.loadSessionMetadata()
     #expect(model.handoffHarnesses == ["shell", "claude-code", "agy"])
@@ -581,7 +582,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { request in
         request.url?.path == "/harness" ? (200, snapshot) : (200, encodedCatalog(catalog))
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "harness-preferred", store: store
     )
 
@@ -611,7 +612,7 @@ struct ChatModelTests {
             ? (200, sessionJSON(model: "   ", thinkingEffort: "  \t "))
             : (200, encodedCatalog(catalog))
     }
-    let model = ChatModel(client: client(), sessionID: "s1", store: store)
+    let model = recoveryChatModel(client: client(), sessionID: "s1", store: store)
 
     await model.loadSessionMetadata()
 
@@ -642,7 +643,7 @@ struct ChatModelTests {
         sentEffort = body["thinking_effort"] as? String
         return (202, Data(#"{"turn_id":"t1"}"#.utf8))
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", store: chatTestStore()
     )
 
@@ -673,7 +674,7 @@ struct ChatModelTests {
         }
         return (200, delayedCatalog.waitForRelease())
     }
-    let model = ChatModel(client: client(), sessionID: "s1", store: store)
+    let model = recoveryChatModel(client: client(), sessionID: "s1", store: store)
 
     let load = Task { await model.loadSessionMetadata() }
     await eventually { delayedCatalog.hasStarted }
@@ -690,7 +691,7 @@ struct ChatModelTests {
 
 @Test @MainActor func loadSessionMetadataUnknownSessionLeavesListEmpty() async throws {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
-    let model = ChatModel(client: client(), sessionID: "not-in-snapshot")
+    let model = recoveryChatModel(client: client(), sessionID: "not-in-snapshot")
     await model.loadSessionMetadata()
     #expect(model.handoffHarnesses.isEmpty)
 }
@@ -699,7 +700,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in
         (409, Data(#"{"error": "host offline"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     let continued = await model.handOff()
     #expect(continued == nil)
     #expect(model.hint == "host offline")
@@ -718,7 +719,7 @@ struct ChatModelTests {
         }
         return (202, Data(#"{"turn_id": "t2"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "follow-up question"
     await model.sendTurn()
 
@@ -744,7 +745,7 @@ struct ChatModelTests {
         counter.bump()
         return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "wait for the live completion"
     await model.sendTurn()
     #expect(model.queuedTurn == "wait for the live completion")
@@ -770,7 +771,7 @@ struct ChatModelTests {
         sentImages = body["images"] as? [[String: Any]] ?? []
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "hi"
     model.pendingAttachments = [attachment]
     await model.sendTurn()
@@ -810,7 +811,7 @@ struct ChatModelTests {
             return (202, Data(#"{"turn_id":"t1"}"#.utf8))
         }
     }
-    let model = ChatModel(client: client(), sessionID: "s1", store: store)
+    let model = recoveryChatModel(client: client(), sessionID: "s1", store: store)
 
     await model.loadSessionMetadata()
     model.composerText = "hi"
@@ -830,7 +831,7 @@ struct ChatModelTests {
         sentThinking = body["thinking_effort"] as? String
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "codex", store: chatTestStore()
     )
     model.runPreferences.select(hostID: "host-1", harness: "codex")
@@ -856,7 +857,7 @@ struct ChatModelTests {
         sentThinking = body.keys.contains("thinking_effort")
         return (202, Data(#"{"turn_id":"t1"}"#.utf8))
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "agy", store: chatTestStore()
     )
     model.runPreferences.select(hostID: "host-1", harness: "agy")
@@ -888,7 +889,7 @@ struct ChatModelTests {
         sentThinking = body.keys.contains("thinking_effort")
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "claude-code",
         store: chatTestStore()
     )
@@ -919,7 +920,7 @@ struct ChatModelTests {
         }
         return (202, Data(#"{"turn_id": "t2"}"#.utf8))
     }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "claude-code",
         store: chatTestStore()
     )
@@ -950,7 +951,7 @@ struct ChatModelTests {
         sentTexts.append(body["text"] as? String ?? "missing")
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.pendingAttachments = [TurnAttachment(mediaType: "image/jpeg", data: Data([0x03]))]
     await model.sendTurn()
     #expect(sentTexts == [""])
@@ -969,7 +970,7 @@ struct ChatModelTests {
         }
         return (202, Data(#"{"turn_id": "t2"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "see attached"
     model.pendingAttachments = [attachment]
     await model.sendTurn()
@@ -990,7 +991,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in
         (409, Data(#"{"error": "approval pending; answer it first"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "do it anyway"
     await model.sendTurn()
     #expect(model.queuedTurn == nil)
@@ -1004,7 +1005,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in
         (409, Data(#"{"error": "\#(message)"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "continue from here"
     model.pendingAttachments = [attachment]
 
@@ -1037,7 +1038,7 @@ struct ChatModelTests {
         turnID = clientTurnID(in: request)
         return (202, Data(#"{"turn_id": "t9"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "do it"
     await model.sendTurn()
     let confirmedTurnID = try #require(turnID)
@@ -1124,7 +1125,7 @@ struct ChatModelTests {
         paths.append(request.url?.path ?? "")
         return (200, Data())
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     await model.interrupt()
     await model.terminate()
     #expect(paths == ["/harness/sessions/s1/interrupt", "/harness/sessions/s1/terminate"])
@@ -1132,7 +1133,7 @@ struct ChatModelTests {
 
 @Test @MainActor func transportFailureGetsGenericRetryHint() async throws {
     MockURLProtocol.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     await model.interrupt()
     #expect(model.hint == "Could not interrupt — try again.")
 }
@@ -1146,7 +1147,7 @@ struct ChatModelTests {
     MockURLProtocol.handler = { _ in
         (504, Data(#"{"error": "harness host did not answer within 120s"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
 
     await model.interrupt()
 
@@ -1173,7 +1174,7 @@ struct ChatModelTests {
         .frames([chatWireMessage(seq: 1, text: "before stop")], thenError: false),
         .frames([chatWireMessage(seq: 2, text: "after restart")], thenError: false),
     ])
-    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { c, s in
+    let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { c, s in
         MessageStream(client: c, sessionID: s, connector: connector,
                       reconnectBaseDelay: .milliseconds(10))
     })
@@ -1242,7 +1243,7 @@ struct ChatModelTests {
         .frames([], thenError: false),
         .frames([], thenError: false),
     ])
-    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+    let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
         MessageStream(client: client, sessionID: sessionID, connector: connector,
                       reconnectBaseDelay: .milliseconds(10))
     })
@@ -1261,7 +1262,7 @@ struct ChatModelTests {
     // 500s forever behind a backoff long enough that the restarted pump
     // cannot land a failure of its own inside this test.
     MockURLProtocol.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
-    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+    let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
         MessageStream(client: client, sessionID: sessionID,
                       connector: FakeConnector([.frames([], thenError: false)]),
                       reconnectBaseDelay: .seconds(60))
@@ -1298,7 +1299,7 @@ struct ChatModelTests {
         }
     }
     let connector = FakeConnector([.frames([], thenError: false)])
-    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+    let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
         // Two-message cold window: the older page stays behind the explicit
         // request rather than being pulled in while assembling the window.
         MessageStream(client: client, sessionID: sessionID, connector: connector,
@@ -1330,7 +1331,7 @@ struct ChatModelTests {
         return (500, Data(#"{"error": "transient"}"#.utf8))
     }
     let connector = FakeConnector([.frames([], thenError: false)])
-    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
+    let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
         // Two-message cold window: the older page stays behind the explicit
         // request rather than being pulled in while assembling the window.
         MessageStream(client: client, sessionID: sessionID, connector: connector,
@@ -1358,7 +1359,7 @@ struct ChatModelTests {
         return (401, Data(#"{"error": "authentication required"}"#.utf8))
     }
     let connector = FakeConnector([.frames([], thenError: false)])
-    let model = ChatModel(client: client(), sessionID: "s1", streamFactory: { c, s in
+    let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { c, s in
         MessageStream(client: c, sessionID: s, connector: connector,
                       reconnectBaseDelay: .milliseconds(10))
     })
@@ -1400,7 +1401,7 @@ struct ChatModelTests {
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
     defer { MockURLProtocol.handler = nil }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
     let confirmedTurnID = try #require(turnID)
@@ -1426,7 +1427,7 @@ struct ChatModelTests {
 @Test @MainActor func echoOfDifferentTextLeavesPendingDeliveryInPlace() async throws {
     MockURLProtocol.transportError = URLError(.networkConnectionLost)
     defer { MockURLProtocol.transportError = nil }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
 
@@ -1443,7 +1444,7 @@ struct ChatModelTests {
     // resolve; it degrades to a retryable state instead.
     MockURLProtocol.handler = { _ in (202, Data(#"{"status": "accepted"}"#.utf8)) }
     defer { MockURLProtocol.handler = nil }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(),
         sessionID: "s1",
         deliveryConfirmationTimeout: .milliseconds(20)
@@ -1469,7 +1470,7 @@ struct ChatModelTests {
         return (202, Data(#"{"status": "accepted"}"#.utf8))
     }
     defer { MockURLProtocol.handler = nil }
-    let model = ChatModel(
+    let model = recoveryChatModel(
         client: client(),
         sessionID: "s1",
         deliveryConfirmationTimeout: .milliseconds(20)
@@ -1497,7 +1498,7 @@ struct ChatModelTests {
     // driven by the pending turn, so it has to survive them.
     MockURLProtocol.transportError = URLError(.networkConnectionLost)
     defer { MockURLProtocol.transportError = nil }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
 
@@ -1523,7 +1524,7 @@ struct ChatModelTests {
         localTurnID = clientTurnID(in: request)
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
     let confirmedTurnID = try #require(localTurnID)
@@ -1554,7 +1555,7 @@ struct ChatModelTests {
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
     defer { MockURLProtocol.handler = nil }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
     let confirmedTurnID = try #require(turnID)
@@ -1587,7 +1588,7 @@ struct ChatModelTests {
         turnID = clientTurnID(in: request)
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
     #expect(model.composerText.isEmpty)
@@ -1620,7 +1621,7 @@ struct ChatModelTests {
         }
         return (202, Data(#"{"turn_id": "accepted"}"#.utf8))
     }
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
     #expect(model.pendingTurn?.canRetry == true)
@@ -1648,7 +1649,7 @@ struct ChatModelTests {
     defer { MockURLProtocol.handler = nil }
     let landedAttachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
     let laterAttachment = TurnAttachment(mediaType: "image/png", data: Data([0x02]))
-    let model = ChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     model.pendingAttachments = [landedAttachment]
     await model.sendTurn()
