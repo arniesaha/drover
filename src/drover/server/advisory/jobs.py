@@ -6,6 +6,7 @@ import math
 import time
 from pathlib import Path
 from typing import Callable, Iterable
+from uuid import uuid4
 
 from drover.server.db import open_duckdb_connection
 from drover.server.ledger import JOB_LEASED, JOB_PENDING, JOB_RETRY_WAIT, Job, Ledger
@@ -42,6 +43,7 @@ def enqueue_advisory_check(
     source_version: str,
     force: bool = False,
     max_attempts: int = 5,
+    requested_finding_id: str | None = None,
 ) -> Job:
     """Enqueue or reuse one analyzer/target/source-version check.
 
@@ -53,8 +55,11 @@ def enqueue_advisory_check(
 
     subject_key = advisory_subject_key(analyzer_id, target_id)
     version = _required(source_version, "source_version")
+    if requested_finding_id is not None:
+        requested_finding_id = _required(requested_finding_id, "requested_finding_id")
     con = open_duckdb_connection(Path(duckdb_path), role="worker")
     try:
+        con.execute("BEGIN TRANSACTION")
         ledger = Ledger(con)
         receipt = ledger.record_receipt(
             source_kind=ADVISORY_RECEIPT_KIND,
@@ -67,38 +72,77 @@ def enqueue_advisory_check(
         )
         exact = _job_for_receipt(con, receipt.receipt.receipt_id)
         if receipt.is_duplicate and not force and exact is not None:
-            return exact
-
-        latest = ledger.latest_job(ADVISORY_JOB_KIND, subject_key)
-        if latest is None:
-            opened = ledger.open_job(
-                job_kind=ADVISORY_JOB_KIND,
-                subject_kind="advisory_target",
-                subject_key=subject_key,
-                caused_by_receipt_id=receipt.receipt.receipt_id,
-                max_attempts=max_attempts,
-            ).job
-        elif force or latest.status not in {JOB_PENDING, JOB_LEASED, JOB_RETRY_WAIT}:
-            replay = ledger.replay_job(
-                job_kind=ADVISORY_JOB_KIND, subject_key=subject_key
-            )
-            if replay is None:
-                return latest
-            opened = replay.job
-            con.execute(
-                "UPDATE pipeline_jobs SET caused_by_receipt_id = ? WHERE job_id = ?",
-                [receipt.receipt.receipt_id, opened.job_id],
-            )
+            opened = exact
         else:
-            opened = latest
-            if latest.status != JOB_LEASED:
-                con.execute(
-                    "UPDATE pipeline_jobs SET caused_by_receipt_id = ? WHERE job_id = ?",
-                    [receipt.receipt.receipt_id, latest.job_id],
+            latest = ledger.latest_job(ADVISORY_JOB_KIND, subject_key)
+            if latest is None:
+                opened = ledger.open_job(
+                    job_kind=ADVISORY_JOB_KIND,
+                    subject_kind="advisory_target",
+                    subject_key=subject_key,
+                    caused_by_receipt_id=receipt.receipt.receipt_id,
+                    max_attempts=max_attempts,
+                ).job
+            elif force or latest.status not in {
+                JOB_PENDING,
+                JOB_LEASED,
+                JOB_RETRY_WAIT,
+            }:
+                replay = ledger.replay_job(
+                    job_kind=ADVISORY_JOB_KIND, subject_key=subject_key
                 )
-        return _load_job(con, opened.job_id)
+                if replay is None:
+                    opened = latest
+                else:
+                    opened = replay.job
+                    con.execute(
+                        "UPDATE pipeline_jobs SET caused_by_receipt_id = ? WHERE job_id = ?",
+                        [receipt.receipt.receipt_id, opened.job_id],
+                    )
+            else:
+                opened = latest
+                if latest.status != JOB_LEASED:
+                    con.execute(
+                        "UPDATE pipeline_jobs SET caused_by_receipt_id = ? WHERE job_id = ?",
+                        [receipt.receipt.receipt_id, latest.job_id],
+                    )
+        job = _load_job(con, opened.job_id)
+        if requested_finding_id is not None:
+            _record_check_request(
+                con, job_id=job.job_id, finding_id=requested_finding_id
+            )
+        con.execute("COMMIT")
+        return job
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
     finally:
         con.close()
+
+
+def _record_check_request(con, *, job_id: str, finding_id: str) -> None:
+    """Persist the exact user-requested finding with the ledger job.
+
+    A job subject can cover a host or fleet, so subject_key alone cannot prove
+    that a pending job belongs to one requested finding.  This table is the
+    durable boundary that lets a later status read validate exact opaque IDs
+    without recomputing the check scope.
+    """
+
+    existing = con.execute(
+        "SELECT request_id FROM advisory_check_requests "
+        "WHERE job_id = ? AND finding_id = ?",
+        [job_id, finding_id],
+    ).fetchone()
+    if existing is None:
+        con.execute(
+            """
+            INSERT INTO advisory_check_requests
+              (request_id, job_id, finding_id)
+            VALUES (?, ?, ?)
+            """,
+            [uuid4().hex, job_id, finding_id],
+        )
 
 
 def enqueue_operational_checks(
