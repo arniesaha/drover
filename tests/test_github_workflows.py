@@ -193,17 +193,35 @@ def test_distribution_workflow_is_manual_and_uses_the_documented_xcode() -> None
     }
 
     job = workflow["jobs"]["archive"]
+    assert job["if"] == "github.ref == 'refs/heads/main'"
     assert job["runs-on"] == "macos-26"
     assert job["environment"] == "ios-distribution"
     assert (
         job["env"]["DEVELOPER_DIR"] == "/Applications/Xcode_26.6.app/Contents/Developer"
     )
-    assert job["env"]["DROVER_IOS_ARTIFACT_ROOT"] == "${{ runner.temp }}"
+    assert "DROVER_IOS_ARTIFACT_ROOT" not in job["env"]
     steps = job["steps"]
+    checkout = steps[0]
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
     commands = "\n".join(step.get("run", "") for step in steps)
+    assert "DEVELOPER_DIR %s" in commands
+    assert "xcode-select -p" not in commands
     assert "xcodebuild -version" in commands
     assert "xcrun --sdk iphoneos --show-sdk-version" in commands
+    assert "setup_distribution_signing.sh" in commands
+    assert "cleanup_distribution_signing.sh" in commands
     assert "scripts/ios/archive.sh" in commands
+    signing_step = next(step for step in steps if step.get("id") == "signing")
+    assert (
+        signing_step["env"]["DROVER_DISTRIBUTION_IDENTITY_NAME"]
+        == "${{ secrets.DROVER_DISTRIBUTION_IDENTITY_NAME }}"
+    )
+    upload = next(
+        step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    assert upload["with"]["path"].endswith("/archive-record.json")
+    assert "xcarchive" not in upload["with"]["path"]
 
 
 def test_release_workflow_is_tag_triggered_and_publishes_three_artifacts() -> None:

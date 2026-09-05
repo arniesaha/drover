@@ -1,7 +1,9 @@
 """Contracts for verifying a signed iOS distribution artifact."""
 
 import importlib.util
+import os
 import plistlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,6 +53,25 @@ def write_bundle(tmp_path: Path, *, info: dict[str, object] | None = None) -> Pa
     with (app / "PrivacyInfo.xcprivacy").open("wb") as handle:
         plistlib.dump(valid_manifest(), handle)
     return app
+
+
+def write_executable(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def write_signing_config(directory: Path, *, keychain: Path) -> Path:
+    keychain.touch()
+    config = directory / "signing.xcconfig"
+    config.write_text(
+        "CODE_SIGN_STYLE = Manual\n"
+        "DEVELOPMENT_TEAM = TEAMID1234\n"
+        "CODE_SIGN_IDENTITY = Apple Distribution: Example Organization (TEAMID1234)\n"
+        "PROVISIONING_PROFILE_SPECIFIER = 11111111-2222-3333-4444-555555555555\n"
+        f"OTHER_CODE_SIGN_FLAGS = --keychain {keychain}\n",
+        encoding="utf-8",
+    )
+    return config
 
 
 def signed_entitlements(*, aps_environment: str = "production") -> dict[str, object]:
@@ -104,6 +125,117 @@ def test_verify_app_accepts_a_signed_iphoneos_candidate(tmp_path: Path) -> None:
 
     assert identity.bundle_identifier == "com.arnab.drover"
     assert identity.sdk_version == "26.5"
+
+
+def test_verify_app_parses_entitlements_from_stdout_without_stderr_diagnostics(
+    tmp_path: Path,
+) -> None:
+    verifier = load_verifier()
+    evidence = plistlib.dumps(signed_entitlements()).decode()
+
+    def stdout_entitlements_runner(
+        command: list[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[1:2] == ["--verify"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[1:2] == ["-dvv"]:
+            return subprocess.CompletedProcess(
+                command, 0, "", "Authority=Apple Distribution: Example (TEAMID)\n"
+            )
+        if command[1:3] == ["-d", "--entitlements"]:
+            return subprocess.CompletedProcess(
+                command, 0, evidence, "Executable=/tmp/Drover.app/Drover\n"
+            )
+        raise AssertionError(f"unexpected codesign command: {command}")
+
+    identity = verifier.verify_app(
+        write_bundle(tmp_path),
+        expected_version="1.2.3",
+        expected_build="42",
+        sdk_floor="26.0",
+        run=stdout_entitlements_runner,
+    )
+
+    assert identity.bundle_identifier == "com.arnab.drover"
+
+
+def test_verify_app_accepts_legacy_stderr_entitlements_after_diagnostics(
+    tmp_path: Path,
+) -> None:
+    verifier = load_verifier()
+    evidence = plistlib.dumps(signed_entitlements()).decode()
+
+    def stderr_entitlements_runner(
+        command: list[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[1:2] == ["--verify"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[1:2] == ["-dvv"]:
+            return subprocess.CompletedProcess(
+                command, 0, "", "Authority=Apple Distribution: Example (TEAMID)\n"
+            )
+        if command[1:3] == ["-d", "--entitlements"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "",
+                "Executable=/tmp/Drover.app/Drover\n" + evidence,
+            )
+        raise AssertionError(f"unexpected codesign command: {command}")
+
+    identity = verifier.verify_app(
+        write_bundle(tmp_path),
+        expected_version="1.2.3",
+        expected_build="42",
+        sdk_floor="26.0",
+        run=stderr_entitlements_runner,
+    )
+
+    assert identity.bundle_identifier == "com.arnab.drover"
+
+
+def test_verify_app_rejects_a_malformed_selected_entitlement_stream(
+    tmp_path: Path,
+) -> None:
+    verifier = load_verifier()
+    fallback_evidence = plistlib.dumps(signed_entitlements()).decode()
+
+    def malformed_stdout_runner(
+        command: list[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[1:2] == ["--verify"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[1:2] == ["-dvv"]:
+            return subprocess.CompletedProcess(
+                command, 0, "", "Authority=Apple Distribution: Example (TEAMID)\n"
+            )
+        if command[1:3] == ["-d", "--entitlements"]:
+            return subprocess.CompletedProcess(
+                command, 0, "<?xml malformed", fallback_evidence
+            )
+        raise AssertionError(f"unexpected codesign command: {command}")
+
+    with pytest.raises(verifier.ArtifactVerificationError, match="malformed"):
+        verifier.verify_app(
+            write_bundle(tmp_path),
+            expected_version="1.2.3",
+            expected_build="42",
+            sdk_floor="26.0",
+            run=malformed_stdout_runner,
+        )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS codesign")
+def test_inspect_signing_parses_a_preexisting_system_app() -> None:
+    verifier = load_verifier()
+    calculator = Path("/System/Applications/Calculator.app")
+    if not calculator.is_dir():
+        pytest.skip("Calculator.app is not installed")
+
+    evidence = verifier.inspect_signing(calculator)
+
+    assert isinstance(evidence.entitlements, dict)
+    assert evidence.entitlements
 
 
 def test_verify_app_invokes_codesign_for_signed_evidence(tmp_path: Path) -> None:
@@ -398,11 +530,108 @@ def test_archive_wrapper_rejects_unexpanded_values_before_archiving() -> None:
     assert not output.exists()
 
 
-def test_archive_wrapper_does_not_select_a_signing_identity() -> None:
+def test_archive_wrapper_requires_a_private_explicit_signing_configuration() -> None:
     script = ARCHIVE_SCRIPT_PATH.read_text(encoding="utf-8")
 
-    assert "CODE_SIGN_IDENTITY" not in script
+    assert "--signing-config" in script
+    assert "CODE_SIGN_STYLE = Manual" in script
+    assert '"CODE_SIGN_IDENTITY = "' in script
+    assert "Apple Distribution: " in script
+    assert '-xcconfig "$SIGNING_CONFIG"' in script
+    assert "CODE_SIGN_IDENTITY=" not in script
     assert "-allowProvisioningUpdates" not in script
+
+
+def test_archive_wrapper_uses_environment_selected_xcode_with_portable_output(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    xcodebuild_log = tmp_path / "xcodebuild-log"
+    xcode_select_log = tmp_path / "xcode-select-log"
+    record_args = tmp_path / "record-args"
+    effective_developer_dir = tmp_path / "selected-xcode"
+    effective_developer_dir.mkdir()
+    signing_config = write_signing_config(
+        tmp_path, keychain=tmp_path / "distribution.keychain-db"
+    )
+    output = tmp_path / "portable-output"
+
+    write_executable(
+        fake_bin / "xcodebuild",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "-version" ]]; then\n'
+        "  printf 'Xcode 26.6\\nBuild version test\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        'printf \'%s\\n\' "$DEVELOPER_DIR" >> "$STUB_XCODEBUILD_LOG"\n'
+        'archive_path=""\n'
+        "while [[ $# -gt 0 ]]; do\n"
+        '  if [[ "$1" == "-archivePath" ]]; then archive_path="$2"; fi\n'
+        "  shift\n"
+        "done\n"
+        'mkdir -p "$archive_path"\n',
+    )
+    write_executable(fake_bin / "xcrun", "#!/usr/bin/env bash\nprintf '26.5\\n'\n")
+    write_executable(fake_bin / "xcodegen", "#!/usr/bin/env bash\nexit 0\n")
+    write_executable(
+        fake_bin / "xcode-select",
+        "#!/usr/bin/env bash\nprintf 'called\\n' >> \"$STUB_XCODE_SELECT_LOG\"\nexit 99\n",
+    )
+    write_executable(
+        fake_bin / "git",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$3" == "rev-parse" ]]; then printf \'%040d\\n\' 0; fi\n',
+    )
+    write_executable(
+        fake_bin / "ditto",
+        "#!/usr/bin/env bash\n"
+        'last=""\nfor argument in "$@"; do last="$argument"; done\n: > "$last"\n',
+    )
+    write_executable(
+        fake_bin / "shasum",
+        "#!/usr/bin/env bash\nprintf '%064d  candidate\\n' 0\n",
+    )
+    write_executable(
+        fake_bin / "python3",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "-" ]]; then\n'
+        '  printf \'%s\\n\' "$@" > "$STUB_RECORD_ARGS"\n'
+        "fi\n",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ARCHIVE_SCRIPT_PATH),
+            "--version",
+            "1.2.3",
+            "--build",
+            "42",
+            "--output",
+            str(output),
+            "--signing-config",
+            str(signing_config),
+        ],
+        cwd=ARCHIVE_SCRIPT_PATH.parents[2],
+        env=os.environ
+        | {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEVELOPER_DIR": str(effective_developer_dir),
+            "STUB_XCODEBUILD_LOG": str(xcodebuild_log),
+            "STUB_XCODE_SELECT_LOG": str(xcode_select_log),
+            "STUB_RECORD_ARGS": str(record_args),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert xcodebuild_log.read_text(encoding="utf-8").splitlines() == [
+        str(effective_developer_dir)
+    ]
+    assert not xcode_select_log.exists()
+    assert str(effective_developer_dir) in record_args.read_text(encoding="utf-8")
 
 
 def test_distribution_docs_describe_signed_artifact_validation() -> None:
@@ -415,3 +644,6 @@ def test_distribution_docs_describe_signed_artifact_validation() -> None:
     assert "signed entitlements" in documentation
     assert "get-task-allow" in documentation
     assert "ios-distribution" in documentation
+    assert "--signing-config" in documentation
+    assert "sanitized metadata" in documentation
+    assert "not uploaded" in documentation

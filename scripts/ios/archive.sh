@@ -2,16 +2,16 @@
 # Archive and validate a candidate without selecting a signing identity.
 set -euo pipefail
 
-readonly ARTIFACT_ROOT="${DROVER_IOS_ARTIFACT_ROOT:-/Volumes/M2 1}"
 readonly REQUIRED_IOS_SDK="26.0"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/ios/archive.sh --version VERSION --build BUILD --output DIRECTORY
+Usage: scripts/ios/archive.sh --version VERSION --build BUILD --output DIRECTORY \
+  --signing-config PATH
 
 Creates DIRECTORY/Drover.xcarchive, an archive zip and an archive-record.json.
-DIRECTORY must not already exist and must be under the selected artifact root.
-The default artifact root is /Volumes/M2 1.
+DIRECTORY must not already exist. PATH is a private Xcode config with reviewed
+manual team, certificate, profile, and temporary-keychain references.
 USAGE
 }
 
@@ -42,9 +42,49 @@ version_at_least() {
   (( actual_patch >= required_patch ))
 }
 
+validate_signing_config() {
+  local line code_sign_style="" team_id="" identity_name="" profile_uuid="" keychain_path=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "CODE_SIGN_STYLE = Manual")
+        [[ -z "$code_sign_style" ]] || fail "signing configuration is invalid"
+        code_sign_style=Manual
+        ;;
+      "DEVELOPMENT_TEAM = "*)
+        [[ -z "$team_id" ]] || fail "signing configuration is invalid"
+        team_id="${line#DEVELOPMENT_TEAM = }"
+        [[ "$team_id" =~ ^[A-Z0-9]{10}$ ]] || fail "signing configuration is invalid"
+        ;;
+      "CODE_SIGN_IDENTITY = "*)
+        [[ -z "$identity_name" ]] || fail "signing configuration is invalid"
+        identity_name="${line#CODE_SIGN_IDENTITY = }"
+        [[ "$identity_name" == "Apple Distribution: "* && "$identity_name" != *$'\n'* \
+          && "$identity_name" != *$'\r'* ]] || fail "signing configuration is invalid"
+        ;;
+      "PROVISIONING_PROFILE_SPECIFIER = "*)
+        [[ -z "$profile_uuid" ]] || fail "signing configuration is invalid"
+        profile_uuid="${line#PROVISIONING_PROFILE_SPECIFIER = }"
+        [[ "$profile_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+          || fail "signing configuration is invalid"
+        ;;
+      "OTHER_CODE_SIGN_FLAGS = --keychain "*)
+        [[ -z "$keychain_path" ]] || fail "signing configuration is invalid"
+        keychain_path="${line#OTHER_CODE_SIGN_FLAGS = --keychain }"
+        [[ "$keychain_path" = /* && -f "$keychain_path" ]] \
+          || fail "signing configuration is invalid"
+        ;;
+      *) fail "signing configuration is invalid" ;;
+    esac
+  done < "$SIGNING_CONFIG"
+  [[ "$code_sign_style" = Manual && -n "$team_id" && "$identity_name" == *"($team_id)" \
+    && -n "$profile_uuid" && -n "$keychain_path" ]] \
+    || fail "signing configuration is incomplete"
+}
+
 VERSION=""
 BUILD=""
 OUTPUT=""
+SIGNING_CONFIG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,6 +101,11 @@ while [[ $# -gt 0 ]]; do
     --output)
       [[ $# -ge 2 ]] || fail "--output requires a value"
       OUTPUT="$2"
+      shift 2
+      ;;
+    --signing-config)
+      [[ $# -ge 2 ]] || fail "--signing-config requires a value"
+      SIGNING_CONFIG="$2"
       shift 2
       ;;
     -h|--help)
@@ -83,24 +128,33 @@ done
   || fail "build must be an expanded numeric build number"
 [[ "$OUTPUT" = /* ]] || fail "output must be an absolute path"
 [[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || fail "output directory already exists"
+[[ -n "$SIGNING_CONFIG" ]] || fail "--signing-config is required"
+[[ -f "$SIGNING_CONFIG" && ! -L "$SIGNING_CONFIG" ]] \
+  || fail "signing configuration is unavailable"
+validate_signing_config
 
 OUTPUT_PARENT="$(dirname "$OUTPUT")"
 [[ -d "$OUTPUT_PARENT" ]] || fail "output parent directory does not exist"
 OUTPUT_PARENT_REAL="$(cd "$OUTPUT_PARENT" && pwd -P)"
-case "$OUTPUT_PARENT_REAL" in
-  "$ARTIFACT_ROOT"|"$ARTIFACT_ROOT"/*) ;;
-  *) fail "output must be under $ARTIFACT_ROOT" ;;
-esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 APP_DIRECTORY="$REPOSITORY_ROOT/apps/drover"
 VERIFY_SCRIPT="$SCRIPT_DIR/verify_archive.py"
 
-for command in xcodebuild xcodegen xcrun xcode-select git ditto shasum python3; do
+for command in xcodebuild xcodegen xcrun git ditto shasum python3; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable"
 done
 [[ -f "$VERIFY_SCRIPT" ]] || fail "distribution verifier is unavailable"
+
+if [[ -n "${DEVELOPER_DIR:-}" ]]; then
+  [[ -d "$DEVELOPER_DIR" ]] || fail "selected Xcode developer directory is unavailable"
+  EFFECTIVE_DEVELOPER_DIR="$(cd "$DEVELOPER_DIR" && pwd -P)"
+else
+  command -v xcode-select >/dev/null 2>&1 || fail "xcode-select is unavailable"
+  EFFECTIVE_DEVELOPER_DIR="$(xcode-select -p)"
+fi
+export DEVELOPER_DIR="$EFFECTIVE_DEVELOPER_DIR"
 
 XCODE_VERSION="$(xcodebuild -version | awk '$1 == "Xcode" { print $2; exit }')"
 [[ "$XCODE_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] \
@@ -113,8 +167,6 @@ IPHONEOS_SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
   || fail "selected iPhoneOS SDK version could not be determined"
 version_at_least "$IPHONEOS_SDK" "$REQUIRED_IOS_SDK" \
   || fail "selected iPhoneOS SDK is below $REQUIRED_IOS_SDK"
-SELECTED_DEVELOPER_DIR="$(xcode-select -p)"
-
 COMMIT="$(git -C "$REPOSITORY_ROOT" rev-parse HEAD)"
 if [[ -z "$(git -C "$REPOSITORY_ROOT" status --porcelain --untracked-files=normal)" ]]; then
   CLEAN_TREE=true
@@ -137,6 +189,7 @@ if ! xcodebuild \
   -project "$APP_DIRECTORY/Drover.xcodeproj" \
   -scheme DroverAppStore \
   -configuration StoreRelease \
+  -xcconfig "$SIGNING_CONFIG" \
   -sdk iphoneos \
   -destination 'generic/platform=iOS' \
   -archivePath "$ARCHIVE_PATH" \
@@ -162,7 +215,7 @@ ARTIFACT_SHA256="$(shasum -a 256 "$ARCHIVE_ZIP" | awk '{ print $1 }')"
 [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "archive hash could not be determined"
 
 python3 - "$RECORD_PATH" "$COMMIT" "$CLEAN_TREE" "$XCODE_VERSION" \
-  "$SELECTED_DEVELOPER_DIR" "$IPHONEOS_SDK" "$VERSION" "$BUILD" "$ARCHIVE_PATH" \
+  "$EFFECTIVE_DEVELOPER_DIR" "$IPHONEOS_SDK" "$VERSION" "$BUILD" "$ARCHIVE_PATH" \
   "$ARCHIVE_ZIP" "$ARTIFACT_SHA256" <<'PY'
 import json
 import pathlib

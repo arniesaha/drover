@@ -152,24 +152,39 @@ def validate_distribution_metadata(
     )
 
 
-def _run_codesign(command: Sequence[str], run: Runner) -> str:
+def _run_codesign(
+    command: Sequence[str], run: Runner
+) -> subprocess.CompletedProcess[str]:
     try:
         completed = run(list(command), capture_output=True, text=True, check=False)
     except OSError as error:
         raise ArtifactVerificationError("codesign is unavailable") from error
     if completed.returncode != 0:
         raise ArtifactVerificationError("codesign could not verify the signed artifact")
-    return f"{completed.stdout}\n{completed.stderr}"
+    return completed
 
 
-def _load_codesign_entitlements(output: str) -> dict[str, Any]:
-    start = output.find("<?xml")
-    if start < 0:
-        start = output.find("<plist")
-    if start < 0:
+def _load_codesign_entitlements(stdout: str, stderr: str) -> dict[str, Any]:
+    """Parse only the stream selected by codesign's entitlements destination."""
+    if stdout.strip():
+        selected_stream = stdout
+    elif stderr.strip():
+        # Older codesign variants can emit entitlements on stderr. This fallback
+        # is used only when stdout is empty, never by concatenating diagnostics.
+        start = stderr.find("<?xml")
+        if start < 0:
+            start = stderr.find("<plist")
+        if start < 0:
+            raise ArtifactVerificationError("codesign returned no signed entitlements")
+        end = stderr.find("</plist>", start)
+        if end < 0:
+            selected_stream = stderr[start:]
+        else:
+            selected_stream = stderr[start : end + len("</plist>")]
+    else:
         raise ArtifactVerificationError("codesign returned no signed entitlements")
     try:
-        entitlements = plistlib.loads(output[start:].encode())
+        entitlements = plistlib.loads(selected_stream.encode())
     except (ExpatError, plistlib.InvalidFileException, ValueError) as error:
         raise ArtifactVerificationError(
             "codesign returned malformed signed entitlements"
@@ -188,15 +203,17 @@ def inspect_signing(app: Path, *, run: Runner = subprocess.run) -> SigningEviden
     details = _run_codesign(["codesign", "-dvv", app_text], run)
     authorities = tuple(
         line.partition("=")[2].strip()
-        for line in details.splitlines()
+        for line in f"{details.stdout}\n{details.stderr}".splitlines()
         if line.startswith("Authority=")
     )
-    entitlements_output = _run_codesign(
+    entitlements = _run_codesign(
         ["codesign", "-d", "--entitlements", ":-", app_text], run
     )
     return SigningEvidence(
         authorities=authorities,
-        entitlements=_load_codesign_entitlements(entitlements_output),
+        entitlements=_load_codesign_entitlements(
+            entitlements.stdout, entitlements.stderr
+        ),
     )
 
 

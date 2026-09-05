@@ -22,6 +22,9 @@ concurrency:
 jobs:
   archive:
     name: Archive signed iOS candidate
+    # workflow_dispatch can target any ref. Evaluate this before the protected
+    # environment is entered so an unreviewed branch never receives its inputs.
+    if: github.ref == 'refs/heads/main'
     # Configure this as a protected GitHub environment before dispatching.
     # It is the only place distribution credentials and profiles may be made
     # available; this workflow never runs on a pull request.
@@ -32,13 +35,13 @@ jobs:
       # Keep it explicit so an image-default change cannot alter the SDK used
       # for an App Store candidate without a reviewed workflow change.
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      DROVER_IOS_ARTIFACT_ROOT: ${{ runner.temp }}
       CANDIDATE_VERSION: ${{ github.event.inputs.version }}
       CANDIDATE_BUILD: ${{ github.event.inputs.build }}
 
     steps:
     - uses: actions/checkout@v4
       with:
+        ref: ${{ github.sha }}
         fetch-depth: 0
 
     - name: Report the selected Xcode and iPhoneOS SDK
@@ -47,7 +50,7 @@ jobs:
           echo "selected Xcode is not installed on this runner" >&2
           exit 1
         }
-        xcode-select -p
+        printf 'DEVELOPER_DIR %s\n' "$DEVELOPER_DIR"
         xcodebuild -version
         SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
         echo "iPhoneOS SDK $SDK"
@@ -59,36 +62,38 @@ jobs:
     - name: Install XcodeGen
       run: brew install xcodegen
 
-    - name: Check distribution signing prerequisites
+    - name: Set up deterministic distribution signing
+      id: signing
+      env:
+        DROVER_DISTRIBUTION_P12_BASE64: ${{ secrets.DROVER_DISTRIBUTION_P12_BASE64 }}
+        DROVER_DISTRIBUTION_P12_PASSWORD: ${{ secrets.DROVER_DISTRIBUTION_P12_PASSWORD }}
+        DROVER_DISTRIBUTION_PROFILE_BASE64: ${{ secrets.DROVER_DISTRIBUTION_PROFILE_BASE64 }}
+        DROVER_DISTRIBUTION_TEAM_ID: ${{ secrets.DROVER_DISTRIBUTION_TEAM_ID }}
+        DROVER_DISTRIBUTION_PROFILE_UUID: ${{ secrets.DROVER_DISTRIBUTION_PROFILE_UUID }}
+        DROVER_DISTRIBUTION_IDENTITY_SHA1: ${{ secrets.DROVER_DISTRIBUTION_IDENTITY_SHA1 }}
+        DROVER_DISTRIBUTION_IDENTITY_NAME: ${{ secrets.DROVER_DISTRIBUTION_IDENTITY_NAME }}
       run: |
-        # Only report whether a distribution identity exists. Do not print an
-        # identity, profile, keychain path, provisioning profile or secret.
-        if ! security find-identity -v -p codesigning 2>/dev/null \
-             | grep -q 'Apple Distribution'; then
-          echo "Apple Distribution signing identity is unavailable in ios-distribution" >&2
-          exit 1
-        fi
-        (cd apps/drover && xcodegen generate)
-        xcodebuild -project apps/drover/Drover.xcodeproj \
-          -scheme DroverAppStore -configuration StoreRelease -showBuildSettings \
-          | grep -q 'CODE_SIGN_ENTITLEMENTS.*Drover-AppStore.entitlements' \
-          || {
-            echo "StoreRelease does not select App Store entitlements" >&2
-            exit 1
-          }
+        scripts/ios/setup_distribution_signing.sh \
+          --workspace "$RUNNER_TEMP/drover-distribution-signing" \
+          --github-output "$GITHUB_OUTPUT"
 
     - name: Archive and verify the approved candidate
       run: |
         scripts/ios/archive.sh \
           --version "$CANDIDATE_VERSION" \
           --build "$CANDIDATE_BUILD" \
-          --output "$RUNNER_TEMP/drover-ios-$CANDIDATE_VERSION-$CANDIDATE_BUILD"
+          --output "$RUNNER_TEMP/drover-ios-$CANDIDATE_VERSION-$CANDIDATE_BUILD" \
+          --signing-config "${{ steps.signing.outputs.signing_config }}"
 
-    - name: Upload archive record and candidate package
+    - name: Upload sanitized candidate metadata
       uses: actions/upload-artifact@v4
       with:
-        name: drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}
-        path: |
-          ${{ runner.temp }}/drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}/archive-record.json
-          ${{ runner.temp }}/drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}/Drover.xcarchive.zip
+        name: drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}-metadata
+        path: ${{ runner.temp }}/drover-ios-${{ github.event.inputs.version }}-${{ github.event.inputs.build }}/archive-record.json
         if-no-files-found: error
+
+    - name: Remove temporary signing material
+      if: ${{ always() && steps.signing.outputs.state_file != '' }}
+      run: |
+        scripts/ios/cleanup_distribution_signing.sh \
+          --state "${{ steps.signing.outputs.state_file }}"
