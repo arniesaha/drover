@@ -180,6 +180,7 @@ struct ChatView: View {
                      harness: model.harnessPresentation.harness,
                      isSending: model.isSending,
                      canSend: model.canSendTurn,
+                     canAddAttachments: !model.isCommittingPendingDeliveryAction,
                      onAddAttachment: { attachment in
                          await model.addAttachmentIfRecoverable(attachment)
                      }) {

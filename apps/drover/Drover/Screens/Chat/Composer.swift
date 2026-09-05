@@ -12,6 +12,7 @@ struct Composer: View {
     let harness: String
     let isSending: Bool
     let canSend: Bool
+    let canAddAttachments: Bool
     let onAddAttachment: (TurnAttachment) async -> Bool
     let onSend: () -> Void
 
@@ -42,6 +43,8 @@ struct Composer: View {
             }
             .accessibilityLabel("Attach image")
             .accessibilityIdentifier("composer-attach")
+            .disabled(!canAddAttachments)
+            .opacity(canAddAttachments ? 1 : 0.45)
         } onSend: {
             onSend()
         }

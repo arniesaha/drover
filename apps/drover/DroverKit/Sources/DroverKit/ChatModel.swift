@@ -354,6 +354,10 @@ public final class ChatModel {
     private var recoveryStateRevision = 0
     private var isApplyingRecoveredState = false
     private var recoveryFailureOrigin: RecoveryFailureOrigin?
+    /// The exact manual-review delivery protected by an in-flight Copy or
+    /// Discard. An exact stream echo may confirm it before phase two commits.
+    private var pendingDeliveryActionClientTurnID: String?
+    private var acknowledgedPendingDeliveryActionClientTurnID: String?
 
     public convenience init(
         client: DroverClient,
@@ -723,16 +727,11 @@ public final class ChatModel {
     /// editable composition, which keeps the composer honest about what can
     /// survive a recreation.
     public func addAttachmentIfRecoverable(_ attachment: TurnAttachment) async -> Bool {
-        guard pendingAttachments.count < 4, recoveryStatusMessage == nil else { return false }
+        guard !isCommittingPendingDeliveryAction,
+              pendingAttachments.count < 4,
+              recoveryStatusMessage == nil
+        else { return false }
         let updatedAttachments = pendingAttachments + [attachment]
-        // A manual delivery action has already taken responsibility for its
-        // final snapshot. Keep the user's selected image in memory so that
-        // action can include it; its completion or its explicit save retry
-        // durably commits the complete current composition.
-        if isCommittingPendingDeliveryAction {
-            pendingAttachments = updatedAttachments
-            return true
-        }
         do {
             try await persistRecoveryState(
                 recoverySnapshot(
@@ -879,7 +878,7 @@ public final class ChatModel {
             return
         }
         let copiedTurn = pendingTurn
-        beginPendingDeliveryAction()
+        beginPendingDeliveryAction(for: copiedTurn.clientTurnID)
         isApplyingRecoveredState = true
         composerText = copiedTurn.text
         pendingAttachments = copiedTurn.attachments
@@ -896,7 +895,8 @@ public final class ChatModel {
         } catch {
             // The original A stayed in memory through the first save. Do not
             // roll back newer composition edits made while it was suspended.
-            if self.pendingTurn == nil {
+            if self.pendingTurn == nil,
+               acknowledgedPendingDeliveryActionClientTurnID != copiedTurn.clientTurnID {
                 self.pendingTurn = copiedTurn
             }
             if recoveryStateRevision == copiedCompositionRevision {
@@ -918,7 +918,7 @@ public final class ChatModel {
               let pendingTurn,
               pendingTurn.deliveryState == .needsManualReview
         else { return }
-        beginPendingDeliveryAction()
+        beginPendingDeliveryAction(for: pendingTurn.clientTurnID)
         do {
             // Save a recovery-safe A + latest-draft boundary before making
             // the destructive local removal visible.
@@ -928,7 +928,8 @@ public final class ChatModel {
             finishPendingDeliveryAction()
             hint = nil
         } catch {
-            if self.pendingTurn == nil {
+            if self.pendingTurn == nil,
+               acknowledgedPendingDeliveryActionClientTurnID != pendingTurn.clientTurnID {
                 self.pendingTurn = pendingTurn
             }
             finishPendingDeliveryAction()
@@ -945,6 +946,10 @@ public final class ChatModel {
               let pendingTurn,
               message.turnID == pendingTurn.clientTurnID
         else { return }
+        if isCommittingPendingDeliveryAction,
+           pendingDeliveryActionClientTurnID == pendingTurn.clientTurnID {
+            acknowledgedPendingDeliveryActionClientTurnID = pendingTurn.clientTurnID
+        }
         self.pendingTurn = nil
         cancelDeliveryConfirmationTimeout()
         hint = nil
@@ -1145,8 +1150,10 @@ public final class ChatModel {
         }
     }
 
-    private func beginPendingDeliveryAction() {
+    private func beginPendingDeliveryAction(for clientTurnID: String) {
         isCommittingPendingDeliveryAction = true
+        pendingDeliveryActionClientTurnID = clientTurnID
+        acknowledgedPendingDeliveryActionClientTurnID = nil
         recoveryCheckpointGeneration &+= 1
         recoveryCheckpointTask?.cancel()
         recoveryCheckpointTask = nil
@@ -1154,6 +1161,8 @@ public final class ChatModel {
 
     private func finishPendingDeliveryAction() {
         isCommittingPendingDeliveryAction = false
+        pendingDeliveryActionClientTurnID = nil
+        acknowledgedPendingDeliveryActionClientTurnID = nil
         recoveryCheckpointGeneration &+= 1
         recoveryCheckpointTask?.cancel()
         recoveryCheckpointTask = nil

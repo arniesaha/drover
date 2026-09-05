@@ -320,6 +320,161 @@ struct ChatRecoveryModelTests {
         #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
     }
 
+    @Test @MainActor func copyRefusesNewAttachmentAdmissionWhileItsFirstSaveIsBlocked() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xE1, 0xE2]))
+        let candidateImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xF1, 0xF2]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let copying = Task { @MainActor in
+            await model.copyPendingTurnToDraft()
+        }
+        await recovery.waitUntilSaveStarted()
+        let admitted = await model.addAttachmentIfRecoverable(candidateImage)
+
+        #expect(admitted == false)
+        #expect(model.pendingAttachments == [olderImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        await recovery.failSave()
+        await copying.value
+    }
+
+    @Test @MainActor func discardRefusesNewAttachmentAdmissionWhileItsFirstSaveIsBlocked() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let candidateImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xF3, 0xF4]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(clientTurnID: originalID, text: "older A")
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let discarding = Task { @MainActor in
+            await model.discardPendingTurn()
+        }
+        await recovery.waitUntilSaveStarted()
+        let admitted = await model.addAttachmentIfRecoverable(candidateImage)
+
+        #expect(admitted == false)
+        #expect(model.pendingAttachments.isEmpty)
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        await recovery.failSave()
+        await discarding.value
+    }
+
+    @Test @MainActor func exactAcknowledgmentDuringCopyNeverResurrectsItsManualDeliveryAfterPhaseTwoFailure() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = PhaseOneThenFailPhaseTwoRecoveryStore()
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xA3, 0xA4]))
+        let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xB3, 0xB4]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let copying = Task { @MainActor in
+            await model.copyPendingTurnToDraft()
+        }
+        await recovery.waitUntilPhaseOneStarted()
+        model.composerText = "newer B"
+        model.pendingAttachments = [newerImage]
+        model.ingest(.message(.fixture(seq: 9, type: .userInput, text: "older A", turnID: originalID.uuidString)))
+        #expect(model.pendingTurn == nil)
+        await recovery.releasePhaseOne()
+        await copying.value
+
+        #expect(model.pendingTurn == nil)
+        #expect(model.composerText == "newer B")
+        #expect(model.pendingAttachments == [newerImage])
+        await model.retryRecoverySave()
+        await model.prepareForDeparture()
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.pendingTurn == nil)
+        #expect(recreated.composerText == "newer B")
+        #expect(recreated.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
+    @Test @MainActor func exactAcknowledgmentDuringDiscardNeverResurrectsItsManualDeliveryAfterPhaseTwoFailure() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = PhaseOneThenFailPhaseTwoRecoveryStore()
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xC3, 0xC4]))
+        let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xD3, 0xD4]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let discarding = Task { @MainActor in
+            await model.discardPendingTurn()
+        }
+        await recovery.waitUntilPhaseOneStarted()
+        model.composerText = "newer B"
+        model.pendingAttachments = [newerImage]
+        model.ingest(.message(.fixture(seq: 9, type: .userInput, text: "older A", turnID: originalID.uuidString)))
+        #expect(model.pendingTurn == nil)
+        await recovery.releasePhaseOne()
+        await discarding.value
+
+        #expect(model.pendingTurn == nil)
+        #expect(model.composerText == "newer B")
+        #expect(model.pendingAttachments == [newerImage])
+        await model.retryRecoverySave()
+        await model.prepareForDeparture()
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.pendingTurn == nil)
+        #expect(recreated.composerText == "newer B")
+        #expect(recreated.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
     @Test @MainActor func failedRecoveryReadCannotRetrySavingOrReplaceTheUnreadRecord() async throws {
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let original = ChatRecoverySnapshot(draftText: "unread saved draft")
@@ -1169,6 +1324,70 @@ private actor SavedThenFailThenBlockRetryRecoveryStore: ChatRecoveryPersisting {
         let continuation = retrySaveRelease
         retrySaveRelease = nil
         continuation?.resume()
+    }
+}
+
+private actor PhaseOneThenFailPhaseTwoRecoveryStore: ChatRecoveryPersisting {
+    private var saveCount = 0
+    private var phaseOneStarted = false
+    private var phaseOneWaiters: [CheckedContinuation<Void, Never>] = []
+    private var phaseOneRelease: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
+    private var snapshots: [ChatRecoveryKey: ChatRecoverySnapshot] = [:]
+
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? {
+        snapshots[key]
+    }
+
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
+        saveCount += 1
+        switch saveCount {
+        case 1:
+            snapshots[key] = snapshot
+        case 2:
+            phaseOneStarted = true
+            let waiters = phaseOneWaiters
+            phaseOneWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { continuation in
+                if releaseRequested {
+                    releaseRequested = false
+                    continuation.resume()
+                } else {
+                    phaseOneRelease = continuation
+                }
+            }
+            snapshots[key] = snapshot
+        case 3:
+            snapshots[key] = snapshot
+        case 4:
+            throw ChatRecoveryError.storageUnavailable
+        default:
+            snapshots[key] = snapshot
+        }
+    }
+
+    func remove(for key: ChatRecoveryKey) async throws {
+        snapshots.removeValue(forKey: key)
+    }
+    func purge(bindingID: UUID) async throws {}
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {}
+    func eraseAllAfterCredentialDeletion() async throws {}
+
+    func waitUntilPhaseOneStarted() async {
+        guard !phaseOneStarted else { return }
+        await withCheckedContinuation { continuation in
+            phaseOneWaiters.append(continuation)
+        }
+    }
+
+    func releasePhaseOne() {
+        if let phaseOneRelease {
+            self.phaseOneRelease = nil
+            phaseOneRelease.resume()
+        } else {
+            releaseRequested = true
+        }
     }
 }
 
