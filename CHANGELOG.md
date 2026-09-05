@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-09-05
+
+### Fixed
+
+- The session-usage rollup no longer holds the control-plane lock while it
+  parses events, so `/harness` stays answerable while a busy session is
+  rolled up. Passes of 47 s, 141 s and 238 s were measured on the hub, each
+  one a window in which the phone's session list could not load and its
+  retries queued behind the same lock. The pass is now three short windows
+  per session with the parsing outside them (#334).
+
 ## [0.4.6] - 2026-09-04
 
 ### Fixed
