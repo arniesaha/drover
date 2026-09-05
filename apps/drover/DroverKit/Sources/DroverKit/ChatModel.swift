@@ -50,7 +50,7 @@ public struct ChatPendingTurn: Sendable, Equatable {
     }
 
     public var manualReviewMessage: String {
-        "Delivery could not be confirmed. Check delivery, copy it to a draft, or discard it locally."
+        "This delivery is held for review. Check delivery, copy it to a draft, or discard it locally."
     }
 }
 
@@ -131,6 +131,12 @@ public final class ChatRecoveryWriteGate {
 @MainActor
 @Observable
 public final class ChatModel {
+    private enum RecoveryFailureOrigin {
+        case save
+        case load
+        case unavailable
+    }
+
     private let client: DroverClient
     private let sessionID: String
     private let stream: MessageStream
@@ -169,6 +175,12 @@ public final class ChatModel {
     /// locally. The composer remains editable, but sending is disabled until
     /// protected storage is usable again.
     public private(set) var recoveryStatusMessage: String?
+    /// A save retry is available only for a failed write or removal from an
+    /// inspected in-memory composition. A failed read must never be turned
+    /// into a blank save or removal of a record the model could not inspect.
+    public var canRetryRecoverySave: Bool {
+        recoveryFailureOrigin == .save && canPersistRecovery
+    }
     public private(set) var harnessPresentation: HarnessPresentation
     /// The server-generated recap when available, otherwise the session's
     /// stable preview. It is intentionally independent of the message stream:
@@ -264,11 +276,17 @@ public final class ChatModel {
         return found
     }
     public var composerText = "" {
-        didSet { scheduleRecoveryCheckpoint() }
+        didSet {
+            parkDeferredTurnForManualReviewIfDraftIsPresent()
+            scheduleRecoveryCheckpoint()
+        }
     }
     /// Images picked in the composer, waiting to ride the next turn.
     public var pendingAttachments: [TurnAttachment] = [] {
-        didSet { scheduleRecoveryCheckpoint() }
+        didSet {
+            parkDeferredTurnForManualReviewIfDraftIsPresent()
+            scheduleRecoveryCheckpoint()
+        }
     }
     /// Whether a new composer submission is allowed. A typed next message is
     /// preserved while the previous one confirms, but must not leapfrog or
@@ -284,6 +302,10 @@ public final class ChatModel {
     public private(set) var queuedTurn: String?
     /// Attachments that were on a turn deferred by the same 409.
     private var queuedAttachments: [TurnAttachment] = []
+    /// The client-generated ID from the rejected request. Deferred-only
+    /// recovery does not persist it, but it lets a later editable composition
+    /// hold this exact delivery for review instead of replacing either turn.
+    private var queuedClientTurnID: String?
     /// request_id -> the prompt still awaiting an answer. Tiny in practice:
     /// a harness blocks on one approval at a time.
     @ObservationIgnored private var openApprovals: [String: HarnessMessage] = [:]
@@ -309,6 +331,7 @@ public final class ChatModel {
     private nonisolated(unsafe) var recoveryCheckpointTask: Task<Void, Never>?
     private var recoveryCheckpointGeneration = 0
     private var isApplyingRecoveredState = false
+    private var recoveryFailureOrigin: RecoveryFailureOrigin?
 
     public convenience init(
         client: DroverClient,
@@ -388,6 +411,7 @@ public final class ChatModel {
         self.stream = factory(client, sessionID)
         if !canPersistRecovery {
             recoveryStatusMessage = "Chat recovery is unavailable. Check local storage in Settings."
+            recoveryFailureOrigin = .unavailable
         }
         rebuildApprovals()
     }
@@ -650,10 +674,17 @@ public final class ChatModel {
         do {
             try await persistRecoveryState()
         } catch {
-            pendingTurn = nil
-            composerText = text
-            pendingAttachments = images
-            recordRecoveryFailure()
+            if hasEditableComposition {
+                holdForManualReview(
+                    turn,
+                    message: "Saving the earlier delivery failed. It is held for review; this draft is preserved."
+                )
+            } else {
+                pendingTurn = nil
+                composerText = text
+                pendingAttachments = images
+            }
+            recordRecoveryFailure(.save)
             return
         }
         // A sign out or replacement can retire this credential while its
@@ -674,13 +705,16 @@ public final class ChatModel {
         let updatedAttachments = pendingAttachments + [attachment]
         do {
             try await persistRecoveryState(
-                recoverySnapshot(draftAttachments: updatedAttachments)
+                recoverySnapshot(
+                    draftAttachments: updatedAttachments,
+                    parkingDeferredTurnForManualReview: true
+                )
             )
             guard canPersistRecovery else { return false }
             pendingAttachments = updatedAttachments
             return true
         } catch {
-            recordRecoveryFailure()
+            recordRecoveryFailure(.save)
             return false
         }
     }
@@ -696,7 +730,7 @@ public final class ChatModel {
         do {
             try await persistRecoveryState()
         } catch {
-            recordRecoveryFailure()
+            recordRecoveryFailure(.save)
         }
     }
 
@@ -705,6 +739,30 @@ public final class ChatModel {
     public func prepareForDeparture() async {
         stop()
         await flushRecoveryCheckpoint()
+    }
+
+    /// Retries only a failed write for the current inspected composition. It
+    /// never calls a turn submission path, and it leaves unavailable or
+    /// unread recovery records alone.
+    public func retryRecoverySave() async {
+        guard canRetryRecoverySave else { return }
+        do {
+            try await persistRecoveryState()
+            guard canPersistRecovery else {
+                throw ChatRecoveryError.storageUnavailable
+            }
+            recoveryFailureOrigin = nil
+            recoveryStatusMessage = nil
+            if pendingTurn?.deliveryState != .needsManualReview {
+                hint = nil
+            }
+            // An edit made while this retry was suspended could not schedule
+            // its usual checkpoint while the save error was latched. Take a
+            // fresh snapshot after clearing that latch so it is not stranded.
+            scheduleRecoveryCheckpoint()
+        } catch {
+            recordRecoveryFailure(.save)
+        }
     }
 
     /// Replays the same client turn ID after a transport-level ambiguity.
@@ -721,7 +779,7 @@ public final class ChatModel {
         } catch {
             pendingTurn.deliveryState = .awaitingConfirmation
             self.pendingTurn = pendingTurn
-            recordRecoveryFailure()
+            recordRecoveryFailure(.save)
             return
         }
         guard canPersistRecovery,
@@ -758,7 +816,7 @@ public final class ChatModel {
                 )
             }
         } catch {
-            recordRecoveryFailure()
+            recordRecoveryFailure(.load)
         }
     }
 
@@ -801,7 +859,7 @@ public final class ChatModel {
             pendingAttachments = []
             self.pendingTurn = copiedTurn
             isApplyingRecoveredState = false
-            recordRecoveryFailure()
+            recordRecoveryFailure(.save)
         }
     }
 
@@ -817,7 +875,7 @@ public final class ChatModel {
             hint = nil
         } catch {
             self.pendingTurn = pendingTurn
-            recordRecoveryFailure()
+            recordRecoveryFailure(.save)
         }
     }
 
@@ -889,13 +947,20 @@ public final class ChatModel {
             }
         } catch DroverError.conflict(let message) where message == "turn already in flight" {
             guard pendingTurn?.clientTurnID == turn.clientTurnID else { return }
-            pendingTurn = nil
             cancelDeliveryConfirmationTimeout()
-            queue(turn)
+            if hasEditableComposition {
+                holdForManualReview(
+                    turn,
+                    message: "The server was busy. The earlier delivery is held for review; this draft is preserved."
+                )
+            } else {
+                pendingTurn = nil
+                queue(turn)
+            }
             do {
                 try await persistRecoveryState()
             } catch {
-                recordRecoveryFailure()
+                recordRecoveryFailure(.save)
             }
         } catch {
             guard pendingTurn?.clientTurnID == turn.clientTurnID else { return }
@@ -913,12 +978,60 @@ public final class ChatModel {
     }
 
     private func queue(_ turn: ChatPendingTurn) {
+        if queuedTurn == nil, queuedAttachments.isEmpty {
+            queuedClientTurnID = turn.clientTurnID
+        }
         if !turn.text.isEmpty {
             queuedTurn = queuedTurn.map { "\($0)\n\(turn.text)" } ?? turn.text
         }
         queuedAttachments.append(contentsOf: turn.attachments)
         hint = "Queued — sends when the current response finishes."
         scheduleRecoveryCheckpoint()
+    }
+
+    /// A 409 means this delivery was not accepted while the harness was busy.
+    /// If the user is already composing a distinct next turn, preserve both
+    /// bounded compositions: the existing pending/manual-review slot keeps the
+    /// original ID and the composer remains the newer draft. Neither is merged
+    /// or sent automatically.
+    private func holdForManualReview(_ turn: ChatPendingTurn, message: String) {
+        var heldTurn = turn
+        heldTurn.deliveryState = .needsManualReview
+        pendingTurn = heldTurn
+        queuedTurn = nil
+        queuedAttachments = []
+        queuedClientTurnID = nil
+        hint = message
+    }
+
+    /// An earlier 409 may have already entered the deferred queue before the
+    /// user begins a new draft. Move that older composition into manual review
+    /// before the next checkpoint so the snapshot can retain both records.
+    private func parkDeferredTurnForManualReviewIfDraftIsPresent() {
+        guard !isApplyingRecoveredState,
+              hasEditableComposition,
+              let turn = deferredTurnForManualReview()
+        else { return }
+        holdForManualReview(
+            turn,
+            message: "The server was busy. The earlier delivery is held for review; this draft is preserved."
+        )
+    }
+
+    private func deferredTurnForManualReview() -> ChatPendingTurn? {
+        guard let clientTurnID = queuedClientTurnID,
+              queuedTurn != nil || !queuedAttachments.isEmpty
+        else { return nil }
+        return ChatPendingTurn(
+            text: queuedTurn ?? "",
+            attachments: queuedAttachments,
+            clientTurnID: clientTurnID,
+            deliveryState: .needsManualReview
+        )
+    }
+
+    private var hasEditableComposition: Bool {
+        !composerText.isEmpty || !pendingAttachments.isEmpty
     }
 
     private func restoreRejectedTurn(_ turn: ChatPendingTurn) {
@@ -962,18 +1075,25 @@ public final class ChatModel {
 
     private func recoverySnapshot(
         draftText: String? = nil,
-        draftAttachments: [TurnAttachment]? = nil
+        draftAttachments: [TurnAttachment]? = nil,
+        parkingDeferredTurnForManualReview: Bool = false
     ) -> ChatRecoverySnapshot {
-        let deferredTurn = queuedTurn.map {
-            RecoveredDeferredTurn(text: $0, attachments: queuedAttachments.map(recoveredAttachment))
-        }
         let draftText = draftText ?? composerText
         let draftAttachments = draftAttachments ?? pendingAttachments
+        let parkedTurn = parkingDeferredTurnForManualReview
+            ? deferredTurnForManualReview()
+            : nil
+        let deferredTurn = parkedTurn == nil && (queuedTurn != nil || !queuedAttachments.isEmpty)
+            ? RecoveredDeferredTurn(
+                text: queuedTurn ?? "",
+                attachments: queuedAttachments.map(recoveredAttachment)
+            )
+            : nil
         return ChatRecoverySnapshot(
             draftText: deferredTurn == nil ? draftText : "",
             draftAttachments: deferredTurn == nil ? draftAttachments.map(recoveredAttachment) : [],
             deferredTurn: deferredTurn,
-            pendingTurn: pendingTurn.flatMap(recoveredPendingTurn)
+            pendingTurn: (parkedTurn ?? pendingTurn).flatMap(recoveredPendingTurn)
         )
     }
 
@@ -1016,7 +1136,7 @@ public final class ChatModel {
                       self.recoveryCheckpointGeneration == generation
                 else { return }
                 self.recoveryCheckpointTask = nil
-                self.recordRecoveryFailure()
+                self.recordRecoveryFailure(.save)
             }
         }
     }
@@ -1042,9 +1162,21 @@ public final class ChatModel {
         }
     }
 
-    private func recordRecoveryFailure() {
-        recoveryStatusMessage = "Chat recovery could not protect this draft. Check local storage in Settings."
-        hint = recoveryStatusMessage
+    private func recordRecoveryFailure(_ origin: RecoveryFailureOrigin) {
+        let message: String
+        switch origin {
+        case .save:
+            message = "Chat recovery could not protect this draft. Check local storage in Settings."
+        case .load:
+            message = "Chat recovery could not be read. Existing saved drafts were left unchanged."
+        case .unavailable:
+            message = "Chat recovery is unavailable. Check local storage in Settings."
+        }
+        recoveryFailureOrigin = origin
+        recoveryStatusMessage = message
+        if pendingTurn?.deliveryState != .needsManualReview {
+            hint = message
+        }
     }
 
     private var canPersistRecovery: Bool {
@@ -1081,6 +1213,7 @@ public final class ChatModel {
         let images = queuedAttachments
         queuedTurn = nil
         queuedAttachments = []
+        queuedClientTurnID = nil
         Task { await sendQueued(text, images: images) }
     }
 
@@ -1160,10 +1293,18 @@ public final class ChatModel {
         do {
             try await persistRecoveryState()
         } catch {
-            pendingTurn = nil
-            queuedTurn = queuedTurn.map { "\(text)\n\($0)" } ?? text
-            queuedAttachments = images + queuedAttachments
-            recordRecoveryFailure()
+            if hasEditableComposition {
+                holdForManualReview(
+                    turn,
+                    message: "Saving the earlier delivery failed. It is held for review; this draft is preserved."
+                )
+            } else {
+                pendingTurn = nil
+                queuedTurn = text
+                queuedAttachments = images
+                queuedClientTurnID = turn.clientTurnID
+            }
+            recordRecoveryFailure(.save)
             return
         }
         guard canPersistRecovery,

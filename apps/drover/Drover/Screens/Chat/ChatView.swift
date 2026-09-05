@@ -158,13 +158,17 @@ struct ChatView: View {
             // Deliberately not gated on `hint`: approve, interrupt, terminate
             // and an unauthorized stream event all clear it, and an
             // unconfirmed delivery must keep its Retry through any of them.
-            if let pendingTurn = model.pendingTurn, pendingTurn.canRetry {
+            if let pendingTurn = model.pendingTurn,
+                      pendingTurn.canRetry,
+                      model.recoveryStatusMessage == nil {
                 ChatHintBanner(model.hint ?? pendingTurn.retryMessage, actionTitle: "Retry") {
                     Task { await model.retryPendingTurn() }
                 }
             } else if let pendingTurn = model.pendingTurn,
                       pendingTurn.deliveryState == .needsManualReview {
                 pendingDeliveryReview(pendingTurn)
+            } else if let recoveryStatusMessage = model.recoveryStatusMessage {
+                recoveryStatusBanner(recoveryStatusMessage)
             } else if let hint = model.hint {
                 ChatHintBanner(hint)
             }
@@ -250,7 +254,13 @@ struct ChatView: View {
 
     private func pendingDeliveryReview(_ pendingTurn: ChatPendingTurn) -> some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let hint = model.hint {
+                ChatHintBanner(hint)
+            }
             ChatHintBanner(pendingTurn.manualReviewMessage)
+            if let recoveryStatusMessage = model.recoveryStatusMessage {
+                recoveryStatusBanner(recoveryStatusMessage)
+            }
             HStack(spacing: 12) {
                 Button("Check delivery") {
                     model.checkPendingDelivery()
@@ -269,6 +279,17 @@ struct ChatView: View {
             }
             .font(.caption.weight(.semibold))
             .padding(.horizontal, 16)
+        }
+    }
+
+    @ViewBuilder
+    private func recoveryStatusBanner(_ message: String) -> some View {
+        if model.canRetryRecoverySave {
+            ChatHintBanner(message, actionTitle: "Retry saving") {
+                Task { await model.retryRecoverySave() }
+            }
+        } else {
+            ChatHintBanner(message)
         }
     }
 
