@@ -285,6 +285,8 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .accessibilityIdentifier(identifier)
+        .accessibilityLabel(label)
+        .accessibilityHint("Opens the Drover \(label.lowercased()) page.")
     }
 
     /// Quieter than "Test & Save": this is a recovery action, not the primary
