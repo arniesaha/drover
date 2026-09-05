@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-09-05
+
+### Changed
+
+- JSON responses are compressed when the client offers it, not only session
+  message pages. Measured on the hub: the fleet listing drops from 41.5 KB
+  to 7.9 KB, the host list from 6.2 KB to 1.1 KB, the cockpit overview from
+  18.6 KB to 2.6 KB, and insights from 23.5 KB to 2.9 KB. The phone polls
+  all four, and re-fetches them after every abandoned request, so the saving
+  compounds exactly when the server is under pressure (#224).
+
+### Added
+
+- iOS builds carry the signing team and an encryption-exemption
+  declaration, so a device build works from a clean checkout and an App
+  Store Connect upload does not stall on an unanswered question (#351).
+- The Settings screen links to the privacy policy and support pages (#347).
+- CI runs the deterministic UI journey and the DroverKit package tests
+  rather than only building them (#348).
+
 ## [0.4.7] - 2026-09-05
 
 ### Fixed
