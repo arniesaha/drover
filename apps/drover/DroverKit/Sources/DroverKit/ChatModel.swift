@@ -170,11 +170,18 @@ public final class ChatModel {
     /// A turn that has been removed from the composer and is waiting for its
     /// exact `user_input` stream echo. It is the model-level send gate: while
     /// present, normal sends cannot create an accidental duplicate.
-    public private(set) var pendingTurn: ChatPendingTurn?
+    public private(set) var pendingTurn: ChatPendingTurn? {
+        didSet { recoveryStateRevision &+= 1 }
+    }
     /// A storage failure means a new unresolved turn cannot be protected
     /// locally. The composer remains editable, but sending is disabled until
     /// protected storage is usable again.
     public private(set) var recoveryStatusMessage: String?
+    /// A Copy to draft or Discard locally action keeps its original manual
+    /// delivery protected until its replacement snapshot has committed. New
+    /// draft edits remain possible, but no send or second delivery action can
+    /// interleave with that commit.
+    public private(set) var isCommittingPendingDeliveryAction = false
     /// A save retry is available only for a failed write or removal from an
     /// inspected in-memory composition. A failed read must never be turned
     /// into a blank save or removal of a record the model could not inspect.
@@ -277,6 +284,7 @@ public final class ChatModel {
     }
     public var composerText = "" {
         didSet {
+            recoveryStateRevision &+= 1
             parkDeferredTurnForManualReviewIfDraftIsPresent()
             scheduleRecoveryCheckpoint()
         }
@@ -284,6 +292,7 @@ public final class ChatModel {
     /// Images picked in the composer, waiting to ride the next turn.
     public var pendingAttachments: [TurnAttachment] = [] {
         didSet {
+            recoveryStateRevision &+= 1
             parkDeferredTurnForManualReviewIfDraftIsPresent()
             scheduleRecoveryCheckpoint()
         }
@@ -292,20 +301,30 @@ public final class ChatModel {
     /// preserved while the previous one confirms, but must not leapfrog or
     /// duplicate that delivery.
     public var canSendTurn: Bool {
-        !isSending && pendingTurn == nil && recoveryStatusMessage == nil && canPersistRecovery
+        !isSending
+            && !isCommittingPendingDeliveryAction
+            && pendingTurn == nil
+            && recoveryStatusMessage == nil
+            && canPersistRecovery
     }
     /// Text the user sent while the harness was mid-turn (codex/gemini
     /// reject overlapping turns with 409 "turn already in flight"). Held
     /// here and auto-dispatched when the turn-complete status arrives.
     /// Claude never 409s on overlap (mid-turn input is steering), so this
     /// only ever fills for harnesses that actually reject.
-    public private(set) var queuedTurn: String?
+    public private(set) var queuedTurn: String? {
+        didSet { recoveryStateRevision &+= 1 }
+    }
     /// Attachments that were on a turn deferred by the same 409.
-    private var queuedAttachments: [TurnAttachment] = []
+    private var queuedAttachments: [TurnAttachment] = [] {
+        didSet { recoveryStateRevision &+= 1 }
+    }
     /// The client-generated ID from the rejected request. Deferred-only
     /// recovery does not persist it, but it lets a later editable composition
     /// hold this exact delivery for review instead of replacing either turn.
-    private var queuedClientTurnID: String?
+    private var queuedClientTurnID: String? {
+        didSet { recoveryStateRevision &+= 1 }
+    }
     /// request_id -> the prompt still awaiting an answer. Tiny in practice:
     /// a harness blocks on one approval at a time.
     @ObservationIgnored private var openApprovals: [String: HarnessMessage] = [:]
@@ -330,6 +349,9 @@ public final class ChatModel {
     private nonisolated(unsafe) var deliveryTimeoutTask: Task<Void, Never>?
     private nonisolated(unsafe) var recoveryCheckpointTask: Task<Void, Never>?
     private var recoveryCheckpointGeneration = 0
+    /// Mutations that occur while a direct recovery write is suspended must
+    /// be captured by that write before its owning task releases the model.
+    private var recoveryStateRevision = 0
     private var isApplyingRecoveredState = false
     private var recoveryFailureOrigin: RecoveryFailureOrigin?
 
@@ -703,6 +725,14 @@ public final class ChatModel {
     public func addAttachmentIfRecoverable(_ attachment: TurnAttachment) async -> Bool {
         guard pendingAttachments.count < 4, recoveryStatusMessage == nil else { return false }
         let updatedAttachments = pendingAttachments + [attachment]
+        // A manual delivery action has already taken responsibility for its
+        // final snapshot. Keep the user's selected image in memory so that
+        // action can include it; its completion or its explicit save retry
+        // durably commits the complete current composition.
+        if isCommittingPendingDeliveryAction {
+            pendingAttachments = updatedAttachments
+            return true
+        }
         do {
             try await persistRecoveryState(
                 recoverySnapshot(
@@ -724,6 +754,7 @@ public final class ChatModel {
     /// not cancel their final checkpoint before it reaches protected storage.
     public func flushRecoveryCheckpoint() async {
         guard !isApplyingRecoveredState,
+              !isCommittingPendingDeliveryAction,
               recoveryStatusMessage == nil,
               canPersistRecovery
         else { return }
@@ -745,21 +776,17 @@ public final class ChatModel {
     /// never calls a turn submission path, and it leaves unavailable or
     /// unread recovery records alone.
     public func retryRecoverySave() async {
-        guard canRetryRecoverySave else { return }
+        guard canRetryRecoverySave, !isCommittingPendingDeliveryAction else { return }
         do {
-            try await persistRecoveryState()
-            guard canPersistRecovery else {
-                throw ChatRecoveryError.storageUnavailable
-            }
+            // Retain `self` through a stable, current write. A departing view
+            // can release every other owner while this retry is in flight, so
+            // a later weak debounced checkpoint is not sufficient here.
+            try await persistCurrentRecoveryStateUntilStable()
             recoveryFailureOrigin = nil
             recoveryStatusMessage = nil
             if pendingTurn?.deliveryState != .needsManualReview {
                 hint = nil
             }
-            // An edit made while this retry was suspended could not schedule
-            // its usual checkpoint while the save error was latched. Take a
-            // fresh snapshot after clearing that latch so it is not stranded.
-            scheduleRecoveryCheckpoint()
         } catch {
             recordRecoveryFailure(.save)
         }
@@ -769,7 +796,11 @@ public final class ChatModel {
     /// The hub returns the original accepted turn without dispatching it
     /// again, so recovery is safe even if the first response was lost.
     public func retryPendingTurn() async {
-        guard var pendingTurn, pendingTurn.canRetry, !isSending else { return }
+        guard !isCommittingPendingDeliveryAction,
+              var pendingTurn,
+              pendingTurn.canRetry,
+              !isSending
+        else { return }
         pendingTurn.deliveryState = .sending
         self.pendingTurn = pendingTurn
         cancelDeliveryConfirmationTimeout()
@@ -824,7 +855,9 @@ public final class ChatModel {
     /// `sendTurn` or `retryPendingTurn`, because a restored ID has no durable
     /// server receipt proving a replay remains safe.
     public func checkPendingDelivery() {
-        guard pendingTurn?.deliveryState == .needsManualReview else { return }
+        guard !isCommittingPendingDeliveryAction,
+              pendingTurn?.deliveryState == .needsManualReview
+        else { return }
         // ChatView already starts its normal catch-up after restoration. An
         // explicit check must therefore replace an active pump rather than
         // relying on `start()`'s intentional idempotence. This touches only
@@ -837,7 +870,8 @@ public final class ChatModel {
     /// never submits the saved ID, and refuses to replace words the user is
     /// already editing without an explicit choice outside this action.
     public func copyPendingTurnToDraft() async {
-        guard let pendingTurn,
+        guard !isCommittingPendingDeliveryAction,
+              let pendingTurn,
               pendingTurn.deliveryState == .needsManualReview
         else { return }
         guard composerText.isEmpty, pendingAttachments.isEmpty else {
@@ -845,20 +879,34 @@ public final class ChatModel {
             return
         }
         let copiedTurn = pendingTurn
+        beginPendingDeliveryAction()
         isApplyingRecoveredState = true
         composerText = copiedTurn.text
         pendingAttachments = copiedTurn.attachments
-        self.pendingTurn = nil
         isApplyingRecoveredState = false
+        let copiedCompositionRevision = recoveryStateRevision
         do {
-            try await persistRecoveryState()
+            // First checkpoint every current edit while A remains protected.
+            // Only then remove A and commit Copy's requested final state.
+            try await persistCurrentRecoveryStateUntilStable()
+            self.pendingTurn = nil
+            try await persistCurrentRecoveryStateUntilStable()
+            finishPendingDeliveryAction()
             hint = "Copied to draft. Review it before sending."
         } catch {
-            isApplyingRecoveredState = true
-            composerText = ""
-            pendingAttachments = []
-            self.pendingTurn = copiedTurn
-            isApplyingRecoveredState = false
+            // The original A stayed in memory through the first save. Do not
+            // roll back newer composition edits made while it was suspended.
+            if self.pendingTurn == nil {
+                self.pendingTurn = copiedTurn
+            }
+            if recoveryStateRevision == copiedCompositionRevision {
+                isApplyingRecoveredState = true
+                composerText = ""
+                pendingAttachments = []
+                isApplyingRecoveredState = false
+            }
+            finishPendingDeliveryAction()
+            hint = "Saving this delivery update failed. It is held for review; this draft is preserved."
             recordRecoveryFailure(.save)
         }
     }
@@ -866,15 +914,25 @@ public final class ChatModel {
     /// Removes only the local unresolved-delivery record. The caller is
     /// responsible for the destructive UI confirmation.
     public func discardPendingTurn() async {
-        guard let pendingTurn,
+        guard !isCommittingPendingDeliveryAction,
+              let pendingTurn,
               pendingTurn.deliveryState == .needsManualReview
         else { return }
-        self.pendingTurn = nil
+        beginPendingDeliveryAction()
         do {
-            try await persistRecoveryState()
+            // Save a recovery-safe A + latest-draft boundary before making
+            // the destructive local removal visible.
+            try await persistCurrentRecoveryStateUntilStable()
+            self.pendingTurn = nil
+            try await persistCurrentRecoveryStateUntilStable()
+            finishPendingDeliveryAction()
             hint = nil
         } catch {
-            self.pendingTurn = pendingTurn
+            if self.pendingTurn == nil {
+                self.pendingTurn = pendingTurn
+            }
+            finishPendingDeliveryAction()
+            hint = "Saving this delivery update failed. It is held for review; this draft is preserved."
             recordRecoveryFailure(.save)
         }
     }
@@ -1073,6 +1131,34 @@ public final class ChatModel {
         )
     }
 
+    /// Persists a fresh snapshot until no composer or attachment mutation
+    /// raced its awaited store call. Direct actions use this instead of a
+    /// weak, delayed checkpoint because they may be the model's final owner.
+    private func persistCurrentRecoveryStateUntilStable() async throws {
+        while true {
+            let revision = recoveryStateRevision
+            try await persistRecoveryState()
+            guard canPersistRecovery else {
+                throw ChatRecoveryError.storageUnavailable
+            }
+            guard revision != recoveryStateRevision else { return }
+        }
+    }
+
+    private func beginPendingDeliveryAction() {
+        isCommittingPendingDeliveryAction = true
+        recoveryCheckpointGeneration &+= 1
+        recoveryCheckpointTask?.cancel()
+        recoveryCheckpointTask = nil
+    }
+
+    private func finishPendingDeliveryAction() {
+        isCommittingPendingDeliveryAction = false
+        recoveryCheckpointGeneration &+= 1
+        recoveryCheckpointTask?.cancel()
+        recoveryCheckpointTask = nil
+    }
+
     private func recoverySnapshot(
         draftText: String? = nil,
         draftAttachments: [TurnAttachment]? = nil,
@@ -1099,6 +1185,7 @@ public final class ChatModel {
 
     private func scheduleRecoveryCheckpoint() {
         guard !isApplyingRecoveredState,
+              !isCommittingPendingDeliveryAction,
               recoveryStatusMessage == nil,
               let recoveryStore,
               let recoveryKey,

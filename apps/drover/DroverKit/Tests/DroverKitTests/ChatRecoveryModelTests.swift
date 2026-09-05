@@ -154,6 +154,172 @@ struct ChatRecoveryModelTests {
         #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
     }
 
+    @Test @MainActor func departingBeforeASuspendedRetryReturnsStillRecoversTheNewestEdit() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = SavedThenFailThenBlockRetryRecoveryStore()
+        var model: ChatModel? = recoveryModel(binding: binding, recoveryStore: recovery)
+        model?.composerText = "older A"
+        await model?.flushRecoveryCheckpoint()
+        await model?.flushRecoveryCheckpoint()
+        #expect(model?.canRetryRecoverySave == true)
+
+        let retry = Task { @MainActor [model = try #require(model)] in
+            await model.retryRecoverySave()
+        }
+        await recovery.waitUntilRetrySaveStarted()
+        model?.composerText = "newer B"
+        let departure = Task { @MainActor [model = try #require(model)] in
+            await model.prepareForDeparture()
+        }
+        await departure.value
+        model = nil
+        await recovery.releaseRetrySave()
+        await retry.value
+
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.composerText == "newer B")
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
+    @Test @MainActor func departingBeforeASuspendedRetryReturnsDurablyCommitsAnIntentionalClear() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = SavedThenFailThenBlockRetryRecoveryStore()
+        var model: ChatModel? = recoveryModel(binding: binding, recoveryStore: recovery)
+        model?.composerText = "older A"
+        await model?.flushRecoveryCheckpoint()
+        await model?.flushRecoveryCheckpoint()
+        #expect(model?.canRetryRecoverySave == true)
+
+        let retry = Task { @MainActor [model = try #require(model)] in
+            await model.retryRecoverySave()
+        }
+        await recovery.waitUntilRetrySaveStarted()
+        model?.composerText = ""
+        let departure = Task { @MainActor [model = try #require(model)] in
+            await model.prepareForDeparture()
+        }
+        await departure.value
+        model = nil
+        await recovery.releaseRetrySave()
+        await retry.value
+
+        #expect(try await recovery.load(for: recoveryKey(binding: binding)) == nil)
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+        #expect(recreated.composerText.isEmpty)
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
+    @Test @MainActor func failedCopyPreservesANewerDraftAndBlocksSendUntilRetryMakesBothDurable() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xA1, 0xA2]))
+        let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xB1, 0xB2]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
+        defer { MockURLProtocol.handler = nil }
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let copying = Task { @MainActor in
+            await model.copyPendingTurnToDraft()
+        }
+        await recovery.waitUntilSaveStarted()
+        model.composerText = "newer B"
+        model.pendingAttachments = [newerImage]
+        #expect(model.canSendTurn == false)
+        let attemptedSend = Task { @MainActor in
+            await model.sendTurn()
+        }
+        await attemptedSend.value
+        await recovery.failSave()
+        await copying.value
+
+        #expect(model.pendingTurn?.clientTurnID == originalID.uuidString)
+        #expect(model.pendingTurn?.attachments == [olderImage])
+        #expect(model.composerText == "newer B")
+        #expect(model.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+
+        await model.retryRecoverySave()
+        await model.prepareForDeparture()
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.pendingTurn?.clientTurnID == originalID.uuidString)
+        #expect(recreated.pendingTurn?.attachments == [olderImage])
+        #expect(recreated.composerText == "newer B")
+        #expect(recreated.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
+    @Test @MainActor func failedDiscardPreservesANewerDraftAndBlocksSendUntilRetryMakesBothDurable() async throws {
+        MockURLProtocol.resetRecordedRequests()
+        let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
+        let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
+        let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
+        let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xC1, 0xC2]))
+        let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xD1, 0xD2]))
+        try await recovery.save(
+            ChatRecoverySnapshot(
+                draftText: "",
+                pendingTurn: RecoveredPendingTurn(
+                    clientTurnID: originalID,
+                    text: "older A",
+                    attachments: [RecoveredTurnAttachment(mediaType: "image/jpeg", data: olderImage.data)]
+                )
+            ),
+            for: recoveryKey(binding: binding)
+        )
+        MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
+        defer { MockURLProtocol.handler = nil }
+        let model = recoveryModel(binding: binding, recoveryStore: recovery)
+        await model.restoreRecovery()
+
+        let discarding = Task { @MainActor in
+            await model.discardPendingTurn()
+        }
+        await recovery.waitUntilSaveStarted()
+        model.composerText = "newer B"
+        model.pendingAttachments = [newerImage]
+        #expect(model.canSendTurn == false)
+        await recovery.failSave()
+        await discarding.value
+
+        #expect(model.pendingTurn?.clientTurnID == originalID.uuidString)
+        #expect(model.pendingTurn?.attachments == [olderImage])
+        #expect(model.composerText == "newer B")
+        #expect(model.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+
+        await model.retryRecoverySave()
+        await model.prepareForDeparture()
+        let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
+        await recreated.restoreRecovery()
+
+        #expect(recreated.pendingTurn?.clientTurnID == originalID.uuidString)
+        #expect(recreated.pendingTurn?.attachments == [olderImage])
+        #expect(recreated.composerText == "newer B")
+        #expect(recreated.pendingAttachments == [newerImage])
+        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+    }
+
     @Test @MainActor func failedRecoveryReadCannotRetrySavingOrReplaceTheUnreadRecord() async throws {
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let original = ChatRecoverySnapshot(draftText: "unread saved draft")
@@ -840,6 +1006,7 @@ private actor FailingBlockingRecoveryStore: ChatRecoveryPersisting {
     private var saveStarted = false
     private var saveStartWaiters: [CheckedContinuation<Void, Never>] = []
     private var saveFailure: CheckedContinuation<Void, Never>?
+    private var failureRequested = false
     private let failingSaveNumber: Int
     private var saveCount = 0
     private var snapshots: [ChatRecoveryKey: ChatRecoverySnapshot] = [:]
@@ -866,7 +1033,12 @@ private actor FailingBlockingRecoveryStore: ChatRecoveryPersisting {
         saveStartWaiters.removeAll()
         waiters.forEach { $0.resume() }
         await withCheckedContinuation { continuation in
-            saveFailure = continuation
+            if failureRequested {
+                failureRequested = false
+                continuation.resume()
+            } else {
+                saveFailure = continuation
+            }
         }
         throw ChatRecoveryError.storageUnavailable
     }
@@ -887,9 +1059,12 @@ private actor FailingBlockingRecoveryStore: ChatRecoveryPersisting {
     }
 
     func failSave() {
-        let continuation = saveFailure
-        saveFailure = nil
-        continuation?.resume()
+        if let saveFailure {
+            self.saveFailure = nil
+            saveFailure.resume()
+        } else {
+            failureRequested = true
+        }
     }
 }
 
@@ -910,6 +1085,59 @@ private actor FailThenBlockRetryRecoveryStore: ChatRecoveryPersisting {
         case 1:
             throw ChatRecoveryError.storageUnavailable
         case 2:
+            retrySaveStarted = true
+            let waiters = retrySaveWaiters
+            retrySaveWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { continuation in
+                retrySaveRelease = continuation
+            }
+            snapshots[key] = snapshot
+        default:
+            snapshots[key] = snapshot
+        }
+    }
+
+    func remove(for key: ChatRecoveryKey) async throws {
+        snapshots.removeValue(forKey: key)
+    }
+    func purge(bindingID: UUID) async throws {}
+    func sweep(keeping bindingIDs: Set<UUID>) async throws {}
+    func eraseAllAfterCredentialDeletion() async throws {}
+
+    func waitUntilRetrySaveStarted() async {
+        guard !retrySaveStarted else { return }
+        await withCheckedContinuation { continuation in
+            retrySaveWaiters.append(continuation)
+        }
+    }
+
+    func releaseRetrySave() {
+        let continuation = retrySaveRelease
+        retrySaveRelease = nil
+        continuation?.resume()
+    }
+}
+
+private actor SavedThenFailThenBlockRetryRecoveryStore: ChatRecoveryPersisting {
+    private var saveCount = 0
+    private var retrySaveStarted = false
+    private var retrySaveWaiters: [CheckedContinuation<Void, Never>] = []
+    private var retrySaveRelease: CheckedContinuation<Void, Never>?
+    private var snapshots: [ChatRecoveryKey: ChatRecoverySnapshot] = [:]
+
+    func load(for key: ChatRecoveryKey) async throws -> ChatRecoverySnapshot? {
+        snapshots[key]
+    }
+
+    func save(_ snapshot: ChatRecoverySnapshot, for key: ChatRecoveryKey) async throws {
+        saveCount += 1
+        switch saveCount {
+        case 1:
+            snapshots[key] = snapshot
+        case 2:
+            throw ChatRecoveryError.storageUnavailable
+        case 3:
             retrySaveStarted = true
             let waiters = retrySaveWaiters
             retrySaveWaiters.removeAll()

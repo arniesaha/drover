@@ -261,6 +261,9 @@ struct ChatView: View {
             if let recoveryStatusMessage = model.recoveryStatusMessage {
                 recoveryStatusBanner(recoveryStatusMessage)
             }
+            if model.isCommittingPendingDeliveryAction {
+                ChatHintBanner("Saving the local delivery update…")
+            }
             HStack(spacing: 12) {
                 Button("Check delivery") {
                     model.checkPendingDelivery()
@@ -277,6 +280,7 @@ struct ChatView: View {
                 }
                 .accessibilityIdentifier("chat-discard-pending")
             }
+            .disabled(model.isCommittingPendingDeliveryAction)
             .font(.caption.weight(.semibold))
             .padding(.horizontal, 16)
         }
