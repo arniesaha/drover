@@ -84,6 +84,9 @@ def _telemetry(**overrides: object) -> TelemetryAggregate:
         "input_span_records": 10,
         "source_ref": "analytics:mac-mini/codex/24h",
         "latest_span_at": NOW - timedelta(minutes=30),
+        "exact_cache_metric_pair_sessions": 1,
+        "exact_cache_metric_pair_prompt_tokens": 10_000,
+        "exact_cache_metric_pair_cache_read_tokens": 5_000,
     }
     values.update(overrides)
     return TelemetryAggregate(**values)  # type: ignore[arg-type]
@@ -414,7 +417,12 @@ def test_empty_telemetry_window_does_not_create_coverage_findings() -> None:
 
 
 def test_low_cache_read_ratio_reports_numerical_evidence() -> None:
-    aggregate = _telemetry(prompt_tokens=9_500, cache_read_tokens=500)
+    aggregate = _telemetry(
+        prompt_tokens=9_500,
+        cache_read_tokens=500,
+        exact_cache_metric_pair_prompt_tokens=9_500,
+        exact_cache_metric_pair_cache_read_tokens=500,
+    )
 
     finding = CacheReadEfficiencyAnalyzer(
         minimum_input_tokens=1_000,
@@ -423,11 +431,14 @@ def test_low_cache_read_ratio_reports_numerical_evidence() -> None:
 
     assert finding.rule_id == "telemetry.cache_read_inefficiency"
     assert finding.evidence[0].fields == {
-        "prompt_tokens": 9500,
-        "cache_read_tokens": 500,
+        "measured_prompt_tokens": 9500,
+        "measured_cache_read_tokens": 500,
         "reusable_input_tokens": 10000,
         "cache_read_percent": 5,
         "minimum_cache_read_percent": 20,
+        "cache_metric_sources": ["exact_session_usage"],
+        "exact_cache_metric_pair_sessions": 1,
+        "span_cache_metric_pair_records": 0,
     }
     assert "Inspect repeated context" in finding.remediation[0]
 

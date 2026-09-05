@@ -186,12 +186,26 @@ class CacheReadEfficiencyAnalyzer:
         for aggregate in sorted(snapshot.telemetry, key=lambda item: item.target_id):
             if not aggregate.facts_complete:
                 continue
-            reusable_input = aggregate.prompt_tokens + aggregate.cache_read_tokens
+            prompt_tokens = (
+                aggregate.exact_cache_metric_pair_prompt_tokens
+                + aggregate.span_cache_metric_pair_prompt_tokens
+            )
+            cache_read_tokens = (
+                aggregate.exact_cache_metric_pair_cache_read_tokens
+                + aggregate.span_cache_metric_pair_cache_read_tokens
+            )
+            reusable_input = prompt_tokens + cache_read_tokens
             if reusable_input < self.minimum_input_tokens or reusable_input == 0:
                 continue
-            cache_percent = _percent(aggregate.cache_read_tokens, reusable_input)
+            cache_percent = _percent(cache_read_tokens, reusable_input)
             if cache_percent >= self.minimum_cache_read_percent:
                 continue
+            has_span_pairs = aggregate.span_cache_metric_pair_records > 0
+            sources = []
+            if aggregate.exact_cache_metric_pair_sessions:
+                sources.append("exact_session_usage")
+            if has_span_pairs:
+                sources.append("span")
             findings.append(
                 FindingCandidate(
                     analyzer_id=self.analyzer_id,
@@ -200,7 +214,9 @@ class CacheReadEfficiencyAnalyzer:
                     target_id=aggregate.target_id,
                     analyzer_class=AnalyzerClass.DETERMINISTIC,
                     severity=Severity.MEDIUM,
-                    confidence=Confidence.CONFIRMED,
+                    confidence=(
+                        Confidence.LIKELY if has_span_pairs else Confidence.CONFIRMED
+                    ),
                     title="Cache-read efficiency is low",
                     impact="Repeated input context is consuming uncached model tokens and may increase latency or API cost.",
                     remediation=(
@@ -211,11 +227,18 @@ class CacheReadEfficiencyAnalyzer:
                             source_ref=aggregate.source_ref,
                             observed_at=aggregate.observed_at,
                             fields={
-                                "prompt_tokens": aggregate.prompt_tokens,
-                                "cache_read_tokens": aggregate.cache_read_tokens,
+                                "measured_prompt_tokens": prompt_tokens,
+                                "measured_cache_read_tokens": cache_read_tokens,
                                 "reusable_input_tokens": reusable_input,
                                 "cache_read_percent": cache_percent,
                                 "minimum_cache_read_percent": self.minimum_cache_read_percent,
+                                "cache_metric_sources": sources,
+                                "exact_cache_metric_pair_sessions": (
+                                    aggregate.exact_cache_metric_pair_sessions
+                                ),
+                                "span_cache_metric_pair_records": (
+                                    aggregate.span_cache_metric_pair_records
+                                ),
                             },
                         ),
                     ),
