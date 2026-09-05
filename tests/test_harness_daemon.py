@@ -356,6 +356,7 @@ class _FakeStructuredManager:
         self.harness = harness
         self.starts = []
         self.turns = []
+        self.accepted_turns = {}
 
     def has(self, session_id: str) -> bool:
         return True
@@ -369,6 +370,24 @@ class _FakeStructuredManager:
     def send_turn(self, session_id: str, text: str, **kwargs) -> str:
         self.turns.append((session_id, text, kwargs))
         return "turn-1"
+
+    def submit_turn(self, session_id: str, *, prepare, **kwargs) -> tuple[str, bool]:
+        client_turn_id = kwargs.get("client_turn_id")
+        key = (session_id, client_turn_id)
+        if client_turn_id and key in self.accepted_turns:
+            return self.accepted_turns[key], True
+        text, images = prepare()
+        turn_id = self.send_turn(
+            session_id,
+            text,
+            images=images,
+            model=kwargs.get("model"),
+            thinking_effort=kwargs.get("thinking_effort"),
+            client_turn_id=client_turn_id,
+        )
+        if client_turn_id:
+            self.accepted_turns[key] = turn_id
+        return turn_id, False
 
 
 def _enabled_preset(name: str, executable: str = "/resolved/harness"):
@@ -687,6 +706,52 @@ def test_model_preference_validation_passes_codex_turn_preferences_unchanged(
             },
         )
     ]
+
+
+def test_duplicate_turn_skips_attachment_and_preference_side_effects(
+    monkeypatch, tmp_path
+):
+    client_turn_id = "1a8c547f-5d4c-4e21-a361-e688407b103c"
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="codex")
+    state.attachments_dir = tmp_path / "attachments"
+    preference_updates = []
+    real_update = state.registry.update_session_preferences
+
+    def record_preference_update(*args, **kwargs):
+        preference_updates.append((args, kwargs))
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state.registry, "update_session_preferences", record_preference_update
+    )
+    payload = {
+        "text": "see attached",
+        "client_turn_id": client_turn_id,
+        "images": [
+            {
+                "media_type": "image/png",
+                "data_base64": base64.b64encode(b"image").decode(),
+            }
+        ],
+    }
+    try:
+        first_status, first = _json_request(
+            f"{base_url}/sessions/session-1/turns", payload=payload
+        )
+        second_status, second = _json_request(
+            f"{base_url}/sessions/session-1/turns", payload=payload
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert (first_status, first) == (202, {"turn_id": "turn-1"})
+    assert (second_status, second) == (202, {"turn_id": "turn-1"})
+    assert len(state.structured.turns) == 1
+    assert len(list((state.attachments_dir / "session-1").iterdir())) == 1
+    assert len(preference_updates) == 1
 
 
 def test_model_preference_validation_preserves_opaque_identifier_whitespace(

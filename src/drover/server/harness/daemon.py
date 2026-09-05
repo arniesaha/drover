@@ -2502,28 +2502,30 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             except CatalogSelectionError as exc:
                 self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
-        try:
+
+        def prepare() -> tuple[str, list[dict[str, str]] | None]:
             saved = save_turn_attachments(
                 self.server.state.attachments_dir, session_id, images
             )
-        except ValueError as exc:
-            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-        text = append_attachment_lines(text, saved)
+            return append_attachment_lines(text, saved), saved or None
+
         try:
-            turn_id = self.server.state.structured.send_turn(
+            turn_id, replayed = self.server.state.structured.submit_turn(
                 session_id,
-                text,
-                images=saved or None,
+                prepare=prepare,
                 model=model,
                 thinking_effort=thinking_effort,
                 client_turn_id=client_turn_id,
             )
-            self.server.state.registry.update_session_preferences(
-                session_id,
-                model=model,
-                thinking_effort=thinking_effort,
-            )
+            if not replayed:
+                self.server.state.registry.update_session_preferences(
+                    session_id,
+                    model=model,
+                    thinking_effort=thinking_effort,
+                )
+        except ValueError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         except KeyError:
             # Session was closed by a concurrent /terminate between the has()
             # check above and this call -- treat it as "no longer there".

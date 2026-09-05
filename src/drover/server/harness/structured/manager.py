@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -60,6 +61,8 @@ _FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
     ),
 }
 
+_MAX_ACCEPTED_CLIENT_TURNS = 128
+
 
 class _Entry:
     def __init__(self, driver: Any, harness: str) -> None:
@@ -74,6 +77,12 @@ class _Entry:
         self.lock = threading.RLock()
         self.turn_lock = threading.Lock()
         self.turn_active = False
+        # A client can lose the response after a driver has accepted a turn.
+        # Retrying that same client-generated key must return the original
+        # turn instead of steering the harness a second time. Keep this
+        # deliberately bounded: live sessions can be long-running and the
+        # key is supplied by an untrusted client.
+        self.accepted_client_turns: OrderedDict[str, str] = OrderedDict()
         self.emit: Callable[[StructuredMessage], None] | None = None
 
 
@@ -124,6 +133,13 @@ class StructuredSessionManager:
         builder, default_command = _FACTORIES[harness]
         entry = _Entry(None, harness)
         entry.seq = registry.max_event_seq(session_id)
+        # The process-local map prevents duplicate dispatches while a daemon is
+        # running. Populate it from the bounded durable user-input ledger as
+        # well, so a retry that follows harnessd recovery stays idempotent.
+        for turn_id in registry.recent_user_input_turn_ids(
+            session_id, limit=_MAX_ACCEPTED_CLIENT_TURNS
+        ):
+            entry.accepted_client_turns[turn_id] = turn_id
 
         def emit(message: StructuredMessage) -> None:
             payload = message.payload or {}
@@ -289,6 +305,86 @@ class StructuredSessionManager:
         client_turn_id: str | None = None,
     ) -> str:
         entry = self._require_entry(session_id)
+        # The driver call and its recorded user_input already need the same
+        # ordering lock (as approval answers do below). It also gives a retry
+        # a single atomic boundary: a duplicate waits for the first dispatch
+        # to either fail, or publish the turn ID it must return.
+        with entry.lock:
+            accepted = self._accepted_turn_id(entry, client_turn_id)
+            if accepted is not None:
+                return accepted
+            return self._send_turn_locked(
+                entry,
+                text,
+                images=images,
+                model=model,
+                thinking_effort=thinking_effort,
+                client_turn_id=client_turn_id,
+            )
+
+    def submit_turn(
+        self,
+        session_id: str,
+        *,
+        prepare: Callable[[], tuple[str, list | None]],
+        model: str | None = None,
+        thinking_effort: str | None = None,
+        client_turn_id: str | None = None,
+    ) -> tuple[str, bool]:
+        """Prepare and dispatch a turn behind the client-ID admission lock.
+
+        HTTP requests persist image attachments while preparing a turn. Keeping
+        that work inside this lock means a duplicate retry returns before it
+        can create orphaned files or update preferences a second time.
+        """
+        entry = self._require_entry(session_id)
+        with entry.lock:
+            accepted = self._accepted_turn_id(entry, client_turn_id)
+            if accepted is not None:
+                return accepted, True
+            text, images = prepare()
+            return (
+                self._send_turn_locked(
+                    entry,
+                    text,
+                    images=images,
+                    model=model,
+                    thinking_effort=thinking_effort,
+                    client_turn_id=client_turn_id,
+                ),
+                False,
+            )
+
+    @staticmethod
+    def _accepted_turn_id(entry: _Entry, client_turn_id: str | None) -> str | None:
+        if not client_turn_id:
+            return None
+        accepted = entry.accepted_client_turns.get(client_turn_id)
+        if accepted is not None:
+            entry.accepted_client_turns.move_to_end(client_turn_id)
+        return accepted
+
+    @staticmethod
+    def _remember_accepted_turn(
+        entry: _Entry, client_turn_id: str | None, turn_id: str
+    ) -> None:
+        if not client_turn_id:
+            return
+        entry.accepted_client_turns[client_turn_id] = turn_id
+        entry.accepted_client_turns.move_to_end(client_turn_id)
+        if len(entry.accepted_client_turns) > _MAX_ACCEPTED_CLIENT_TURNS:
+            entry.accepted_client_turns.popitem(last=False)
+
+    def _send_turn_locked(
+        self,
+        entry: _Entry,
+        text: str,
+        *,
+        images: list | None,
+        model: str | None,
+        thinking_effort: str | None,
+        client_turn_id: str | None,
+    ) -> str:
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
         guard_persistent_turn = entry.harness == "claude-code"
@@ -298,10 +394,9 @@ class StructuredSessionManager:
                     raise RuntimeError("turn already in flight")
                 entry.turn_active = True
         turn_id = client_turn_id or f"turn-{uuid4()}"
-        # Dispatch first: Codex/Agy raise RuntimeError here ("turn
-        # already in flight" / "driver is closed") when a turn can't be
-        # accepted, and we must not record a user_input event for a turn
-        # that was never actually sent.
+        # Dispatch first: Codex/Agy raise RuntimeError here ("turn already in
+        # flight" / "driver is closed") when a turn cannot be accepted, and
+        # we must not record a user_input event for a turn that was never sent.
         try:
             entry.driver.send_turn(
                 text,
@@ -315,10 +410,11 @@ class StructuredSessionManager:
                 with entry.turn_lock:
                     entry.turn_active = False
             raise
+        self._remember_accepted_turn(entry, client_turn_id, turn_id)
         payload: dict = {}
         if images:
-            # Metadata only — the base64 payload never enters the event
-            # stream (events are pushed to the hub and replayed later).
+            # Metadata only — the base64 payload never enters the event stream
+            # (events are pushed to the hub and replayed later).
             payload["attachments"] = [
                 {"path": image["path"], "media_type": image["media_type"]}
                 for image in images

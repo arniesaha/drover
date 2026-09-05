@@ -1447,6 +1447,41 @@ class HarnessRegistry:
                 )
             ]
 
+    def recent_user_input_turn_ids(self, session_id: str, *, limit: int) -> list[str]:
+        """Return a bounded oldest-to-newest window of durable user turn IDs.
+
+        The structured-session manager restores its client-id replay cache
+        from this ledger after harnessd restarts. Reading only the tail keeps
+        recovery independent of the full transcript size.
+        """
+        if limit <= 0:
+            return []
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                """
+                SELECT payload_json FROM (
+                  SELECT payload_json
+                  FROM harness_events
+                  WHERE session_id = ? AND event_type = 'user_input'
+                  ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
+                  LIMIT ?
+                ) recent
+                """,
+                [session_id, limit],
+            )
+        turn_ids: list[str] = []
+        # Preserve chronological insertion order for the LRU cache.
+        for row in reversed(rows):
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                continue
+            turn_id = payload.get("turn_id") if isinstance(payload, dict) else None
+            if isinstance(turn_id, str) and turn_id:
+                turn_ids.append(turn_id)
+        return turn_ids
+
     def latest_session_previews(self, session_ids: list[str]) -> dict[str, str]:
         session_ids = [session_id for session_id in session_ids if session_id]
         if not session_ids:

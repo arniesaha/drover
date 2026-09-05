@@ -14,9 +14,13 @@ import SwiftUI
 /// composer below, and a ramp that clears the AA floor in both themes.
 struct ChatHintBanner: View {
     private let hint: String
+    private let actionTitle: String?
+    private let onAction: (() -> Void)?
 
-    init(_ hint: String) {
+    init(_ hint: String, actionTitle: String? = nil, onAction: (() -> Void)? = nil) {
         self.hint = hint
+        self.actionTitle = actionTitle
+        self.onAction = onAction
     }
 
     var body: some View {
@@ -32,6 +36,12 @@ struct ChatHintBanner: View {
                 .foregroundStyle(DroverColor.warn)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            if let actionTitle, let onAction {
+                Button(actionTitle, action: onAction)
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("chat-hint-action")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -42,7 +52,10 @@ struct ChatHintBanner: View {
         // One element, read as one sentence. Announced rather than left for
         // the user to find: it appears in response to an action they just
         // took and were told nothing else about.
-        .accessibilityElement(children: .combine)
+        // The retry must remain a separate actionable element when present;
+        // combining the row would make VoiceOver announce the label but hide
+        // the button that resolves the delivery ambiguity.
+        .accessibilityElement(children: actionTitle == nil ? .combine : .contain)
         .accessibilityLabel(hint)
         .accessibilityAddTraits(.isStaticText)
         .accessibilityIdentifier("chat-hint")

@@ -11,6 +11,7 @@ struct Composer: View {
     let runPreferences: HarnessModelCatalogState
     let harness: String
     let isSending: Bool
+    let canSend: Bool
     let onSend: () -> Void
 
     @State private var pickerItems: [PhotosPickerItem] = []
@@ -27,7 +28,7 @@ struct Composer: View {
             arePreferencesEditable: HarnessRunPreferences.canChangeInExistingSession(harness),
             placeholder: "Add feedback...",
             isSending: isSending,
-            canSend: !isEmpty,
+            canSend: !isEmpty && canSend,
             attachmentAccessibilityIdentifier: "composer-attachment"
         ) {
             PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
