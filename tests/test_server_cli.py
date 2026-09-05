@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -25,6 +26,7 @@ from drover.server.__main__ import (
     _summarizer_backend_available,
     main,
 )
+from drover.server.setup_readiness import SetupCheck, SetupReadinessReport
 from drover.server.db import control_plane_path
 from drover.server.harness import cli as harness_cli
 from drover.server.harness.recap_jobs import enqueue_live_recap
@@ -666,8 +668,197 @@ def test_cli_help_lists_subcommands():
         "embeddings",
         "context",
         "archive",
+        "setup-check",
     ):
         assert sub in res.output
+
+
+def test_setup_check_json_exits_two_without_echoing_private_arguments(
+    monkeypatch, tmp_path
+):
+    """An incomplete support report contains only the fixed check contract."""
+    report = SetupReadinessReport(
+        checks=(
+            SetupCheck(
+                key="local_liveness",
+                state="pass",
+                action="No action needed.",
+            ),
+            SetupCheck(
+                key="advertised_liveness",
+                state="fail",
+                action="Configure a reachable private advertised address, then rerun setup-check.",
+            ),
+        )
+    )
+    monkeypatch.setattr(server_main, "evaluate_setup", lambda *args, **kwargs: report)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--config",
+            str(_make_config(tmp_path)),
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "codex",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output) == report.as_dict()
+    assert "private-host" not in result.output
+    assert "/private/project" not in result.output
+
+
+def test_setup_check_bounds_authenticated_response_bytes(monkeypatch):
+    """A control response over the support-report bound is rejected before decode."""
+    read_sizes: list[int] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size: int) -> bytes:
+            read_sizes.append(size)
+            return b"x" * size
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    cfg = replace(default_config(), auth_api_token="test-token")
+
+    with pytest.raises(ValueError, match="response exceeds"):
+        server_main._setup_check_request_json(
+            cfg,
+            "GET",
+            "/harness/hosts",
+            None,
+            deadline=server_main.time.monotonic() + 1,
+        )
+
+    assert read_sizes == [server_main._SETUP_CHECK_MAX_RESPONSE_BYTES + 1]
+
+
+def test_setup_check_sanitizes_config_failure_before_evaluation(monkeypatch):
+    """A configuration error cannot put a host, project, or token detail in JSON."""
+    secret = "token private-token /private/config.toml"
+
+    def fail_config(_path):
+        raise click.ClickException(secret)
+
+    monkeypatch.setattr(server_main, "_resolve_config", fail_config)
+    monkeypatch.setattr(
+        server_main,
+        "evaluate_setup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not called")),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "host/../../private-host",
+            "--harness",
+            "provider/private-harness",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert [check["key"] for check in json.loads(result.output)["checks"]] == [
+        "local_liveness",
+        "advertised_liveness",
+        "control_api",
+        "host",
+        "harness_auth",
+        "project",
+    ]
+    for private_text in (
+        "private-token",
+        "/private/config.toml",
+        "private-host",
+        "private-harness",
+        "/private/project",
+    ):
+        assert private_text not in result.output
+
+
+def test_setup_check_sanitizes_token_resolution_failure(monkeypatch):
+    """Credential lookup errors are classified without opening a control request."""
+    secret = "token private-token /private/api_token"
+    cfg = replace(default_config(), auth_api_token="")
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        server_main, "_setup_check_liveness", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        server_main,
+        "_local_api_token",
+        lambda _cfg: (_ for _ in ()).throw(click.ClickException(secret)),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "codex",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output)["ready"] is False
+    assert "private-token" not in result.output
+    assert "/private/api_token" not in result.output
+    assert "private-host" not in result.output
+    assert "/private/project" not in result.output
+
+
+def test_setup_check_sanitizes_request_construction_failure(monkeypatch):
+    """A malformed local request cannot expose the command's private arguments."""
+    cfg = replace(default_config(), auth_api_token="test-token")
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        server_main, "_setup_check_liveness", lambda *args, **kwargs: True
+    )
+
+    def fail_request(url, *args, **kwargs):
+        raise ValueError(f"could not build request for {url}")
+
+    monkeypatch.setattr("urllib.request.Request", fail_request)
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "provider/private-harness",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output)["ready"] is False
+    assert "private-host" not in result.output
+    assert "private-harness" not in result.output
+    assert "/private/project" not in result.output
 
 
 def test_archive_help_preserves_existing_commands_and_adds_backup():
