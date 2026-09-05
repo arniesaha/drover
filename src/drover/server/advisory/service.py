@@ -226,6 +226,7 @@ class InsightsService:
             tuple[tuple[str, str], Future[dict[str, Any]]] | None
         ) = None
         self._check_status_connections: dict[Future[dict[str, Any]], set[Any]] = {}
+        self._check_status_timed_out: set[Future[dict[str, Any]]] = set()
         consent_path = self.config_path.with_name(
             f".{self.config_path.name}.content-consent.json"
         )
@@ -772,9 +773,18 @@ class InsightsService:
         try:
             future.set_result(self._read_check_status(*key, future=future))
         except BaseException as exc:  # delivered to the waiting request
-            future.set_exception(exc)
+            with self._check_status_lock:
+                timed_out = future in self._check_status_timed_out
+            if timed_out:
+                # Every caller shares the same interrupted database operation.
+                # Once any waiter hit the deadline, return a stable bounded
+                # status rather than race another waiter into a 503.
+                future.set_result(_unavailable_check_status())
+            else:
+                future.set_exception(exc)
         finally:
             with self._check_status_lock:
+                self._check_status_timed_out.discard(future)
                 if self._check_status_inflight == (key, future):
                     self._check_status_inflight = None
 
@@ -937,6 +947,7 @@ class InsightsService:
         with self._check_status_lock:
             if self._check_status_inflight != (key, future):
                 return
+            self._check_status_timed_out.add(future)
             connections = tuple(self._check_status_connections.get(future, ()))
         for con in connections:
             try:

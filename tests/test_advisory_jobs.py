@@ -407,6 +407,84 @@ def test_check_status_times_out_once_and_refuses_parallel_reads(
     assert second["status"] == "unavailable"
 
 
+def test_same_key_timeout_makes_every_waiter_unavailable(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt after one timeout cannot turn another poll into a 503."""
+
+    class ControlledFuture(Future[dict[str, object]]):
+        waits = 0
+
+        def result(self, timeout=None):  # type: ignore[override]
+            type(self).waits += 1
+            if type(self).waits == 1:
+                first_waiter.set()
+                assert second_waiter.wait(1)
+                raise advisory_service_module.FuturesTimeout()
+            second_waiter.set()
+            return super().result(timeout)
+
+    service = InsightsService(db_path)
+    first_waiter = threading.Event()
+    second_waiter = threading.Event()
+    interrupted = threading.Event()
+    done = threading.Event()
+    results: list[object] = []
+    monkeypatch.setattr(advisory_service_module, "Future", ControlledFuture)
+
+    def interrupted_read(_finding_id: str, _job_id: str, **_kwargs):
+        assert interrupted.wait(1)
+        raise RuntimeError("DuckDB query interrupted")
+
+    original_interrupt = service._interrupt_check_status_connections
+
+    def signal_interrupt(key, future) -> None:
+        original_interrupt(key, future)
+        interrupted.set()
+
+    monkeypatch.setattr(service, "_read_check_status", interrupted_read)
+    monkeypatch.setattr(
+        service, "_interrupt_check_status_connections", signal_interrupt
+    )
+
+    def poll() -> None:
+        try:
+            results.append(service.check_status("a" * 32, "job-1"))
+        except Exception as exc:  # test captures the incorrect 503 path
+            results.append(exc)
+        if len(results) == 2:
+            done.set()
+
+    first = threading.Thread(target=poll)
+    second = threading.Thread(target=poll)
+    first.start()
+    assert first_waiter.wait(1)
+    second.start()
+    assert done.wait(1)
+    first.join(1)
+    second.join(1)
+
+    assert len(results) == 2
+    assert all(
+        isinstance(result, dict) and result["status"] == "unavailable"
+        for result in results
+    )
+
+
+def test_check_status_propagates_unrelated_read_errors(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = InsightsService(db_path)
+
+    def broken_read(_finding_id: str, _job_id: str, **_kwargs):
+        raise RuntimeError("unexpected ledger failure")
+
+    monkeypatch.setattr(service, "_read_check_status", broken_read)
+
+    with pytest.raises(RuntimeError, match="unexpected ledger failure"):
+        service.check_status("a" * 32, "job-1")
+
+
 def test_check_status_interrupt_is_scoped_and_tolerates_interrupt_failure(
     db_path: Path,
 ) -> None:
