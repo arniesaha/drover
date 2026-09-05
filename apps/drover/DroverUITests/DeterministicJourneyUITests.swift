@@ -8,6 +8,7 @@ final class DeterministicJourneyUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    @MainActor
     private func makeCoreJourneyApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
