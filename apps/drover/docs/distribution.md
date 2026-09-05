@@ -19,15 +19,19 @@ the configured Drover account/server credential, and none is used for tracking.
 | `Name` | The device name provided during QR pairing. | `Drover/Screens/Settings/PairingView.swift` calls `UIDevice.current.name` when it calls `DroverClient.pair`. |
 | `Device ID` | The APNs device token uploaded to the configured server for notifications. | `Drover/PushRegistrar.swift` receives the APNs token and calls `registerAPNsToken`. |
 | `Other User Content` | User-entered prompts, terminal input, and any clipboard text that the person explicitly pastes into a terminal. The server returns agent/session and terminal output for display. | `DroverKit/DroverClient.swift`, `MessageStream.swift`, `TerminalStream.swift`, and `Drover/Screens/Terminal/TerminalBridge.swift`. |
+| `Photos or Videos` | Image data that the person explicitly selects in the chat composer or session-launch view. The app downscales it, sends it as a JPEG attachment to the configured Drover server, and that server can persist it with the session attachments. | `Drover/Screens/Chat/Composer.swift`, `Drover/Screens/Launch/LaunchView.swift`, and `DroverKit/DroverClient.swift`. |
 | `Other Data` | The configured server URL, pairing code, API bearer credential, session IDs, and model choices needed to authenticate and operate the self-hosted client. | `DroverKit/ServerConfig.swift`, `Keychain.swift`, `DroverClient.swift`, and `HarnessModelCatalogStore.swift`. |
 
 The pairing QR camera is used only to decode the pairing payload locally;
 `PairingView.swift` does not save or upload camera frames. The bearer credential
 is stored in the Keychain rather than `UserDefaults` and is sent only as the
 `Authorization: Bearer` header to the selected Drover server. The app does not
-read contacts, photos, location, health, microphone, or advertising identifiers.
-It writes to the pasteboard for explicit copy actions and reads pasteboard text
-only for an explicit terminal-paste action.
+access contacts, photos beyond images explicitly selected with `PhotosPicker`,
+location, health, microphone, or advertising identifiers. The system-managed
+picker provides the selected asset without broad photo-library authorization,
+so the app has no photo-library usage-description key. It writes to the
+pasteboard for explicit copy actions and reads pasteboard text only for an
+explicit terminal-paste action.
 
 The manifest uses the `UserDefaults` required-reason API declaration with
 `CA92.1`. The app uses it solely for app-owned configuration and state: server
