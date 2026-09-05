@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-09-04
+
+### Fixed
+
+- A transient shortage on the shared analytical DuckDB instance no longer
+  does lasting damage. An out-of-memory failure is classified apart from an
+  analyzer error, so it always retries and never dead-letters a healthy
+  advisory analyzer; recording that failure can no longer abandon the
+  analyzers queued behind it; and the cockpit's provider-capacity section
+  serves its last good answer marked stale instead of an empty error
+  section the client draws as "no accounts" (#328).
+
 ## [0.4.4] - 2026-09-04
 
 ### Fixed
