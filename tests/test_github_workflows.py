@@ -232,6 +232,20 @@ def test_clean_install_uses_configured_address_and_keeps_pairing_private() -> No
     assert 'echo "$PAIR_OUTPUT"' not in steps
 
 
+def test_clean_install_suppresses_every_network_failure_diagnostic() -> None:
+    """A failed curl must not expand a configured private endpoint in CI logs."""
+    smoke = next(
+        step["run"]
+        for step in load_workflow("release.yml")["jobs"]["verify-install"]["steps"]
+        if step.get("name") == "The installed server accepts a paired device"
+    )
+
+    assert smoke.count("curl -fsS") == 4
+    assert smoke.count('2> "$RUNNER_TEMP/drover-health.log"') == 2
+    assert smoke.count('2> "$RUNNER_TEMP/drover-pair-redemption.log"') == 1
+    assert smoke.count('2> "$RUNNER_TEMP/drover-hosts.log"') == 1
+
+
 def test_ci_runs_the_shell_tests() -> None:
     """The installer is shell, so pytest alone would leave it unguarded."""
     steps = " ".join(

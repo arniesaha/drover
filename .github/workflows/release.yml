@@ -216,10 +216,12 @@ jobs:
         case "$HOST" in ""|"0.0.0.0"|"::"|"*") HOST="127.0.0.1" ;; esac
         case "$PORT" in ""|*[!0-9]*) echo "configured-address stage failed" >&2; exit 1 ;; esac
         for _ in $(seq 1 30); do
-          curl -fsS --max-time 2 "http://$HOST:$PORT/healthz" > /dev/null && break
+          curl -fsS --max-time 2 "http://$HOST:$PORT/healthz" \
+            > /dev/null 2> "$RUNNER_TEMP/drover-health.log" && break
           sleep 2
         done
-        curl -fsS --max-time 5 "http://$HOST:$PORT/healthz" > /dev/null \
+        curl -fsS --max-time 5 "http://$HOST:$PORT/healthz" \
+          > /dev/null 2> "$RUNNER_TEMP/drover-health.log" \
           || { echo "server health stage failed" >&2; exit 1; }
 
         PAIR_OUTPUT="$("$BIN/drover-server" pair 2> "$RUNNER_TEMP/drover-pair.log")" \
@@ -231,7 +233,8 @@ jobs:
           -H 'Content-Type: application/json' \
           -d "{\"code\":\"$PAIR_CODE\",\"device_name\":\"release-artifact-check\"}" \
           "http://$HOST:$PORT/auth/pair" \
-          > "$RUNNER_TEMP/drover-pair-response.json"; then
+          > "$RUNNER_TEMP/drover-pair-response.json" \
+          2> "$RUNNER_TEMP/drover-pair-redemption.log"; then
           echo "pairing redemption stage failed" >&2
           exit 1
         fi
@@ -243,7 +246,8 @@ jobs:
         if ! curl -fsS --max-time 10 \
           -H "Authorization: Bearer $DEVICE_TOKEN" \
           "http://$HOST:$PORT/harness/hosts" \
-          > "$RUNNER_TEMP/drover-hosts.json"; then
+          > "$RUNNER_TEMP/drover-hosts.json" \
+          2> "$RUNNER_TEMP/drover-hosts.log"; then
           echo "paired control-access stage failed" >&2
           exit 1
         fi
