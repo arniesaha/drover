@@ -139,6 +139,15 @@ from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
 from drover.server.runtime import RuntimeLayout
 from drover.server.session_graph import format_ascii, format_dot, session_graph_payload
+from drover.server.setup_readiness import (
+    SetupTarget,
+    evaluate_setup,
+    unavailable_setup_report,
+)
+from drover.server.setup_readiness_transport import (
+    run_setup_check_http_request,
+    suppress_setup_check_transport_logs,
+)
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.summarizer.diagnostics import summarize_backend_auth
 from drover.server.summarizer.retry import retry_errored_jobs
@@ -484,6 +493,81 @@ def _local_api_request(
         ) from exc
 
 
+_SETUP_CHECK_TOTAL_TIMEOUT_SECONDS = 25.0
+_SETUP_CHECK_MAX_RESPONSE_BYTES = 1_048_576
+
+
+def _setup_check_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("setup-check time budget exhausted")
+    return min(5.0, remaining)
+
+
+def _setup_check_liveness(url: str, *, deadline: float) -> bool:
+    """Probe one configured listener without authenticating or decoding its body."""
+    try:
+        status, _ = _setup_check_http_request(
+            url, "GET", None, {}, deadline=deadline, max_response_bytes=None
+        )
+        return 200 <= status < 300
+    except (OSError, RuntimeError, ValueError, TimeoutError):
+        return False
+
+
+def _setup_check_request_json(
+    cfg: DroverConfig,
+    method: str,
+    path: str,
+    payload: Optional[dict],
+    *,
+    deadline: float,
+) -> dict:
+    """Make one bounded authenticated control-plane read for ``setup-check``."""
+    url = f"http://{_local_api_host(cfg)}:{cfg.metrics_http_port}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {_local_api_token(cfg)}",
+    }
+    status, raw = _setup_check_http_request(
+        url,
+        method,
+        data,
+        headers,
+        deadline=deadline,
+        max_response_bytes=_SETUP_CHECK_MAX_RESPONSE_BYTES,
+    )
+    if not 200 <= status < 300:
+        raise ValueError("setup-check request returned a non-success status")
+    if len(raw) > _SETUP_CHECK_MAX_RESPONSE_BYTES:
+        raise ValueError("setup-check response exceeds the configured bound")
+    parsed = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+    if not isinstance(parsed, dict):
+        raise ValueError("setup-check response must be a JSON object")
+    return parsed
+
+
+def _setup_check_http_request(
+    url: str,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    *,
+    deadline: float,
+    max_response_bytes: int | None,
+) -> tuple[int, bytes]:
+    """Perform one no-redirect request within the shared setup-check deadline."""
+    return run_setup_check_http_request(
+        url,
+        method,
+        data,
+        headers,
+        timeout=_setup_check_timeout(deadline),
+        max_response_bytes=max_response_bytes,
+    )
+
+
 def _bootstrap_if_missing(cfg: DroverConfig) -> None:
     """Create the local store for first-run commands without taking live locks."""
     if not cfg.duckdb_path.exists():
@@ -749,6 +833,43 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
     )
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
+
+
+@main.command(name="setup-check")
+@click.option("--host", "host_id", required=True, help="Host id to check")
+@click.option("--harness", required=True, help="Harness to check")
+@click.option("--project", required=True, help="Project directory to check")
+@click.option("--json", "as_json", is_flag=True, help="Print the safe JSON report")
+@click.pass_context
+def setup_check(
+    ctx: click.Context,
+    host_id: str,
+    harness: str,
+    project: str,
+    as_json: bool,
+) -> None:
+    """Report read-only first-computer setup readiness."""
+    try:
+        cfg = _resolve_config(ctx.obj["config_path"])
+        deadline = time.monotonic() + _SETUP_CHECK_TOTAL_TIMEOUT_SECONDS
+        with suppress_setup_check_transport_logs():
+            report = evaluate_setup(
+                cfg,
+                SetupTarget(host_id=host_id, harness=harness, project=project),
+                liveness=lambda url: _setup_check_liveness(url, deadline=deadline),
+                request_json=lambda method, path, payload: _setup_check_request_json(
+                    cfg, method, path, payload, deadline=deadline
+                ),
+            )
+    except Exception:  # noqa: BLE001 - setup reports never disclose local details
+        report = unavailable_setup_report()
+    if as_json:
+        click.echo(json.dumps(report.as_dict(), sort_keys=True))
+    else:
+        for check in report.checks:
+            click.echo(f"{check.key}: {check.state} — {check.action}")
+    if not report.ready:
+        ctx.exit(2)
 
 
 @main.command(name="harnessd")

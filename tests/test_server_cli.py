@@ -1,14 +1,23 @@
 """Tests for src/drover/server/__main__.py CLI."""
 
 import json
+import logging
+import multiprocessing
+import os
+import socket
 import subprocess
 import sys
 import textwrap
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -29,6 +38,7 @@ from drover.server.db import control_plane_path
 from drover.server.harness import cli as harness_cli
 from drover.server.harness.recap_jobs import enqueue_live_recap
 from drover.server.ledger import ArtifactSpec, Ledger
+from drover.server.setup_readiness import SetupCheck, SetupReadinessReport
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig
 
@@ -69,6 +79,27 @@ def _make_config(tmp_path: Path) -> Path:
         principal_id = "test"
     """))
     return cfg
+
+
+class _SetupCheckHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        pass
+
+
+@contextmanager
+def _serve_setup_check_http(handler):
+    server = _SetupCheckHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
 def seeded_server_db(tmp_path: Path) -> Path:
@@ -666,8 +697,746 @@ def test_cli_help_lists_subcommands():
         "embeddings",
         "context",
         "archive",
+        "setup-check",
     ):
         assert sub in res.output
+
+
+def test_setup_check_json_exits_two_without_echoing_private_arguments(
+    monkeypatch, tmp_path
+):
+    """An incomplete support report contains only the fixed check contract."""
+    report = SetupReadinessReport(
+        checks=(
+            SetupCheck(
+                key="local_liveness",
+                state="pass",
+                action="No action needed.",
+            ),
+            SetupCheck(
+                key="advertised_liveness",
+                state="fail",
+                action="Configure a reachable private advertised address, then rerun setup-check.",
+            ),
+        )
+    )
+    monkeypatch.setattr(server_main, "evaluate_setup", lambda *args, **kwargs: report)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--config",
+            str(_make_config(tmp_path)),
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "codex",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output) == report.as_dict()
+    assert "private-host" not in result.output
+    assert "/private/project" not in result.output
+
+
+def test_setup_check_bounds_authenticated_response_bytes():
+    """A control response over the support-report bound is rejected before decode."""
+    body = b"x" * (server_main._SETUP_CHECK_MAX_RESPONSE_BYTES + 1)
+
+    class OversizedHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(OversizedHandler) as server:
+        cfg = replace(
+            default_config(),
+            auth_api_token="test-token",
+            server_metrics_host="127.0.0.1",
+            metrics_http_port=server.server_port,
+        )
+        with pytest.raises(ValueError, match="response exceeds"):
+            server_main._setup_check_request_json(
+                cfg,
+                "GET",
+                "/harness/hosts",
+                None,
+                deadline=server_main.time.monotonic() + 1,
+            )
+
+
+def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypatch):
+    """Bytes arriving before socket inactivity timeout cannot extend a control read."""
+    request_started = threading.Event()
+    completed = threading.Event()
+    body = b'{"hosts":[],"padding":"' + (b"x" * 80) + b'"}'
+
+    class DripHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            request_started.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(b"1\r\n" + bytes((byte,)) + b"\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.01)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                completed.set()
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(DripHandler) as server:
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.5)
+        cfg = replace(
+            default_config(),
+            auth_api_token="test-token",
+            server_metrics_host="127.0.0.1",
+            metrics_http_port=server.server_port,
+        )
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            server_main._setup_check_request_json(
+                cfg,
+                "GET",
+                "/harness/hosts",
+                None,
+                deadline=started + 1,
+            )
+        assert time.monotonic() - started < 0.7
+        assert request_started.wait(timeout=0.5)
+        assert not any(
+            child.name == "drover-setup-check-request"
+            for child in multiprocessing.active_children()
+        )
+        assert completed.wait(timeout=2)
+
+
+def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch):
+    """Health headers arriving in fragments cannot extend the listener probe."""
+    request_started = threading.Event()
+    completed = threading.Event()
+    raw_headers = b"Content-Length: 0\r\nX-Delayed: true\r\n\r\n"
+
+    class DripHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            request_started.set()
+            try:
+                self.connection.sendall(b"HTTP/1.1 200 OK\r\n")
+                for byte in raw_headers:
+                    self.connection.sendall(bytes((byte,)))
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                completed.set()
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(DripHandler) as server:
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.5)
+        started = time.monotonic()
+        assert (
+            server_main._setup_check_liveness(
+                f"http://127.0.0.1:{server.server_port}/healthz",
+                deadline=started + 1,
+            )
+            is False
+        )
+        assert time.monotonic() - started < 0.7
+        assert request_started.wait(timeout=0.5)
+        assert not any(
+            child.name == "drover-setup-check-request"
+            for child in multiprocessing.active_children()
+        )
+        assert completed.wait(timeout=1.5)
+
+
+def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
+    tmp_path, monkeypatch
+):
+    """A resolver stalled in an executor cannot keep setup-check past its deadline."""
+    marker = tmp_path / "resolver-started"
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        textwrap.dedent("""\
+            import os
+            import socket
+            import time
+            from pathlib import Path
+
+            if os.environ.get("DROVER_SETUP_CHECK_DELAY_RESOLVER") == "1":
+                marker = Path(os.environ["DROVER_SETUP_CHECK_RESOLVER_MARKER"])
+
+                def delayed_resolver(*args, **kwargs):
+                    marker.write_text("started", encoding="utf-8")
+                    time.sleep(2)
+                    raise socket.gaierror("synthetic resolver delay")
+
+                socket.getaddrinfo = delayed_resolver
+            """),
+        encoding="utf-8",
+    )
+
+    def delayed_resolver(*args, **kwargs):
+        marker.write_text("started", encoding="utf-8")
+        time.sleep(2)
+        raise socket.gaierror("synthetic resolver delay")
+
+    monkeypatch.setattr(socket, "getaddrinfo", delayed_resolver)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))),
+    )
+    monkeypatch.setenv("DROVER_SETUP_CHECK_DELAY_RESOLVER", "1")
+    monkeypatch.setenv("DROVER_SETUP_CHECK_RESOLVER_MARKER", str(marker))
+    existing_children = {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.name == "drover-setup-check-request"
+    }
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        server_main._setup_check_http_request(
+            "http://resolver-delay.invalid/healthz",
+            "GET",
+            None,
+            {},
+            deadline=started + 1,
+            max_response_bytes=None,
+        )
+
+    assert marker.exists()
+    assert time.monotonic() - started < 1.4
+    assert {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.name == "drover-setup-check-request"
+    } == existing_children
+
+
+def test_setup_check_bounds_large_request_transfer_before_child_receive(
+    tmp_path, monkeypatch, capsys
+):
+    """A child delayed before receive cannot block private request transfer past timeout."""
+    marker = tmp_path / "receive-started"
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        textwrap.dedent("""\
+            import os
+            import sys
+            import time
+            from pathlib import Path
+
+            if os.environ.get("DROVER_SETUP_CHECK_DELAY_STDIN") == "1":
+                marker = Path(os.environ["DROVER_SETUP_CHECK_STDIN_MARKER"])
+                original_stdin = sys.stdin
+
+                class DelayedBuffer:
+                    def read(self, *args, **kwargs):
+                        marker.write_text(str(os.getpid()), encoding="utf-8")
+                        time.sleep(2)
+                        return original_stdin.buffer.read(*args, **kwargs)
+
+                class DelayedStdin:
+                    buffer = DelayedBuffer()
+
+                sys.stdin = DelayedStdin()
+            """),
+        encoding="utf-8",
+    )
+    private_body = b"private-request-body-" + (b"x" * (24 * 1024))
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))),
+    )
+    monkeypatch.setenv("DROVER_SETUP_CHECK_DELAY_STDIN", "1")
+    monkeypatch.setenv("DROVER_SETUP_CHECK_STDIN_MARKER", str(marker))
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        server_main._setup_check_http_request(
+            "http://127.0.0.1:1/private-request-url",
+            "POST",
+            private_body,
+            {"Authorization": "Bearer private-request-token"},
+            deadline=started + 0.5,
+            max_response_bytes=None,
+        )
+
+    assert marker.exists()
+    assert time.monotonic() - started < 0.8
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text(encoding="utf-8")), 0)
+    captured = capsys.readouterr()
+    assert "private-request-body" not in captured.out + captured.err
+    assert "private-request-token" not in captured.out + captured.err
+
+
+def test_setup_check_rejects_oversized_private_request_before_starting_worker(
+    capsys,
+):
+    """Pathological request bytes are classified before any worker input can block."""
+    private_body = b"private-request-body-" + (b"x" * (64 * 1024))
+    started = time.monotonic()
+
+    with pytest.raises(ValueError, match="request exceeds"):
+        server_main._setup_check_http_request(
+            "http://127.0.0.1:1/private-request-url",
+            "POST",
+            private_body,
+            {"Authorization": "Bearer private-request-token"},
+            deadline=started + 0.5,
+            max_response_bytes=None,
+        )
+
+    assert time.monotonic() - started < 0.1
+    captured = capsys.readouterr()
+    assert "private-request-body" not in captured.out + captured.err
+    assert "private-request-token" not in captured.out + captured.err
+
+
+def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch):
+    """An oversized configured token becomes the fixed report without a subprocess."""
+    cfg = replace(
+        default_config(),
+        auth_api_token="private-token-" + ("x" * (64 * 1024)),
+    )
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        server_main, "_setup_check_liveness", lambda *args, **kwargs: True
+    )
+    started = time.monotonic()
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "codex",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert time.monotonic() - started < 0.3
+    assert json.loads(result.output)["ready"] is False
+    assert "private-token" not in result.output
+    assert "private-host" not in result.output
+    assert "/private/project" not in result.output
+
+
+def test_setup_check_control_redirect_does_not_reach_second_origin():
+    """A redirect response cannot forward the local API credential to another host."""
+    redirect_origin_headers: list[dict[str, str]] = []
+    second_origin_headers: list[dict[str, str]] = []
+
+    class SecondOriginHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            second_origin_headers.append(dict(self.headers))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "12")
+            self.end_headers()
+            self.wfile.write(b'{"hosts":[]}')
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(SecondOriginHandler) as second_origin:
+        second_host, second_port = second_origin.server_address
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                redirect_origin_headers.append(dict(self.headers))
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://{second_host}:{second_port}/redirect-target"
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args) -> None:
+                pass
+
+        with _serve_setup_check_http(RedirectHandler) as redirect_origin:
+            cfg = replace(
+                default_config(),
+                auth_api_token="private-bearer-token",
+                server_metrics_host="127.0.0.1",
+                metrics_http_port=redirect_origin.server_port,
+            )
+            with pytest.raises(ValueError):
+                server_main._setup_check_request_json(
+                    cfg,
+                    "GET",
+                    "/harness/hosts",
+                    None,
+                    deadline=time.monotonic() + 1,
+                )
+
+    assert len(redirect_origin_headers) == 1
+    assert redirect_origin_headers[0]["Authorization"] == "Bearer private-bearer-token"
+    assert second_origin_headers == []
+
+
+def test_setup_check_liveness_rejects_redirect():
+    """A redirected health response is not evidence for the configured listener."""
+    second_origin_requests: list[str] = []
+
+    class SecondOriginHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            second_origin_requests.append(self.path)
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(SecondOriginHandler) as second_origin:
+        second_host, second_port = second_origin.server_address
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(307)
+                self.send_header(
+                    "Location", f"http://{second_host}:{second_port}/healthy"
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args) -> None:
+                pass
+
+        with _serve_setup_check_http(RedirectHandler) as redirect_origin:
+            assert (
+                server_main._setup_check_liveness(
+                    f"http://127.0.0.1:{redirect_origin.server_port}/healthz",
+                    deadline=time.monotonic() + 1,
+                )
+                is False
+            )
+
+    assert second_origin_requests == []
+
+
+def test_setup_check_sanitizes_config_failure_before_evaluation(monkeypatch):
+    """A configuration error cannot put a host, project, or token detail in JSON."""
+    secret = "token private-token /private/config.toml"
+
+    def fail_config(_path):
+        raise click.ClickException(secret)
+
+    monkeypatch.setattr(server_main, "_resolve_config", fail_config)
+    monkeypatch.setattr(
+        server_main,
+        "evaluate_setup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not called")),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "host/../../private-host",
+            "--harness",
+            "provider/private-harness",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert [check["key"] for check in json.loads(result.output)["checks"]] == [
+        "local_liveness",
+        "advertised_liveness",
+        "control_api",
+        "host",
+        "harness_auth",
+        "project",
+    ]
+    for private_text in (
+        "private-token",
+        "/private/config.toml",
+        "private-host",
+        "private-harness",
+        "/private/project",
+    ):
+        assert private_text not in result.output
+
+
+def test_setup_check_sanitizes_token_resolution_failure(monkeypatch):
+    """Credential lookup errors are classified without opening a control request."""
+    secret = "token private-token /private/api_token"
+    cfg = replace(default_config(), auth_api_token="")
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        server_main, "_setup_check_liveness", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        server_main,
+        "_local_api_token",
+        lambda _cfg: (_ for _ in ()).throw(click.ClickException(secret)),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "codex",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output)["ready"] is False
+    assert "private-token" not in result.output
+    assert "/private/api_token" not in result.output
+    assert "private-host" not in result.output
+    assert "/private/project" not in result.output
+
+
+def test_setup_check_sanitizes_request_construction_failure(monkeypatch):
+    """A malformed local request cannot expose the command's private arguments."""
+    cfg = replace(default_config(), auth_api_token="test-token")
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(
+        server_main, "_setup_check_liveness", lambda *args, **kwargs: True
+    )
+
+    def fail_request(url, *args, **kwargs):
+        raise ValueError(f"could not build request for {url}")
+
+    monkeypatch.setattr(server_main, "_setup_check_http_request", fail_request)
+    result = CliRunner().invoke(
+        main,
+        [
+            "setup-check",
+            "--host",
+            "private-host",
+            "--harness",
+            "provider/private-harness",
+            "--project",
+            "/private/project",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert json.loads(result.output)["ready"] is False
+    assert "private-host" not in result.output
+    assert "private-harness" not in result.output
+    assert "/private/project" not in result.output
+
+
+def test_setup_check_verbose_suppresses_transport_log_details(monkeypatch, caplog):
+    """Verbose setup-check output cannot leak httpx request URLs or target details."""
+    request_paths: list[str] = []
+
+    class ControlHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            request_paths.append(self.path)
+            body = b'{"hosts":[]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(ControlHandler) as server:
+        cfg = replace(
+            default_config(),
+            auth_api_token="private-bearer-token",
+            server_metrics_host="127.0.0.1",
+            metrics_http_port=server.server_port,
+        )
+        monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+
+        def evaluate_with_transport(cfg, target, *, liveness, request_json):
+            assert target.host_id == "private-host"
+            assert target.project == "/private/project"
+            assert request_json("GET", "/private-control-path", None) == {"hosts": []}
+            return server_main.unavailable_setup_report()
+
+        monkeypatch.setattr(server_main, "evaluate_setup", evaluate_with_transport)
+        transport_loggers = [logging.getLogger("httpx"), logging.getLogger("httpcore")]
+        logger_state = [
+            (tuple(logger.handlers), logger.propagate) for logger in transport_loggers
+        ]
+        caplog.set_level(logging.DEBUG)
+        result = CliRunner().invoke(
+            main,
+            [
+                "--verbose",
+                "setup-check",
+                "--host",
+                "private-host",
+                "--harness",
+                "codex",
+                "--project",
+                "/private/project",
+                "--json",
+            ],
+        )
+
+    assert result.exit_code == 2, result.output
+    assert request_paths == ["/private-control-path"]
+    assert [
+        (tuple(logger.handlers), logger.propagate) for logger in transport_loggers
+    ] == logger_state
+    assert not any(
+        record.name == "httpx" or record.name.startswith("httpcore")
+        for record in caplog.records
+    )
+    output = result.output + caplog.text
+    for private_text in (
+        "private-bearer-token",
+        "private-control-path",
+        "private-host",
+        "/private/project",
+    ):
+        assert private_text not in output
+
+
+def test_setup_check_module_entrypoint_uses_spawn_safe_transport(tmp_path):
+    """The installed module entrypoint can complete checks that spawn worker processes."""
+    requested_paths: list[str] = []
+
+    class ReadyHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requested_paths.append(self.path)
+            if self.path == "/healthz":
+                self.send_response(204)
+                self.end_headers()
+                return
+            if self.path == "/harness/hosts":
+                body = json.dumps(
+                    {
+                        "hosts": [
+                            {
+                                "host_id": "subprocess-host",
+                                "status": "online",
+                                "capabilities": {
+                                    "harnesses": [{"name": "codex", "enabled": True}]
+                                },
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+            elif self.path == "/harness/hosts/subprocess-host/auth/codex/status":
+                body = b'{"state":"authenticated"}'
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            requested_paths.append(self.path)
+            assert self.path == "/harness/hosts/subprocess-host/fs/exists"
+            body = b'{"exists":{"/private/subprocess-project":true}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(ReadyHandler) as server:
+        config_path = tmp_path / "setup-check-subprocess.toml"
+        config_path.write_text(
+            textwrap.dedent(f"""\
+                [server]
+                metrics_http_port = {server.server_port}
+                metrics_host = "127.0.0.1"
+                advertised_url = "http://127.0.0.1:{server.server_port}"
+
+                [auth]
+                api_token = "subprocess-test-token"
+                """),
+            encoding="utf-8",
+        )
+        root = Path(__file__).parents[1]
+        environment = os.environ | {
+            "PYTHONPATH": str(root / "src"),
+            "DROVER_API_TOKEN": "subprocess-test-token",
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "drover.server",
+                "--config",
+                str(config_path),
+                "setup-check",
+                "--host",
+                "subprocess-host",
+                "--harness",
+                "codex",
+                "--project",
+                "/private/subprocess-project",
+                "--json",
+            ],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["ready"] is True
+    assert requested_paths == [
+        "/healthz",
+        "/healthz",
+        "/harness/hosts",
+        "/harness/hosts/subprocess-host/auth/codex/status",
+        "/harness/hosts/subprocess-host/fs/exists",
+    ]
+    assert "subprocess-test-token" not in result.stdout + result.stderr
 
 
 def test_archive_help_preserves_existing_commands_and_adds_backup():
