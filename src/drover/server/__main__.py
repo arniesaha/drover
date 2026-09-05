@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -20,6 +21,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import click
 import duckdb
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 import drover
@@ -502,16 +504,12 @@ def _setup_check_timeout(deadline: float) -> float:
 
 def _setup_check_liveness(url: str, *, deadline: float) -> bool:
     """Probe one configured listener without authenticating or decoding its body."""
-    import urllib.error
-    import urllib.request
-
     try:
-        request = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(
-            request, timeout=_setup_check_timeout(deadline)
-        ) as response:
-            return 200 <= response.status < 300
-    except (OSError, ValueError, TimeoutError, urllib.error.HTTPError):
+        status, _ = _setup_check_http_request(
+            url, "GET", None, {}, deadline=deadline, max_response_bytes=None
+        )
+        return 200 <= status < 300
+    except (OSError, RuntimeError, ValueError, TimeoutError, httpx.HTTPError):
         return False
 
 
@@ -524,23 +522,117 @@ def _setup_check_request_json(
     deadline: float,
 ) -> dict:
     """Make one bounded authenticated control-plane read for ``setup-check``."""
-    import urllib.request
-
     url = f"http://{_local_api_host(cfg)}:{cfg.metrics_http_port}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=data, method=method)
-    request.add_header("Content-Type", "application/json")
-    request.add_header("Authorization", f"Bearer {_local_api_token(cfg)}")
-    with urllib.request.urlopen(
-        request, timeout=_setup_check_timeout(deadline)
-    ) as response:
-        raw = response.read(_SETUP_CHECK_MAX_RESPONSE_BYTES + 1)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {_local_api_token(cfg)}",
+    }
+    status, raw = _setup_check_http_request(
+        url,
+        method,
+        data,
+        headers,
+        deadline=deadline,
+        max_response_bytes=_SETUP_CHECK_MAX_RESPONSE_BYTES,
+    )
+    if not 200 <= status < 300:
+        raise ValueError("setup-check request returned a non-success status")
     if len(raw) > _SETUP_CHECK_MAX_RESPONSE_BYTES:
         raise ValueError("setup-check response exceeds the configured bound")
     parsed = json.loads(raw.decode("utf-8")) if raw.strip() else {}
     if not isinstance(parsed, dict):
         raise ValueError("setup-check response must be a JSON object")
     return parsed
+
+
+def _setup_check_http_request(
+    url: str,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    *,
+    deadline: float,
+    max_response_bytes: int | None,
+) -> tuple[int, bytes]:
+    """Perform one no-redirect request within the shared setup-check deadline."""
+    return asyncio.run(
+        _setup_check_http_request_async(
+            url,
+            method,
+            data,
+            headers,
+            deadline=deadline,
+            max_response_bytes=max_response_bytes,
+        )
+    )
+
+
+async def _setup_check_http_request_async(
+    url: str,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    *,
+    deadline: float,
+    max_response_bytes: int | None,
+) -> tuple[int, bytes]:
+    timeout = _setup_check_timeout(deadline)
+    async with asyncio.timeout(timeout):
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=httpx.Timeout(timeout),
+            trust_env=False,
+        ) as client:
+            async with client.stream(
+                method, url, content=data, headers=headers
+            ) as response:
+                status = response.status_code
+                if not 200 <= status < 300 or max_response_bytes is None:
+                    return status, b""
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > max_response_bytes:
+                        raise ValueError(
+                            "setup-check response exceeds the configured bound"
+                        )
+                    body.extend(chunk)
+                return status, bytes(body)
+
+
+@contextmanager
+def _suppress_setup_check_transport_logs():
+    """Keep setup-check transport details out of its public CLI boundary."""
+    logger_dict = logging.Logger.manager.loggerDict
+    loggers = [
+        logger
+        for name, logger in logger_dict.items()
+        if isinstance(logger, logging.Logger)
+        and (
+            name == "httpx"
+            or name.startswith("httpx.")
+            or name == "httpcore"
+            or name.startswith("httpcore.")
+        )
+    ]
+    for name in ("httpx", "httpcore"):
+        logger = logging.getLogger(name)
+        if logger not in loggers:
+            loggers.append(logger)
+    previous = [
+        (logger, tuple(logger.handlers), logger.propagate) for logger in loggers
+    ]
+    try:
+        for logger, _, _ in previous:
+            logger.handlers.clear()
+            logger.addHandler(logging.NullHandler())
+            logger.propagate = False
+        yield
+    finally:
+        for logger, handlers, propagate in previous:
+            logger.handlers.clear()
+            logger.handlers.extend(handlers)
+            logger.propagate = propagate
 
 
 def _bootstrap_if_missing(cfg: DroverConfig) -> None:
@@ -827,14 +919,15 @@ def setup_check(
     try:
         cfg = _resolve_config(ctx.obj["config_path"])
         deadline = time.monotonic() + _SETUP_CHECK_TOTAL_TIMEOUT_SECONDS
-        report = evaluate_setup(
-            cfg,
-            SetupTarget(host_id=host_id, harness=harness, project=project),
-            liveness=lambda url: _setup_check_liveness(url, deadline=deadline),
-            request_json=lambda method, path, payload: _setup_check_request_json(
-                cfg, method, path, payload, deadline=deadline
-            ),
-        )
+        with _suppress_setup_check_transport_logs():
+            report = evaluate_setup(
+                cfg,
+                SetupTarget(host_id=host_id, harness=harness, project=project),
+                liveness=lambda url: _setup_check_liveness(url, deadline=deadline),
+                request_json=lambda method, path, payload: _setup_check_request_json(
+                    cfg, method, path, payload, deadline=deadline
+                ),
+            )
     except Exception:  # noqa: BLE001 - setup reports never disclose local details
         report = unavailable_setup_report()
     if as_json:

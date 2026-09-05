@@ -1,11 +1,16 @@
 """Tests for src/drover/server/__main__.py CLI."""
 
 import json
+import logging
 import subprocess
 import sys
 import textwrap
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -71,6 +76,27 @@ def _make_config(tmp_path: Path) -> Path:
         principal_id = "test"
     """))
     return cfg
+
+
+class _SetupCheckHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        pass
+
+
+@contextmanager
+def _serve_setup_check_http(handler):
+    server = _SetupCheckHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
 def seeded_server_db(tmp_path: Path) -> Path:
@@ -715,34 +741,214 @@ def test_setup_check_json_exits_two_without_echoing_private_arguments(
     assert "/private/project" not in result.output
 
 
-def test_setup_check_bounds_authenticated_response_bytes(monkeypatch):
+def test_setup_check_bounds_authenticated_response_bytes():
     """A control response over the support-report bound is rejected before decode."""
-    read_sizes: list[int] = []
+    body = b"x" * (server_main._SETUP_CHECK_MAX_RESPONSE_BYTES + 1)
 
-    class Response:
-        def __enter__(self):
-            return self
+    class OversizedHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-        def __exit__(self, exc_type, exc_value, traceback):
-            return False
+        def log_message(self, format, *args) -> None:
+            pass
 
-        def read(self, size: int) -> bytes:
-            read_sizes.append(size)
-            return b"x" * size
-
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
-    cfg = replace(default_config(), auth_api_token="test-token")
-
-    with pytest.raises(ValueError, match="response exceeds"):
-        server_main._setup_check_request_json(
-            cfg,
-            "GET",
-            "/harness/hosts",
-            None,
-            deadline=server_main.time.monotonic() + 1,
+    with _serve_setup_check_http(OversizedHandler) as server:
+        cfg = replace(
+            default_config(),
+            auth_api_token="test-token",
+            server_metrics_host="127.0.0.1",
+            metrics_http_port=server.server_port,
         )
+        with pytest.raises(ValueError, match="response exceeds"):
+            server_main._setup_check_request_json(
+                cfg,
+                "GET",
+                "/harness/hosts",
+                None,
+                deadline=server_main.time.monotonic() + 1,
+            )
 
-    assert read_sizes == [server_main._SETUP_CHECK_MAX_RESPONSE_BYTES + 1]
+
+def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypatch):
+    """Bytes arriving before socket inactivity timeout cannot extend a control read."""
+    completed = threading.Event()
+    body = b'{"hosts":[],"padding":"' + (b"x" * 80) + b'"}'
+
+    class DripHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(b"1\r\n" + bytes((byte,)) + b"\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.01)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                completed.set()
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(DripHandler) as server:
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.12)
+        cfg = replace(
+            default_config(),
+            auth_api_token="test-token",
+            server_metrics_host="127.0.0.1",
+            metrics_http_port=server.server_port,
+        )
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            server_main._setup_check_request_json(
+                cfg,
+                "GET",
+                "/harness/hosts",
+                None,
+                deadline=started + 0.5,
+            )
+        assert time.monotonic() - started < 0.3
+        assert completed.wait(timeout=0.4)
+
+
+def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch):
+    """Health headers arriving in fragments cannot extend the listener probe."""
+    completed = threading.Event()
+    raw_headers = b"Content-Length: 0\r\nX-Delayed: true\r\n\r\n"
+
+    class DripHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            try:
+                self.connection.sendall(b"HTTP/1.1 200 OK\r\n")
+                for byte in raw_headers:
+                    self.connection.sendall(bytes((byte,)))
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                completed.set()
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(DripHandler) as server:
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.12)
+        started = time.monotonic()
+        assert (
+            server_main._setup_check_liveness(
+                f"http://127.0.0.1:{server.server_port}/healthz",
+                deadline=started + 0.5,
+            )
+            is False
+        )
+        assert time.monotonic() - started < 0.3
+        assert completed.wait(timeout=1)
+
+
+def test_setup_check_control_redirect_does_not_reach_second_origin():
+    """A redirect response cannot forward the local API credential to another host."""
+    redirect_origin_headers: list[dict[str, str]] = []
+    second_origin_headers: list[dict[str, str]] = []
+
+    class SecondOriginHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            second_origin_headers.append(dict(self.headers))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "12")
+            self.end_headers()
+            self.wfile.write(b'{"hosts":[]}')
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(SecondOriginHandler) as second_origin:
+        second_host, second_port = second_origin.server_address
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                redirect_origin_headers.append(dict(self.headers))
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://{second_host}:{second_port}/redirect-target"
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args) -> None:
+                pass
+
+        with _serve_setup_check_http(RedirectHandler) as redirect_origin:
+            cfg = replace(
+                default_config(),
+                auth_api_token="private-bearer-token",
+                server_metrics_host="127.0.0.1",
+                metrics_http_port=redirect_origin.server_port,
+            )
+            with pytest.raises(ValueError):
+                server_main._setup_check_request_json(
+                    cfg,
+                    "GET",
+                    "/harness/hosts",
+                    None,
+                    deadline=time.monotonic() + 1,
+                )
+
+    assert len(redirect_origin_headers) == 1
+    assert redirect_origin_headers[0]["Authorization"] == "Bearer private-bearer-token"
+    assert second_origin_headers == []
+
+
+def test_setup_check_liveness_rejects_redirect():
+    """A redirected health response is not evidence for the configured listener."""
+    second_origin_requests: list[str] = []
+
+    class SecondOriginHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            second_origin_requests.append(self.path)
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(SecondOriginHandler) as second_origin:
+        second_host, second_port = second_origin.server_address
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(307)
+                self.send_header(
+                    "Location", f"http://{second_host}:{second_port}/healthy"
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args) -> None:
+                pass
+
+        with _serve_setup_check_http(RedirectHandler) as redirect_origin:
+            assert (
+                server_main._setup_check_liveness(
+                    f"http://127.0.0.1:{redirect_origin.server_port}/healthz",
+                    deadline=time.monotonic() + 1,
+                )
+                is False
+            )
+
+    assert second_origin_requests == []
 
 
 def test_setup_check_sanitizes_config_failure_before_evaluation(monkeypatch):
@@ -839,7 +1045,7 @@ def test_setup_check_sanitizes_request_construction_failure(monkeypatch):
     def fail_request(url, *args, **kwargs):
         raise ValueError(f"could not build request for {url}")
 
-    monkeypatch.setattr("urllib.request.Request", fail_request)
+    monkeypatch.setattr(server_main, "_setup_check_http_request", fail_request)
     result = CliRunner().invoke(
         main,
         [
@@ -859,6 +1065,78 @@ def test_setup_check_sanitizes_request_construction_failure(monkeypatch):
     assert "private-host" not in result.output
     assert "private-harness" not in result.output
     assert "/private/project" not in result.output
+
+
+def test_setup_check_verbose_suppresses_transport_log_details(monkeypatch, caplog):
+    """Verbose setup-check output cannot leak httpx request URLs or target details."""
+    request_paths: list[str] = []
+
+    class ControlHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            request_paths.append(self.path)
+            body = b'{"hosts":[]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args) -> None:
+            pass
+
+    with _serve_setup_check_http(ControlHandler) as server:
+        cfg = replace(
+            default_config(),
+            auth_api_token="private-bearer-token",
+            server_metrics_host="127.0.0.1",
+            metrics_http_port=server.server_port,
+        )
+        monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+
+        def evaluate_with_transport(cfg, target, *, liveness, request_json):
+            assert target.host_id == "private-host"
+            assert target.project == "/private/project"
+            assert request_json("GET", "/private-control-path", None) == {"hosts": []}
+            return server_main.unavailable_setup_report()
+
+        monkeypatch.setattr(server_main, "evaluate_setup", evaluate_with_transport)
+        transport_loggers = [logging.getLogger("httpx"), logging.getLogger("httpcore")]
+        logger_state = [
+            (tuple(logger.handlers), logger.propagate) for logger in transport_loggers
+        ]
+        caplog.set_level(logging.DEBUG)
+        result = CliRunner().invoke(
+            main,
+            [
+                "--verbose",
+                "setup-check",
+                "--host",
+                "private-host",
+                "--harness",
+                "codex",
+                "--project",
+                "/private/project",
+                "--json",
+            ],
+        )
+
+    assert result.exit_code == 2, result.output
+    assert request_paths == ["/private-control-path"]
+    assert [
+        (tuple(logger.handlers), logger.propagate) for logger in transport_loggers
+    ] == logger_state
+    assert not any(
+        record.name == "httpx" or record.name.startswith("httpcore")
+        for record in caplog.records
+    )
+    output = result.output + caplog.text
+    for private_text in (
+        "private-bearer-token",
+        "private-control-path",
+        "private-host",
+        "/private/project",
+    ):
+        assert private_text not in output
 
 
 def test_archive_help_preserves_existing_commands_and_adds_backup():
