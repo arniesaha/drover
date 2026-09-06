@@ -14,7 +14,6 @@ from typing import Any, Literal
 
 import duckdb
 
-from drover.event_identity import canonical_agent_events_cte
 from drover.server.harness.usage import CACHE_INSIDE_INPUT_HARNESSES
 
 _MAX_DAYS = 365
@@ -528,31 +527,79 @@ def _session_facts_sql(
     where: list[str] = []
     params: list[Any] = [snapshot_at, filters.days]
     if event_dates:
-        # The dedup window below (canonical_agent_events_cte) sorts every
-        # column it is fed, and raw_data is a multi-KB JSON blob per row
-        # (measured ~40% of this statement's runtime on a ~2.15M-event
-        # 30-day window). The only downstream consumer of raw_data is
-        # session_base's is_claude_mem_observer check, which only needs a
-        # single resolved cwd string. Pre-extract that cwd here, before the
-        # window, and carry a tiny synthetic raw_data instead of the
-        # original blob.
+        # Reduce each day's partition to a session/repo summary *before* anything
+        # combines them. The previous shape unioned one raw scan per partition and
+        # deduplicated across the lot, so a 30-day window pushed 2,488,925 events
+        # through a single WINDOW operator to produce 348 rows. Cost scaled with
+        # the window, not the answer: 9 partitions needed 192 MB, 39 needed the
+        # whole 1 GB instance budget -- and since that budget is instance-wide,
+        # the cockpit could starve the summarizer and the advisory worker with it
+        # (hundreds of "failed to render observed activity" OOMs on the hub).
+        #
+        # Every measure below combines across partitions, so the union now carries
+        # thousands of rows instead of millions. Measured on the hub's own store:
+        # 2,488,925 events collapse to about 5,000 summary rows, in 64 MB rather
+        # than 1 GB.
+        #
+        # Deduplication moves inside the partition, which is exactly equivalent
+        # here: a dedup_key identifies one logical event on one day, and over the
+        # hub's 30-day window no key appeared in two partitions (0 of 2,489,782).
+        # The ordering that picks the survivor is unchanged.
+        #
+        # Two sets of measures, because the consumers disagree about the cutoff:
+        # session_base counts only events at or after it, while the repo
+        # attributions deliberately look at whole days either side of a span. No
+        # post-hoc filter can recover that from an aggregate, so both leave the
+        # partition.
         per_date_source = """
-          SELECT id, dedup_key, session_id, agent_id, timestamp,
-                 repo_owner, repo_name, branch, date,
-                 CASE WHEN json_valid(raw_data) THEN to_json(struct_pack(cwd :=
-                   COALESCE(
-                     NULLIF(trim(json_extract_string(raw_data, '$.cwd')), ''),
-                     NULLIF(trim(json_extract_string(
-                       raw_data, '$.currentWorkingDirectory'
-                     )), ''),
-                     NULLIF(trim(json_extract_string(
-                       raw_data, '$.working_directory'
-                     )), ''),
-                     NULLIF(trim(json_extract_string(raw_data, '$.workspaceDir')), ''),
-                     ''
-                   )))::VARCHAR
-                 ELSE NULL END AS raw_data
-          FROM agent_events_for_date(?)
+          SELECT session_id, agent_id, date, repo_owner, repo_name,
+                 count(*) AS event_count,
+                 count(*) FILTER (WHERE ts >= cutoff) AS windowed_event_count,
+                 min(ts) FILTER (WHERE ts >= cutoff) AS started_at,
+                 max(ts) FILTER (WHERE ts >= cutoff) AS ended_at,
+                 COALESCE(
+                   bool_or(is_claude_mem_observer) FILTER (WHERE ts >= cutoff),
+                   FALSE
+                 ) AS is_claude_mem_observer
+          FROM (
+            SELECT ae.session_id, ae.agent_id, ae.date,
+                   ae.repo_owner, ae.repo_name,
+                   TRY_CAST(ae.timestamp AS TIMESTAMPTZ) AS ts,
+                   bounds.cutoff AS cutoff,
+                   ae.dedup_key AS dedup_key,
+                   CASE
+                     WHEN json_valid(ae.raw_data) THEN ends_with(
+                       rtrim(COALESCE(
+                         NULLIF(trim(json_extract_string(ae.raw_data, '$.cwd')), ''),
+                         NULLIF(trim(json_extract_string(
+                           ae.raw_data, '$.currentWorkingDirectory'
+                         )), ''),
+                         NULLIF(trim(json_extract_string(
+                           ae.raw_data, '$.working_directory'
+                         )), ''),
+                         NULLIF(trim(json_extract_string(
+                           ae.raw_data, '$.workspaceDir'
+                         )), ''),
+                         ''
+                       ), '/'),
+                       '/claude/mem/observer/sessions'
+                     )
+                     ELSE FALSE
+                   END AS is_claude_mem_observer,
+                   row_number() OVER (
+                     PARTITION BY ae.dedup_key
+                     ORDER BY (
+                                ae.repo_owner IS NOT NULL
+                                AND ae.repo_name IS NOT NULL
+                              ) DESC,
+                              TRY_CAST(ae.timestamp AS TIMESTAMPTZ) DESC NULLS LAST,
+                              ae.id DESC NULLS LAST
+                   ) AS _identity_rank
+            FROM agent_events_for_date(?) ae, bounds
+          )
+          WHERE (dedup_key IS NULL OR _identity_rank = 1)
+            AND session_id IS NOT NULL
+          GROUP BY session_id, agent_id, date, repo_owner, repo_name
         """
         event_source = "\nUNION ALL BY NAME\n".join(
             per_date_source for _ in event_dates
@@ -561,16 +608,16 @@ def _session_facts_sql(
     else:
         event_source = """
           SELECT
-            NULL::VARCHAR AS id,
-            NULL::VARCHAR AS dedup_key,
             NULL::VARCHAR AS session_id,
             NULL::VARCHAR AS agent_id,
-            NULL::TIMESTAMPTZ AS timestamp,
+            NULL::VARCHAR AS date,
             NULL::VARCHAR AS repo_owner,
             NULL::VARCHAR AS repo_name,
-            NULL::VARCHAR AS branch,
-            NULL::VARCHAR AS raw_data,
-            NULL::VARCHAR AS date
+            NULL::BIGINT AS event_count,
+            NULL::BIGINT AS windowed_event_count,
+            NULL::TIMESTAMPTZ AS started_at,
+            NULL::TIMESTAMPTZ AS ended_at,
+            FALSE AS is_claude_mem_observer
           WHERE FALSE
         """
     if span_dates:
@@ -610,34 +657,41 @@ def _session_facts_sql(
           SELECT CAST(? AS TIMESTAMPTZ)
                  - CAST(? AS INTEGER) * INTERVAL '1 day' AS cutoff
         ),
-        bounded_agent_events AS (
+        agent_event_summary AS (
           {event_source}
         ),
-        {canonical_agent_events_cte(source="bounded_agent_events")},
+        -- `mode()` over the raw events is a plurality vote weighted by how many
+        -- events carried each repo. The summary keeps those counts, so the same
+        -- vote is a sum and an ordered pick. Ties broke arbitrarily before and
+        -- now break on the repo name, which is at least repeatable.
+        session_project AS (
+          SELECT session_id, repo_owner || '/' || repo_name AS project_key
+          FROM (
+            SELECT session_id, repo_owner, repo_name,
+                   row_number() OVER (
+                     PARTITION BY session_id
+                     ORDER BY sum(windowed_event_count) DESC,
+                              repo_owner, repo_name
+                   ) AS rn
+            FROM agent_event_summary
+            WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
+            GROUP BY session_id, repo_owner, repo_name
+            HAVING sum(windowed_event_count) > 0
+          )
+          WHERE rn = 1
+        ),
         session_base AS (
           SELECT
-            session_id,
-            min(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS started_at,
-            max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS ended_at,
-            mode(repo_owner || '/' || repo_name) FILTER (
-              WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
-            ) AS project_key,
-            bool_or(
-              CASE
-                WHEN json_valid(raw_data) THEN ends_with(
-                  rtrim(COALESCE(
-                    NULLIF(trim(json_extract_string(raw_data, '$.cwd')), ''),
-                    ''
-                  ), '/'),
-                  '/claude/mem/observer/sessions'
-                )
-                ELSE FALSE
-              END
-            ) AS is_claude_mem_observer
-          FROM canonical_agent_events, bounds
-          WHERE session_id IS NOT NULL
-            AND TRY_CAST(timestamp AS TIMESTAMPTZ) >= bounds.cutoff
-          GROUP BY session_id
+            s.session_id,
+            min(s.started_at) AS started_at,
+            max(s.ended_at) AS ended_at,
+            any_value(p.project_key) AS project_key,
+            COALESCE(bool_or(s.is_claude_mem_observer), FALSE)
+              AS is_claude_mem_observer
+          FROM agent_event_summary s
+          LEFT JOIN session_project p USING (session_id)
+          GROUP BY s.session_id
+          HAVING sum(s.windowed_event_count) > 0
         ),
         bounded_spans AS (
           {span_source}
@@ -661,10 +715,10 @@ def _session_facts_sql(
                    ae.repo_name,
                    row_number() OVER (
                      PARTITION BY sd.session_id, sd.date
-                     ORDER BY count(*) DESC, ae.repo_owner, ae.repo_name
+                     ORDER BY sum(ae.event_count) DESC, ae.repo_owner, ae.repo_name
                    ) AS rn
             FROM span_session_days sd
-            JOIN canonical_agent_events ae
+            JOIN agent_event_summary ae
               ON ae.session_id = sd.session_id
              AND ae.date BETWEEN strftime(
                    TRY_CAST(sd.date AS DATE) - INTERVAL '1 day', '%Y-%m-%d'
@@ -686,10 +740,10 @@ def _session_facts_sql(
                    ae.repo_name,
                    row_number() OVER (
                      PARTITION BY sad.agent_id, sad.date
-                     ORDER BY count(*) DESC, ae.repo_owner, ae.repo_name
+                     ORDER BY sum(ae.event_count) DESC, ae.repo_owner, ae.repo_name
                    ) AS rn
             FROM span_agent_days sad
-            JOIN canonical_agent_events ae
+            JOIN agent_event_summary ae
               ON ae.agent_id = sad.agent_id AND ae.date = sad.date
             WHERE ae.repo_owner IS NOT NULL
             GROUP BY sad.agent_id, sad.date, ae.repo_owner, ae.repo_name
