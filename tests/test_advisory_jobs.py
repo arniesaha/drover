@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import drover.server.advisory.jobs as advisory_jobs_module
+import drover.server.advisory.service as advisory_service_module
 from drover.config import AdvisoryContentConfig, default_config, load_config
 from drover.schema import bootstrap
 from drover.server.__main__ import _create_content_analysis_worker
@@ -153,6 +156,29 @@ def _model_candidate(
             ),
         ),
         content_hash=content_hash,
+    )
+
+
+def _verification_candidate() -> FindingCandidate:
+    return FindingCandidate(
+        analyzer_id="verification.analyzer",
+        rule_id="verification.rule",
+        target_type="host",
+        target_id="mac-mini",
+        analyzer_class=AnalyzerClass.DETERMINISTIC,
+        severity=Severity.HIGH,
+        confidence=Confidence.CONFIRMED,
+        title="Verification fixture finding",
+        impact="The verification fixture is failing.",
+        remediation=("Re-run the verification fixture.",),
+        evidence=(
+            FindingEvidence(
+                source_ref="verification:mac-mini",
+                observed_at=NOW,
+                fields={"present": True},
+            ),
+        ),
+        content_hash="verification-v1",
     )
 
 
@@ -301,6 +327,399 @@ def test_same_target_hash_coalesces_to_one_job(db_path: Path) -> None:
             ).fetchone()[0]
             == 1
         )
+
+
+def test_check_again_rolls_back_job_when_request_mapping_cannot_persist(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A returned acknowledgement must always have a durable finding mapping."""
+
+    finding = AdvisoryRepository(db_path).observe(
+        _verification_candidate(), run_id="previous-run"
+    )
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+
+    def fail_mapping(*_args, **_kwargs) -> None:
+        raise RuntimeError("mapping write failed")
+
+    monkeypatch.setattr(advisory_jobs_module, "_record_check_request", fail_mapping)
+
+    with pytest.raises(RuntimeError, match="mapping write failed"):
+        service.check_again(finding.finding_id)
+
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM pipeline_jobs").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM pipeline_receipts").fetchone() == (0,)
+        assert con.execute(
+            "SELECT count(*) FROM advisory_check_requests"
+        ).fetchone() == (0,)
+
+
+def test_check_status_uses_a_writer_compatible_ledger_connection(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finding = AdvisoryRepository(db_path).observe(
+        _verification_candidate(), run_id="previous-run"
+    )
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    original = advisory_service_module.open_duckdb_connection
+    opens: list[dict] = []
+
+    def open_ledger(*args, **kwargs):
+        opens.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(advisory_service_module, "open_duckdb_connection", open_ledger)
+
+    assert (
+        service.check_status(finding.finding_id, queued["job_id"])["status"] == "queued"
+    )
+    assert opens == [{"role": "diagnostic"}]
+
+
+def test_check_status_times_out_once_and_refuses_parallel_reads(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(advisory_service_module, "CHECK_STATUS_BUDGET_SECONDS", 0.05)
+    service = InsightsService(db_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_read(_finding_id: str, _job_id: str, **_kwargs):
+        entered.set()
+        assert release.wait(1)
+        return {"status": "queued"}
+
+    monkeypatch.setattr(service, "_read_check_status", slow_read, raising=False)
+    started = time.monotonic()
+    try:
+        first = service.check_status("a" * 32, "job-1")
+        elapsed = time.monotonic() - started
+        second = service.check_status("a" * 32, "job-2")
+    finally:
+        release.set()
+
+    assert entered.is_set()
+    assert elapsed < 0.2
+    assert first["status"] == "unavailable"
+    assert second["status"] == "unavailable"
+
+
+def test_same_key_timeout_makes_every_waiter_unavailable(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt after one timeout cannot turn another poll into a 503."""
+
+    class ControlledFuture(Future[dict[str, object]]):
+        waits = 0
+
+        def result(self, timeout=None):  # type: ignore[override]
+            type(self).waits += 1
+            if type(self).waits == 1:
+                first_waiter.set()
+                assert second_waiter.wait(1)
+                raise advisory_service_module.FuturesTimeout()
+            second_waiter.set()
+            return super().result(timeout)
+
+    service = InsightsService(db_path)
+    first_waiter = threading.Event()
+    second_waiter = threading.Event()
+    interrupted = threading.Event()
+    done = threading.Event()
+    results: list[object] = []
+    monkeypatch.setattr(advisory_service_module, "Future", ControlledFuture)
+
+    def interrupted_read(_finding_id: str, _job_id: str, **_kwargs):
+        assert interrupted.wait(1)
+        raise RuntimeError("DuckDB query interrupted")
+
+    original_interrupt = service._interrupt_check_status_connections
+
+    def signal_interrupt(key, future) -> None:
+        original_interrupt(key, future)
+        interrupted.set()
+
+    monkeypatch.setattr(service, "_read_check_status", interrupted_read)
+    monkeypatch.setattr(
+        service, "_interrupt_check_status_connections", signal_interrupt
+    )
+
+    def poll() -> None:
+        try:
+            results.append(service.check_status("a" * 32, "job-1"))
+        except Exception as exc:  # test captures the incorrect 503 path
+            results.append(exc)
+        if len(results) == 2:
+            done.set()
+
+    first = threading.Thread(target=poll)
+    second = threading.Thread(target=poll)
+    first.start()
+    assert first_waiter.wait(1)
+    second.start()
+    assert done.wait(1)
+    first.join(1)
+    second.join(1)
+
+    assert len(results) == 2
+    assert all(
+        isinstance(result, dict) and result["status"] == "unavailable"
+        for result in results
+    )
+
+
+def test_check_status_propagates_unrelated_read_errors(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = InsightsService(db_path)
+
+    def broken_read(_finding_id: str, _job_id: str, **_kwargs):
+        raise RuntimeError("unexpected ledger failure")
+
+    monkeypatch.setattr(service, "_read_check_status", broken_read)
+
+    with pytest.raises(RuntimeError, match="unexpected ledger failure"):
+        service.check_status("a" * 32, "job-1")
+
+
+def test_check_status_interrupt_is_scoped_and_tolerates_interrupt_failure(
+    db_path: Path,
+) -> None:
+    class BrokenConnection:
+        interrupted = False
+
+        def interrupt(self) -> None:
+            self.interrupted = True
+            raise RuntimeError("interrupt failed")
+
+    service = InsightsService(db_path)
+    future: Future[dict[str, object]] = Future()
+    other: Future[dict[str, object]] = Future()
+    connection = BrokenConnection()
+    with service._check_status_lock:
+        service._check_status_inflight = (("a" * 32, "job-1"), future)
+        service._check_status_connections = {future: {connection}, other: set()}
+
+    service._interrupt_check_status_connections(("a" * 32, "job-1"), future)
+    service._interrupt_check_status_connections(("a" * 32, "job-2"), other)
+
+    assert connection.interrupted is True
+
+
+def test_check_status_does_not_call_a_flapping_hold_resolved(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        attempt = Ledger(con).lease_job(queued["job_id"], worker_id="test-worker")
+    _control_plane_execute(
+        db_path,
+        "UPDATE advisory_findings SET regression_count = 3, regressed_at = ? "
+        "WHERE finding_id = ?",
+        [datetime.now(timezone.utc), finding.finding_id],
+    )
+    repository.mark_passing(finding.finding_id, run_id=attempt.attempt_id)
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).succeed_job(queued["job_id"])
+
+    status = service.check_status(finding.finding_id, queued["job_id"])
+
+    assert status["finding_state"] == "open"
+    assert status["outcome"] == "inconclusive"
+    assert status["outcome_reason"] == "finding remains open after passing evidence"
+
+
+def test_check_status_reports_resolved_for_exact_passing_evidence(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        attempt = Ledger(con).lease_job(queued["job_id"], worker_id="test-worker")
+    repository.mark_passing(finding.finding_id, run_id=attempt.attempt_id)
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).succeed_job(queued["job_id"])
+
+    status = service.check_status(finding.finding_id, queued["job_id"])
+
+    assert status["finding_state"] == "resolved"
+    assert status["outcome"] == "resolved"
+    assert status["evidence"][0]["outcome"] == "passing"
+
+
+def test_check_status_keeps_its_answer_after_a_later_run_moves_the_pointer(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settled check does not decay to inconclusive when another run happens.
+
+    The finding row used to be read with ``AND latest_run_id = ?``, so the daily
+    full review or ``enqueue_operational_checks`` moving that pointer discarded
+    this attempt's own occurrences and returned "inconclusive" with no evidence.
+    A client polling a resolved check watched it flip for no visible reason.
+    """
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        attempt = Ledger(con).lease_job(queued["job_id"], worker_id="test-worker")
+    repository.mark_passing(finding.finding_id, run_id=attempt.attempt_id)
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).succeed_job(queued["job_id"])
+
+    settled = service.check_status(finding.finding_id, queued["job_id"])
+    assert settled["outcome"] == "resolved"
+
+    # A later analyzer pass records against the same finding, moving latest_run_id.
+    with duckdb.connect(str(control_plane_path(db_path))) as con:
+        con.execute(
+            "UPDATE advisory_findings SET latest_run_id = ? WHERE finding_id = ?",
+            ["a-later-unrelated-run", finding.finding_id],
+        )
+
+    after = service.check_status(finding.finding_id, queued["job_id"])
+
+    assert after["outcome"] == "resolved"
+    assert after["finding_state"] == "resolved"
+    assert after["evidence"][0]["outcome"] == "passing"
+
+
+def test_check_status_rejects_unmapped_finding_and_historical_job(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    requested = repository.observe(_verification_candidate(), run_id="previous-run")
+    other = repository.observe(
+        replace(_verification_candidate(), rule_id="verification.other"),
+        run_id="previous-run",
+    )
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    requested_job = service.check_again(requested.finding_id)
+    historical = enqueue_advisory_check(
+        db_path,
+        analyzer_id="verification.analyzer",
+        target_id="other-host",
+        source_version="historical-v1",
+    )
+
+    with pytest.raises(KeyError):
+        service.check_status(other.finding_id, requested_job["job_id"])
+    with pytest.raises(KeyError):
+        service.check_status(requested.finding_id, historical.job_id)
+
+
+def test_check_again_reuses_live_mapping_and_records_completed_replay(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finding = AdvisoryRepository(db_path).observe(
+        _verification_candidate(), run_id="previous-run"
+    )
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    first = service.check_again(finding.finding_id)
+    reused = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        ledger = Ledger(con)
+        ledger.lease_job(first["job_id"], worker_id="test-worker")
+        ledger.succeed_job(first["job_id"])
+    replayed = service.check_again(finding.finding_id)
+
+    assert reused["job_id"] == first["job_id"]
+    assert replayed["job_id"] != first["job_id"]
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        rows = con.execute(
+            "SELECT job_id, finding_id FROM advisory_check_requests "
+            "WHERE finding_id = ? ORDER BY job_id",
+            [finding.finding_id],
+        ).fetchall()
+    assert rows == sorted(
+        [
+            (first["job_id"], finding.finding_id),
+            (replayed["job_id"], finding.finding_id),
+        ]
+    )
+
+
+def test_check_status_uses_only_the_current_attempt_evidence(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        attempt = Ledger(con).lease_job(queued["job_id"], worker_id="test-worker")
+    assert (
+        service.check_status(finding.finding_id, queued["job_id"])["status"]
+        == "running"
+    )
+
+    repository.observe(_verification_candidate(), run_id=attempt.attempt_id)
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).succeed_job(queued["job_id"])
+
+    status = service.check_status(finding.finding_id, queued["job_id"])
+    assert status["status"] == "completed"
+    assert status["outcome"] == "still_present"
+    assert status["evidence"][0]["outcome"] == "failing"
+
+
+def test_check_status_is_inconclusive_without_exact_attempt_evidence(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).lease_job(queued["job_id"], worker_id="test-worker")
+        Ledger(con).succeed_job(queued["job_id"])
+
+    status = service.check_status(finding.finding_id, queued["job_id"])
+    assert status["status"] == "completed"
+    assert status["outcome"] == "inconclusive"
+    assert status["evidence"] == []
+
+
+@pytest.mark.parametrize(
+    ("close", "expected"),
+    [("fail_job", "failed"), ("cancel_job", "cancelled")],
+)
+def test_check_status_never_resolves_failed_or_cancelled_attempts(
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    close: str,
+    expected: str,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        ledger = Ledger(con)
+        ledger.lease_job(queued["job_id"], worker_id="test-worker")
+        getattr(ledger, close)(queued["job_id"])
+
+    status = service.check_status(finding.finding_id, queued["job_id"])
+    assert status["status"] == expected
+    assert status["outcome"] is None
+    assert status["evidence"] == []
 
 
 def test_new_source_version_replays_completed_subject(db_path: Path) -> None:

@@ -1148,6 +1148,13 @@ class MetricsCollector:
     def render_insight_json(self, finding_id: str) -> tuple[int, str]:
         return _insight_response(lambda: self._insights().get_insight(finding_id))
 
+    def render_insight_check_status_json(
+        self, finding_id: str, job_id: str
+    ) -> tuple[int, str]:
+        return _insight_response(
+            lambda: self._insights().check_status(finding_id, job_id)
+        )
+
     def render_content_analysis_status_json(self) -> tuple[int, str]:
         try:
             payload = self._insights().content_analysis_status()

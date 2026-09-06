@@ -1178,6 +1178,36 @@ def test_check_again_enqueues_without_configuration_mutation(tmp_path):
         server.server_close()
 
 
+def test_check_status_reports_the_requested_queued_job_only(tmp_path):
+    collector = _make_collector(tmp_path)
+    finding = _observe_provider_insight(collector)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with _authed_post(
+            base + f"/insights/{finding.finding_id}/check", {}
+        ) as response:
+            queued = json.loads(response.read())
+
+        with _authed_get(
+            base + f"/insights/{finding.finding_id}/checks/{queued['job_id']}"
+        ) as response:
+            status = json.loads(response.read())
+
+        assert status == {
+            "status": "queued",
+            "outcome": None,
+            "checked_at": None,
+            "evidence": [],
+            "finding_state": "open",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
