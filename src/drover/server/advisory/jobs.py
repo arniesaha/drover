@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from pathlib import Path
@@ -10,6 +11,8 @@ from uuid import uuid4
 
 from drover.server.db import open_duckdb_connection
 from drover.server.ledger import JOB_LEASED, JOB_PENDING, JOB_RETRY_WAIT, Job, Ledger
+
+log = logging.getLogger(__name__)
 
 ADVISORY_JOB_KIND = "analyze_advisory_target"
 ADVISORY_RECEIPT_KIND = "advisory_target_snapshot"
@@ -114,7 +117,15 @@ def enqueue_advisory_check(
         con.execute("COMMIT")
         return job
     except Exception:
-        con.execute("ROLLBACK")
+        # If the COMMIT itself failed there is no transaction left to roll back,
+        # and DuckDB raises "cannot rollback - no transaction is active" from
+        # inside the handler -- which replaces the real error with a misleading
+        # one. Newly reachable here because UNIQUE (job_id, finding_id) turns two
+        # concurrent Check Again requests into a commit-time conflict.
+        try:
+            con.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 - the original failure is what matters
+            log.debug("no active transaction to roll back", exc_info=True)
         raise
     finally:
         con.close()

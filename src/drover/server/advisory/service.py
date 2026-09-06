@@ -758,7 +758,17 @@ class InsightsService:
                 )
                 start = (future, worker)
         if start is not None:
-            start[1].start()
+            try:
+                start[1].start()
+            except BaseException:
+                # The slot is published before the thread exists, so a
+                # failed start would leave a Future nobody completes and
+                # every later request for this key would report
+                # unavailable until the process restarted.
+                with self._check_status_lock:
+                    if self._check_status_inflight == (key, start[0]):
+                        self._check_status_inflight = None
+                raise
         try:
             return future.result(timeout=CHECK_STATUS_BUDGET_SECONDS)
         except FuturesTimeout:
@@ -830,7 +840,14 @@ class InsightsService:
             return _verification_status(
                 status=status,
                 outcome=None,
-                checked_at=_wire_datetime(finished_at),
+                # A retry_wait job reports "queued", and finished_at then belongs
+                # to the earlier failed attempt. Sending it would date a check
+                # that has not happened yet.
+                checked_at=(
+                    None
+                    if status in {"queued", "running"}
+                    else _wire_datetime(finished_at)
+                ),
                 evidence=[],
                 finding_state=finding_state,
             )
@@ -839,13 +856,21 @@ class InsightsService:
             with control_plane_connection(self.duckdb_path, timeout=0.25) as con:
                 self._track_check_status_connection(future, con)
                 try:
+                    # Read the finding's current state, not the state as of this
+                    # run. Pinning on latest_run_id meant that any later analyzer
+                    # pass -- enqueue_operational_checks, or the daily full review
+                    # -- moved the pointer and turned an already-answered check
+                    # into "inconclusive" with no evidence, so a polling client
+                    # watched a settled "resolved" decay for no visible reason.
+                    # This attempt's occurrences below are still the evidence of
+                    # what it found; a later run does not invalidate them.
                     finding_row = con.execute(
                         """
                         SELECT state
                         FROM advisory_findings
-                        WHERE finding_id = ? AND latest_run_id = ?
+                        WHERE finding_id = ?
                         """,
-                        [finding_id, attempt_id],
+                        [finding_id],
                     ).fetchone()
                     rows = con.execute(
                         """
@@ -944,16 +969,29 @@ class InsightsService:
         key: tuple[str, str],
         future: Future[dict[str, Any]],
     ) -> None:
+        # Interrupt while still holding _check_status_lock, not after releasing it.
+        # With DROVER_CONTROL_PLANE_PIN=1 the control-plane handle is process-wide,
+        # so between reading this set and interrupting, the read could finish,
+        # untrack, release the control-plane lock, and another component could
+        # acquire the same connection and start its own query -- which the
+        # interrupt would then abort. A /harness read cancelled by an unrelated
+        # check-status timeout is the failure this avoids, and it is the same
+        # surface as the outages in #332 and #345.
+        #
+        # Holding the lock closes the window: _untrack_check_status_connection
+        # needs it too, so the read cannot leave its `with control_plane_connection`
+        # block while we are in here, and the control-plane lock stays held.
+        # Interrupting our own finished query is a no-op, so the worst case is
+        # harmless. DuckDB's interrupt() only sets a flag, so it cannot block here.
         with self._check_status_lock:
             if self._check_status_inflight != (key, future):
                 return
             self._check_status_timed_out.add(future)
-            connections = tuple(self._check_status_connections.get(future, ()))
-        for con in connections:
-            try:
-                con.interrupt()
-            except Exception:  # noqa: BLE001 - deadline still reports unavailable
-                log.debug("failed to interrupt timed-out check-status read")
+            for con in tuple(self._check_status_connections.get(future, ())):
+                try:
+                    con.interrupt()
+                except Exception:  # noqa: BLE001 - deadline still reports unavailable
+                    log.debug("failed to interrupt timed-out check-status read")
 
     def _enqueue_check(self, finding: Finding, target_id: str, source_version: str):
         return enqueue_advisory_check(
@@ -1013,7 +1051,17 @@ class InsightsService:
                 )
                 start = (future, worker)
         if start is not None:
-            start[1].start()
+            try:
+                start[1].start()
+            except BaseException:
+                # The slot is published before the thread exists, so a
+                # failed start would leave a Future nobody completes and
+                # every later request for this key would report
+                # unavailable until the process restarted.
+                with self._scope_lock:
+                    if self._scope_inflight == (key, start[0]):
+                        self._scope_inflight = None
+                raise
         try:
             return future.result(timeout=CHECK_SCOPE_BUDGET_SECONDS)
         except FuturesTimeout as exc:

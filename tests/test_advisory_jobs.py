@@ -557,6 +557,44 @@ def test_check_status_reports_resolved_for_exact_passing_evidence(
     assert status["evidence"][0]["outcome"] == "passing"
 
 
+def test_check_status_keeps_its_answer_after_a_later_run_moves_the_pointer(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settled check does not decay to inconclusive when another run happens.
+
+    The finding row used to be read with ``AND latest_run_id = ?``, so the daily
+    full review or ``enqueue_operational_checks`` moving that pointer discarded
+    this attempt's own occurrences and returned "inconclusive" with no evidence.
+    A client polling a resolved check watched it flip for no visible reason.
+    """
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(_verification_candidate(), run_id="previous-run")
+    service = InsightsService(db_path)
+    monkeypatch.setattr(service, "_check_scope", lambda _finding: ("mac-mini", "v1"))
+    queued = service.check_again(finding.finding_id)
+    with duckdb.connect(str(db_path)) as con:
+        attempt = Ledger(con).lease_job(queued["job_id"], worker_id="test-worker")
+    repository.mark_passing(finding.finding_id, run_id=attempt.attempt_id)
+    with duckdb.connect(str(db_path)) as con:
+        Ledger(con).succeed_job(queued["job_id"])
+
+    settled = service.check_status(finding.finding_id, queued["job_id"])
+    assert settled["outcome"] == "resolved"
+
+    # A later analyzer pass records against the same finding, moving latest_run_id.
+    with duckdb.connect(str(control_plane_path(db_path))) as con:
+        con.execute(
+            "UPDATE advisory_findings SET latest_run_id = ? WHERE finding_id = ?",
+            ["a-later-unrelated-run", finding.finding_id],
+        )
+
+    after = service.check_status(finding.finding_id, queued["job_id"])
+
+    assert after["outcome"] == "resolved"
+    assert after["finding_state"] == "resolved"
+    assert after["evidence"][0]["outcome"] == "passing"
+
+
 def test_check_status_rejects_unmapped_finding_and_historical_job(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
