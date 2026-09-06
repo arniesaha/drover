@@ -674,6 +674,114 @@ public struct InsightPresentation: Sendable, Equatable {
     }
 }
 
+/// Presentation-only wording for an insight's arbitrary evidence fields.
+///
+/// `JSONValue.displayString` intentionally remains useful for generic JSON
+/// surfaces, where `null` is a useful structural value. An absent observation
+/// is different in the cockpit: presenting it as zero or as raw JSON would
+/// make an unknown operational value look known.
+public enum InsightEvidencePresentation {
+    public static func valueText(_ value: JSONValue?) -> String {
+        guard let value, value != .null else { return "Not reported" }
+        return value.displayString
+    }
+
+    public static func label(for field: String) -> String {
+        field
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
+            .capitalized
+    }
+}
+
+/// One spoken description for the detail header after SwiftUI combines its
+/// children. Keep the status and compact evidence metadata here so they do
+/// not disappear for VoiceOver when the visible chips wrap across lines.
+public enum InsightDetailHeaderPresentation {
+    public static func accessibilityLabel(
+        severity: String,
+        status: String,
+        confidence: String,
+        source: String,
+        title: String,
+        targetID: String,
+        evidenceSummary: String,
+        uncertainty: String? = nil
+    ) -> String {
+        var parts = [severity, status, source, confidence, title, "target \(targetID)", evidenceSummary]
+        if let uncertainty { parts.append(uncertainty) }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Local UI state for a reanalysis request. A successful request only means
+/// the work was accepted; a later refresh supplies any changed disposition.
+public enum InsightCheckActionState: Sendable, Equatable {
+    case ready
+    case pending
+    case queued
+    case failed(String)
+
+    public var isPending: Bool {
+        if case .pending = self { return true }
+        return false
+    }
+
+    public var notice: String? {
+        switch self {
+        case .ready: nil
+        case .pending: "Checking again…"
+        case .queued: "Reanalysis queued. Refresh to view the latest result."
+        case .failed(let error): error
+        }
+    }
+
+    /// Returns false for an in-flight request, preventing a second tap from
+    /// scheduling duplicate analysis before this request is acknowledged.
+    public mutating func begin() -> Bool {
+        guard !isPending else { return false }
+        self = .pending
+        return true
+    }
+
+    public mutating func finish(accepted: Bool, error: String? = nil) {
+        if accepted {
+            self = .queued
+        } else if let error {
+            self = .failed(error)
+        } else {
+            // A refusal that set no message is a cancellation, or a cockpit that
+            // is simply unavailable. Neither is a failure worth showing in error
+            // styling, and the view showed nothing for them before.
+            self = .ready
+        }
+    }
+}
+
+/// The detail payload can lag behind a lifecycle action. This keeps controls
+/// aligned with the store's current disposition without changing that store's
+/// authoritative state or network behavior.
+public struct InsightLifecycleActionsPresentation: Sendable, Equatable {
+    public let canCheckAgain: Bool
+    public let canAcknowledge: Bool
+    public let canDismiss: Bool
+
+    public init(state: InsightState, checkAgainAvailable: Bool) {
+        canCheckAgain = checkAgainAvailable
+        switch state {
+        case .open, .regressed:
+            canAcknowledge = true
+            canDismiss = true
+        case .acknowledged:
+            canAcknowledge = false
+            canDismiss = true
+        case .dismissed, .resolved:
+            canAcknowledge = false
+            canDismiss = false
+        }
+    }
+}
+
 private enum ProviderNumberFormatting {
     static func amount(_ value: Double) -> String {
         let formatter = NumberFormatter()

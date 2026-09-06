@@ -35,6 +35,62 @@ enum FixtureScenarioData {
     static let launchedSessionID = "fixture-launched-session"
     static let otherSessionID = "fixture-other-session"
     static let syntheticTurnID = "fixture-turn"
+    static let insightFindingID = "0123456789abcdef0123456789abcdef"
+
+    static func insightSummaryData() -> Data {
+        jsonData(insightFinding())
+    }
+
+    static func insightDetailData() -> Data {
+        jsonData([
+            "finding": insightFinding(),
+            "evidence": [
+                [
+                    "observed_at": "2026-08-08T18:01:00Z",
+                    "source_ref": "fixture-source-a",
+                    "fields": [
+                        "host": "fixture-host",
+                        "items": ["codex", 20],
+                        "missing_value": NSNull(),
+                    ] as [String: Any],
+                    "excerpt": "Synthetic evidence for visual review.",
+                ] as [String: Any],
+                [
+                    "observed_at": "2026-08-08T17:59:00Z",
+                    "source_ref": "fixture-source-b",
+                    "fields": ["attempt_count": 20] as [String: Any],
+                    "excerpt": NSNull(),
+                ] as [String: Any],
+            ],
+            "actions": ["check_again": ["available": true]],
+        ])
+    }
+
+    private static func insightFinding() -> [String: Any] {
+        [
+            "finding_id": insightFindingID,
+            "analyzer_id": "fixture-analyzer",
+            "rule_id": "fixture-rule",
+            "target_type": "hook",
+            "target_id": "fixture-host/codex/pre-tool",
+            "analyzer_class": "deterministic",
+            "severity": "high",
+            "confidence": "confirmed",
+            "title": "Fixture hook needs attention",
+            "impact": "The check cannot run until the hook is restored.",
+            "remediation": [
+                "Restore the hook from the checked-in configuration.",
+                "Run Check Again to verify the restored hook.",
+            ],
+            "state": "open",
+            "dismissal_reason": NSNull(),
+            "first_seen_at": "2026-08-08T18:00:00Z",
+            "last_seen_at": "2026-08-08T18:01:00Z",
+            "resolved_at": NSNull(),
+            "dismissed_at": NSNull(),
+            "regressed_at": NSNull(),
+        ]
+    }
 
     static func snapshotData() -> Data {
         jsonData([
@@ -64,6 +120,22 @@ enum FixtureScenarioData {
                 "source": "fixture",
                 "host_id": coreJourney.hostID,
             ]],
+        ])
+    }
+
+    /// A snapshot that declares the cockpit available with insights enabled.
+    ///
+    /// `CockpitStore` gates every insight lifecycle action on `isCockpitAvailable`,
+    /// which is false until a snapshot carrying `cockpit_api_version` arrives. A
+    /// fixture that skips this renders the detail layout but cannot reach its own
+    /// Check Again, Acknowledge or Dismiss actions.
+    static func insightCapabilitySnapshotData() -> Data {
+        jsonData([
+            "hosts": [],
+            "sessions": [],
+            "cwd_suggestions": [],
+            "cockpit_api_version": 1,
+            "cockpit_sections": ["insights"],
         ])
     }
 
