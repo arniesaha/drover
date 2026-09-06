@@ -19,7 +19,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import duckdb
 
@@ -67,6 +67,7 @@ EXPECTED_TABLES = (
     "provider_connections",
     "span_partition_activity",
     "agent_event_partition_activity",
+    "agent_event_day_summary",
     # `harness_*`, `live_recap_jobs`, `live_session_recaps`, `advisory_findings`
     # and `advisory_occurrences` are deliberately absent: these tables were moved
     # to the control-plane store to isolate them from parquet scans that can
@@ -110,6 +111,21 @@ _SPAN_PARTITION_ACTIVITY_DDL = """
 CREATE TABLE IF NOT EXISTS span_partition_activity (
   date VARCHAR PRIMARY KEY,
   latest_activity_at TIMESTAMPTZ NOT NULL
+);
+"""
+
+_AGENT_EVENT_DAY_SUMMARY_DDL = """
+CREATE TABLE IF NOT EXISTS agent_event_day_summary (
+  date VARCHAR NOT NULL,
+  session_id VARCHAR NOT NULL,
+  agent_id VARCHAR,
+  repo_owner VARCHAR,
+  repo_name VARCHAR,
+  event_count BIGINT NOT NULL,
+  first_event_at TIMESTAMPTZ,
+  last_event_at TIMESTAMPTZ,
+  is_claude_mem_observer BOOLEAN NOT NULL,
+  summarised_ingested_at TIMESTAMP NOT NULL
 );
 """
 
@@ -1066,6 +1082,123 @@ def _refresh_agent_event_partition_activity(
             """,
             [partition_date, latest_ingested_at],
         )
+
+
+#: Days summarised per call on a caller-owned connection.
+#:
+#: Each day costs a fraction of a second and yields a few dozen rows, but the
+#: buffer pool keeps the parquet it touched and will not give it back within the
+#: connection: on the hub's store the seventh day in one connection exhausts the
+#: 1 GB budget however often it checkpoints, and the ceiling falls as the store
+#: grows. One day per connection has no such limit -- 34 days took 10 seconds --
+#: so a caller holding its own connection does one day, and a backfill that can
+#: open its own goes through `backfill_agent_event_day_summary`.
+_DAY_SUMMARY_BATCH = 1
+
+
+def refresh_agent_event_day_summary(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    dates: Iterable[str] | None = None,
+    limit: int | None = _DAY_SUMMARY_BATCH,
+) -> list[str]:
+    """Summarise closed event partitions once, so reads never rescan them.
+
+    The observed-activity query used to scan every day in its window on every
+    request: 2,488,925 events for a 30-day answer of 348 rows, which needed the
+    whole 1 GB analytical budget and starved everything sharing it. A day's
+    events do not change once it is ingested, so the reduction belongs here.
+
+    Freshness is decided against ``agent_event_partition_activity``, which
+    already tracks each partition's newest file. A day whose parquet has been
+    touched since its summary was written is rebuilt; the rest are skipped.
+
+    Returns the dates rebuilt, so callers can log how much work this did.
+    """
+    from drover.server.cockpit.analytics import agent_event_day_summary_sql
+
+    if dates is None:
+        rows = con.execute("""
+            SELECT a.date
+            FROM agent_event_partition_activity a
+            LEFT JOIN (
+              SELECT date, max(summarised_ingested_at) AS summarised_ingested_at
+              FROM agent_event_day_summary GROUP BY date
+            ) s USING (date)
+            WHERE a.date <> '_seed'
+              AND (s.summarised_ingested_at IS NULL
+                   OR s.summarised_ingested_at < a.latest_ingested_at)
+            ORDER BY a.date
+            """).fetchall()
+        stale = [str(r[0]) for r in rows]
+    else:
+        stale = [str(d) for d in dates if str(d) != "_seed"]
+    if limit is not None:
+        # Newest first: a cold store serves recent windows correctly right away
+        # and backfills older days over later passes.
+        stale = sorted(stale, reverse=True)[:limit]
+    if not stale:
+        return []
+
+    summary_sql = agent_event_day_summary_sql(windowed=False)
+    rebuilt: list[str] = []
+    for partition_date in stale:
+        ingested = con.execute(
+            "SELECT latest_ingested_at FROM agent_event_partition_activity WHERE date = ?",
+            [partition_date],
+        ).fetchone()
+        if ingested is None:
+            continue
+        con.execute(
+            "DELETE FROM agent_event_day_summary WHERE date = ?", [partition_date]
+        )
+        con.execute(
+            f"""
+            INSERT INTO agent_event_day_summary BY NAME
+            SELECT date, session_id, agent_id, repo_owner, repo_name,
+                   event_count, started_at AS first_event_at,
+                   ended_at AS last_event_at, is_claude_mem_observer,
+                   CAST(? AS TIMESTAMP) AS summarised_ingested_at
+            FROM ({summary_sql})
+            """,
+            [ingested[0], partition_date],
+        )
+        # Checkpoint per day. Without it the pass accumulates written blocks and
+        # scanned partitions in one buffer pool and exhausts the same budget it
+        # exists to protect -- it OOM'd around the twentieth day of a 32-day
+        # backfill. One day at a time is the whole point of doing this here.
+        con.execute("CHECKPOINT")
+        rebuilt.append(partition_date)
+    return rebuilt
+
+
+def backfill_agent_event_day_summary(
+    duckdb_path: str | Path, *, max_days: int = 45
+) -> int:
+    """Summarise pending days, one connection each, newest first.
+
+    A connection cannot summarise more than a handful of days before the buffer
+    pool it cannot release exhausts the budget, and a caller that already holds
+    the write connection cannot reconnect underneath itself. So the backfill owns
+    its connections and closes each one, which is what makes it bounded.
+
+    Returns the number of days summarised. Safe to call repeatedly: it only ever
+    picks up days whose summary is missing or older than the partition.
+    """
+    from drover.server.db import open_duckdb_connection
+
+    done = 0
+    for _ in range(max_days):
+        con = open_duckdb_connection(duckdb_path, role="worker")
+        try:
+            con.execute(_AGENT_EVENT_DAY_SUMMARY_DDL)
+            built = refresh_agent_event_day_summary(con, limit=1)
+        finally:
+            con.close()
+        if not built:
+            break
+        done += 1
+    return done
 
 
 def _pr_events_view(parquet_dir: Path) -> str:
@@ -2075,6 +2208,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_TASKS_DDL)
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
         con.execute(_AGENT_EVENT_PARTITION_ACTIVITY_DDL)
+        con.execute(_AGENT_EVENT_DAY_SUMMARY_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
@@ -2111,6 +2245,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_span_query_macros(parquet_dir))
         _refresh_span_partition_activity(con)
         _refresh_agent_event_partition_activity(con, parquet_dir)
+        refresh_agent_event_day_summary(con)
         con.execute(_SESSION_LINKS_VIEW)
         con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
         con.execute(_pr_events_view(parquet_dir))

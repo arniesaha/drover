@@ -2596,6 +2596,33 @@ def run(
         log.exception("advisory worker failed to start; continuing without it")
         advisory_worker = None
 
+    # Summarise event partitions in the background, one connection per day.
+    # Bootstrap does at most one day because it holds the write connection and
+    # cannot reconnect underneath itself; this finishes the rest. Reads fall back
+    # to scanning any day that is not summarised yet, so a hub is correct from
+    # the first second and merely gets faster as this proceeds.
+    #
+    # Only when the cockpit is actually being served: these summaries exist to
+    # keep its activity query off the raw partitions, and a run without the
+    # metrics server has nothing to make faster.
+    if not no_metrics:
+
+        def _backfill_day_summaries() -> None:
+            try:
+                from drover.schema import backfill_agent_event_day_summary
+
+                summarised = backfill_agent_event_day_summary(cfg.duckdb_path)
+                if summarised:
+                    log.info("summarised %d event partition(s)", summarised)
+            except Exception:  # noqa: BLE001 - a cold cache only costs speed
+                log.exception("event day summary backfill failed; reads will scan")
+
+        threading.Thread(
+            target=_backfill_day_summaries,
+            name="agent-event-day-summary",
+            daemon=True,
+        ).start()
+
     usage_rollup: UsageRollupWorker | None = None
     try:
         usage_rollup = UsageRollupWorker(duckdb_path=cfg.duckdb_path)
