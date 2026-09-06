@@ -168,6 +168,48 @@ struct StoreTests {
     #expect(!store.isReachable)
 }
 
+/// A counter the mock handler can touch from whatever thread URLProtocol uses.
+private final class LockedCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+@Test @MainActor func concurrentRefreshesShareOneRequest() async throws {
+    // The store is @MainActor but refresh() suspends at the network call, so the
+    // poll loop, pull-to-refresh, a Retry tap and a scene-phase change can each
+    // start one while another is running. Every extra request is load on a hub
+    // already too slow to answer, and superseded ones land as the cancellations
+    // that drive the fast-retry path. The hub logged 51 cancelled
+    // /harness/hosts requests in one second this way (drover#331).
+    let requests = LockedCount()
+    MockURLProtocol.handler = { _ in
+        requests.increment()
+        return (200, snapshotJSON)
+    }
+    let store = SessionStore(client: client())
+
+    var started: [Task<Void, Never>] = []
+    for _ in 0 ..< 8 {
+        started.append(Task { @MainActor in await store.refresh() })
+    }
+    for task in started { await task.value }
+
+    #expect(requests.value == 1)
+    #expect(store.isReachable)
+}
+
 @Test @MainActor func cancelledRefreshIsNotTreatedAsUnreachable() async throws {
     // A superseded poll or a dismissed screen cancels its own request. That
     // used to flash an unreachable banner over a perfectly healthy fleet.
