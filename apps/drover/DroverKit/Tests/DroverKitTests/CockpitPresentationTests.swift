@@ -272,6 +272,20 @@ import Testing
     #expect(state.notice == "The request timed out.")
 }
 
+@Test func insightCheckStateShowsNothingWhenARequestIsRefusedWithoutAMessage() {
+    // A cancelled request, or one refused because the cockpit is unavailable,
+    // returns false and sets no message. Reporting "Could not queue reanalysis."
+    // in error styling invents a failure the user did not cause.
+    var state = InsightCheckActionState.ready
+
+    let started = state.begin()
+    #expect(started)
+    state.finish(accepted: false)
+
+    #expect(state == .ready)
+    #expect(state.notice == nil)
+}
+
 @Test func insightLifecycleControlsRespectTheCurrentDisposition() {
     let open = InsightLifecycleActionsPresentation(state: .open, checkAgainAvailable: true)
     #expect(open.canCheckAgain)

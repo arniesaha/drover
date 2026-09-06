@@ -745,7 +745,16 @@ public enum InsightCheckActionState: Sendable, Equatable {
     }
 
     public mutating func finish(accepted: Bool, error: String? = nil) {
-        self = accepted ? .queued : .failed(error ?? "Could not queue reanalysis.")
+        if accepted {
+            self = .queued
+        } else if let error {
+            self = .failed(error)
+        } else {
+            // A refusal that set no message is a cancellation, or a cockpit that
+            // is simply unavailable. Neither is a failure worth showing in error
+            // styling, and the view showed nothing for them before.
+            self = .ready
+        }
     }
 }
 

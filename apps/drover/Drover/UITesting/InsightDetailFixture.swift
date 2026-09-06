@@ -23,6 +23,17 @@ struct InsightDetailFixtureRoot: View {
                 summary: fixtureSummary
             )
         }
+        .task { store.updateCapability(from: fixtureCapabilitySnapshot) }
+    }
+
+    /// Without this the store reports the cockpit unavailable, and every action
+    /// this fixture exists to exercise short-circuits before reaching the
+    /// transport.
+    private var fixtureCapabilitySnapshot: HarnessSnapshot? {
+        try? JSONDecoder().decode(
+            HarnessSnapshot.self,
+            from: FixtureScenarioData.insightCapabilitySnapshotData()
+        )
     }
 
     private var fixtureSummary: InsightSummary {

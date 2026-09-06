@@ -201,8 +201,14 @@ struct InsightDetailView: View {
                     }
                 }
             }
+            // Only suppress a duplicate of the check notice when that notice is
+            // actually on screen. When the Check Again block is hidden, deduping
+            // against it renders the message nowhere at all.
+            let checkNoticeVisible = actions.canCheckAgain
             let lifecycleMessage = store.lifecycleError ?? actionMessage
-            if let message = lifecycleMessage, message != checkState.notice {
+            if let message = lifecycleMessage,
+                !(checkNoticeVisible && message == checkState.notice)
+            {
                 Text(message)
                     .droverText(.nested)
                     .foregroundStyle(store.lifecycleError == nil ? DroverColor.muted : DroverColor.accentHi)
@@ -268,6 +274,12 @@ struct InsightDetailView: View {
             detail = loadedDetail
             currentState = loadedDetail.finding.state
             loadError = nil
+            // The notice describes the last request, not the data just fetched.
+            // Leaving it up lets "Reanalysis queued. Refresh to view the latest
+            // result." sit above the refreshed result it was asking for.
+            if !checkState.isPending {
+                checkState = .ready
+            }
         } catch {
             loadError = (error as NSError).localizedDescription
         }

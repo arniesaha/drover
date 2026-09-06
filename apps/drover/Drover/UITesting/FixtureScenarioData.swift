@@ -123,6 +123,22 @@ enum FixtureScenarioData {
         ])
     }
 
+    /// A snapshot that declares the cockpit available with insights enabled.
+    ///
+    /// `CockpitStore` gates every insight lifecycle action on `isCockpitAvailable`,
+    /// which is false until a snapshot carrying `cockpit_api_version` arrives. A
+    /// fixture that skips this renders the detail layout but cannot reach its own
+    /// Check Again, Acknowledge or Dismiss actions.
+    static func insightCapabilitySnapshotData() -> Data {
+        jsonData([
+            "hosts": [],
+            "sessions": [],
+            "cwd_suggestions": [],
+            "cockpit_api_version": 1,
+            "cockpit_sections": ["insights"],
+        ])
+    }
+
     static func historyData(sessionID: String, receiptTurnID: String?) -> Data {
         var messages: [[String: Any]] = [[
             "event_id": "fixture-intro-\(sessionID)",
