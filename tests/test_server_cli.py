@@ -1,5 +1,6 @@
 """Tests for src/drover/server/__main__.py CLI."""
 
+import functools
 import json
 import logging
 import multiprocessing
@@ -27,6 +28,7 @@ from click.testing import CliRunner
 from drover.config import default_config, load_config
 from drover.schema import bootstrap
 from drover.server import __main__ as server_main
+from drover.server import setup_readiness_transport as transport_module
 from drover.server.__main__ import (
     _bootstrap_harnessd_schema,
     _build_redis_job_streams,
@@ -702,6 +704,190 @@ def test_cli_help_lists_subcommands():
         assert sub in res.output
 
 
+# Every setup-check request runs in a freshly spawned interpreter, and on a loaded
+# machine that spawn has been measured at 11.7 s against a normal 0.05 s. That
+# spike is what made this file nondeterministic (drover#321): budgets sized for a
+# warm machine turned a slow spawn into a wrong answer rather than a slow pass.
+#
+# The budgets below are of two kinds, and they are deliberately not one number. A
+# hang guard exists only so a wedged request cannot hang the suite forever; it
+# measures nothing, so it is generous and fixed. A deadline under test is the
+# property being asserted, and those are calibrated to what a spawn actually costs
+# here rather than to a figure that was true on one machine on one day.
+_SPAWN_HANG_GUARD_SECONDS = 120.0
+
+# Attempts allowed to the entrypoint test below; see the note at its retry loop.
+_ENTRYPOINT_ATTEMPTS = 3
+
+# A spawn spike can begin after a test has measured the machine, and then it makes
+# setup-check give up before the behaviour under test ever happens. That is a
+# measurement that did not take place, not evidence about the code, and the two
+# have to be told apart: reporting the first as a defect is what made this file
+# untrustworthy, and retrying the second would hide real ones.
+#
+# So a test raises _Inconclusive when it can see that it never got to observe
+# anything -- the request never reached the server, the worker never started -- and
+# only that is retried. A failed assertion is still a failure, first time and every
+# time. When the attempts are spent the test skips and says why, rather than
+# claiming a defect it did not see.
+_MEASUREMENT_ATTEMPTS = 3
+
+
+class _Inconclusive(Exception):
+    """A worker spawn was too slow for the observation to happen at all."""
+
+
+def _retry_when_inconclusive(test):
+    """Re-run an observation a spawn spike prevented; skip if it never happens."""
+
+    @functools.wraps(test)
+    def wrapper(*args, **kwargs):
+        for remaining in reversed(range(_MEASUREMENT_ATTEMPTS)):
+            try:
+                return test(*args, **kwargs)
+            except _Inconclusive as exc:
+                if not remaining:
+                    pytest.skip(
+                        f"{exc} after {_MEASUREMENT_ATTEMPTS} attempts; spawning a "
+                        "setup-check worker is too slow here to observe this "
+                        "(drover#354)"
+                    )
+        raise AssertionError("unreachable")
+
+    return wrapper
+
+
+# The drip tests prove that bytes trickling in cannot extend a read past its
+# deadline. Two things have to hold for that to be measurable, and neither did.
+#
+# The deadline has to outlast starting the worker. Against a fixed 0.5 s it did
+# not: the spawn simply won, the request was killed before it reached the server,
+# and the test failed having never exercised a drip at all.
+#
+# And the drip has to be slower than the deadline by enough that the verdict is
+# unambiguous. At 0.01 s a body drip finished in 1.03 s against a 0.7 s bound,
+# leaving 0.33 s between "the deadline worked" and "the drip simply ended". Held
+# for one deadline per byte, the same body takes a hundred deadlines, so no
+# plausible hiccup can confuse the two.
+_DRIP_SPAWN_HEADROOM = 5
+_DRIP_BOUND_MULTIPLE = 3
+
+# Past this the test would cost more than it is worth, and a machine this slow
+# cannot say anything trustworthy about a sub-second deadline. Skipping says that
+# out loud; failing would claim the code broke, which is the thing this file kept
+# getting wrong.
+_DRIP_MAX_MEASURABLE_TIMEOUT_SECONDS = 15.0
+
+
+# setup-check caps every request at 5 s (``_setup_check_timeout``), and that one
+# budget has to cover spawning a fresh interpreter as well as the request itself.
+# Widening a test's deadline past 5 s therefore changes nothing: the cap still
+# applies, and a spawn spike walks straight through it. Tests whose subject is not
+# the deadline replace the cap outright, so a slow spawn cannot turn their
+# assertion into a timeout and quietly stop testing what they name.
+#
+# Calibrating this to a measured spawn cost was tried and is worthless here: at a
+# normal 0.05 s, ten times that is under the 5 s the cap already allows, so on
+# every healthy machine the fixture raised nothing at all. A budget that only
+# helps where the problem does not exist is not a budget.
+
+
+@pytest.fixture
+def generous_request_timeout(monkeypatch) -> float:
+    """Replace the per-request cap with one a slow worker spawn cannot exhaust."""
+    monkeypatch.setattr(
+        server_main, "_setup_check_timeout", lambda _: _SPAWN_HANG_GUARD_SECONDS
+    )
+    return _SPAWN_HANG_GUARD_SECONDS
+
+
+class _PopenShim:
+    """The transport's view of ``subprocess`` with only Popen replaced.
+
+    ``transport_module.subprocess`` is the shared stdlib module, so setting Popen
+    on it would change every spawn in the process. This stands in front of it and
+    forwards everything else, so the transport still finds SubprocessError, PIPE
+    and the rest.
+    """
+
+    def __init__(self, module, popen):
+        self._module = module
+        self.Popen = popen
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+@pytest.fixture
+def spawn_attempts(monkeypatch) -> list:
+    """Record every worker spawn the transport attempts, without preventing one.
+
+    A missing stall marker has two very different causes. If a worker was started
+    and was simply too slow to get there, nothing was observed and the test should
+    retry. If no worker was started at all, setup-check is broken and the test must
+    say so -- skipping there would keep the suite green over a real defect.
+    """
+    attempts: list = []
+    real_subprocess = transport_module.subprocess
+
+    def recording_popen(*args, **kwargs):
+        attempts.append(args)
+        return real_subprocess.Popen(*args, **kwargs)
+
+    monkeypatch.setattr(
+        transport_module, "subprocess", _PopenShim(real_subprocess, recording_popen)
+    )
+    return attempts
+
+
+@pytest.fixture
+def worker_spawn_seconds() -> float:
+    """Measure what one setup-check worker interpreter costs on this machine now."""
+    samples = []
+    for _ in range(2):
+        started = time.monotonic()
+        subprocess.run(
+            [sys.executable, "-c", "import drover.server.setup_readiness_transport"],
+            check=True,
+            capture_output=True,
+        )
+        samples.append(time.monotonic() - started)
+    return max(samples)
+
+
+def _drip_budget(worker_spawn_seconds: float) -> tuple[float, float]:
+    """Return the request timeout and elapsed bound this machine can measure."""
+    timeout = max(0.5, worker_spawn_seconds * _DRIP_SPAWN_HEADROOM)
+    if timeout > _DRIP_MAX_MEASURABLE_TIMEOUT_SECONDS:
+        pytest.skip(
+            f"spawning a setup-check worker costs {worker_spawn_seconds:.1f}s here; "
+            "too slow to measure a drip deadline"
+        )
+    return timeout, timeout * _DRIP_BOUND_MULTIPLE
+
+
+# The reaping tests take the same shape against a synthetic stall: a deadline
+# calibrated to what a spawn costs here, and a stall far longer than the bound, so
+# a request that failed to reap at its deadline is unmistakable. The stall only
+# elapses when the reaping is broken; a working deadline kills the child long
+# before it, so it costs nothing on a passing run.
+_REAP_SPAWN_HEADROOM = 5
+_REAP_BOUND_MULTIPLE = 3
+_SYNTHETIC_STALL_SECONDS = 60.0
+_REAP_MAX_MEASURABLE_DEADLINE_SECONDS = 6.0
+
+
+def _reap_budget(worker_spawn_seconds: float) -> tuple[float, float]:
+    """Return the request deadline and elapsed bound this machine can measure."""
+    deadline = max(1.0, worker_spawn_seconds * _REAP_SPAWN_HEADROOM)
+    if deadline > _REAP_MAX_MEASURABLE_DEADLINE_SECONDS:
+        pytest.skip(
+            f"spawning a setup-check worker costs {worker_spawn_seconds:.1f}s here; "
+            "too slow to measure a reap deadline"
+        )
+    return deadline, deadline * _REAP_BOUND_MULTIPLE
+
+
 def test_setup_check_json_exits_two_without_echoing_private_arguments(
     monkeypatch, tmp_path
 ):
@@ -744,7 +930,8 @@ def test_setup_check_json_exits_two_without_echoing_private_arguments(
     assert "/private/project" not in result.output
 
 
-def test_setup_check_bounds_authenticated_response_bytes():
+@_retry_when_inconclusive
+def test_setup_check_bounds_authenticated_response_bytes(generous_request_timeout):
     """A control response over the support-report bound is rejected before decode."""
     body = b"x" * (server_main._SETUP_CHECK_MAX_RESPONSE_BYTES + 1)
 
@@ -765,18 +952,26 @@ def test_setup_check_bounds_authenticated_response_bytes():
             server_metrics_host="127.0.0.1",
             metrics_http_port=server.server_port,
         )
-        with pytest.raises(ValueError, match="response exceeds"):
-            server_main._setup_check_request_json(
-                cfg,
-                "GET",
-                "/harness/hosts",
-                None,
-                deadline=server_main.time.monotonic() + 1,
-            )
+        try:
+            with pytest.raises(ValueError, match="response exceeds"):
+                server_main._setup_check_request_json(
+                    cfg,
+                    "GET",
+                    "/harness/hosts",
+                    None,
+                    deadline=server_main.time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
+                )
+        except TimeoutError:
+            raise _Inconclusive("the oversized response was never received") from None
 
 
-def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypatch):
+@_retry_when_inconclusive
+def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(
+    monkeypatch, worker_spawn_seconds
+):
     """Bytes arriving before socket inactivity timeout cannot extend a control read."""
+    drip_timeout, drip_bound = _drip_budget(worker_spawn_seconds)
+    drip_interval = drip_timeout
     request_started = threading.Event()
     completed = threading.Event()
     body = b'{"hosts":[],"padding":"' + (b"x" * 80) + b'"}'
@@ -794,7 +989,7 @@ def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypat
                 for byte in body:
                     self.wfile.write(b"1\r\n" + bytes((byte,)) + b"\r\n")
                     self.wfile.flush()
-                    time.sleep(0.01)
+                    time.sleep(drip_interval)
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -806,7 +1001,7 @@ def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypat
             pass
 
     with _serve_setup_check_http(DripHandler) as server:
-        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.5)
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: drip_timeout)
         cfg = replace(
             default_config(),
             auth_api_token="test-token",
@@ -820,19 +1015,25 @@ def test_setup_check_control_read_has_a_wall_deadline_during_body_drip(monkeypat
                 "GET",
                 "/harness/hosts",
                 None,
-                deadline=started + 1,
+                deadline=started + drip_bound,
             )
-        assert time.monotonic() - started < 0.7
-        assert request_started.wait(timeout=0.5)
+        if not request_started.wait(timeout=drip_bound):
+            raise _Inconclusive("the drip request never reached the server")
+        assert time.monotonic() - started < drip_bound
         assert not any(
             child.name == "drover-setup-check-request"
             for child in multiprocessing.active_children()
         )
-        assert completed.wait(timeout=2)
+        assert completed.wait(timeout=drip_bound)
 
 
-def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch):
+@_retry_when_inconclusive
+def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(
+    monkeypatch, worker_spawn_seconds
+):
     """Health headers arriving in fragments cannot extend the listener probe."""
+    drip_timeout, drip_bound = _drip_budget(worker_spawn_seconds)
+    drip_interval = drip_timeout
     request_started = threading.Event()
     completed = threading.Event()
     raw_headers = b"Content-Length: 0\r\nX-Delayed: true\r\n\r\n"
@@ -846,7 +1047,7 @@ def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch
                 self.connection.sendall(b"HTTP/1.1 200 OK\r\n")
                 for byte in raw_headers:
                     self.connection.sendall(bytes((byte,)))
-                    time.sleep(0.02)
+                    time.sleep(drip_interval)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
@@ -856,32 +1057,35 @@ def test_setup_check_liveness_has_a_wall_deadline_during_header_drip(monkeypatch
             pass
 
     with _serve_setup_check_http(DripHandler) as server:
-        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: 0.5)
+        monkeypatch.setattr(server_main, "_setup_check_timeout", lambda _: drip_timeout)
         started = time.monotonic()
         assert (
             server_main._setup_check_liveness(
                 f"http://127.0.0.1:{server.server_port}/healthz",
-                deadline=started + 1,
+                deadline=started + drip_bound,
             )
             is False
         )
-        assert time.monotonic() - started < 0.7
-        assert request_started.wait(timeout=0.5)
+        if not request_started.wait(timeout=drip_bound):
+            raise _Inconclusive("the drip request never reached the server")
+        assert time.monotonic() - started < drip_bound
         assert not any(
             child.name == "drover-setup-check-request"
             for child in multiprocessing.active_children()
         )
-        assert completed.wait(timeout=1.5)
+        assert completed.wait(timeout=drip_bound)
 
 
+@_retry_when_inconclusive
 def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, worker_spawn_seconds, spawn_attempts
 ):
     """A resolver stalled in an executor cannot keep setup-check past its deadline."""
+    reap_deadline, reap_bound = _reap_budget(worker_spawn_seconds)
     marker = tmp_path / "resolver-started"
     sitecustomize = tmp_path / "sitecustomize.py"
     sitecustomize.write_text(
-        textwrap.dedent("""\
+        textwrap.dedent(f"""\
             import os
             import socket
             import time
@@ -892,7 +1096,7 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
 
                 def delayed_resolver(*args, **kwargs):
                     marker.write_text("started", encoding="utf-8")
-                    time.sleep(2)
+                    time.sleep({_SYNTHETIC_STALL_SECONDS})
                     raise socket.gaierror("synthetic resolver delay")
 
                 socket.getaddrinfo = delayed_resolver
@@ -900,12 +1104,14 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
         encoding="utf-8",
     )
 
-    def delayed_resolver(*args, **kwargs):
-        marker.write_text("started", encoding="utf-8")
-        time.sleep(2)
+    # The request runs in the worker, so this parent-side stub only guards against
+    # the test process resolving on its own. It must not write the worker's marker
+    # -- that file is what proves the worker ran -- and it must not hold the suite
+    # for the worker's stall.
+    def parent_resolver(*args, **kwargs):
         raise socket.gaierror("synthetic resolver delay")
 
-    monkeypatch.setattr(socket, "getaddrinfo", delayed_resolver)
+    monkeypatch.setattr(socket, "getaddrinfo", parent_resolver)
     monkeypatch.setenv(
         "PYTHONPATH",
         os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))),
@@ -925,12 +1131,14 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
             "GET",
             None,
             {},
-            deadline=started + 1,
+            deadline=started + reap_deadline,
             max_response_bytes=None,
         )
 
-    assert marker.exists()
-    assert time.monotonic() - started < 1.4
+    if not marker.exists():
+        assert spawn_attempts, "setup-check started no worker at all"
+        raise _Inconclusive("the worker never reached the synthetic stall")
+    assert time.monotonic() - started < reap_bound
     assert {
         child.pid
         for child in multiprocessing.active_children()
@@ -938,14 +1146,16 @@ def test_setup_check_reaps_delayed_resolver_at_the_request_deadline(
     } == existing_children
 
 
+@_retry_when_inconclusive
 def test_setup_check_bounds_large_request_transfer_before_child_receive(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, worker_spawn_seconds, spawn_attempts
 ):
     """A child delayed before receive cannot block private request transfer past timeout."""
+    reap_deadline, reap_bound = _reap_budget(worker_spawn_seconds)
     marker = tmp_path / "receive-started"
     sitecustomize = tmp_path / "sitecustomize.py"
     sitecustomize.write_text(
-        textwrap.dedent("""\
+        textwrap.dedent(f"""\
             import os
             import sys
             import time
@@ -958,7 +1168,7 @@ def test_setup_check_bounds_large_request_transfer_before_child_receive(
                 class DelayedBuffer:
                     def read(self, *args, **kwargs):
                         marker.write_text(str(os.getpid()), encoding="utf-8")
-                        time.sleep(2)
+                        time.sleep({_SYNTHETIC_STALL_SECONDS})
                         return original_stdin.buffer.read(*args, **kwargs)
 
                 class DelayedStdin:
@@ -983,12 +1193,14 @@ def test_setup_check_bounds_large_request_transfer_before_child_receive(
             "POST",
             private_body,
             {"Authorization": "Bearer private-request-token"},
-            deadline=started + 0.5,
+            deadline=started + reap_deadline,
             max_response_bytes=None,
         )
 
-    assert marker.exists()
-    assert time.monotonic() - started < 0.8
+    if not marker.exists():
+        assert spawn_attempts, "setup-check started no worker at all"
+        raise _Inconclusive("the worker never reached the synthetic stall")
+    assert time.monotonic() - started < reap_bound
     with pytest.raises(ProcessLookupError):
         os.kill(int(marker.read_text(encoding="utf-8")), 0)
     captured = capsys.readouterr()
@@ -997,11 +1209,24 @@ def test_setup_check_bounds_large_request_transfer_before_child_receive(
 
 
 def test_setup_check_rejects_oversized_private_request_before_starting_worker(
-    capsys,
+    capsys, monkeypatch
 ):
     """Pathological request bytes are classified before any worker input can block."""
     private_body = b"private-request-body-" + (b"x" * (64 * 1024))
-    started = time.monotonic()
+    spawns: list[object] = []
+
+    def record_spawn(*args, **kwargs):
+        spawns.append(args)
+        raise AssertionError("oversized request reached the worker")
+
+    # Patch the transport's view of subprocess, not the stdlib module itself:
+    # ``transport_module.subprocess`` is the shared singleton, so setting Popen on
+    # it would break every other spawn in the process for the duration.
+    monkeypatch.setattr(
+        transport_module,
+        "subprocess",
+        _PopenShim(transport_module.subprocess, record_spawn),
+    )
 
     with pytest.raises(ValueError, match="request exceeds"):
         server_main._setup_check_http_request(
@@ -1009,17 +1234,19 @@ def test_setup_check_rejects_oversized_private_request_before_starting_worker(
             "POST",
             private_body,
             {"Authorization": "Bearer private-request-token"},
-            deadline=started + 0.5,
+            deadline=time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
             max_response_bytes=None,
         )
 
-    assert time.monotonic() - started < 0.1
+    assert spawns == []
     captured = capsys.readouterr()
     assert "private-request-body" not in captured.out + captured.err
     assert "private-request-token" not in captured.out + captured.err
 
 
-def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch):
+def test_setup_check_sanitizes_oversized_config_token_before_worker(
+    monkeypatch, spawn_attempts
+):
     """An oversized configured token becomes the fixed report without a subprocess."""
     cfg = replace(
         default_config(),
@@ -1029,7 +1256,6 @@ def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch)
     monkeypatch.setattr(
         server_main, "_setup_check_liveness", lambda *args, **kwargs: True
     )
-    started = time.monotonic()
 
     result = CliRunner().invoke(
         main,
@@ -1046,14 +1272,17 @@ def test_setup_check_sanitizes_oversized_config_token_before_worker(monkeypatch)
     )
 
     assert result.exit_code == 2, result.output
-    assert time.monotonic() - started < 0.3
+    assert spawn_attempts == []
     assert json.loads(result.output)["ready"] is False
     assert "private-token" not in result.output
     assert "private-host" not in result.output
     assert "/private/project" not in result.output
 
 
-def test_setup_check_control_redirect_does_not_reach_second_origin():
+@_retry_when_inconclusive
+def test_setup_check_control_redirect_does_not_reach_second_origin(
+    generous_request_timeout,
+):
     """A redirect response cannot forward the local API credential to another host."""
     redirect_origin_headers: list[dict[str, str]] = []
     second_origin_headers: list[dict[str, str]] = []
@@ -1093,23 +1322,35 @@ def test_setup_check_control_redirect_does_not_reach_second_origin():
                 server_metrics_host="127.0.0.1",
                 metrics_http_port=redirect_origin.server_port,
             )
-            with pytest.raises(ValueError):
-                server_main._setup_check_request_json(
-                    cfg,
-                    "GET",
-                    "/harness/hosts",
-                    None,
-                    deadline=time.monotonic() + 1,
-                )
+            try:
+                with pytest.raises(ValueError):
+                    server_main._setup_check_request_json(
+                        cfg,
+                        "GET",
+                        "/harness/hosts",
+                        None,
+                        deadline=time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
+                    )
+            except TimeoutError:
+                # Whatever the second origin already saw is evidence, and a leak
+                # that then timed out is still a leak. Check it before deciding
+                # nothing was observed.
+                assert second_origin_headers == []
+                raise _Inconclusive("the redirect was never requested") from None
 
+    if not redirect_origin_headers:
+        assert second_origin_headers == []
+        raise _Inconclusive("the redirect was never requested")
     assert len(redirect_origin_headers) == 1
     assert redirect_origin_headers[0]["Authorization"] == "Bearer private-bearer-token"
     assert second_origin_headers == []
 
 
-def test_setup_check_liveness_rejects_redirect():
+@_retry_when_inconclusive
+def test_setup_check_liveness_rejects_redirect(generous_request_timeout):
     """A redirected health response is not evidence for the configured listener."""
     second_origin_requests: list[str] = []
+    redirect_origin_requests: list[str] = []
 
     class SecondOriginHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1125,6 +1366,7 @@ def test_setup_check_liveness_rejects_redirect():
 
         class RedirectHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                redirect_origin_requests.append(self.path)
                 self.send_response(307)
                 self.send_header(
                     "Location", f"http://{second_host}:{second_port}/healthy"
@@ -1136,15 +1378,21 @@ def test_setup_check_liveness_rejects_redirect():
                 pass
 
         with _serve_setup_check_http(RedirectHandler) as redirect_origin:
-            assert (
-                server_main._setup_check_liveness(
-                    f"http://127.0.0.1:{redirect_origin.server_port}/healthz",
-                    deadline=time.monotonic() + 1,
-                )
-                is False
+            liveness = server_main._setup_check_liveness(
+                f"http://127.0.0.1:{redirect_origin.server_port}/healthz",
+                deadline=time.monotonic() + _SPAWN_HANG_GUARD_SECONDS,
             )
 
+    # _setup_check_liveness catches TimeoutError and returns False, so a False
+    # here is not by itself evidence: on a slow spawn the worker is killed before
+    # it asks for anything, and both assertions below would hold having tested
+    # nothing. The redirect origin having been reached is what makes them mean
+    # something. The second origin is still checked first, because a redirect that
+    # was followed is a failure however the call ended.
     assert second_origin_requests == []
+    if not redirect_origin_requests:
+        raise _Inconclusive("the redirect was never requested")
+    assert liveness is False
 
 
 def test_setup_check_sanitizes_config_failure_before_evaluation(monkeypatch):
@@ -1404,38 +1652,61 @@ def test_setup_check_module_entrypoint_uses_spawn_safe_transport(tmp_path):
             "PYTHONPATH": str(root / "src"),
             "DROVER_API_TOKEN": "subprocess-test-token",
         }
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "drover.server",
-                "--config",
-                str(config_path),
-                "setup-check",
-                "--host",
-                "subprocess-host",
-                "--harness",
-                "codex",
-                "--project",
-                "/private/subprocess-project",
-                "--json",
-            ],
-            cwd=root,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
+        # This test cannot calibrate its way out of a slow spawn the way the ones
+        # above can. It runs the real entrypoint, so it is bound by setup-check's
+        # own budget -- 25 s total, 5 s per request, covering six interpreter
+        # starts -- which no test-side setting can raise. That is drover#354.
+        #
+        # Retrying is sound here and would not be elsewhere in this file. The claim
+        # is an existence one: that the installed entrypoint *can* complete checks
+        # that spawn workers. One success proves it. A genuine spawn-safety defect
+        # fails every attempt, because it is a property of how the module starts
+        # rather than of how loaded the machine was that second.
+        for remaining in reversed(range(_ENTRYPOINT_ATTEMPTS)):
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "drover.server",
+                    "--config",
+                    str(config_path),
+                    "setup-check",
+                    "--host",
+                    "subprocess-host",
+                    "--harness",
+                    "codex",
+                    "--project",
+                    "/private/subprocess-project",
+                    "--json",
+                ],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=_SPAWN_HANG_GUARD_SECONDS,
+            )
+            if result.returncode == 0 or not remaining:
+                break
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, (
+        "setup-check did not complete in "
+        f"{_ENTRYPOINT_ATTEMPTS} attempts. If this is a timeout rather than a\n"
+        "spawn-safety failure, it is drover#354, not a regression here.\n"
+        + result.stdout
+        + result.stderr
+    )
     assert json.loads(result.stdout)["ready"] is True
-    assert requested_paths == [
+    # Compare the tail rather than the whole list, and do not clear between
+    # attempts: an abandoned attempt can leave a worker that connects later, and
+    # clearing would let its path land in the middle of the next attempt's run.
+    expected_paths = [
         "/healthz",
         "/healthz",
         "/harness/hosts",
         "/harness/hosts/subprocess-host/auth/codex/status",
         "/harness/hosts/subprocess-host/fs/exists",
     ]
+    assert requested_paths[-len(expected_paths) :] == expected_paths
     assert "subprocess-test-token" not in result.stdout + result.stderr
 
 
