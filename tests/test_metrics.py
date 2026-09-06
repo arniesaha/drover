@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -5429,3 +5430,79 @@ def test_usage_rollup_metrics_render_counters_and_last_pass():
     assert "drover_usage_rollup_malformed_payloads_total 1" in text
     assert "# TYPE drover_usage_rollup_last_pass_seconds gauge" in text
     usage_rollup.reset_counters_for_tests()
+
+
+def test_concurrent_fleet_renders_share_one_build(tmp_path, monkeypatch):
+    """Pollers arriving together get one render, not one each.
+
+    When analytical work starves this endpoint, every poller that arrives starts
+    its own render of the same data, and each is more work for a server already
+    not keeping up. The phone times out and asks again immediately, so the load
+    never decays (drover#331).
+    """
+    collector = _make_collector(tmp_path)
+    builds = 0
+    started = threading.Event()
+
+    def slow_snapshot(**_kwargs):
+        nonlocal builds
+        builds += 1
+        started.set()
+        time.sleep(0.4)
+        return {
+            "cockpit_api_version": 1,
+            "cockpit_sections": [],
+            "hosts": [],
+            "sessions": [],
+        }
+
+    monkeypatch.setattr(collector, "harness_snapshot", slow_snapshot)
+    results: list[str] = []
+
+    def poll() -> None:
+        try:
+            results.append(collector.render_harness_json())
+        except Exception as exc:  # noqa: BLE001
+            results.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=poll) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert builds == 1, f"expected one build, got {builds}"
+    assert all(not isinstance(r, str) or r.startswith("{") for r in results)
+
+
+def test_a_fleet_render_that_cannot_finish_in_time_refuses_rather_than_queues(
+    tmp_path, monkeypatch
+):
+    """A caller past the budget is told the server is busy.
+
+    An unanswered request reads to a client as "ask again now", and that retry is
+    what kept the hub saturated until it was restarted.
+    """
+    collector = _make_collector(tmp_path)
+    monkeypatch.setattr(metrics, "HARNESS_BUSY_WAIT_SECONDS", 0.1)
+    release = threading.Event()
+
+    def blocked_snapshot(**_kwargs):
+        release.wait(timeout=5)
+        return {
+            "cockpit_api_version": 1,
+            "cockpit_sections": [],
+            "hosts": [],
+            "sessions": [],
+        }
+
+    monkeypatch.setattr(collector, "harness_snapshot", blocked_snapshot)
+    leader = threading.Thread(target=collector.render_harness_json)
+    leader.start()
+    time.sleep(0.15)
+    try:
+        with pytest.raises(metrics.HarnessRenderBusy):
+            collector.render_harness_json()
+    finally:
+        release.set()
+        leader.join(timeout=5)

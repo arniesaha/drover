@@ -55,7 +55,7 @@ from drover.server.web.ui import load_page
 
 if TYPE_CHECKING:
     from drover.server.harness.models import HarnessHost
-    from drover.server.metrics import MetricsCollector
+    from drover.server.metrics import HarnessRenderBusy, MetricsCollector
     from drover.server.relay_manager import RelayManager
 
 log = logging.getLogger("drover.metrics")
@@ -860,13 +860,24 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(status, "application/json", body)
             return
         if path == "/harness":
-            self._send(
-                200,
-                "application/json",
-                self.collector.render_harness_json(
+            try:
+                body = self.collector.render_harness_json(
                     **_archived_limit_kwargs(parse_qs(parsed.query))
-                ),
-            )
+                )
+            except HarnessRenderBusy:
+                # Answer, rather than leave the client waiting on a server that
+                # is not going to get to it. An unanswered request reads as "ask
+                # again now", and that retry is what kept the hub saturated until
+                # it was restarted (drover#331). A 503 with Retry-After is the
+                # one response that tells the client to wait.
+                self._send(
+                    503,
+                    "application/json",
+                    json.dumps({"error": "fleet listing busy"}) + "\n",
+                    extra_headers={"Retry-After": "2"},
+                )
+                return
+            self._send(200, "application/json", body)
             return
         if path == "/harness/hosts":
             self._send(
@@ -2029,6 +2040,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         *,
         allow_gzip: bool = False,
         route_class: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         started = time.monotonic()
         # Every JSON response is compressible, and the ones the phone polls
@@ -2056,6 +2068,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if compressed:
             self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(payload)))
+        for header, value in (extra_headers or {}).items():
+            self.send_header(header, value)
         if self.path.startswith(("/ui/harness", "/harness")):
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("Pragma", "no-cache")

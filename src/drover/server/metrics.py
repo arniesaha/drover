@@ -55,6 +55,18 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("drover.metrics")
 
+#: How long a second caller waits for the fleet listing already being built.
+#:
+#: Short: it exists so concurrent pollers share one render, not so they queue.
+#: Past this the honest answer is that the server is busy, which at least tells
+#: the client to wait rather than to ask again immediately.
+HARNESS_BUSY_WAIT_SECONDS = 2.0
+
+
+class HarnessRenderBusy(RuntimeError):
+    """The fleet listing could not be produced inside its budget."""
+
+
 #: Ceiling on how many archived sessions a caller may ask a fleet render for.
 #: Above this the payload stops being a fleet view and starts being a history
 #: export, which belongs on a paged endpoint rather than the 5s poll.
@@ -1027,6 +1039,12 @@ class MetricsCollector:
     #: therefore never cached -- while being the endpoint the fleet actually
     #: polls. Bounded: only the default archived cap is cached, so the key
     #: space is the two booleans and no client can grow it.
+    _harness_render_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+    _harness_render_inflight: dict[tuple[bool, bool], threading.Event] = field(
+        default_factory=dict, repr=False, compare=False
+    )
     _harness_cache: dict[tuple[bool, bool], tuple[float, str]] = field(
         default_factory=dict, init=False
     )
@@ -1084,15 +1102,74 @@ class MetricsCollector:
             entry = self._harness_cache.get(key)
             if entry is not None and now < entry[0]:
                 return entry[1]
+        # One render at a time per variant, and a bounded wait for it.
+        #
+        # When the analytical side starves this endpoint of CPU, every poller
+        # that arrives starts its own render of the same data, and each one is
+        # more work for a server that is already not keeping up. The phone then
+        # times out and immediately asks again, so the load never decays: the hub
+        # logged dozens of `client disconnected while sending` per second and did
+        # not recover until it was restarted (drover#331).
+        #
+        # Waiting for the render already running gives the same answer for the
+        # cost of one. A caller that cannot be served inside the budget is told
+        # so, because an unanswered request reads to a client as "ask again now",
+        # which is precisely the wrong instruction to give a saturated server.
+        if not default_cap:
+            return self._render_harness_uncached(
+                include_hosts=include_hosts,
+                include_sessions=include_sessions,
+                archived_limit=archived_limit,
+            )
+
+        with self._harness_render_lock:
+            pending = self._harness_render_inflight.get(key)
+            leader = pending is None
+            if leader:
+                pending = threading.Event()
+                self._harness_render_inflight[key] = pending
+
+        if not leader:
+            assert pending is not None
+            if not pending.wait(timeout=HARNESS_BUSY_WAIT_SECONDS):
+                raise HarnessRenderBusy(
+                    "the fleet listing is still being built for another request"
+                )
+            entry = self._harness_cache.get(key)
+            if entry is not None:
+                return entry[1]
+            raise HarnessRenderBusy("the fleet listing could not be built in time")
+
+        try:
+            rendered = self._render_harness_uncached(
+                include_hosts=include_hosts,
+                include_sessions=include_sessions,
+                archived_limit=archived_limit,
+            )
+            self._harness_cache[key] = (
+                time.monotonic() + self.harness_ttl_seconds,
+                rendered,
+            )
+            return rendered
+        finally:
+            with self._harness_render_lock:
+                self._harness_render_inflight.pop(key, None)
+            assert pending is not None
+            pending.set()
+
+    def _render_harness_uncached(
+        self,
+        *,
+        include_hosts: bool,
+        include_sessions: bool,
+        archived_limit: int | None,
+    ) -> str:
         snapshot = self.harness_snapshot(
             include_hosts=include_hosts,
             include_sessions=include_sessions,
             archived_limit=archived_limit,
         )
-        rendered = json.dumps(snapshot, sort_keys=True, default=str) + "\n"
-        if default_cap:
-            self._harness_cache[key] = (now + self.harness_ttl_seconds, rendered)
-        return rendered
+        return json.dumps(snapshot, sort_keys=True, default=str) + "\n"
 
     def invalidate_harness_cache(self) -> None:
         """Drop every rendered variant.
