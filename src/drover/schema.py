@@ -497,6 +497,16 @@ CREATE TABLE IF NOT EXISTS pipeline_artifacts (
 );
 """
 
+_ADVISORY_CHECK_REQUESTS_DDL = """
+CREATE TABLE IF NOT EXISTS advisory_check_requests (
+  request_id   VARCHAR PRIMARY KEY,
+  job_id       VARCHAR NOT NULL,
+  finding_id   VARCHAR NOT NULL,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (job_id, finding_id)
+);
+"""
+
 _PROVIDER_CONNECTIONS_DDL = """
 CREATE TABLE IF NOT EXISTS provider_connections (
   provider                     VARCHAR NOT NULL,
@@ -2087,6 +2097,7 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_JOBS_DDL)
         con.execute(_PIPELINE_JOB_ATTEMPTS_DDL)
         con.execute(_PIPELINE_ARTIFACTS_DDL)
+        con.execute(_ADVISORY_CHECK_REQUESTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
         bootstrap_control_plane_store(duckdb_path)
         copied_control_plane_rows = migrate_control_plane_tables(con, duckdb_path)

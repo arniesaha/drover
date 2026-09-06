@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import tempfile
@@ -33,8 +34,14 @@ from drover.server.advisory.types import (
     FindingState,
     Severity,
 )
-from drover.server.db import control_plane_connection, open_duckdb_connection
+from drover.server.db import (
+    ControlPlaneBusy,
+    control_plane_connection,
+    open_duckdb_connection,
+)
 from drover.server.harness.content_consent import DurableContentConsent
+
+log = logging.getLogger(__name__)
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
@@ -188,6 +195,10 @@ CHECK_SCOPE_FAILURE_CACHE_SECONDS = 5.0
 #: well as pruning expired entries.
 CHECK_SCOPE_CACHE_MAX_ENTRIES = 128
 
+# One stalled status query must not create one blocked thread per polling
+# request. The single-flight read is interrupted at this end-to-end budget.
+CHECK_STATUS_BUDGET_SECONDS = 0.5
+
 
 class InsightsService:
     """Serialize bounded findings and delegate lifecycle persistence."""
@@ -210,6 +221,12 @@ class InsightsService:
         # request path.
         self._scope_inflight: tuple[tuple, Future[tuple[str, str]]] | None = None
         self._scope_connection: Any | None = None
+        self._check_status_lock = threading.Lock()
+        self._check_status_inflight: (
+            tuple[tuple[str, str], Future[dict[str, Any]]] | None
+        ) = None
+        self._check_status_connections: dict[Future[dict[str, Any]], set[Any]] = {}
+        self._check_status_timed_out: set[Future[dict[str, Any]]] = set()
         consent_path = self.config_path.with_name(
             f".{self.config_path.name}.content-consent.json"
         )
@@ -712,6 +729,270 @@ class InsightsService:
             job = self._enqueue_check(finding, target_id, source_version)
         return {"status": "queued", "job_id": job.job_id}
 
+    def check_status(self, finding_id: str, job_id: str) -> dict[str, Any]:
+        """Return one requested check's durable, bounded status.
+
+        The request mapping establishes scope before the worker has emitted an
+        occurrence.  Terminal outcomes require the current job attempt and a
+        finding occurrence to share the same opaque run identity.
+        """
+
+        finding_id = validate_finding_id(finding_id)
+        job_id = _validate_job_id(job_id)
+        key = (finding_id, job_id)
+        start: tuple[Future[dict[str, Any]], threading.Thread] | None = None
+        with self._check_status_lock:
+            inflight = self._check_status_inflight
+            if inflight is not None:
+                if inflight[0] != key:
+                    return _unavailable_check_status()
+                future = inflight[1]
+            else:
+                future = Future()
+                self._check_status_inflight = (key, future)
+                worker = threading.Thread(
+                    target=self._run_check_status_read,
+                    args=(key, future),
+                    name="insight-check-status",
+                    daemon=True,
+                )
+                start = (future, worker)
+        if start is not None:
+            try:
+                start[1].start()
+            except BaseException:
+                # The slot is published before the thread exists, so a
+                # failed start would leave a Future nobody completes and
+                # every later request for this key would report
+                # unavailable until the process restarted.
+                with self._check_status_lock:
+                    if self._check_status_inflight == (key, start[0]):
+                        self._check_status_inflight = None
+                raise
+        try:
+            return future.result(timeout=CHECK_STATUS_BUDGET_SECONDS)
+        except FuturesTimeout:
+            self._interrupt_check_status_connections(key, future)
+            return _unavailable_check_status()
+
+    def _run_check_status_read(
+        self,
+        key: tuple[str, str],
+        future: Future[dict[str, Any]],
+    ) -> None:
+        try:
+            future.set_result(self._read_check_status(*key, future=future))
+        except BaseException as exc:  # delivered to the waiting request
+            with self._check_status_lock:
+                timed_out = future in self._check_status_timed_out
+            if timed_out:
+                # Every caller shares the same interrupted database operation.
+                # Once any waiter hit the deadline, return a stable bounded
+                # status rather than race another waiter into a 503.
+                future.set_result(_unavailable_check_status())
+            else:
+                future.set_exception(exc)
+        finally:
+            with self._check_status_lock:
+                self._check_status_timed_out.discard(future)
+                if self._check_status_inflight == (key, future):
+                    self._check_status_inflight = None
+
+    def _read_check_status(
+        self,
+        finding_id: str,
+        job_id: str,
+        *,
+        future: Future[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            # Keep this connection configuration compatible with live writers.
+            con = open_duckdb_connection(self.duckdb_path, role="diagnostic")
+            try:
+                self._track_check_status_connection(future, con)
+                row = con.execute(
+                    """
+                    SELECT j.status, j.latest_attempt_id, a.result, a.finished_at
+                    FROM advisory_check_requests request
+                    JOIN pipeline_jobs j ON j.job_id = request.job_id
+                    LEFT JOIN pipeline_job_attempts a
+                      ON a.job_id = j.job_id AND a.attempt_id = j.latest_attempt_id
+                    WHERE request.job_id = ? AND request.finding_id = ?
+                      AND j.job_kind = ?
+                    LIMIT 1
+                    """,
+                    [job_id, finding_id, ADVISORY_JOB_KIND],
+                ).fetchone()
+            finally:
+                self._untrack_check_status_connection(future, con)
+                con.close()
+        except Exception as exc:  # analytical ledger must not stall the client
+            if _is_ledger_busy(exc):
+                return _unavailable_check_status()
+            raise
+        if row is None:
+            raise KeyError("requested check not found")
+
+        job_status, attempt_id, attempt_result, finished_at = row
+        status = _verification_job_status(str(job_status), attempt_result)
+        if status != "completed" or not isinstance(attempt_id, str):
+            finding_state = self._verification_finding_state(finding_id, future=future)
+            return _verification_status(
+                status=status,
+                outcome=None,
+                # A retry_wait job reports "queued", and finished_at then belongs
+                # to the earlier failed attempt. Sending it would date a check
+                # that has not happened yet.
+                checked_at=(
+                    None
+                    if status in {"queued", "running"}
+                    else _wire_datetime(finished_at)
+                ),
+                evidence=[],
+                finding_state=finding_state,
+            )
+
+        try:
+            with control_plane_connection(self.duckdb_path, timeout=0.25) as con:
+                self._track_check_status_connection(future, con)
+                try:
+                    # Read the finding's current state, not the state as of this
+                    # run. Pinning on latest_run_id meant that any later analyzer
+                    # pass -- enqueue_operational_checks, or the daily full review
+                    # -- moved the pointer and turned an already-answered check
+                    # into "inconclusive" with no evidence, so a polling client
+                    # watched a settled "resolved" decay for no visible reason.
+                    # This attempt's occurrences below are still the evidence of
+                    # what it found; a later run does not invalidate them.
+                    finding_row = con.execute(
+                        """
+                        SELECT state
+                        FROM advisory_findings
+                        WHERE finding_id = ?
+                        """,
+                        [finding_id],
+                    ).fetchone()
+                    rows = con.execute(
+                        """
+                        SELECT outcome, observed_at, source_ref, evidence_json, excerpt
+                        FROM advisory_occurrences
+                        WHERE finding_id = ? AND run_id = ?
+                        ORDER BY observed_at DESC, recorded_at DESC, occurrence_id DESC
+                        LIMIT ?
+                        """,
+                        [finding_id, attempt_id, MAX_DETAIL_EVIDENCE],
+                    ).fetchall()
+                finally:
+                    self._untrack_check_status_connection(future, con)
+        except ControlPlaneBusy:
+            return _verification_status(
+                status="unavailable",
+                outcome=None,
+                checked_at=_wire_datetime(finished_at),
+                evidence=[],
+                finding_state=None,
+            )
+
+        if finding_row is None or not rows:
+            return _verification_status(
+                status="completed",
+                outcome="inconclusive",
+                checked_at=_wire_datetime(finished_at),
+                evidence=[],
+                finding_state=None,
+            )
+        finding_state = str(finding_row[0])
+        evidence = [
+            {
+                "outcome": str(item[0]),
+                "observed_at": _wire_datetime(item[1]),
+                "source_ref": item[2],
+                "fields": json.loads(item[3]) if item[3] else {},
+                "excerpt": item[4],
+            }
+            for item in rows
+        ]
+        if evidence[0]["outcome"] == "failing":
+            outcome, outcome_reason = "still_present", None
+        elif finding_state == FindingState.RESOLVED.value:
+            outcome, outcome_reason = "resolved", None
+        else:
+            outcome = "inconclusive"
+            outcome_reason = "finding remains open after passing evidence"
+        return _verification_status(
+            status="completed",
+            outcome=outcome,
+            checked_at=_wire_datetime(finished_at),
+            evidence=evidence,
+            finding_state=finding_state,
+            outcome_reason=outcome_reason,
+        )
+
+    def _verification_finding_state(
+        self,
+        finding_id: str,
+        *,
+        future: Future[dict[str, Any]],
+    ) -> str | None:
+        try:
+            with control_plane_connection(self.duckdb_path, timeout=0.25) as con:
+                self._track_check_status_connection(future, con)
+                try:
+                    row = con.execute(
+                        "SELECT state FROM advisory_findings WHERE finding_id = ?",
+                        [finding_id],
+                    ).fetchone()
+                finally:
+                    self._untrack_check_status_connection(future, con)
+        except ControlPlaneBusy:
+            return None
+        return str(row[0]) if row is not None else None
+
+    def _track_check_status_connection(
+        self, future: Future[dict[str, Any]], con: Any
+    ) -> None:
+        with self._check_status_lock:
+            self._check_status_connections.setdefault(future, set()).add(con)
+
+    def _untrack_check_status_connection(
+        self, future: Future[dict[str, Any]], con: Any
+    ) -> None:
+        with self._check_status_lock:
+            connections = self._check_status_connections.get(future)
+            if connections is not None:
+                connections.discard(con)
+                if not connections:
+                    self._check_status_connections.pop(future, None)
+
+    def _interrupt_check_status_connections(
+        self,
+        key: tuple[str, str],
+        future: Future[dict[str, Any]],
+    ) -> None:
+        # Interrupt while still holding _check_status_lock, not after releasing it.
+        # With DROVER_CONTROL_PLANE_PIN=1 the control-plane handle is process-wide,
+        # so between reading this set and interrupting, the read could finish,
+        # untrack, release the control-plane lock, and another component could
+        # acquire the same connection and start its own query -- which the
+        # interrupt would then abort. A /harness read cancelled by an unrelated
+        # check-status timeout is the failure this avoids, and it is the same
+        # surface as the outages in #332 and #345.
+        #
+        # Holding the lock closes the window: _untrack_check_status_connection
+        # needs it too, so the read cannot leave its `with control_plane_connection`
+        # block while we are in here, and the control-plane lock stays held.
+        # Interrupting our own finished query is a no-op, so the worst case is
+        # harmless. DuckDB's interrupt() only sets a flag, so it cannot block here.
+        with self._check_status_lock:
+            if self._check_status_inflight != (key, future):
+                return
+            self._check_status_timed_out.add(future)
+            for con in tuple(self._check_status_connections.get(future, ())):
+                try:
+                    con.interrupt()
+                except Exception:  # noqa: BLE001 - deadline still reports unavailable
+                    log.debug("failed to interrupt timed-out check-status read")
+
     def _enqueue_check(self, finding: Finding, target_id: str, source_version: str):
         return enqueue_advisory_check(
             self.duckdb_path,
@@ -719,6 +1000,7 @@ class InsightsService:
             target_id=target_id,
             source_version=source_version,
             force=True,
+            requested_finding_id=finding.finding_id,
         )
 
     def _check_scope_cached(self, finding: Finding) -> tuple[str, str]:
@@ -769,7 +1051,17 @@ class InsightsService:
                 )
                 start = (future, worker)
         if start is not None:
-            start[1].start()
+            try:
+                start[1].start()
+            except BaseException:
+                # The slot is published before the thread exists, so a
+                # failed start would leave a Future nobody completes and
+                # every later request for this key would report
+                # unavailable until the process restarted.
+                with self._scope_lock:
+                    if self._scope_inflight == (key, start[0]):
+                        self._scope_inflight = None
+                raise
         try:
             return future.result(timeout=CHECK_SCOPE_BUDGET_SECONDS)
         except FuturesTimeout as exc:
@@ -1002,6 +1294,65 @@ def validate_finding_id(value: str) -> str:
     if not isinstance(value, str) or _FINDING_ID.fullmatch(value) is None:
         raise InvalidInsightRequest("invalid finding id")
     return value
+
+
+def _validate_job_id(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise InvalidInsightRequest("invalid job id")
+    return value
+
+
+def _verification_job_status(job_status: str, attempt_result: Any) -> str:
+    if job_status in {"pending", "retry_wait"}:
+        return "queued"
+    if job_status == "leased":
+        return "running"
+    if job_status == "cancelled" or attempt_result == "cancelled":
+        return "cancelled"
+    if job_status in {"terminal_failed", "dead_lettered"} or attempt_result in {
+        "terminal_failed",
+        "retryable_failed",
+    }:
+        return "failed"
+    if job_status in {"succeeded", "superseded"} and attempt_result == "succeeded":
+        return "completed"
+    return "unavailable"
+
+
+def _verification_status(
+    *,
+    status: str,
+    outcome: str | None,
+    checked_at: str | None,
+    evidence: list[dict[str, Any]],
+    finding_state: str | None,
+    outcome_reason: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "status": status,
+        "outcome": outcome,
+        "checked_at": checked_at,
+        "evidence": evidence,
+        "finding_state": finding_state,
+    }
+    if outcome_reason is not None:
+        payload["outcome_reason"] = outcome_reason
+    return payload
+
+
+def _unavailable_check_status() -> dict[str, Any]:
+    return _verification_status(
+        status="unavailable",
+        outcome=None,
+        checked_at=None,
+        evidence=[],
+        finding_state=None,
+    )
+
+
+def _is_ledger_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "could not set lock" in text or "database is locked" in text
 
 
 def validate_action_body(body: Mapping[str, Any], *, allowed: set[str]) -> None:

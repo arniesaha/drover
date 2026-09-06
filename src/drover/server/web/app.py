@@ -258,6 +258,13 @@ def _parse_insight_route(path: str) -> tuple[str, str | None] | None:
     return finding_id, action
 
 
+def _parse_insight_check_status_route(path: str) -> tuple[str, str] | None:
+    parts = path.strip("/").split("/")
+    if len(parts) != 4 or parts[0] != "insights" or parts[2] != "checks":
+        return None
+    return unquote(parts[1]), unquote(parts[3])
+
+
 def _harness_event_record(session_id: str, message: object) -> dict[str, Any] | None:
     """Extract the mirrorable event out of a terminal message, or ``None``.
 
@@ -838,6 +845,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/insights/content-analysis":
             status, body = self.collector.render_content_analysis_status_json()
+            self._send(status, "application/json", body)
+            return
+        check_status_route = _parse_insight_check_status_route(path)
+        if check_status_route is not None:
+            status, body = self.collector.render_insight_check_status_json(
+                *check_status_route
+            )
             self._send(status, "application/json", body)
             return
         insight_route = _parse_insight_route(path)
