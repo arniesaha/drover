@@ -1086,6 +1086,13 @@ def _refresh_agent_event_partition_activity(
 
 #: Days summarised per call on a caller-owned connection.
 #:
+#: There is deliberately no CHECKPOINT between days. An earlier cut had one, to
+#: bound what the buffer pool accumulated, and it failed on the first live hub it
+#: reached: "Cannot CHECKPOINT: there are other write transactions active" is the
+#: normal state of a running server, and the isolated probe that validated the
+#: backfill had no concurrent writers to reveal it. Closing the connection is what
+#: actually releases the buffers, which is why the backfill owns one per day.
+#:
 #: Each day costs a fraction of a second and yields a few dozen rows, but the
 #: buffer pool keeps the parquet it touched and will not give it back within the
 #: connection: on the hub's store the seventh day in one connection exhausts the
@@ -1163,11 +1170,6 @@ def refresh_agent_event_day_summary(
             """,
             [ingested[0], partition_date],
         )
-        # Checkpoint per day. Without it the pass accumulates written blocks and
-        # scanned partitions in one buffer pool and exhausts the same budget it
-        # exists to protect -- it OOM'd around the twentieth day of a 32-day
-        # backfill. One day at a time is the whole point of doing this here.
-        con.execute("CHECKPOINT")
         rebuilt.append(partition_date)
     return rebuilt
 
