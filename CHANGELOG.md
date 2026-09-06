@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-09-06
+
+### Changed
+
+- The cockpit's observed-activity query no longer rescans raw event partitions
+  on every request. A 30-day window pushed 2,488,925 events through a single
+  window operator to produce 348 rows, which took the whole 1 GB analytical
+  budget; since that budget is instance-wide, it starved the summarizer, the
+  advisory worker and host registration alongside it. Each day is now
+  summarised once and reused. Measured on the hub at the same budget: a 30-day
+  build drops from 11.7 s to 1.0 s, a 7-day one from 1.1 s to 0.3 s, and the
+  memory a 30-day build needs from 1 GB to 384 MB. Two concurrent builds both
+  succeed where one used to fail; four now get three through where all four
+  failed. Output is unchanged.
+
 ## [0.4.9] - 2026-09-06
 
 ### Fixed
