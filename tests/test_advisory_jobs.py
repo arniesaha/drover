@@ -26,6 +26,7 @@ from drover.server.advisory.analyzers import (
     TelemetryAggregate,
 )
 from drover.server.advisory.analyzers.connectors import ConnectorFreshnessAnalyzer
+from drover.server.advisory.analyzers.telemetry import CacheReadEfficiencyAnalyzer
 from drover.server.advisory.content_targets import BundledTarget, ContentBundle
 from drover.server.advisory.jobs import (
     AdvisoryScheduler,
@@ -2503,6 +2504,101 @@ def test_runtime_telemetry_prefers_exact_session_usage_over_span_token_fallback(
     assert telemetry.cache_read_tokens == 9
 
 
+def test_runtime_cache_efficiency_uses_only_complete_quality_pairs(
+    db_path: Path,
+) -> None:
+    """Cache absence and inexact usage must not be reported as zero cache reads."""
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DROP VIEW spans_enriched")
+        con.execute("DROP VIEW spans")
+        con.execute("""
+            CREATE TABLE spans (
+              span_id VARCHAR, session_id VARCHAR, start_time TIMESTAMPTZ,
+              prompt_tokens BIGINT, total_tokens BIGINT,
+              cache_read_tokens BIGINT, cost_usd DOUBLE
+            )
+            """)
+        con.execute(
+            """
+            INSERT INTO spans VALUES
+              ('span-missing-cache', 'span-missing-cache', ?, 20000, 20000, NULL, 1.0),
+              ('span-zero', 'span-zero', ?, 20000, 20000, 0, 1.0),
+              ('span-fallback', 'usage-inexact-with-span', ?, 20000, 20000, 0, 1.0)
+            """,
+            [NOW, NOW, NOW],
+        )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, started_at, updated_at
+        ) VALUES
+          ('usage-missing-cache', 'mac-mini', 'usage-missing-cache', 'codex', 'completed', ?, ?),
+          ('usage-exact-zero', 'mac-mini', 'usage-exact-zero', 'codex', 'completed', ?, ?),
+          ('usage-inexact-zero', 'mac-mini', 'usage-inexact-zero', 'codex', 'completed', ?, ?),
+          ('usage-inexact-with-span', 'mac-mini', 'usage-inexact-with-span', 'codex', 'completed', ?, ?),
+          ('usage-missing-input', 'mac-mini', 'usage-missing-input', 'codex', 'completed', ?, ?),
+          ('usage-known-cache', 'mac-mini', 'mixed', 'codex', 'completed', ?, ?),
+          ('usage-unknown-cache', 'mac-mini', 'mixed', 'codex', 'completed', ?, ?),
+          ('span-missing-cache', 'mac-mini', 'span-missing-cache', 'codex', 'completed', ?, ?),
+          ('span-zero', 'mac-mini', 'span-zero', 'codex', 'completed', ?, ?)
+        """,
+        [NOW] * 18,
+    )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO session_usage (
+          session_id, host_id, harness, input_tokens, output_tokens,
+          cache_read_tokens, cache_write_tokens, reasoning_tokens, turn_count,
+          exact, source, source_seq, source_event_count, observed_at
+        ) VALUES
+          ('usage-missing-cache', NULL, NULL, 20000, 0, NULL, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?),
+          ('usage-exact-zero', NULL, NULL, 20000, 0, 0, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?),
+          ('usage-inexact-zero', NULL, NULL, 20000, 0, 0, NULL, NULL, 1, FALSE,
+           'native_agent_events', 1, 1, ?),
+          ('usage-inexact-with-span', NULL, NULL, 20000, 0, 0, NULL, NULL, 1, FALSE,
+           'native_agent_events', 1, 1, ?),
+          ('usage-missing-input', NULL, NULL, NULL, 0, 0, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?),
+          ('usage-known-cache', NULL, NULL, 20000, 0, 4000, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?),
+          ('usage-unknown-cache', NULL, NULL, 20000, 0, NULL, NULL, NULL, 1, TRUE,
+           'native_agent_events', 1, 1, ?)
+        """,
+        [NOW] * 7,
+    )
+
+    snapshot = load_operational_snapshot(
+        db_path,
+        "deterministic.cache_read_efficiency",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+
+    findings = CacheReadEfficiencyAnalyzer(
+        minimum_input_tokens=10_000,
+        minimum_cache_read_percent=15,
+    ).analyze(snapshot)
+
+    assert [(item.target_id, item.confidence) for item in findings] == [
+        ("mac-mini/span-zero", Confidence.LIKELY),
+        ("mac-mini/usage-exact-zero", Confidence.CONFIRMED),
+        ("mac-mini/usage-inexact-with-span", Confidence.LIKELY),
+    ]
+    span_finding, exact_finding, fallback_finding = findings
+    assert span_finding.evidence[0].fields["cache_metric_sources"] == ["span"]
+    assert span_finding.evidence[0].fields["exact_cache_metric_pair_sessions"] == 0
+    assert span_finding.evidence[0].fields["span_cache_metric_pair_records"] == 1
+    assert exact_finding.evidence[0].fields["cache_metric_sources"] == [
+        "exact_session_usage"
+    ]
+    assert fallback_finding.evidence[0].fields["cache_metric_sources"] == ["span"]
+
+
 def test_load_hook_facts_returns_aware_utc_timestamps(db_path: Path) -> None:
     """harness_hosts.updated_at/last_seen_at are naive TIMESTAMP columns.
 
@@ -2573,6 +2669,49 @@ def test_operational_fact_hash_coalesces_unchanged_rows(db_path: Path) -> None:
 
     assert first == second
     assert first.startswith("operational-facts:")
+
+
+def test_cache_quality_change_updates_operational_fact_hash(db_path: Path) -> None:
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO harness_sessions (
+          session_id, host_id, harness, command, status, started_at, updated_at
+        ) VALUES ('cache-quality', 'mac-mini', 'codex', 'codex', 'completed', ?, ?)
+        """,
+        [NOW, NOW],
+    )
+    _control_plane_execute(
+        db_path,
+        """
+        INSERT INTO session_usage (
+          session_id, host_id, harness, input_tokens, output_tokens,
+          cache_read_tokens, cache_write_tokens, reasoning_tokens, turn_count,
+          exact, source, source_seq, source_event_count, observed_at
+        ) VALUES ('cache-quality', NULL, NULL, 20000, 0, NULL, NULL, NULL, 1,
+                TRUE, 'native_agent_events', 1, 1, ?)
+        """,
+        [NOW],
+    )
+    unavailable = operational_snapshot_source_version(
+        db_path,
+        "deterministic.cache_read_efficiency",
+        "fleet",
+        analyzed_at=NOW,
+    )
+    _control_plane_execute(
+        db_path,
+        "UPDATE session_usage SET cache_read_tokens = 0 WHERE session_id = ?",
+        ["cache-quality"],
+    )
+    measured_zero = operational_snapshot_source_version(
+        db_path,
+        "deterministic.cache_read_efficiency",
+        "fleet",
+        analyzed_at=NOW,
+    )
+
+    assert unavailable != measured_zero
 
 
 def test_runtime_telemetry_snapshot_caps_input_sessions(db_path: Path) -> None:
@@ -2974,6 +3113,105 @@ def test_truncated_span_facts_cannot_resolve_existing_cache_finding(
 
     assert worker.run_once([operational_analyzers()[4]]).succeeded == 1
     assert repository.get_finding(existing.finding_id).state.value == "open"
+
+
+def test_missing_cache_pair_facts_cannot_resolve_existing_cache_finding(
+    db_path: Path,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.cache_read_efficiency",
+            rule_id="telemetry.cache_read_inefficiency",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Cache-read efficiency is low",
+            impact="Repeated input is not using cache reads.",
+            remediation=("Inspect repeated context, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="normalized-telemetry:mac-mini/codex",
+                    observed_at=NOW,
+                    fields={"cache_read_percent": 0},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.cache_read_efficiency",
+        target_id="fleet",
+        source_version="cache-absent:v2",
+    )
+    unavailable = _telemetry_snapshot("cache-absent:v2")
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: unavailable,
+    )
+
+    assert worker.run_once([operational_analyzers()[4]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "open"
+
+
+def test_adequate_healthy_cache_pair_facts_resolve_existing_cache_finding(
+    db_path: Path,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    existing = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.cache_read_efficiency",
+            rule_id="telemetry.cache_read_inefficiency",
+            target_type="telemetry_source",
+            target_id="mac-mini/codex",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.CONFIRMED,
+            title="Cache-read efficiency is low",
+            impact="Repeated input is not using cache reads.",
+            remediation=("Inspect repeated context, then run Check Again.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="normalized-telemetry:mac-mini/codex",
+                    observed_at=NOW,
+                    fields={"cache_read_percent": 0},
+                ),
+            ),
+        ),
+        run_id="previous-run",
+    )
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id="deterministic.cache_read_efficiency",
+        target_id="fleet",
+        source_version="cache-healthy:v2",
+    )
+    healthy = AnalysisSnapshot(
+        source_version="cache-healthy:v2",
+        analyzed_at=NOW,
+        telemetry=(
+            replace(
+                _telemetry_snapshot("unused").telemetry[0],
+                prompt_tokens=20_000,
+                cache_read_tokens=5_000,
+                exact_cache_metric_pair_sessions=1,
+                exact_cache_metric_pair_prompt_tokens=20_000,
+                exact_cache_metric_pair_cache_read_tokens=5_000,
+            ),
+        ),
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=repository,
+        snapshot_factory=lambda _analyzer, _target, _version: healthy,
+    )
+
+    assert worker.run_once([operational_analyzers()[4]]).succeeded == 1
+    assert repository.get_finding(existing.finding_id).state.value == "resolved"
 
 
 def test_fleet_scope_telemetry_job_resolves_legacy_flow_coverage_finding(
