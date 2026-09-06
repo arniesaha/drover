@@ -1122,6 +1122,9 @@ def _snapshot_covers_finding(
         )
     if target_type == "telemetry_source":
 
+        # Read the threshold once, not once per telemetry row inside the any().
+        minimum_input_tokens = CacheReadEfficiencyAnalyzer().minimum_input_tokens
+
         def has_cache_efficiency_evidence(item: TelemetryAggregate) -> bool:
             measured_input = (
                 item.exact_cache_metric_pair_prompt_tokens
@@ -1129,10 +1132,7 @@ def _snapshot_covers_finding(
                 + item.span_cache_metric_pair_prompt_tokens
                 + item.span_cache_metric_pair_cache_read_tokens
             )
-            return (
-                item.facts_complete
-                and measured_input >= CacheReadEfficiencyAnalyzer().minimum_input_tokens
-            )
+            return item.facts_complete and measured_input >= minimum_input_tokens
 
         if analyzer_id == CacheReadEfficiencyAnalyzer.analyzer_id:
             return any(
