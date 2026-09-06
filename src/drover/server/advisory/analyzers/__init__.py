@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import PurePath
 from typing import Protocol, runtime_checkable
@@ -101,6 +101,15 @@ class TelemetryAggregate:
     input_span_records: int
     source_ref: str
     latest_span_at: datetime | None = None
+    # The exact count is a session denominator. The span count is a record
+    # denominator: each counted span carried both measured prompt and cache
+    # read tokens, without combining fields across sources.
+    exact_cache_metric_pair_sessions: int = field(default=0, kw_only=True)
+    exact_cache_metric_pair_prompt_tokens: int = field(default=0, kw_only=True)
+    exact_cache_metric_pair_cache_read_tokens: int = field(default=0, kw_only=True)
+    span_cache_metric_pair_records: int = field(default=0, kw_only=True)
+    span_cache_metric_pair_prompt_tokens: int = field(default=0, kw_only=True)
+    span_cache_metric_pair_cache_read_tokens: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         for field_name in ("target_id", "host_id", "harness_id", "source_ref"):
@@ -117,6 +126,12 @@ class TelemetryAggregate:
             "prompt_tokens",
             "cache_read_tokens",
             "input_span_records",
+            "exact_cache_metric_pair_sessions",
+            "exact_cache_metric_pair_prompt_tokens",
+            "exact_cache_metric_pair_cache_read_tokens",
+            "span_cache_metric_pair_records",
+            "span_cache_metric_pair_prompt_tokens",
+            "span_cache_metric_pair_cache_read_tokens",
         )
         for field_name in count_fields:
             _require_nonnegative(getattr(self, field_name), field_name)

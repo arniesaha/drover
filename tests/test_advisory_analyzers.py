@@ -84,6 +84,9 @@ def _telemetry(**overrides: object) -> TelemetryAggregate:
         "input_span_records": 10,
         "source_ref": "analytics:mac-mini/codex/24h",
         "latest_span_at": NOW - timedelta(minutes=30),
+        "exact_cache_metric_pair_sessions": 1,
+        "exact_cache_metric_pair_prompt_tokens": 10_000,
+        "exact_cache_metric_pair_cache_read_tokens": 5_000,
     }
     values.update(overrides)
     return TelemetryAggregate(**values)  # type: ignore[arg-type]
@@ -414,7 +417,12 @@ def test_empty_telemetry_window_does_not_create_coverage_findings() -> None:
 
 
 def test_low_cache_read_ratio_reports_numerical_evidence() -> None:
-    aggregate = _telemetry(prompt_tokens=9_500, cache_read_tokens=500)
+    aggregate = _telemetry(
+        prompt_tokens=9_500,
+        cache_read_tokens=500,
+        exact_cache_metric_pair_prompt_tokens=9_500,
+        exact_cache_metric_pair_cache_read_tokens=500,
+    )
 
     finding = CacheReadEfficiencyAnalyzer(
         minimum_input_tokens=1_000,
@@ -423,13 +431,116 @@ def test_low_cache_read_ratio_reports_numerical_evidence() -> None:
 
     assert finding.rule_id == "telemetry.cache_read_inefficiency"
     assert finding.evidence[0].fields == {
-        "prompt_tokens": 9500,
-        "cache_read_tokens": 500,
-        "reusable_input_tokens": 10000,
-        "cache_read_percent": 5,
+        "measured_prompt_tokens": 9500,
+        "measured_cache_read_tokens": 500,
+        # codex reports cache reads inside input, so 9,500 is the whole of the
+        # reusable input here, not 9,500 + 500.
+        "reusable_input_tokens": 9500,
+        "cache_read_percent": 5.26,
         "minimum_cache_read_percent": 20,
+        "cache_metric_sources": ["exact_session_usage"],
+        "exact_cache_metric_pair_sessions": 1,
+        "span_cache_metric_pair_records": 0,
     }
     assert "Inspect repeated context" in finding.remediation[0]
+
+
+def test_codex_cache_reads_are_not_added_on_top_of_its_input() -> None:
+    """A healthy codex target is not flagged by counting its cache reads twice.
+
+    codex reports ``cached_input_tokens`` as a subset of ``input_tokens``
+    (``CACHE_INSIDE_INPUT_HARNESSES``). Summing the two inflates the denominator:
+    11,000 of 100,000 is 11% and healthy, but 11,000/111,000 is 9.91% and trips a
+    10% floor. Since the pair is exact, the false finding would carry CONFIRMED.
+    """
+    aggregate = _telemetry(
+        harness_id="codex",
+        prompt_tokens=100_000,
+        cache_read_tokens=11_000,
+        exact_cache_metric_pair_prompt_tokens=100_000,
+        exact_cache_metric_pair_cache_read_tokens=11_000,
+    )
+
+    assert (
+        CacheReadEfficiencyAnalyzer(
+            minimum_input_tokens=1_000,
+            minimum_cache_read_percent=10,
+        ).analyze(_snapshot(telemetry=(aggregate,)))
+        == []
+    )
+
+
+def test_a_harness_reporting_cache_beside_input_still_sums_both() -> None:
+    """The same numbers under claude are a real finding, and must stay one."""
+    aggregate = _telemetry(
+        target_id="mac-mini/claude",
+        harness_id="claude",
+        prompt_tokens=100_000,
+        cache_read_tokens=11_000,
+        exact_cache_metric_pair_prompt_tokens=100_000,
+        exact_cache_metric_pair_cache_read_tokens=11_000,
+    )
+
+    finding = CacheReadEfficiencyAnalyzer(
+        minimum_input_tokens=1_000,
+        minimum_cache_read_percent=10,
+    ).analyze(_snapshot(telemetry=(aggregate,)))[0]
+
+    assert finding.evidence[0].fields["reusable_input_tokens"] == 111_000
+    assert finding.evidence[0].fields["cache_read_percent"] == 9.91
+
+
+def test_one_span_record_does_not_downgrade_a_finding_the_exact_numbers_carry() -> None:
+    """Span data downgrades confidence only when it is load-bearing.
+
+    A target whose exact numbers alone already fall below the floor is CONFIRMED
+    however many span records sit beside them; one span-only session worth 100
+    tokens should not reduce the confidence of a ratio resting on 500 exact ones.
+    """
+    aggregate = _telemetry(
+        target_id="mac-mini/claude",
+        harness_id="claude",
+        prompt_tokens=10_000_000,
+        cache_read_tokens=100_000,
+        exact_cache_metric_pair_sessions=500,
+        exact_cache_metric_pair_prompt_tokens=10_000_000,
+        exact_cache_metric_pair_cache_read_tokens=100_000,
+        span_cache_metric_pair_records=1,
+        span_cache_metric_pair_prompt_tokens=100,
+        span_cache_metric_pair_cache_read_tokens=0,
+    )
+
+    finding = CacheReadEfficiencyAnalyzer(
+        minimum_input_tokens=1_000,
+        minimum_cache_read_percent=10,
+    ).analyze(_snapshot(telemetry=(aggregate,)))[0]
+
+    assert finding.confidence is Confidence.CONFIRMED
+
+
+def test_span_data_that_carries_the_finding_still_downgrades_it() -> None:
+    """Where the exact numbers alone would not raise it, the span part is decisive."""
+    aggregate = _telemetry(
+        target_id="mac-mini/claude",
+        harness_id="claude",
+        # Exact alone is 500 reusable tokens, under the 1,000 floor, so it could
+        # not have raised this on its own; the span records are what carry it.
+        prompt_tokens=9_400,
+        cache_read_tokens=200,
+        exact_cache_metric_pair_sessions=1,
+        exact_cache_metric_pair_prompt_tokens=400,
+        exact_cache_metric_pair_cache_read_tokens=100,
+        span_cache_metric_pair_records=5,
+        span_cache_metric_pair_prompt_tokens=9_000,
+        span_cache_metric_pair_cache_read_tokens=100,
+    )
+
+    finding = CacheReadEfficiencyAnalyzer(
+        minimum_input_tokens=1_000,
+        minimum_cache_read_percent=10,
+    ).analyze(_snapshot(telemetry=(aggregate,)))[0]
+
+    assert finding.confidence is Confidence.LIKELY
 
 
 def test_routing_mismatch_frequency_is_confirmed() -> None:
