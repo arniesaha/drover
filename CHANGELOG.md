@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-09-06
+
+### Fixed
+
+- Cache-read efficiency no longer counts codex cache reads twice. codex reports
+  cached input as a subset of input, so summing the two inflated the
+  denominator: a session at a healthy 11% was measured as 9.91% and flagged. The
+  finding also carried the highest confidence tier, because the numbers behind
+  it were exact.
+- A completed insight check keeps its answer. The finding row was read pinned to
+  the latest analyzer run, so any later pass discarded the check's own evidence
+  and turned a settled result into "inconclusive" with nothing to show. A client
+  polling a resolved check watched it flip for no visible reason.
+- A check-status timeout can no longer interrupt an unrelated query. The
+  interrupt was issued after releasing the lock that guards the shared
+  control-plane handle, so it could land on whatever acquired that handle next.
+- A queued check no longer reports the previous attempt's finish time, which
+  dated a check that had not run.
+- Insight detail messages reach the reader: a lifecycle error is no longer
+  suppressed when the notice it duplicates is off screen, a stale reanalysis
+  notice clears on refresh, and a cancelled request no longer draws
+  "Could not queue reanalysis." as an error.
+
+### Changed
+
+- Confidence on a cache-efficiency finding now reflects whether span-derived
+  data is load-bearing, rather than whether any span record exists at all.
+- `tests/test_server_cli.py` no longer gives different answers on identical
+  code. Interpreter startup, which every setup-check request pays, has been
+  measured spiking from 0.05 s to 11.7 s on the hub; budgets sized for a warm
+  machine turned that into a wrong answer rather than a slow pass. See #321.
+
 ## [0.4.8] - 2026-09-05
 
 ### Changed
