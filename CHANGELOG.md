@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-09-06
+
+### Fixed
+
+- The event day summary backfill introduced in 0.4.10 never ran on a live hub.
+  It checkpointed between days, and "Cannot CHECKPOINT: there are other write
+  transactions active" is the normal state of a running server, so every pass
+  failed at the first day. The isolated store it was validated against had no
+  concurrent writers to reveal it. Closing the connection is what releases the
+  buffers the checkpoint was there for, and the backfill already opens one per
+  day. Reads fell back to scanning throughout, so this cost speed rather than
+  correctness.
+
 ## [0.4.10] - 2026-09-06
 
 ### Changed
