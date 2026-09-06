@@ -140,6 +140,8 @@ final class FixtureHubURLProtocol: URLProtocol {
             return .json(status: 400, ["error": "fixture refuses non-synthetic origin"])
         }
         switch (request.httpMethod, path) {
+        case ("GET", let path) where path == "/insights/\(FixtureScenarioData.insightFindingID)":
+            return FixtureHubResponse(status: 200, body: FixtureScenarioData.insightDetailData())
         case ("GET", "/harness"):
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
         case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/model-catalog":

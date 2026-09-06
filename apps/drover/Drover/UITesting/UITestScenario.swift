@@ -2,21 +2,30 @@ import Foundation
 import DroverKit
 
 #if DEBUG
-/// Isolated building blocks for the one allowed environment-selected scenario.
+enum FixtureScenarioKind: String {
+    case coreJourney = "core-journey"
+    case insightDetail = "insight-detail"
+}
+
+/// Isolated building blocks for environment-selected fixture scenarios.
 struct UITestScenarioTransport {
+    let kind: FixtureScenarioKind
     let runID: String
     let client: DroverClient
     let receiptState: FixtureReceiptState
 
     init?(environment: [String: String] = ProcessInfo.processInfo.environment) {
-        guard environment["DROVER_UI_TEST_SCENARIO"] == "core-journey" else { return nil }
+        guard let rawKind = environment["DROVER_UI_TEST_SCENARIO"],
+              let kind = FixtureScenarioKind(rawValue: rawKind)
+        else { return nil }
         guard let rawRunID = environment["DROVER_UI_TEST_RUN_ID"],
               let runUUID = UUID(uuidString: rawRunID),
               let config = ServerConfig(urlString: FixtureScenarioData.coreJourney.serverURLString)
         else {
-            preconditionFailure("core-journey requires a UUID isolation identifier")
+            preconditionFailure("fixture scenarios require a UUID isolation identifier")
         }
         let runID = runUUID.uuidString
+        self.kind = kind
         self.runID = runID
         let receiptState = FixtureReceiptState(runID: runID)
         FixtureHubURLProtocol.install(receiptState: receiptState)
@@ -55,6 +64,8 @@ struct UITestScenario {
     let environment: AppEnvironment
     private let recoveryStore: ChatRecoveryStore
     private let catalogStore: HarnessModelCatalogStore
+
+    var kind: FixtureScenarioKind { transport.kind }
 
     init?(launchEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         guard let transport = UITestScenarioTransport(environment: launchEnvironment) else { return nil }

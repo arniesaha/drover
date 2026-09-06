@@ -100,6 +100,7 @@ jobs:
           -scheme DroverUITests \
           -destination "$SIMULATOR_DESTINATION" \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
+          -only-testing:DroverUITests/InsightDetailFixtureUITests \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test
 
@@ -112,9 +113,10 @@ jobs:
         if-no-files-found: ignore
 
     - name: Upload deterministic UI test result bundle
-      if: failure() && steps.scope.outputs.ios == 'true'
+      if: always() && steps.scope.outputs.ios == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: DroverUITests.xcresult
         path: ${{ runner.temp }}/DroverUITests.xcresult
         if-no-files-found: ignore
+        retention-days: 3
