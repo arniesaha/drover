@@ -1121,6 +1121,24 @@ def _snapshot_covers_finding(
             for item in snapshot.provider_connections
         )
     if target_type == "telemetry_source":
+
+        # Read the threshold once, not once per telemetry row inside the any().
+        minimum_input_tokens = CacheReadEfficiencyAnalyzer().minimum_input_tokens
+
+        def has_cache_efficiency_evidence(item: TelemetryAggregate) -> bool:
+            measured_input = (
+                item.exact_cache_metric_pair_prompt_tokens
+                + item.exact_cache_metric_pair_cache_read_tokens
+                + item.span_cache_metric_pair_prompt_tokens
+                + item.span_cache_metric_pair_cache_read_tokens
+            )
+            return item.facts_complete and measured_input >= minimum_input_tokens
+
+        if analyzer_id == CacheReadEfficiencyAnalyzer.analyzer_id:
+            return any(
+                item.target_id == target_id and has_cache_efficiency_evidence(item)
+                for item in snapshot.telemetry
+            )
         if target_id == "fleet":
             return any(item.facts_complete for item in snapshot.telemetry)
         if target_id.startswith("fleet/"):
@@ -1454,6 +1472,18 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                  bool_or(s.cost_usd IS NOT NULL) AS has_cost,
                  COALESCE(sum(s.prompt_tokens), 0)::BIGINT AS prompt_tokens,
                  COALESCE(sum(s.cache_read_tokens), 0)::BIGINT AS cache_read_tokens,
+                 count(*) FILTER (
+                   WHERE s.prompt_tokens IS NOT NULL
+                     AND s.cache_read_tokens IS NOT NULL
+                 )::BIGINT AS cache_metric_pair_records,
+                 COALESCE(sum(s.prompt_tokens) FILTER (
+                   WHERE s.prompt_tokens IS NOT NULL
+                     AND s.cache_read_tokens IS NOT NULL
+                 ), 0)::BIGINT AS cache_metric_pair_prompt_tokens,
+                 COALESCE(sum(s.cache_read_tokens) FILTER (
+                   WHERE s.prompt_tokens IS NOT NULL
+                     AND s.cache_read_tokens IS NOT NULL
+                 ), 0)::BIGINT AS cache_metric_pair_cache_read_tokens,
                  bool_or(
                    s.session_span_count > {MAX_SNAPSHOT_SPANS_PER_SESSION}
                    OR s.bounded_span_count > {MAX_SNAPSHOT_SPANS}
@@ -1482,6 +1512,45 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                    AS prompt_tokens,
                  COALESCE(u.cache_read_tokens, s.cache_read_tokens, 0)::BIGINT
                    AS cache_read_tokens,
+                 CASE WHEN u.exact
+                           AND u.input_tokens IS NOT NULL
+                           AND u.cache_read_tokens IS NOT NULL
+                   THEN 1 ELSE 0 END::BIGINT
+                   AS exact_cache_metric_pair_sessions,
+                 CASE WHEN u.exact
+                           AND u.input_tokens IS NOT NULL
+                           AND u.cache_read_tokens IS NOT NULL
+                   THEN u.input_tokens ELSE 0 END::BIGINT
+                   AS exact_cache_metric_pair_prompt_tokens,
+                 CASE WHEN u.exact
+                           AND u.input_tokens IS NOT NULL
+                           AND u.cache_read_tokens IS NOT NULL
+                   THEN u.cache_read_tokens ELSE 0 END::BIGINT
+                   AS exact_cache_metric_pair_cache_read_tokens,
+                 CASE WHEN NOT COALESCE(
+                           u.exact
+                           AND u.input_tokens IS NOT NULL
+                           AND u.cache_read_tokens IS NOT NULL,
+                           FALSE
+                         )
+                   THEN COALESCE(s.cache_metric_pair_records, 0)
+                   ELSE 0 END::BIGINT AS span_cache_metric_pair_records,
+                 CASE WHEN NOT COALESCE(
+                           u.exact
+                           AND u.input_tokens IS NOT NULL
+                           AND u.cache_read_tokens IS NOT NULL,
+                           FALSE
+                         )
+                   THEN COALESCE(s.cache_metric_pair_prompt_tokens, 0)
+                   ELSE 0 END::BIGINT AS span_cache_metric_pair_prompt_tokens,
+                 CASE WHEN NOT COALESCE(
+                           u.exact
+                           AND u.input_tokens IS NOT NULL
+                           AND u.cache_read_tokens IS NOT NULL,
+                           FALSE
+                         )
+                   THEN COALESCE(s.cache_metric_pair_cache_read_tokens, 0)
+                   ELSE 0 END::BIGINT AS span_cache_metric_pair_cache_read_tokens,
                  COALESCE(s.spans_truncated, FALSE) AS spans_truncated,
                  h.snapshot_session_count
           FROM bounded_sessions h
@@ -1510,7 +1579,13 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
                  OR COALESCE(bool_or(f.spans_truncated), FALSE)
                ),
                any_value(raw_bounds.input_span_records),
-               max(f.observed_at) FILTER (WHERE f.has_spans)
+               max(f.observed_at) FILTER (WHERE f.has_spans),
+               COALESCE(sum(f.exact_cache_metric_pair_sessions), 0)::BIGINT,
+               COALESCE(sum(f.exact_cache_metric_pair_prompt_tokens), 0)::BIGINT,
+               COALESCE(sum(f.exact_cache_metric_pair_cache_read_tokens), 0)::BIGINT,
+               COALESCE(sum(f.span_cache_metric_pair_records), 0)::BIGINT,
+               COALESCE(sum(f.span_cache_metric_pair_prompt_tokens), 0)::BIGINT,
+               COALESCE(sum(f.span_cache_metric_pair_cache_read_tokens), 0)::BIGINT
         FROM session_facts f
         CROSS JOIN span_status bounds
         CROSS JOIN raw_span_status raw_bounds
@@ -1541,6 +1616,12 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
             input_span_records=int(row[11]),
             source_ref=f"normalized-telemetry:{row[0]}/{row[1]}",
             latest_span_at=_optional_aware(row[12]),
+            exact_cache_metric_pair_sessions=int(row[13]),
+            exact_cache_metric_pair_prompt_tokens=int(row[14]),
+            exact_cache_metric_pair_cache_read_tokens=int(row[15]),
+            span_cache_metric_pair_records=int(row[16]),
+            span_cache_metric_pair_prompt_tokens=int(row[17]),
+            span_cache_metric_pair_cache_read_tokens=int(row[18]),
         )
         for row in rows
     )
@@ -1817,6 +1898,22 @@ def _operational_material(
                 "cost_observed_sessions": item.cost_observed_sessions,
                 "prompt_tokens": item.prompt_tokens,
                 "cache_read_tokens": item.cache_read_tokens,
+                "exact_cache_metric_pair_sessions": (
+                    item.exact_cache_metric_pair_sessions
+                ),
+                "exact_cache_metric_pair_prompt_tokens": (
+                    item.exact_cache_metric_pair_prompt_tokens
+                ),
+                "exact_cache_metric_pair_cache_read_tokens": (
+                    item.exact_cache_metric_pair_cache_read_tokens
+                ),
+                "span_cache_metric_pair_records": item.span_cache_metric_pair_records,
+                "span_cache_metric_pair_prompt_tokens": (
+                    item.span_cache_metric_pair_prompt_tokens
+                ),
+                "span_cache_metric_pair_cache_read_tokens": (
+                    item.span_cache_metric_pair_cache_read_tokens
+                ),
                 "facts_complete": item.facts_complete,
                 "input_span_records": item.input_span_records,
             }
