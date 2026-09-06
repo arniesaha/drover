@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-09-06
+
+### Fixed
+
+- A saturated fleet listing answers instead of leaving the client waiting.
+  Pollers arriving while a render is in flight now share it rather than each
+  starting their own, and a caller that cannot be served inside the budget gets
+  a 503 with `Retry-After`. An unanswered request reads to a client as "ask
+  again now", and that retry is what kept the hub saturated until it was
+  restarted. This is the server half of #331; the client half shipped
+  separately.
+
 ## [0.4.12] - 2026-09-06
 
 ### Fixed
