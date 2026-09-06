@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-09-06
+
+### Fixed
+
+- The event day summary cache decayed back to a full scan and stayed there. A
+  day is marked stale as soon as its partition is re-ingested, the watcher does
+  that about hourly, and the backfill only ran at startup -- so the cockpit
+  quietly returned to the behaviour the cache exists to prevent, until the next
+  restart. It now sweeps every 15 minutes.
+
 ## [0.4.11] - 2026-09-06
 
 ### Fixed

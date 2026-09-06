@@ -493,6 +493,12 @@ def _local_api_request(
         ) from exc
 
 
+#: How often the day-summary backfill looks for partitions to summarise.
+#: Long, because it exists to catch a day re-ingested since it was summarised and
+#: the watcher does that about hourly. A sweep that finds nothing is one indexed
+#: query.
+_DAY_SUMMARY_REFRESH_SECONDS = 900.0
+
 _SETUP_CHECK_TOTAL_TIMEOUT_SECONDS = 25.0
 _SETUP_CHECK_MAX_RESPONSE_BYTES = 1_048_576
 
@@ -2608,14 +2614,21 @@ def run(
     if not no_metrics:
 
         def _backfill_day_summaries() -> None:
-            try:
-                from drover.schema import backfill_agent_event_day_summary
+            # Keep going, not just once at startup. A day is marked stale the
+            # moment its partition is re-ingested, and the watcher re-ingests
+            # today's file every hour, so a run-once backfill lets the cache decay
+            # back to a full scan and stay there until the next restart -- the
+            # exact regression this cache exists to prevent, arriving quietly.
+            from drover.schema import backfill_agent_event_day_summary
 
-                summarised = backfill_agent_event_day_summary(cfg.duckdb_path)
-                if summarised:
-                    log.info("summarised %d event partition(s)", summarised)
-            except Exception:  # noqa: BLE001 - a cold cache only costs speed
-                log.exception("event day summary backfill failed; reads will scan")
+            while True:
+                try:
+                    summarised = backfill_agent_event_day_summary(cfg.duckdb_path)
+                    if summarised:
+                        log.info("summarised %d event partition(s)", summarised)
+                except Exception:  # noqa: BLE001 - a cold cache only costs speed
+                    log.exception("event day summary backfill failed; reads will scan")
+                time.sleep(_DAY_SUMMARY_REFRESH_SECONDS)
 
         threading.Thread(
             target=_backfill_day_summaries,
