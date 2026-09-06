@@ -250,7 +250,35 @@ public final class SessionStore {
         return "\(refreshAttempts) \(plural) · \(lastRefreshOutcome ?? "no response yet")"
     }
 
+    /// Coalesce concurrent refreshes onto one request.
+    ///
+    /// The store is `@MainActor`, but `refresh()` suspends at the network call,
+    /// so the poll loop, pull-to-refresh, a Retry tap and a scene-phase change
+    /// can each start their own while one is already running. Every extra one is
+    /// load on a hub that is, by hypothesis, already too slow to answer -- and
+    /// when they supersede each other they land as cancellations, which is what
+    /// drives the fast-retry path below. The hub logged 51 cancelled
+    /// `/harness/hosts` requests in a single second this way (drover#331).
+    ///
+    /// Joining the in-flight request gives every caller the same answer it would
+    /// have got, without asking for it again.
+    private var inFlightRefresh: Task<Void, Never>?
+
     public func refresh() async {
+        if let existing = inFlightRefresh {
+            await existing.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performRefresh()
+        }
+        inFlightRefresh = task
+        await task.value
+        inFlightRefresh = nil
+    }
+
+    private func performRefresh() async {
         guard let client else { return }
         refreshAttempts += 1
         do {
@@ -262,6 +290,7 @@ public final class SessionStore {
             hasLoadedOnce = true
             refreshAttempts = 0
             cancelledFirstLoads = 0
+            fastRetryStartedAt = nil
             lastRefreshOutcome = nil
             lastSuccessfulRefresh = Date()
         } catch {
@@ -279,6 +308,7 @@ public final class SessionStore {
                 return
             }
             cancelledFirstLoads = 0
+            fastRetryStartedAt = nil
             isReachable = false
             lastRefreshFailure = Self.classify(error)
             lastError = Self.errorMessage(
@@ -305,6 +335,7 @@ public final class SessionStore {
     /// This is the existing unreachable presentation, not a new one.
     private func noteCancelledFirstLoad() {
         guard !hasLoadedOnce else { return }
+        if cancelledFirstLoads == 0 { fastRetryStartedAt = Date() }
         cancelledFirstLoads += 1
         guard cancelledFirstLoads >= Self.cancelledFirstLoadLimit else { return }
         isReachable = false
@@ -393,8 +424,27 @@ public final class SessionStore {
     /// times a second forever.
     private func pollDelay(base seconds: Double) -> Double {
         guard !hasLoadedOnce, cancelledFirstLoads > 0, lastError == nil else { return seconds }
+        // Bounded by the clock, not just by a run of cancellations. The counter
+        // resets on any honest failure, so a hub that alternates between timing
+        // out and cancelling never reaches the limit that would slow this down,
+        // and the phone keeps asking four times a second for as long as it is
+        // held open. That is load the hub cannot afford from the one client
+        // waiting on it (drover#331).
+        guard let since = fastRetryStartedAt,
+            Date().timeIntervalSince(since) < Self.fastRetryWindow
+        else { return seconds }
         return min(Self.cancelledFirstLoadRetry, seconds)
     }
+
+    /// When the current run of quick retries began, or nil if none is running.
+    private var fastRetryStartedAt: Date?
+
+    /// How long quick retries may continue before the ordinary cadence resumes.
+    ///
+    /// Long enough to cover the launch-time churn this exists for (#85) and far
+    /// short of the point where a struggling hub is being polled into the
+    /// ground.
+    private static let fastRetryWindow: TimeInterval = 5
 
     private static let cancelledFirstLoadRetry = 0.25
 
