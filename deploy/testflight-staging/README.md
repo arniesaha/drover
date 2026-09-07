@@ -36,14 +36,30 @@ preparation; the tool does not fetch or decide which candidate to trust.
 
 2. Configure separate staging provider and APNs material. Both jobs run with
    `HOME=<STAGING_ROOT>/home` and a cleared environment. Sign the selected
-   provider CLI into a **dedicated low-quota account** with that HOME using a
-   clean environment; do not copy personal CLI state or export personal tokens.
+   provider using dedicated low-quota staging credentials. For Claude, provision
+   `<STAGING_HOME>/.drover/anthropic_api_key` as an owner-only `0600` regular file
+   containing a dedicated Anthropic API key. Do not export the key or place it in
+   a command argument. Claude's API-key helper reads that file through a private
+   pipe; the key never enters a plist or process environment. The CLI must support
+   [bare mode](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode),
+   which skips OAuth and the system Keychain. Staging disables subscription
+   login/status commands and OAuth usage readers; this lane does not validate
+   subscription billing behavior. Do not copy personal CLI state or credentials.
    Install the selected CLI so the launchd PATH shown in the rendered plist can
    find it. Keep any staging APNs key and configuration paths below the staging
    root, and edit only `<STAGING_HOME>/.drover/config.toml`. The tool preserves
    operator additions on subsequent prepares, while enforcing its paths,
    authentication, and listener settings. The config example embeds no token.
-   Background summarizer, briefs, embeddings, OTLP, and MCP are disabled.
+   Background summarizer, briefs, embeddings, OTLP, MCP, and automatic updates
+   are disabled. Both jobs explicitly identify their dedicated launchd label
+   through `XPC_SERVICE_NAME`; no fallback personal label is used.
+
+   For Codex, use only the dedicated `CODEX_HOME=<STAGING_HOME>/.codex` and log in
+   locally with `-c 'cli_auth_credentials_store="file"'`. Both the structured
+   driver and provider app-server force that setting; the credential stays in
+   this home rather than the OS Keychain. See [Codex credential storage](https://learn.chatgpt.com/docs/auth#credential-storage).
+   The app does not start login flows in staging. It accepts only structured
+   Claude/Codex sessions using runtime-selected commands.
 
 3. Activate:
 
@@ -86,7 +102,8 @@ preparation; the tool does not fetch or decide which candidate to trust.
    `<STAGING_ROOT>/workspace`, waits for the exact expected assistant response
    via the central messages API, and terminates the session on success or
    failure. It polls at most 60 times; each HTTP request has a five-second
-   timeout and a one-MiB response bound. A successful cleanup is required before
+   timeout and a one-MiB response bound. Cleanup must confirm the exact session
+   and host, `terminated: true`, and `status: terminated` before
    publishing `<STAGING_ROOT>/staging-probe.json` atomically with mode `0600`.
    The attestation contains only `source_sha`, `host_id`, a timezone-bearing
    `completed_at`, and `session_id_sha256`. It has no endpoint, credential,
@@ -117,7 +134,10 @@ restart; verify `/release-identity` to establish the running candidate.
 The generated plist environment and an `env -i` wrapper prevent inherited
 launchd provider settings or token overrides from selecting personal accounts.
 Staging never shares personal databases, pairing state, credentials, provider
-homes, or logs. Do not point staging paths at symlinks into personal storage.
+homes, or logs. The tool rejects symlinks throughout staging runtime state,
+including implicit provider homes and individual stdout/stderr files. Candidate
+code must contain the enforced credential-boundary module; preparation and
+activation refuse older releases that lack it.
 
 The checked-in plist files are examples with placeholders; `stage.py` renders
 actual definitions under the staging root. Do not install examples directly.

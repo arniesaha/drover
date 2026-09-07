@@ -17,6 +17,9 @@
 <string>XDG_DATA_HOME=&lt;STAGING_HOME&gt;/.local/share</string>
 <string>UV_CACHE_DIR=&lt;STAGING_ROOT&gt;/cache/uv</string>
 <string>DROVER_RELEASE_ROLE=testflight-staging</string>
+<string>DROVER_STAGING_ROOT=&lt;STAGING_ROOT&gt;</string>
+<string>CODEX_HOME=&lt;STAGING_HOME&gt;/.codex</string>
+<string>XPC_SERVICE_NAME=com.drover.testflight-harnessd</string>
 <string>DROVER_RELEASE_SHA=&lt;RELEASE_SHA&gt;</string>
 <string>DROVER_STAGING_ATTESTATION_PATH=&lt;STAGING_ROOT&gt;/staging-probe.json</string>
 <string>&lt;STAGING_ROOT&gt;/worktrees/&lt;RELEASE_SHA&gt;/.venv/bin/drover-harnessd</string>
@@ -53,6 +56,12 @@
 <string>&lt;STAGING_ROOT&gt;/cache/uv</string>
 <key>DROVER_RELEASE_ROLE</key>
 <string>testflight-staging</string>
+<key>DROVER_STAGING_ROOT</key>
+<string>&lt;STAGING_ROOT&gt;</string>
+<key>CODEX_HOME</key>
+<string>&lt;STAGING_HOME&gt;/.codex</string>
+<key>XPC_SERVICE_NAME</key>
+<string>com.drover.testflight-harnessd</string>
 <key>DROVER_RELEASE_SHA</key>
 <string>&lt;RELEASE_SHA&gt;</string>
 <key>DROVER_STAGING_ATTESTATION_PATH</key>

@@ -90,6 +90,17 @@ def private_dir(root: Path, relative: str) -> Path:
     return path
 
 
+def validate_runtime_paths(root: Path) -> None:
+    # Provider libraries discover descendants implicitly, not just config keys.
+    # Refuse links throughout runtime state, including individual log files.
+    for relative in ("home", "state", "workspace", "logs", "tmp", "cache"):
+        base = confined(root, relative)
+        if base.exists():
+            for directory, directories, files in os.walk(base, followlinks=False):
+                for name in [*directories, *files]:
+                    confined(root, str((Path(directory) / name).relative_to(root)))
+
+
 def atomic_write(root: Path, relative: str, data: bytes) -> None:
     path = confined(root, relative)
     private_dir(root, str(path.parent.relative_to(root)))
@@ -123,6 +134,8 @@ def environment(root: Path, sha: str) -> dict[str, str]:
         "XDG_DATA_HOME": str(root / "home/.local/share"),
         "UV_CACHE_DIR": str(root / "cache/uv"),
         "DROVER_RELEASE_ROLE": "testflight-staging",
+        "DROVER_STAGING_ROOT": str(root),
+        "CODEX_HOME": str(root / "home/.codex"),
         "DROVER_RELEASE_SHA": sha,
         "DROVER_STAGING_ATTESTATION_PATH": str(root / "staging-probe.json"),
     }
@@ -156,7 +169,7 @@ def config_text(root: Path, public_url: str) -> str:
 def validate_config(root: Path, public_url: str) -> None:
     cfg = tomllib.loads(confined(root, "home/.drover/config.toml").read_text())
     expected = tomllib.loads(config_text(root, public_url))
-    for section in ("paths", "server", "auth"):
+    for section in ("paths", "server", "auth", "update"):
         if any(
             cfg.get(section, {}).get(key) != value
             for key, value in expected[section].items()
@@ -190,7 +203,7 @@ def validate_config(root: Path, public_url: str) -> None:
 
 
 def render_jobs(root: Path, sha: str) -> None:
-    env = environment(root, sha)
+    validate_runtime_paths(root)
     checkout = confined(root, f"worktrees/{sha}")
     config = str(root / "home/.drover/config.toml")
     for label, executable, args in (
@@ -231,6 +244,7 @@ def render_jobs(root: Path, sha: str) -> None:
             ],
         ),
     ):
+        env = {**environment(root, sha), "XPC_SERVICE_NAME": label}
         job = {
             "Label": label,
             # launchd inherits manager environment. env -i blocks personal API
@@ -253,10 +267,23 @@ def render_jobs(root: Path, sha: str) -> None:
         atomic_write(root, f"launchd/{label}.plist", plistlib.dumps(job))
 
 
+def verify_candidate_boundary(root: Path, sha: str) -> None:
+    checkout = confined(root, f"worktrees/{sha}/.venv")
+    command(
+        [
+            str(checkout / "bin/python"),
+            "-c",
+            "from drover.server.staging_credentials import STAGING_CREDENTIAL_BOUNDARY_VERSION; assert STAGING_CREDENTIAL_BOUNDARY_VERSION == 1",
+        ],
+        env=environment(root, sha),
+    )
+
+
 def prepare(repository: Path, root: Path, sha: str, public_url: str) -> None:
     validate_sha(sha)
     validate_url(public_url)
     root = validate_root(root)
+    validate_runtime_paths(root)
     repository = Path(repository).resolve()
     git = ["git", "-C", str(repository)]
     if command([*git, "status", "--porcelain", "--untracked-files=all"]).stdout.strip():
@@ -315,6 +342,7 @@ def prepare(repository: Path, root: Path, sha: str, public_url: str) -> None:
     ).stdout.strip()
     if not re.fullmatch(r"[0-9][0-9A-Za-z.+-]{0,63}", version):
         raise StageError("installed package version is invalid")
+    verify_candidate_boundary(root, sha)
     config = confined(root, "home/.drover/config.toml")
     if not config.exists():
         atomic_write(
@@ -330,6 +358,7 @@ def prepare(repository: Path, root: Path, sha: str, public_url: str) -> None:
 def release(root: Path, sha: str) -> tuple[Path, dict]:
     validate_sha(sha)
     root = validate_root(root)
+    validate_runtime_paths(root)
     if confined(root, ".stage-root").read_text() != "drover-testflight-staging-v1\n":
         raise StageError("unrecognized staging root")
     record = json.loads(confined(root, f"releases/{sha}.json").read_text())
@@ -352,6 +381,7 @@ def release(root: Path, sha: str) -> tuple[Path, dict]:
         raise StageError("staged checkout SHA has changed")
     if command([*git, "status", "--porcelain", "--untracked-files=all"]).stdout.strip():
         raise StageError("staged checkout is dirty")
+    verify_candidate_boundary(root, sha)
     return root, record
 
 
@@ -533,7 +563,7 @@ def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
         if session_id:
             # Bound provider use on both successful and failed probes. A cleanup
             # failure must also prevent issuing a successful attestation.
-            http(
+            termination = http(
                 SERVER
                 + "/harness/sessions/"
                 + quote(session_id, safe="")
@@ -542,6 +572,13 @@ def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
                 token=token,
                 payload={},
             )
+            if not isinstance(termination, dict) or (
+                termination.get("session_id") != session_id
+                or termination.get("host_id") != HOST_ID
+                or termination.get("terminated") is not True
+                or termination.get("status") != "terminated"
+            ):
+                raise StageError("probe termination was not confirmed")
     write_json(
         root,
         "staging-probe.json",

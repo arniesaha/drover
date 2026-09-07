@@ -2020,6 +2020,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        from drover.server.staging_credentials import is_staging
+
+        if is_staging() and (
+            body.get("mode") != "structured"
+            or body.get("harness") not in {"claude-code", "codex"}
+            or body.get("command") is not None
+        ):
+            self._write_json(
+                {"error": "staging requires a supported structured runtime command"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         # Idempotency gate, before anything is spawned (drover#268). A caller
         # whose create timed out cannot otherwise tell whether it was served,
         # and retrying blind puts a second live agent on the same working

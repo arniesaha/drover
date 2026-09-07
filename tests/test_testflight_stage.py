@@ -9,7 +9,11 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from test_harness_update_wiring import _run_harnessd_capturing_state
 from testflight import stage
+
+from drover.config import load_config
+from drover.server.harness import updater
 
 SHA = "a" * 40
 OLDER = "b" * 40
@@ -145,6 +149,13 @@ def test_prepare_renders_isolated_private_artifacts(runtime, monkeypatch):
 
 
 def healthy_http(url, *, method="GET", token=None, payload=None):
+    if url.endswith("/terminate"):
+        return {
+            "session_id": url.split("/")[-2],
+            "host_id": "testflight-staging-mac-mini",
+            "terminated": True,
+            "status": "terminated",
+        }
     if url.endswith("/release-identity"):
         return {
             "role": "testflight-staging",
@@ -507,3 +518,146 @@ def test_probe_rejects_wrong_session_host_and_cleans_up(runtime, monkeypatch):
     assert calls[-1].endswith("/terminate")
     assert not any("/messages?" in url for url in calls)
     assert not (root / "staging-probe.json").exists()
+
+
+def test_staging_effective_config_never_starts_updater(runtime, monkeypatch):
+    root = prepare(runtime)
+    cfg = load_config(root / "home/.drover/config.toml")
+    assert cfg.update_enabled is False
+    state = _run_harnessd_capturing_state(monkeypatch, root / "state", cfg)
+    assert state.updater is None
+
+
+def test_staging_updater_restarter_can_only_address_dedicated_label(
+    runtime, monkeypatch
+):
+    root = prepare(runtime)
+    for name in ("server", "harnessd"):
+        label = f"com.drover.testflight-{name}"
+        job = plistlib.loads((root / "launchd" / f"{label}.plist").read_bytes())
+        assert job["EnvironmentVariables"]["XPC_SERVICE_NAME"] == label
+        monkeypatch.setenv("XPC_SERVICE_NAME", label)
+        monkeypatch.setattr(updater.sys, "platform", "darwin")
+        updater.default_restarter()
+        assert runtime[2][-1][0][-1].endswith("/" + label)
+
+
+def test_activate_rejects_enabled_updater(runtime, monkeypatch):
+    root = ready_root(runtime, monkeypatch)
+    path = root / "home/.drover/config.toml"
+    path.write_text(
+        path.read_text().replace(
+            "[update]\nenabled = false", "[update]\nenabled = true"
+        )
+    )
+    with pytest.raises(stage.StageError):
+        stage.activate(root, SHA)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "home/.claude",
+        "home/.claude/projects",
+        "home/.codex/auth.json",
+        "home/.drover/model-catalog-scope.key",
+        "logs/com.drover.testflight-server.stdout.log",
+        "logs/com.drover.testflight-harnessd.stderr.log",
+    ],
+)
+@pytest.mark.parametrize("action", ["prepare", "activate", "probe", "rollback"])
+def test_lifecycle_rejects_implicit_state_and_log_symlink_escapes(
+    runtime, monkeypatch, relative, action
+):
+    root = ready_root(runtime, monkeypatch)
+    outside = runtime[1] / "private-data"
+    outside.mkdir()
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(outside, target_is_directory=True)
+
+    def unexpected_http(*args, **kwargs):
+        pytest.fail("unsafe staging path reached the HTTP boundary")
+
+    monkeypatch.setattr(stage, "http", unexpected_http)
+    runtime[2].clear()
+    with pytest.raises(stage.StageError):
+        if action == "prepare":
+            prepare(runtime)
+        else:
+            getattr(stage, action)(root, SHA)
+    assert not any(argv[0] == "launchctl" for argv, _ in runtime[2])
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "termination",
+    [
+        {},
+        {"terminated": False},
+        {
+            "terminated": True,
+            "status": "running",
+            "host_id": "testflight-staging-mac-mini",
+            "session_id": "probe-test",
+        },
+        {
+            "terminated": True,
+            "status": "terminated",
+            "host_id": "wrong-host",
+            "session_id": "probe-test",
+        },
+        {
+            "terminated": True,
+            "status": "terminated",
+            "host_id": "testflight-staging-mac-mini",
+            "session_id": "stale-test",
+        },
+    ],
+)
+def test_probe_requires_exact_confirmed_termination(runtime, monkeypatch, termination):
+    root = ready_root(runtime, monkeypatch)
+    attestation = root / "staging-probe.json"
+    attestation.write_text("previous")
+
+    def response(url, **kwargs):
+        if url.endswith("/sessions"):
+            return {
+                "session_id": "probe-test",
+                "host_id": "testflight-staging-mac-mini",
+                "mode": "structured",
+            }
+        if "/messages?" in url:
+            return {
+                "messages": [
+                    {
+                        "session_id": "probe-test",
+                        "seq": 1,
+                        "type": "assistant_output",
+                        "role": "assistant",
+                        "text": "DROVER_TESTFLIGHT_STAGE_OK",
+                    }
+                ]
+            }
+        if url.endswith("/terminate"):
+            return termination
+        return healthy_http(url, **kwargs)
+
+    monkeypatch.setattr(stage, "http", response)
+    with pytest.raises(stage.StageError):
+        stage.probe(root, SHA, attempts=1)
+    assert attestation.read_text() == "previous"
+
+
+def test_prepare_requires_candidate_credential_boundary(runtime, monkeypatch):
+    original = stage.subprocess.run
+
+    def run(argv, **kwargs):
+        if "STAGING_CREDENTIAL_BOUNDARY_VERSION" in " ".join(argv):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(stage.subprocess, "run", run)
+    with pytest.raises(stage.StageError):
+        prepare(runtime)
+    assert not (runtime[0] / "active-release.json").exists()

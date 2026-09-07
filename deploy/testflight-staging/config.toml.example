@@ -13,3 +13,7 @@ advertised_url = "<STAGING_PUBLIC_ORIGIN>"
 enabled = true
 api_token = ""
 legacy_token_enabled = true
+
+[update]
+enabled = false
+restart_units = []
