@@ -30,6 +30,11 @@ from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.mcp.tools")
 
+#: Partition bound for the fleet-status message snippet. A session reported as
+#: active had an event in the last 30 minutes; its newest *user* message can be
+#: older than that when a long run is under way, but not older than this.
+_FLEET_SNIPPET_DAYS = 7
+
 
 def _connect(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
     # Read-write open even for read paths: a read_only connection has a
@@ -528,11 +533,18 @@ def drover_recent_sessions(
         owner, name = repo_owner, repo_name
     con = _connect(duckdb_path)
     try:
-        # Prefer the task-keyed join (covers tasks linked via task_id);
-        # union with the repo-direct path so unlinked summaries still surface.
+        # Prefer the task-keyed join (covers tasks linked via task_id); fall
+        # back to the day-summary index so unlinked summaries still surface.
+        #
+        # That fallback used to rank every event in the lakehouse by dedup_key
+        # to learn which sessions belong to a repository, which cost the whole
+        # analytical budget and returned an OOM instead of five rows
+        # (drover#369). `agent_event_day_summary` already records
+        # (date, session_id, repo) per summarised partition, newest days first,
+        # so the same question is a small table lookup. A session older than
+        # the summarised horizon is still reachable through its task link.
         cur = con.execute(
-            f"""WITH {canonical_agent_events_cte()}
-               SELECT DISTINCT ss.session_id, ss.agent_id, ss.ended_at,
+            """SELECT DISTINCT ss.session_id, ss.agent_id, ss.ended_at,
                       ss.summary_md, ss.next_steps_md, ss.open_questions,
                       ss.files_touched, ss.generator_model
                FROM session_summaries ss
@@ -541,7 +553,7 @@ def drover_recent_sessions(
                  AND (
                    (t.repo_owner = ? AND t.repo_name = ?)
                    OR ss.session_id IN (
-                       SELECT DISTINCT session_id FROM canonical_agent_events
+                       SELECT DISTINCT session_id FROM agent_event_day_summary
                        WHERE repo_owner=? AND repo_name=?
                      )
                  )
@@ -832,17 +844,40 @@ def drover_fleet_status(
                FROM active_sessions a
                LEFT JOIN tasks t ON a.task_id = t.task_id
                ORDER BY a.last_event_at DESC"""))
-        # Pull the latest event content snippet for each session.
+        # One bounded pass for every snippet. The previous loop ran a
+        # whole-history canonical scan *per session*, so the cost of the tool
+        # grew with the size of the fleet it was reporting on and a busy hub
+        # never finished it (drover#369).
+        snippets: dict[str, str | None] = {}
+        session_ids = [s["session_id"] for s in sessions]
+        if session_ids:
+            placeholders = ", ".join("?" for _ in session_ids)
+            rows = con.execute(
+                f"""WITH recent_agent_events AS (
+                      SELECT * FROM agent_events
+                      WHERE date >= strftime(
+                              now() - INTERVAL {_FLEET_SNIPPET_DAYS} DAY, '%Y-%m-%d'
+                            )
+                        AND session_id IN ({placeholders})
+                        AND role = 'user'
+                        AND content IS NOT NULL
+                    ),
+                    {canonical_agent_events_cte(source="recent_agent_events")}
+                    SELECT session_id, content FROM (
+                      SELECT session_id, content,
+                             row_number() OVER (
+                               PARTITION BY session_id
+                               ORDER BY TRY_CAST(timestamp AS TIMESTAMPTZ) DESC
+                             ) AS rank
+                        FROM canonical_agent_events
+                    )
+                    WHERE rank = 1""",
+                session_ids,
+            ).fetchall()
+            snippets = {str(row[0]): row[1] for row in rows}
         for s in sessions:
-            sid = s["session_id"]
-            snippet = con.execute(
-                f"""WITH {canonical_agent_events_cte()}
-                    SELECT content FROM canonical_agent_events
-                    WHERE session_id = ? AND role = 'user' AND content IS NOT NULL
-                    ORDER BY timestamp DESC LIMIT 1""",
-                [sid],
-            ).fetchone()
-            s["latest_user_message"] = (snippet[0] or "")[:300] if snippet else None
+            content = snippets.get(s["session_id"])
+            s["latest_user_message"] = (content or "")[:300] if content else None
     finally:
         con.close()
     return {"active_sessions": sessions, "count": len(sessions)}

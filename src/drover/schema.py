@@ -1251,25 +1251,62 @@ GROUP BY e.session_id, ss.summary_md, ss.next_steps_md;
 """
 
 
+#: Partition slack for the 30-minute window. `date` is the hive key, derived
+#: from the event's own clock, so a window that straddles midnight (or a
+#: host a few hours off) still needs yesterday's partition to be read.
+_ACTIVE_SESSION_PARTITION_DAYS = 2
+
 _ACTIVE_SESSIONS_VIEW = f"""
 CREATE OR REPLACE VIEW active_sessions AS
-WITH {canonical_agent_events_cte()}
+WITH recent_agent_events AS (
+  -- Bound the scan *before* the canonical de-duplication below. That window
+  -- function partitions by dedup_key across whatever it is given, and no
+  -- predicate above it can be pushed into it, so the unbounded form ranked
+  -- every event in the lakehouse to answer a question about the last half
+  -- hour: 2.5M rows over 217 date partitions, which exhausted the 1GB
+  -- analytical budget and made every caller fail with an OOM instead of an
+  -- answer (drover#369).
+  SELECT *
+  FROM agent_events
+  WHERE date >= strftime(
+          now() - INTERVAL {_ACTIVE_SESSION_PARTITION_DAYS} DAY, '%Y-%m-%d'
+        )
+    AND TRY_CAST(timestamp AS TIMESTAMP WITH TIME ZONE) > now() - INTERVAL 30 MINUTE
+),
+{canonical_agent_events_cte(source="recent_agent_events")},
+recently_active AS (
+  SELECT
+    e.session_id,
+    any_value(e.agent_id) AS agent_id,
+    any_value(e.task_id)  AS task_id,
+    any_value(COALESCE(e.repo_owner, t.repo_owner)) AS repo_owner,
+    any_value(COALESCE(e.repo_name, t.repo_name))   AS repo_name,
+    any_value(COALESCE(e.branch, t.branch))         AS branch,
+    min(TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE)) AS started_at,
+    max(TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE)) AS last_event_at,
+    count(*)                AS event_count
+  FROM canonical_agent_events e
+  LEFT JOIN tasks t USING (task_id)
+  -- Both are ingest placeholders, not sessions: `unknown_session` is what
+  -- parsers.py substitutes for an event that carried no session id at all.
+  -- Reported as a live agent they are noise in every handoff.
+  WHERE e.session_id NOT IN ('unknown_openclaw', 'unknown_session')
+  GROUP BY e.session_id
+)
 SELECT
-  e.session_id,
-  any_value(e.agent_id) AS agent_id,
-  any_value(e.task_id)  AS task_id,
-  any_value(COALESCE(e.repo_owner, t.repo_owner)) AS repo_owner,
-  any_value(COALESCE(e.repo_name, t.repo_name))   AS repo_name,
-  any_value(COALESCE(e.branch, t.branch))         AS branch,
-  min(TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE)) AS started_at,
-  max(TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE)) AS last_event_at,
-  count(*)                AS event_count
-FROM canonical_agent_events e
-LEFT JOIN tasks t USING (task_id)
-WHERE NOT EXISTS (SELECT 1 FROM session_summaries ss WHERE ss.session_id = e.session_id)
-  AND e.session_id <> 'unknown_openclaw'
-  AND TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE) > now() - INTERVAL 30 MINUTE
-GROUP BY e.session_id;
+  s.session_id, s.agent_id, s.task_id, s.repo_owner, s.repo_name, s.branch,
+  s.started_at, s.last_event_at, s.event_count
+FROM recently_active s
+-- A summary is not an ending. The summarizer fires on an idle gap, so a
+-- session that is still working has one long before it stops, and treating
+-- "has a summary" as "closed" hid live sessions from every handoff. Only a
+-- receipt that already covers the newest event closes the session.
+-- `ended_at` is the newest event's own timestamp stored naive (see
+-- summarizer/worker.py), so compare in that same wall-clock space.
+LEFT JOIN session_summaries ss USING (session_id)
+WHERE ss.session_id IS NULL
+   OR ss.ended_at IS NULL
+   OR ss.ended_at < CAST(s.last_event_at AS TIMESTAMP);
 """
 
 
