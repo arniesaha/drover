@@ -67,47 +67,56 @@ def test_issue_accepts_preflight_scope_and_persists_only_its_verifier(tmp_path):
     assert credential.verifier in stored
 
 
-def test_issue_preflight_cli_prints_only_the_new_plaintext_token(monkeypatch, tmp_path):
+def test_issue_preflight_cli_mints_through_the_running_server(monkeypatch, tmp_path):
+    """The CLI is a different process from the hub that has to honour the token.
+
+    CredentialStore loads once per process, so a credential written straight to
+    the file is invisible to the running server -- and erased by its next write.
+    """
     import drover.server.__main__ as server_main
 
-    store = _store(tmp_path)
+    sent = {}
+
+    def fake_request(cfg, method, path, payload=None):
+        sent.update({"method": method, "path": path, "payload": payload})
+        return {"token": "preflight-token", "credential_id": "cred-1"}
+
     monkeypatch.setattr(server_main, "_resolve_config", lambda path: default_config())
-    monkeypatch.setattr(
-        server_main,
-        "load_auth",
-        lambda cfg, token_home=None: AuthSettings(
-            enabled=True, api_token="cluster-token", credentials=store
-        ),
-    )
+    monkeypatch.setattr(server_main, "_local_api_request", fake_request)
 
     result = CliRunner().invoke(
         main, ["credentials", "issue-preflight", "--label", "testflight-ci"]
     )
 
     assert result.exit_code == 0, result.output
-    assert result.output.count("\n") == 1
-    token = result.output.strip()
-    assert store.find_active(token) is not None
-    assert store.find_active(token).scope == "preflight"
+    assert result.output == "preflight-token\n"
+    assert sent == {
+        "method": "POST",
+        "path": "/auth/credentials",
+        "payload": {"scope": "preflight", "label": "testflight-ci"},
+    }
 
 
-def test_issue_preflight_cli_keeps_selected_config_state_separate_from_personal_home(
+def test_issue_preflight_cli_never_writes_a_credential_file_itself(
     monkeypatch, tmp_path
 ):
-    import drover.server.web.auth as web_auth
+    """No local store is touched, whichever config selected the hub."""
+    import drover.server.__main__ as server_main
 
-    personal_home = tmp_path / "personal"
-    personal_store = CredentialStore(personal_home / CREDENTIALS_FILENAME)
-    personal_store.issue(scope="device", label="personal-phone")
-    personal_before = (personal_home / CREDENTIALS_FILENAME).read_text(encoding="utf-8")
-    staging_home = tmp_path / "staging"
-    config_path = staging_home / "config.toml"
-    staging_home.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "config.toml"
     config_path.write_text(
         '[auth]\nenabled = true\napi_token = "staging-token"\n', encoding="utf-8"
     )
-    monkeypatch.delenv("DROVER_API_TOKEN", raising=False)
-    monkeypatch.setattr(web_auth, "config_home", lambda: personal_home)
+    monkeypatch.setattr(
+        server_main,
+        "_local_api_request",
+        lambda cfg, method, path, payload=None: {
+            "token": "preflight-token",
+            "credential_id": "cred-1",
+        },
+    )
 
     result = CliRunner().invoke(
         main,
@@ -122,13 +131,7 @@ def test_issue_preflight_cli_keeps_selected_config_state_separate_from_personal_
     )
 
     assert result.exit_code == 0, result.output
-    assert (personal_home / CREDENTIALS_FILENAME).read_text(
-        encoding="utf-8"
-    ) == personal_before
-    staging_store = CredentialStore(staging_home / CREDENTIALS_FILENAME)
-    issued = staging_store.find_active(result.output.strip())
-    assert issued is not None
-    assert issued.scope == "preflight"
+    assert not (home / CREDENTIALS_FILENAME).exists()
 
 
 def test_find_active_matches_only_the_issued_token(tmp_path):

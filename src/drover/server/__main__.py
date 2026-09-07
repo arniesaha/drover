@@ -409,13 +409,6 @@ def _resolve_config(path: Optional[str]) -> DroverConfig:
     return default_config()
 
 
-def _auth_home_for_selected_config(config_path: Optional[str]) -> Path:
-    """Keep credential state beside an explicitly selected configuration."""
-    if config_path:
-        return Path(config_path).expanduser().resolve().parent
-    return config_home()
-
-
 def _advertised_host_port(cfg: DroverConfig) -> str:
     """Where clients should dial this hub.
 
@@ -1561,17 +1554,18 @@ def credentials_list_cmd(ctx: click.Context) -> None:
 )
 @click.pass_context
 def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
-    """Issue one locally-scoped credential for TestFlight preflight checks."""
+    """Issue one locally-scoped credential for TestFlight preflight checks.
+
+    Minted by the running hub, like pair codes and revocations, because the
+    credential store is loaded once per process: a token written to the file
+    from here would never be honoured by the server the staging gate calls,
+    and that server's next write would delete it again.
+    """
     cfg = _resolve_config(ctx.obj["config_path"])
-    auth = load_auth(
-        cfg, token_home=_auth_home_for_selected_config(ctx.obj["config_path"])
+    minted = _local_api_request(
+        cfg, "POST", "/auth/credentials", {"scope": "preflight", "label": label}
     )
-    if not auth.enabled or auth.credentials is None:
-        raise click.ClickException(
-            "auth must be enabled to issue a preflight credential"
-        )
-    _, token = auth.credentials.issue(scope="preflight", label=label)
-    click.echo(token)
+    click.echo(minted["token"])
 
 
 @credentials_cmd.command(name="revoke")

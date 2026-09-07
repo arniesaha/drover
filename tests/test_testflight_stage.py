@@ -22,8 +22,7 @@ OLDER = "b" * 40
 def test_cloudflared_example_exposes_only_the_staging_origin():
     """A public tunnel must terminate at the staging HTTP listener only."""
     template = (
-        Path(__file__).parents[1]
-        / "deploy/testflight-staging/cloudflared.yml.example"
+        Path(__file__).parents[1] / "deploy/testflight-staging/cloudflared.yml.example"
     )
     text = template.read_text()
 
@@ -668,6 +667,73 @@ def test_probe_requires_exact_confirmed_termination(runtime, monkeypatch, termin
     with pytest.raises(stage.StageError):
         stage.probe(root, SHA, attempts=1)
     assert attestation.read_text() == "previous"
+
+
+def _probing_http(termination, *, answers=True):
+    def response(url, **kwargs):
+        if url.endswith("/sessions"):
+            return {
+                "session_id": "probe-test",
+                "host_id": "testflight-staging-mac-mini",
+                "mode": "structured",
+            }
+        if "/messages?" in url:
+            return {
+                "messages": [
+                    {
+                        "session_id": "probe-test",
+                        "seq": 1,
+                        "type": "assistant_output",
+                        "role": "assistant",
+                        "text": (
+                            "DROVER_TESTFLIGHT_STAGE_OK"
+                            if answers
+                            else "something else"
+                        ),
+                    }
+                ]
+            }
+        if url.endswith("/terminate"):
+            return termination
+        return healthy_http(url, **kwargs)
+
+    return response
+
+
+def test_probe_accepts_a_session_the_hub_has_already_forgotten(runtime, monkeypatch):
+    """The stale shape is cleanup succeeding, not failing.
+
+    A hub that has lost the session answers session_id + status + stale, with
+    no host_id and no `terminated` (see
+    MetricsCollector._proxy_terminate_harness_session). Demanding the full
+    shape threw away an otherwise good probe.
+    """
+    root = ready_root(runtime, monkeypatch)
+    monkeypatch.setattr(
+        stage,
+        "http",
+        _probing_http(
+            {"session_id": "probe-test", "status": "terminated", "stale": True}
+        ),
+    )
+
+    stage.probe(root, SHA, attempts=1)
+
+    attested = json.loads((root / "staging-probe.json").read_text())
+    assert attested["source_sha"] == SHA
+    assert attested["host_id"] == "testflight-staging-mac-mini"
+
+
+def test_probe_failure_survives_an_unconfirmed_cleanup(runtime, monkeypatch):
+    """Raising from `finally` replaced the real reason the probe failed."""
+    root = ready_root(runtime, monkeypatch)
+    monkeypatch.setattr(stage, "http", _probing_http({}, answers=False))
+
+    with pytest.raises(stage.StageError) as failure:
+        stage.probe(root, SHA, attempts=1)
+
+    assert "expected assistant response" in str(failure.value)
+    assert not (root / "staging-probe.json").exists()
 
 
 def test_prepare_requires_candidate_credential_boundary(runtime, monkeypatch):

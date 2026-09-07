@@ -121,15 +121,18 @@ def main():
             )
         require(result.returncode == 0, "upload failed; private diagnostics discarded")
         response = json.loads(raw.read_text())
-        confirmations = {
-            "No errors uploading archive.",
-            f"No errors uploading '{args.ipa}'",
-            f"No errors uploading '{args.ipa.name}'",
-        }
+        # altool has punctuated this line differently across Xcode releases --
+        # "archive", the full path, the basename, with and without a trailing
+        # period. An exact-match set fails the run *after* the bytes are at
+        # Apple: no receipt is written, and the operator's natural retry
+        # becomes a second build. Match the invariant part, and keep the
+        # product-errors check as the real gate.
+        message = response.get("success-message") if isinstance(response, dict) else None
+        confirmed = isinstance(message, str) and re.match(
+            r"^No errors uploading\b", message.strip()
+        )
         require(
-            isinstance(response, dict)
-            and response.get("success-message") in confirmations
-            and not response.get("product-errors"),
+            bool(confirmed) and not response.get("product-errors"),
             "upload confirmation was not received",
         )
     with args.ipa.open("rb") as artifact:

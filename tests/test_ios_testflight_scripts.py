@@ -440,6 +440,44 @@ def test_upload_pins_first_key_search_location_before_home_fallbacks(chain):
     assert call["local_keys"] is True
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No errors uploading '{ipa}'.",
+        "No errors uploading archive",
+        "No errors uploading '{name}'.",
+    ],
+)
+def test_upload_accepts_every_altool_confirmation_wording(chain, message):
+    """altool has punctuated this line differently across Xcode releases.
+
+    Rejecting an unrecognised wording fails the run *after* the bytes are at
+    Apple, writes no receipt, and invites a retry that becomes a second build.
+    """
+    root, _, _, upload, _ = chain
+    result = upload(
+        UPLOAD_RESPONSE=json.dumps(
+            {
+                "success-message": message.format(
+                    ipa=root / "fixture.ipa", name="fixture.ipa"
+                )
+            }
+        )
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        json.loads((root / "upload-record.json").read_text())["upload_confirmed"]
+        is True
+    )
+
+
+def test_upload_still_rejects_an_unrelated_success_message(chain):
+    root, _, _, upload, _ = chain
+    result = upload(UPLOAD_RESPONSE=json.dumps({"success-message": "Uploaded 1 file."}))
+    assert result.returncode != 0
+    assert not (root / "upload-record.json").exists()
+
+
 def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
     root, _, _, upload, _ = chain
     result = upload(

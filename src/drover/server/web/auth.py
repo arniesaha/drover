@@ -146,10 +146,12 @@ def request_authorized(
         if credential is not None:
             if credential.scope != "preflight":
                 return True
+            # Deliberately not "/harness": that is the full snapshot,
+            # including session previews and recaps, and the staging gate
+            # only ever needed the host listing.
             return (method, path) in {
                 ("GET", "/release-identity"),
                 ("GET", "/readyz"),
-                ("GET", "/harness"),
                 ("GET", "/harness/hosts"),
             }
         if (

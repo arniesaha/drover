@@ -174,6 +174,52 @@ def test_revoking_an_unknown_credential_is_not_found(server):
     assert status == 404
 
 
+def test_preflight_credentials_are_issued_by_the_running_server(server):
+    """The hub owns the credential store for the life of the process.
+
+    A CLI writing credentials.json directly issues a token this server will
+    never honour, and the server's next write deletes it again.
+    """
+    base, store, _ = server
+    status, minted = _call(
+        base,
+        "POST",
+        "/auth/credentials",
+        {"scope": "preflight", "label": "testflight-ci"},
+        token="cluster-token",
+    )
+
+    assert status == 201
+    issued = store.find_active(minted["token"])
+    assert issued is not None
+    assert issued.scope == "preflight"
+    assert minted["credential_id"] == issued.id
+
+
+def test_issuing_a_credential_refuses_any_scope_but_preflight(server):
+    """Device and host credentials only ever come from a redeemed code."""
+    base, store, _ = server
+    for scope in ("device", "host", "admin"):
+        status, _ = _call(
+            base,
+            "POST",
+            "/auth/credentials",
+            {"scope": scope, "label": "nope"},
+            token="cluster-token",
+        )
+        assert status == 400
+    assert store.list_all() == []
+
+
+def test_issuing_a_credential_requires_auth(server):
+    base, store, _ = server
+    status, _ = _call(
+        base, "POST", "/auth/credentials", {"scope": "preflight", "label": "x"}
+    )
+    assert status == 401
+    assert store.list_all() == []
+
+
 def test_preflight_token_cannot_mint_pair_codes_or_read_credentials(server):
     base, store, _ = server
     _, token = store.issue(scope="preflight", label="testflight-ci")
@@ -186,7 +232,7 @@ def test_preflight_token_cannot_mint_pair_codes_or_read_credentials(server):
     assert status == 401
 
 
-def test_preflight_token_receives_only_the_four_read_only_route_responses(
+def test_preflight_token_receives_only_the_three_read_only_route_responses(
     server, monkeypatch
 ):
     base, store, _ = server
@@ -194,11 +240,15 @@ def test_preflight_token_receives_only_the_four_read_only_route_responses(
     monkeypatch.setenv("DROVER_RELEASE_ROLE", "testflight-staging")
     monkeypatch.setenv("DROVER_RELEASE_SHA", "a" * 40)
 
-    for path in ("/release-identity", "/readyz", "/harness", "/harness/hosts"):
+    for path in ("/release-identity", "/readyz", "/harness/hosts"):
         status, _ = _call(base, "GET", path, token=token)
         assert status == 200
     for method, path, headers in (
+        # /harness carries session previews and recaps -- conversation text a
+        # read-only release check has no business seeing.
+        ("GET", "/harness", {}),
         ("GET", "/auth/credentials", {}),
+        ("POST", "/auth/credentials", {}),
         ("POST", "/auth/pair-codes", {}),
         ("POST", "/harness/sessions/one/turns", {}),
         (

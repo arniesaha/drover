@@ -230,11 +230,14 @@ def test_preflight_credential_is_limited_to_literal_read_only_routes(tmp_path):
     settings = _auth(credentials=store)
     headers = _Headers({"Authorization": f"Bearer {token}"})
 
-    for path in ("/release-identity", "/readyz", "/harness", "/harness/hosts"):
+    for path in ("/release-identity", "/readyz", "/harness/hosts"):
         assert request_authorized(settings, headers, method="GET", path=path)
     for method, path in (
+        # The full snapshot includes session previews and recaps.
+        ("GET", "/harness"),
         ("POST", "/auth/pair-codes"),
         ("GET", "/auth/credentials"),
+        ("POST", "/auth/credentials"),
         ("POST", "/harness/sessions/one/turns"),
         ("GET", "/unknown"),
         ("GET", "/harness/hosts/one/terminal"),

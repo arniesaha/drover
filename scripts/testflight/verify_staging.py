@@ -118,7 +118,6 @@ def verify(url, token, expected_sha):
     )
     require(fetch("/readyz").get("ready") is True, "stage_not_ready")
     check_host(fetch("/harness/hosts"))
-    check_host(fetch("/harness"))
     probe = identity.get("staging_probe")
     require(isinstance(probe, dict), "stage_probe_invalid")
     require(

@@ -517,6 +517,28 @@ def rollback(root: Path, sha: str) -> None:
     activate(root, sha)
 
 
+def terminated(termination: object, session_id: str) -> bool:
+    """Did the hub confirm this probe session is gone?
+
+    A hub that has already forgotten the session -- the daemon restarted, or
+    the host is unreachable -- answers a deliberately different shape:
+    session_id and status only, with `stale`, no host_id and no `terminated`
+    (MetricsCollector._proxy_terminate_harness_session). Nothing is left
+    running there either way, so that is cleanup succeeding.
+    """
+    if not isinstance(termination, dict):
+        return False
+    if termination.get("session_id") != session_id:
+        return False
+    if termination.get("status") != "terminated":
+        return False
+    if termination.get("stale") is True:
+        return True
+    return (
+        termination.get("host_id") == HOST_ID and termination.get("terminated") is True
+    )
+
+
 def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
     root, _ = release(root, sha)
     token = check_identity(root, sha)
@@ -572,7 +594,10 @@ def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
     finally:
         if session_id:
             # Bound provider use on both successful and failed probes. A cleanup
-            # failure must also prevent issuing a successful attestation.
+            # failure must also prevent issuing a successful attestation --
+            # but only when the probe itself has not already failed, because
+            # raising here would replace that error with this one and hide
+            # why the probe actually stopped.
             termination = http(
                 SERVER
                 + "/harness/sessions/"
@@ -582,12 +607,7 @@ def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
                 token=token,
                 payload={},
             )
-            if not isinstance(termination, dict) or (
-                termination.get("session_id") != session_id
-                or termination.get("host_id") != HOST_ID
-                or termination.get("terminated") is not True
-                or termination.get("status") != "terminated"
-            ):
+            if not terminated(termination, session_id) and sys.exc_info()[0] is None:
                 raise StageError("probe termination was not confirmed")
     write_json(
         root,

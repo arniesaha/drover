@@ -117,8 +117,16 @@ preparation; the tool does not fetch or decide which candidate to trust.
      credentials issue-preflight --label internal-testflight
    ```
 
-   The preflight credential is for read-only candidate checks. The local probe
-   uses the isolated owner token because it needs to create a session.
+   The command asks the running staging hub to mint the credential; it does not
+   write the credential file itself. The store is loaded once per process, so a
+   token written from the outside would be invisible to the server the gate
+   calls, and that server's next write would delete it again. Step 3 therefore
+   has to have succeeded before this step runs.
+
+   The preflight credential is for read-only candidate checks: release
+   identity, readiness, and the harness host listing. It cannot read
+   `/harness`, which carries session previews and recaps. The local probe uses
+   the isolated owner token because it needs to create a session.
 
 5. Run the bounded structured probe after staging provider login:
 
@@ -132,7 +140,9 @@ preparation; the tool does not fetch or decide which candidate to trust.
    via the central messages API, and terminates the session on success or
    failure. It polls at most 60 times; each HTTP request has a five-second
    timeout and a one-MiB response bound. Cleanup must confirm the exact session
-   and host, `terminated: true`, and `status: terminated` before
+   is gone -- either the full `terminated: true` / `status: terminated`
+   acknowledgement from the expected host, or the `stale` answer a hub gives
+   for a session it has already forgotten -- before
    publishing `<STAGING_ROOT>/staging-probe.json` atomically with mode `0600`.
    The attestation contains only `source_sha`, `host_id`, a timezone-bearing
    `completed_at`, and `session_id_sha256`. It has no endpoint, credential,

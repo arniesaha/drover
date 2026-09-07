@@ -31,6 +31,35 @@ struct EnvironmentTests {
     #expect(ClientFactory.make(defaults: defaults, tokenStore: store) != nil)
 }
 
+@Test func factoryRefusesASavedEndpointThePolicyRejects() throws {
+    let defaults = UserDefaults(suiteName: "drover-env-\(UUID().uuidString)")!
+    let store = TokenStore(service: "drover-env-\(UUID().uuidString)")
+    ServerConfig(urlString: "https://personal.example.test")!.save(defaults: defaults)
+    try store.save("tok")
+
+    #expect(ClientFactory.make(
+        defaults: defaults,
+        tokenStore: store,
+        endpointIsAllowed: { $0.host == "stage.example.test" }
+    ) == nil)
+}
+
+/// The gate has to live here, not in one caller: `BackgroundRefresh` builds
+/// its own client from the same UserDefaults and Keychain, with no
+/// `AppEnvironment` in the process to ask.
+@Test func factoryBuildsWhenThePolicyAcceptsTheSavedEndpoint() throws {
+    let defaults = UserDefaults(suiteName: "drover-env-\(UUID().uuidString)")!
+    let store = TokenStore(service: "drover-env-\(UUID().uuidString)")
+    ServerConfig(urlString: "https://stage.example.test")!.save(defaults: defaults)
+    try store.save("tok")
+
+    #expect(ClientFactory.make(
+        defaults: defaults,
+        tokenStore: store,
+        endpointIsAllowed: { $0.host == "stage.example.test" }
+    ) != nil)
+}
+
 @Test func validateFailsWhenHealthzUnhealthy() async {
     MockURLProtocol.handler = { request in
         #expect(request.url?.path == "/healthz")

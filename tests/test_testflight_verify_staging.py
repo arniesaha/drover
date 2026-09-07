@@ -1,6 +1,5 @@
 """Exercise the staging gate through a real local HTTPS server."""
 
-import copy
 import hashlib
 import importlib.util
 import json
@@ -74,7 +73,6 @@ def stage(tmp_path, monkeypatch):
         },
         "/readyz": {"ready": True},
         "/harness/hosts": {"hosts": [host]},
-        "/harness": {"hosts": [copy.deepcopy(host)], "sessions": []},
     }
     requests = []
 
@@ -127,7 +125,7 @@ def invoke(gate, stage, tmp_path, *, url=None):
     return result, json.loads(record.read_text())
 
 
-def test_success_fetches_only_four_gets_and_retains_only_safe_fields(
+def test_success_fetches_only_three_gets_and_retains_only_safe_fields(
     gate, stage, tmp_path
 ):
     result, record = invoke(gate, stage, tmp_path, url=stage[0] + "/")
@@ -144,7 +142,7 @@ def test_success_fetches_only_four_gets_and_retains_only_safe_fields(
     }
     assert stage[2] == [
         (path, f"Bearer {TOKEN}")
-        for path in ("/release-identity", "/readyz", "/harness/hosts", "/harness")
+        for path in ("/release-identity", "/readyz", "/harness/hosts")
     ]
 
 
@@ -161,10 +159,9 @@ def test_success_fetches_only_four_gets_and_retains_only_safe_fields(
 def test_only_runtimes_allowed_by_staging_launch_policy_pass(
     gate, stage, tmp_path, runtime, accepted
 ):
-    for route in ("/harness/hosts", "/harness"):
-        stage[1][route]["hosts"][0]["capabilities"]["harnesses"] = [
-            {"name": runtime, "enabled": True}
-        ]
+    stage[1]["/harness/hosts"]["hosts"][0]["capabilities"]["harnesses"] = [
+        {"name": runtime, "enabled": True}
+    ]
     result, record = invoke(gate, stage, tmp_path)
     if accepted:
         assert result == 0
@@ -194,7 +191,6 @@ def test_only_runtimes_allowed_by_staging_launch_policy_pass(
         ("naive", "stage_probe_invalid"),
         ("digest", "stage_probe_invalid"),
         ("version", "stage_identity_mismatch"),
-        ("harness-offline", "stage_host_unavailable"),
     ],
 )
 def test_gate_fails_closed_without_diagnostics(
@@ -241,8 +237,6 @@ def test_gate_fails_closed_without_diagnostics(
         probe["session_id_sha256"] = "private-session"
     elif problem == "version":
         identity["package_version"] = "private diagnostic body"
-    elif problem == "harness-offline":
-        stage[1]["/harness"]["hosts"][0]["status"] = "offline"
     result, record = invoke(gate, stage, tmp_path)
     assert result == 1
     assert record == {"category": category}

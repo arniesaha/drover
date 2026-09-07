@@ -16,7 +16,11 @@ struct TestFlightEndpointPolicy {
                   components.password == nil,
                   components.query == nil,
                   components.fragment == nil,
-                  components.path.isEmpty
+                  // A bare "/" is the canonical root, not a path: it is what a
+                  // browser copies and what `normalize_staging_url` strips on
+                  // the build side. Rejecting it told a tester who pasted the
+                  // correct hub that it was the wrong one.
+                  components.path.isEmpty || components.path == "/"
             else {
                 return nil
             }
@@ -61,15 +65,6 @@ struct TestFlightEndpointPolicy {
         case .rejectAll:
             false
         }
-    }
-
-    /// A stage-locked build must not let ClientFactory's DEBUG override create
-    /// an unverified client when there is no persisted endpoint to inspect.
-    var allowsUnconfiguredStartup: Bool {
-        if case .unrestricted = requirement {
-            return true
-        }
-        return false
     }
 
     static func fromBundle(_ bundle: Bundle = .main) -> TestFlightEndpointPolicy {

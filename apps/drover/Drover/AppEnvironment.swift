@@ -139,13 +139,15 @@ final class AppEnvironment {
             // example, a locked Keychain), so it must not orphan-purge files.
             shouldSweepRecovery = savedConfig == nil
         }
-        let allowsSavedClient = savedConfig.map { endpointPolicy.accepts($0.baseURL) }
-            ?? endpointPolicy.allowsUnconfiguredStartup
-        if allowsSavedClient,
-           let built = ClientFactory.make(
+        // The policy goes *into* the factory rather than gating the call: the
+        // factory prefers ClientFactory's DEBUG override over the saved
+        // config, so a check out here would clear a saved on-stage endpoint
+        // and then hand back a client for whatever DROVER_BASE_URL said.
+        if let built = ClientFactory.make(
             defaults: defaults,
             tokenStore: tokenStore,
-            credentialBindingID: startupBindingID
+            credentialBindingID: startupBindingID,
+            endpointIsAllowed: endpointPolicy.accepts
         ) {
             client = built.client
             config = built.config

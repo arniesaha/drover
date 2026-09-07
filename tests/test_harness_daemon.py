@@ -4375,3 +4375,67 @@ def test_creates_without_a_client_key_are_still_independent(tmp_path):
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def _raise_missing_staging_key() -> list[str]:
+    raise ValueError("invalid staging credential path")
+
+
+def test_create_session_answers_400_when_the_staging_key_is_unreadable(
+    monkeypatch, tmp_path
+):
+    """Fail closed with a reason, not a dropped connection.
+
+    `claude_command` reads the staging API key and raises ValueError when the
+    file is missing or not exactly 0600. Letting that escape the handler kills
+    the connection mid-response, so the hub reports 502 and the operator has
+    only a traceback in the daemon log to work from.
+    """
+    monkeypatch.setitem(
+        harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
+        "claude-code",
+        _raise_missing_staging_key,
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "claude-code",
+                    "mode": "structured",
+                    "cwd": str(tmp_path),
+                },
+            )
+        assert failure.value.code == 400
+        assert "staging" in json.loads(failure.value.read())["error"]
+        assert state.structured.session_ids() == []
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_recover_answers_409_when_the_staging_key_is_unreadable(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
+        "claude-code",
+        _raise_missing_staging_key,
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(
+        state, tmp_path, harness="claude-code"
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )
+        assert failure.value.code == 409
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
