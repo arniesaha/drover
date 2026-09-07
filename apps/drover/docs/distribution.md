@@ -255,6 +255,69 @@ when invoking commands with protected arguments.
 
 ## Protected manual CI archive
 
+### Internal TestFlight staging gate
+
+`ios-testflight-internal.yml` accepts only an approved version and build. Both
+jobs check `main` before entering their protected environment, check out the
+dispatch SHA, and use GitHub-hosted runners with Python 3.13. The release owner
+must configure required reviewers and main-only deployment branches on both
+`ios-testflight-staging` and `ios-testflight-upload` before enabling a dispatch.
+Keep these credentials environment-scoped, never repository-wide. This
+repository change does not configure environments or authorize a live upload.
+
+Set the repository variable `DROVER_TESTFLIGHT_STAGING_URL` to the reviewed
+staging HTTPS origin; avoid environment overrides so both jobs use the same
+origin. The staging environment receives only
+`DROVER_TESTFLIGHT_PREFLIGHT_TOKEN`. Its Ubuntu job makes exactly four possible
+GETs: `/release-identity`, `/readyz`, `/harness/hosts`, and `/harness`. It accepts
+only a root HTTPS origin, refuses every redirect, bypasses ambient proxies,
+uses a ten-second timeout per request, and checks the exact dispatch SHA,
+staging role, readiness, online `testflight-staging-mac-mini`, an enabled known
+structured runtime, and a matching successful probe no older than 30 minutes.
+It never creates a probe session. Refresh the operator-run probe before dispatch.
+The archive job downloads this run's sanitized record and checks its source SHA
+and origin digest before signing, so an environment override or changed variable
+cannot silently select a different staging endpoint.
+
+Run the client with URL/token environment variables to keep the token out of
+process arguments; explicit `--url` and `--token` remain available for callers
+that manage their own argument exposure:
+
+```sh
+python3 scripts/testflight/verify_staging.py --expected-sha "$CANDIDATE_SHA" \
+  --record "$PRIVATE_OUTPUT/preflight-record.json"
+```
+
+Failures emit only a fixed category. Successful records contain only source
+SHA, package version, role, normalized probe completion timestamp, fixed host
+ID, and SHA-256 of the normalized staging origin. Neither response bodies nor
+session identifiers are retained.
+
+The upload environment holds the seven distribution signing values documented
+below and `DROVER_APPSTORE_API_KEY_ID`, `DROVER_APPSTORE_API_ISSUER_ID`, and
+`DROVER_APPSTORE_API_PRIVATE_KEY_BASE64`. It receives no staging credential.
+The macOS job selects Xcode 26.6, repeats the package, app unit, and deterministic
+UI slices from `ios.yml`, archives the stage-only app, exports a verified internal
+IPA, and confirms upload. The Apple key is materialized only at upload under
+`$RUNNER_TEMP/private_keys/AuthKey_<id>.p8` with mode `0600` in a `0700` directory.
+
+Export needs the temporary signing identity in the runner's user keychain
+search list. The workflow snapshots that list privately before signing setup,
+adds the temporary keychain, and restores the exact original list in `always()`
+cleanup before deleting the temporary keychain/profile and both credential
+directories. This reversible sequence is workflow configuration only; validate
+it on the protected hosted runner before relying on a live export. No local or
+fleet keychain changes are part of repository verification.
+
+Only sanitized preflight/archive/export/upload JSON records become Actions
+artifacts. Approval delay and the iOS checks can make the original probe older
+by upload time; its 30-minute freshness is assessed when preflight runs.
+Upload confirmation does not assert Apple processing, internal tester
+availability, or physical-device acceptance. The workflow does not wait for
+processing or assign external testers.
+
+### Distribution archive
+
 `.github/workflows/ios-distribution.yml` is dispatch-only and uses the
 protected `ios-distribution` environment. Its job is restricted to `main`
 before that environment is entered and checks out the exact `github.sha` that
