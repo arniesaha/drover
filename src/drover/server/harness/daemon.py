@@ -2271,6 +2271,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         client_session_id = _optional_text(body.get("client_session_id"))
         harness = str(body.get("harness") or "")
         cwd = body.get("cwd")
+        worktrees_dir = self.server.state.worktrees_dir
+        from drover.server.staging_credentials import is_staging, staging_session_paths
+
+        if is_staging():
+            # Check the original request before command preparation, Git, or
+            # registry writes. A worktree must never launder a personal cwd
+            # into a directory that appears staging-owned after the fact.
+            try:
+                cwd, worktrees_dir = staging_session_paths(cwd)
+            except ValueError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         if cwd is not None and not Path(str(cwd)).expanduser().is_dir():
             self._write_json(
                 {"error": f"cwd does not exist: {cwd}"},
@@ -2349,7 +2361,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         session_worktree: SessionWorktree | None = None
         if harness in _WORKTREE_HARNESSES and session_cwd is not None:
             session_worktree = create_session_worktree(
-                session_cwd, session_id, self.server.state.worktrees_dir
+                session_cwd, session_id, worktrees_dir
             )
             if session_worktree is not None:
                 session_cwd = session_worktree.path

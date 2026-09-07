@@ -2,6 +2,7 @@
 
 import json
 import shlex
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ def credential_root(tmp_path, monkeypatch):
     key.parent.mkdir(parents=True)
     key.write_text("staging-fixture-value\n")
     key.chmod(0o600)
+    (root / "workspace").mkdir()
     monkeypatch.setenv("DROVER_RELEASE_ROLE", "testflight-staging")
     monkeypatch.setenv("DROVER_STAGING_ROOT", str(root))
     monkeypatch.setenv("HOME", str(home))
@@ -188,3 +190,139 @@ def test_stage_allows_supported_structured_session(credential_root, harness):
     handler._create_structured_session = launched.append
     HarnessRequestHandler._create_session(handler)
     assert launched == [body]
+
+
+@pytest.fixture
+def session_handler(credential_root, monkeypatch):
+    from drover.server.harness import daemon
+    from drover.server.harness.worktree import SessionWorktree
+
+    root, _ = credential_root
+    effects = []
+    responses = []
+
+    def command():
+        effects.append(("command",))
+        return ["synthetic-runtime"]
+
+    def worktree(cwd, session_id, destination):
+        effects.append(("git", cwd, destination))
+        return SessionWorktree(
+            cwd, str(destination / session_id), "synthetic", "a" * 40
+        )
+
+    def create_session(**kwargs):
+        effects.append(("registry", kwargs["cwd"]))
+        return SimpleNamespace(session_id=kwargs["session_id"])
+
+    def start(session_id, **kwargs):
+        effects.append(("launch", kwargs["cwd"]))
+
+    monkeypatch.setattr(
+        daemon,
+        "_STRUCTURED_DEFAULT_COMMANDS",
+        {"claude-code": command, "codex": command},
+    )
+    monkeypatch.setattr(daemon, "create_session_worktree", worktree)
+    handler = object.__new__(daemon.HarnessRequestHandler)
+    handler.server = SimpleNamespace(
+        state=SimpleNamespace(
+            host_id="stage-test",
+            registry=SimpleNamespace(create_session=create_session),
+            structured=SimpleNamespace(start=start),
+            worktrees_dir=root / "home/.drover/worktrees",
+            session_worktrees={},
+            push_event=lambda *args: None,
+        )
+    )
+    handler._write_json = lambda payload, status=200: responses.append(
+        (status, payload)
+    )
+    handler._safe_update_session_status = lambda *args, **kwargs: None
+    handler._safe_append_event = lambda *args, **kwargs: None
+
+    def invoke(body):
+        handler._read_json = lambda: body
+        handler._create_session()
+        return responses[-1]
+
+    return invoke, effects
+
+
+@pytest.mark.parametrize("harness", ["claude-code", "codex"])
+@pytest.mark.parametrize(
+    "cwd_kind", ["root", "personal", "home", "traversal", "symlink"]
+)
+def test_stage_rejects_cwd_escape_before_command_git_or_launch(
+    credential_root, session_handler, tmp_path, harness, cwd_kind
+):
+    root, _ = credential_root
+    personal = tmp_path / "personal"
+    personal.mkdir()
+    link = root / "workspace/personal-link"
+    link.symlink_to(personal, target_is_directory=True)
+    cwd = {
+        "root": "/",
+        "personal": str(personal),
+        "home": str(root / "home"),
+        "traversal": "../../personal",
+        "symlink": str(link),
+    }[cwd_kind]
+    invoke, effects = session_handler
+    status, payload = invoke({"harness": harness, "mode": "structured", "cwd": cwd})
+    assert status == 400
+    assert payload == {"error": "staging cwd must stay within its workspace"}
+    assert effects == []
+
+
+@pytest.mark.parametrize("harness", ["claude-code", "codex"])
+@pytest.mark.parametrize("cwd_kind", ["omitted", "relative", "absolute", "symlink"])
+def test_stage_resolves_cwd_and_keeps_generated_worktree_in_workspace(
+    credential_root, session_handler, harness, cwd_kind
+):
+    root, _ = credential_root
+    workspace = root / "workspace"
+    project = workspace / "project"
+    project.mkdir()
+    (workspace / "project-link").symlink_to(project, target_is_directory=True)
+    cwd = {
+        "omitted": None,
+        "relative": "project",
+        "absolute": str(project),
+        "symlink": "project-link",
+    }[cwd_kind]
+    invoke, effects = session_handler
+    status, _ = invoke({"harness": harness, "mode": "structured", "cwd": cwd})
+    assert status == 201
+    expected = workspace if cwd_kind == "omitted" else project
+    if harness == "codex":
+        assert effects[1] == ("git", str(expected), workspace / ".worktrees")
+        assert effects[-1][1].startswith(str(workspace / ".worktrees/harness-"))
+    else:
+        assert effects[-1] == ("launch", str(expected))
+
+
+def test_stage_rejects_symlinked_worktree_destination_before_git(
+    credential_root, session_handler, tmp_path
+):
+    root, _ = credential_root
+    (root / "workspace/.worktrees").symlink_to(tmp_path, target_is_directory=True)
+    invoke, effects = session_handler
+    status, _ = invoke({"harness": "codex", "mode": "structured"})
+    assert status == 400
+    assert effects == []
+
+
+@pytest.mark.parametrize("cwd", [None, "/"])
+def test_nonstaging_preserves_requested_cwd_and_worktree_destination(
+    credential_root, session_handler, monkeypatch, cwd
+):
+    root, _ = credential_root
+    monkeypatch.delenv("DROVER_RELEASE_ROLE")
+    invoke, effects = session_handler
+    status, _ = invoke({"harness": "codex", "mode": "structured", "cwd": cwd})
+    assert status == 201
+    if cwd is None:
+        assert effects[-1] == ("launch", None)
+    else:
+        assert effects[1] == ("git", "/", root / "home/.drover/worktrees")

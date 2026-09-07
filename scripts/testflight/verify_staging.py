@@ -17,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ios"))
 from verify_archive import normalize_staging_url  # noqa: E402
 
 HOST_ID = "testflight-staging-mac-mini"
-STRUCTURED_HARNESSES = {"claude-code", "codex", "agy", "deepseek-harness"}
+# Match the staging daemon's enforced launch policy, not every structured
+# runtime supported by an ordinary self-hosted daemon.
+STAGING_HARNESSES = {"claude-code", "codex"}
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -60,7 +62,7 @@ def check_host(payload):
         and any(
             isinstance(item, dict)
             and isinstance(item.get("name"), str)
-            and item["name"] in STRUCTURED_HARNESSES
+            and item["name"] in STAGING_HARNESSES
             and item.get("enabled") is True
             for item in harnesses
         ),

@@ -205,6 +205,24 @@ final class AppEnvironment {
         case failure(String)
     }
 
+    /// Pairing consumes a one-time code and creates a server credential, so
+    /// enforce the app's endpoint policy before the unauthenticated POST.
+    /// Both onboarding and Settings must enter through this boundary.
+    func pair(
+        payload: PairingPayload,
+        deviceName: String,
+        session: URLSession = .shared
+    ) async throws -> PairResponse {
+        guard endpointPolicy.accepts(payload.serverURL) else {
+            throw DroverError.badRequest("This TestFlight build connects only to its staging hub.")
+        }
+        return try await DroverClient.pair(
+            payload: payload,
+            deviceName: deviceName,
+            session: session
+        )
+    }
+
     /// Validates `urlString`/`token` against the live server (`healthz()`
     /// then `snapshot()`) before saving anything. Only on success does this
     /// persist the URL to `UserDefaults`, save the token to the Keychain, and

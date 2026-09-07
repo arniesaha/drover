@@ -29,6 +29,28 @@ def staging_root() -> Path:
     return root
 
 
+def staging_session_paths(cwd: str | None) -> tuple[str, Path]:
+    """Resolve a launch and its Git worktrees inside the dedicated workspace."""
+    try:
+        workspace = staging_root() / "workspace"
+        if workspace.resolve(strict=True) != workspace or not workspace.is_dir():
+            raise ValueError
+        if cwd is not None and not isinstance(cwd, str):
+            raise ValueError
+        requested = Path(cwd).expanduser() if cwd else workspace
+        resolved = (workspace / requested).resolve(strict=True)
+        worktrees = (workspace / ".worktrees").resolve()
+        if (
+            not resolved.is_relative_to(workspace)
+            or not resolved.is_dir()
+            or not worktrees.is_relative_to(workspace)
+        ):
+            raise ValueError
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("staging cwd must stay within its workspace") from None
+    return str(resolved), worktrees
+
+
 def read_api_key() -> str:
     root = staging_root()
     path = root / "home/.drover/anthropic_api_key"

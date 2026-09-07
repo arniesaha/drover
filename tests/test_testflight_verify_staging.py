@@ -153,12 +153,12 @@ def test_success_fetches_only_four_gets_and_retains_only_safe_fields(
     [
         ("claude-code", True),
         ("codex", True),
-        ("agy", True),
-        ("deepseek-harness", True),
+        ("agy", False),
+        ("deepseek-harness", False),
         ("deepseek", False),
     ],
 )
-def test_only_canonical_structured_runtimes_pass(
+def test_only_runtimes_allowed_by_staging_launch_policy_pass(
     gate, stage, tmp_path, runtime, accepted
 ):
     for route in ("/harness/hosts", "/harness"):
