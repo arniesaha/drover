@@ -1,0 +1,15 @@
+# Rendered by stage.py into the isolated home; never insert a token here.
+[paths]
+incoming_dir = "<STAGING_ROOT>/state/incoming"
+parquet_dir = "<STAGING_ROOT>/state/parquet"
+duckdb_path = "<STAGING_ROOT>/state/drover.duckdb"
+
+[server]
+metrics_host = "127.0.0.1"
+metrics_http_port = 17080
+advertised_url = "<STAGING_PUBLIC_ORIGIN>"
+
+[auth]
+enabled = true
+api_token = ""
+legacy_token_enabled = true
