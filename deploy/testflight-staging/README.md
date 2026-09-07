@@ -14,6 +14,35 @@ Any later public tunnel must target **only port 17080**. Port 17081 stays on
 loopback. Tunnel provisioning, Apple uploads, CI workflows, and remote repair
 are outside this tool. Use the logged-in operator's launchd GUI domain.
 
+## Dedicated public tunnel
+
+[`cloudflared.yml.example`](cloudflared.yml.example) is a generic boundary
+template, not an installable configuration. The release owner creates the
+locally managed named `drover-testflight` tunnel, assigns a dedicated
+single-level staging hostname, and writes a private configuration and its
+owner-only credentials outside this repository. Its sole ingress target is the
+staging server at `http://127.0.0.1:17080`; the final `http_status:404` rule is
+intentional.
+
+Run the tunnel as a separate user launchd job labeled
+`com.drover.testflight-tunnel`, with `cloudflared` invoked as
+`--config <private-config> tunnel run`. Before enabling the job, the release
+owner validates and renders the private configuration with:
+
+```sh
+cloudflared tunnel ingress validate --config "$DROVER_TESTFLIGHT_TUNNEL_CONFIG"
+cloudflared tunnel ingress rule --config "$DROVER_TESTFLIGHT_TUNNEL_CONFIG" \
+  "https://$DROVER_TESTFLIGHT_PUBLIC_HOST"
+```
+
+Do not copy credentials, an account identifier, or a real hostname into this
+repository. Cloudflare Access is not required on this app route: the signed
+app authenticates to Drover with its device bearer credential, while the
+tunnel supplies public TLS transport. After deployment, verify the dedicated
+edge from outside the LAN using a short-lived pairing code kept out of logs;
+inspect the connector and the dedicated launchd label rather than exposing a
+second local listener for diagnosis.
+
 ## Operator sequence
 
 Choose an absolute, dedicated root corresponding to `~/.drover-testflight`.

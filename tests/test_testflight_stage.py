@@ -19,6 +19,27 @@ SHA = "a" * 40
 OLDER = "b" * 40
 
 
+def test_cloudflared_example_exposes_only_the_staging_origin():
+    """A public tunnel must terminate at the staging HTTP listener only."""
+    template = (
+        Path(__file__).parents[1]
+        / "deploy/testflight-staging/cloudflared.yml.example"
+    )
+    text = template.read_text()
+
+    entries = [line.strip().removeprefix("- ").strip() for line in text.splitlines()]
+    hostnames = [entry for entry in entries if entry.startswith("hostname:")]
+    services = [entry for entry in entries if entry.startswith("service:")]
+
+    assert hostnames == ["hostname: <staging-public-hostname>"]
+    assert services == [
+        "service: http://127.0.0.1:17080",
+        "service: http_status:404",
+    ]
+    for forbidden in ["7081", "7077", "4317", "0.0.0.0"]:
+        assert forbidden not in text
+
+
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     root = tmp_path / "stage"
