@@ -1055,6 +1055,31 @@ struct ChatModelTests {
     #expect(model.canSendTurn == true)
 }
 
+@Test @MainActor func sentTurnIsConfirmedByTheHubsCanonicalTurnID() async throws {
+    nonisolated(unsafe) var turnID: String?
+    MockURLProtocol.handler = { request in
+        turnID = clientTurnID(in: request)
+        return (202, Data(#"{"turn_id": "t9"}"#.utf8))
+    }
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.composerText = "do it"
+    await model.sendTurn()
+    let sentTurnID = try #require(turnID)
+    // The hub parses `client_turn_id` as a UUID and echoes `str(UUID(...))`,
+    // which is lowercase. `UUID().uuidString` is uppercase, so the echo never
+    // arrives as the exact bytes this client sent.
+    #expect(UUID(uuidString: sentTurnID) != nil)
+    let canonicalTurnID = sentTurnID.lowercased()
+    #expect(canonicalTurnID != sentTurnID)
+
+    model.ingest(.message(.fixture(
+        seq: 1, type: .userInput, text: "do it", turnID: canonicalTurnID
+    )))
+
+    #expect(model.pendingTurn == nil)
+    #expect(model.canSendTurn == true)
+}
+
 @Test @MainActor func pendingApprovalIgnoresUnrelatedRequestIDs() async throws {
     let model = ChatModel.fixture()
     model.ingest(.message(.fixture(seq: 1, type: .approvalPrompt,
