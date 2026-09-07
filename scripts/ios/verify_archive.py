@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import plistlib
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.parse import urlsplit
 from xml.parsers.expat import ExpatError
 
 DEFAULT_BUNDLE_IDENTIFIER = "com.arnab.drover"
@@ -35,6 +37,40 @@ class ArtifactIdentity:
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def normalize_staging_url(value: str) -> str:
+    """Accept only an HTTPS origin; return the exact string embedded in the app."""
+    try:
+        if not value or any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError
+        if any(c in value for c in "?#\\"):
+            raise ValueError
+        parts = urlsplit(value)
+        host = parts.hostname
+        if (
+            parts.scheme != "https"
+            or not host
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path not in ("", "/")
+        ):
+            raise ValueError
+        port = parts.port
+        if parts.netloc.endswith(":") or (port is not None and not 1 <= port <= 65535):
+            raise ValueError
+        if ":" in host:
+            host = f"[{ipaddress.IPv6Address(host).compressed}]"
+        elif not all(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in host.split(".")
+        ):
+            raise ValueError
+        return f"https://{host}" + (f":{port}" if port not in (None, 443) else "")
+    except ValueError as error:
+        raise ArtifactVerificationError(
+            "staging URL must be a root HTTPS URL"
+        ) from error
 
 
 def _contains_build_setting(value: str) -> bool:
@@ -86,6 +122,7 @@ def validate_distribution_metadata(
     expected_build: str,
     sdk_floor: str,
     expected_bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER,
+    expected_staging_url: str | None = None,
 ) -> ArtifactIdentity:
     """Validate plist data and signed entitlements without reading source settings."""
     bundle_identifier = _required_string(
@@ -120,6 +157,21 @@ def validate_distribution_metadata(
         raise ArtifactVerificationError("artifact SDK metadata is inconsistent")
     if not _version_at_least(sdk_version, sdk_floor):
         raise ArtifactVerificationError("artifact SDK is below the required floor")
+
+    if expected_staging_url is not None:
+        staging_url = normalize_staging_url(expected_staging_url)
+        if info.get("DROVER_TESTFLIGHT_STAGING_URL") != staging_url:
+            raise ArtifactVerificationError(
+                "signed staging URL does not match the candidate"
+            )
+        # The runtime policy checks the exact YES string, not a plist boolean.
+        if info.get("DROVER_TESTFLIGHT_STAGE_ONLY") != "YES":
+            raise ArtifactVerificationError("signed stage-only flag is not YES")
+        ats = info.get("NSAppTransportSecurity")
+        if not isinstance(ats, dict) or ats.get("NSAllowsArbitraryLoads") is not False:
+            raise ArtifactVerificationError(
+                "signed arbitrary loads must be explicitly false"
+            )
 
     _validate_manifest(manifest)
 
@@ -237,6 +289,7 @@ def verify_app(
     expected_build: str,
     sdk_floor: str,
     expected_bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER,
+    expected_staging_url: str | None = None,
     run: Runner = subprocess.run,
 ) -> ArtifactIdentity:
     """Verify an unpacked app bundle or the app stored in an Xcode archive."""
@@ -266,6 +319,7 @@ def verify_app(
         expected_build=expected_build,
         sdk_floor=sdk_floor,
         expected_bundle_identifier=expected_bundle_identifier,
+        expected_staging_url=expected_staging_url,
     )
 
 
@@ -276,6 +330,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-build", required=True)
     parser.add_argument("--minimum-ios-sdk", default="26.0")
     parser.add_argument("--expected-bundle-id", default=DEFAULT_BUNDLE_IDENTIFIER)
+    parser.add_argument("--expected-staging-url")
     return parser.parse_args(argv)
 
 
@@ -288,6 +343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_build=args.expected_build,
             sdk_floor=args.minimum_ios_sdk,
             expected_bundle_identifier=args.expected_bundle_id,
+            expected_staging_url=args.expected_staging_url,
         )
     except ArtifactVerificationError as error:
         print(f"distribution artifact rejected: {error}")

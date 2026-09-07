@@ -127,6 +127,39 @@ def test_verify_app_accepts_a_signed_iphoneos_candidate(tmp_path: Path) -> None:
     assert identity.sdk_version == "26.5"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("DROVER_TESTFLIGHT_STAGING_URL", None),
+        ("DROVER_TESTFLIGHT_STAGING_URL", "https://other.example.test"),
+        ("DROVER_TESTFLIGHT_STAGE_ONLY", "NO"),
+        ("DROVER_TESTFLIGHT_STAGE_ONLY", True),
+        ("NSAppTransportSecurity", {"NSAllowsArbitraryLoads": True}),
+        ("NSAppTransportSecurity", {}),
+    ],
+)
+def test_verify_app_rejects_broken_stage_lock(tmp_path: Path, field, value) -> None:
+    verifier = load_verifier()
+    info = valid_info() | {
+        "DROVER_TESTFLIGHT_STAGE_ONLY": "YES",
+        "DROVER_TESTFLIGHT_STAGING_URL": "https://stage.example.test",
+        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": False},
+    }
+    if value is None:
+        info.pop(field)
+    else:
+        info[field] = value
+    with pytest.raises(verifier.ArtifactVerificationError, match="stag|arbitrary"):
+        verifier.verify_app(
+            write_bundle(tmp_path, info=info),
+            expected_version="1.2.3",
+            expected_build="42",
+            sdk_floor="26.0",
+            expected_staging_url="https://stage.example.test",
+            run=stub_codesign(),
+        )
+
+
 def test_verify_app_parses_entitlements_from_stdout_without_stderr_diagnostics(
     tmp_path: Path,
 ) -> None:
