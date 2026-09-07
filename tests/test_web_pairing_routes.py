@@ -15,9 +15,15 @@ from drover.server.web.pairing import PairingCodes
 
 
 class _Collector:
-    """The pairing routes never touch the collector; this satisfies the type."""
+    """Minimal safe responses for the read-only preflight routes."""
 
     relay_manager = None
+
+    def render_readiness(self, *, include_detail):
+        return 200, "{}\n"
+
+    def render_harness_json(self, **kwargs):
+        return "{}\n"
 
 
 @pytest.fixture()
@@ -35,12 +41,14 @@ def server(tmp_path):
         httpd.shutdown()
 
 
-def _call(base, method, path, payload=None, token=None):
+def _call(base, method, path, payload=None, token=None, headers=None):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(base + path, data=data, method=method)
     request.add_header("Content-Type", "application/json")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             raw = response.read().decode("utf-8")
@@ -164,3 +172,105 @@ def test_revoking_an_unknown_credential_is_not_found(server):
     base, _, _ = server
     status, _ = _call(base, "DELETE", "/auth/credentials/nope", token="cluster-token")
     assert status == 404
+
+
+def test_preflight_credentials_are_issued_by_the_running_server(server):
+    """The hub owns the credential store for the life of the process.
+
+    A CLI writing credentials.json directly issues a token this server will
+    never honour, and the server's next write deletes it again.
+    """
+    base, store, _ = server
+    status, minted = _call(
+        base,
+        "POST",
+        "/auth/credentials",
+        {"scope": "preflight", "label": "testflight-ci"},
+        token="cluster-token",
+    )
+
+    assert status == 201
+    issued = store.find_active(minted["token"])
+    assert issued is not None
+    assert issued.scope == "preflight"
+    assert minted["credential_id"] == issued.id
+
+
+def test_issuing_a_credential_refuses_any_scope_but_preflight(server):
+    """Device and host credentials only ever come from a redeemed code."""
+    base, store, _ = server
+    for scope in ("device", "host", "admin"):
+        status, _ = _call(
+            base,
+            "POST",
+            "/auth/credentials",
+            {"scope": scope, "label": "nope"},
+            token="cluster-token",
+        )
+        assert status == 400
+    assert store.list_all() == []
+
+
+def test_issuing_a_credential_requires_auth(server):
+    base, store, _ = server
+    status, _ = _call(
+        base, "POST", "/auth/credentials", {"scope": "preflight", "label": "x"}
+    )
+    assert status == 401
+    assert store.list_all() == []
+
+
+def test_preflight_token_cannot_mint_pair_codes_or_read_credentials(server):
+    base, store, _ = server
+    _, token = store.issue(scope="preflight", label="testflight-ci")
+
+    status, _ = _call(
+        base, "POST", "/auth/pair-codes", {"scope": "device"}, token=token
+    )
+    assert status == 401
+    status, _ = _call(base, "GET", "/auth/credentials", token=token)
+    assert status == 401
+
+
+def test_preflight_token_receives_only_the_three_read_only_route_responses(
+    server, monkeypatch
+):
+    base, store, _ = server
+    _, token = store.issue(scope="preflight", label="testflight-ci")
+    monkeypatch.setenv("DROVER_RELEASE_ROLE", "testflight-staging")
+    monkeypatch.setenv("DROVER_RELEASE_SHA", "a" * 40)
+
+    for path in ("/release-identity", "/readyz", "/harness/hosts"):
+        status, _ = _call(base, "GET", path, token=token)
+        assert status == 200
+    for method, path, headers in (
+        # /harness carries session previews and recaps -- conversation text a
+        # read-only release check has no business seeing.
+        ("GET", "/harness", {}),
+        ("GET", "/auth/credentials", {}),
+        ("POST", "/auth/credentials", {}),
+        ("POST", "/auth/pair-codes", {}),
+        ("POST", "/harness/sessions/one/turns", {}),
+        (
+            "GET",
+            "/harness/relay",
+            {"Upgrade": "websocket", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="},
+        ),
+        ("GET", "/unknown", {}),
+    ):
+        status, _ = _call(base, method, path, {"scope": "device"}, token, headers)
+        assert status == 401
+
+
+def test_preflight_release_identity_returns_fixed_503_when_launch_identity_is_invalid(
+    server, monkeypatch
+):
+    base, store, _ = server
+    _, token = store.issue(scope="preflight", label="testflight-ci")
+    monkeypatch.delenv("DROVER_RELEASE_ROLE", raising=False)
+    monkeypatch.delenv("DROVER_RELEASE_SHA", raising=False)
+
+    status, response = _call(base, "GET", "/release-identity", token=token)
+
+    assert status == 503
+    assert response == {"error": "staging release identity unavailable"}

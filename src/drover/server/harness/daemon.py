@@ -2020,6 +2020,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        from drover.server.staging_credentials import is_staging
+
+        if is_staging() and (
+            body.get("mode") != "structured"
+            or body.get("harness") not in {"claude-code", "codex"}
+            or body.get("command") is not None
+        ):
+            self._write_json(
+                {"error": "staging requires a supported structured runtime command"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         # Idempotency gate, before anything is spawned (drover#268). A caller
         # whose create timed out cannot otherwise tell whether it was served,
         # and retrying blind puts a second live agent on the same working
@@ -2259,6 +2271,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         client_session_id = _optional_text(body.get("client_session_id"))
         harness = str(body.get("harness") or "")
         cwd = body.get("cwd")
+        worktrees_dir = self.server.state.worktrees_dir
+        from drover.server.staging_credentials import is_staging, staging_session_paths
+
+        if is_staging():
+            # Check the original request before command preparation, Git, or
+            # registry writes. A worktree must never launder a personal cwd
+            # into a directory that appears staging-owned after the fact.
+            try:
+                cwd, worktrees_dir = staging_session_paths(cwd)
+            except ValueError as exc:
+                self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
         if cwd is not None and not Path(str(cwd)).expanduser().is_dir():
             self._write_json(
                 {"error": f"cwd does not exist: {cwd}"},
@@ -2294,7 +2318,25 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         command = body.get("command")
         default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
         if command is None and default_command_fn:
-            command = default_command_fn()
+            try:
+                command = default_command_fn()
+            except (ValueError, OSError) as exc:
+                # A staging host builds its command from an explicit key file
+                # and refuses to launch without it. That has to reach the
+                # caller as a reason: letting it escape kills the connection
+                # mid-response, so the hub reports a bare 502 and the only
+                # explanation is a traceback in the daemon's log.
+                #
+                # Both families, because `read_api_key` reaches the file
+                # through os.open: a key that is not in place yet raises
+                # FileNotFoundError and one the user cannot read raises
+                # PermissionError. Only the wrong-mode check is a ValueError,
+                # and "not there yet" is the likeliest of the three.
+                self._write_json(
+                    {"error": f"harness command unavailable: {exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
         if command is not None:
             command = apply_structured_preferences(
                 list(command),
@@ -2337,7 +2379,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         session_worktree: SessionWorktree | None = None
         if harness in _WORKTREE_HARNESSES and session_cwd is not None:
             session_worktree = create_session_worktree(
-                session_cwd, session_id, self.server.state.worktrees_dir
+                session_cwd, session_id, worktrees_dir
             )
             if session_worktree is not None:
                 session_cwd = session_worktree.path
@@ -2589,8 +2631,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.CONFLICT,
                 )
                 return
+            try:
+                default_command = default_command_fn()
+            except (ValueError, OSError):
+                # Same explicit-credential refusal as the create path. There
+                # is nothing to recover onto until the operator fixes the key.
+                self._write_json(
+                    {"error": _RECOVERY_UNAVAILABLE},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
             command = apply_structured_preferences(
-                default_command_fn(),
+                default_command,
                 harness=session.harness,
                 model=session.model,
                 thinking_effort=session.thinking_effort,

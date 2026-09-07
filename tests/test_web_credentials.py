@@ -6,7 +6,11 @@ import json
 import stat
 
 import pytest
+from click.testing import CliRunner
 
+from drover.config import default_config
+from drover.server.__main__ import main
+from drover.server.web.auth import AuthSettings
 from drover.server.web.credentials import (
     CREDENTIALS_FILENAME,
     Credential,
@@ -51,6 +55,83 @@ def test_issue_returns_token_and_stores_only_the_verifier(tmp_path):
 def test_issue_rejects_unknown_scope(tmp_path):
     with pytest.raises(ValueError):
         _store(tmp_path).issue(scope="admin", label="nope")
+
+
+def test_issue_accepts_preflight_scope_and_persists_only_its_verifier(tmp_path):
+    store = _store(tmp_path)
+    credential, token = store.issue(scope="preflight", label="testflight-ci")
+
+    assert credential.scope == "preflight"
+    stored = (tmp_path / CREDENTIALS_FILENAME).read_text(encoding="utf-8")
+    assert token not in stored
+    assert credential.verifier in stored
+
+
+def test_issue_preflight_cli_mints_through_the_running_server(monkeypatch, tmp_path):
+    """The CLI is a different process from the hub that has to honour the token.
+
+    CredentialStore loads once per process, so a credential written straight to
+    the file is invisible to the running server -- and erased by its next write.
+    """
+    import drover.server.__main__ as server_main
+
+    sent = {}
+
+    def fake_request(cfg, method, path, payload=None):
+        sent.update({"method": method, "path": path, "payload": payload})
+        return {"token": "preflight-token", "credential_id": "cred-1"}
+
+    monkeypatch.setattr(server_main, "_resolve_config", lambda path: default_config())
+    monkeypatch.setattr(server_main, "_local_api_request", fake_request)
+
+    result = CliRunner().invoke(
+        main, ["credentials", "issue-preflight", "--label", "testflight-ci"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "preflight-token\n"
+    assert sent == {
+        "method": "POST",
+        "path": "/auth/credentials",
+        "payload": {"scope": "preflight", "label": "testflight-ci"},
+    }
+
+
+def test_issue_preflight_cli_never_writes_a_credential_file_itself(
+    monkeypatch, tmp_path
+):
+    """No local store is touched, whichever config selected the hub."""
+    import drover.server.__main__ as server_main
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "config.toml"
+    config_path.write_text(
+        '[auth]\nenabled = true\napi_token = "staging-token"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        server_main,
+        "_local_api_request",
+        lambda cfg, method, path, payload=None: {
+            "token": "preflight-token",
+            "credential_id": "cred-1",
+        },
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--config",
+            str(config_path),
+            "credentials",
+            "issue-preflight",
+            "--label",
+            "testflight-ci",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (home / CREDENTIALS_FILENAME).exists()
 
 
 def test_find_active_matches_only_the_issued_token(tmp_path):

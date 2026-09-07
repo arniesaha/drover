@@ -29,7 +29,9 @@ class CodexAppServerSession:
     """A bounded session with a local Codex app-server process."""
 
     def __init__(self, command: Sequence[str], timeout_s: float):
-        self.command = tuple(command)
+        from drover.server.staging_credentials import codex_command
+
+        self.command = tuple(codex_command(command))
         self.timeout_s = timeout_s
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None

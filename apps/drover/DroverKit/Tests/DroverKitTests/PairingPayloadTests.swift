@@ -13,9 +13,9 @@ final class PairingPayloadTests: XCTestCase {
 
     func testTLSFlagSelectsHTTPS() throws {
         let payload = try XCTUnwrap(
-            PairingPayload(scanned: "drover://example.test:443?v=1&code=K7QP-2M4X&tls=1")
+            PairingPayload(scanned: "drover://stage.example.test:443?v=1&code=K7QP-2M4X&tls=1")
         )
-        XCTAssertEqual(payload.serverURL.absoluteString, "https://example.test:443")
+        XCTAssertEqual(payload.serverURL.absoluteString, "https://stage.example.test:443")
     }
 
     func testFleetNameIsOptional() throws {

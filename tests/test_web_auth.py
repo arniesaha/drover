@@ -16,6 +16,7 @@ from drover.server.web.auth import (
     mint_session,
     request_authorized,
     session_cookie_value,
+    token_matches,
     verify_session,
 )
 from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
@@ -221,3 +222,31 @@ def test_bearer_credential_rejects_legacy_cookie_and_revoked(tmp_path):
         bearer_credential(settings, _Headers({"Authorization": f"Bearer {token}"}))
         is None
     )
+
+
+def test_preflight_credential_is_limited_to_literal_read_only_routes(tmp_path):
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    _, token = store.issue(scope="preflight", label="testflight-ci")
+    settings = _auth(credentials=store)
+    headers = _Headers({"Authorization": f"Bearer {token}"})
+
+    for path in ("/release-identity", "/readyz", "/harness/hosts"):
+        assert request_authorized(settings, headers, method="GET", path=path)
+    for method, path in (
+        # The full snapshot includes session previews and recaps.
+        ("GET", "/harness"),
+        ("POST", "/auth/pair-codes"),
+        ("GET", "/auth/credentials"),
+        ("POST", "/auth/credentials"),
+        ("POST", "/harness/sessions/one/turns"),
+        ("GET", "/unknown"),
+        ("GET", "/harness/hosts/one/terminal"),
+    ):
+        assert not request_authorized(settings, headers, method=method, path=path)
+
+
+def test_preflight_credential_cannot_mint_a_browser_session(tmp_path):
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    _, token = store.issue(scope="preflight", label="testflight-ci")
+
+    assert not token_matches(_auth(credentials=store), token)

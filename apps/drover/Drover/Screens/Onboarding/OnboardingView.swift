@@ -333,7 +333,7 @@ struct OnboardingView: View {
 
         let response: PairResponse
         do {
-            response = try await DroverClient.pair(
+            response = try await environment.pair(
                 payload: payload,
                 deviceName: UITestOverrides.pairingDeviceName(
                     fallback: UIDevice.current.name

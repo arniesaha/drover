@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Archive and validate a candidate without selecting a signing identity.
+set +x
 set -euo pipefail
+umask 077
 
 readonly REQUIRED_IOS_SDK="26.0"
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/ios/archive.sh --version VERSION --build BUILD --output DIRECTORY \
-  --signing-config PATH
+  --signing-config PATH [--channel testflight-internal --staging-url HTTPS_URL]
 
 Creates DIRECTORY/Drover.xcarchive, an archive zip and an archive-record.json.
 DIRECTORY must not already exist. PATH is a private Xcode config with reviewed
@@ -94,9 +96,21 @@ VERSION=""
 BUILD=""
 OUTPUT=""
 SIGNING_CONFIG=""
+CHANNEL="distribution"
+STAGING_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --channel)
+      [[ $# -ge 2 ]] || fail "--channel requires a value"
+      CHANNEL="$2"
+      shift 2
+      ;;
+    --staging-url)
+      [[ $# -ge 2 ]] || fail "staging URL requires a value"
+      STAGING_URL="$2"
+      shift 2
+      ;;
     --version)
       [[ $# -ge 2 ]] || fail "--version requires a value"
       VERSION="$2"
@@ -127,6 +141,33 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+STAGING_URL_SHA256=""
+STAGE_SETTINGS=()
+STAGE_VERIFY_ARGS=()
+case "$CHANNEL" in
+  testflight-internal)
+    [[ -n "$STAGING_URL" ]] || fail "staging URL is required for testflight-internal"
+    STAGING_URL="$(python3 - "$SCRIPT_DIR" "$STAGING_URL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from verify_archive import ArtifactVerificationError, normalize_staging_url
+try:
+    print(normalize_staging_url(sys.argv[2]))
+except ArtifactVerificationError:
+    raise SystemExit(1)
+PY
+    )" || fail "staging URL must be a root HTTPS URL"
+    STAGING_URL_SHA256="$(printf '%s' "$STAGING_URL" | shasum -a 256 | awk '{ print $1 }')"
+    STAGE_SETTINGS=("DROVER_TESTFLIGHT_STAGE_ONLY=YES" "DROVER_TESTFLIGHT_STAGING_URL=$STAGING_URL" "DROVER_ALLOW_ARBITRARY_LOADS=NO")
+    STAGE_VERIFY_ARGS=(--expected-staging-url "$STAGING_URL")
+    ;;
+  distribution)
+    [[ -z "$STAGING_URL" ]] || fail "staging URL requires the testflight-internal channel"
+    ;;
+  *) fail "unsupported archive channel" ;;
+esac
 
 [[ -n "$VERSION" ]] || fail "--version is required"
 [[ -n "$BUILD" ]] || fail "--build is required"
@@ -204,6 +245,7 @@ if ! xcodebuild \
   -archivePath "$ARCHIVE_PATH" \
   "MARKETING_VERSION=$VERSION" \
   "CURRENT_PROJECT_VERSION=$BUILD" \
+  ${STAGE_SETTINGS[@]+"${STAGE_SETTINGS[@]}"} \
   archive >"$LOG_DIRECTORY/archive.log" 2>&1; then
   fail "archive failed; no signing details were printed"
 fi
@@ -212,6 +254,7 @@ if ! python3 "$VERIFY_SCRIPT" \
   --app "$ARCHIVE_PATH" \
   --expected-version "$VERSION" \
   --expected-build "$BUILD" \
+  ${STAGE_VERIFY_ARGS[@]+"${STAGE_VERIFY_ARGS[@]}"} \
   --minimum-ios-sdk "$REQUIRED_IOS_SDK" >"$LOG_DIRECTORY/verify.log" 2>&1; then
   fail "archive verification failed; signed artifact was rejected"
 fi
@@ -225,7 +268,7 @@ ARTIFACT_SHA256="$(shasum -a 256 "$ARCHIVE_ZIP" | awk '{ print $1 }')"
 
 python3 - "$RECORD_PATH" "$COMMIT" "$CLEAN_TREE" "$XCODE_VERSION" \
   "$EFFECTIVE_DEVELOPER_DIR" "$IPHONEOS_SDK" "$VERSION" "$BUILD" "$ARCHIVE_PATH" \
-  "$ARCHIVE_ZIP" "$ARTIFACT_SHA256" <<'PY'
+  "$ARCHIVE_ZIP" "$ARTIFACT_SHA256" "$CHANNEL" "$STAGING_URL_SHA256" <<'PY'
 import json
 import pathlib
 import sys
@@ -242,6 +285,8 @@ import sys
     archive_path,
     archive_zip,
     artifact_sha256,
+    channel,
+    staging_url_sha256,
 ) = sys.argv[1:]
 pathlib.Path(record_path).write_text(
     json.dumps(
@@ -250,6 +295,8 @@ pathlib.Path(record_path).write_text(
             "archive_zip": archive_zip,
             "archive_zip_sha256": artifact_sha256,
             "build": build,
+            "channel": channel,
+            "staging_url_sha256": staging_url_sha256 or None,
             "clean_tree": clean_tree == "true",
             "commit": commit,
             "iphoneos_sdk": iphoneos_sdk,

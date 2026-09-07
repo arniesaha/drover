@@ -10,6 +10,7 @@ import contextlib
 import gzip
 import json
 import logging
+import os
 import queue
 import socket
 import threading
@@ -42,6 +43,7 @@ from drover.server.harness.websocket import (
     send_frame,
     send_json,
 )
+from drover.server.release_identity import load_release_identity
 from drover.server.web.auth import (
     DISABLED,
     AuthSettings,
@@ -754,7 +756,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         """
         if path in _PUBLIC_PATHS or not self.auth.enabled:
             return True
-        if request_authorized(self.auth, self.headers):
+        if request_authorized(self.auth, self.headers, method=self.command, path=path):
             return True
         if path in {"/", "/ui"} or path.startswith("/ui/"):
             self.send_response(302)
@@ -777,6 +779,18 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             # about the database belongs to /readyz, so that a restart trigger
             # keyed on readiness cannot be defeated by the process being up.
             self._send(200, "text/plain; charset=utf-8", "ok\n")
+            return
+        if path == "/release-identity":
+            try:
+                identity = load_release_identity(os.environ)
+            except ValueError:
+                self._send(
+                    503,
+                    "application/json",
+                    '{"error": "staging release identity unavailable"}\n',
+                )
+                return
+            self._send(200, "application/json", json.dumps(identity.as_json()) + "\n")
             return
         if path == "/readyz":
             # Answers 503 when a store this hub serves from can no longer be
@@ -1118,6 +1132,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/auth/pair-codes":
             self._mint_pairing_code()
+            return
+        if path == "/auth/credentials":
+            self._issue_credential()
             return
         if path == "/harness/events":
             self._ingest_harness_events()
@@ -1948,6 +1965,45 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             "scope": credential.scope,
             "server_id": store.server_id,
             "fleet_name": store.fleet_name,
+        }
+        self._send(201, "application/json", json.dumps(payload, sort_keys=True) + "\n")
+
+    def _issue_credential(self) -> None:
+        """Issue a preflight credential inside the process that must honour it.
+
+        `CredentialStore` reads the file once, in `__init__`, and the server
+        holds that instance for its whole life. A credential minted by any
+        other process is therefore invisible here -- and erased from disk by
+        this server's next write, which rebuilds the file from what it still
+        has in memory. Preflight is the only scope this route issues: a device
+        or host credential only ever comes from a redeemed pairing code.
+        """
+        if not self._pairing_ready():
+            return
+        body = self._read_json()
+        if body is None:
+            self._send(
+                400,
+                "application/json",
+                '{"error": "request body must be a JSON object"}\n',
+            )
+            return
+        if body.get("scope") != "preflight":
+            self._send(
+                400,
+                "application/json",
+                '{"error": "only preflight credentials are issued here"}\n',
+            )
+            return
+        label = str(body.get("label") or "").strip()
+        if not label:
+            self._send(400, "application/json", '{"error": "label is required"}\n')
+            return
+        credential, token = self.auth.credentials.issue(scope="preflight", label=label)
+        payload = {
+            "token": token,
+            "credential_id": credential.id,
+            "scope": credential.scope,
         }
         self._send(201, "application/json", json.dumps(payload, sort_keys=True) + "\n")
 

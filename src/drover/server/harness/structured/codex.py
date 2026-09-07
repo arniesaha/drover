@@ -50,7 +50,9 @@ _STDERR_TAIL_LINES = 20
 
 
 def default_command(binary: str | None = None) -> list[str]:
-    return [binary or shutil.which("codex") or "codex"]
+    from drover.server.staging_credentials import codex_command
+
+    return codex_command([binary or shutil.which("codex") or "codex"])
 
 
 def _catalog_number(value: Any) -> float | None:
