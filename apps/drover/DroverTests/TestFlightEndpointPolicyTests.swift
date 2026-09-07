@@ -12,10 +12,19 @@ final class TestFlightEndpointPolicyTests: XCTestCase {
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "http://stage.example.test"))))
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://other.example.test"))))
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://stage.example.test:8443"))))
+        XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://stage.example.test/"))))
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://stage.example.test/api"))))
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://token@stage.example.test"))))
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://stage.example.test?mode=test"))))
         XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://stage.example.test#section"))))
+    }
+
+    func testStagePolicyRejectsARequiredOriginWithTrailingRootSlash() throws {
+        let policy = TestFlightEndpointPolicy(
+            requiredOrigin: try XCTUnwrap(URL(string: "https://stage.example.test/"))
+        )
+
+        XCTAssertFalse(policy.accepts(try XCTUnwrap(URL(string: "https://stage.example.test"))))
     }
 
     func testNilRequiredOriginAllowsOrdinarySelfHostedServers() throws {

@@ -16,7 +16,7 @@ struct TestFlightEndpointPolicy {
                   components.password == nil,
                   components.query == nil,
                   components.fragment == nil,
-                  components.path.isEmpty || components.path == "/"
+                  components.path.isEmpty
             else {
                 return nil
             }
