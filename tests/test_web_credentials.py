@@ -6,7 +6,11 @@ import json
 import stat
 
 import pytest
+from click.testing import CliRunner
 
+from drover.config import default_config
+from drover.server.__main__ import main
+from drover.server.web.auth import AuthSettings
 from drover.server.web.credentials import (
     CREDENTIALS_FILENAME,
     Credential,
@@ -51,6 +55,40 @@ def test_issue_returns_token_and_stores_only_the_verifier(tmp_path):
 def test_issue_rejects_unknown_scope(tmp_path):
     with pytest.raises(ValueError):
         _store(tmp_path).issue(scope="admin", label="nope")
+
+
+def test_issue_accepts_preflight_scope_and_persists_only_its_verifier(tmp_path):
+    store = _store(tmp_path)
+    credential, token = store.issue(scope="preflight", label="testflight-ci")
+
+    assert credential.scope == "preflight"
+    stored = (tmp_path / CREDENTIALS_FILENAME).read_text(encoding="utf-8")
+    assert token not in stored
+    assert credential.verifier in stored
+
+
+def test_issue_preflight_cli_prints_only_the_new_plaintext_token(monkeypatch, tmp_path):
+    import drover.server.__main__ as server_main
+
+    store = _store(tmp_path)
+    monkeypatch.setattr(server_main, "_resolve_config", lambda path: default_config())
+    monkeypatch.setattr(
+        server_main,
+        "load_auth",
+        lambda cfg: AuthSettings(
+            enabled=True, api_token="cluster-token", credentials=store
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main, ["credentials", "issue-preflight", "--label", "testflight-ci"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("\n") == 1
+    token = result.output.strip()
+    assert store.find_active(token) is not None
+    assert store.find_active(token).scope == "preflight"
 
 
 def test_find_active_matches_only_the_issued_token(tmp_path):

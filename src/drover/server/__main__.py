@@ -1548,6 +1548,23 @@ def credentials_list_cmd(ctx: click.Context) -> None:
         )
 
 
+@credentials_cmd.command(name="issue-preflight")
+@click.option(
+    "--label", required=True, help="Local label for this preflight credential"
+)
+@click.pass_context
+def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
+    """Issue one locally-scoped credential for TestFlight preflight checks."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    auth = load_auth(cfg)
+    if not auth.enabled or auth.credentials is None:
+        raise click.ClickException(
+            "auth must be enabled to issue a preflight credential"
+        )
+    _, token = auth.credentials.issue(scope="preflight", label=label)
+    click.echo(token)
+
+
 @credentials_cmd.command(name="revoke")
 @click.argument("credential_id")
 @click.pass_context

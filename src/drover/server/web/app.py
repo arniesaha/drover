@@ -10,6 +10,7 @@ import contextlib
 import gzip
 import json
 import logging
+import os
 import queue
 import socket
 import threading
@@ -52,6 +53,7 @@ from drover.server.web.auth import (
 )
 from drover.server.web.pairing import PairingCodes, ThrottledSource, UnknownCode
 from drover.server.web.ui import load_page
+from drover.server.release_identity import load_release_identity
 
 if TYPE_CHECKING:
     from drover.server.harness.models import HarnessHost
@@ -754,7 +756,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         """
         if path in _PUBLIC_PATHS or not self.auth.enabled:
             return True
-        if request_authorized(self.auth, self.headers):
+        if request_authorized(self.auth, self.headers, method=self.command, path=path):
             return True
         if path in {"/", "/ui"} or path.startswith("/ui/"):
             self.send_response(302)
@@ -777,6 +779,18 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             # about the database belongs to /readyz, so that a restart trigger
             # keyed on readiness cannot be defeated by the process being up.
             self._send(200, "text/plain; charset=utf-8", "ok\n")
+            return
+        if path == "/release-identity":
+            try:
+                identity = load_release_identity(os.environ)
+            except ValueError:
+                self._send(
+                    503,
+                    "application/json",
+                    '{"error": "staging release identity unavailable"}\n',
+                )
+                return
+            self._send(200, "application/json", json.dumps(identity.as_json()) + "\n")
             return
         if path == "/readyz":
             # Answers 503 when a store this hub serves from can no longer be

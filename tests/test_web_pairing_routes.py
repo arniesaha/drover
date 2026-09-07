@@ -164,3 +164,15 @@ def test_revoking_an_unknown_credential_is_not_found(server):
     base, _, _ = server
     status, _ = _call(base, "DELETE", "/auth/credentials/nope", token="cluster-token")
     assert status == 404
+
+
+def test_preflight_token_cannot_mint_pair_codes_or_read_credentials(server):
+    base, store, _ = server
+    _, token = store.issue(scope="preflight", label="testflight-ci")
+
+    status, _ = _call(
+        base, "POST", "/auth/pair-codes", {"scope": "device"}, token=token
+    )
+    assert status == 401
+    status, _ = _call(base, "GET", "/auth/credentials", token=token)
+    assert status == 401

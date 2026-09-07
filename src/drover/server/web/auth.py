@@ -129,18 +129,35 @@ def token_matches(auth: AuthSettings, candidate: str) -> bool:
         and hmac.compare_digest(candidate, auth.api_token)
     ):
         return True
-    return _credential_for_token(auth, candidate) is not None
+    credential = _credential_for_token(auth, candidate)
+    return credential is not None and credential.scope != "preflight"
 
 
-def request_authorized(auth: AuthSettings, headers) -> bool:
+def request_authorized(
+    auth: AuthSettings, headers, *, method: str | None = None, path: str | None = None
+) -> bool:
     """Accept either a bearer token or a valid session cookie."""
     if not auth.enabled:
         return True
     authorization = headers.get("Authorization", "") or ""
-    if authorization.startswith("Bearer ") and token_matches(
-        auth, authorization.removeprefix("Bearer ").strip()
-    ):
-        return True
+    if authorization.startswith("Bearer "):
+        candidate = authorization.removeprefix("Bearer ").strip()
+        credential = _credential_for_token(auth, candidate)
+        if credential is not None:
+            if credential.scope != "preflight":
+                return True
+            return (method, path) in {
+                ("GET", "/release-identity"),
+                ("GET", "/readyz"),
+                ("GET", "/harness"),
+                ("GET", "/harness/hosts"),
+            }
+        if (
+            auth.legacy_token_enabled
+            and auth.api_token
+            and hmac.compare_digest(candidate, auth.api_token)
+        ):
+            return True
     raw_cookie = headers.get("Cookie", "") or ""
     if raw_cookie:
         jar = SimpleCookie()
