@@ -57,6 +57,7 @@ final class AppEnvironment {
     private let tokenStore: TokenStore
     private let recoveryBindingStore: RecoveryBindingStore
     private let recoveryStore: (any ChatRecoveryPersisting)?
+    private let endpointPolicy: TestFlightEndpointPolicy
     /// The one app-owned recovery writer boundary. Every foreground chat
     /// receives this exact instance so sign out can drain writes already
     /// admitted to the recovery actor before it erases their namespace.
@@ -75,6 +76,7 @@ final class AppEnvironment {
         self.tokenStore = tokenStore
         self.recoveryBindingStore = RecoveryBindingStore(service: tokenStore.service)
         self.recoveryStore = recoveryStore
+        self.endpointPolicy = .fromBundle()
         self.validator = { _, _ in "Connection changes are disabled in this synthetic fixture." }
         self.client = fixtureClient
         self.config = fixtureClient?.config
@@ -86,6 +88,7 @@ final class AppEnvironment {
         tokenStore: TokenStore = TokenStore(),
         recoveryBindingStore: RecoveryBindingStore? = nil,
         recoveryStore: (any ChatRecoveryPersisting)? = nil,
+        endpointPolicy: TestFlightEndpointPolicy = .fromBundle(),
         validator: @escaping @Sendable (ServerConfig, String) async -> String? = { config, token in
             await ClientFactory.validate(config: config, token: token)
         },
@@ -97,6 +100,7 @@ final class AppEnvironment {
             ?? RecoveryBindingStore(service: tokenStore.service)
         self.recoveryBindingStore = resolvedBindingStore
         self.recoveryStore = recoveryStore ?? Self.defaultRecoveryStore()
+        self.endpointPolicy = endpointPolicy
         self.validator = validator
         if UITestOverrides.shouldResetAuthentication(environment: launchEnvironment) {
             try? tokenStore.delete()
@@ -107,7 +111,13 @@ final class AppEnvironment {
         let savedToken = tokenStore.load()
         let startupBindingID: UUID?
         let shouldSweepRecovery: Bool
-        if let savedConfig, let savedToken {
+        if let savedConfig, !endpointPolicy.accepts(savedConfig.baseURL) {
+            // Keep the old credential and configuration untouched so a
+            // different build can still guide the user through recovery, but
+            // never bind recovery or construct a client for an off-stage hub.
+            startupBindingID = nil
+            shouldSweepRecovery = false
+        } else if let savedConfig, let savedToken {
             do {
                 startupBindingID = try resolvedBindingStore.binding(
                     forToken: savedToken,
@@ -129,7 +139,10 @@ final class AppEnvironment {
             // example, a locked Keychain), so it must not orphan-purge files.
             shouldSweepRecovery = savedConfig == nil
         }
-        if let built = ClientFactory.make(
+        let allowsSavedClient = savedConfig.map { endpointPolicy.accepts($0.baseURL) }
+            ?? endpointPolicy.allowsUnconfiguredStartup
+        if allowsSavedClient,
+           let built = ClientFactory.make(
             defaults: defaults,
             tokenStore: tokenStore,
             credentialBindingID: startupBindingID
@@ -202,6 +215,9 @@ final class AppEnvironment {
         }
         guard let newConfig = ServerConfig(urlString: urlString) else {
             return .failure("Enter a valid server URL.")
+        }
+        guard endpointPolicy.accepts(newConfig.baseURL) else {
+            return .failure("This TestFlight build connects only to its staging hub.")
         }
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedToken.isEmpty else {

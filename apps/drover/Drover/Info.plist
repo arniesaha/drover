@@ -22,12 +22,16 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>DROVER_TESTFLIGHT_STAGE_ONLY</key>
+	<string>$(DROVER_TESTFLIGHT_STAGE_ONLY)</string>
+	<key>DROVER_TESTFLIGHT_STAGING_URL</key>
+	<string>$(DROVER_TESTFLIGHT_STAGING_URL)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
-		<true/>
+		<string>$(DROVER_ALLOW_ARBITRARY_LOADS)</string>
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Drover uses the camera to scan the pairing QR code shown by drover-server. The camera is not used for anything else.</string>

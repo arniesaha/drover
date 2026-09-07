@@ -43,6 +43,9 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: "0.1.0"
         SWIFT_VERSION: 6.0
+        DROVER_TESTFLIGHT_STAGE_ONLY: "NO"
+        DROVER_TESTFLIGHT_STAGING_URL: ""
+        DROVER_ALLOW_ARBITRARY_LOADS: "YES"
       configs:
         # Development configurations keep the development APNs entitlement
         # from `base`; only the distribution configuration selects production.
@@ -57,8 +60,10 @@ targets:
         # only HTTPS/TLS through the system frameworks, which is exempt.
         ITSAppUsesNonExemptEncryption: false
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        DROVER_TESTFLIGHT_STAGE_ONLY: "$(DROVER_TESTFLIGHT_STAGE_ONLY)"
+        DROVER_TESTFLIGHT_STAGING_URL: "$(DROVER_TESTFLIGHT_STAGING_URL)"
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoads: "$(DROVER_ALLOW_ARBITRARY_LOADS)"
         # Required on physical devices to reach the central server over the
         # LAN (192.168.1.x): without this key iOS never shows the Local
         # Network prompt and silently blocks the connection ("Server did not
