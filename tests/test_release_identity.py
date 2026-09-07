@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-
 import pytest
 
 from drover.server.release_identity import load_release_identity
@@ -78,6 +76,15 @@ def test_load_release_identity_includes_a_matching_owner_only_probe(tmp_path):
         ({"nope": True}, 0o600),
         ({"source_sha": "b" * 40}, 0o600),
         ({"source_sha": "a" * 40}, 0o640),
+        (
+            {
+                "source_sha": "a" * 40,
+                "host_id": "testflight-staging-mac-mini",
+                "completed_at": "not-a-timestamp",
+                "session_id_sha256": "b" * 64,
+            },
+            0o600,
+        ),
     ],
 )
 def test_invalid_or_non_owner_only_probe_is_absent(tmp_path, payload, mode):

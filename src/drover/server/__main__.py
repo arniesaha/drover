@@ -409,6 +409,13 @@ def _resolve_config(path: Optional[str]) -> DroverConfig:
     return default_config()
 
 
+def _auth_home_for_selected_config(config_path: Optional[str]) -> Path:
+    """Keep credential state beside an explicitly selected configuration."""
+    if config_path:
+        return Path(config_path).expanduser().resolve().parent
+    return config_home()
+
+
 def _advertised_host_port(cfg: DroverConfig) -> str:
     """Where clients should dial this hub.
 
@@ -1556,7 +1563,9 @@ def credentials_list_cmd(ctx: click.Context) -> None:
 def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
     """Issue one locally-scoped credential for TestFlight preflight checks."""
     cfg = _resolve_config(ctx.obj["config_path"])
-    auth = load_auth(cfg)
+    auth = load_auth(
+        cfg, token_home=_auth_home_for_selected_config(ctx.obj["config_path"])
+    )
     if not auth.enabled or auth.credentials is None:
         raise click.ClickException(
             "auth must be enabled to issue a preflight credential"

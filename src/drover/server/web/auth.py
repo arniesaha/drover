@@ -118,7 +118,7 @@ def bearer_credential(auth: AuthSettings, headers) -> Credential | None:
 
 
 def token_matches(auth: AuthSettings, candidate: str) -> bool:
-    """Accept the legacy cluster token or any active per-credential token.
+    """Accept the legacy cluster token or an active non-preflight credential.
 
     The credential path hashes the candidate before looking it up, so lookup
     cost never varies with the secret and there is no per-credential loop.

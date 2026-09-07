@@ -75,7 +75,7 @@ def test_issue_preflight_cli_prints_only_the_new_plaintext_token(monkeypatch, tm
     monkeypatch.setattr(
         server_main,
         "load_auth",
-        lambda cfg: AuthSettings(
+        lambda cfg, token_home=None: AuthSettings(
             enabled=True, api_token="cluster-token", credentials=store
         ),
     )
@@ -89,6 +89,46 @@ def test_issue_preflight_cli_prints_only_the_new_plaintext_token(monkeypatch, tm
     token = result.output.strip()
     assert store.find_active(token) is not None
     assert store.find_active(token).scope == "preflight"
+
+
+def test_issue_preflight_cli_keeps_selected_config_state_separate_from_personal_home(
+    monkeypatch, tmp_path
+):
+    import drover.server.web.auth as web_auth
+
+    personal_home = tmp_path / "personal"
+    personal_store = CredentialStore(personal_home / CREDENTIALS_FILENAME)
+    personal_store.issue(scope="device", label="personal-phone")
+    personal_before = (personal_home / CREDENTIALS_FILENAME).read_text(encoding="utf-8")
+    staging_home = tmp_path / "staging"
+    config_path = staging_home / "config.toml"
+    staging_home.mkdir()
+    config_path.write_text(
+        '[auth]\nenabled = true\napi_token = "staging-token"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("DROVER_API_TOKEN", raising=False)
+    monkeypatch.setattr(web_auth, "config_home", lambda: personal_home)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--config",
+            str(config_path),
+            "credentials",
+            "issue-preflight",
+            "--label",
+            "testflight-ci",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (personal_home / CREDENTIALS_FILENAME).read_text(
+        encoding="utf-8"
+    ) == personal_before
+    staging_store = CredentialStore(staging_home / CREDENTIALS_FILENAME)
+    issued = staging_store.find_active(result.output.strip())
+    assert issued is not None
+    assert issued.scope == "preflight"
 
 
 def test_find_active_matches_only_the_issued_token(tmp_path):

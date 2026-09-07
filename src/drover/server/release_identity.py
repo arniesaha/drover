@@ -7,6 +7,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
@@ -17,6 +18,16 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SESSION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _ATTESTATION_KEYS = {"source_sha", "host_id", "completed_at", "session_id_sha256"}
 _INVALID_IDENTITY = "invalid staging release identity"
+
+
+def _is_timezone_bearing_iso_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return timestamp.tzinfo is not None and timestamp.utcoffset() is not None
 
 
 @dataclass(frozen=True)
@@ -73,8 +84,7 @@ def _load_probe(path: str, source_sha: str) -> StagingProbeAttestation | None:
         raw.get("source_sha") != source_sha
         or not isinstance(raw.get("host_id"), str)
         or not raw["host_id"]
-        or not isinstance(raw.get("completed_at"), str)
-        or not raw["completed_at"]
+        or not _is_timezone_bearing_iso_timestamp(raw.get("completed_at"))
         or not isinstance(raw.get("session_id_sha256"), str)
         or not _SESSION_DIGEST_RE.fullmatch(raw["session_id_sha256"])
     ):
