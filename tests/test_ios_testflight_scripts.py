@@ -1,4 +1,4 @@
-"""Exercise the artifact chain with synthetic bundles and fake Apple binaries."""
+"""Exercise synthetic artifact fixtures and real unsigned Xcode metadata builds."""
 
 from __future__ import annotations
 
@@ -8,9 +8,11 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from test_ios_archive_verifier import (
     valid_info,
     write_bundle,
@@ -449,4 +451,87 @@ def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
     assert (
         json.loads((root / "upload-record.json").read_text())["upload_confirmed"]
         is True
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("xcodegen") is None,
+    reason="requires macOS Xcode and XcodeGen for real plist processing",
+)
+@pytest.mark.parametrize(
+    "configuration,stage_only,allow_loads,expected",
+    [("StoreRelease", "YES", "NO", False), ("Debug", "NO", "YES", True)],
+)
+def test_generated_project_processes_typed_ats_metadata(
+    tmp_path: Path,
+    configuration: str,
+    stage_only: str,
+    allow_loads: str,
+    expected: bool,
+):
+    """Process production metadata in a tiny unsigned app with the real Xcode tools."""
+    project = SCRIPTS.parents[1] / "apps" / "drover" / "project.yml"
+    spec = yaml.safe_load(project.read_text())
+    target = spec["targets"]["Drover"]
+    # Preserve production settings, metadata and build phases. Package and UI
+    # compilation are irrelevant to ProcessInfoPlistFile, so use a tiny C app.
+    target["dependencies"] = []
+    spec["targets"] = {"Drover": target}
+    spec["packages"] = {}
+    spec["schemes"] = {"DroverAppStore": spec["schemes"]["DroverAppStore"]}
+    source = tmp_path / "Drover"
+    source.mkdir()
+    (source / "main.c").write_text("int main(void) { return 0; }\n")
+    (tmp_path / "project.yml").write_text(yaml.safe_dump(spec))
+    generated = subprocess.run(
+        ["xcodegen", "generate", "--spec", str(tmp_path / "project.yml")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    result = subprocess.run(
+        [
+            "xcodebuild",
+            "-project",
+            str(tmp_path / "Drover.xcodeproj"),
+            "-scheme",
+            "DroverAppStore",
+            "-configuration",
+            configuration,
+            "-sdk",
+            "iphonesimulator",
+            "-destination",
+            "generic/platform=iOS Simulator",
+            "-derivedDataPath",
+            str(tmp_path / "derived"),
+            "CODE_SIGNING_ALLOWED=NO",
+            f"DROVER_TESTFLIGHT_STAGE_ONLY={stage_only}",
+            f"DROVER_TESTFLIGHT_STAGING_URL={STAGE}",
+            f"DROVER_ALLOW_ARBITRARY_LOADS={allow_loads}",
+            "build",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    processed = (
+        tmp_path
+        / "derived"
+        / "Build"
+        / "Products"
+        / f"{configuration}-iphonesimulator"
+        / "Drover.app"
+        / "Info.plist"
+    )
+    info = plistlib.loads(processed.read_bytes())
+    assert info["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is expected
+    assert info["DROVER_TESTFLIGHT_STAGE_ONLY"] == stage_only
+    assert info["DROVER_TESTFLIGHT_STAGING_URL"] == STAGE
+    template = plistlib.loads((source / "Info.plist").read_bytes())
+    assert template["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is True
+    assert template["DROVER_TESTFLIGHT_STAGE_ONLY"] == "$(DROVER_TESTFLIGHT_STAGE_ONLY)"
+    assert (
+        template["DROVER_TESTFLIGHT_STAGING_URL"] == "$(DROVER_TESTFLIGHT_STAGING_URL)"
     )

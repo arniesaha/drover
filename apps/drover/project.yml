@@ -18,7 +18,11 @@ targets:
   Drover:
     type: application
     platform: iOS
-    sources: [Drover]
+    sources:
+      - path: Drover
+        # INFOPLIST_FILE selects a derived copy; do not also copy the source
+        # template into the app as a resource with the same output path.
+        excludes: [Info.plist]
     dependencies:
       - package: DroverKit
       - package: SwiftTerm
@@ -36,6 +40,9 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Drover/Drover.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
+        # The build phase below preserves the plist Boolean type for ATS before
+        # Xcode expands the independent stage URL and YES/NO string settings.
+        INFOPLIST_FILE: "$(DERIVED_FILE_DIR)/Drover-Info.plist"
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         # Release automation supplies these two values at build time. Keep
         # development defaults usable, but never write a candidate version or
@@ -63,7 +70,7 @@ targets:
         DROVER_TESTFLIGHT_STAGE_ONLY: "$(DROVER_TESTFLIGHT_STAGE_ONLY)"
         DROVER_TESTFLIGHT_STAGING_URL: "$(DROVER_TESTFLIGHT_STAGING_URL)"
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: "$(DROVER_ALLOW_ARBITRARY_LOADS)"
+          NSAllowsArbitraryLoads: true
         # Required on physical devices to reach the central server over the
         # LAN (192.168.1.x): without this key iOS never shows the Local
         # Network prompt and silently blocks the connection ("Server did not
@@ -81,6 +88,25 @@ targets:
           drover-server. The camera is not used for anything else.
         UIBackgroundModes: [fetch]
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
+    preBuildScripts:
+      - name: Prepare typed ATS metadata
+        # String build-setting substitution does not turn YES/NO into a plist
+        # Boolean. Change the typed value in a derived copy, never in source.
+        script: |
+          set -eu
+          case "$DROVER_ALLOW_ARBITRARY_LOADS" in
+            YES) ats_boolean=true ;;
+            NO) ats_boolean=false ;;
+            *) echo "DROVER_ALLOW_ARBITRARY_LOADS must be YES or NO" >&2; exit 1 ;;
+          esac
+          /bin/cp "$SRCROOT/Drover/Info.plist" "$DERIVED_FILE_DIR/Drover-Info.plist"
+          /usr/bin/plutil -replace NSAppTransportSecurity.NSAllowsArbitraryLoads \
+            -bool "$ats_boolean" "$DERIVED_FILE_DIR/Drover-Info.plist"
+        inputFiles:
+          - "$(SRCROOT)/Drover/Info.plist"
+        outputFiles:
+          - "$(DERIVED_FILE_DIR)/Drover-Info.plist"
+        basedOnDependencyAnalysis: false
     # Requires a paid team: neither the push nor the time-sensitive
     # entitlement is grantable to a personal one, which is why this app spent
     # its first months on local notifications alone (iOS silently downgraded

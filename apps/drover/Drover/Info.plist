@@ -31,7 +31,7 @@
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
-		<string>$(DROVER_ALLOW_ARBITRARY_LOADS)</string>
+		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Drover uses the camera to scan the pairing QR code shown by drover-server. The camera is not used for anything else.</string>
