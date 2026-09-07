@@ -661,3 +661,56 @@ def test_prepare_requires_candidate_credential_boundary(runtime, monkeypatch):
     with pytest.raises(stage.StageError):
         prepare(runtime)
     assert not (runtime[0] / "active-release.json").exists()
+
+
+@pytest.mark.parametrize("escaping", [False, True])
+def test_prepare_accepts_only_contained_uv_cache_output(runtime, monkeypatch, escaping):
+    root, repository, _ = runtime
+    original = stage.subprocess.run
+
+    def sync_with_cache(argv, **kwargs):
+        result = original(argv, **kwargs)
+        if argv[:2] == ["uv", "sync"]:
+            cache = Path(kwargs["env"]["UV_CACHE_DIR"])
+            archive = cache / "archive-v0" / "archive-fixture"
+            archive.mkdir(parents=True)
+            (archive / "package.py").write_text("# disposable wheel content\n")
+            wheel = cache / "wheels-v5" / "pypi" / "fixture"
+            wheel.mkdir(parents=True)
+            destination = repository if escaping else archive
+            (wheel / "fixture-1.0-py3-none-any").symlink_to(
+                destination, target_is_directory=True
+            )
+        return result
+
+    monkeypatch.setattr(stage.subprocess, "run", sync_with_cache)
+    if escaping:
+        with pytest.raises(stage.StageError):
+            prepare(runtime)
+        assert not (root / "active-release.json").exists()
+    else:
+        prepare(runtime)
+        assert (
+            json.loads((root / "active-release.json").read_text())["source_sha"] == SHA
+        )
+        assert (root / "launchd/com.drover.testflight-server.plist").is_file()
+        # Subsequent lifecycle validation accepts the same cache output.
+        stage.release(root, SHA)
+
+
+@pytest.mark.parametrize("destination", ["home", "state", "logs", "workspace"])
+def test_cache_links_cannot_target_other_staging_trees(runtime, destination):
+    root = prepare(runtime)
+    (root / "cache/redirect").symlink_to(root / destination, target_is_directory=True)
+    with pytest.raises(stage.StageError):
+        stage.release(root, SHA)
+
+
+def test_internal_cache_link_cannot_hide_descendant_escape(runtime):
+    root = prepare(runtime)
+    archive = root / "cache/uv/archive-v0/fixture"
+    archive.mkdir(parents=True)
+    (archive / "escape").symlink_to(runtime[1], target_is_directory=True)
+    (root / "cache/alias").symlink_to(archive, target_is_directory=True)
+    with pytest.raises(stage.StageError):
+        stage.release(root, SHA)

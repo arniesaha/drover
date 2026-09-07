@@ -92,13 +92,23 @@ def private_dir(root: Path, relative: str) -> Path:
 
 def validate_runtime_paths(root: Path) -> None:
     # Provider libraries discover descendants implicitly, not just config keys.
-    # Refuse links throughout runtime state, including individual log files.
+    # Only cache links may resolve within their own tree (uv wheel archives).
+    # Walk physical entries too so linked archives cannot hide escaping links.
     for relative in ("home", "state", "workspace", "logs", "tmp", "cache"):
         base = confined(root, relative)
         if base.exists():
             for directory, directories, files in os.walk(base, followlinks=False):
                 for name in [*directories, *files]:
-                    confined(root, str((Path(directory) / name).relative_to(root)))
+                    path = Path(directory) / name
+                    if relative == "cache" and path.is_symlink():
+                        try:
+                            target = path.resolve(strict=True)
+                        except (OSError, RuntimeError) as exc:
+                            raise StageError("invalid staging cache link") from exc
+                        if not target.is_relative_to(base):
+                            raise StageError("cache link leaves staging cache")
+                    else:
+                        confined(root, str(path.relative_to(root)))
 
 
 def atomic_write(root: Path, relative: str, data: bytes) -> None:
