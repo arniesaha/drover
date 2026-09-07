@@ -941,15 +941,27 @@ public final class ChatModel {
     /// The hub echoing a `user_input` with this client's turn ID is the sole
     /// confirmation that removes the local pending row. Text matches are not
     /// enough: another device may have sent identical words.
+    /// The hub parses `client_turn_id` as a UUID and echoes its canonical
+    /// lowercase form, while `UUID().uuidString` — and every ID restored from
+    /// a recovery record — is uppercase. Comparing the raw strings therefore
+    /// never matched a real echo: the pending row outlived the very message
+    /// that proves it was delivered, so the transcript showed the words twice
+    /// and the delivery decayed to "still confirming" and then to manual
+    /// review. Case is not part of a UUID's identity; compare accordingly.
+    private static func isSameTurn(_ echoed: String?, _ client: String) -> Bool {
+        guard let echoed else { return false }
+        return echoed.compare(client, options: .caseInsensitive) == .orderedSame
+    }
+
     private func confirmPendingTurn(_ message: HarnessMessage) {
         guard message.type == .userInput else { return }
         if isCommittingPendingDeliveryAction,
            let actionClientTurnID = pendingDeliveryActionClientTurnID,
-           message.turnID == actionClientTurnID {
+           Self.isSameTurn(message.turnID, actionClientTurnID) {
             acknowledgedPendingDeliveryActionClientTurnID = actionClientTurnID
         }
         guard let pendingTurn,
-              message.turnID == pendingTurn.clientTurnID
+              Self.isSameTurn(message.turnID, pendingTurn.clientTurnID)
         else { return }
         self.pendingTurn = nil
         cancelDeliveryConfirmationTimeout()
