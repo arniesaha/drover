@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ios"))
 from verify_archive import normalize_staging_url  # noqa: E402
 
 HOST_ID = "testflight-staging-mac-mini"
-STRUCTURED_HARNESSES = {"claude-code", "codex", "agy", "deepseek"}
+STRUCTURED_HARNESSES = {"claude-code", "codex", "agy", "deepseek-harness"}
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 

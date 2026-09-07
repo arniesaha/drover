@@ -149,6 +149,32 @@ def test_success_fetches_only_four_gets_and_retains_only_safe_fields(
 
 
 @pytest.mark.parametrize(
+    "runtime,accepted",
+    [
+        ("claude-code", True),
+        ("codex", True),
+        ("agy", True),
+        ("deepseek-harness", True),
+        ("deepseek", False),
+    ],
+)
+def test_only_canonical_structured_runtimes_pass(
+    gate, stage, tmp_path, runtime, accepted
+):
+    for route in ("/harness/hosts", "/harness"):
+        stage[1][route]["hosts"][0]["capabilities"]["harnesses"] = [
+            {"name": runtime, "enabled": True}
+        ]
+    result, record = invoke(gate, stage, tmp_path)
+    if accepted:
+        assert result == 0
+        assert record["host_id"] == HOST
+    else:
+        assert result == 1
+        assert record == {"category": "stage_harness_unavailable"}
+
+
+@pytest.mark.parametrize(
     "problem,category",
     [
         ("redirect", "stage_request_failed"),
