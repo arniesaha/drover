@@ -4378,27 +4378,47 @@ def test_creates_without_a_client_key_are_still_independent(tmp_path):
 
 
 def _raise_missing_staging_key() -> list[str]:
-    raise ValueError("invalid staging credential path")
+    # What `read_api_key`'s os.open actually raises for an absent key file.
+    raise FileNotFoundError(2, "No such file or directory")
 
 
-def test_create_session_answers_400_when_the_staging_key_is_unreadable(
-    monkeypatch, tmp_path
+def _raise_unreadable_staging_key() -> list[str]:
+    raise PermissionError(13, "Permission denied")
+
+
+def _raise_wrong_mode_staging_key() -> list[str]:
+    raise ValueError("staging API key must be a private regular file")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _raise_missing_staging_key,
+        _raise_unreadable_staging_key,
+        _raise_wrong_mode_staging_key,
+    ],
+)
+def test_create_session_answers_400_when_the_staging_key_is_unusable(
+    monkeypatch, tmp_path, failure
 ):
     """Fail closed with a reason, not a dropped connection.
 
-    `claude_command` reads the staging API key and raises ValueError when the
-    file is missing or not exactly 0600. Letting that escape the handler kills
-    the connection mid-response, so the hub reports 502 and the operator has
-    only a traceback in the daemon log to work from.
+    `claude_command` reads the staging API key before spawning. It reaches the
+    file through os.open, so a missing key is FileNotFoundError and an
+    unreadable one PermissionError -- only the wrong-mode case is ValueError.
+    A key that is simply not in place yet is the likeliest of the three, and
+    letting any of them escape the handler kills the connection mid-response:
+    the hub reports a bare 502 and the operator gets a traceback in the
+    daemon log instead of an answer.
     """
     monkeypatch.setitem(
         harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
         "claude-code",
-        _raise_missing_staging_key,
+        failure,
     )
     server, state, base_url = _start_test_server(tmp_path)
     try:
-        with pytest.raises(urllib.error.HTTPError) as failure:
+        with pytest.raises(urllib.error.HTTPError) as refusal:
             _json_request(
                 f"{base_url}/sessions",
                 payload={
@@ -4407,8 +4427,8 @@ def test_create_session_answers_400_when_the_staging_key_is_unreadable(
                     "cwd": str(tmp_path),
                 },
             )
-        assert failure.value.code == 400
-        assert "staging" in json.loads(failure.value.read())["error"]
+        assert refusal.value.code == 400
+        assert "unavailable" in json.loads(refusal.value.read())["error"]
         assert state.structured.session_ids() == []
     finally:
         _close_structured_sessions(state)
@@ -4417,23 +4437,28 @@ def test_create_session_answers_400_when_the_staging_key_is_unreadable(
         server.server_close()
 
 
-def test_recover_answers_409_when_the_staging_key_is_unreadable(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "failure", [_raise_missing_staging_key, _raise_wrong_mode_staging_key]
+)
+def test_recover_answers_409_when_the_staging_key_is_unusable(
+    monkeypatch, tmp_path, failure
+):
     monkeypatch.setitem(
         harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
         "claude-code",
-        _raise_missing_staging_key,
+        failure,
     )
     server, state, base_url = _start_test_server(tmp_path)
     session_id = _seed_restart_lost_structured_session(
         state, tmp_path, harness="claude-code"
     )
     try:
-        with pytest.raises(urllib.error.HTTPError) as failure:
+        with pytest.raises(urllib.error.HTTPError) as refusal:
             _json_request(
                 f"{base_url}/sessions/{session_id}/recover",
                 payload={"native_session_id": "provider-session-1"},
             )
-        assert failure.value.code == 409
+        assert refusal.value.code == 409
     finally:
         _close_structured_sessions(state)
         state.pty.close_all()

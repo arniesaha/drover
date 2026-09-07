@@ -2320,12 +2320,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if command is None and default_command_fn:
             try:
                 command = default_command_fn()
-            except ValueError as exc:
+            except (ValueError, OSError) as exc:
                 # A staging host builds its command from an explicit key file
                 # and refuses to launch without it. That has to reach the
                 # caller as a reason: letting it escape kills the connection
                 # mid-response, so the hub reports a bare 502 and the only
                 # explanation is a traceback in the daemon's log.
+                #
+                # Both families, because `read_api_key` reaches the file
+                # through os.open: a key that is not in place yet raises
+                # FileNotFoundError and one the user cannot read raises
+                # PermissionError. Only the wrong-mode check is a ValueError,
+                # and "not there yet" is the likeliest of the three.
                 self._write_json(
                     {"error": f"harness command unavailable: {exc}"},
                     status=HTTPStatus.BAD_REQUEST,
@@ -2627,7 +2633,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 default_command = default_command_fn()
-            except ValueError:
+            except (ValueError, OSError):
                 # Same explicit-credential refusal as the create path. There
                 # is nothing to recover onto until the operator fixes the key.
                 self._write_json(

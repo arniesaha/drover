@@ -669,8 +669,16 @@ def test_probe_requires_exact_confirmed_termination(runtime, monkeypatch, termin
     assert attestation.read_text() == "previous"
 
 
-def _probing_http(termination, *, answers=True):
+def _probing_http(termination, *, answers=True, harness_drops=False, terminate=None):
+    """`harness_drops` wedges the staging daemon *after* the probe's own
+    opening health check, which is when a session already exists to clean up."""
+    health_checks = []
+
     def response(url, **kwargs):
+        if url == "http://127.0.0.1:17081/healthz":
+            health_checks.append(url)
+            if harness_drops and len(health_checks) > 1:
+                raise stage.StageError("loopback API request failed")
         if url.endswith("/sessions"):
             return {
                 "session_id": "probe-test",
@@ -694,6 +702,8 @@ def _probing_http(termination, *, answers=True):
                 ]
             }
         if url.endswith("/terminate"):
+            if terminate is not None:
+                return terminate()
             return termination
         return healthy_http(url, **kwargs)
 
@@ -722,6 +732,73 @@ def test_probe_accepts_a_session_the_hub_has_already_forgotten(runtime, monkeypa
     attested = json.loads((root / "staging-probe.json").read_text())
     assert attested["source_sha"] == SHA
     assert attested["host_id"] == "testflight-staging-mac-mini"
+
+
+def test_probe_refuses_a_stale_answer_from_an_unreachable_host(runtime, monkeypatch):
+    """The hub answers `stale` for 404 *and* for a host it could not reach.
+
+    Only the first means the session is gone. If the staging daemon is not
+    answering, the probe's agent may still be running there holding the
+    staging API key, so this is not cleanup and must not attest.
+    """
+    root = ready_root(runtime, monkeypatch)
+    attestation = root / "staging-probe.json"
+    attestation.write_text("previous")
+    monkeypatch.setattr(
+        stage,
+        "http",
+        _probing_http(
+            {"session_id": "probe-test", "status": "terminated", "stale": True},
+            harness_drops=True,
+        ),
+    )
+
+    with pytest.raises(stage.StageError):
+        stage.probe(root, SHA, attempts=1)
+
+    assert attestation.read_text() == "previous"
+
+
+def test_probe_failure_survives_a_cleanup_that_cannot_be_delivered(
+    runtime, monkeypatch
+):
+    """The terminate call runs in `finally` and can fail the same way.
+
+    A wedged daemon breaks the probe and the cleanup together, so the raise
+    from the cleanup path is exactly the one likeliest to replace the real
+    reason the probe stopped.
+    """
+    root = ready_root(runtime, monkeypatch)
+
+    def unreachable():
+        raise stage.StageError("loopback API request failed")
+
+    monkeypatch.setattr(
+        stage, "http", _probing_http(None, answers=False, terminate=unreachable)
+    )
+
+    with pytest.raises(stage.StageError) as failure:
+        stage.probe(root, SHA, attempts=1)
+
+    assert "expected assistant response" in str(failure.value)
+    assert not (root / "staging-probe.json").exists()
+
+
+def test_probe_reports_a_cleanup_it_could_not_deliver_after_a_good_run(
+    runtime, monkeypatch
+):
+    """A successful probe still may not attest if cleanup went unconfirmed."""
+    root = ready_root(runtime, monkeypatch)
+
+    def unreachable():
+        raise stage.StageError("loopback API request failed")
+
+    monkeypatch.setattr(stage, "http", _probing_http(None, terminate=unreachable))
+
+    with pytest.raises(stage.StageError):
+        stage.probe(root, SHA, attempts=1)
+
+    assert not (root / "staging-probe.json").exists()
 
 
 def test_probe_failure_survives_an_unconfirmed_cleanup(runtime, monkeypatch):

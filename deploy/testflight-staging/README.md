@@ -141,8 +141,11 @@ preparation; the tool does not fetch or decide which candidate to trust.
    failure. It polls at most 60 times; each HTTP request has a five-second
    timeout and a one-MiB response bound. Cleanup must confirm the exact session
    is gone -- either the full `terminated: true` / `status: terminated`
-   acknowledgement from the expected host, or the `stale` answer a hub gives
-   for a session it has already forgotten -- before
+   acknowledgement from the expected host, or the `stale` answer for a session
+   the hub has forgotten *while the staging daemon is still answering its own
+   health check*. The hub returns that same `stale` shape when it cannot reach
+   the host at all, and an unreachable host may still be running the probe's
+   agent -- before
    publishing `<STAGING_ROOT>/staging-probe.json` atomically with mode `0600`.
    The attestation contains only `source_sha`, `host_id`, a timezone-bearing
    `completed_at`, and `session_id_sha256`. It has no endpoint, credential,

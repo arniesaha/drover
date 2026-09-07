@@ -517,26 +517,40 @@ def rollback(root: Path, sha: str) -> None:
     activate(root, sha)
 
 
-def terminated(termination: object, session_id: str) -> bool:
-    """Did the hub confirm this probe session is gone?
-
-    A hub that has already forgotten the session -- the daemon restarted, or
-    the host is unreachable -- answers a deliberately different shape:
-    session_id and status only, with `stale`, no host_id and no `terminated`
-    (MetricsCollector._proxy_terminate_harness_session). Nothing is left
-    running there either way, so that is cleanup succeeding.
-    """
-    if not isinstance(termination, dict):
-        return False
-    if termination.get("session_id") != session_id:
-        return False
-    if termination.get("status") != "terminated":
-        return False
-    if termination.get("stale") is True:
-        return True
+def acknowledged(termination: object, session_id: str) -> bool:
+    """The expected host confirmed it stopped this exact session."""
     return (
-        termination.get("host_id") == HOST_ID and termination.get("terminated") is True
+        isinstance(termination, dict)
+        and termination.get("session_id") == session_id
+        and termination.get("host_id") == HOST_ID
+        and termination.get("terminated") is True
+        and termination.get("status") == "terminated"
     )
+
+
+def forgotten(termination: object, session_id: str) -> bool:
+    """The hub says it has no such session to stop.
+
+    Not on its own proof that nothing is running: the hub emits this same
+    shape for a 404 from the daemon *and* for a host it could not reach at
+    all (MetricsCollector._proxy_terminate_harness_session takes both). The
+    caller has to establish which one this is.
+    """
+    return (
+        isinstance(termination, dict)
+        and termination.get("session_id") == session_id
+        and termination.get("status") == "terminated"
+        and termination.get("stale") is True
+    )
+
+
+def harness_answering(token: str) -> bool:
+    """Is the staging daemon itself reachable and healthy right now?"""
+    try:
+        http(HARNESS + "/healthz", token=token)
+        return True
+    except StageError:
+        return False
 
 
 def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
@@ -547,6 +561,7 @@ def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
     check_host(token)
     session_id = None
     success = False
+    probe_failed = False
     try:
         session = http(
             SERVER + f"/harness/hosts/{HOST_ID}/sessions",
@@ -591,23 +606,40 @@ def probe(root: Path, sha: str, *, harness="claude-code", attempts=60) -> None:
             raise StageError(
                 "probe did not observe the exact expected assistant response"
             )
+    except BaseException:
+        # Recorded rather than read back out of sys.exc_info() in the cleanup
+        # below: that reports whatever the whole thread is handling, so a
+        # caller invoking probe() from inside an except block would silently
+        # disable the cleanup check on an otherwise successful probe.
+        probe_failed = True
+        raise
     finally:
         if session_id:
-            # Bound provider use on both successful and failed probes. A cleanup
-            # failure must also prevent issuing a successful attestation --
-            # but only when the probe itself has not already failed, because
-            # raising here would replace that error with this one and hide
-            # why the probe actually stopped.
-            termination = http(
-                SERVER
-                + "/harness/sessions/"
-                + quote(session_id, safe="")
-                + "/terminate",
-                method="POST",
-                token=token,
-                payload={},
+            # Bound provider use on both successful and failed probes. A
+            # cleanup failure must also prevent issuing a successful
+            # attestation -- but it must never replace the reason the probe
+            # itself failed, and a wedged daemon breaks both at once, so the
+            # transport error here is swallowed rather than raised.
+            try:
+                termination = http(
+                    SERVER
+                    + "/harness/sessions/"
+                    + quote(session_id, safe="")
+                    + "/terminate",
+                    method="POST",
+                    token=token,
+                    payload={},
+                )
+            except StageError:
+                termination = None
+            confirmed = acknowledged(termination, session_id) or (
+                # "No such session" is cleanup only once the daemon is known
+                # to be answering. If it is not, the probe's agent may still
+                # be running there, holding the staging API key.
+                forgotten(termination, session_id)
+                and harness_answering(token)
             )
-            if not terminated(termination, session_id) and sys.exc_info()[0] is None:
+            if not confirmed and not probe_failed:
                 raise StageError("probe termination was not confirmed")
     write_json(
         root,
