@@ -1,0 +1,6 @@
+tunnel: <tunnel-uuid>
+credentials-file: <owner-only-credentials-json>
+ingress:
+  - hostname: <staging-public-hostname>
+    service: http://127.0.0.1:17080
+  - service: http_status:404

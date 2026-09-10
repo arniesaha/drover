@@ -1548,6 +1548,26 @@ def credentials_list_cmd(ctx: click.Context) -> None:
         )
 
 
+@credentials_cmd.command(name="issue-preflight")
+@click.option(
+    "--label", required=True, help="Local label for this preflight credential"
+)
+@click.pass_context
+def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
+    """Issue one locally-scoped credential for TestFlight preflight checks.
+
+    Minted by the running hub, like pair codes and revocations, because the
+    credential store is loaded once per process: a token written to the file
+    from here would never be honoured by the server the staging gate calls,
+    and that server's next write would delete it again.
+    """
+    cfg = _resolve_config(ctx.obj["config_path"])
+    minted = _local_api_request(
+        cfg, "POST", "/auth/credentials", {"scope": "preflight", "label": label}
+    )
+    click.echo(minted["token"])
+
+
 @credentials_cmd.command(name="revoke")
 @click.argument("credential_id")
 @click.pass_context

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from drover.server.harness.structured.driver import ProcessDriver, StructuredMessage
+from drover.server.staging_credentials import claude_command, is_staging
 
 
 def resolve_binary(binary: str | None = None) -> str | None:
@@ -33,22 +34,24 @@ def resolve_binary(binary: str | None = None) -> str | None:
 
 def default_command(binary: str | None = None) -> list[str]:
     resolved_binary = resolve_binary(binary)
-    return [
-        resolved_binary or "claude",
-        "-p",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        # M5: structured sessions run headless — without an answered
-        # control_request channel, any gated tool call fails outright
-        # ("requested permissions ... but you haven't granted it"), so the
-        # only workable posture until approval surfacing (Part B) lands is
-        # full bypass, matching codex danger-full-access / agy skip-permissions.
-        "--permission-mode",
-        "bypassPermissions",
-    ]
+    return claude_command(
+        [
+            resolved_binary or "claude",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            # M5: structured sessions run headless — without an answered
+            # control_request channel, any gated tool call fails outright
+            # ("requested permissions ... but you haven't granted it"), so the
+            # only workable posture until approval surfacing (Part B) lands is
+            # full bypass, matching codex danger-full-access / agy skip-permissions.
+            "--permission-mode",
+            "bypassPermissions",
+        ]
+    )
 
 
 def resume_command(command: list[str], native_session_id: str | None) -> list[str]:
@@ -67,9 +70,14 @@ def child_env() -> dict[str, str]:
     ``--setting-sources ""`` is passed. Strip anything starting with
     ``CLAUDE`` so a spawned driver process sees a clean environment.
     """
-    return {
+    env = {
         key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")
     }
+    if is_staging():
+        env = {
+            key: value for key, value in env.items() if not key.startswith("ANTHROPIC")
+        }
+    return env
 
 
 def _versioned_claude_binary(home: Path | None = None) -> str | None:

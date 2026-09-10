@@ -595,6 +595,25 @@ def _command_with_args(command: Sequence[str], *args: str) -> list[str]:
 
 
 def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthAdapter]:
+    from drover.server.staging_credentials import is_staging, read_api_key
+
+    if is_staging():
+        try:
+            read_api_key()
+            state = "authenticated"
+        except (OSError, ValueError):
+            state = "unauthenticated"
+        return {
+            "claude-code": StaticAuthAdapter(
+                "claude-code",
+                HarnessAuthStatus(
+                    "claude-code",
+                    state,
+                    detail="Dedicated staging API key; local provisioning only",
+                ),
+                sign_in="unsupported",
+            )
+        }
     adapters: dict[str, HarnessAuthAdapter] = {}
     claude = _resolve_login_command("claude", shell=shell)
     if claude is not None:

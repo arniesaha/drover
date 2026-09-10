@@ -212,7 +212,14 @@ class AgyUsageProbe:
         Deliberately does NOT read ``~/.gemini/oauth_creds.json``: agy never
         refreshes it, so it is stale on a perfectly healthy host.
         """
-        for load in (self._keychain_blob, self._file_blob):
+        from drover.server.staging_credentials import is_staging
+
+        sources = (
+            (self._file_blob,)
+            if is_staging()
+            else (self._keychain_blob, self._file_blob)
+        )
+        for load in sources:
             try:
                 raw = load()
             except _ProbeFailure:

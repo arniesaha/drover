@@ -1,0 +1,276 @@
+name: Internal TestFlight candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Approved CFBundleShortVersionString
+        required: true
+        type: string
+      build:
+        description: Approved CFBundleVersion
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight-internal
+  cancel-in-progress: false
+
+jobs:
+  preflight-staging:
+    if: github.ref == 'refs/heads/main'
+    environment: ios-testflight-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Verify staging identity and recent probe
+      env:
+        DROVER_TESTFLIGHT_STAGING_URL: ${{ vars.DROVER_TESTFLIGHT_STAGING_URL }}
+        DROVER_TESTFLIGHT_PREFLIGHT_TOKEN: ${{ secrets.DROVER_TESTFLIGHT_PREFLIGHT_TOKEN }}
+      run: |
+        python3 scripts/testflight/verify_staging.py \
+          --expected-sha "$GITHUB_SHA" \
+          --record "$RUNNER_TEMP/preflight-record.json"
+    - name: Upload sanitized preflight metadata
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: testflight-preflight-metadata
+        path: ${{ runner.temp }}/preflight-record.json
+        if-no-files-found: error
+        retention-days: 7
+
+  archive-upload:
+    if: github.ref == 'refs/heads/main'
+    needs: preflight-staging
+    environment: ios-testflight-upload
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      CANDIDATE_VERSION: ${{ inputs.version }}
+      CANDIDATE_BUILD: ${{ inputs.build }}
+      DROVER_TESTFLIGHT_STAGING_URL: ${{ vars.DROVER_TESTFLIGHT_STAGING_URL }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Report selected Xcode and iPhoneOS SDK
+      run: |
+        test -d "$DEVELOPER_DIR"
+        printf 'DEVELOPER_DIR %s\n' "$DEVELOPER_DIR"
+        xcodebuild -version
+        xcrun --sdk iphoneos --show-sdk-version
+    - uses: actions/download-artifact@v4
+      with:
+        name: testflight-preflight-metadata
+        path: ${{ runner.temp }}/preflight-metadata
+    - name: Bind candidate to preflight origin
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path("scripts/ios").resolve()))
+        from verify_archive import normalize_staging_url
+        try:
+            record = json.loads((Path(os.environ["RUNNER_TEMP"]) / "preflight-metadata/preflight-record.json").read_text())
+            origin = normalize_staging_url(os.environ["DROVER_TESTFLIGHT_STAGING_URL"])
+            if record["source_sha"] != os.environ["GITHUB_SHA"] or record["staging_url_sha256"] != hashlib.sha256(origin.encode()).hexdigest():
+                raise ValueError()
+        except Exception:
+            raise SystemExit("candidate staging binding failed")
+        PY
+    - name: Install XcodeGen
+      run: brew install xcodegen
+    - name: Generate Xcode project
+      working-directory: apps/drover
+      run: xcodegen generate
+    - name: Run DroverKit package tests
+      working-directory: apps/drover
+      run: swift test --package-path DroverKit --jobs 2
+    - name: Select iPhone simulator
+      working-directory: apps/drover
+      run: |
+        simulator_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
+        if [ -z "$simulator_id" ]; then
+          echo "No available iPhone simulator found." >&2
+          xcrun simctl list devices available >&2
+          exit 1
+        fi
+        echo "SIMULATOR_DESTINATION=id=$simulator_id" >> "$GITHUB_ENV"
+        echo "Selected simulator id=$simulator_id"
+    - name: Resolve Swift packages
+      working-directory: apps/drover
+      run: |
+        xcodebuild -project Drover.xcodeproj \
+          -scheme Drover \
+          -resolvePackageDependencies
+    - name: Run app unit tests
+      working-directory: apps/drover
+      run: |
+        set -o pipefail
+        xcodebuild -project Drover.xcodeproj \
+          -scheme Drover \
+          -destination "$SIMULATOR_DESTINATION" \
+          -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
+          test
+    - name: Run deterministic UI journey
+      working-directory: apps/drover
+      run: |
+        set -o pipefail
+        xcodebuild -project Drover.xcodeproj \
+          -scheme DroverUITests \
+          -destination "$SIMULATOR_DESTINATION" \
+          -only-testing:DroverUITests/DeterministicJourneyUITests \
+          -only-testing:DroverUITests/InsightDetailFixtureUITests \
+          -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
+          test
+    - name: Snapshot runner keychain search list
+      run: |
+        python3 - <<'PY'
+        import json, os, shlex, subprocess
+        from pathlib import Path
+        try:
+            root = Path(os.environ["RUNNER_TEMP"]) / "drover-keychain-state"
+            root.mkdir(mode=0o700)
+            result = subprocess.run(["security", "list-keychains", "-d", "user"], capture_output=True, text=True, check=True)
+            original = shlex.split(result.stdout)
+            path = root / "keychain-search-list.json"
+            with path.open("x") as output:
+                json.dump(original, output)
+            path.chmod(0o600)
+        except Exception:
+            raise SystemExit("keychain snapshot failed; private diagnostics discarded")
+        PY
+    - name: Set up deterministic distribution signing
+      id: signing
+      env:
+        DROVER_DISTRIBUTION_P12_BASE64: ${{ secrets.DROVER_DISTRIBUTION_P12_BASE64 }}
+        DROVER_DISTRIBUTION_P12_PASSWORD: ${{ secrets.DROVER_DISTRIBUTION_P12_PASSWORD }}
+        DROVER_DISTRIBUTION_PROFILE_BASE64: ${{ secrets.DROVER_DISTRIBUTION_PROFILE_BASE64 }}
+        DROVER_DISTRIBUTION_TEAM_ID: ${{ secrets.DROVER_DISTRIBUTION_TEAM_ID }}
+        DROVER_DISTRIBUTION_PROFILE_UUID: ${{ secrets.DROVER_DISTRIBUTION_PROFILE_UUID }}
+        DROVER_DISTRIBUTION_IDENTITY_SHA1: ${{ secrets.DROVER_DISTRIBUTION_IDENTITY_SHA1 }}
+        DROVER_DISTRIBUTION_IDENTITY_NAME: ${{ secrets.DROVER_DISTRIBUTION_IDENTITY_NAME }}
+      run: |
+        scripts/ios/setup_distribution_signing.sh \
+          --workspace "$RUNNER_TEMP/drover-distribution-signing" \
+          --github-output "$GITHUB_OUTPUT"
+    - name: Make temporary signing identity discoverable for export
+      run: |
+        python3 - <<'PY'
+        import json, os, subprocess
+        from pathlib import Path
+        try:
+            root = Path(os.environ["RUNNER_TEMP"])
+            original = json.loads((root / "drover-keychain-state/keychain-search-list.json").read_text())
+            keychain = root / "drover-distribution-signing/distribution.keychain-db"
+            if not keychain.is_file() or keychain.is_symlink():
+                raise ValueError()
+            subprocess.run(["security", "list-keychains", "-d", "user", "-s", *original, str(keychain)], capture_output=True, check=True)
+        except Exception:
+            raise SystemExit("keychain discovery failed; private diagnostics discarded")
+        PY
+    - name: Archive and verify internal candidate
+      run: |
+        scripts/ios/archive.sh \
+          --version "$CANDIDATE_VERSION" --build "$CANDIDATE_BUILD" \
+          --output "$RUNNER_TEMP/drover-ios-candidate" \
+          --signing-config "$RUNNER_TEMP/drover-distribution-signing/signing.xcconfig" \
+          --channel testflight-internal \
+          --staging-url "$DROVER_TESTFLIGHT_STAGING_URL"
+    - name: Export and verify internal IPA
+      run: |
+        scripts/ios/export_ipa.sh \
+          --archive "$RUNNER_TEMP/drover-ios-candidate/Drover.xcarchive" \
+          --output "$RUNNER_TEMP/drover-ios-export" \
+          --export-options "$RUNNER_TEMP/drover-distribution-signing/ExportOptions.plist" \
+          --version "$CANDIDATE_VERSION" --build "$CANDIDATE_BUILD" \
+          --staging-url "$DROVER_TESTFLIGHT_STAGING_URL"
+    - name: Materialize Apple key and confirm upload
+      env:
+        DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
+        DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+        DROVER_APPSTORE_API_PRIVATE_KEY_BASE64: ${{ secrets.DROVER_APPSTORE_API_PRIVATE_KEY_BASE64 }}
+      run: |
+        python3 - <<'PY'
+        import base64, os, re, subprocess
+        from pathlib import Path
+        try:
+            root = Path(os.environ["RUNNER_TEMP"])
+            key_id = os.environ["DROVER_APPSTORE_API_KEY_ID"]
+            if not re.fullmatch(r"[A-Z0-9]{8,20}", key_id):
+                raise ValueError()
+            directory = root / "private_keys"
+            directory.mkdir(mode=0o700)
+            material = base64.b64decode(os.environ["DROVER_APPSTORE_API_PRIVATE_KEY_BASE64"], validate=True)
+            path = directory / f"AuthKey_{key_id}.p8"
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(material)
+            environment = os.environ.copy()
+            environment.pop("DROVER_APPSTORE_API_PRIVATE_KEY_BASE64", None)
+            subprocess.run([
+                "scripts/ios/upload_testflight.sh", "--ipa", str(root / "drover-ios-export/Drover.ipa"),
+                "--api-key-id", key_id, "--api-issuer", os.environ["DROVER_APPSTORE_API_ISSUER_ID"],
+                "--private-keys-dir", str(directory), "--record", str(root / "upload-record.json"),
+            ], env=environment, check=True)
+        except Exception:
+            raise SystemExit("upload failed; private diagnostics discarded")
+        PY
+    - name: Remove temporary credentials
+      if: always()
+      run: |
+        python3 - <<'PY'
+        import json, os, shutil, subprocess
+        from pathlib import Path
+        root = Path(os.environ["RUNNER_TEMP"])
+        failed = False
+        snapshot = root / "drover-keychain-state/keychain-search-list.json"
+        try:
+            if snapshot.is_file():
+                original = json.loads(snapshot.read_text())
+                subprocess.run(["security", "list-keychains", "-d", "user", "-s", *original], capture_output=True, check=True)
+        except Exception:
+            failed = True
+        try:
+            state = root / "drover-distribution-signing/signing-state"
+            if state.is_file():
+                subprocess.run(["scripts/ios/cleanup_distribution_signing.sh", "--state", str(state)], capture_output=True, check=True)
+        except Exception:
+            failed = True
+        for name in ("private_keys", "drover-distribution-signing", "drover-keychain-state"):
+            try:
+                directory = root / name
+                if directory.exists():
+                    shutil.rmtree(directory)
+            except Exception:
+                failed = True
+        if failed:
+            raise SystemExit("credential cleanup failed; private diagnostics discarded")
+        PY
+    - name: Upload sanitized candidate metadata
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: testflight-candidate-metadata
+        path: |
+          ${{ runner.temp }}/drover-ios-candidate/archive-record.json
+          ${{ runner.temp }}/drover-ios-export/export-record.json
+          ${{ runner.temp }}/upload-record.json
+        if-no-files-found: ignore
+        retention-days: 7

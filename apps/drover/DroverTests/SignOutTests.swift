@@ -131,6 +131,34 @@ final class SignOutTests: XCTestCase {
         }
     }
 
+    func testStageOnlyLaunchLeavesAnOffStageConnectionPersistedButDoesNotBuildClient() throws {
+        let suiteName = "drover.stage-launch.\(UUID().uuidString)"
+        let service = "drover-stage-launch-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let tokenStore = TokenStore(service: service)
+        defer {
+            try? tokenStore.delete()
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let savedConfig = ServerConfig(urlString: "http://127.0.0.1:7080")!
+        savedConfig.save(defaults: defaults)
+        try tokenStore.save("existing-token")
+
+        let environment = AppEnvironment(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            endpointPolicy: TestFlightEndpointPolicy(
+                requiredOrigin: URL(string: "https://stage.example.test")
+            ),
+            launchEnvironment: [:]
+        )
+
+        XCTAssertNil(environment.client)
+        XCTAssertNil(environment.config)
+        XCTAssertEqual(ServerConfig.load(defaults: defaults), savedConfig)
+        XCTAssertEqual(tokenStore.load(), "existing-token")
+    }
+
     func testSignOutPurgesOnlyTheOldCredentialBinding() async throws {
         try await withEnvironment { environment, _, _, recovery, root in
             let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)

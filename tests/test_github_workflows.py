@@ -9,6 +9,207 @@ import yaml
 WORKFLOWS_DIR = Path(__file__).parents[1] / ".github" / "workflows"
 
 
+def test_internal_testflight_is_manual_main_and_credential_isolated() -> None:
+    path = WORKFLOWS_DIR / "ios-testflight-internal.yml"
+    assert path.exists(), "internal TestFlight workflow is missing"
+    workflow = load_workflow(path.name)
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert set(workflow["on"]["workflow_dispatch"]["inputs"]) == {"version", "build"}
+    assert workflow["permissions"] == {"contents": "read"}
+    jobs = workflow["jobs"]
+    assert set(jobs) == {"preflight-staging", "archive-upload"}
+    preflight, upload = jobs["preflight-staging"], jobs["archive-upload"]
+    assert preflight["environment"] == "ios-testflight-staging"
+    assert preflight["runs-on"] == "ubuntu-latest"
+    assert upload["environment"] == "ios-testflight-upload"
+    assert upload["runs-on"] == "macos-26"
+    assert upload["needs"] == "preflight-staging"
+    assert (
+        upload["env"]["DEVELOPER_DIR"]
+        == "/Applications/Xcode_26.6.app/Contents/Developer"
+    )
+    assert (
+        upload["env"]["DROVER_TESTFLIGHT_STAGING_URL"]
+        == "${{ vars.DROVER_TESTFLIGHT_STAGING_URL }}"
+    )
+    for job in jobs.values():
+        assert job["if"] == "github.ref == 'refs/heads/main'"
+        checkout = job["steps"][0]
+        assert checkout["uses"] == "actions/checkout@v4"
+        assert checkout["with"]["ref"] == "${{ github.sha }}"
+        setup = next(
+            s
+            for s in job["steps"]
+            if s.get("uses", "").startswith("actions/setup-python@")
+        )
+        assert setup["with"]["python-version"] == "3.13"
+        for step in job["steps"]:
+            assert "${{ secrets." not in step.get("run", "")
+            if step.get("uses") == "actions/upload-artifact@v4":
+                assert all(
+                    p.strip().endswith("-record.json")
+                    for p in step["with"]["path"].splitlines()
+                )
+    preflight_text = str(preflight)
+    assert "secrets.DROVER_TESTFLIGHT_PREFLIGHT_TOKEN" in preflight_text
+    assert "DROVER_DISTRIBUTION" not in preflight_text
+    assert "DROVER_APPSTORE" not in preflight_text
+    assert "PREFLIGHT_TOKEN" not in str(upload)
+    assert "--token" not in preflight_text
+    commands = "\n".join(s.get("run", "") for s in upload["steps"])
+    for script in (
+        "setup_distribution_signing.sh",
+        "archive.sh",
+        "export_ipa.sh",
+        "upload_testflight.sh",
+        "cleanup_distribution_signing.sh",
+    ):
+        assert script in commands
+    assert "--channel testflight-internal" in commands
+    cleanup = next(
+        s for s in upload["steps"] if s.get("name") == "Remove temporary credentials"
+    )
+    assert cleanup["if"] == "always()"
+    assert "private_keys" in cleanup["run"]
+    assert "keychain-search-list.json" in cleanup["run"]
+    assert '"list-keychains", "-d", "user", "-s"' in cleanup["run"]
+
+
+def test_internal_testflight_repeats_the_required_ios_slices() -> None:
+    assert (WORKFLOWS_DIR / "ios-testflight-internal.yml").exists()
+    steps = load_workflow("ios-testflight-internal.yml")["jobs"]["archive-upload"][
+        "steps"
+    ]
+    existing = load_workflow("ios.yml")["jobs"]["build-and-test"]["steps"]
+    for name in (
+        "Generate Xcode project",
+        "Run DroverKit package tests",
+        "Select iPhone simulator",
+        "Resolve Swift packages",
+        "Run app unit tests",
+        "Run deterministic UI journey",
+    ):
+        actual = next(s for s in steps if s.get("name") == name)
+        expected = next(s for s in existing if s.get("name") == name)
+        assert actual["run"] == expected["run"]
+        assert actual["working-directory"] == "apps/drover"
+        assert "if" not in actual
+
+
+def _run_internal_python_step(name, monkeypatch, tmp_path):
+    """Execute the real embedded workflow program; callers stub external tools."""
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    steps = load_workflow("ios-testflight-internal.yml")["jobs"]["archive-upload"][
+        "steps"
+    ]
+    program = next(s["run"] for s in steps if s.get("name") == name)
+    assert program.startswith("python3 - <<'PY'\n")
+    exec(compile(program.split("\n", 1)[1].rsplit("\nPY", 1)[0], name, "exec"), {})
+
+
+def test_internal_cleanup_restores_search_list_and_removes_credentials(
+    monkeypatch, tmp_path
+):
+    import json
+    import subprocess
+
+    original = [
+        "/private/runner/login.keychain-db",
+        "/Library/Keychains/System.keychain",
+    ]
+    snapshot = tmp_path / "drover-keychain-state"
+    snapshot.mkdir()
+    (snapshot / "keychain-search-list.json").write_text(json.dumps(original))
+    signing = tmp_path / "drover-distribution-signing"
+    signing.mkdir()
+    (signing / "signing-state").write_text("private state")
+    keys = tmp_path / "private_keys"
+    keys.mkdir()
+    (keys / "AuthKey_EXAMPLE123.p8").write_text("private key")
+    commands = []
+
+    def external(command, **kwargs):
+        commands.append(command)
+        assert kwargs["capture_output"] is True
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", external)
+    _run_internal_python_step("Remove temporary credentials", monkeypatch, tmp_path)
+    assert commands[0] == ["security", "list-keychains", "-d", "user", "-s", *original]
+    assert commands[1] == [
+        "scripts/ios/cleanup_distribution_signing.sh",
+        "--state",
+        str(signing / "signing-state"),
+    ]
+    assert not keys.exists() and not signing.exists() and not snapshot.exists()
+
+
+def test_internal_apple_key_is_private_and_cleanup_survives_tool_failure(
+    monkeypatch, tmp_path
+):
+    import base64
+    import stat
+    import subprocess
+
+    material = b"synthetic private Apple key"
+    monkeypatch.setenv("DROVER_APPSTORE_API_KEY_ID", "EXAMPLE123")
+    monkeypatch.setenv(
+        "DROVER_APPSTORE_API_ISSUER_ID", "00000000-0000-0000-0000-000000000000"
+    )
+    monkeypatch.setenv(
+        "DROVER_APPSTORE_API_PRIVATE_KEY_BASE64", base64.b64encode(material).decode()
+    )
+
+    def upload_failure(command, **kwargs):
+        key = tmp_path / "private_keys/AuthKey_EXAMPLE123.p8"
+        assert key.read_bytes() == material
+        assert stat.S_IMODE(key.stat().st_mode) == 0o600
+        assert stat.S_IMODE(key.parent.stat().st_mode) == 0o700
+        assert material.decode() not in str(command)
+        assert "DROVER_APPSTORE_API_PRIVATE_KEY_BASE64" not in kwargs["env"]
+        raise subprocess.CalledProcessError(1, command, stderr="private diagnostic")
+
+    monkeypatch.setattr(subprocess, "run", upload_failure)
+    with pytest.raises(
+        SystemExit, match="^upload failed; private diagnostics discarded$"
+    ):
+        _run_internal_python_step(
+            "Materialize Apple key and confirm upload", monkeypatch, tmp_path
+        )
+    _run_internal_python_step("Remove temporary credentials", monkeypatch, tmp_path)
+    assert not (tmp_path / "private_keys").exists()
+
+
+def test_internal_candidate_rejects_different_origin_from_preflight(
+    monkeypatch, tmp_path
+):
+    import hashlib
+    import json
+
+    directory = tmp_path / "preflight-metadata"
+    directory.mkdir()
+    (directory / "preflight-record.json").write_text(
+        json.dumps(
+            {
+                "source_sha": "a" * 40,
+                "staging_url_sha256": hashlib.sha256(
+                    b"https://approved.invalid"
+                ).hexdigest(),
+            }
+        )
+    )
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setenv("DROVER_TESTFLIGHT_STAGING_URL", "https://different.invalid")
+    with pytest.raises(SystemExit, match="^candidate staging binding failed$"):
+        _run_internal_python_step(
+            "Bind candidate to preflight origin", monkeypatch, tmp_path
+        )
+    monkeypatch.setenv("DROVER_TESTFLIGHT_STAGING_URL", "https://APPROVED.invalid:443/")
+    _run_internal_python_step(
+        "Bind candidate to preflight origin", monkeypatch, tmp_path
+    )
+
+
 def load_workflow(name: str) -> dict[str, Any]:
     """Load a workflow without YAML 1.1 coercing the ``on`` key."""
     path = WORKFLOWS_DIR / name

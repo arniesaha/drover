@@ -4,6 +4,13 @@ Start with the one-machine path in [Getting Started](getting-started.md). A
 multi-host fleet adds trusted machines over a private LAN or private Tailscale
 network; it does not change Drover's single-operator trust model.
 
+The internal TestFlight candidate uses a separate operator-run staging hub,
+isolated home and state, and fixed loopback ports `17080`/`17081`. Follow the
+[staging runtime procedure](../deploy/testflight-staging/README.md) for its
+prepare, activate, local probe, and rollback sequence. That lane's eventual
+public tunnel targets only the staging server on port `17080`; ordinary fleet
+hosts and the personal hub retain the private-network topology below.
+
 ## Topology
 
 ```text

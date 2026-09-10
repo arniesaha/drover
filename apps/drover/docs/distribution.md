@@ -177,7 +177,146 @@ also verifies App Store Connect access and agreements, app identity, and
 distribution provisioning. A working development installation is not evidence
 that these distribution prerequisites are available.
 
+## Internal TestFlight artifact chain
+
+Use Python 3.11 or later and the selected Xcode 26.6 toolchain. For the internal
+channel, archive with both `--channel testflight-internal` and
+`--staging-url "$DROVER_TESTFLIGHT_STAGING_URL"` in addition to the explicit
+version, build, output, and signing configuration above. The URL must be an
+HTTPS origin without credentials, a path, query, or fragment. An optional root
+slash, uppercase hostname, and explicit default port are normalized away.
+
+The archive command sets `DROVER_TESTFLIGHT_STAGE_ONLY=YES`,
+`DROVER_TESTFLIGHT_STAGING_URL`, and `DROVER_ALLOW_ARBITRARY_LOADS=NO`.
+The signed Info.plist must contain the exact normalized origin, the literal
+`YES` stage flag consumed by the app, and boolean
+`NSAppTransportSecurity.NSAllowsArbitraryLoads=false`. These checks apply again
+to the signed application unpacked from the exported IPA. They can be requested
+directly with `verify_archive.py --expected-staging-url`. The archive record adds
+`channel` and `staging_url_sha256`; it does not record the origin itself.
+
+```sh
+scripts/ios/export_ipa.sh \
+  --archive "$DROVER_IOS_OUTPUT/Drover.xcarchive" \
+  --output "$DROVER_IOS_EXPORT_OUTPUT" \
+  --export-options "$DROVER_IOS_SIGNING_TEMP/ExportOptions.plist" \
+  --version "$DROVER_APP_VERSION" --build "$DROVER_APP_BUILD" \
+  --staging-url "$DROVER_TESTFLIGHT_STAGING_URL"
+```
+
+The export output directory must be absolute and absent. The export-options
+path must live in an existing owner-only temporary signing directory. An
+existing plist must also be owner-only and reviewed. If the file is absent,
+the wrapper generates it from the verified archive's signing authority, signed
+team entitlement, and decoded embedded provisioning profile UUID. It checks
+the profile team and application identifier against the signed app. Keep the
+generated plist inside that signing directory until signing cleanup removes it.
+
+Export options require `method=app-store-connect`, `destination=export`,
+`signingStyle=manual`, `testFlightInternalTestingOnly=true`, and
+`manageAppVersionAndBuildNumber=false`. Xcode 26.6 documents these options in
+`xcodebuild -help`. Export cannot implicitly upload, enable external distribution,
+or change the candidate build number. Exactly one IPA and one Payload application
+must be present, and signed-artifact verification must succeed before the output
+directory is created. The retained files are `Drover.ipa` and
+`export-record.json`. That record contains only `version`, `build`,
+`bundle_identifier`, `ipa_sha256`, and `staging_url_sha256`. Raw Xcode diagnostics,
+export sidecars, and the unpacked app remain temporary and are discarded.
+
+After the release owner has authorized upload and supplied the temporary
+App Store Connect key directory:
+
+```sh
+scripts/ios/upload_testflight.sh \
+  --ipa "$DROVER_IOS_EXPORT_OUTPUT/Drover.ipa" \
+  --api-key-id "$DROVER_ASC_KEY_ID" --api-issuer "$DROVER_ASC_ISSUER" \
+  --private-keys-dir "$DROVER_ASC_PRIVATE_KEYS_DIR" \
+  --record "$DROVER_IOS_UPLOAD_RECORD"
+```
+
+The supplied directory and `AuthKey_<id>.p8` must belong to the current user,
+have no group/other permissions, and be actual directories/files rather than
+symlinks. The receipt path must be absolute and absent. The wrapper sets
+`API_PRIVATE_KEYS_DIR` and pins `altool`'s first `./private_keys` lookup to that
+same directory from a private temporary working directory. Key contents are
+never passed in command arguments. Raw JSON and stderr are captured in private
+temporary files and discarded on success or failure. Only a zero exit code and
+recognized positive upload confirmation without product errors produce a
+receipt. The receipt contains only `upload_confirmed` and `ipa_sha256`.
+
+The upload wrapper uses `xcrun altool --upload-app -f` with JSON output and
+returns after upload confirmation. It does not wait for Apple processing.
+Upload confirmation, Apple processing, tester availability, and physical-device
+acceptance are separate checks; this receipt asserts only the first. The caller
+owns removal of the supplied temporary key directory and signing workspace.
+Never publish IPA/archive files, staging origins, keys, issuer IDs, generated
+signing options, or raw tool output as workflow artifacts. Disable shell tracing
+when invoking commands with protected arguments.
+
 ## Protected manual CI archive
+
+### Internal TestFlight staging gate
+
+`ios-testflight-internal.yml` accepts only an approved version and build. Both
+jobs check `main` before entering their protected environment, check out the
+dispatch SHA, and use GitHub-hosted runners with Python 3.13. The release owner
+must configure required reviewers and main-only deployment branches on both
+`ios-testflight-staging` and `ios-testflight-upload` before enabling a dispatch.
+Keep these credentials environment-scoped, never repository-wide. This
+repository change does not configure environments or authorize a live upload.
+
+Set the repository variable `DROVER_TESTFLIGHT_STAGING_URL` to the reviewed
+staging HTTPS origin; avoid environment overrides so both jobs use the same
+origin. The staging environment receives only
+`DROVER_TESTFLIGHT_PREFLIGHT_TOKEN`. Its Ubuntu job makes exactly four possible
+GETs: `/release-identity`, `/readyz`, `/harness/hosts`, and `/harness`. It accepts
+only a root HTTPS origin, refuses every redirect, bypasses ambient proxies,
+uses a ten-second timeout per request, and checks the exact dispatch SHA,
+staging role, readiness, online `testflight-staging-mac-mini`, an enabled known
+structured runtime, and a matching successful probe no older than 30 minutes.
+It never creates a probe session. Refresh the operator-run probe before dispatch.
+The archive job downloads this run's sanitized record and checks its source SHA
+and origin digest before signing, so an environment override or changed variable
+cannot silently select a different staging endpoint.
+
+Run the client with URL/token environment variables to keep the token out of
+process arguments; explicit `--url` and `--token` remain available for callers
+that manage their own argument exposure:
+
+```sh
+python3 scripts/testflight/verify_staging.py --expected-sha "$CANDIDATE_SHA" \
+  --record "$PRIVATE_OUTPUT/preflight-record.json"
+```
+
+Failures emit only a fixed category. Successful records contain only source
+SHA, package version, role, normalized probe completion timestamp, fixed host
+ID, and SHA-256 of the normalized staging origin. Neither response bodies nor
+session identifiers are retained.
+
+The upload environment holds the seven distribution signing values documented
+below and `DROVER_APPSTORE_API_KEY_ID`, `DROVER_APPSTORE_API_ISSUER_ID`, and
+`DROVER_APPSTORE_API_PRIVATE_KEY_BASE64`. It receives no staging credential.
+The macOS job selects Xcode 26.6, repeats the package, app unit, and deterministic
+UI slices from `ios.yml`, archives the stage-only app, exports a verified internal
+IPA, and confirms upload. The Apple key is materialized only at upload under
+`$RUNNER_TEMP/private_keys/AuthKey_<id>.p8` with mode `0600` in a `0700` directory.
+
+Export needs the temporary signing identity in the runner's user keychain
+search list. The workflow snapshots that list privately before signing setup,
+adds the temporary keychain, and restores the exact original list in `always()`
+cleanup before deleting the temporary keychain/profile and both credential
+directories. This reversible sequence is workflow configuration only; validate
+it on the protected hosted runner before relying on a live export. No local or
+fleet keychain changes are part of repository verification.
+
+Only sanitized preflight/archive/export/upload JSON records become Actions
+artifacts. Approval delay and the iOS checks can make the original probe older
+by upload time; its 30-minute freshness is assessed when preflight runs.
+Upload confirmation does not assert Apple processing, internal tester
+availability, or physical-device acceptance. The workflow does not wait for
+processing or assign external testers.
+
+### Distribution archive
 
 `.github/workflows/ios-distribution.yml` is dispatch-only and uses the
 protected `ios-distribution` environment. Its job is restricted to `main`

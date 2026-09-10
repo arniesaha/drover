@@ -25,7 +25,7 @@ CREDENTIALS_FILENAME = "credentials.json"
 STORE_VERSION = 1
 TOKEN_BYTES = 32
 TOUCH_DEBOUNCE_SECONDS = 60.0
-SCOPES = ("device", "host")
+SCOPES = ("device", "host", "preflight")
 APNS_ENVIRONMENTS = ("sandbox", "production")
 _VERIFIER_DOMAIN = b"drover-cred-v1\0"
 

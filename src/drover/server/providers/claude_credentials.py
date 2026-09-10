@@ -13,6 +13,8 @@ from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from drover.server.staging_credentials import is_staging
+
 _ACCOUNT_LABEL = "Claude Code"
 _KEYCHAIN_SERVICE = "Claude Code-credentials"
 _KEYCHAIN_TIMEOUT_S = 2.0
@@ -48,6 +50,10 @@ def load_claude_credential(
     the returned redacted value and local parsing variables.
     """
 
+    if is_staging():
+        # This lane is API-key-only. Never discover subscription credentials,
+        # including injected readers and a personal macOS Keychain item.
+        raise ClaudeCredentialError("not_authenticated", status="usage_unavailable")
     resolved_credentials = (
         Path(credentials_path)
         if credentials_path is not None

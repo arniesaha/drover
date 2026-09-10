@@ -9,14 +9,24 @@ public enum ClientFactory {
     /// otherwise the persisted `ServerConfig` plus the Keychain token are
     /// used. Background callers leave `credentialBindingID` nil: this factory
     /// never reads or writes foreground recovery metadata.
+    ///
+    /// `endpointIsAllowed` is where a restricted build (an internal TestFlight
+    /// stage lock) decides whether an endpoint may be dialled at all. It has
+    /// to be enforced *here*, on both branches: a caller-side check cannot see
+    /// the DEBUG override this factory prefers over the saved config, and
+    /// `BackgroundRefresh` builds its own client from the same UserDefaults
+    /// and Keychain with no `AppEnvironment` in the process to ask.
     public static func make(defaults: UserDefaults = .standard,
                              tokenStore: TokenStore = TokenStore(),
-                             credentialBindingID: UUID? = nil)
+                             credentialBindingID: UUID? = nil,
+                             endpointIsAllowed: (URL) -> Bool = { _ in true })
         -> (client: DroverClient, config: ServerConfig)? {
         if let override = ServerConfig.debugOverride() {
+            guard endpointIsAllowed(override.config.baseURL) else { return nil }
             return (DroverClient(config: override.config, token: override.token), override.config)
         }
         guard let config = ServerConfig.load(defaults: defaults),
+              endpointIsAllowed(config.baseURL),
               let token = tokenStore.load()
         else {
             return nil

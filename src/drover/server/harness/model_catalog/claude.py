@@ -190,6 +190,12 @@ class ClaudeCatalogAdapter:
             )
         )
         self.env = dict(os.environ if env is None else env)
+        from drover.server.staging_credentials import is_staging, staging_root
+
+        if is_staging():
+            self.settings_paths = ()
+            self.env = {}
+            self.credentials_path = staging_root() / "home/.drover/anthropic_api_key"
         self.timeout_s = timeout_s
         self.opener = opener or _http_get
         self.credential_loader = credential_loader or (
@@ -296,6 +302,15 @@ class ClaudeCatalogAdapter:
             "Accept": "application/json",
             "anthropic-version": "2023-06-01",
         }
+        from drover.server.staging_credentials import is_staging, read_api_key
+
+        if is_staging():
+            try:
+                api_key = read_api_key()
+            except (OSError, ValueError):
+                raise CatalogDiscoveryError("not_authenticated") from None
+            headers["x-api-key"] = api_key
+            return headers, f"{api_key}\0{base_url}"
         api_key = env.get("ANTHROPIC_API_KEY")
         if isinstance(api_key, str) and api_key:
             headers["x-api-key"] = api_key
