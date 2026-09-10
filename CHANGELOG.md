@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-09-09
+
+### Fixed
+
+- Every message sent from the phone rendered twice. The client owns a
+  correlation ID for a delivery and clears its local pending row only when the
+  stream echoes it back, but the hub parses `client_turn_id` as a UUID and
+  echoes the canonical lowercase form, while the phone generates the uppercase
+  one. The raw string comparison never matched a real echo, so the pending row
+  outlived the message proving it was delivered: it decayed to "Still
+  confirming delivery" and came back after a restart as a delivery held for
+  review. No turn was ever dispatched twice -- the hub keys idempotency on the
+  normalized ID -- but the duplicate had to be discarded by hand.
+
+- Every MCP tool that answers "what sessions" failed with an out-of-memory
+  error: active sessions, fleet status, handoff and recent sessions. The
+  `active_sessions` view ranked every event in the lakehouse by dedup key
+  before filtering to the last thirty minutes, and no predicate above a window
+  function can be pushed into it, so a question about the last half hour
+  materialised the whole history. Underneath that, the view treated any
+  session with a summary as ended -- but the summarizer fires on an idle gap,
+  so a session still working gets one long before it stops and then vanished
+  from every handoff. The same view backs the session-start hook and the CLI
+  handoff, so the "what else is running" line has been empty rather than
+  wrong.
+
+### Added
+
+- An internal TestFlight staging gate: a logically separate staging hub with
+  its own service root, identity, ports and hostname, a bounded structured
+  probe that must observe one exact response, and a preflight credential
+  limited to release identity, readiness and the harness host listing. A
+  TestFlight build built for that stage refuses to dial anything else, in the
+  foreground and from a background refresh alike.
+- `POST /auth/credentials` issues a preflight credential from the running hub.
+  The credential store is loaded once per process, so a token written to the
+  file by a separate CLI would never be honoured by the server that has to
+  accept it -- and would be erased by that server's next write.
+
+### Changed
+
+- A harness whose command cannot be built -- a staging host whose API key file
+  is missing, unreadable, or not private -- now fails closed with a reason
+  (400 on create, 409 on recover) instead of dropping the connection and
+  surfacing as a bare 502.
+
 ## [0.4.13] - 2026-09-06
 
 ### Fixed
