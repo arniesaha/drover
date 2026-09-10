@@ -682,3 +682,238 @@ def test_data_quality_returns_structured_snapshot(
     assert "freshness" in out["categories"]
     assert out["warnings"] == ["freshness: latest agent_event is stale"]
     json.dumps(out)
+
+
+def _seed_summarised_mid_flight(
+    tmp_path: Path, *, summary_offset: timedelta
+) -> tuple[Path, str]:
+    """One session with events either side of its summary's ``ended_at``.
+
+    The summarizer writes ``ended_at`` from the newest event it saw, as a naive
+    local wall clock (``worker.py`` inserts the event timestamp straight into a
+    ``TIMESTAMP`` column). ``summary_offset`` moves that receipt relative to the
+    session's newest event: negative means the session kept working afterwards.
+    """
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    now = datetime.now(timezone.utc)
+    newest = now - timedelta(minutes=2)
+    repo_owner, repo_name, branch = "arniesaha", "drover", "main"
+    tid = compute_task_id(None, repo_owner, repo_name, branch)
+    rows = [
+        dict(
+            id=f"live-{index}",
+            session_id="sess-live",
+            agent_id="macmini-claude",
+            task_id=tid,
+            timestamp=timestamp,
+            event_type="user_message",
+            role="user",
+            content="still going",
+            repo_owner=repo_owner,
+            repo_name=repo_name,
+            branch=branch,
+            principal_id="arnab",
+            dedup_key=f"live{index}",
+            raw_data="{}",
+        )
+        for index, timestamp in enumerate(
+            (now - timedelta(minutes=10), newest), start=1
+        )
+    ]
+    _write_agent_events(parquet_dir, rows)
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            """INSERT INTO tasks (task_id, repo_owner, repo_name, branch, principal_id,
+                                  status, created_at, last_activity_at, session_count,
+                                  total_cost_usd)
+               VALUES (?, ?, ?, ?, 'arnab', 'open', now(), now(), 1, 0.0)""",
+            [tid, repo_owner, repo_name, branch],
+        )
+        con.execute(
+            """INSERT INTO session_summaries (session_id, task_id, agent_id, ended_at,
+                                              summary_md, files_touched, tools_used,
+                                              last_user_prompt, last_assistant,
+                                              next_steps_md, open_questions, status,
+                                              generator_model, generated_at)
+               VALUES (?, ?, ?, ?, ?, [], MAP{}, '', '', '', [], 'completed', 'test',
+                       now())""",
+            [
+                "sess-live",
+                tid,
+                "macmini-claude",
+                (newest + summary_offset).astimezone().replace(tzinfo=None),
+                "summarised while the session was still running",
+            ],
+        )
+    finally:
+        con.close()
+    return duckdb_path, tid
+
+
+def test_active_sessions_keeps_a_session_summarised_mid_flight(tmp_path: Path) -> None:
+    """A summary is not an ending: the summarizer fires on an idle gap.
+
+    Before this, one mid-session summary removed a live session from every
+    handoff for the rest of its life.
+    """
+    duckdb_path, _ = _seed_summarised_mid_flight(
+        tmp_path, summary_offset=-timedelta(minutes=4)
+    )
+    out = drover_active_sessions(duckdb_path=duckdb_path)
+    assert [s["session_id"] for s in out["active_sessions"]] == ["sess-live"]
+
+
+def test_active_sessions_drops_a_session_its_summary_already_covers(
+    tmp_path: Path,
+) -> None:
+    """The original intent survives: a finished session stays out."""
+    duckdb_path, _ = _seed_summarised_mid_flight(tmp_path, summary_offset=timedelta(0))
+    out = drover_active_sessions(duckdb_path=duckdb_path)
+    assert out["active_sessions"] == []
+
+
+def _seed_active_fleet(tmp_path: Path, *, sessions: int) -> Path:
+    """N sessions all active inside the 30-minute window."""
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    now = datetime.now(timezone.utc)
+    rows = []
+    for index in range(sessions):
+        for offset, role, content in (
+            (12, "user", f"first ask {index}"),
+            (3, "user", f"latest ask {index}"),
+        ):
+            rows.append(
+                dict(
+                    id=f"fleet-{index}-{offset}",
+                    session_id=f"sess-{index}",
+                    agent_id="macmini-claude",
+                    task_id=None,
+                    timestamp=now - timedelta(minutes=offset),
+                    event_type="user_message",
+                    role=role,
+                    content=content,
+                    repo_owner="arniesaha",
+                    repo_name="drover",
+                    branch="main",
+                    principal_id="arnab",
+                    dedup_key=f"fleet{index}{offset}",
+                    raw_data="{}",
+                )
+            )
+    _write_agent_events(parquet_dir, rows)
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    return duckdb_path
+
+
+def test_fleet_status_cost_does_not_grow_with_the_fleet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One pass for the snippets, not one whole-history scan per session.
+
+    Each of those per-session scans ranked the entire lakehouse by dedup_key,
+    so a busy fleet multiplied the most expensive query in the tool by the
+    number of sessions it was reporting on (drover#369).
+    """
+    duckdb_path = _seed_active_fleet(tmp_path, sessions=3)
+    statements: list[str] = []
+    real_connect = mcp_tools._connect
+
+    class CountingConnection:
+        """Delegates to a real connection, recording each statement."""
+
+        def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
+            self._con = con
+
+        def execute(self, sql, *args, **kwargs):
+            statements.append(sql)
+            return self._con.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self._con, name)
+
+    monkeypatch.setattr(
+        mcp_tools, "_connect", lambda path: CountingConnection(real_connect(path))
+    )
+    out = mcp_tools.drover_fleet_status(duckdb_path=duckdb_path)
+
+    assert out["count"] == 3
+    assert {s["latest_user_message"] for s in out["active_sessions"]} == {
+        "latest ask 0",
+        "latest ask 1",
+        "latest ask 2",
+    }
+    assert len(statements) <= 2, f"{len(statements)} statements for 3 sessions"
+
+
+def test_recent_sessions_attributes_a_repo_without_rescanning_history(
+    tmp_path: Path,
+) -> None:
+    """Repo attribution comes from the day-summary index, not a full scan.
+
+    ``agent_event_day_summary`` already records (date, session, repo) for every
+    summarised partition, so the tool no longer ranks every event in the
+    lakehouse to learn which sessions belong to a repository.
+    """
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute("""INSERT INTO agent_event_day_summary
+               (date, session_id, agent_id, repo_owner, repo_name, event_count,
+                first_event_at, last_event_at, is_claude_mem_observer,
+                summarised_ingested_at)
+               VALUES ('2026-09-06', 'sess-unlinked', 'macmini-claude',
+                       'arniesaha', 'drover', 12, now(), now(), false, now())""")
+        con.execute(
+            """INSERT INTO session_summaries (session_id, task_id, agent_id, ended_at,
+                                              summary_md, files_touched, tools_used,
+                                              last_user_prompt, last_assistant,
+                                              next_steps_md, open_questions, status,
+                                              generator_model, generated_at)
+               VALUES ('sess-unlinked', 'task-not-in-tasks-table', 'macmini-claude',
+                       now(), 'unlinked but attributable', [], MAP{}, '', '', '', [],
+                       'completed', 'test', now())"""
+        )
+    finally:
+        con.close()
+
+    out = mcp_tools.drover_recent_sessions(
+        duckdb_path=duckdb_path, repo_owner="arniesaha", repo_name="drover"
+    )
+    assert [s["session_id"] for s in out["sessions"]] == ["sess-unlinked"]
+
+
+def test_active_sessions_hides_the_unattributed_event_bucket(tmp_path: Path) -> None:
+    """`unknown_session` is where parsers.py puts an event with no session id.
+
+    It accumulates across agents, so on a live hub it reported itself as one
+    busy participant in the fleet.
+    """
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    now = datetime.now(timezone.utc)
+    _write_agent_events(
+        parquet_dir,
+        [
+            dict(
+                id="orphan-1",
+                session_id="unknown_session",
+                agent_id="macmini-claude",
+                task_id=None,
+                timestamp=now - timedelta(minutes=1),
+                event_type="user_message",
+                role="user",
+                content="no session id on this one",
+                repo_owner="arniesaha",
+                repo_name="drover",
+                branch="main",
+                principal_id="arnab",
+                dedup_key="orphan1",
+                raw_data="{}",
+            )
+        ],
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    out = drover_active_sessions(duckdb_path=duckdb_path)
+    assert out["active_sessions"] == []
