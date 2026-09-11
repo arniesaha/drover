@@ -5506,3 +5506,42 @@ def test_a_fleet_render_that_cannot_finish_in_time_refuses_rather_than_queues(
     finally:
         release.set()
         leader.join(timeout=5)
+
+
+def test_saturated_fleet_listing_route_answers_503_with_retry_after(tmp_path):
+    """The 503 has to survive the route, not just the collector.
+
+    `HarnessRenderBusy` was imported in web/app.py under TYPE_CHECKING only, so
+    the name did not exist at runtime and `except HarnessRenderBusy` raised
+    NameError instead of catching. The request died with no usable answer under
+    exactly the saturation the 503 was written for, which is what a client
+    reads as "ask again now" (drover#331).
+    """
+    import urllib.error
+    import urllib.request
+
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+
+    class BusyCollector:
+        relay_manager = None
+
+        def render_harness_json(self, **_kwargs):
+            raise metrics.HarnessRenderBusy("the fleet listing could not be built")
+
+    httpd = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=BusyCollector(),
+        auth=AuthSettings(enabled=False, api_token=""),
+    )
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/harness"
+        with pytest.raises(urllib.error.HTTPError) as busy:
+            urllib.request.urlopen(url, timeout=5)
+        assert busy.value.code == 503
+        assert busy.value.headers.get("Retry-After") == "2"
+        assert json.loads(busy.value.read())["error"] == "fleet listing busy"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
