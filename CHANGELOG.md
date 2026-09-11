@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-09-10
+
+### Fixed
+
+- A saturated fleet listing raised `NameError` instead of answering. The
+  exception the handler catches was imported for type checking only, so the
+  name did not exist at runtime and the `except` clause failed rather than
+  caught: the 503 with `Retry-After` added in 0.4.13 never went out, and the
+  request died with no usable answer under exactly the saturation it was
+  written for. A client reads that as "ask again now", which is the retry
+  storm the 503 exists to stop. The coverage that missed it asserted the
+  collector raises; nothing drove the route, where the broken clause lived.
+
 ## [0.4.14] - 2026-09-09
 
 ### Fixed
