@@ -57,7 +57,7 @@ from drover.server.web.ui import load_page
 
 if TYPE_CHECKING:
     from drover.server.harness.models import HarnessHost
-    from drover.server.metrics import HarnessRenderBusy, MetricsCollector
+    from drover.server.metrics import MetricsCollector
     from drover.server.relay_manager import RelayManager
 
 log = logging.getLogger("drover.metrics")
@@ -874,6 +874,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(status, "application/json", body)
             return
         if path == "/harness":
+            # Imported here rather than at module scope: metrics re-exports
+            # `start_metrics_server` from this module at the bottom of its own
+            # file, so a top-level import would close that cycle. It was under
+            # TYPE_CHECKING for that reason -- which left the name undefined at
+            # runtime, so the `except` below raised NameError instead of
+            # catching, and the request died with no usable answer under
+            # exactly the saturation the 503 exists for (drover#372).
+            from drover.server.metrics import HarnessRenderBusy
+
             try:
                 body = self.collector.render_harness_json(
                     **_archived_limit_kwargs(parse_qs(parsed.query))
