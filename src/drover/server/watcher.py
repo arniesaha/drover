@@ -513,6 +513,8 @@ class IncomingWatcher:
             for jsonl in sorted(self._incoming.rglob("*.jsonl")):
                 if self._stopping.is_set():
                     return
+                if ".processed" in jsonl.parts:  # the audit archive, not backlog
+                    continue
                 attempted += 1
                 try:
                     self._handler._maybe_ingest(jsonl)

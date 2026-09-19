@@ -109,6 +109,35 @@ def test_backlog_failure_still_marks_backlog_done(lh):
             w.stop()
 
 
+def test_backlog_count_ignores_the_processed_archive(lh, caplog):
+    """`rglob` also walks `.processed/`, which `_maybe_ingest` skips; those
+    audit copies must not be counted as backlog the pass attempted.
+    """
+    incoming, parquet_dir, db_path = lh
+    host = incoming / "macmini"
+    (host / ".processed").mkdir(parents=True)
+    _write_event(host / "backlog-004.jsonl", "backlog-004")
+    _write_event(host / ".processed" / "done-001.jsonl", "done-001")
+    _write_event(host / ".processed" / "done-002.jsonl", "done-002")
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    caplog.set_level(logging.INFO, logger="drover.watcher")
+    w.start()
+    try:
+        assert w.backlog_done.wait(timeout=10)
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "drover.watcher"
+            and record.getMessage().startswith("watcher backlog:")
+        ]
+        assert len(messages) == 1
+        assert messages[0].startswith("watcher backlog: 1 file(s)"), messages
+    finally:
+        w.stop()
+
+
 def test_backlog_logs_when_the_pass_finishes(lh, caplog):
     """Nothing else tells an operator when the startup backlog pass finished
     since it stopped blocking `start()`; the `finally` block in
