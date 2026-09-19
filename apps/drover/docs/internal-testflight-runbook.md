@@ -2,8 +2,9 @@
 
 Operator guide for the **first Internal TestFlight** upload of Drover.
 Follow this document in order. It does not authorize a live upload by itself:
-Apple agreements, certificates, GitHub Environment protection, and Mac Mini
-staging must already exist or be created by a human with the right access.
+Apple agreements, certificates, and the App Store Connect app record must
+already exist or be created by a human with the right access. The interactive
+provisioner below handles the remaining GitHub, tunnel, and Mac staging setup.
 
 This lane is **internal-only** (`testFlightInternalTestingOnly=true`). It is
 not public TestFlight, not App Store submission, and not the development
@@ -20,6 +21,59 @@ Source of truth for automation:
 
 Optional local tool check (no secrets):
 [`scripts/ios/verify_testflight_prereqs.sh`](../../../scripts/ios/verify_testflight_prereqs.sh).
+
+## Interactive provisioning (recommended)
+
+Run the provisioner on the staging Mac from a clean Drover checkout. It starts
+with a read-only audit and requires typed confirmation before it changes
+Cloudflare, GitHub, launchd, or staging state:
+
+```sh
+.venv/bin/python scripts/ios/provision_testflight.py audit --json
+
+chmod 600 /private/path/distribution.p12 \
+  /private/path/profile.mobileprovision \
+  /private/path/AuthKey_<KEY_ID>.p8
+
+.venv/bin/python scripts/ios/provision_testflight.py apply \
+  --public-origin 'https://testflight-staging.example.com' \
+  --p12 /private/path/distribution.p12 \
+  --profile /private/path/profile.mobileprovision \
+  --asc-key /private/path/AuthKey_<KEY_ID>.p8 \
+  --asc-issuer-id '<ASC_ISSUER_UUID>'
+```
+
+The default `codex` staging harness opens an isolated Codex login under the
+staging home. For a dedicated Anthropic API key file instead, add
+`--harness claude-code --provider-credential /private/path/anthropic_api_key`.
+The key file must also be mode `0600`.
+
+Defaults and prompts:
+
+- Source is the current checkout; candidate SHA is its fetched `origin/main`.
+- GitHub repository is `arniesaha/drover`; the required reviewer defaults to
+  the authenticated `gh` user.
+- The ASC key ID is inferred from `AuthKey_<KEY_ID>.p8` when possible.
+- The PKCS#12 password is read with a hidden prompt, never a CLI argument.
+- Missing `cloudflared` can be installed with Homebrew only after typing
+  `INSTALL`; first-time Cloudflare authorization opens its login flow.
+- Each external phase requires a separate `YES` confirmation. Secret values
+  are streamed through stdin and are not written to command arguments.
+
+The provisioner validates the real certificate/profile/key, creates or updates
+the protected GitHub Environments and `main` branch policies, creates the
+dedicated locally managed Cloudflare tunnel, installs its launchd job, runs the
+staging prepare/activate/probe sequence, and performs a final read-only audit.
+It is safe to rerun with the same inputs.
+
+It deliberately cannot create the Apple Distribution certificate/profile, ASC
+API key, paid agreements, or the `com.arnab.drover` App Store Connect app
+record. It pauses for an explicit confirmation that the app record and API-key
+upload permission exist before making any external changes.
+
+To explicitly dispatch after provisioning, append
+`--dispatch --version '<version>' --build '<unused-build-number>'`. This adds a
+fifth confirmation before starting the workflow. Omit it for setup-only use.
 
 ## 1. Prerequisites (human / Apple / machine)
 
@@ -171,7 +225,8 @@ For **both** `ios-testflight-staging` and `ios-testflight-upload`:
 4. Add the secrets and confirm the repository variable
    `DROVER_TESTFLIGHT_STAGING_URL` is set.
 5. Do not enable this workflow’s first live dispatch until reviewers and
-   branch rules are in place. Merging docs does not configure Environments.
+   branch rules are in place. The interactive provisioner configures these;
+   merely merging the repository changes does not.
 
 Workflow gates (already in YAML):
 
@@ -405,7 +460,7 @@ if a runner failure leaves uncertainty.
 
 - Invent or store Apple / GitHub secret values.
 - Claim that an upload or processing step succeeded without ASC evidence.
-- Configure GitHub Environments for you.
+- Create Apple credentials, agreements, or the App Store Connect app record.
 - Cover public TestFlight, App Store review submission, or PyPI/server
   releases.
 - Replace [`distribution.md`](distribution.md) deep dives on privacy, ATS, or
