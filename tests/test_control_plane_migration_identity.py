@@ -17,6 +17,8 @@ import json
 import duckdb
 
 from drover.schema import (
+    _ADVISORY_OCCURRENCES_DDL,
+    bootstrap_control_plane_store,
     migrate_control_plane_tables,
     prune_legacy_control_plane_tables,
 )
@@ -242,3 +244,96 @@ def test_the_prune_reports_without_dropping_unless_asked(tmp_path):
     assert report["tables"]["harness_events"]["missing"] == 0
     assert report["tables"]["harness_events"]["dropped"] is False
     assert _legacy_table_exists(analytical)
+
+
+# --- retention-aware pruning: drover#280's second half -----------------
+#
+# The watcher's sweep deletes `advisory_occurrences` rows older than
+# `advisory_occurrence_retention_days` from the control plane. Without a
+# retention exemption, `prune_legacy_control_plane_tables` would see those
+# swept rows as permanently "missing" and could never drop the legacy copy,
+# so every boot would keep resurrecting them via `migrate_control_plane_tables`.
+
+
+def _days_ago(days: int) -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+
+
+def _analytical_with_legacy_advisory_occurrences(
+    db, *, rows: list[tuple[str, dt.datetime]]
+) -> duckdb.DuckDBPyConnection:
+    """Seed the pre-split `advisory_occurrences` table in the analytical store."""
+    con = duckdb.connect(str(db))
+    con.execute(_ADVISORY_OCCURRENCES_DDL)
+    for occurrence_id, recorded_at in rows:
+        con.execute(
+            "INSERT INTO advisory_occurrences ("
+            "occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            [occurrence_id, "finding-1", "run-1", "fail", recorded_at, recorded_at],
+        )
+    return con
+
+
+def _control_plane_holding_advisory_occurrences(db, *, ids: list[str]) -> None:
+    """Bootstrap the control-plane store, holding only the given occurrence ids."""
+    bootstrap_control_plane_store(db)
+    registry = control_plane_path(db)
+    con = duckdb.connect(str(registry))
+    try:
+        for occurrence_id in ids:
+            con.execute(
+                "INSERT INTO advisory_occurrences ("
+                "occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                [occurrence_id, "finding-1", "run-1", "fail", _CREATED_AT, _CREATED_AT],
+            )
+    finally:
+        con.close()
+
+
+def test_prune_drops_a_table_whose_only_gaps_are_past_retention(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db,
+        rows=[("old-1", _days_ago(45)), ("new-1", _days_ago(2))],
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=["new-1"])  # old-1 was swept
+
+    report = prune_legacy_control_plane_tables(
+        con, db, apply=True, retention_days={"advisory_occurrences": 30}
+    )
+
+    assert report["tables"]["advisory_occurrences"]["dropped"] is True
+    assert "advisory_occurrences" not in {
+        r[0]
+        for r in con.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+
+
+def test_prune_still_refuses_when_a_row_inside_retention_is_missing(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db, rows=[("new-1", _days_ago(2)), ("new-2", _days_ago(3))]
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=["new-1"])
+
+    report = prune_legacy_control_plane_tables(
+        con, db, apply=True, retention_days={"advisory_occurrences": 30}
+    )
+
+    assert report["tables"]["advisory_occurrences"]["dropped"] is False
+
+
+def test_prune_without_retention_keeps_todays_strict_behaviour(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db, rows=[("old-1", _days_ago(45))]
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=[])
+
+    report = prune_legacy_control_plane_tables(con, db, apply=True)
+
+    assert report["tables"]["advisory_occurrences"]["dropped"] is False
