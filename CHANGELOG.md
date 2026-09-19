@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-09-19
+
+### Fixed
+
+- The hub no longer ingests the files already waiting in `incoming/` before
+  it binds its port. The watcher did that pass on the caller's thread, and one
+  restart spent 49 seconds in it with nothing answering. The pass now runs on
+  its own thread after the observer starts, and logs
+  `watcher backlog: N file(s) in Xs` when it finishes. A file seen by both the
+  observer and the backlog pass is ingested once; the one that loses the race
+  returns quietly instead of logging a false "ingest failed".
+
+- Swept advisory occurrences came back on every restart. The pre-split copy
+  of the control-plane tables is re-copied at each boot for any row the
+  control plane lacks, and the 30-day sweep deletes old occurrences, so one
+  boot re-inserted 5,668 rows that the sweep deleted again two seconds later.
+  `drover-server harness prune-legacy-tables` would never drop that copy,
+  because retention guarantees some rows are always "missing". It now treats
+  rows past the configured retention window as swept, and reports how many as
+  `exempt_past_retention`, so a dry run shows exactly what `--apply` drops.
+
+### Changed
+
+- The usage rollup fetches only events that can carry token usage (plus every
+  row that is not valid JSON or not an object), instead of every event of a
+  session. On the busiest session measured this halved the rows read.
+
+### Added
+
+- `scripts/load_harness_poll.py` polls `/harness` at the phone's rate and
+  exits non-zero on any response other than 200.
+
 ## [0.4.15] - 2026-09-10
 
 ### Fixed
