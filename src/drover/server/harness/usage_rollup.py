@@ -101,11 +101,17 @@ ORDER BY p.session_id
 LIMIT ?
 """
 
-#: Only rows that can contribute to a total, plus every row Python would count
-#: as malformed so `exact` keeps meaning what it meant. Mirrors `_USAGE_PATHS`
-#: in usage.py; a usage object anywhere else is invisible to `_usage_records`
-#: and fetching it only cost a `json.loads`. The CASE keeps `json_type` away
-#: from text that is not JSON.
+#: Only rows that can contribute to a total, plus every row DuckDB rejects as
+#: JSON or finds is not an object, so the malformed count behind `exact` keeps
+#: meaning what it meant. Mirrors `_USAGE_PATHS` in usage.py; a usage object
+#: anywhere else is invisible to `_usage_records` and fetching it only cost a
+#: `json.loads`. The CASE keeps `json_type` away from text that is not JSON.
+#:
+#: DuckDB's parser is more lenient than `json.loads`: it accepts a trailing
+#: comma, for one. A row like that with no usage path is dropped here although
+#: Python would have counted it malformed. Every `harness_events` payload is
+#: written by `registry._json_dumps`, which cannot produce one, so the
+#: difference is only reachable by a row written some other way.
 _EVENTS_SQL = """
 SELECT seq, payload_json
 FROM harness_events
