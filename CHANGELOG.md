@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.18] - 2026-09-19
+
+### Fixed
+
+- The fleet listing stopped reading the largest column in the control-plane
+  store on every render. `harness_events` has no index on `session_id`, so
+  the session-preview window is a full scan of the table, and it carried
+  `payload_json`: 171 MB of the store's 240 MB. Every `/harness` render read
+  it from disk while holding the control-plane lock, every two seconds under
+  the phone's polling. Caught in the act with the SIGUSR1 dump added in
+  0.4.17: 72 threads queued on that lock while the one holding it sat in
+  `latest_session_previews`, in the same frame across two dumps three seconds
+  apart, and again in a second wedge 40 minutes later. Measured on a copy of
+  the live store: 678 ms cold with the column, 11 ms without it. Candidates
+  with a blank stored preview now get one narrow follow-up query keyed on
+  `event_id`; the fallback behaves exactly as before.
+
 ## [0.4.17] - 2026-09-19
 
 ### Fixed
