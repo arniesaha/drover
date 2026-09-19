@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.16] - 2026-09-19
+## [0.4.17] - 2026-09-19
+
+### Fixed
+
+- The watcher's startup backlog runs before the port binds again, as it did
+  through 0.4.15. 0.4.16 moved it onto a thread so the port could bind sooner;
+  on the hub that put the backlog, the retention sweeps and every worker on a
+  slow disk at the moment the fleet started polling, and `/harness` answered
+  503 to every request until the release was rolled back. The rest of 0.4.16
+  is kept: the usage rollup prefilter, the retention-aware legacy prune, the
+  backlog completion log line and the ingest-lock re-check.
+
+### Added
+
+- `drover-server run` writes every thread's Python stack to its stderr log on
+  `SIGUSR1`. The fleet listing has wedged behind a render that never finished
+  more than once, and until now the only way out was a restart that destroyed
+  the evidence.
+
+## [0.4.16] - 2026-09-19 [YANKED]
+
+Withdrawn the day it shipped: the fleet listing answered "fleet listing busy"
+to every request for about eight minutes after the hub restarted onto it, and
+the hub was rolled back to 0.4.15. See 0.4.17.
 
 ### Fixed
 
