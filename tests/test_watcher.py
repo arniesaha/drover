@@ -61,34 +61,51 @@ def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.1):
     return False
 
 
-def test_start_returns_before_the_backlog_is_ingested(lh):
+def test_start_ingests_the_backlog_before_it_returns(lh):
+    """The backlog runs on the caller's thread, as it did through 0.4.15.
+
+    0.4.16 moved it onto a thread so the port could bind sooner. In production
+    that put the backlog, the retention sweeps and every worker on a slow disk
+    at the moment the fleet started polling, and `/harness` stayed at "fleet
+    listing busy" for eight minutes until the release was rolled back.
+    """
     incoming, parquet_dir, db_path = lh
     host_dir = incoming / "macmini"
     host_dir.mkdir()
     _write_event(host_dir / "backlog-001.jsonl", "backlog-001")
-
-    release = threading.Event()
     w = IncomingWatcher(
         incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
     )
-    real = w._handler._maybe_ingest
+    w.start()
+    try:
+        assert w.backlog_done.is_set(), "start() returned before the backlog"
+        assert not (host_dir / "backlog-001.jsonl").exists()
+        assert (host_dir / ".processed" / "backlog-001.jsonl").exists()
+    finally:
+        w.stop()
 
-    def slow_ingest(path):
-        release.wait(timeout=10)
-        real(path)
 
-    with mock.patch.object(w._handler, "_maybe_ingest", side_effect=slow_ingest):
-        started = time.monotonic()
+def test_retention_sweeps_start_only_after_the_backlog(lh):
+    incoming, parquet_dir, db_path = lh
+    order: list[str] = []
+    w = IncomingWatcher(
+        incoming_dir=incoming,
+        parquet_dir=parquet_dir,
+        duckdb_path=db_path,
+        retention_days=7,
+    )
+    with (
+        mock.patch.object(
+            w, "_ingest_backlog", side_effect=lambda: order.append("backlog")
+        ),
+        mock.patch.object(
+            w, "_start_sweeper", side_effect=lambda: order.append("sweeper")
+        ),
+    ):
         w.start()
         try:
-            assert time.monotonic() - started < 1.0, "start() waited on the backlog"
-            assert not w.backlog_done.is_set()
-            release.set()
-            assert w.backlog_done.wait(timeout=10), "backlog never finished"
-            assert not (host_dir / "backlog-001.jsonl").exists()
-            assert (host_dir / ".processed" / "backlog-001.jsonl").exists()
+            assert order == ["backlog", "sweeper"]
         finally:
-            release.set()
             w.stop()
 
 

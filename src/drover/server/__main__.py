@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import logging
 import math
@@ -213,6 +214,29 @@ def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
     return (backend_cfg.allows_anthropic and backend_cfg.has_anthropic_creds) or (
         backend_cfg.allows_harness_backend and backend_cfg.has_harness_backend
     )
+
+
+def _register_stack_dump() -> None:
+    """Dump every thread's Python stack to stderr on SIGUSR1.
+
+    The fleet listing has wedged behind a render that never finished, more
+    than once (#331), and each time the only mitigation was a restart that
+    destroyed the evidence. py-spy needs root on macOS; this does not.
+    `kill -USR1 <pid>` writes the stacks to the server's stderr log.
+
+    The process's own stderr (`sys.__stderr__`), not `sys.stderr`: that is the
+    descriptor launchd points at the log, and a replaced stream -- click's
+    CliRunner, for one -- has no descriptor for faulthandler to write to.
+    Diagnostics must never stop the server, so a failure is logged and ignored.
+    """
+    stream = sys.__stderr__
+    if stream is None:
+        log.debug("no stderr to dump stacks to; SIGUSR1 dump not registered")
+        return
+    try:
+        faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True)
+    except (OSError, ValueError) as exc:
+        log.debug("SIGUSR1 stack dump not registered: %s", exc)
 
 
 def _warm_cockpit(service: "CockpitService") -> None:
@@ -2541,6 +2565,7 @@ def run(
     no_embeddings: bool,
 ) -> None:
     """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
+    _register_stack_dump()
     cfg = _resolve_config(ctx.obj["config_path"])
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     # After bootstrap, which is what creates and migrates the control-plane
