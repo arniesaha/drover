@@ -15,10 +15,12 @@ from drover.schema import bootstrap
 from drover.server import harness as _harness_pkg  # noqa: F401
 from drover.server.db import control_plane_path
 from drover.server.harness import usage_rollup as usage_rollup_module
-from drover.server.harness.usage import TokenTotals
+from drover.server.harness.usage import TokenTotals, session_totals, usage_turn_count
 from drover.server.harness.usage_rollup import (
     SOURCE_HARNESS_EVENTS,
     SOURCE_UNOBSERVED,
+    _parse_event_rows,
+    fetch_event_rows,
     malformed_payload_count,
     reset_counters_for_tests,
     rolled_session_count,
@@ -107,6 +109,14 @@ def usage_row(con, session_id: str):
                   turn_count, exact, source, source_seq, source_event_count, harness, host_id
            FROM session_usage WHERE session_id = ?""",
         [session_id],
+    ).fetchone()
+
+
+def _usage_row(con, session_id: str):
+    return con.execute(
+        "SELECT input_tokens, output_tokens, exact, turn_count "
+        "FROM session_usage_sources WHERE session_id = ? AND source = ?",
+        [session_id, SOURCE_HARNESS_EVENTS],
     ).fetchone()
 
 
@@ -445,3 +455,93 @@ def test_a_pass_does_not_hold_the_control_plane_across_its_parsing(tmp_path):
     assert peak == 1
     with duckdb.connect(str(control_plane_path(db))) as con:
         assert usage_row(con, "c1")[:2] == (110, 11)
+
+
+def test_rollup_fetches_only_rows_that_can_carry_usage(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "s-filter", "claude-code")
+    add_event(con, "s-filter", 1, claude_usage("n1", inp=10, out=5))
+    for seq in range(2, 52):
+        add_event(
+            con,
+            "s-filter",
+            seq,
+            {"type": "tool_result", "payload": {"output": "x" * 500}},
+            event_type="tool_result",
+        )
+
+    rows = fetch_event_rows(con, "s-filter")
+    assert len(rows) == 1, f"fetched {len(rows)} rows for 1 usage-bearing event"
+
+
+def test_prefilter_keeps_every_usage_path_and_every_malformed_row(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "s-paths", "claude-code")
+    add_event(
+        con,
+        "s-paths",
+        1,
+        {
+            "payload": {
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "native_event_id": "a",
+            }
+        },
+    )
+    add_event(
+        con,
+        "s-paths",
+        2,
+        {"usage": {"input_tokens": 2, "output_tokens": 2}, "native_event_id": "b"},
+    )
+    add_event(
+        con,
+        "s-paths",
+        3,
+        {
+            "message": {
+                "usage": {"input_tokens": 4, "output_tokens": 4},
+                "native_event_id": "c",
+            }
+        },
+    )
+    add_event(con, "s-paths", 4, "{not json")
+    add_event(con, "s-paths", 5, "[1, 2, 3]")
+    add_event(con, "s-paths", 6, {"payload": {"usage": "not-a-mapping"}})
+    add_event(con, "s-paths", 7, {"type": "status"})
+
+    seqs = sorted(r[0] for r in fetch_event_rows(con, "s-paths"))
+    assert seqs == [1, 2, 3, 4, 5]
+
+
+def test_prefiltered_rollup_equals_a_full_read(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "s-eq", "claude-code")
+    add_event(con, "s-eq", 1, claude_usage("n1", inp=10, out=5))
+    add_event(
+        con, "s-eq", 2, claude_usage("n1", inp=10, out=5)
+    )  # re-delivery, same native id
+    add_event(con, "s-eq", 3, claude_usage("n2", inp=7, out=3))
+    add_event(con, "s-eq", 4, "{not json")
+    add_event(
+        con,
+        "s-eq",
+        5,
+        {"type": "tool_result", "payload": {"output": "y"}},
+        event_type="tool_result",
+    )
+
+    full = con.execute(
+        "SELECT seq, payload_json FROM harness_events WHERE session_id = ? "
+        "ORDER BY COALESCE(seq, 0), created_at, event_id",
+        ["s-eq"],
+    ).fetchall()
+    full_events, full_malformed = _parse_event_rows(full)
+
+    rollup_pending_sessions(con)
+    row = _usage_row(con, "s-eq")
+    expected = session_totals("claude-code", full_events)
+    assert row[0] == expected.input_tokens
+    assert row[1] == expected.output_tokens
+    assert row[2] == (bool(expected.exact) and full_malformed == 0)
+    assert row[3] == usage_turn_count(full_events)

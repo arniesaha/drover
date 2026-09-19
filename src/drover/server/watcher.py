@@ -107,6 +107,8 @@ class _Handler(FileSystemEventHandler):
             return
 
         with self._lock:
+            if not path.is_file():  # moved by another caller while we waited
+                return
             attempts = self._max_lock_retries + 1
             for attempt in range(1, attempts + 1):
                 try:
@@ -465,6 +467,8 @@ class IncomingWatcher:
         )
         self._sweeper: threading.Thread | None = None
         self._stopping = threading.Event()
+        self.backlog_done = threading.Event()
+        self._backlog: threading.Thread | None = None
         self._parquet_dir = Path(parquet_dir)
         self._duckdb_path = Path(duckdb_path)
         self._observer: Observer | None = None
@@ -477,15 +481,49 @@ class IncomingWatcher:
 
     def start(self) -> None:
         self._incoming.mkdir(parents=True, exist_ok=True)
-        # Pick up files already present at start time
-        for jsonl in self._incoming.rglob("*.jsonl"):
-            self._handler._maybe_ingest(jsonl)
+        # The observer goes first so nothing written from here on is missed;
+        # the backlog pass then picks up whatever was already here. A file seen
+        # by both is ingested once: `_maybe_ingest` re-checks `path.is_file()`
+        # once it holds `self._lock`, so whichever caller loses the race to
+        # the lock finds the file already moved and returns without touching it.
         observer = Observer()
         observer.schedule(self._handler, str(self._incoming), recursive=True)
         observer.start()
         self._observer = observer
+        self._backlog = threading.Thread(
+            target=self._ingest_backlog, name="drover-incoming-backlog", daemon=True
+        )
+        self._backlog.start()
         log.info("watcher started on %s", self._incoming)
         self._start_sweeper()
+
+    def _ingest_backlog(self) -> None:
+        """Ingest files that were already waiting when the watcher started.
+
+        Off the caller's thread: `run()` starts the watcher before it binds the
+        metrics port, and a backlog of a dozen files held the bind for 49 s.
+        Nothing else tells an operator when this pass finished, so the
+        `finally` block logs how many files it attempted and how long that
+        took -- including when the pass exits early because `_stopping` is
+        set.
+        """
+        started = time.monotonic()
+        attempted = 0
+        try:
+            for jsonl in sorted(self._incoming.rglob("*.jsonl")):
+                if self._stopping.is_set():
+                    return
+                if ".processed" in jsonl.parts:  # the audit archive, not backlog
+                    continue
+                attempted += 1
+                try:
+                    self._handler._maybe_ingest(jsonl)
+                except Exception:  # noqa: BLE001 - one bad file must not end the pass
+                    log.exception("backlog ingest failed for %s", jsonl)
+        finally:
+            elapsed = time.monotonic() - started
+            log.info("watcher backlog: %d file(s) in %.1fs", attempted, elapsed)
+            self.backlog_done.set()
 
     def _start_sweeper(self) -> None:
         """Sweep once at startup, then daily.
@@ -531,6 +569,9 @@ class IncomingWatcher:
 
     def stop(self) -> None:
         self._stopping.set()
+        if self._backlog is not None:
+            self._backlog.join(timeout=5)
+            self._backlog = None
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)

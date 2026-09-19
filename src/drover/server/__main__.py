@@ -1715,7 +1715,10 @@ def harness_dedupe_events_cmd(db_path: Path, apply: bool, as_json: bool) -> None
     help="Actually drop the complete tables. Without it this only reports.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
-def harness_prune_legacy_tables_cmd(db_path: Path, apply: bool, as_json: bool) -> None:
+@click.pass_context
+def harness_prune_legacy_tables_cmd(
+    ctx: click.Context, db_path: Path, apply: bool, as_json: bool
+) -> None:
     """Drop pre-split control-plane copies once the control plane holds them.
 
     The control-plane split left the old tables in the analytical store as a
@@ -1723,10 +1726,23 @@ def harness_prune_legacy_tables_cmd(db_path: Path, apply: bool, as_json: bool) -
     from on every start, so once the control plane demonstrably holds a table
     -- tested on identity for harness_events, on the primary key for the rest
     -- this removes it. A table with anything still missing is left alone.
+
+    A legacy row past `advisory_occurrence_retention_days` does not count as
+    missing: the watcher sweep already deletes rows that old from the control
+    plane, so without this exemption that table could never demonstrate
+    completeness and would never be dropped.
     """
+    cfg = _resolve_config(ctx.obj["config_path"])
+    retention_days = None
+    if cfg.advisory_occurrence_retention_days > 0:
+        retention_days = {
+            "advisory_occurrences": cfg.advisory_occurrence_retention_days
+        }
     con = duckdb.connect(str(db_path), read_only=not apply)
     try:
-        payload = prune_legacy_control_plane_tables(con, db_path, apply=apply)
+        payload = prune_legacy_control_plane_tables(
+            con, db_path, apply=apply, retention_days=retention_days
+        )
     finally:
         con.close()
     if as_json:

@@ -140,6 +140,7 @@ def _int_for(usage: Mapping[str, Any], keys: Iterable[str]) -> Optional[int]:
 #: Where a usage object sits, depending on who handed us the event. Rows read
 #: from `harness_events` nest it under `payload`; the harness API's message
 #: list has been seen with all three.
+# Mirrored in SQL by usage_rollup._EVENTS_SQL; change both together.
 _USAGE_PATHS = (("payload", "usage"), ("usage",), ("message", "usage"))
 
 

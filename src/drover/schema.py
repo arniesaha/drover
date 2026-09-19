@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import duckdb
 
@@ -2062,9 +2062,11 @@ def _copy_harness_events_by_identity(
     return len(params)
 
 
-def _scalar_int(con: duckdb.DuckDBPyConnection, sql: str) -> int:
+def _scalar_int(
+    con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None
+) -> int:
     """First column of the first row, as an int. `fetchone` is Optional."""
-    row = con.execute(sql).fetchone()
+    row = con.execute(sql, params or []).fetchone()
     return int(row[0]) if row else 0
 
 
@@ -2092,8 +2094,18 @@ def _harness_events_gap(con: duckdb.DuckDBPyConnection, alias: str) -> tuple[int
     return len(rows), len(missing)
 
 
+#: Column each table's `retention_days` cutoff is compared against. Only
+#: tables listed here may be passed in `prune_legacy_control_plane_tables`'s
+#: `retention_days`, so a typo cannot silently widen what gets dropped.
+_RETENTION_COLUMNS = {"advisory_occurrences": "recorded_at"}
+
+
 def prune_legacy_control_plane_tables(
-    con: duckdb.DuckDBPyConnection, duckdb_path: Path, *, apply: bool = False
+    con: duckdb.DuckDBPyConnection,
+    duckdb_path: Path,
+    *,
+    apply: bool = False,
+    retention_days: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Drop pre-split copies the control plane already holds.
 
@@ -2106,8 +2118,31 @@ def prune_legacy_control_plane_tables(
     primary key is not its identity, and on the primary key for the rest.
     A table with anything still missing is left exactly where it is.
 
+    `retention_days` treats a legacy row past that table's retention window as
+    not missing, even when the control plane no longer holds it. A watcher
+    sweep (e.g. `sweep_advisory_occurrences`) deletes rows past that same
+    window from the control plane, so without this a legacy table with any
+    history at all can never demonstrate completeness and never gets dropped
+    -- drover#280's resurrection would repeat every boot. Using the same
+    cutoff arithmetic as the sweep is what makes exempting those rows safe: an
+    old row the sweep *kept* is still present in the control plane, so it
+    never counts as missing regardless of this option.
+
     Reports without dropping unless `apply`.
     """
+    if retention_days:
+        unknown = set(retention_days) - set(_RETENTION_COLUMNS)
+        if unknown:
+            raise ValueError(
+                "retention_days given for table(s) with no retention column: "
+                f"{sorted(unknown)}"
+            )
+        for table, days in retention_days.items():
+            if int(days) <= 0:
+                raise ValueError(
+                    f"retention_days[{table!r}] must be a positive number of "
+                    f"days, got {days!r}"
+                )
     registry_path = control_plane_path(duckdb_path)
     report: dict[str, Any] = {
         "database": str(duckdb_path),
@@ -2133,19 +2168,50 @@ def prune_legacy_control_plane_tables(
                 continue
             if table == HARNESS_EVENTS_TABLE:
                 rows, missing = _harness_events_gap(con, alias)
+                # No retention column applies to this table (see
+                # `_RETENTION_COLUMNS`), so nothing is ever exempted here.
+                exempt_past_retention = 0
             else:
                 key = CONTROL_PLANE_PRIMARY_KEYS[table]
                 rows = _scalar_int(con, f"SELECT count(*) FROM main.{table}")
+                cutoff_sql = ""
+                params: list[Any] = []
+                exempt_past_retention = 0
+                if retention_days and table in retention_days:
+                    cutoff_sql = f" AND src.{_RETENTION_COLUMNS[table]} >= ?"
+                    # Same arithmetic as sweep_advisory_occurrences, so the
+                    # two agree on which rows are past the window. Computed
+                    # once and reused for both counts below, so "missing" and
+                    # "exempt_past_retention" can never disagree on the cutoff.
+                    cutoff = datetime.now(timezone.utc) - timedelta(
+                        days=int(retention_days[table])
+                    )
+                    params.append(cutoff)
+                    # Legacy rows the retention cutoff exempts from `missing`
+                    # above -- i.e. what `--apply` will actually destroy for
+                    # this table when it drops the whole legacy copy. Without
+                    # this, a dry run reporting `missing=0` gives no way to
+                    # tell how many rows the DROP takes with it.
+                    exempt_past_retention = _scalar_int(
+                        con,
+                        f"SELECT count(*) FROM main.{table} src "
+                        f"WHERE src.{_RETENTION_COLUMNS[table]} < ? "
+                        f"AND NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+                        f"WHERE dst.{key} = src.{key})",
+                        [cutoff],
+                    )
                 missing = _scalar_int(
                     con,
                     f"SELECT count(*) FROM main.{table} src "
                     f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
-                    f"WHERE dst.{key} = src.{key})",
+                    f"WHERE dst.{key} = src.{key}){cutoff_sql}",
+                    params,
                 )
             report["tables"][table] = {
                 "rows": rows,
                 "missing": missing,
                 "dropped": False,
+                "exempt_past_retention": exempt_past_retention,
             }
     finally:
         con.execute(f"DETACH {alias}")

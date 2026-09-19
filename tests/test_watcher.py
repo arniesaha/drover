@@ -1,11 +1,14 @@
 """Tests for src/drover/server/watcher.py."""
 
 import json
+import logging
 import os
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import duckdb
 import pytest
@@ -56,6 +59,161 @@ def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.1):
             return True
         time.sleep(interval)
     return False
+
+
+def test_start_returns_before_the_backlog_is_ingested(lh):
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini"
+    host_dir.mkdir()
+    _write_event(host_dir / "backlog-001.jsonl", "backlog-001")
+
+    release = threading.Event()
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    real = w._handler._maybe_ingest
+
+    def slow_ingest(path):
+        release.wait(timeout=10)
+        real(path)
+
+    with mock.patch.object(w._handler, "_maybe_ingest", side_effect=slow_ingest):
+        started = time.monotonic()
+        w.start()
+        try:
+            assert time.monotonic() - started < 1.0, "start() waited on the backlog"
+            assert not w.backlog_done.is_set()
+            release.set()
+            assert w.backlog_done.wait(timeout=10), "backlog never finished"
+            assert not (host_dir / "backlog-001.jsonl").exists()
+            assert (host_dir / ".processed" / "backlog-001.jsonl").exists()
+        finally:
+            release.set()
+            w.stop()
+
+
+def test_backlog_failure_still_marks_backlog_done(lh):
+    incoming, parquet_dir, db_path = lh
+    (incoming / "macmini").mkdir()
+    _write_event(incoming / "macmini" / "backlog-002.jsonl", "backlog-002")
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    with mock.patch.object(
+        w._handler, "_maybe_ingest", side_effect=RuntimeError("boom")
+    ):
+        w.start()
+        try:
+            assert w.backlog_done.wait(timeout=10)
+        finally:
+            w.stop()
+
+
+def test_backlog_count_ignores_the_processed_archive(lh, caplog):
+    """`rglob` also walks `.processed/`, which `_maybe_ingest` skips; those
+    audit copies must not be counted as backlog the pass attempted.
+    """
+    incoming, parquet_dir, db_path = lh
+    host = incoming / "macmini"
+    (host / ".processed").mkdir(parents=True)
+    _write_event(host / "backlog-004.jsonl", "backlog-004")
+    _write_event(host / ".processed" / "done-001.jsonl", "done-001")
+    _write_event(host / ".processed" / "done-002.jsonl", "done-002")
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    caplog.set_level(logging.INFO, logger="drover.watcher")
+    w.start()
+    try:
+        assert w.backlog_done.wait(timeout=10)
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "drover.watcher"
+            and record.getMessage().startswith("watcher backlog:")
+        ]
+        assert len(messages) == 1
+        assert messages[0].startswith("watcher backlog: 1 file(s)"), messages
+    finally:
+        w.stop()
+
+
+def test_backlog_logs_when_the_pass_finishes(lh, caplog):
+    """Nothing else tells an operator when the startup backlog pass finished
+    since it stopped blocking `start()`; the `finally` block in
+    `_ingest_backlog` must log a count and duration at INFO.
+    """
+    incoming, parquet_dir, db_path = lh
+    (incoming / "macmini").mkdir()
+    _write_event(incoming / "macmini" / "backlog-003.jsonl", "backlog-003")
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    caplog.set_level(logging.INFO, logger="drover.watcher")
+    w.start()
+    try:
+        assert w.backlog_done.wait(timeout=10)
+        assert any(
+            record.name == "drover.watcher"
+            and record.levelno == logging.INFO
+            and "watcher backlog: 1 file(s)" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        w.stop()
+
+
+def test_maybe_ingest_rechecks_file_existence_under_the_lock(lh, caplog):
+    """A file moved by a concurrent caller while this one waited on the lock
+    must not be logged as an ingest failure.
+
+    `_maybe_ingest`'s outer `path.is_file()` check runs before `self._lock`
+    is acquired, so two callers -- the live observer and the startup backlog
+    pass, say -- can both pass it for the same file. Without a re-check once
+    the lock is held, the loser calls `_ingest_once` on a file the winner
+    already moved to `.processed/`; `ingest_file` then raises
+    `FileNotFoundError`, which is not DuckDB lock contention, so it is logged
+    as `log.exception("ingest failed for %s; leaving file in place", path)` --
+    a false ERROR for what is actually a benign, already-handled outcome.
+    """
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini"
+    host_dir.mkdir()
+    path = host_dir / "race.jsonl"
+    _write_event(path, "race-001")
+
+    handler = _Handler(parquet_dir, db_path)
+    caplog.set_level(logging.ERROR)
+
+    handler._lock.acquire()
+    try:
+        thread = threading.Thread(target=handler._maybe_ingest, args=(path,))
+        thread.start()
+        # There is no event to wait on for "another thread is now blocked
+        # acquiring a lock", so a bounded join is the most deterministic
+        # signal available short of instrumenting the lock itself: it gives
+        # the thread time to clear the outer is_file() check and reach
+        # self._lock, and it fails loudly via the assertion below -- rather
+        # than racing ahead silently -- if that did not happen within the
+        # timeout. This is polling a fixed condition to a hard deadline, not
+        # a bare sleep-as-synchronisation.
+        thread.join(timeout=1)
+        assert thread.is_alive(), "thread did not block on the lock as expected"
+
+        processed = host_dir / ".processed"
+        processed.mkdir(exist_ok=True)
+        target = processed / path.name
+        shutil.move(str(path), str(target))
+    finally:
+        handler._lock.release()
+
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "_maybe_ingest never returned"
+    assert target.exists(), "the winner's move must be left untouched"
+    assert not path.exists()
+    assert not any(
+        record.levelno >= logging.ERROR for record in caplog.records
+    ), "a file moved by another caller must not be logged as a failure"
 
 
 def test_watcher_picks_up_dropped_file(lh):
