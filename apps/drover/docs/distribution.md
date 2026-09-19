@@ -234,6 +234,13 @@ scripts/ios/upload_testflight.sh \
   --record "$DROVER_IOS_UPLOAD_RECORD"
 ```
 
+`DROVER_ASC_KEY_ID`, `DROVER_ASC_ISSUER`, and `DROVER_ASC_PRIVATE_KEYS_DIR` are
+local shell placeholders for those CLI flags. They are not GitHub secret names.
+The protected workflow stores the same material as
+`DROVER_APPSTORE_API_KEY_ID`, `DROVER_APPSTORE_API_ISSUER_ID`, and
+`DROVER_APPSTORE_API_PRIVATE_KEY_BASE64` on Environment `ios-testflight-upload`
+(see the [Internal TestFlight runbook](internal-testflight-runbook.md)).
+
 The supplied directory and `AuthKey_<id>.p8` must belong to the current user,
 have no group/other permissions, and be actual directories/files rather than
 symlinks. The receipt path must be absolute and absent. The wrapper sets
@@ -256,6 +263,11 @@ when invoking commands with protected arguments.
 ## Protected manual CI archive
 
 ### Internal TestFlight staging gate
+
+For the operator end-to-end sequence (Environments, staging hub, dispatch,
+Apple processing, physical-device acceptance, rollback), use the focused
+[Internal TestFlight runbook](internal-testflight-runbook.md). This section
+remains the artifact-chain and workflow-contract detail.
 
 `ios-testflight-internal.yml` accepts only an approved version and build. Both
 jobs check `main` before entering their protected environment, check out the
@@ -293,9 +305,13 @@ SHA, package version, role, normalized probe completion timestamp, fixed host
 ID, and SHA-256 of the normalized staging origin. Neither response bodies nor
 session identifiers are retained.
 
-The upload environment holds the seven distribution signing values documented
-below and `DROVER_APPSTORE_API_KEY_ID`, `DROVER_APPSTORE_API_ISSUER_ID`, and
-`DROVER_APPSTORE_API_PRIVATE_KEY_BASE64`. It receives no staging credential.
+The upload environment holds these seven distribution signing secrets —
+`DROVER_DISTRIBUTION_P12_BASE64`, `DROVER_DISTRIBUTION_P12_PASSWORD`,
+`DROVER_DISTRIBUTION_PROFILE_BASE64`, `DROVER_DISTRIBUTION_TEAM_ID`,
+`DROVER_DISTRIBUTION_PROFILE_UUID`, `DROVER_DISTRIBUTION_IDENTITY_SHA1`, and
+`DROVER_DISTRIBUTION_IDENTITY_NAME` — plus `DROVER_APPSTORE_API_KEY_ID`,
+`DROVER_APPSTORE_API_ISSUER_ID`, and `DROVER_APPSTORE_API_PRIVATE_KEY_BASE64`.
+It receives no staging credential.
 The macOS job selects Xcode 26.6, repeats the package, app unit, and deterministic
 UI slices from `ios.yml`, archives the stage-only app, exports a verified internal
 IPA, and confirms upload. The Apple key is materialized only at upload under

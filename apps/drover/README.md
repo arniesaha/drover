@@ -4,8 +4,12 @@ Drover is a native iOS client for supervising coding-agent sessions across your
 machines. It connects directly to the `/harness` REST and WebSocket API exposed
 by `drover-server`.
 
-The app is distributed from source for v0.1. It is not available through the
-App Store or TestFlight.
+The app is distributed from source for day-to-day development. It is **not**
+on the public App Store or **public** TestFlight. Operators preparing the first
+**internal** TestFlight candidate should follow
+[Internal TestFlight runbook](docs/internal-testflight-runbook.md) and
+[distribution configuration](docs/distribution.md); that path is separate from
+`scripts/deploy-ios.sh` development installs.
 
 ## Requirements
 
@@ -131,6 +135,10 @@ xcodebuild -project apps/drover/Drover.xcodeproj -scheme DroverUITests \
 the required CI selection.
 
 ## Release-device evidence
+
+After an internal TestFlight upload, use the physical-device checklist in
+[Internal TestFlight runbook](docs/internal-testflight-runbook.md) together
+with the targets below.
 
 Root records this evidence before release on the smallest supported physical
 iPhone. Record the reference iPhone model and OS, app build, local network,

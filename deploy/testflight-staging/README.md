@@ -1,9 +1,12 @@
 # Isolated internal TestFlight staging
 
 This is an operator-run Mac Mini runtime for one reviewed candidate. GitHub
-Actions never receives shell access to this machine. Run the local tool from
-a trusted checkout; it creates detached candidate worktrees, installs with
-`uv sync --frozen --no-dev`, and manages only these two launchd labels:
+Actions never receives shell access to this machine. For the full first-run
+sequence (GitHub Environments, dispatch, Apple processing, device acceptance),
+see the [Internal TestFlight runbook](../../apps/drover/docs/internal-testflight-runbook.md).
+Run the local tool from a trusted checkout; it creates detached candidate
+worktrees, installs with `uv sync --frozen --no-dev`, and manages only these
+two launchd labels:
 
 | Job | Listener | Advertised route |
 | --- | --- | --- |
