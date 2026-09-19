@@ -55,6 +55,18 @@ provisioning profile matching `com.arnab.drover`. Encode them the same way
 The setup script fails closed if any of these are missing or mismatched. Do not
 invent placeholder values in the repository.
 
+Encode local files before pasting into GitHub Environment secrets
+(`setup_distribution_signing.sh` only decodes). On macOS or Linux:
+
+```sh
+# PKCS#12, provisioning profile, and ASC .p8 (strip newlines for secret values)
+base64 < path/to/distribution.p12 | tr -d '\n'
+base64 < path/to/profile.mobileprovision | tr -d '\n'
+base64 < path/to/AuthKey_<KEY_ID>.p8 | tr -d '\n'
+```
+
+Keep the plaintext files and encoded outputs out of the repository and chat logs.
+
 ### App Store Connect API (same Environment)
 
 | Secret (exact name) | Contents |
@@ -87,7 +99,7 @@ from the three `DROVER_APPSTORE_API_*` secrets above.
 
 - Python 3.11+ (CI uses 3.13; staging docs say 3.11+).
 - For local archive/export experiments only: Xcode 26.6+, XcodeGen, and the
-  same signing material — not required merely to dispatch CI.
+  same signing material -- not required merely to dispatch CI.
 - `gh` CLI authenticated to this repository if you prefer dispatching from a
   terminal instead of the Actions UI.
 
@@ -115,10 +127,10 @@ Job: `preflight-staging` (`runs-on: ubuntu-latest`).
 | Kind | Exact name |
 | --- | --- |
 | Secret | `DROVER_TESTFLIGHT_PREFLIGHT_TOKEN` |
-| Variable (same as repo) | `DROVER_TESTFLIGHT_STAGING_URL` |
 
 This Environment receives **only** the preflight token. It must not hold
-distribution signing or App Store Connect API material.
+`DROVER_TESTFLIGHT_STAGING_URL` (repo variable only), distribution signing, or
+App Store Connect API material.
 
 ### Environment `ios-testflight-upload`
 
@@ -126,7 +138,6 @@ Job: `archive-upload` (`runs-on: macos-26`).
 
 | Kind | Exact name |
 | --- | --- |
-| Variable (same as repo) | `DROVER_TESTFLIGHT_STAGING_URL` |
 | Secret | `DROVER_DISTRIBUTION_P12_BASE64` |
 | Secret | `DROVER_DISTRIBUTION_P12_PASSWORD` |
 | Secret | `DROVER_DISTRIBUTION_PROFILE_BASE64` |
@@ -138,7 +149,8 @@ Job: `archive-upload` (`runs-on: macos-26`).
 | Secret | `DROVER_APPSTORE_API_ISSUER_ID` |
 | Secret | `DROVER_APPSTORE_API_PRIVATE_KEY_BASE64` |
 
-This Environment receives **no** staging preflight token.
+This Environment receives **no** staging preflight token and no
+`DROVER_TESTFLIGHT_STAGING_URL` (that remains a repository variable only).
 
 ### Related Environment (not this workflow)
 
@@ -171,26 +183,34 @@ Workflow gates (already in YAML):
 
 ## 4. Staging hub steps (before every dispatch)
 
+**Before prepare:** `RELEASE_SHA` must already be a full lowercase 40-hex commit
+on the locally fetched `origin/main` (reachable from that ref). Fetch and review
+that SHA first; `stage.py prepare` does not fetch or choose the candidate. The
+workflow later rejects any dispatch that is not `refs/heads/main` at that SHA.
+
 On the Mac Mini, follow
 [`deploy/testflight-staging/README.md`](../../../deploy/testflight-staging/README.md)
-for the candidate SHA that will be on `main` when you dispatch.
+for the rest of the isolated staging root.
 
 Abbreviated operator sequence (placeholders only; never commit real values):
 
 ```sh
-# 1. Prepare (no services yet)
+# Isolated home required by staging README (set before any command that uses it)
+STAGING_HOME="$STAGING_ROOT/home"
+
+# 1. Prepare (no services yet) -- only after RELEASE_SHA is on origin/main
 python3 scripts/testflight/stage.py prepare \
   --repository "$REPOSITORY" --root "$STAGING_ROOT" \
   --sha "$RELEASE_SHA" --public-url "$STAGING_PUBLIC_ORIGIN"
 
-# 2. Configure staging provider + APNs under $STAGING_ROOT/home (see staging README)
+# 2. Configure staging provider + APNs under $STAGING_HOME (see staging README)
 
 # 3. Activate
 python3 scripts/testflight/stage.py activate \
   --root "$STAGING_ROOT" --sha "$RELEASE_SHA"
 
-# 4. Mint preflight credential (prints a secret — keep private)
-env -i HOME="$STAGING_ROOT/home" PATH=/usr/bin:/bin \
+# 4. Mint preflight credential (prints a secret -- keep private)
+env -i HOME="$STAGING_HOME" PATH=/usr/bin:/bin \
   "$STAGING_ROOT/worktrees/$RELEASE_SHA/.venv/bin/drover-server" \
   --config "$STAGING_HOME/.drover/config.toml" \
   credentials issue-preflight --label internal-testflight
@@ -243,9 +263,9 @@ python3 scripts/testflight/verify_staging.py \
 
 What the workflow does (do not re-implement ad hoc):
 
-1. **preflight-staging** — `verify_staging.py`; uploads sanitized
+1. **preflight-staging** -- `verify_staging.py`; uploads sanitized
    `testflight-preflight-metadata`.
-2. **archive-upload** — binds candidate to preflight origin digest; installs
+2. **archive-upload** -- binds candidate to preflight origin digest; installs
    XcodeGen; runs DroverKit tests, app unit tests, and deterministic UI
    journey slices; sets up distribution signing; archives with
    `--channel testflight-internal` and `--staging-url`; exports IPA with
@@ -255,7 +275,7 @@ What the workflow does (do not re-implement ad hoc):
 
 Runner pin: `macos-26` with
 `DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer`. If that path
-is missing after a GitHub image change, the job fails loudly — recheck the
+is missing after a GitHub image change, the job fails loudly -- recheck the
 [macOS 26 runner inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-26-Readme.md)
 before retrying.
 
@@ -284,26 +304,46 @@ After a green `archive-upload` job:
      hours; status is owned by Apple).
    - Confirm the build number and version match the dispatch inputs.
    - Confirm the build is eligible for **internal** testing only for this lane.
-3. Add or confirm internal testers / groups in ASC as your org requires. The
-   workflow does not assign external testers.
+3. Confirm App Store Connect **users** (not external email invites) are on an
+   **Internal** testing group for this build. Internal TestFlight is ASC-user
+   Internal groups only; the workflow does not assign external testers.
 4. Do not treat “workflow green” as “installable on a phone” until processing
-   finishes and the build is available to the internal group.
+   finishes and the build is available to that Internal group.
 
 This repository change never claims a live upload succeeded.
 
 ## 7. Physical-device acceptance checklist
 
 Install the internal build on the **smallest supported physical iPhone** used
-for release evidence ([`apps/drover/README.md`](../README.md) — Release-device
+for release evidence ([`apps/drover/README.md`](../README.md) -- Release-device
 evidence). Record model, OS, app version/build, network, and fixture.
 
 ### Install and pair
 
+Mint a short-lived pairing code against the **isolated staging hub** (same
+`HOME` / `--config` isolation as the staging README). Do not use your personal
+`~/.drover` home for this pass. Canonical pairing UX (QR scan, hand-entry
+fallback, advertised URL) is in
+[`docs/getting-started.md`](../../../docs/getting-started.md) (Connect The iOS
+App); the command below is the staging-isolated equivalent of
+`drover-server pair`:
+
+```sh
+STAGING_HOME="$STAGING_ROOT/home"
+env -i HOME="$STAGING_HOME" PATH=/usr/bin:/bin \
+  "$STAGING_ROOT/worktrees/$RELEASE_SHA/.venv/bin/drover-server" \
+  --config "$STAGING_HOME/.drover/config.toml" \
+  pair
+```
+
+Ensure `[server] advertised_url` in that staging config is the reviewed public
+staging origin the app can reach (tunnel), then:
+
 - [ ] Install from TestFlight (internal) on a physical device (not simulator).
-- [ ] Pair to the **staging** hub (QR or manual URL + pairing code from the
-      staged server). Confirm the app uses the stage-only endpoint policy
-      baked at archive time (`DROVER_TESTFLIGHT_STAGE_ONLY` / staging URL in
-      Info.plist — see `distribution.md`).
+- [ ] Pair to the **staging** hub with the QR or manual URL + pairing code from
+      the mint above. Confirm the app uses the stage-only endpoint policy baked
+      at archive time (`DROVER_TESTFLIGHT_STAGE_ONLY` / staging URL in
+      Info.plist -- see `distribution.md`).
 - [ ] Reject accidental pairing to a personal production hub for this
       acceptance pass unless that is an explicit separate check.
 
@@ -342,7 +382,7 @@ python3 scripts/testflight/stage.py rollback \
 ```
 
 Re-run the probe for the rolled-back SHA before another dispatch. Rollback
-does not revert database schemas or provider state — choose a
+does not revert database schemas or provider state -- choose a
 schema-compatible candidate.
 
 ### Workflow / upload failures

@@ -305,11 +305,11 @@ SHA, package version, role, normalized probe completion timestamp, fixed host
 ID, and SHA-256 of the normalized staging origin. Neither response bodies nor
 session identifiers are retained.
 
-The upload environment holds these seven distribution signing secrets —
+The upload environment holds these seven distribution signing secrets:
 `DROVER_DISTRIBUTION_P12_BASE64`, `DROVER_DISTRIBUTION_P12_PASSWORD`,
 `DROVER_DISTRIBUTION_PROFILE_BASE64`, `DROVER_DISTRIBUTION_TEAM_ID`,
 `DROVER_DISTRIBUTION_PROFILE_UUID`, `DROVER_DISTRIBUTION_IDENTITY_SHA1`, and
-`DROVER_DISTRIBUTION_IDENTITY_NAME` — plus `DROVER_APPSTORE_API_KEY_ID`,
+`DROVER_DISTRIBUTION_IDENTITY_NAME`, plus `DROVER_APPSTORE_API_KEY_ID`,
 `DROVER_APPSTORE_API_ISSUER_ID`, and `DROVER_APPSTORE_API_PRIVATE_KEY_BASE64`.
 It receives no staging credential.
 The macOS job selects Xcode 26.6, repeats the package, app unit, and deterministic

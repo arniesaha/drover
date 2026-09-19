@@ -46,7 +46,7 @@ if command -v python3 >/dev/null 2>&1; then
   fi
 fi
 
-# Optional local macOS tooling — warn only when absent (Linux operators OK).
+# Optional local macOS tooling -- warn only when absent (Linux operators OK).
 for optional in xcodegen xcodebuild xcrun security plutil gh; do
   if command -v "$optional" >/dev/null 2>&1; then
     ok "optional command $optional"
