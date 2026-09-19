@@ -527,9 +527,11 @@ def test_tunnel_create_then_rerun_reuses_canonical_credentials(tmp_path: Path) -
             listings += 1
             runner.calls.append((arguments, kwargs.get("input_text")))
             # First configure_tunnel: empty inventory, then post-create. Rerun: present.
-            records = [] if listings == 1 else [
-                {"id": tunnel_id, "name": "drover-testflight"}
-            ]
+            records = (
+                []
+                if listings == 1
+                else [{"id": tunnel_id, "name": "drover-testflight"}]
+            )
             return subprocess.CompletedProcess(arguments, 0, json.dumps(records), "")
         if "create" in arguments and arguments[-1] == "drover-testflight":
             staging = cloudflare_home / "drover-testflight.json"

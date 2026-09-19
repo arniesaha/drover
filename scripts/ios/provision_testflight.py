@@ -894,9 +894,7 @@ def apply_provisioning(
 
     if not confirm("Write the protected GitHub environments, variable, and secrets"):
         raise ProvisionError("GitHub configuration was not confirmed")
-    actor_id = int(
-        runner.run(["gh", "api", "user", "--jq", ".id"]).stdout.strip()
-    )
+    actor_id = int(runner.run(["gh", "api", "user", "--jq", ".id"]).stdout.strip())
     prevent_self_review = reviewer_id != actor_id
     if not prevent_self_review:
         print(
