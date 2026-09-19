@@ -7,6 +7,7 @@ Usage: uv run python scripts/load_harness_poll.py --url http://127.0.0.1:7080 \
 from __future__ import annotations
 
 import argparse
+import math
 import statistics
 import threading
 import time
@@ -54,9 +55,14 @@ def main() -> int:
     for t in threads:
         t.join()
     latencies.sort()
-    p99 = latencies[int(len(latencies) * 0.99) - 1] if latencies else float("nan")
+    p99 = (
+        latencies[max(0, math.ceil(len(latencies) * 0.99) - 1)]
+        if latencies
+        else float("nan")
+    )
+    p50 = statistics.median(latencies) if latencies else float("nan")
     print(f"requests={sum(codes.values())} codes={dict(codes)}")
-    print(f"p50={statistics.median(latencies):.3f}s p99={p99:.3f}s")
+    print(f"p50={p50:.3f}s p99={p99:.3f}s")
     return 0 if set(codes) == {200} else 1
 
 
