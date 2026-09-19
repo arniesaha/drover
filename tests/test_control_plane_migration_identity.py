@@ -15,6 +15,7 @@ import datetime as dt
 import json
 
 import duckdb
+import pytest
 
 from drover.schema import (
     _ADVISORY_OCCURRENCES_DDL,
@@ -337,3 +338,61 @@ def test_prune_without_retention_keeps_todays_strict_behaviour(tmp_path):
     report = prune_legacy_control_plane_tables(con, db, apply=True)
 
     assert report["tables"]["advisory_occurrences"]["dropped"] is False
+
+
+def _advisory_occurrences_table_exists(con) -> bool:
+    return "advisory_occurrences" in {
+        r[0]
+        for r in con.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+
+
+def test_prune_refuses_zero_retention_and_drops_nothing(tmp_path):
+    """0 must not mean "exempt every row" -- it reads the cutoff as `now`,
+    under which every existing row looks past retention. That is the
+    opposite of `sweep_advisory_occurrences`'s own reading of <=0 ("do
+    nothing"), and this function decides a DROP TABLE, so it must refuse
+    rather than rely on a caller (e.g. the CLI) to filter it out first.
+    """
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db, rows=[("old-1", _days_ago(45))]
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=[])
+
+    with pytest.raises(ValueError):
+        prune_legacy_control_plane_tables(
+            con, db, apply=True, retention_days={"advisory_occurrences": 0}
+        )
+
+    assert _advisory_occurrences_table_exists(con)
+
+
+def test_prune_refuses_negative_retention_and_drops_nothing(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db, rows=[("old-1", _days_ago(45))]
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=[])
+
+    with pytest.raises(ValueError):
+        prune_legacy_control_plane_tables(
+            con, db, apply=True, retention_days={"advisory_occurrences": -1}
+        )
+
+    assert _advisory_occurrences_table_exists(con)
+
+
+def test_prune_refuses_a_table_without_a_retention_column(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db, rows=[("old-1", _days_ago(45))]
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=[])
+
+    with pytest.raises(ValueError):
+        prune_legacy_control_plane_tables(
+            con, db, apply=True, retention_days={"harness_hosts": 5}
+        )

@@ -2137,6 +2137,12 @@ def prune_legacy_control_plane_tables(
                 "retention_days given for table(s) with no retention column: "
                 f"{sorted(unknown)}"
             )
+        for table, days in retention_days.items():
+            if days <= 0:
+                raise ValueError(
+                    f"retention_days[{table!r}] must be a positive number of "
+                    f"days, got {days!r}"
+                )
     registry_path = control_plane_path(duckdb_path)
     report: dict[str, Any] = {
         "database": str(duckdb_path),
