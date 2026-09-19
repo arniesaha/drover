@@ -3,9 +3,11 @@
 import json
 import os
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import duckdb
 import pytest
@@ -56,6 +58,54 @@ def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.1):
             return True
         time.sleep(interval)
     return False
+
+
+def test_start_returns_before_the_backlog_is_ingested(lh):
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini"
+    host_dir.mkdir()
+    _write_event(host_dir / "backlog-001.jsonl", "backlog-001")
+
+    release = threading.Event()
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    real = w._handler._maybe_ingest
+
+    def slow_ingest(path):
+        release.wait(timeout=10)
+        real(path)
+
+    with mock.patch.object(w._handler, "_maybe_ingest", side_effect=slow_ingest):
+        started = time.monotonic()
+        w.start()
+        try:
+            assert time.monotonic() - started < 1.0, "start() waited on the backlog"
+            assert not w.backlog_done.is_set()
+            release.set()
+            assert w.backlog_done.wait(timeout=10), "backlog never finished"
+            assert not (host_dir / "backlog-001.jsonl").exists()
+            assert (host_dir / ".processed" / "backlog-001.jsonl").exists()
+        finally:
+            release.set()
+            w.stop()
+
+
+def test_backlog_failure_still_marks_backlog_done(lh):
+    incoming, parquet_dir, db_path = lh
+    (incoming / "macmini").mkdir()
+    _write_event(incoming / "macmini" / "backlog-002.jsonl", "backlog-002")
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    with mock.patch.object(
+        w._handler, "_maybe_ingest", side_effect=RuntimeError("boom")
+    ):
+        w.start()
+        try:
+            assert w.backlog_done.wait(timeout=10)
+        finally:
+            w.stop()
 
 
 def test_watcher_picks_up_dropped_file(lh):
