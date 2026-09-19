@@ -180,11 +180,13 @@ The generated plist environment and an `env -i` wrapper prevent inherited
 launchd provider settings or token overrides from selecting personal accounts.
 Staging never shares personal databases, pairing state, credentials, provider
 homes, or logs. The tool rejects symlinks throughout staging runtime state,
-including implicit provider homes and individual stdout/stderr files. Only
-cache-internal links are allowed, for uv wheel archives; dangling links and
-links outside the cache are rejected. Candidate code must contain the enforced
-credential-boundary module; preparation and
-activation refuse older releases that lack it.
+including implicit provider homes and individual stdout/stderr files. It allows
+only cache-internal links for uv wheel archives and Codex's three fixed
+executable aliases below `.codex/tmp/arg0`. Each Codex alias must resolve to an
+owner- or root-owned, non-writable executable in the package selected by the
+fixed staging `PATH`; dangling or differently named links remain rejected.
+Candidate code must contain the enforced credential-boundary module;
+preparation and activation refuse older releases that lack it.
 
 The checked-in plist files are examples with placeholders; `stage.py` renders
 actual definitions under the staging root. Do not install examples directly.

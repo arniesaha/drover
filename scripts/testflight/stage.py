@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -90,6 +91,41 @@ def private_dir(root: Path, relative: str) -> Path:
     return path
 
 
+def trusted_codex_alias(root: Path, path: Path) -> bool:
+    """Accept only Codex's fixed executable aliases from the installed package."""
+    try:
+        relative = path.relative_to(root).parts
+    except ValueError:
+        return False
+    if (
+        len(relative) != 6
+        or relative[:4] != ("home", ".codex", "tmp", "arg0")
+        or not re.fullmatch(r"codex-arg0[A-Za-z0-9_-]+", relative[4])
+        or relative[5] not in {"applypatch", "apply_patch", "codex-execve-wrapper"}
+    ):
+        return False
+    launcher = shutil.which("codex", path=SAFE_PATH)
+    if not launcher:
+        return False
+    try:
+        installed_launcher = Path(launcher).resolve(strict=True)
+        target = path.resolve(strict=True)
+        metadata = target.stat()
+    except (OSError, RuntimeError):
+        return False
+    if installed_launcher.name != "codex.js" or installed_launcher.parent.name != "bin":
+        return False
+    package = installed_launcher.parent.parent
+    return (
+        target.name == "codex"
+        and target.is_relative_to(package)
+        and stat.S_ISREG(metadata.st_mode)
+        and bool(metadata.st_mode & 0o111)
+        and not (metadata.st_mode & 0o022)
+        and metadata.st_uid in (0, os.getuid())
+    )
+
+
 def validate_runtime_paths(root: Path) -> None:
     # Provider libraries discover descendants implicitly, not just config keys.
     # Only cache links may resolve within their own tree (uv wheel archives).
@@ -100,13 +136,18 @@ def validate_runtime_paths(root: Path) -> None:
             for directory, directories, files in os.walk(base, followlinks=False):
                 for name in [*directories, *files]:
                     path = Path(directory) / name
-                    if relative == "cache" and path.is_symlink():
-                        try:
-                            target = path.resolve(strict=True)
-                        except (OSError, RuntimeError) as exc:
-                            raise StageError("invalid staging cache link") from exc
-                        if not target.is_relative_to(base):
-                            raise StageError("cache link leaves staging cache")
+                    if path.is_symlink():
+                        if relative == "cache":
+                            try:
+                                target = path.resolve(strict=True)
+                            except (OSError, RuntimeError) as exc:
+                                raise StageError("invalid staging cache link") from exc
+                            if not target.is_relative_to(base):
+                                raise StageError("cache link leaves staging cache")
+                        elif trusted_codex_alias(root, path):
+                            continue
+                        else:
+                            confined(root, str(path.relative_to(root)))
                     else:
                         confined(root, str(path.relative_to(root)))
 
