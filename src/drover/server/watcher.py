@@ -468,7 +468,6 @@ class IncomingWatcher:
         self._sweeper: threading.Thread | None = None
         self._stopping = threading.Event()
         self.backlog_done = threading.Event()
-        self._backlog: threading.Thread | None = None
         self._parquet_dir = Path(parquet_dir)
         self._duckdb_path = Path(duckdb_path)
         self._observer: Observer | None = None
@@ -481,31 +480,26 @@ class IncomingWatcher:
 
     def start(self) -> None:
         self._incoming.mkdir(parents=True, exist_ok=True)
-        # The observer goes first so nothing written from here on is missed;
-        # the backlog pass then picks up whatever was already here. A file seen
-        # by both is ingested once: `_maybe_ingest` re-checks `path.is_file()`
-        # once it holds `self._lock`, so whichever caller loses the race to
-        # the lock finds the file already moved and returns without touching it.
+        # The backlog runs here, on the caller's thread, before the observer,
+        # the retention sweeps or anything after `start()` in `run()`. 0.4.16
+        # moved it onto a thread so the port could bind sooner; in production
+        # that put the backlog, the sweeps and every worker on a slow disk at
+        # the moment the fleet started polling, and `/harness` answered
+        # "fleet listing busy" for eight minutes until the release was rolled
+        # back. A later bind is the cheaper failure.
+        self._ingest_backlog()
         observer = Observer()
         observer.schedule(self._handler, str(self._incoming), recursive=True)
         observer.start()
         self._observer = observer
-        self._backlog = threading.Thread(
-            target=self._ingest_backlog, name="drover-incoming-backlog", daemon=True
-        )
-        self._backlog.start()
         log.info("watcher started on %s", self._incoming)
         self._start_sweeper()
 
     def _ingest_backlog(self) -> None:
         """Ingest files that were already waiting when the watcher started.
 
-        Off the caller's thread: `run()` starts the watcher before it binds the
-        metrics port, and a backlog of a dozen files held the bind for 49 s.
-        Nothing else tells an operator when this pass finished, so the
-        `finally` block logs how many files it attempted and how long that
-        took -- including when the pass exits early because `_stopping` is
-        set.
+        Logs how many files it attempted and how long that took, so the
+        backlog's share of a restart is visible on its own.
         """
         started = time.monotonic()
         attempted = 0
@@ -569,9 +563,6 @@ class IncomingWatcher:
 
     def stop(self) -> None:
         self._stopping.set()
-        if self._backlog is not None:
-            self._backlog.join(timeout=5)
-            self._backlog = None
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
