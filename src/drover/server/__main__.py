@@ -223,8 +223,20 @@ def _register_stack_dump() -> None:
     than once (#331), and each time the only mitigation was a restart that
     destroyed the evidence. py-spy needs root on macOS; this does not.
     `kill -USR1 <pid>` writes the stacks to the server's stderr log.
+
+    The process's own stderr (`sys.__stderr__`), not `sys.stderr`: that is the
+    descriptor launchd points at the log, and a replaced stream -- click's
+    CliRunner, for one -- has no descriptor for faulthandler to write to.
+    Diagnostics must never stop the server, so a failure is logged and ignored.
     """
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    stream = sys.__stderr__
+    if stream is None:
+        log.debug("no stderr to dump stacks to; SIGUSR1 dump not registered")
+        return
+    try:
+        faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True)
+    except (OSError, ValueError) as exc:
+        log.debug("SIGUSR1 stack dump not registered: %s", exc)
 
 
 def _warm_cockpit(service: "CockpitService") -> None:
