@@ -1483,6 +1483,17 @@ class HarnessRegistry:
         return turn_ids
 
     def latest_session_previews(self, session_ids: list[str]) -> dict[str, str]:
+        """The preview line for each session, cheapest source first.
+
+        `payload_json` is deliberately absent from the candidate window.
+        `harness_events` has no index on `session_id`, so that window is a
+        full scan, and `payload_json` is the largest column in the store:
+        carrying it made every fleet listing read it from disk while holding
+        the control-plane lock. On 2026-09-19 that left 72 threads queued on
+        the lock and `/harness` answering 503 for eight minutes (drover#331).
+        Almost every row has a usable `content_preview`; the few that do not
+        get one narrow follow-up query keyed on `event_id`.
+        """
         session_ids = [session_id for session_id in session_ids if session_id]
         if not session_ids:
             return {}
@@ -1491,12 +1502,12 @@ class HarnessRegistry:
             rows = _rows(
                 con,
                 f"""
-                SELECT session_id, event_type, content_preview, payload_json
+                SELECT session_id, event_id, event_type, content_preview
                 FROM (
                   SELECT session_id,
+                         event_id,
                          event_type,
                          content_preview,
-                         payload_json,
                          row_number() OVER (
                            PARTITION BY session_id
                            ORDER BY CASE event_type
@@ -1517,15 +1528,61 @@ class HarnessRegistry:
                 """,
                 [*session_ids, _SESSION_PREVIEW_CANDIDATE_LIMIT],
             )
-        previews: dict[str, str] = {}
-        for row in rows:
+            previews: dict[str, str] = {}
+            # Candidates whose stored preview was blank, in the same order the
+            # window returned them, so the fallback picks what it always did.
+            pending: list[dict[str, Any]] = []
+            for row in rows:
+                session_id = str(row.get("session_id") or "")
+                if not session_id or session_id in previews:
+                    continue
+                stored = str(row.get("content_preview") or "").strip()
+                if stored:
+                    preview = HarnessRegistry._safe_session_preview(stored)
+                    if preview:
+                        previews[session_id] = preview
+                        continue
+                pending.append(row)
+            pending = [
+                row
+                for row in pending
+                if str(row.get("session_id") or "") not in previews
+            ]
+            if not pending:
+                return previews
+            payloads = self._event_payloads(
+                con, [str(row.get("event_id") or "") for row in pending]
+            )
+        for row in pending:
             session_id = str(row.get("session_id") or "")
             if not session_id or session_id in previews:
                 continue
-            preview = self._session_event_preview(row)
+            preview = self._session_event_preview(
+                {**row, "payload_json": payloads.get(str(row.get("event_id") or ""))}
+            )
             if preview:
                 previews[session_id] = preview
         return previews
+
+    @staticmethod
+    def _event_payloads(
+        con: duckdb.DuckDBPyConnection, event_ids: list[str]
+    ) -> dict[str, str]:
+        """`payload_json` for the handful of candidates with no preview."""
+        event_ids = [event_id for event_id in event_ids if event_id]
+        if not event_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in event_ids)
+        rows = _rows(
+            con,
+            f"SELECT event_id, payload_json FROM harness_events "
+            f"WHERE event_id IN ({placeholders})",
+            list(event_ids),
+        )
+        return {
+            str(row.get("event_id") or ""): str(row.get("payload_json") or "")
+            for row in rows
+        }
 
     def latest_live_recaps(self, session_ids: list[str]) -> dict[str, LiveRecap]:
         """Return the durable recap projection for the requested sessions."""

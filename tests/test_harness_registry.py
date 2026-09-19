@@ -1705,3 +1705,80 @@ def test_the_migration_stamps_every_survivor_so_a_replay_cannot_return(tmp_path)
     )
 
     assert len(registry.list_events("s1")) == 1
+
+
+def _spy_on_rows(monkeypatch):
+    """Record every SQL statement `latest_session_previews` runs."""
+    seen: list[str] = []
+    real = registry_module._rows
+
+    def spy(con, query, params):
+        seen.append(query)
+        return real(con, query, params)
+
+    monkeypatch.setattr(registry_module, "_rows", spy)
+    return seen
+
+
+def test_latest_session_previews_does_not_scan_payload_json(tmp_path, monkeypatch):
+    """The candidate window must not carry `payload_json`.
+
+    `harness_events` has no index on `session_id`, so this is a full scan of
+    the table, and `payload_json` is the largest column in the store (171 MB
+    of 240 MB). Reading it every render is what held the control-plane lock
+    while 72 threads queued behind it on 2026-09-19; the stacks are in
+    drover#331.
+    """
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="harness-session-scan",
+        host_id="mac-mini",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        session_id="harness-session-scan",
+        event_type="user_input",
+        payload={"text": "hello"},
+        content_preview="hello",
+    )
+    seen = _spy_on_rows(monkeypatch)
+
+    registry.latest_session_previews(["harness-session-scan"])
+
+    windows = [q for q in seen if "row_number()" in q]
+    assert windows, "the candidate window query did not run"
+    for query in windows:
+        assert "payload_json" not in query, query
+
+
+def test_latest_session_previews_reads_payload_only_when_preview_is_blank(
+    tmp_path, monkeypatch
+):
+    registry, _ = _registry(tmp_path)
+    for session_id, preview in (
+        ("harness-session-has-preview", "ready to go"),
+        ("harness-session-blank", ""),
+    ):
+        registry.create_session(
+            session_id=session_id,
+            host_id="mac-mini",
+            harness="codex",
+            command="codex",
+        )
+        registry.append_event(
+            session_id=session_id,
+            event_type="user_input",
+            payload={"text": "payload text for the blank one"},
+            content_preview=preview,
+        )
+
+    seen = _spy_on_rows(monkeypatch)
+    previews = registry.latest_session_previews(["harness-session-has-preview"])
+    assert previews == {"harness-session-has-preview": "ready to go"}
+    assert not [q for q in seen if "payload_json" in q], "read payloads it did not need"
+
+    seen.clear()
+    previews = registry.latest_session_previews(["harness-session-blank"])
+    assert previews == {"harness-session-blank": "payload text for the blank one"}
+    assert [q for q in seen if "payload_json" in q], "never fetched the fallback"
