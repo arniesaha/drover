@@ -107,6 +107,8 @@ class _Handler(FileSystemEventHandler):
             return
 
         with self._lock:
+            if not path.is_file():  # moved by another caller while we waited
+                return
             attempts = self._max_lock_retries + 1
             for attempt in range(1, attempts + 1):
                 try:
@@ -481,7 +483,9 @@ class IncomingWatcher:
         self._incoming.mkdir(parents=True, exist_ok=True)
         # The observer goes first so nothing written from here on is missed;
         # the backlog pass then picks up whatever was already here. A file seen
-        # by both is ingested once and moved, and ingest dedupes regardless.
+        # by both is ingested once: `_maybe_ingest` re-checks `path.is_file()`
+        # once it holds `self._lock`, so whichever caller loses the race to
+        # the lock finds the file already moved and returns without touching it.
         observer = Observer()
         observer.schedule(self._handler, str(self._incoming), recursive=True)
         observer.start()

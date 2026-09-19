@@ -1,6 +1,7 @@
 """Tests for src/drover/server/watcher.py."""
 
 import json
+import logging
 import os
 import shutil
 import threading
@@ -106,6 +107,59 @@ def test_backlog_failure_still_marks_backlog_done(lh):
             assert w.backlog_done.wait(timeout=10)
         finally:
             w.stop()
+
+
+def test_maybe_ingest_rechecks_file_existence_under_the_lock(lh, caplog):
+    """A file moved by a concurrent caller while this one waited on the lock
+    must not be logged as an ingest failure.
+
+    `_maybe_ingest`'s outer `path.is_file()` check runs before `self._lock`
+    is acquired, so two callers -- the live observer and the startup backlog
+    pass, say -- can both pass it for the same file. Without a re-check once
+    the lock is held, the loser calls `_ingest_once` on a file the winner
+    already moved to `.processed/`; `ingest_file` then raises
+    `FileNotFoundError`, which is not DuckDB lock contention, so it is logged
+    as `log.exception("ingest failed for %s; leaving file in place", path)` --
+    a false ERROR for what is actually a benign, already-handled outcome.
+    """
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini"
+    host_dir.mkdir()
+    path = host_dir / "race.jsonl"
+    _write_event(path, "race-001")
+
+    handler = _Handler(parquet_dir, db_path)
+    caplog.set_level(logging.ERROR)
+
+    handler._lock.acquire()
+    try:
+        thread = threading.Thread(target=handler._maybe_ingest, args=(path,))
+        thread.start()
+        # There is no event to wait on for "another thread is now blocked
+        # acquiring a lock", so a bounded join is the most deterministic
+        # signal available short of instrumenting the lock itself: it gives
+        # the thread time to clear the outer is_file() check and reach
+        # self._lock, and it fails loudly via the assertion below -- rather
+        # than racing ahead silently -- if that did not happen within the
+        # timeout. This is polling a fixed condition to a hard deadline, not
+        # a bare sleep-as-synchronisation.
+        thread.join(timeout=1)
+        assert thread.is_alive(), "thread did not block on the lock as expected"
+
+        processed = host_dir / ".processed"
+        processed.mkdir(exist_ok=True)
+        target = processed / path.name
+        shutil.move(str(path), str(target))
+    finally:
+        handler._lock.release()
+
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "_maybe_ingest never returned"
+    assert target.exists(), "the winner's move must be left untouched"
+    assert not path.exists()
+    assert not any(
+        record.levelno >= logging.ERROR for record in caplog.records
+    ), "a file moved by another caller must not be logged as a failure"
 
 
 def test_watcher_picks_up_dropped_file(lh):
