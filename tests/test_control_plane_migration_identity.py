@@ -301,10 +301,23 @@ def test_prune_drops_a_table_whose_only_gaps_are_past_retention(tmp_path):
     )
     _control_plane_holding_advisory_occurrences(db, ids=["new-1"])  # old-1 was swept
 
+    # A dry run must report exactly what `--apply` would destroy: one legacy
+    # row (`old-1`) is missing from the control plane only because it is past
+    # retention, and `missing=0` alone gives an operator no way to see that.
+    dry_run_report = prune_legacy_control_plane_tables(
+        con, db, apply=False, retention_days={"advisory_occurrences": 30}
+    )
+    assert (
+        dry_run_report["tables"]["advisory_occurrences"]["exempt_past_retention"] == 1
+    )
+    assert dry_run_report["tables"]["advisory_occurrences"]["dropped"] is False
+    assert _advisory_occurrences_table_exists(con)
+
     report = prune_legacy_control_plane_tables(
         con, db, apply=True, retention_days={"advisory_occurrences": 30}
     )
 
+    assert report["tables"]["advisory_occurrences"]["exempt_past_retention"] == 1
     assert report["tables"]["advisory_occurrences"]["dropped"] is True
     assert "advisory_occurrences" not in {
         r[0]
@@ -380,6 +393,28 @@ def test_prune_refuses_negative_retention_and_drops_nothing(tmp_path):
     with pytest.raises(ValueError):
         prune_legacy_control_plane_tables(
             con, db, apply=True, retention_days={"advisory_occurrences": -1}
+        )
+
+    assert _advisory_occurrences_table_exists(con)
+
+
+def test_prune_refuses_fractional_retention_below_one_day_and_drops_nothing(
+    tmp_path,
+):
+    """A float in (0, 1) must not slip past the guard: `int(days)` truncates
+    it to 0, which reads as "every row is past retention" and would exempt
+    everything from `missing`. The guard has to check the truncated value,
+    not the raw one.
+    """
+    db = tmp_path / "drover.duckdb"
+    con = _analytical_with_legacy_advisory_occurrences(
+        db, rows=[("old-1", _days_ago(45))]
+    )
+    _control_plane_holding_advisory_occurrences(db, ids=[])
+
+    with pytest.raises(ValueError):
+        prune_legacy_control_plane_tables(
+            con, db, apply=True, retention_days={"advisory_occurrences": 0.5}
         )
 
     assert _advisory_occurrences_table_exists(con)

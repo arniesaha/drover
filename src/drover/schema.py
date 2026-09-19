@@ -2138,7 +2138,7 @@ def prune_legacy_control_plane_tables(
                 f"{sorted(unknown)}"
             )
         for table, days in retention_days.items():
-            if days <= 0:
+            if int(days) <= 0:
                 raise ValueError(
                     f"retention_days[{table!r}] must be a positive number of "
                     f"days, got {days!r}"
@@ -2168,18 +2168,37 @@ def prune_legacy_control_plane_tables(
                 continue
             if table == HARNESS_EVENTS_TABLE:
                 rows, missing = _harness_events_gap(con, alias)
+                # No retention column applies to this table (see
+                # `_RETENTION_COLUMNS`), so nothing is ever exempted here.
+                exempt_past_retention = 0
             else:
                 key = CONTROL_PLANE_PRIMARY_KEYS[table]
                 rows = _scalar_int(con, f"SELECT count(*) FROM main.{table}")
                 cutoff_sql = ""
                 params: list[Any] = []
+                exempt_past_retention = 0
                 if retention_days and table in retention_days:
                     cutoff_sql = f" AND src.{_RETENTION_COLUMNS[table]} >= ?"
                     # Same arithmetic as sweep_advisory_occurrences, so the
-                    # two agree on which rows are past the window.
-                    params.append(
-                        datetime.now(timezone.utc)
-                        - timedelta(days=int(retention_days[table]))
+                    # two agree on which rows are past the window. Computed
+                    # once and reused for both counts below, so "missing" and
+                    # "exempt_past_retention" can never disagree on the cutoff.
+                    cutoff = datetime.now(timezone.utc) - timedelta(
+                        days=int(retention_days[table])
+                    )
+                    params.append(cutoff)
+                    # Legacy rows the retention cutoff exempts from `missing`
+                    # above -- i.e. what `--apply` will actually destroy for
+                    # this table when it drops the whole legacy copy. Without
+                    # this, a dry run reporting `missing=0` gives no way to
+                    # tell how many rows the DROP takes with it.
+                    exempt_past_retention = _scalar_int(
+                        con,
+                        f"SELECT count(*) FROM main.{table} src "
+                        f"WHERE src.{_RETENTION_COLUMNS[table]} < ? "
+                        f"AND NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
+                        f"WHERE dst.{key} = src.{key})",
+                        [cutoff],
                     )
                 missing = _scalar_int(
                     con,
@@ -2192,6 +2211,7 @@ def prune_legacy_control_plane_tables(
                 "rows": rows,
                 "missing": missing,
                 "dropped": False,
+                "exempt_past_retention": exempt_past_retention,
             }
     finally:
         con.execute(f"DETACH {alias}")
