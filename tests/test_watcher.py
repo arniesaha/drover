@@ -109,6 +109,31 @@ def test_backlog_failure_still_marks_backlog_done(lh):
             w.stop()
 
 
+def test_backlog_logs_when_the_pass_finishes(lh, caplog):
+    """Nothing else tells an operator when the startup backlog pass finished
+    since it stopped blocking `start()`; the `finally` block in
+    `_ingest_backlog` must log a count and duration at INFO.
+    """
+    incoming, parquet_dir, db_path = lh
+    (incoming / "macmini").mkdir()
+    _write_event(incoming / "macmini" / "backlog-003.jsonl", "backlog-003")
+    w = IncomingWatcher(
+        incoming_dir=incoming, parquet_dir=parquet_dir, duckdb_path=db_path
+    )
+    caplog.set_level(logging.INFO, logger="drover.watcher")
+    w.start()
+    try:
+        assert w.backlog_done.wait(timeout=10)
+        assert any(
+            record.name == "drover.watcher"
+            and record.levelno == logging.INFO
+            and "watcher backlog: 1 file(s)" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        w.stop()
+
+
 def test_maybe_ingest_rechecks_file_existence_under_the_lock(lh, caplog):
     """A file moved by a concurrent caller while this one waited on the lock
     must not be logged as an ingest failure.

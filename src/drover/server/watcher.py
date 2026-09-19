@@ -502,16 +502,25 @@ class IncomingWatcher:
 
         Off the caller's thread: `run()` starts the watcher before it binds the
         metrics port, and a backlog of a dozen files held the bind for 49 s.
+        Nothing else tells an operator when this pass finished, so the
+        `finally` block logs how many files it attempted and how long that
+        took -- including when the pass exits early because `_stopping` is
+        set.
         """
+        started = time.monotonic()
+        attempted = 0
         try:
             for jsonl in sorted(self._incoming.rglob("*.jsonl")):
                 if self._stopping.is_set():
                     return
+                attempted += 1
                 try:
                     self._handler._maybe_ingest(jsonl)
                 except Exception:  # noqa: BLE001 - one bad file must not end the pass
                     log.exception("backlog ingest failed for %s", jsonl)
         finally:
+            elapsed = time.monotonic() - started
+            log.info("watcher backlog: %d file(s) in %.1fs", attempted, elapsed)
             self.backlog_done.set()
 
     def _start_sweeper(self) -> None:
