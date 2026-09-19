@@ -337,6 +337,29 @@ def test_github_configuration_streams_secrets_and_protects_main() -> None:
     )
 
 
+def test_github_configuration_enables_prevent_self_review_when_requested() -> None:
+    runner = RecordingRunner()
+    provision.configure_github(
+        runner=runner,
+        repository="arniesaha/drover",
+        reviewer_id=5678,
+        public_origin="https://stage.example.test",
+        preflight_token="preflight-private-value",
+        distribution_values={},
+        appstore_values={},
+        prevent_self_review=True,
+    )
+    environment_calls = [
+        call
+        for call in runner.calls
+        if "/environments/" in " ".join(call[0]) and call[0][2:4] == ["--method", "PUT"]
+    ]
+    assert environment_calls
+    assert all(
+        json.loads(body)["prevent_self_review"] is True for _, body in environment_calls
+    )
+
+
 def test_github_configuration_removes_non_main_deployment_policies() -> None:
     runner = RecordingRunner()
     original_run = runner.run
@@ -483,6 +506,65 @@ def test_missing_tunnel_is_created_before_local_configuration(tmp_path: Path) ->
         str(cloudflare_home / "drover-testflight.json"),
         "drover-testflight",
     ] in [call for call, _ in runner.calls]
+    assert (cloudflare_home / f"{tunnel_id}.json").is_file()
+    assert not (cloudflare_home / "drover-testflight.json").exists()
+    config_text = (tmp_path / "stage/tunnel/cloudflared.yml").read_text()
+    assert str(cloudflare_home / f"{tunnel_id}.json") in config_text
+
+
+def test_tunnel_create_then_rerun_reuses_canonical_credentials(tmp_path: Path) -> None:
+    """Create normalizes credentials to {tunnel_id}.json so a rerun succeeds."""
+    runner = RecordingRunner()
+    tunnel_id = "11111111-2222-3333-4444-555555555555"
+    cloudflare_home = tmp_path / "cloudflare"
+    cloudflare_home.mkdir()
+    listings = 0
+    original_run = runner.run
+
+    def run(arguments, **kwargs):
+        nonlocal listings
+        if arguments[-4:] == ["tunnel", "list", "--output", "json"]:
+            listings += 1
+            runner.calls.append((arguments, kwargs.get("input_text")))
+            # First configure_tunnel: empty inventory, then post-create. Rerun: present.
+            records = [] if listings == 1 else [
+                {"id": tunnel_id, "name": "drover-testflight"}
+            ]
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(records), "")
+        if "create" in arguments and arguments[-1] == "drover-testflight":
+            staging = cloudflare_home / "drover-testflight.json"
+            staging.write_text("private-credential", encoding="utf-8")
+            staging.chmod(0o600)
+        return original_run(arguments, **kwargs)
+
+    runner.run = run
+    root = tmp_path / "stage"
+    provision.configure_tunnel(
+        runner=runner,
+        root=root,
+        hostname="stage.example.test",
+        cloudflared=Path("/opt/homebrew/bin/cloudflared"),
+        cloudflare_home=cloudflare_home,
+    )
+    canonical = cloudflare_home / f"{tunnel_id}.json"
+    assert canonical.is_file()
+    assert not (cloudflare_home / "drover-testflight.json").exists()
+
+    provision.configure_tunnel(
+        runner=runner,
+        root=root,
+        hostname="stage.example.test",
+        cloudflared=Path("/opt/homebrew/bin/cloudflared"),
+        cloudflare_home=cloudflare_home,
+    )
+    create_calls = [
+        call
+        for call, _ in runner.calls
+        if len(call) >= 3 and call[1:3] == ["tunnel", "create"]
+    ]
+    assert len(create_calls) == 1
+    assert canonical.read_text(encoding="utf-8") == "private-credential"
+    assert str(canonical) in (root / "tunnel/cloudflared.yml").read_text()
 
 
 def test_staging_flow_uses_isolated_provider_and_keeps_token_off_argv(
@@ -667,6 +749,72 @@ def test_audit_cli_returns_nonzero_and_machine_readable_blockers(
     }
 
 
+def test_apply_cli_returns_nonzero_when_final_audit_is_blocked(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    answers = iter(["APPLY"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    monkeypatch.setattr(provision.getpass, "getpass", lambda _: "p12-private")
+    runner = RecordingRunner()
+    original_run = runner.run
+
+    def run(arguments, **kwargs):
+        if arguments[-2:] == ["rev-parse", "origin/main"]:
+            runner.calls.append((arguments, kwargs.get("input_text")))
+            return subprocess.CompletedProcess(arguments, 0, "a" * 40 + "\n", "")
+        if arguments[:3] == ["gh", "api", "user"]:
+            runner.calls.append((arguments, kwargs.get("input_text")))
+            return subprocess.CompletedProcess(arguments, 0, "1234\n", "")
+        return original_run(arguments, **kwargs)
+
+    runner.run = run
+    monkeypatch.setattr(provision, "SubprocessRunner", lambda: runner)
+    monkeypatch.setattr(
+        provision,
+        "apply_provisioning",
+        lambda **_: {"device": True, "tunnel": False},
+    )
+
+    status = provision.main(
+        [
+            "apply",
+            "--source",
+            str(tmp_path / "repo"),
+            "--root",
+            str(tmp_path / "stage"),
+            "--repository",
+            "arniesaha/drover",
+            "--public-origin",
+            "https://stage.example.test",
+            "--harness",
+            "claude-code",
+            "--provider-credential",
+            str(tmp_path / "anthropic_api_key"),
+            "--p12",
+            str(tmp_path / "distribution.p12"),
+            "--profile",
+            str(tmp_path / "profile.mobileprovision"),
+            "--asc-key",
+            str(tmp_path / "AuthKey_EXAMPLE123.p8"),
+            "--asc-key-id",
+            "EXAMPLE123",
+            "--asc-issuer-id",
+            "11111111-2222-3333-4444-555555555555",
+            "--reviewer-id",
+            "1234",
+            "--cloudflared",
+            "/opt/homebrew/bin/cloudflared",
+            "--cloudflare-home",
+            str(tmp_path / "cloudflare"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert "BLOCKED" in captured.out
+    assert "tunnel" in captured.out
+
+
 def test_apply_requires_typed_confirmation_before_any_mutation(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -782,6 +930,7 @@ def test_apply_runs_confirmed_phases_and_writes_only_nonsecret_state(
         assert kwargs["preflight_token"] == "preflight-secret"
         assert kwargs["distribution_values"] is distribution
         assert kwargs["appstore_values"] is appstore
+        assert kwargs["prevent_self_review"] is True
 
     monkeypatch.setattr(provision, "configure_github", github)
     monkeypatch.setattr(
@@ -791,8 +940,18 @@ def test_apply_runs_confirmed_phases_and_writes_only_nonsecret_state(
     )
     confirmations: list[str] = []
 
+    runner = RecordingRunner()
+    original_run = runner.run
+
+    def run(arguments, **kwargs):
+        if arguments[:3] == ["gh", "api", "user"]:
+            runner.calls.append((arguments, kwargs.get("input_text")))
+            return subprocess.CompletedProcess(arguments, 0, "9999\n", "")
+        return original_run(arguments, **kwargs)
+
+    runner.run = run
     report = provision.apply_provisioning(
-        runner=RecordingRunner(),
+        runner=runner,
         source=tmp_path / "repo",
         root=tmp_path / "stage",
         repository="arniesaha/drover",

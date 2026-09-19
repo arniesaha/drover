@@ -335,6 +335,7 @@ def configure_github(
     preflight_token: str,
     distribution_values: dict[str, str],
     appstore_values: dict[str, str],
+    prevent_self_review: bool = False,
 ) -> None:
     """Protect both environments and stream their values through stdin."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -348,7 +349,7 @@ def configure_github(
     environment_payload = json.dumps(
         {
             "wait_timer": 0,
-            "prevent_self_review": False,
+            "prevent_self_review": bool(prevent_self_review),
             "reviewers": [{"type": "User", "id": reviewer_id}],
             "deployment_branch_policy": {
                 "protected_branches": False,
@@ -490,8 +491,9 @@ def configure_tunnel(
             raise ProvisionError("Cloudflare tunnel inventory was invalid") from exc
 
     matches = matching_tunnels()
-    created_credentials = cloudflare_home / f"{tunnel_name}.json"
-    created = False
+    # cloudflared's normal on-disk name is {tunnel_id}.json; create may stage
+    # under the tunnel name until the id is known, then we normalize.
+    staging_credentials = cloudflare_home / f"{tunnel_name}.json"
     if not matches:
         runner.run(
             [
@@ -499,21 +501,22 @@ def configure_tunnel(
                 "tunnel",
                 "create",
                 "--credentials-file",
-                str(created_credentials),
+                str(staging_credentials),
                 tunnel_name,
             ],
             env=cloudflare_env,
         )
-        created = True
         matches = matching_tunnels()
     if len(matches) != 1:
         raise ProvisionError("expected exactly one active Drover TestFlight tunnel")
     tunnel_id = str(matches[0].get("id", "")).lower()
     if not TUNNEL_ID.fullmatch(tunnel_id):
         raise ProvisionError("Cloudflare tunnel identifier was invalid")
-    credentials = (
-        created_credentials if created else cloudflare_home / f"{tunnel_id}.json"
-    )
+    credentials = cloudflare_home / f"{tunnel_id}.json"
+    if not credentials.is_file() and staging_credentials.is_file():
+        if credentials.exists() or credentials.is_symlink():
+            raise ProvisionError("tunnel credential path is unsafe")
+        staging_credentials.rename(credentials)
     for relative in ("home", "logs"):
         directory = root.resolve() / relative
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -891,6 +894,18 @@ def apply_provisioning(
 
     if not confirm("Write the protected GitHub environments, variable, and secrets"):
         raise ProvisionError("GitHub configuration was not confirmed")
+    actor_id = int(
+        runner.run(["gh", "api", "user", "--jq", ".id"]).stdout.strip()
+    )
+    prevent_self_review = reviewer_id != actor_id
+    if not prevent_self_review:
+        print(
+            "warning: required reviewer matches the authenticated gh user; "
+            "prevent_self_review stays disabled so solo self-approve remains "
+            "possible. Pass a different --reviewer-id to require a second "
+            "person.",
+            file=sys.stderr,
+        )
     configure_github(
         runner=runner,
         repository=repository,
@@ -899,6 +914,7 @@ def apply_provisioning(
         preflight_token=preflight_token,
         distribution_values=distribution,
         appstore_values=appstore,
+        prevent_self_review=prevent_self_review,
     )
     record = {
         "source_sha": sha,
@@ -1100,7 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             for name, ready in report.items():
                 print(f"{'OK' if ready else 'BLOCKED':7} {name}")
-            return 0
+            return 0 if all(report.values()) else 1
     except ProvisionError as error:
         print(f"provisioning failed: {error}", file=sys.stderr)
         return 1

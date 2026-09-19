@@ -52,7 +52,10 @@ Defaults and prompts:
 
 - Source is the current checkout; candidate SHA is its fetched `origin/main`.
 - GitHub repository is `arniesaha/drover`; the required reviewer defaults to
-  the authenticated `gh` user.
+  the authenticated `gh` user. When that default is used, `prevent_self_review`
+  stays disabled so a solo operator can approve their own Environment
+  deployments. Pass `--reviewer-id` for a different GitHub user to enable
+  `prevent_self_review` and block silent self-approve.
 - The ASC key ID is inferred from `AuthKey_<KEY_ID>.p8` when possible.
 - The PKCS#12 password is read with a hidden prompt, never a CLI argument.
 - Missing `cloudflared` can be installed with Homebrew only after typing
@@ -104,7 +107,7 @@ provisioning profile matching `com.arnab.drover`. Encode them the same way
 | `DROVER_DISTRIBUTION_TEAM_ID` | Ten-character team ID (`^[A-Z0-9]{10}$`) |
 | `DROVER_DISTRIBUTION_PROFILE_UUID` | Profile UUID from the provision file |
 | `DROVER_DISTRIBUTION_IDENTITY_SHA1` | 40-hex SHA-1 of the distribution certificate |
-| `DROVER_DISTRIBUTION_IDENTITY_NAME` | Exact common name: `Apple Distribution: … (TEAM_ID)` |
+| `DROVER_DISTRIBUTION_IDENTITY_NAME` | Exact common name: `Apple Distribution: ... (TEAM_ID)` |
 
 The setup script fails closed if any of these are missing or mismatched. Do not
 invent placeholder values in the repository.
@@ -172,7 +175,7 @@ Keep credentials **environment-scoped**, never repository-wide.
 Set this as a **repository** variable to the reviewed HTTPS staging origin
 (no credentials, path, query, or fragment). Avoid Environment-level overrides
 so both jobs bind to the same origin. The archive job compares the preflight
-record’s `staging_url_sha256` to this variable before signing.
+record's `staging_url_sha256` to this variable before signing.
 
 ### Environment `ios-testflight-staging`
 
@@ -220,11 +223,14 @@ In the GitHub repository: **Settings → Environments**.
 For **both** `ios-testflight-staging` and `ios-testflight-upload`:
 
 1. Create the Environment if it does not exist (names must match exactly).
-2. Enable **Required reviewers** (release owner / on-call).
+2. Enable **Required reviewers** (release owner / on-call). If the only
+   required reviewer is the same account that will dispatch, GitHub will allow
+   that person to self-approve unless `prevent_self_review` is enabled (the
+   provisioner enables it only when `--reviewer-id` differs from the `gh` user).
 3. Restrict **Deployment branches** to `main` only.
 4. Add the secrets and confirm the repository variable
    `DROVER_TESTFLIGHT_STAGING_URL` is set.
-5. Do not enable this workflow’s first live dispatch until reviewers and
+5. Do not enable this workflow's first live dispatch until reviewers and
    branch rules are in place. The interactive provisioner configures these;
    merely merging the repository changes does not.
 
@@ -273,9 +279,9 @@ env -i HOME="$STAGING_HOME" PATH=/usr/bin:/bin \
 # Store that value as Environment secret DROVER_TESTFLIGHT_PREFLIGHT_TOKEN
 # (or refresh it if rotated). Do not paste into issues, chat, or the repo.
 
-# 5. Bounded structured probe (required; gate wants a probe ≤ 30 minutes old)
+# 5. Bounded structured probe (required; gate wants a probe <= 30 minutes old)
 python3 scripts/testflight/stage.py probe \
-  --root "$STAGING_ROOT" --sha "$RELEASE_SHA" --harness claude-code
+  --root "$STAGING_ROOT" --sha "$RELEASE_SHA" --harness codex
 ```
 
 Preflight (`scripts/testflight/verify_staging.py`) will then require:
@@ -295,7 +301,7 @@ token out of argv when possible):
 
 ```sh
 export DROVER_TESTFLIGHT_STAGING_URL='https://your-staging-origin.example'
-export DROVER_TESTFLIGHT_PREFLIGHT_TOKEN='…'   # private shell only
+export DROVER_TESTFLIGHT_PREFLIGHT_TOKEN='...'   # private shell only
 python3 scripts/testflight/verify_staging.py \
   --expected-sha "$RELEASE_SHA" \
   --record "$PRIVATE_OUTPUT/preflight-record.json"
@@ -362,7 +368,7 @@ After a green `archive-upload` job:
 3. Confirm App Store Connect **users** (not external email invites) are on an
    **Internal** testing group for this build. Internal TestFlight is ASC-user
    Internal groups only; the workflow does not assign external testers.
-4. Do not treat “workflow green” as “installable on a phone” until processing
+4. Do not treat "workflow green" as "installable on a phone" until processing
    finishes and the build is available to that Internal group.
 
 This repository change never claims a live upload succeeded.
@@ -449,10 +455,10 @@ schema-compatible candidate.
 | Archive / export / verify fails | Inspect sanitized records only; fix version/build, signing, or staging URL binding. Do not publish IPA/archive artifacts to GitHub. |
 | Upload step fails | Confirm ASC API secrets, agreements, bundle ID, and that the build number is unused. Rotate the API key if exposure is suspected. |
 | Workflow green but build missing in TestFlight | Wait for Apple processing; check ASC Activity / Processing. Re-upload only with a new build number after ASC rejects or processing fails permanently. |
-| Processing fails in ASC | Read Apple’s processing error in ASC; fix signing/entitlements/ATS/privacy as indicated; bump build; re-stage probe; dispatch again from `main`. |
-| Bad candidate already on internal TestFlight | Expire or stop testing that build in ASC; roll staging back if needed; ship a fixed build number. Do not “hotfix” by rewriting history on `main`. |
+| Processing fails in ASC | Read Apple's processing error in ASC; fix signing/entitlements/ATS/privacy as indicated; bump build; re-stage probe; dispatch again from `main`. |
+| Bad candidate already on internal TestFlight | Expire or stop testing that build in ASC; roll staging back if needed; ship a fixed build number. Do not "hotfix" by rewriting history on `main`. |
 
-Credential cleanup is handled by the workflow’s `always()` step. If a job is
+Credential cleanup is handled by the workflow's `always()` step. If a job is
 cancelled mid-flight, confirm in the run log that cleanup ran; rotate secrets
 if a runner failure leaves uncertainty.
 
