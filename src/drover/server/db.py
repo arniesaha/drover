@@ -650,6 +650,89 @@ def _discard_control_plane_connection(key: str) -> None:
         log.debug("failed to close the failed control-plane connection for %s", key)
 
 
+#: What DuckDB says once a fatal error has poisoned an instance. The wording
+#: is stable across the versions this has been seen on (1.5.2) and documented
+#: behaviour rather than a bug: "the database must be restarted prior to being
+#: used again" (https://duckdb.org/docs/current/guides/troubleshooting/crashes).
+_INVALIDATED_MARKER = "database has been invalidated"
+
+
+def is_invalidated_error(exc: BaseException) -> bool:
+    """Whether ``exc`` says the instance is poisoned rather than the statement.
+
+    An ordinary ``OutOfMemoryException`` fails one statement and leaves the
+    connection usable; this is the other kind, where every later statement on
+    every connection to that file fails until the instance is gone.
+    """
+    return _INVALIDATED_MARKER in str(exc)
+
+
+def reset_invalidated_instance(duckdb_path: str | Path) -> int:
+    """Close every handle this process holds to ``duckdb_path``.
+
+    DuckDB's instance cache holds only a weak reference, so an instance lives
+    exactly as long as its connections. Closing all of them destroys the
+    poisoned instance, and the next connect builds a fresh one against the
+    file, which is intact -- only the in-memory state was lost. Long-lived
+    worker connections are what kept the hub broken until a restart (#363).
+
+    Returns how many handles were closed. Closing a connection another thread
+    is mid-statement on raises there, which is the point: those statements are
+    already failing against a dead instance.
+    """
+    closed = 0
+    key = _path_key(duckdb_path)
+    for con in live_connections(duckdb_path):
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001 - a handle that will not close is already gone
+            log.debug("could not close a handle to %s while resetting", duckdb_path)
+        closed += 1
+    with _LIVE_GUARD:
+        _LIVE_CONNECTIONS.pop(key, None)
+    # A pinned control-plane connection is not in the live set.
+    _discard_control_plane_connection(_path_key(control_plane_path(duckdb_path)))
+    if closed:
+        log.warning(
+            "closed %d handle(s) to %s after it was invalidated; reopening",
+            closed,
+            duckdb_path,
+        )
+    return closed
+
+
+def _connect_and_probe(
+    duckdb_path: Path,
+    *,
+    role: str,
+    settings_overrides: Optional[Mapping[str, str]],
+) -> duckdb.DuckDBPyConnection:
+    """Open, configure, and confirm the instance behind the handle is alive.
+
+    The probe is one in-process statement. It exists because a connect to an
+    invalidated instance *succeeds* -- the cache hands back the poisoned
+    instance -- and only the next statement fails. Without it, every caller
+    would have to recognise the invalidated state itself, and there are 80-odd
+    of them. When the probe says the instance is dead, every handle to the
+    file is closed so the instance goes with them, and the open is retried
+    once against a fresh one.
+    """
+    for attempt in (0, 1):
+        with duckdb_connect_lock(duckdb_path):
+            con = duckdb.connect(str(duckdb_path))
+        try:
+            _apply_role_settings(con, role, settings_overrides=settings_overrides)
+            con.execute("SELECT 1").fetchone()
+        except Exception as exc:
+            con.close()
+            if attempt == 0 and is_invalidated_error(exc):
+                reset_invalidated_instance(duckdb_path)
+                continue
+            raise
+        return con
+    raise AssertionError("unreachable: the retry either returns or raises")
+
+
 def open_duckdb_connection(
     duckdb_path: Path,
     *,
@@ -672,13 +755,9 @@ def open_duckdb_connection(
             "database does not exist"
         )
     try:
-        with duckdb_connect_lock(duckdb_path):
-            con = duckdb.connect(str(duckdb_path))
-        try:
-            _apply_role_settings(con, role, settings_overrides=settings_overrides)
-        except Exception:
-            con.close()
-            raise
+        con = _connect_and_probe(
+            duckdb_path, role=role, settings_overrides=settings_overrides
+        )
     except Exception as exc:
         # Remembered, then re-raised unchanged: callers keep their error, and
         # readiness gains the one piece of evidence a borrowed handle cannot
