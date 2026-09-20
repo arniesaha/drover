@@ -280,7 +280,7 @@ def test_postgres_bootstrap_serializes_concurrent_starters(tmp_path: Path):
             rows = con.execute(
                 f'SELECT version FROM "{schema}".control_schema_migrations'
             ).fetchall()
-        assert rows == [(1,)]
+        assert rows == [(1,), (2,)]
     finally:
         for store in starters:
             store.close()

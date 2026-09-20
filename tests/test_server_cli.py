@@ -699,6 +699,7 @@ def test_cli_help_lists_subcommands():
         "embeddings",
         "context",
         "archive",
+        "control-store",
         "setup-check",
     ):
         assert sub in res.output

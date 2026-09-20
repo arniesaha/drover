@@ -92,6 +92,12 @@ from drover.server.briefs.worker import (
 from drover.server.cockpit.analytics import AnalyticsFilters
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.compact import compact_table
+from drover.server.control_migration import (
+    control_store_status,
+    import_legacy_snapshot,
+    initialize_empty_control_store,
+    verify_legacy_import,
+)
 from drover.server.context_catalog import (
     diff_bundle,
     format_diff,
@@ -985,6 +991,123 @@ def harness_cmd() -> None:
 @main.group(name="archive")
 def archive_cmd() -> None:
     """Capture and compare local archive inventories."""
+
+
+@main.group(name="control-store")
+def control_store_cmd() -> None:
+    """Operate an explicit PostgreSQL serving-store lifecycle offline."""
+
+
+@control_store_cmd.command(name="status")
+@click.pass_context
+def control_store_status_cmd(ctx: click.Context) -> None:
+    """Print readiness and forward-recovery status without changing state."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    click.echo(
+        json.dumps(control_store_status(cfg.duckdb_path), default=str, sort_keys=True)
+    )
+
+
+@control_store_cmd.command(name="init")
+@click.pass_context
+def control_store_init_cmd(ctx: click.Context) -> None:
+    """Explicitly initialize a new, verified-empty PostgreSQL control store."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    try:
+        report = initialize_empty_control_store(cfg.duckdb_path)
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report, default=str, sort_keys=True))
+
+
+def _control_store_import_options(command):
+    command = click.option(
+        "--source-snapshot",
+        type=click.Path(path_type=Path, exists=True, dir_okay=False),
+        required=True,
+        help="Read-only fenced legacy control-store snapshot.",
+    )(command)
+    command = click.option(
+        "--source-timezone",
+        required=True,
+        help="IANA timezone used by legacy naive TIMESTAMP values.",
+    )(command)
+    command = click.option(
+        "--credentials",
+        "credential_document",
+        type=click.Path(path_type=Path, exists=True, dir_okay=False),
+        default=None,
+        help="Explicit JSON export of server identity and credential verifiers.",
+    )(command)
+    return command
+
+
+@control_store_cmd.command(name="import")
+@_control_store_import_options
+@click.pass_context
+def control_store_import_cmd(
+    ctx: click.Context,
+    source_snapshot: Path,
+    source_timezone: str,
+    credential_document: Path | None,
+) -> None:
+    """Import and verify a fenced snapshot; never discover a live source."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    try:
+        report = import_legacy_snapshot(
+            cfg.duckdb_path,
+            source_snapshot=source_snapshot,
+            source_timezone=source_timezone,
+            credential_document=credential_document,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report, default=str, sort_keys=True))
+
+
+@control_store_cmd.command(name="verify")
+@_control_store_import_options
+@click.pass_context
+def control_store_verify_cmd(
+    ctx: click.Context,
+    source_snapshot: Path,
+    source_timezone: str,
+    credential_document: Path | None,
+) -> None:
+    """Compare an explicit source snapshot and target without mutating either."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    try:
+        report = verify_legacy_import(
+            cfg.duckdb_path,
+            source_snapshot=source_snapshot,
+            source_timezone=source_timezone,
+            credential_document=credential_document,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report, default=str, sort_keys=True))
+    if not report["ok"]:
+        ctx.exit(2)
+
+
+@control_store_cmd.command(name="recovery")
+@click.pass_context
+def control_store_recovery_cmd(ctx: click.Context) -> None:
+    """State the post-cutover recovery boundary without touching data."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    status = control_store_status(cfg.duckdb_path)
+    click.echo(
+        json.dumps(
+            {
+                "state": status.get("state"),
+                "recovery": "forward-recovery-only-after-postgresql-writes",
+                "action": "retain the fenced source backup; do not point a written target back at it",
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def _raise_archive_backup_error(error: Exception, fallback: str) -> None:
@@ -3209,17 +3332,16 @@ def doctor(ctx: click.Context) -> None:
 @main.command()
 @click.option(
     "--dedup-column",
-    default="dedup_key",
-    show_default=True,
-    help="Column to dedup on while compacting (use '' to disable dedup)",
+    default="",
+    show_default=False,
+    help="Override table dedup policy (use '' for the safe per-table default)",
 )
 @click.pass_context
 def compact(ctx: click.Context, dedup_column: str) -> None:
     """Combine small parquet files within each leaf partition."""
     cfg = _resolve_config(ctx.obj["config_path"])
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-    dedup = dedup_column or None
-    summary = compact_table(cfg.parquet_dir, dedup_column=dedup)
+    summary = compact_table(cfg.parquet_dir, dedup_column=dedup_column or None)
     click.echo(
         f"compacted {summary['partitions']} partitions: "
         f"{summary['files_before']} → {summary['files_after']} files, "

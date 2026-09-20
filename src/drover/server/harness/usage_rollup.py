@@ -133,10 +133,11 @@ ORDER BY COALESCE(seq, 0), created_at, event_id
 # each selected envelope below, so this explicit variant trades a cheap
 # DuckDB-side JSON prefilter for correct portable behavior.
 _POSTGRES_EVENTS_SQL = """
-SELECT seq, payload_json
-FROM harness_events
-WHERE session_id = ?
-ORDER BY COALESCE(seq, 0), created_at, event_id
+SELECT e.seq, COALESCE(p.payload_json, e.payload_json) AS payload_json
+FROM harness_events e
+LEFT JOIN harness_event_payloads p ON p.event_id = e.event_id
+WHERE e.session_id = ?
+ORDER BY COALESCE(e.seq, 0), e.created_at, e.event_id
 """
 
 

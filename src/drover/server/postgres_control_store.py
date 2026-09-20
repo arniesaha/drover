@@ -37,6 +37,9 @@ class PostgresCursor:
     def fetchall(self):
         return self._cursor.fetchall()
 
+    def fetchmany(self, size: int | None = None):
+        return self._cursor.fetchmany(size)
+
 
 class PostgresControlConnection:
     """qmark-compatible session wrapper with no DuckDB locking semantics."""

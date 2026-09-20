@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         1,
@@ -132,6 +131,86 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS control_credentials_active_verifier ON control_credentials (verifier) WHERE revoked_at IS NULL",
         ),
     ),
+    (
+        2,
+        (
+            # Keep the legacy column readable for a manually restored v1 row,
+            # but new PostgreSQL writes put the full envelope in the side
+            # table below.  That lets the hot event index stay narrow without
+            # breaking an interrupted upgrade half way through its first boot.
+            "ALTER TABLE harness_events ALTER COLUMN payload_json DROP NOT NULL",
+            """
+            CREATE TABLE IF NOT EXISTS harness_event_payloads (
+              event_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL,
+              payload_sha256 TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            INSERT INTO harness_event_payloads (event_id, payload_json)
+            SELECT event_id, payload_json FROM harness_events
+             WHERE payload_json IS NOT NULL
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            """
+            UPDATE harness_events
+               SET payload_json = NULL
+             WHERE payload_json IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM harness_event_payloads p
+                  WHERE p.event_id = harness_events.event_id
+               )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS harness_session_previews (
+              session_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+              content_preview TEXT NOT NULL, event_type TEXT NOT NULL,
+              event_priority INTEGER NOT NULL, seq INTEGER,
+              event_created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS harness_session_previews_order ON harness_session_previews (session_id, event_priority, seq, event_created_at, event_id)",
+            """
+            CREATE TABLE IF NOT EXISTS control_outbox_events (
+              event_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'pending',
+              batch_id TEXT, lease_owner TEXT, lease_until TIMESTAMPTZ,
+              committed_at TIMESTAMPTZ NOT NULL DEFAULT now(), published_at TIMESTAMPTZ,
+              acknowledged_at TIMESTAMPTZ
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS control_outbox_events_claim ON control_outbox_events (state, lease_until, committed_at, event_id)",
+            """
+            CREATE TABLE IF NOT EXISTS control_outbox_batches (
+              batch_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+              lease_owner TEXT, lease_until TIMESTAMPTZ, member_count INTEGER NOT NULL,
+              content_sha256 TEXT, archive_path TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              published_at TIMESTAMPTZ, acknowledged_at TIMESTAMPTZ
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS control_outbox_batches_visibility ON control_outbox_batches (state, published_at, batch_id)",
+            """
+            CREATE TABLE IF NOT EXISTS control_outbox_batch_events (
+              batch_id TEXT NOT NULL, event_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL, PRIMARY KEY (batch_id, event_id),
+              UNIQUE (batch_id, ordinal)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS harness_event_archives (
+              event_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL, verified_at TIMESTAMPTZ NOT NULL,
+              payload_pruned_at TIMESTAMPTZ
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS control_store_initialization (
+              singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+              state TEXT NOT NULL, mode TEXT NOT NULL, source_fingerprint TEXT,
+              source_timezone TEXT, verified_at TIMESTAMPTZ, details_json TEXT NOT NULL DEFAULT '{}',
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+        ),
+    ),
 )
 
 
@@ -154,7 +233,9 @@ def bootstrap_postgres_control_store(store: Any) -> None:
             raw.execute(
                 sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
             )
-            raw.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(schema)))
+            raw.execute(
+                sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(schema))
+            )
             con.execute(
                 "CREATE TABLE IF NOT EXISTS control_schema_migrations "
                 "(version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
@@ -169,7 +250,8 @@ def bootstrap_postgres_control_store(store: Any) -> None:
                 for statement in statements:
                     con.execute(statement)
                 con.execute(
-                    "INSERT INTO control_schema_migrations (version) VALUES (?)", [version]
+                    "INSERT INTO control_schema_migrations (version) VALUES (?)",
+                    [version],
                 )
             con.execute("COMMIT")
         except Exception:
