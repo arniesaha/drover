@@ -90,7 +90,11 @@ def verify(url, token, expected_sha):
     def fetch(path):
         request = Request(
             origin + path,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": "drover-testflight-preflight/1.0",
+            },
             method="GET",
         )
         try:
