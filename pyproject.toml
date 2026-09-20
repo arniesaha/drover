@@ -11,7 +11,14 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.0",
     "click>=8.1",
-    "duckdb>=1.0",
+    # Upper bound is load-bearing, not caution. DuckDB 2.0.0 lands 2026-10-21
+    # with a new parser and a new default storage format; `>=1.0` would pull it
+    # into the next lock regeneration after that date without anyone choosing
+    # it. 1.5.5 is the current 1.5.x (we shipped 1.5.2), and this line is also
+    # a reminder that 1.5.x goes EOL 2026-11-01 and 1.4 LTS 2026-11-17, so the
+    # 2.0 move wants to be deliberate -- ideally after 2.0.1 (2026-11-16).
+    # Calendar: https://duckdb.org/release_calendar
+    "duckdb>=1.5.5,<2",
     "pyarrow>=15.0",
     "watchdog>=4.0",
     "opentelemetry-proto>=1.30",
