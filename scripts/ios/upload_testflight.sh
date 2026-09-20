@@ -46,6 +46,61 @@ def check_private(path, directory=False):
     )
 
 
+def diagnostic_codes(value):
+    """Return only bounded, non-message identifiers from altool JSON."""
+    found = set()
+    named = {
+        "AUTHENTICATION_ERROR",
+        "FORBIDDEN",
+        "INVALID_REQUEST",
+        "NOT_AUTHORIZED",
+        "UNAUTHORIZED",
+    }
+
+    def visit(item, depth=0):
+        if depth > 12 or len(found) >= 20:
+            return
+        if isinstance(item, dict):
+            for key, child in list(item.items())[:100]:
+                normalized = key.lower().replace("_", "").replace("-", "")
+                if normalized in {"code", "status", "statuscode"}:
+                    candidate = str(child) if isinstance(child, (str, int)) else ""
+                    if (
+                        re.fullmatch(r"-?\d{1,10}", candidate)
+                        or re.fullmatch(r"[A-Z]{2,12}-\d{3,8}", candidate)
+                        or re.fullmatch(
+                            r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*\.\d{3,8}",
+                            candidate,
+                        )
+                        or candidate in named
+                    ):
+                        found.add(candidate)
+                visit(child, depth + 1)
+        elif isinstance(item, list):
+            for child in item[:100]:
+                visit(child, depth + 1)
+
+    visit(value)
+    return sorted(found)
+
+
+def stderr_diagnostic_codes(value):
+    """Extract only explicitly structured identifiers, never free-form text."""
+    found = set()
+    for pattern in (
+        r"\bCode=(-?\d{1,10})\b",
+        r"\bstatusCode\s*=\s*(\d{3})\b",
+        r'"code"\s*:\s*"([A-Z]{2,12}-\d{3,8})"',
+    ):
+        found.update(re.findall(pattern, value))
+    return sorted(found)[:20]
+
+
+def write_receipt(path, receipt):
+    with path.open("x") as output:
+        output.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+
+
 def main():
     parser = Parser(
         description="Upload a verified IPA; confirmation does not imply Apple processing or device acceptance."
@@ -96,9 +151,8 @@ def main():
         # Separate stderr so it cannot corrupt the JSON; both files are private
         # and removed on success, malformed output, or a nonzero tool exit.
         raw = Path(temporary) / "response.json"
-        with raw.open("wb") as output, (Path(temporary) / "stderr.log").open(
-            "wb"
-        ) as errors:
+        errors_path = Path(temporary) / "stderr.log"
+        with raw.open("wb") as output, errors_path.open("wb") as errors:
             result = subprocess.run(
                 [
                     "xcrun",
@@ -119,8 +173,10 @@ def main():
                 cwd=temporary,
                 check=False,
             )
-        require(result.returncode == 0, "upload failed; private diagnostics discarded")
-        response = json.loads(raw.read_text())
+        try:
+            response = json.loads(raw.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            response = None
         # altool has punctuated this line differently across Xcode releases --
         # "archive", the full path, the basename, with and without a trailing
         # period. An exact-match set fails the run *after* the bytes are at
@@ -131,18 +187,31 @@ def main():
         confirmed = isinstance(message, str) and re.match(
             r"^No errors uploading\b", message.strip()
         )
-        require(
-            bool(confirmed) and not response.get("product-errors"),
-            "upload confirmation was not received",
-        )
+        product_errors = response.get("product-errors") if isinstance(response, dict) else None
+        if result.returncode != 0 or not confirmed or product_errors:
+            codes = set(diagnostic_codes(response))
+            codes.update(
+                stderr_diagnostic_codes(
+                    errors_path.read_text(errors="ignore")[:1024 * 1024]
+                )
+            )
+            write_receipt(
+                args.record,
+                {
+                    "diagnostic_codes": sorted(codes)[:20],
+                    "ipa_sha256": digest,
+                    "tool_exit_code": result.returncode,
+                    "upload_confirmed": False,
+                },
+            )
+            raise Rejected("upload rejected; sanitized failure receipt written")
     with args.ipa.open("rb") as artifact:
         require(
             hashlib.file_digest(artifact, "sha256").hexdigest() == digest,
             "IPA changed during upload; receipt withheld",
         )
     receipt = {"upload_confirmed": True, "ipa_sha256": digest}
-    with args.record.open("x") as output:
-        output.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    write_receipt(args.record, receipt)
     print(
         "upload confirmed; Apple processing and physical-device acceptance remain pending"
     )

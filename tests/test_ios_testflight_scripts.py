@@ -96,6 +96,8 @@ elif name == "xcrun":
     else:
         key = pathlib.Path(os.environ["API_PRIVATE_KEYS_DIR"]) / "AuthKey_EXAMPLE123.p8"
         print(json.dumps({"tool-version": "8.003", "tool-path": "/synthetic/altool", "success-message": "No errors uploading archive.", "product-errors": []} | json.loads(os.getenv("UPLOAD_RESPONSE", "{}")) | {"private": key.read_text() + os.environ["LEAK_SENTINEL"]}))
+        if os.getenv("UPLOAD_STDERR"):
+            print(os.environ["UPLOAD_STDERR"], file=sys.stderr)
         sys.exit(int(os.getenv("UPLOAD_EXIT", "0")))
 elif name == "ditto":
     if "-x" in args:
@@ -419,9 +421,73 @@ def test_upload_requires_positive_confirmation_and_discards_raw_errors(chain, ex
     root, _, _, upload, _ = chain
     result = upload(**extra)
     assert result.returncode != 0
-    assert not (root / "upload-record.json").exists()
+    record = json.loads((root / "upload-record.json").read_text())
+    assert record["upload_confirmed"] is False
+    assert record["ipa_sha256"] == hashlib.sha256(b"synthetic IPA bytes").hexdigest()
+    assert set(record) == {
+        "diagnostic_codes",
+        "ipa_sha256",
+        "tool_exit_code",
+        "upload_confirmed",
+    }
     assert "RAW-UPLOAD-RESPONSE" not in result.stdout + result.stderr
+    assert "RAW-UPLOAD-RESPONSE" not in json.dumps(record)
     assert list((root / "scratch").iterdir()) == []
+
+
+def test_upload_failure_receipt_keeps_only_bounded_apple_codes(chain):
+    root, _, _, upload, _ = chain
+    result = upload(
+        UPLOAD_EXIT="1",
+        UPLOAD_RESPONSE=json.dumps(
+            {
+                "product-errors": [
+                    {
+                        "code": -19237,
+                        "message": "private diagnostic RAW-UPLOAD-RESPONSE",
+                        "userInfo": {
+                            "original_server_error": {
+                                "code": "STATE_ERROR.VALIDATION_ERROR.90161",
+                                "status": "409",
+                                "detail": "private diagnostic RAW-UPLOAD-RESPONSE",
+                            }
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+    assert result.returncode != 0
+    record_text = (root / "upload-record.json").read_text()
+    assert json.loads(record_text) == {
+        "diagnostic_codes": [
+            "-19237",
+            "409",
+            "STATE_ERROR.VALIDATION_ERROR.90161",
+        ],
+        "ipa_sha256": hashlib.sha256(b"synthetic IPA bytes").hexdigest(),
+        "tool_exit_code": 1,
+        "upload_confirmed": False,
+    }
+    assert "private diagnostic" not in record_text + result.stdout + result.stderr
+    assert "RAW-UPLOAD-RESPONSE" not in record_text + result.stdout + result.stderr
+
+
+def test_upload_failure_receipt_extracts_only_structured_stderr_codes(chain):
+    root, _, _, upload, _ = chain
+    result = upload(
+        UPLOAD_EXIT="1",
+        UPLOAD_STDERR=(
+            "Error Domain=ITunesConnectionOperationErrorDomain Code=-19237 "
+            'private diagnostic RAW-UPLOAD-RESPONSE statusCode = 401 "code":"ITMS-90161"'
+        ),
+    )
+    assert result.returncode != 0
+    record_text = (root / "upload-record.json").read_text()
+    record = json.loads(record_text)
+    assert record["diagnostic_codes"] == ["-19237", "401", "ITMS-90161"]
+    assert "private diagnostic" not in record_text + result.stdout + result.stderr
+    assert "RAW-UPLOAD-RESPONSE" not in record_text + result.stdout + result.stderr
 
 
 def test_upload_uses_key_directory_and_writes_fixed_sanitized_receipt(chain):
@@ -496,7 +562,9 @@ def test_upload_still_rejects_an_unrelated_success_message(chain):
     root, _, _, upload, _ = chain
     result = upload(UPLOAD_RESPONSE=json.dumps({"success-message": "Uploaded 1 file."}))
     assert result.returncode != 0
-    assert not (root / "upload-record.json").exists()
+    record = json.loads((root / "upload-record.json").read_text())
+    assert record["upload_confirmed"] is False
+    assert record["diagnostic_codes"] == []
 
 
 def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
