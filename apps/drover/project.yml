@@ -72,6 +72,12 @@ targets:
         # only HTTPS/TLS through the system frameworks, which is exempt.
         ITSAppUsesNonExemptEncryption: false
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # App Store validation requires all four orientations for iPad multitasking.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         DROVER_TESTFLIGHT_STAGE_ONLY: "$(DROVER_TESTFLIGHT_STAGE_ONLY)"
         DROVER_TESTFLIGHT_STAGING_URL: "$(DROVER_TESTFLIGHT_STAGING_URL)"
         NSAppTransportSecurity:

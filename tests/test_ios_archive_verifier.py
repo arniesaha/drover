@@ -25,7 +25,7 @@ def load_verifier():
     return module
 
 
-def valid_info() -> dict[str, str]:
+def valid_info() -> dict[str, object]:
     return {
         "CFBundleIdentifier": "com.arnab.drover",
         "CFBundleShortVersionString": "1.2.3",
@@ -33,6 +33,13 @@ def valid_info() -> dict[str, str]:
         "DTPlatformName": "iphoneos",
         "DTPlatformVersion": "26.5",
         "DTSDKName": "iphoneos26.5",
+        "UIDeviceFamily": [1, 2],
+        "UISupportedInterfaceOrientations": [
+            "UIInterfaceOrientationPortrait",
+            "UIInterfaceOrientationPortraitUpsideDown",
+            "UIInterfaceOrientationLandscapeLeft",
+            "UIInterfaceOrientationLandscapeRight",
+        ],
     }
 
 
@@ -374,6 +381,72 @@ def test_verify_app_rejects_candidate_identity_mismatch(
             sdk_floor="26.0",
             run=stub_codesign(),
         )
+
+
+@pytest.mark.parametrize(
+    "orientations",
+    [None, [], "UIInterfaceOrientationPortrait", ["invalid"]],
+)
+def test_verify_app_rejects_missing_or_invalid_orientations(
+    tmp_path: Path, orientations: object
+) -> None:
+    verifier = load_verifier()
+    info = valid_info()
+    if orientations is None:
+        del info["UISupportedInterfaceOrientations"]
+    else:
+        info["UISupportedInterfaceOrientations"] = orientations
+    with pytest.raises(verifier.ArtifactVerificationError, match="orientations"):
+        verifier.verify_app(
+            write_bundle(tmp_path, info=info),
+            expected_version="1.2.3",
+            expected_build="42",
+            sdk_floor="26.0",
+            run=stub_codesign(),
+        )
+
+
+@pytest.mark.parametrize(
+    "key", ["UISupportedInterfaceOrientations", "UISupportedInterfaceOrientations~ipad"]
+)
+def test_verify_app_rejects_incomplete_ipad_multitasking_orientations(
+    tmp_path: Path, key: str
+) -> None:
+    verifier = load_verifier()
+    info = valid_info()
+    info[key] = ["UIInterfaceOrientationPortrait"]
+    with pytest.raises(verifier.ArtifactVerificationError, match="iPad.*orientations"):
+        verifier.verify_app(
+            write_bundle(tmp_path, info=info),
+            expected_version="1.2.3",
+            expected_build="42",
+            sdk_floor="26.0",
+            run=stub_codesign(),
+        )
+
+
+@pytest.mark.parametrize("mode", ["ipad-override", "iphone-only", "full-screen"])
+def test_verify_app_accepts_valid_portrait_only_defaults(
+    tmp_path: Path, mode: str
+) -> None:
+    verifier = load_verifier()
+    info = valid_info()
+    if mode == "ipad-override":
+        info["UISupportedInterfaceOrientations~ipad"] = info[
+            "UISupportedInterfaceOrientations"
+        ]
+    elif mode == "iphone-only":
+        info["UIDeviceFamily"] = [1]
+    else:
+        info["UIRequiresFullScreen"] = True
+    info["UISupportedInterfaceOrientations"] = ["UIInterfaceOrientationPortrait"]
+    verifier.verify_app(
+        write_bundle(tmp_path, info=info),
+        expected_version="1.2.3",
+        expected_build="42",
+        sdk_floor="26.0",
+        run=stub_codesign(),
+    )
 
 
 def test_verify_app_rejects_simulator_product(tmp_path: Path) -> None:
