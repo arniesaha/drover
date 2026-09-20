@@ -77,7 +77,11 @@ with (root / "calls.jsonl").open("a") as f:
     f.write(json.dumps({"tool": name, "args": args, "keys": os.getenv("API_PRIVATE_KEYS_DIR"), "local_keys": pathlib.Path("private_keys").resolve() == pathlib.Path(os.getenv("API_PRIVATE_KEYS_DIR", "/missing"))}) + "\\n")
 if name == "xcodebuild":
     if args == ["-version"]:
-        print("Xcode 26.6\\nBuild version synthetic")
+        print("Xcode 26.6")
+        if os.getenv("XCODE_VERSION_STRESS") == "1":
+            sys.stdout.write("Build version synthetic\\n" * 100000)
+        else:
+            print("Build version synthetic")
     elif "-exportArchive" in args:
         dest = pathlib.Path(args[args.index("-exportPath") + 1])
         for i in range(int(os.getenv("IPA_COUNT", "1"))):
@@ -245,6 +249,23 @@ def test_archive_stage_locks_build_and_hashes_normalized_url(chain):
     assert record["channel"] == "testflight-internal"
     assert record["staging_url_sha256"] == hashlib.sha256(STAGE.encode()).hexdigest()
     assert STAGE not in json.dumps(record) + result.stdout + result.stderr
+
+
+def test_archive_consumes_complete_xcode_version_output(chain):
+    root, run, _, _, config = chain
+    result = run(
+        "archive.sh",
+        "--version",
+        "1.2.3",
+        "--build",
+        "42",
+        "--output",
+        root / "output",
+        "--signing-config",
+        config,
+        XCODE_VERSION_STRESS="1",
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("count", ["0", "2"])
