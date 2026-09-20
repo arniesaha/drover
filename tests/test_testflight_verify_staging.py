@@ -81,7 +81,13 @@ def stage(tmp_path, monkeypatch):
             pass
 
         def do_GET(self):
-            requests.append((self.path, self.headers.get("Authorization")))
+            requests.append(
+                (
+                    self.path,
+                    self.headers.get("Authorization"),
+                    self.headers.get("User-Agent"),
+                )
+            )
             value = payloads.get(self.path)
             if value == "redirect":
                 self.send_response(302)
@@ -141,7 +147,7 @@ def test_success_fetches_only_three_gets_and_retains_only_safe_fields(
         "staging_url_sha256": hashlib.sha256(stage[0].encode()).hexdigest(),
     }
     assert stage[2] == [
-        (path, f"Bearer {TOKEN}")
+        (path, f"Bearer {TOKEN}", "drover-testflight-preflight/1.0")
         for path in ("/release-identity", "/readyz", "/harness/hosts")
     ]
 
@@ -243,7 +249,7 @@ def test_gate_fails_closed_without_diagnostics(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == category + "\n"
-    assert not any(path == "/private-redirect-target" for path, _ in stage[2])
+    assert not any(path == "/private-redirect-target" for path, _, _ in stage[2])
 
 
 @pytest.mark.parametrize(
