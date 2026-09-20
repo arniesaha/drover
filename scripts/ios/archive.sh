@@ -206,7 +206,7 @@ else
 fi
 export DEVELOPER_DIR="$EFFECTIVE_DEVELOPER_DIR"
 
-XCODE_VERSION="$(xcodebuild -version | awk '$1 == "Xcode" { print $2; exit }')"
+XCODE_VERSION="$(xcodebuild -version | awk '$1 == "Xcode" && !found { print $2; found=1 }')"
 [[ "$XCODE_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] \
   || fail "selected Xcode version could not be determined"
 XCODE_MAJOR="${XCODE_VERSION%%.*}"
