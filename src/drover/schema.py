@@ -32,6 +32,7 @@ from drover.server.db import (
     control_plane_path,
     sql_path_literal,
 )
+from drover.server.control_store import is_postgres_control_store, postgres_control_store
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
 
@@ -1882,6 +1883,9 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
     that repeatedly wedged the hub.
     """
     registry_path = control_plane_path(duckdb_path)
+    if is_postgres_control_store(duckdb_path):
+        postgres_control_store(duckdb_path).bootstrap()
+        return registry_path
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     with control_plane_connection(registry_path) as con:
         con.execute(_LIVE_SESSION_RECAPS_DDL)

@@ -100,6 +100,15 @@ class AdvisoryRepository:
             normalized=normalized,
         )
         observed_at = max(item[0].observed_at for item in normalized)
+        if getattr(con, "dialect", None) == "postgres":
+            # The read/insert/update sequence below is a single-writer state
+            # machine for one fingerprint. DuckDB had one in-process control
+            # lock; PostgreSQL needs a transaction-scoped equivalent before
+            # the initial absent-row check can be race-free.
+            con.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(?))",
+                [f"drover-advisory-finding:{fingerprint}"],
+            )
         row = con.execute(
             "SELECT finding_id, state, severity, evaluated_content_hash, "
             "regressed_at, regression_count "

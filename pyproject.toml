@@ -66,6 +66,9 @@ dev = [
 redis = [
     "redis>=5.0",
 ]
+postgres = [
+    "psycopg[binary,pool]>=3.2,<4",
+]
 
 [tool.setuptools.package-data]
 drover = ["prompts/*.md", "server/web/static/*.html"]
