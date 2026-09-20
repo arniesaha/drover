@@ -64,11 +64,11 @@ def write_signing_config(directory: Path, *, keychain: Path) -> Path:
     keychain.touch()
     config = directory / "signing.xcconfig"
     config.write_text(
-        "CODE_SIGN_STYLE = Manual\n"
-        "DEVELOPMENT_TEAM = TEAMID1234\n"
-        "CODE_SIGN_IDENTITY = Apple Distribution: Example Organization (TEAMID1234)\n"
-        "PROVISIONING_PROFILE_SPECIFIER = 11111111-2222-3333-4444-555555555555\n"
-        f'OTHER_CODE_SIGN_FLAGS = --keychain "{keychain}"\n',
+        "DROVER_CODE_SIGN_STYLE = Manual\n"
+        "DROVER_DEVELOPMENT_TEAM = TEAMID1234\n"
+        "DROVER_CODE_SIGN_IDENTITY = Apple Distribution: Example Organization (TEAMID1234)\n"
+        "DROVER_PROVISIONING_PROFILE_SPECIFIER = 11111111-2222-3333-4444-555555555555\n"
+        f'DROVER_OTHER_CODE_SIGN_FLAGS = --keychain "{keychain}"\n',
         encoding="utf-8",
     )
     return config
@@ -569,8 +569,8 @@ def test_archive_wrapper_requires_a_private_explicit_signing_configuration() -> 
     script = ARCHIVE_SCRIPT_PATH.read_text(encoding="utf-8")
 
     assert "--signing-config" in script
-    assert "CODE_SIGN_STYLE = Manual" in script
-    assert '"CODE_SIGN_IDENTITY = "' in script
+    assert "DROVER_CODE_SIGN_STYLE = Manual" in script
+    assert '"DROVER_CODE_SIGN_IDENTITY = "' in script
     assert "Apple Distribution: " in script
     assert '-xcconfig "$SIGNING_CONFIG"' in script
     assert "CODE_SIGN_IDENTITY=" not in script

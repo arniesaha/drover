@@ -54,30 +54,30 @@ validate_signing_config() {
   local line code_sign_style="" team_id="" identity_name="" profile_uuid="" keychain_path="" raw_flags=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
-      "CODE_SIGN_STYLE = Manual")
+      "DROVER_CODE_SIGN_STYLE = Manual")
         [[ -z "$code_sign_style" ]] || fail "signing configuration is invalid"
         code_sign_style=Manual
         ;;
-      "DEVELOPMENT_TEAM = "*)
+      "DROVER_DEVELOPMENT_TEAM = "*)
         [[ -z "$team_id" ]] || fail "signing configuration is invalid"
-        team_id="${line#DEVELOPMENT_TEAM = }"
+        team_id="${line#DROVER_DEVELOPMENT_TEAM = }"
         [[ "$team_id" =~ ^[A-Z0-9]{10}$ ]] || fail "signing configuration is invalid"
         ;;
-      "CODE_SIGN_IDENTITY = "*)
+      "DROVER_CODE_SIGN_IDENTITY = "*)
         [[ -z "$identity_name" ]] || fail "signing configuration is invalid"
-        identity_name="${line#CODE_SIGN_IDENTITY = }"
+        identity_name="${line#DROVER_CODE_SIGN_IDENTITY = }"
         [[ "$identity_name" == "Apple Distribution: "* && "$identity_name" != *$'\n'* \
           && "$identity_name" != *$'\r'* ]] || fail "signing configuration is invalid"
         ;;
-      "PROVISIONING_PROFILE_SPECIFIER = "*)
+      "DROVER_PROVISIONING_PROFILE_SPECIFIER = "*)
         [[ -z "$profile_uuid" ]] || fail "signing configuration is invalid"
-        profile_uuid="${line#PROVISIONING_PROFILE_SPECIFIER = }"
+        profile_uuid="${line#DROVER_PROVISIONING_PROFILE_SPECIFIER = }"
         [[ "$profile_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
           || fail "signing configuration is invalid"
         ;;
-      "OTHER_CODE_SIGN_FLAGS = --keychain "*)
+      "DROVER_OTHER_CODE_SIGN_FLAGS = --keychain "*)
         [[ -z "$keychain_path" ]] || fail "signing configuration is invalid"
-        raw_flags="${line#OTHER_CODE_SIGN_FLAGS = --keychain }"
+        raw_flags="${line#DROVER_OTHER_CODE_SIGN_FLAGS = --keychain }"
         [[ ${#raw_flags} -ge 3 && "${raw_flags:0:1}" = '"' \
           && "${raw_flags: -1}" = '"' ]] || fail "signing configuration is invalid"
         keychain_path="${raw_flags:1:${#raw_flags}-2}"
