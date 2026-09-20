@@ -169,18 +169,15 @@ def test_distribution_signing_values_are_mapped_only_by_the_app_target() -> None
         store_release["PROVISIONING_PROFILE_SPECIFIER"]
         == "$(DROVER_PROVISIONING_PROFILE_SPECIFIER)"
     )
-    assert (
-        store_release["OTHER_CODE_SIGN_FLAGS"]
-        == "$(DROVER_OTHER_CODE_SIGN_FLAGS)"
-    )
+    assert store_release["OTHER_CODE_SIGN_FLAGS"] == "$(DROVER_OTHER_CODE_SIGN_FLAGS)"
     for name, target in project["targets"].items():
         if name == "Drover":
             continue
         settings = target.get("settings", {})
         assert "PROVISIONING_PROFILE_SPECIFIER" not in settings.get("base", {})
-        assert "PROVISIONING_PROFILE_SPECIFIER" not in settings.get(
-            "configs", {}
-        ).get("StoreRelease", {})
+        assert "PROVISIONING_PROFILE_SPECIFIER" not in settings.get("configs", {}).get(
+            "StoreRelease", {}
+        )
 
 
 def test_setup_rejects_an_xcconfig_expansion_in_the_workspace_path(
@@ -355,7 +352,7 @@ def test_setup_rejects_an_ambient_distribution_identity(tmp_path: Path) -> None:
         fake_bin / "security",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
-        '  list-keychains) exit 0 ;;\n'
+        "  list-keychains) exit 0 ;;\n"
         '  default-keychain) if [[ " $* " != *" -s "* ]]; then printf \'    "%s"\\n\' "$HOME/Library/Keychains/login.keychain-db"; fi ;;\n'
         "  find-identity) printf '1) %040d \"%s\"\\n' 0 'Apple Distribution: Unapproved Organization (TEAMID1234)' ;;\n"
         "  *) exit 0 ;;\n"
@@ -437,11 +434,11 @@ def test_setup_failure_removes_keychain_file_when_security_delete_fails(
         fake_bin / "security",
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
-        '  list-keychains) exit 0 ;;\n'
+        "  list-keychains) exit 0 ;;\n"
         '  default-keychain) if [[ " $* " != *" -s "* ]]; then printf \'    "%s"\\n\' "$HOME/Library/Keychains/login.keychain-db"; fi ;;\n'
-        '  find-identity) printf \'1) %040d "Unapproved"\\n\' 0 ;;\n'
-        '  delete-keychain) exit 1 ;;\n'
-        '  *) exit 0 ;;\n'
+        "  find-identity) printf '1) %040d \"Unapproved\"\\n' 0 ;;\n"
+        "  delete-keychain) exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
         "esac\n",
     )
 

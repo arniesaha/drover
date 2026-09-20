@@ -174,9 +174,7 @@ def test_internal_cleanup_retains_signing_recovery_state_when_cleanup_fails(
 
     monkeypatch.setattr(subprocess, "run", external)
     with pytest.raises(SystemExit, match="credential cleanup failed"):
-        _run_internal_python_step(
-            "Remove temporary credentials", monkeypatch, tmp_path
-        )
+        _run_internal_python_step("Remove temporary credentials", monkeypatch, tmp_path)
 
     assert signing.is_dir()
     assert state.is_file()
@@ -184,9 +182,7 @@ def test_internal_cleanup_retains_signing_recovery_state_when_cleanup_fails(
     assert not snapshot.exists()
 
 
-def test_internal_cleanup_retains_setup_failure_recovery_state(
-    monkeypatch, tmp_path
-):
+def test_internal_cleanup_retains_setup_failure_recovery_state(monkeypatch, tmp_path):
     signing = tmp_path / "drover-distribution-signing"
     signing.mkdir()
     recovery = signing / "cleanup-recovery"
@@ -196,9 +192,7 @@ def test_internal_cleanup_retains_setup_failure_recovery_state(
     (keys / "AuthKey_EXAMPLE123.p8").write_text("private key")
 
     with pytest.raises(SystemExit, match="credential cleanup failed"):
-        _run_internal_python_step(
-            "Remove temporary credentials", monkeypatch, tmp_path
-        )
+        _run_internal_python_step("Remove temporary credentials", monkeypatch, tmp_path)
 
     assert signing.is_dir()
     assert recovery.is_file()
