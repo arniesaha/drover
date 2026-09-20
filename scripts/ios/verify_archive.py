@@ -123,6 +123,7 @@ def validate_distribution_metadata(
     sdk_floor: str,
     expected_bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER,
     expected_staging_url: str | None = None,
+    expected_unrestricted_hubs: bool = False,
 ) -> ArtifactIdentity:
     """Validate plist data and signed entitlements without reading source settings."""
     bundle_identifier = _required_string(
@@ -205,6 +206,16 @@ def validate_distribution_metadata(
         if not isinstance(ats, dict) or ats.get("NSAllowsArbitraryLoads") is not False:
             raise ArtifactVerificationError(
                 "signed arbitrary loads must be explicitly false"
+            )
+    if expected_unrestricted_hubs:
+        if info.get("DROVER_TESTFLIGHT_STAGE_ONLY") != "NO":
+            raise ArtifactVerificationError("signed stage-only flag is not NO")
+        if info.get("DROVER_TESTFLIGHT_STAGING_URL") != "":
+            raise ArtifactVerificationError("signed staging URL is not empty")
+        ats = info.get("NSAppTransportSecurity")
+        if not isinstance(ats, dict) or ats.get("NSAllowsArbitraryLoads") is not True:
+            raise ArtifactVerificationError(
+                "signed arbitrary loads must be explicitly true for unrestricted hubs"
             )
 
     _validate_manifest(manifest)
@@ -324,6 +335,7 @@ def verify_app(
     sdk_floor: str,
     expected_bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER,
     expected_staging_url: str | None = None,
+    expected_unrestricted_hubs: bool = False,
     run: Runner = subprocess.run,
 ) -> ArtifactIdentity:
     """Verify an unpacked app bundle or the app stored in an Xcode archive."""
@@ -354,6 +366,7 @@ def verify_app(
         sdk_floor=sdk_floor,
         expected_bundle_identifier=expected_bundle_identifier,
         expected_staging_url=expected_staging_url,
+        expected_unrestricted_hubs=expected_unrestricted_hubs,
     )
 
 
@@ -364,7 +377,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-build", required=True)
     parser.add_argument("--minimum-ios-sdk", default="26.0")
     parser.add_argument("--expected-bundle-id", default=DEFAULT_BUNDLE_IDENTIFIER)
-    parser.add_argument("--expected-staging-url")
+    policy = parser.add_mutually_exclusive_group()
+    policy.add_argument("--expected-staging-url")
+    policy.add_argument("--expected-unrestricted-hubs", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -378,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sdk_floor=args.minimum_ios_sdk,
             expected_bundle_identifier=args.expected_bundle_id,
             expected_staging_url=args.expected_staging_url,
+            expected_unrestricted_hubs=args.expected_unrestricted_hubs,
         )
     except ArtifactVerificationError as error:
         print(f"distribution artifact rejected: {error}")

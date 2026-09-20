@@ -177,7 +177,7 @@ also verifies App Store Connect access and agreements, app identity, and
 distribution provisioning. A working development installation is not evidence
 that these distribution prerequisites are available.
 
-## Internal TestFlight artifact chain
+## TestFlight artifact chains
 
 Use Python 3.11 or later and the selected Xcode 26.6 toolchain. For the internal
 channel, archive with both `--channel testflight-internal` and
@@ -195,6 +195,15 @@ to the signed application unpacked from the exported IPA. They can be requested
 directly with `verify_archive.py --expected-staging-url`. The archive record adds
 `channel` and `staging_url_sha256`; it does not record the origin itself.
 
+The separate production channel is deliberately not pinned to one server. Use
+`--channel testflight-production` without a staging URL. The archive command
+sets `DROVER_TESTFLIGHT_STAGE_ONLY=NO`, embeds an empty staging URL, and sets
+`DROVER_ALLOW_ARBITRARY_LOADS=YES`. The verifier requires those exact signed
+values through `--expected-unrestricted-hubs`, both in the archive and in the
+exported IPA. This lets QR and manual pairing accept any valid Drover hub,
+including private-network HTTP endpoints and HTTPS endpoints. HTTPS remains the
+preferred transport when a hub can provide it.
+
 ```sh
 scripts/ios/export_ipa.sh \
   --archive "$DROVER_IOS_OUTPUT/Drover.xcarchive" \
@@ -203,6 +212,11 @@ scripts/ios/export_ipa.sh \
   --version "$DROVER_APP_VERSION" --build "$DROVER_APP_BUILD" \
   --staging-url "$DROVER_TESTFLIGHT_STAGING_URL"
 ```
+
+For an unrestricted production candidate, export the matching production
+archive with the same command and replace the final staging option with
+`--unrestricted-hubs`. Its sanitized record keeps
+`staging_url_sha256` as `null`.
 
 The export output directory must be absolute and absent. The export-options
 path must live in an existing owner-only temporary signing directory. An
@@ -331,6 +345,19 @@ by upload time; its 30-minute freshness is assessed when preflight runs.
 Upload confirmation does not assert Apple processing, internal tester
 availability, or physical-device acceptance. The workflow does not wait for
 processing or assign external testers.
+
+### Internal TestFlight production channel
+
+`.github/workflows/ios-testflight-production.yml` is the independent manual
+channel for production-hub testing. It accepts the same explicit version and
+build inputs, runs only from `main`, uses the protected
+`ios-testflight-upload` environment, and repeats the same package, app, UI,
+signing, export, upload, and credential-cleanup steps as the staging workflow.
+It has no staging environment, URL, token, preflight artifact, or endpoint
+binding. Instead, both archive and IPA verification require the unrestricted
+hub policy described above. The resulting internal TestFlight app still
+requires a valid one-time pairing code and device credential for whichever hub
+the tester selects.
 
 ### Distribution archive
 
