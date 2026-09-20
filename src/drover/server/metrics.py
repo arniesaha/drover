@@ -24,6 +24,7 @@ from drover.server.db import (
     open_duckdb_connection,
     snapshot_scratch_root,
 )
+from drover.server.control_store import is_postgres_control_store
 from drover.server.harness.daemon import (
     _STRUCTURED_DEFAULT_COMMANDS,
     native_transcript_for_session,
@@ -379,7 +380,7 @@ def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, i
     writes, as before.
     """
     source = control_plane_path(db_path)
-    if not source.exists():
+    if not source.exists() and not is_postgres_control_store(db_path):
         return {
             "null_event_count": 0,
             "all_null_sessions": 0,

@@ -152,6 +152,77 @@ def test_postgres_control_store_rolls_back_a_control_plane_transaction(
         )
 
 
+def test_postgres_control_store_uses_independent_pooled_transactions(
+    postgres_control_store,
+):
+    """One pooled session neither sees nor rolls back another's transaction."""
+    control_path, _ = postgres_control_store
+    from drover.server.db import control_plane_connection
+
+    with control_plane_connection(control_path) as first:
+        with control_plane_connection(control_path) as second:
+            first.execute("BEGIN")
+            first.execute(
+                "INSERT INTO harness_hosts "
+                "(host_id, display_name, kind, status, capabilities_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ["first-tx", "First", "test", "online", "{}"],
+            )
+            assert (
+                second.execute(
+                    "SELECT host_id FROM harness_hosts WHERE host_id = ?", ["first-tx"]
+                ).fetchone()
+                is None
+            )
+            second.execute("BEGIN")
+            second.execute(
+                "INSERT INTO harness_hosts "
+                "(host_id, display_name, kind, status, capabilities_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ["second-tx", "Second", "test", "online", "{}"],
+            )
+            second.execute("COMMIT")
+            first.execute("ROLLBACK")
+
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT host_id FROM harness_hosts ORDER BY host_id"
+        ).fetchall() == [("second-tx",)]
+
+
+def test_postgres_readiness_and_sequence_health_probe_the_registered_store(
+    postgres_control_store,
+):
+    """PostgreSQL has no local registry file, but it still must report serving state."""
+    control_path, _ = postgres_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.metrics import sequence_health_report
+    from drover.server.readiness import (
+        STATE_OK,
+        STORE_CONTROL_PLANE,
+        ReadinessProbe,
+    )
+
+    with control_plane_connection(control_path) as con:
+        con.execute(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, seq) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ["pg-null-seq", "pg-sequence-session", "user_input", "{}", None],
+        )
+
+    report = ReadinessProbe(control_path, cache_seconds=0.0).check()
+    states = {store.store: store.state for store in report.stores}
+
+    assert report.ok
+    assert states[STORE_CONTROL_PLANE] == STATE_OK
+    assert sequence_health_report(control_path) == {
+        "null_event_count": 1,
+        "all_null_sessions": 1,
+        "mixed_sessions": 0,
+    }
+
+
 def test_postgres_bootstrap_creates_the_registered_schema(postgres_control_store):
     _, config = postgres_control_store
     dsn = os.environ[config.dsn_env]
@@ -250,6 +321,49 @@ def test_postgres_registry_round_trip_preserves_duplicate_event_replay(
     assert [event.event_id for event in registry.list_events(session.session_id)] == [
         "pg-event-1"
     ]
+
+
+def test_postgres_client_session_id_concurrency_returns_the_insert_winner(
+    postgres_control_store,
+):
+    """A unique client id is an idempotency key across two API sessions."""
+    control_path, _ = postgres_control_store
+    from drover.server.harness.registry import HarnessRegistry
+
+    HarnessRegistry(control_path).register_host(
+        host_id="pg-concurrent-host", display_name="Concurrent", kind="test"
+    )
+    barrier = threading.Barrier(2)
+    sessions: list[object] = []
+    errors: list[Exception] = []
+
+    def create_session(index: int) -> None:
+        try:
+            barrier.wait(timeout=2)
+            sessions.append(
+                HarnessRegistry(control_path).create_session(
+                    host_id="pg-concurrent-host",
+                    harness="codex",
+                    command="codex",
+                    session_id=f"pg-concurrent-{index}",
+                    client_session_id="pg-client-session",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - asserted by parent thread
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=create_session, args=(index,)) for index in (1, 2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(sessions) == 2
+    assert sessions[0].session_id == sessions[1].session_id
 
 
 def test_postgres_recap_workers_claim_one_generation(postgres_control_store):
@@ -553,3 +667,43 @@ def test_postgres_usage_rollup_preserves_source_usage_projection(
 
     assert (report.candidates, report.rolled, report.malformed_events) == (1, 1, 0)
     assert row == (12, 3, True, "harness_events", 1, 1)
+
+
+def test_postgres_native_usage_rollup_keeps_known_utc_watermarks_comparable(
+    postgres_control_store, tmp_path: Path
+):
+    """A PostgreSQL TIMESTAMPTZ watermark does not break the second rollup pass."""
+    _, config = postgres_control_store
+    from drover.schema import bootstrap
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.ingest import ingest_file
+    from drover.server.native_usage_rollup import rollup_pending_native_usage
+
+    analytics_path = tmp_path / "native-analytics.duckdb"
+    parquet_dir = tmp_path / "native-parquet"
+    source = tmp_path / "native.jsonl"
+    source.write_text(
+        '{"id":"pg-native-1","session_id":"pg-native-session",'
+        '"timestamp":"2026-09-20T12:00:00Z","agent_id":"claude-code",'
+        '"event_type":"assistant_message","message":{"role":"assistant","content":"x"},'
+        '"token_usage":{"input_tokens":9},"raw_data":{}}\n',
+        encoding="utf-8",
+    )
+    configure_control_store(analytics_path, config)
+    try:
+        bootstrap(parquet_dir=parquet_dir, duckdb_path=analytics_path)
+        assert (
+            ingest_file(
+                source, parquet_dir=parquet_dir, duckdb_path=analytics_path
+            ).inserted
+            == 1
+        )
+        assert rollup_pending_native_usage(analytics_path).partitions == 1
+        assert rollup_pending_native_usage(analytics_path).partitions == 0
+        with control_plane_connection(analytics_path) as con:
+            assert con.execute("SELECT current_setting('TimeZone')").fetchone() == (
+                "UTC",
+            )
+    finally:
+        close_control_store(analytics_path)

@@ -45,6 +45,21 @@ ARCHIVED_SESSION_STATUSES: tuple[str, ...] = (
 )
 
 
+def _is_unique_constraint_violation(exc: BaseException) -> bool:
+    """Recognize only the backends' specific uniqueness exceptions.
+
+    The client-session idempotency path retries a duplicate-key winner.  It
+    must not turn arbitrary PostgreSQL errors into a successful lookup.
+    """
+    if isinstance(exc, duckdb.ConstraintException):
+        return True
+    try:
+        from psycopg.errors import UniqueViolation
+    except ImportError:  # Legacy DuckDB installations do not need psycopg.
+        return False
+    return isinstance(exc, UniqueViolation)
+
+
 def _as_utc_datetime(value: Any) -> datetime | None:
     """Normalize an *inbound* timestamp to a UTC-aware datetime.
 
@@ -542,19 +557,23 @@ class HarnessRegistry:
                     ],
                 )
                 con.execute("COMMIT")
-            except duckdb.ConstraintException:
+            except Exception as exc:
                 # Another caller got there between the lookup above and this
                 # insert. That is the case the index exists for: re-read and
                 # hand back their session rather than failing a request that
                 # asked for exactly this.
                 con.execute("ROLLBACK")
-                if client_session_id:
-                    existing = self.session_by_client_id(client_session_id)
-                    if existing is not None:
-                        return existing
-                raise
-            except Exception:
-                con.execute("ROLLBACK")
+                if not _is_unique_constraint_violation(exc) or not client_session_id:
+                    raise
+                # Reuse the just-rolled-back connection. Opening a second
+                # pool session here can deadlock an already-full small pool.
+                rows = _rows(
+                    con,
+                    "SELECT * FROM harness_sessions WHERE client_session_id = ?",
+                    [client_session_id],
+                )
+                if rows:
+                    return HarnessSession.from_row(rows[0])
                 raise
             con.execute("BEGIN TRANSACTION")
             try:

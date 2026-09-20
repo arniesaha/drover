@@ -205,7 +205,7 @@ def _rollup_one(
         source_event_count=candidate.event_count,
         host_id=candidate.host_id,
         harness=candidate.harness,
-        observed_at=now,
+        observed_at=_known_utc_rollup_timestamp(con, now),
     )
     if malformed:
         log.warning(
@@ -253,7 +253,7 @@ def store_rolled_usage(
         source_event_count=candidate.event_count,
         host_id=candidate.host_id,
         harness=candidate.harness,
-        observed_at=now,
+        observed_at=_known_utc_rollup_timestamp(con, now),
     )
     if malformed:
         log.warning(
@@ -261,6 +261,20 @@ def store_rolled_usage(
             malformed,
             candidate.session_id,
         )
+
+
+def _known_utc_rollup_timestamp(con: object, value: datetime) -> datetime:
+    """Make this rollup's generated UTC clock explicit for PostgreSQL writes.
+
+    This module has always generated its default rollup time as naive UTC for
+    DuckDB.  Keep that legacy value unchanged there; PostgreSQL's TIMESTAMPTZ
+    control tables instead receive the same instant as an aware UTC value.
+    """
+    if getattr(con, "dialect", None) != "postgres":
+        return value
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def rollup_pending_sessions(

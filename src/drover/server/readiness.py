@@ -113,6 +113,7 @@ from drover.server.db import (
     last_connect_failure,
     live_connections,
 )
+from drover.server.control_store import is_postgres_control_store
 
 log = logging.getLogger("drover.readiness")
 
@@ -494,7 +495,7 @@ class ReadinessProbe:
         still a failure: the bound is on waiting, not on believing.
         """
         path = control_plane_path(self._duckdb_path)
-        if not path.exists():
+        if not path.exists() and not is_postgres_control_store(self._duckdb_path):
             # Connecting would create it. A readiness poll must not bootstrap
             # a store as a side effect.
             return StoreProbe(

@@ -94,7 +94,9 @@ class PostgresControlStore:
             self._pool.wait(timeout=config.acquire_timeout_seconds)
         except Exception as exc:
             self.close()
-            raise RuntimeError("PostgreSQL control store could not open its pool") from exc
+            raise RuntimeError(
+                "PostgreSQL control store could not open its pool"
+            ) from exc
 
     def _configure_connection(self, connection: Any) -> None:
         from psycopg import sql
@@ -102,14 +104,21 @@ class PostgresControlStore:
         connection.execute(
             sql.SQL("SET search_path TO {}").format(sql.Identifier(self.config.schema))
         )
+        # Control-plane columns use TIMESTAMPTZ.  Make every pooled session
+        # render and bind timestamps against a stable server-independent zone.
+        connection.execute("SET TIME ZONE 'UTC'")
         connection.execute(
             "SELECT set_config('statement_timeout', %s, false)",
             [str(int(self.config.statement_timeout_seconds * 1000))],
         )
 
     @contextmanager
-    def connection(self, timeout: float | None = None) -> Iterator[PostgresControlConnection]:
-        acquire_timeout = self.config.acquire_timeout_seconds if timeout is None else timeout
+    def connection(
+        self, timeout: float | None = None
+    ) -> Iterator[PostgresControlConnection]:
+        acquire_timeout = (
+            self.config.acquire_timeout_seconds if timeout is None else timeout
+        )
         try:
             with self._pool.connection(timeout=max(0.0, acquire_timeout)) as connection:
                 yield PostgresControlConnection(connection)
