@@ -25,6 +25,7 @@ from watchdog.observers import Observer
 
 from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.ingest import ingest_file
+from drover.server.providers.service import compact_closed_snapshot_partitions
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
@@ -554,6 +555,13 @@ class IncomingWatcher:
                     )
                 except Exception as exc:  # noqa: BLE001 - never kill the watcher
                     log.warning("advisory occurrence sweep failed: %s", exc)
+                try:
+                    # Closed days only, so this never races the writer, which
+                    # only appends to today. Without it the tree returns to the
+                    # 18,583 files that cost 325.9 s at every start (#382).
+                    compact_closed_snapshot_partitions(self._parquet_dir)
+                except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                    log.warning("snapshot partition compaction failed: %s", exc)
                 self._stopping.wait(_SWEEP_INTERVAL_SECONDS)
 
         self._sweeper = threading.Thread(

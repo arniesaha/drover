@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import pyarrow as pa
 
+from drover.server.compact import compact_partition
 from drover.server.db import open_duckdb_connection
 from drover.server.parquet_io import atomic_write_table
 from drover.server.providers.types import (
@@ -77,6 +79,9 @@ def provider_operational_source_version(duckdb_path: str | Path, host_id: str) -
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return f"provider-state:{digest}"
+
+
+log = logging.getLogger("drover.providers")
 
 
 class ProviderUsageService:
@@ -373,13 +378,24 @@ class ProviderUsageService:
         ]
         if not new_snapshots:
             return
-        table = pa.concat_tables(
-            [provider_snapshot_table(snapshot) for snapshot in new_snapshots]
-        )
         safe_host_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", host_id).strip("-")
         safe_host_id = safe_host_id or "host"
-        out_path = self.snapshot_dir / f"part-{safe_host_id}-{uuid4().hex}.parquet"
-        atomic_write_table(table, out_path, compression="zstd")
+        # One file per write, and writes are ~1 a minute per host. Flat, that
+        # reached 18,583 files: `union_by_name=true` reads every footer when
+        # the view is created, which cost 325.9 s at every start (#382), and
+        # the duplicate guard above scans the whole table on every write. A
+        # dated partition bounds both to a day's files and gives
+        # `compact_closed_snapshot_partitions` a unit it can merge without
+        # ever racing a writer, which only ever touches today's.
+        for day, rows in _by_observed_day(new_snapshots).items():
+            partition = self.snapshot_dir / f"date={day}"
+            partition.mkdir(parents=True, exist_ok=True)
+            out_path = partition / f"part-{safe_host_id}-{uuid4().hex}.parquet"
+            atomic_write_table(
+                pa.concat_tables([provider_snapshot_table(row) for row in rows]),
+                out_path,
+                compression="zstd",
+            )
 
     def _record_snapshot_attempts(
         self,
@@ -640,3 +656,56 @@ def _canonical_source(value: Any) -> str:
         "codex_app_server": "codex-app-server",
         "harness_inventory": "harness-inventory",
     }.get(source, source)
+
+
+def _by_observed_day(
+    snapshots: "Sequence[ProviderAccountSnapshot]",
+) -> "dict[str, list[ProviderAccountSnapshot]]":
+    """Group snapshots by the UTC day they were observed on.
+
+    A batch can straddle midnight, so the partition follows each row's own
+    `observed_at` rather than the wall clock of the write.
+    """
+    grouped: dict[str, list[ProviderAccountSnapshot]] = {}
+    for snapshot in snapshots:
+        observed = snapshot.observed_at
+        if observed.tzinfo is not None:
+            observed = observed.astimezone(timezone.utc)
+        grouped.setdefault(observed.date().isoformat(), []).append(snapshot)
+    return grouped
+
+
+def compact_closed_snapshot_partitions(parquet_dir: Path) -> dict:
+    """Merge each finished day's snapshot files into one.
+
+    Only days before today, and deliberately without deduplication: in this
+    table `dedup_key` identifies a *snapshot*, and each snapshot contributes
+    one row per window, so deduplicating on it keeps one row in four and
+    unlinks the rest (#389). Today's partition is never touched, which is what
+    makes this safe beside a live writer: writers only ever append to today.
+    """
+    snapshot_dir = Path(parquet_dir) / "provider_usage_snapshots"
+    today = f"date={datetime.now(timezone.utc).date().isoformat()}"
+    results = {"partitions": 0, "files_before": 0, "files_after": 0, "rows": 0}
+    if not snapshot_dir.is_dir():
+        return results
+    for partition in sorted(snapshot_dir.glob("date=*")):
+        if not partition.is_dir() or partition.name >= today:
+            continue
+        files = list(partition.glob("*.parquet"))
+        if len(files) < 2:
+            continue
+        outcome = compact_partition(partition, dedup_column=None)
+        results["partitions"] += 1
+        results["files_before"] += outcome.files_before
+        results["files_after"] += outcome.files_after
+        results["rows"] += outcome.rows
+    if results["partitions"]:
+        log.info(
+            "compacted %d closed snapshot partition(s): %d -> %d files, %d rows",
+            results["partitions"],
+            results["files_before"],
+            results["files_after"],
+            results["rows"],
+        )
+    return results
