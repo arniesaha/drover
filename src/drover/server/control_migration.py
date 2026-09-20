@@ -30,6 +30,90 @@ from drover.server.db import (
 _EXTRA_TABLES = ("control_server_identity", "control_credentials")
 _ALL_TABLES = CONTROL_PLANE_TABLES + _EXTRA_TABLES
 
+# Legacy usage writers stored their instants as naive UTC in DuckDB.  These
+# columns have producer-specific provenance, so applying an operator's old
+# process-wall-clock timezone would silently move real usage history.
+_NAIVE_UTC_TIMESTAMP_COLUMNS = frozenset(
+    {
+        ("session_usage", "observed_at"),
+        ("session_usage_sources", "observed_at"),
+        ("native_usage_partition_totals", "observed_at"),
+        ("native_usage_partition_watermarks", "source_activity_at"),
+        ("native_usage_partition_watermarks", "rolled_at"),
+    }
+)
+
+# These values define control-plane identity and replayability. Optional
+# source columns may evolve, but their absence must not turn an import into a
+# synthetic or relationally incomplete serving store.
+_REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
+    "harness_hosts": frozenset(
+        {"host_id", "display_name", "kind", "status", "capabilities_json"}
+    ),
+    "harness_sessions": frozenset(
+        {"session_id", "host_id", "harness", "command", "status"}
+    ),
+    "harness_events": frozenset(
+        {"event_id", "session_id", "event_type", "payload_json", "created_at"}
+    ),
+    "live_session_recaps": frozenset({"session_id", "recap_text", "source_seq"}),
+    "live_recap_jobs": frozenset({"session_id", "desired_source_seq", "status"}),
+    "advisory_findings": frozenset(
+        {
+            "finding_id",
+            "fingerprint",
+            "analyzer_id",
+            "rule_id",
+            "target_type",
+            "target_id",
+            "analyzer_class",
+            "severity",
+            "confidence",
+            "title",
+            "impact",
+            "remediation_json",
+            "state",
+            "first_seen_at",
+            "last_seen_at",
+            "latest_run_id",
+        }
+    ),
+    "advisory_occurrences": frozenset(
+        {"occurrence_id", "finding_id", "run_id", "outcome", "observed_at"}
+    ),
+    "session_usage": frozenset(
+        {
+            "session_id",
+            "source",
+            "source_seq",
+            "source_event_count",
+            "observed_at",
+        }
+    ),
+    "session_usage_sources": frozenset(
+        {
+            "source_usage_id",
+            "session_id",
+            "source",
+            "source_seq",
+            "source_event_count",
+            "observed_at",
+        }
+    ),
+    "native_usage_partition_totals": frozenset(
+        {
+            "native_usage_partition_id",
+            "session_id",
+            "partition_date",
+            "event_count",
+            "observed_at",
+        }
+    ),
+    "native_usage_partition_watermarks": frozenset(
+        {"partition_date", "source_activity_at", "rolled_at"}
+    ),
+}
+
 
 def _source_fingerprint(path: Path, credential_document: Path | None) -> str:
     digest = hashlib.sha256()
@@ -66,8 +150,12 @@ def _legacy_wall_time_to_utc(value: datetime, source_zone: ZoneInfo) -> datetime
     return first.astimezone(timezone.utc)
 
 
-def _normalise_value(value: Any, source_zone: ZoneInfo) -> Any:
+def _normalise_value(table: str, column: str, value: Any, source_zone: ZoneInfo) -> Any:
     if isinstance(value, datetime):
+        if value.tzinfo is not None and value.tzinfo.utcoffset(value) is not None:
+            return value.astimezone(timezone.utc)
+        if (table, column) in _NAIVE_UTC_TIMESTAMP_COLUMNS:
+            return value.replace(tzinfo=timezone.utc)
         return _legacy_wall_time_to_utc(value, source_zone)
     return value
 
@@ -114,7 +202,7 @@ def _source_table_rows(
             columns = [item[0] for item in result.description]
             output[table] = [
                 {
-                    column: _normalise_value(value, source_zone)
+                    column: _normalise_value(table, column, value, source_zone)
                     for column, value in zip(columns, row)
                 }
                 for row in result.fetchall()
@@ -145,11 +233,12 @@ def _iter_source_rows(
     with duckdb.connect(str(snapshot), read_only=True) as con:
         columns = _source_columns(snapshot, table)
         last_key: Any | None = None
+        key_order = f'{key} COLLATE "C"' if table == "harness_events" else key
         while True:
-            where = "" if last_key is None else f"WHERE {key} > ?"
+            where = "" if last_key is None else f"WHERE {key_order} > ?"
             params = [] if last_key is None else [last_key]
             result = con.execute(
-                f"SELECT * FROM {table} {where} ORDER BY {key} LIMIT ?",
+                f"SELECT * FROM {table} {where} ORDER BY {key_order} LIMIT ?",
                 [*params, max(1, int(batch_size))],
             )
             rows = result.fetchall()
@@ -158,7 +247,7 @@ def _iter_source_rows(
             last_key = rows[-1][columns.index(key)]
             yield [
                 {
-                    column: _normalise_value(value, source_zone)
+                    column: _normalise_value(table, column, value, source_zone)
                     for column, value in zip(columns, row)
                 }
                 for row in rows
@@ -199,6 +288,8 @@ def _credential_rows(
         "control_credentials": [
             {
                 key: _normalise_value(
+                    "control_credentials",
+                    key,
                     (
                         datetime.fromisoformat(value.replace("Z", "+00:00"))
                         if key.endswith("_at") and isinstance(value, str)
@@ -226,11 +317,49 @@ def _target_columns(con: object, table: str) -> set[str]:
     }
 
 
+def _validate_source_inventory(
+    con: object,
+    *,
+    source_snapshot: Path,
+    credential_rows: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Fence every supplied source column before writing any target row."""
+    for table in CONTROL_PLANE_TABLES:
+        source_columns = set(_source_columns(source_snapshot, table))
+        missing = sorted(_REQUIRED_SOURCE_COLUMNS[table] - source_columns)
+        if missing:
+            raise ValueError(
+                f"source table {table} is missing required source columns: "
+                + ", ".join(missing)
+            )
+        unsupported = sorted(source_columns - _target_columns(con, table))
+        if unsupported:
+            raise ValueError(
+                f"source table {table} has unsupported source columns: "
+                + ", ".join(unsupported)
+            )
+    for table in _EXTRA_TABLES:
+        target_columns = _target_columns(con, table)
+        supplied_columns = set().union(*(row.keys() for row in credential_rows[table]))
+        unsupported = sorted(supplied_columns - target_columns)
+        if unsupported:
+            raise ValueError(
+                f"source table {table} has unsupported source columns: "
+                + ", ".join(unsupported)
+            )
+
+
 def _insert_rows(con: object, table: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     target_columns = _target_columns(con, table)
-    columns = [column for column in rows[0] if column in target_columns]
+    columns = sorted(set().union(*(row.keys() for row in rows)))
+    unsupported = sorted(set(columns) - target_columns)
+    if unsupported:
+        raise ValueError(
+            f"source table {table} has unsupported source columns: "
+            + ", ".join(unsupported)
+        )
     if not columns:
         return
     placeholders = ", ".join("?" for _ in columns)
@@ -322,24 +451,50 @@ def initialize_empty_control_store(control_path: Path) -> dict[str, Any]:
             "empty initialization requires an explicit PostgreSQL control store"
         )
     with control_plane_connection(control_path) as con:
-        populated = {
-            table: int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            for table in _ALL_TABLES
-        }
-        if any(populated.values()):
-            raise RuntimeError("refusing empty initialization for a populated target")
-        _mark_state(
-            con,
-            state="ready",
-            mode="empty",
-            fingerprint=None,
-            source_timezone=None,
-            details={
-                "rows": populated,
-                "recovery": "forward-recovery-only-after-writes",
-            },
-            verified=True,
-        )
+        con.execute("BEGIN")
+        try:
+            _lock_import_admission(con)
+            current = con.execute("""
+                SELECT state, mode FROM control_store_initialization
+                 WHERE singleton = TRUE
+                """).fetchone()
+            if current is not None and current[0] == "ready":
+                # Idempotent approval must preserve a verified import's
+                # fingerprint and mode rather than rewriting it as empty.
+                con.execute("COMMIT")
+            else:
+                if current is not None and (
+                    current[0] == "initializing" or current[1] == "import"
+                ):
+                    raise RuntimeError(
+                        "refusing empty initialization while an import owns this target"
+                    )
+                populated = {
+                    table: int(
+                        con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                    )
+                    for table in _ALL_TABLES
+                }
+                if any(populated.values()):
+                    raise RuntimeError(
+                        "refusing empty initialization for a populated target"
+                    )
+                _mark_state(
+                    con,
+                    state="ready",
+                    mode="empty",
+                    fingerprint=None,
+                    source_timezone=None,
+                    details={
+                        "rows": populated,
+                        "recovery": "forward-recovery-only-after-writes",
+                    },
+                    verified=True,
+                )
+                con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
     return control_store_status(Path(control_path))
 
 
@@ -361,7 +516,7 @@ def _iter_logical_target_events(con: object, *, batch_size: int = 500):
         SELECT e.*, COALESCE(p.payload_json, e.payload_json) AS payload_json
           FROM harness_events e
           LEFT JOIN harness_event_payloads p ON p.event_id = e.event_id
-         ORDER BY e.event_id
+         ORDER BY e.event_id COLLATE "C"
     """
     if getattr(con, "dialect", None) == "postgres":
         # Psycopg's ordinary cursor buffers its complete result client-side.
@@ -490,6 +645,51 @@ def _rebuild_previews(con: object) -> None:
         """)
 
 
+def _lock_import_admission(con: object) -> None:
+    """Serialize all snapshot imports for one target schema, not one source."""
+    con.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(?))",
+        ["drover-control-import-admission"],
+    )
+
+
+def _mark_import_failed_if_owned(
+    con: object,
+    *,
+    fingerprint: str,
+    source_timezone: str,
+    error: Exception,
+) -> None:
+    """Only the import that left an initializing marker may mark it failed."""
+    con.execute("BEGIN")
+    try:
+        _lock_import_admission(con)
+        current = con.execute("""
+            SELECT state, source_fingerprint FROM control_store_initialization
+             WHERE singleton = TRUE FOR UPDATE
+            """).fetchone()
+        if (
+            current is not None
+            and current[0] == "initializing"
+            and current[1] == fingerprint
+        ):
+            _mark_state(
+                con,
+                state="failed",
+                mode="import",
+                fingerprint=fingerprint,
+                source_timezone=source_timezone,
+                details={"error": type(error).__name__},
+                verified=False,
+            )
+            con.execute("COMMIT")
+            return
+        con.execute("ROLLBACK")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
 def import_legacy_snapshot(
     control_path: Path,
     *,
@@ -510,41 +710,57 @@ def import_legacy_snapshot(
     credential_rows = _credential_rows(credential_document, zone)
     fingerprint = _source_fingerprint(source_snapshot, credential_document)
     with control_plane_connection(control_path) as con:
-        current = con.execute(
-            "SELECT state FROM control_store_initialization WHERE singleton = TRUE"
-        ).fetchone()
-        if current is not None and current[0] == "ready":
-            raise RuntimeError(
-                "target is already ready; use forward recovery after PostgreSQL writes"
-            )
-        existing = sum(
-            int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-            for table in _ALL_TABLES
-        )
-        if existing:
-            raise RuntimeError("refusing import into a populated unready target")
-        _mark_state(
-            con,
-            state="initializing",
-            mode="import",
-            fingerprint=fingerprint,
-            source_timezone=source_timezone,
-            details={
-                "source_tables": {
-                    **{key: len(value) for key, value in source_rows.items()},
-                    "harness_events": _stream_summary(
-                        _iter_source_rows(source_snapshot, "harness_events", zone)
-                    )["count"],
-                }
-            },
-            verified=False,
-        )
+        owns_initialization = False
         try:
+            # Commit the admission marker while holding the target-wide lock.
+            # A waiting different snapshot then sees `initializing` instead of
+            # an apparently empty target, even if this process subsequently
+            # dies between transactions.
             con.execute("BEGIN")
-            con.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(?))",
-                [f"drover-control-import:{fingerprint}"],
+            _lock_import_admission(con)
+            current = con.execute(
+                "SELECT state FROM control_store_initialization WHERE singleton = TRUE"
+            ).fetchone()
+            if current is not None and current[0] == "ready":
+                raise RuntimeError(
+                    "target is already ready; use forward recovery after PostgreSQL writes"
+                )
+            if current is not None and current[0] == "initializing":
+                raise RuntimeError(
+                    "another snapshot import is already initializing this target"
+                )
+            existing = sum(
+                int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in _ALL_TABLES
             )
+            if existing:
+                raise RuntimeError("refusing import into a populated unready target")
+            _validate_source_inventory(
+                con,
+                source_snapshot=source_snapshot,
+                credential_rows=credential_rows,
+            )
+            _mark_state(
+                con,
+                state="initializing",
+                mode="import",
+                fingerprint=fingerprint,
+                source_timezone=source_timezone,
+                details={
+                    "source_tables": {
+                        **{key: len(value) for key, value in source_rows.items()},
+                        "harness_events": _stream_summary(
+                            _iter_source_rows(source_snapshot, "harness_events", zone)
+                        )["count"],
+                    }
+                },
+                verified=False,
+            )
+            con.execute("COMMIT")
+            owns_initialization = True
+
+            con.execute("BEGIN")
+            _lock_import_admission(con)
             for table in CONTROL_PLANE_TABLES:
                 if table == "harness_events":
                     for rows in _iter_source_rows(source_snapshot, table, zone):
@@ -602,15 +818,13 @@ def import_legacy_snapshot(
             con.execute("COMMIT")
         except Exception as exc:
             con.execute("ROLLBACK")
-            _mark_state(
-                con,
-                state="failed",
-                mode="import",
-                fingerprint=fingerprint,
-                source_timezone=source_timezone,
-                details={"error": type(exc).__name__},
-                verified=False,
-            )
+            if owns_initialization:
+                _mark_import_failed_if_owned(
+                    con,
+                    fingerprint=fingerprint,
+                    source_timezone=source_timezone,
+                    error=exc,
+                )
             raise
     return control_store_status(control_path)
 
@@ -637,6 +851,11 @@ def verify_legacy_import(
     with control_plane_connection(control_path) as con:
         con.execute("BEGIN")
         try:
+            _validate_source_inventory(
+                con,
+                source_snapshot=source_snapshot,
+                credential_rows=credential_rows,
+            )
             report = _verify_rows(
                 con,
                 source_rows=source_rows,

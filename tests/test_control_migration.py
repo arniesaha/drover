@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -237,6 +238,39 @@ def test_fenced_import_preserves_legacy_identity_timezone_and_event_order(
             .isoformat()
             == "2026-09-20T19:00:00+00:00"
         )
+        # These legacy usage and native-rollup writers intentionally produced
+        # naive UTC. Their values must not be shifted by the operator's local
+        # source-timezone used for the old harness wall-clock columns above.
+        assert (
+            con.execute(
+                "SELECT observed_at FROM session_usage WHERE session_id = 'legacy-session'"
+            )
+            .fetchone()[0]
+            .isoformat()
+            == "2026-09-20T12:00:00+00:00"
+        )
+        assert (
+            con.execute(
+                "SELECT observed_at FROM session_usage_sources WHERE source_usage_id = 'usage-source-1'"
+            )
+            .fetchone()[0]
+            .isoformat()
+            == "2026-09-20T12:00:00+00:00"
+        )
+        assert (
+            con.execute(
+                "SELECT observed_at FROM native_usage_partition_totals WHERE native_usage_partition_id = 'native-total-1'"
+            )
+            .fetchone()[0]
+            .isoformat()
+            == "2026-09-20T12:00:00+00:00"
+        )
+        assert con.execute(
+            "SELECT source_activity_at, rolled_at FROM native_usage_partition_watermarks"
+        ).fetchone() == (
+            datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc),
+        )
         assert con.execute(
             "SELECT identity_value FROM control_server_identity WHERE identity_key = 'server_id'"
         ).fetchone() == ("legacy-server-id",)
@@ -258,6 +292,226 @@ def test_fenced_import_rejects_ambiguous_legacy_wall_time(
             source_snapshot=source,
             source_timezone="America/Los_Angeles",
         )
+
+
+def test_import_rejects_unknown_even_null_source_columns(
+    postgres_target, tmp_path: Path
+):
+    """A verified import has a fenced source schema, not a lossy projection."""
+    from drover.server.control_migration import import_legacy_snapshot
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    with duckdb.connect(str(source)) as con:
+        con.execute("ALTER TABLE harness_hosts ADD COLUMN future_null_only VARCHAR")
+
+    with pytest.raises(
+        ValueError, match="unsupported source columns.*future_null_only"
+    ):
+        import_legacy_snapshot(
+            postgres_target,
+            source_snapshot=source,
+            source_timezone="America/Los_Angeles",
+        )
+
+
+def test_import_rejects_missing_load_bearing_source_columns(
+    postgres_target, tmp_path: Path
+):
+    """An absent event envelope cannot be replaced by a synthetic empty payload."""
+    from drover.server.control_migration import import_legacy_snapshot
+    from drover.server.db import CONTROL_PLANE_TABLES
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    missing_column_source = tmp_path / "missing-payload-json.duckdb"
+    with duckdb.connect(str(missing_column_source)) as con:
+        source_literal = str(source).replace("'", "''")
+        con.execute(f"ATTACH '{source_literal}' AS legacy")
+        for table in CONTROL_PLANE_TABLES:
+            select = (
+                "SELECT * EXCLUDE (payload_json) FROM legacy.harness_events"
+                if table == "harness_events"
+                else f"SELECT * FROM legacy.{table}"
+            )
+            con.execute(f"CREATE TABLE {table} AS {select}")
+        con.execute("DETACH legacy")
+
+    with pytest.raises(
+        ValueError, match="missing required source columns.*payload_json"
+    ):
+        import_legacy_snapshot(
+            postgres_target,
+            source_snapshot=missing_column_source,
+            source_timezone="America/Los_Angeles",
+        )
+
+
+def test_import_uses_portable_binary_event_order_for_streamed_verification(
+    postgres_target, tmp_path: Path
+):
+    """DuckDB and PostgreSQL digest the mixed Unicode event-id set identically."""
+    from drover.server.control_migration import (
+        _iter_source_rows,
+        _zone,
+        import_legacy_snapshot,
+        verify_legacy_import,
+    )
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    event_ids = ("A-event", "a-event", "-event", "_event", "évent")
+    with duckdb.connect(str(source)) as con:
+        con.executemany(
+            """
+            INSERT INTO harness_events
+              (event_id, session_id, event_type, payload_json, created_at, seq, dedup_key)
+            VALUES (?, 'legacy-session', 'assistant_output', ?, ?, 9, ?)
+            """,
+            [
+                (
+                    event_id,
+                    json.dumps({"text": event_id}),
+                    datetime(2026, 9, 20, 12, 2),
+                    f"dedup-{index}",
+                )
+                for index, event_id in enumerate(event_ids)
+            ],
+        )
+
+    source_order = [
+        row["event_id"]
+        for batch in _iter_source_rows(
+            source, "harness_events", _zone("UTC"), batch_size=2
+        )
+        for row in batch
+    ]
+    assert source_order == sorted(
+        source_order, key=lambda event_id: event_id.encode("utf-8")
+    )
+    assert (
+        import_legacy_snapshot(
+            postgres_target, source_snapshot=source, source_timezone="UTC"
+        )["state"]
+        == "ready"
+    )
+    assert (
+        verify_legacy_import(
+            postgres_target, source_snapshot=source, source_timezone="UTC"
+        )["ok"]
+        is True
+    )
+
+
+def test_concurrent_snapshot_import_keeps_the_successful_owner_ready(
+    postgres_target, tmp_path: Path, monkeypatch
+):
+    """A waiting second source cannot overwrite the first import's ready marker."""
+    import drover.server.control_migration as migration
+
+    source_a_dir = tmp_path / "source-a"
+    source_b_dir = tmp_path / "source-b"
+    source_a_dir.mkdir()
+    source_b_dir.mkdir()
+    source_a = _legacy_snapshot(
+        source_a_dir, created_at=datetime(2026, 9, 20, 12, 0, 0)
+    )
+    source_b = _legacy_snapshot(
+        source_b_dir, created_at=datetime(2026, 9, 20, 12, 0, 0)
+    )
+    with duckdb.connect(str(source_b)) as con:
+        con.execute(
+            "UPDATE harness_events SET payload_json = '{\"text\":\"other source\"}' WHERE event_id = 'legacy-null'"
+        )
+
+    entered_first = threading.Event()
+    entered_second = threading.Event()
+    release_first = threading.Event()
+    original_rebuild = migration._rebuild_previews
+
+    def pause_first_rebuild(con):
+        if not entered_first.is_set():
+            entered_first.set()
+            assert release_first.wait(timeout=5)
+        else:
+            entered_second.set()
+        original_rebuild(con)
+
+    monkeypatch.setattr(migration, "_rebuild_previews", pause_first_rebuild)
+    results: dict[str, object] = {}
+
+    def run_import(label: str, source: Path) -> None:
+        try:
+            results[label] = migration.import_legacy_snapshot(
+                postgres_target, source_snapshot=source, source_timezone="UTC"
+            )
+        except BaseException as exc:  # thread boundary retains the exact failure.
+            results[label] = exc
+
+    first = threading.Thread(target=run_import, args=("first", source_a))
+    second = threading.Thread(target=run_import, args=("second", source_b))
+    first.start()
+    assert entered_first.wait(timeout=5)
+    second.start()
+    entered_second.wait(timeout=1)
+    release_first.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert isinstance(results.get("first"), dict)
+    assert results["first"]["state"] == "ready"
+    assert isinstance(results.get("second"), RuntimeError)
+    status = migration.control_store_status(postgres_target)
+    assert status["state"] == "ready"
+    assert status["source_fingerprint"] == results["first"]["source_fingerprint"]
+
+
+def test_empty_init_waits_for_import_admission_and_preserves_import_readiness(
+    postgres_target, tmp_path: Path, monkeypatch
+):
+    """Empty init cannot expose an import target before its verification commits."""
+    import drover.server.control_migration as migration
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    import_at_rebuild = threading.Event()
+    release_import = threading.Event()
+    empty_init_finished = threading.Event()
+    original_rebuild = migration._rebuild_previews
+
+    def pause_import(con):
+        import_at_rebuild.set()
+        assert release_import.wait(timeout=5)
+        original_rebuild(con)
+
+    monkeypatch.setattr(migration, "_rebuild_previews", pause_import)
+    results: dict[str, object] = {}
+
+    def import_snapshot() -> None:
+        results["import"] = migration.import_legacy_snapshot(
+            postgres_target, source_snapshot=source, source_timezone="UTC"
+        )
+
+    def initialize_empty() -> None:
+        try:
+            results["init"] = migration.initialize_empty_control_store(postgres_target)
+        finally:
+            empty_init_finished.set()
+
+    importer = threading.Thread(target=import_snapshot)
+    initializer = threading.Thread(target=initialize_empty)
+    importer.start()
+    assert import_at_rebuild.wait(timeout=5)
+    initializer.start()
+    assert empty_init_finished.wait(timeout=0.25) is False
+    release_import.set()
+    importer.join(timeout=10)
+    initializer.join(timeout=10)
+
+    assert results["import"]["state"] == "ready"
+    assert results["import"]["mode"] == "import"
+    assert results["init"]["state"] == "ready"
+    assert results["init"]["mode"] == "import"
+    assert (
+        migration.control_store_status(postgres_target)["source_fingerprint"]
+        == results["import"]["source_fingerprint"]
+    )
 
 
 def test_interrupted_import_marks_target_failed_and_unready(

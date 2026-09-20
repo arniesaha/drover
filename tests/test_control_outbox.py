@@ -8,6 +8,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 
@@ -247,6 +249,72 @@ def test_postgres_batch_and_structured_writers_keep_every_new_event_exportable(
     assert registry.get_event("batch-1").payload == {"text": "first"}
 
 
+def test_postgres_batch_and_structured_writers_roll_back_all_event_side_effects(
+    postgres_control_store, monkeypatch
+):
+    """Both multi-event paths retain their all-or-nothing completion boundary."""
+    control_path, _ = postgres_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.harness import registry as registry_module
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(
+        host_id="writer-rollback-host", display_name="Host", kind="test"
+    )
+    for session_id in ("batch-rollback", "structured-rollback"):
+        registry.create_session(
+            host_id="writer-rollback-host",
+            harness="codex",
+            command="codex",
+            session_id=session_id,
+            mode="structured",
+        )
+    actual_enqueue = registry_module._enqueue_recap_if_completion
+
+    def crash_after_recap(*args, **kwargs):
+        actual_enqueue(*args, **kwargs)
+        raise RuntimeError("simulated post-recap writer failure")
+
+    monkeypatch.setattr(
+        registry_module, "_enqueue_recap_if_completion", crash_after_recap
+    )
+    with pytest.raises(RuntimeError, match="post-recap writer failure"):
+        registry.append_events_if_new(
+            [
+                {
+                    "event_id": "batch-rollback-event",
+                    "session_id": "batch-rollback",
+                    "event_type": "status",
+                    "payload": {"turn_complete": True},
+                    "seq": 1,
+                }
+            ]
+        )
+    with pytest.raises(RuntimeError, match="post-recap writer failure"):
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": "structured-rollback-event",
+                    "session_id": "structured-rollback",
+                    "event_type": "status",
+                    "payload": {"turn_complete": True},
+                    "seq": 1,
+                }
+            ]
+        )
+
+    with control_plane_connection(control_path) as con:
+        for table in (
+            "harness_events",
+            "harness_event_payloads",
+            "harness_session_previews",
+            "control_outbox_events",
+            "live_recap_jobs",
+        ):
+            assert con.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+
+
 def test_postgres_preview_projection_keeps_preferred_newest_candidate(
     postgres_control_store,
 ):
@@ -405,6 +473,53 @@ def test_outbox_reclaims_stable_batch_and_publishes_only_manifested_parquet(
         ).fetchall() == [("acknowledged", 2)]
 
 
+def test_outbox_rejects_a_stale_final_path_before_it_becomes_manifested(
+    postgres_control_store,
+):
+    """A crash-retry filename is not evidence that its immutable facts are valid."""
+    control_path, parquet_dir = postgres_control_store
+    from drover.server.control_outbox import (
+        PUBLISHED_BATCHES_DIR,
+        claim_outbox_batch,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(host_id="stale-host", display_name="Host", kind="test")
+    registry.create_session(
+        host_id="stale-host",
+        harness="codex",
+        command="codex",
+        session_id="stale-session",
+    )
+    registry.append_event(
+        session_id="stale-session",
+        event_id="stale-event",
+        event_type="assistant_output",
+        payload={"text": "the actual claimed envelope"},
+        seq=1,
+    )
+
+    with control_plane_connection(control_path) as con:
+        claim = claim_outbox_batch(con, owner="worker", limit=10)
+        assert claim is not None
+        stale_path = parquet_dir / PUBLISHED_BATCHES_DIR / f"{claim.batch_id}.parquet"
+        stale_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"event_id": ["wrong-event"]}), stale_path)
+
+        with pytest.raises(RuntimeError, match="does not match claimed membership"):
+            publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+
+        assert published_batches(con) == []
+        assert con.execute(
+            "SELECT state, content_sha256, archive_path FROM control_outbox_batches WHERE batch_id = ?",
+            [claim.batch_id],
+        ).fetchone() == ("claimed", None, None)
+
+
 def test_outbox_claims_a_late_old_event_after_newer_work_was_acknowledged(
     postgres_control_store,
 ):
@@ -451,7 +566,7 @@ def test_outbox_claims_a_late_old_event_after_newer_work_was_acknowledged(
 def test_retention_requires_export_usage_and_verified_archive_replay(
     postgres_control_store,
 ):
-    """A terminal event remains hot until all replay and usage dependencies finish."""
+    """A terminal event remains hot until export, usage, and recap finish."""
     control_path, parquet_dir = postgres_control_store
     from drover.server.control_outbox import (
         LocalVerifiedArchiveResolver,
@@ -472,6 +587,7 @@ def test_retention_requires_export_usage_and_verified_archive_replay(
         harness="codex",
         command="codex",
         session_id="retention-session",
+        mode="structured",
     )
     registry.append_event(
         session_id="retention-session",
@@ -481,76 +597,88 @@ def test_retention_requires_export_usage_and_verified_archive_replay(
         content_preview="replay this exact envelope",
         seq=1,
     )
-    with control_plane_connection(control_path) as con:
-        assert prune_verified_payloads(con, resolver=None) == {
-            "pruned": 0,
-            "protected_active": 1,
-            "protected_dependency": 0,
-            "verification_failed": 0,
-        }
+    registry.append_event(
+        session_id="retention-session",
+        event_id="retention-complete",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=2,
+    )
+    assert prune_verified_payloads(control_path, resolver=None) == {
+        "pruned": 0,
+        "protected_active": 2,
+        "protected_dependency": 0,
+        "verification_failed": 0,
+    }
     registry.update_session_status("retention-session", "completed")
 
     with control_plane_connection(control_path) as con:
-        assert prune_verified_payloads(con, resolver=None) == {
-            "pruned": 0,
-            "protected_active": 0,
-            "protected_dependency": 1,
-            "verification_failed": 0,
-        }
         claim = claim_outbox_batch(con, owner="worker", limit=10)
         assert claim is not None
         published = publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
         assert acknowledge_outbox_batch(con, published.batch_id)
-
-        # Export alone is not enough: usage rollup has not consumed the event.
-        assert prune_verified_payloads(con, resolver=None) == {
-            "pruned": 0,
-            "protected_active": 0,
-            "protected_dependency": 1,
-            "verification_failed": 0,
-        }
         rollup_pending_sessions(con)
 
-        class CorruptResolver:
-            def resolve(self, **_kwargs):
-                return '{"text":"tampered"}'
+    # Export and usage alone are insufficient: the completion event left a
+    # durable recap job pending at the terminal source sequence.
+    assert prune_verified_payloads(control_path, resolver=None) == {
+        "pruned": 0,
+        "protected_active": 0,
+        "protected_dependency": 2,
+        "verification_failed": 0,
+    }
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT desired_source_seq, status FROM live_recap_jobs WHERE session_id = ?",
+            ["retention-session"],
+        ).fetchone() == (2, "pending")
+        con.execute("""
+            INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at)
+            VALUES ('retention-session', 'done', 2, now())
+            """)
+        con.execute(
+            "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
+            ["retention-session"],
+        )
 
-        assert prune_verified_payloads(con, resolver=CorruptResolver()) == {
-            "pruned": 0,
-            "protected_active": 0,
-            "protected_dependency": 0,
-            "verification_failed": 1,
-        }
-        resolver = LocalVerifiedArchiveResolver(
-            parquet_dir,
-            manifest_reader=lambda: {
-                batch.batch_id for batch in published_batches(con)
-            },
-        )
-        assert prune_verified_payloads(con, resolver=resolver)["pruned"] == 1
-        assert registry.lookup_event_payload("retention-event").state == "unavailable"
-        recovered = registry.lookup_event_payload("retention-event", resolver=resolver)
-        assert recovered.state == "archive"
-        assert recovered.payload_json == '{"text":"replay this exact envelope"}'
-        unavailable = registry.list_event_page("retention-session", limit=10).events[0]
-        assert unavailable.payload_status.state == "unavailable"
-        assert unavailable.payload_status.reason == "archive_resolver_required"
-        assert unavailable.wire_payload()["payload_unavailable"] == {
-            "reason": "archive_resolver_required"
-        }
-        corrupt = registry.list_event_page(
-            "retention-session", limit=10, resolver=CorruptResolver()
-        ).events[0]
-        assert corrupt.payload_status.state == "unavailable"
-        assert corrupt.payload_status.reason == "archive_verification_failed"
-        # Task 3's API reader receives only this injected worker resolver. Its
-        # normal event paginator must replay an archived row without any raw
-        # archive glob or host-path access.
-        page = registry.list_event_page(
-            "retention-session", limit=10, resolver=resolver
-        )
-        assert page.events[0].payload == {"text": "replay this exact envelope"}
-        assert page.events[0].payload_status.state == "archive"
+    class CorruptResolver:
+        def resolve(self, **_kwargs):
+            return '{"text":"tampered"}'
+
+    assert prune_verified_payloads(control_path, resolver=CorruptResolver()) == {
+        "pruned": 0,
+        "protected_active": 0,
+        "protected_dependency": 0,
+        "verification_failed": 2,
+    }
+
+    def manifest_ids() -> set[str]:
+        with control_plane_connection(control_path) as manifest_con:
+            return {batch.batch_id for batch in published_batches(manifest_con)}
+
+    resolver = LocalVerifiedArchiveResolver(parquet_dir, manifest_reader=manifest_ids)
+    assert prune_verified_payloads(control_path, resolver=resolver)["pruned"] == 2
+    assert registry.lookup_event_payload("retention-event").state == "unavailable"
+    recovered = registry.lookup_event_payload("retention-event", resolver=resolver)
+    assert recovered.state == "archive"
+    assert recovered.payload_json == '{"text":"replay this exact envelope"}'
+    unavailable = registry.list_event_page("retention-session", limit=10).events[0]
+    assert unavailable.payload_status.state == "unavailable"
+    assert unavailable.payload_status.reason == "archive_resolver_required"
+    assert unavailable.wire_payload()["payload_unavailable"] == {
+        "reason": "archive_resolver_required"
+    }
+    corrupt = registry.list_event_page(
+        "retention-session", limit=10, resolver=CorruptResolver()
+    ).events[0]
+    assert corrupt.payload_status.state == "unavailable"
+    assert corrupt.payload_status.reason == "archive_verification_failed"
+    # Task 3's API reader receives only this injected worker resolver. Its
+    # normal event paginator must replay an archived row without any raw
+    # archive glob or host-path access.
+    page = registry.list_event_page("retention-session", limit=10, resolver=resolver)
+    assert page.events[0].payload == {"text": "replay this exact envelope"}
+    assert page.events[0].payload_status.state == "archive"
 
 
 def test_archived_paginator_releases_the_only_postgres_slot_before_worker_rpc(
@@ -605,3 +733,116 @@ def test_archived_paginator_releases_the_only_postgres_slot_before_worker_rpc(
     )
     assert page.events[0].payload == {"text": "cold bytes from the worker"}
     assert page.events[0].payload_status.state == "archive"
+
+
+def test_retention_releases_the_only_postgres_slot_before_archive_resolution(
+    postgres_single_connection_control_store,
+):
+    """Retention resolves detached references, then conditionally reopens a slot."""
+    control_path = postgres_single_connection_control_store
+    from drover.server.control_outbox import (
+        acknowledge_outbox_batch,
+        claim_outbox_batch,
+        prune_verified_payloads,
+        publish_outbox_batch,
+    )
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.usage_rollup import rollup_pending_sessions
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(
+        host_id="retention-slot-host", display_name="Host", kind="test"
+    )
+    registry.create_session(
+        host_id="retention-slot-host",
+        harness="codex",
+        command="codex",
+        session_id="retention-slot-session",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id="retention-slot-session",
+        event_id="retention-slot-event",
+        event_type="assistant_output",
+        payload={"text": "worker RPC must not hold the sole slot"},
+        seq=1,
+    )
+    registry.append_event(
+        session_id="retention-slot-session",
+        event_id="retention-slot-complete",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=2,
+    )
+    registry.update_session_status("retention-slot-session", "completed")
+    with control_plane_connection(control_path) as con:
+        claim = claim_outbox_batch(con, owner="worker", limit=10)
+        assert claim is not None
+        assert acknowledge_outbox_batch(
+            con,
+            publish_outbox_batch(
+                con, claim, parquet_dir=control_path.parent / "retention-slot-parquet"
+            ).batch_id,
+        )
+        rollup_pending_sessions(con)
+        con.execute("""
+            INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at)
+            VALUES ('retention-slot-session', 'done', 2, now())
+            """)
+        con.execute(
+            "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
+            ["retention-slot-session"],
+        )
+
+    payloads = {
+        "retention-slot-event": '{"text":"worker RPC must not hold the sole slot"}',
+        "retention-slot-complete": '{"turn_complete":true}',
+    }
+
+    class ChangesDependencyDuringResolver:
+        def resolve(self, *, event_id, **_kwargs):
+            # The candidate query must have returned this sole pool slot before
+            # Task 3's worker RPC is entered.
+            with control_plane_connection(control_path) as probe:
+                assert probe.execute("SELECT 1").fetchone() == (1,)
+                probe.execute(
+                    "UPDATE harness_sessions SET status = 'active' WHERE session_id = ?",
+                    ["retention-slot-session"],
+                )
+            return payloads[event_id]
+
+    # A resolver may run long enough for a dependency to change. The second,
+    # fresh transaction must refuse both deletions after it observes that fact.
+    assert prune_verified_payloads(
+        control_path, resolver=ChangesDependencyDuringResolver()
+    ) == {
+        "pruned": 0,
+        "protected_active": 0,
+        "protected_dependency": 2,
+        "verification_failed": 0,
+    }
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM harness_event_payloads"
+        ).fetchone() == (2,)
+        assert con.execute(
+            "SELECT count(*) FROM harness_event_archives"
+        ).fetchone() == (0,)
+        con.execute(
+            "UPDATE harness_sessions SET status = 'completed' WHERE session_id = ?",
+            ["retention-slot-session"],
+        )
+
+    class PoolProbeResolver:
+        def resolve(self, *, event_id, **_kwargs):
+            with control_plane_connection(control_path) as probe:
+                assert probe.execute("SELECT 1").fetchone() == (1,)
+            return payloads[event_id]
+
+    assert prune_verified_payloads(control_path, resolver=PoolProbeResolver()) == {
+        "pruned": 2,
+        "protected_active": 0,
+        "protected_dependency": 0,
+        "verification_failed": 0,
+    }

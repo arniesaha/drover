@@ -287,7 +287,8 @@ def claim_outbox_batch(
 def _claim_rows(con: object, claim: OutboxClaim) -> list[dict[str, Any]]:
     rows = con.execute(
         """
-        SELECT e.event_id, e.session_id, e.event_type, e.normalized_type,
+        SELECT m.ordinal AS outbox_ordinal,
+               e.event_id, e.session_id, e.event_type, e.normalized_type,
                e.normalized_source, e.content_preview, e.created_at, e.seq,
                e.dedup_key, COALESCE(p.payload_json, e.payload_json) AS payload_json,
                p.payload_sha256
@@ -315,6 +316,44 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_claim_for_publication(con: object, claim: OutboxClaim) -> None:
+    """Confirm durable lease and ordinal membership before touching its final path."""
+    batch = con.execute(
+        """
+        SELECT state, lease_owner, member_count
+          FROM control_outbox_batches WHERE batch_id = ?
+        """,
+        [claim.batch_id],
+    ).fetchone()
+    if batch is None or batch[0] not in {"claimed", "published", "acknowledged"}:
+        raise RuntimeError("outbox claim is no longer publishable")
+    if batch[0] == "claimed" and batch[1] != claim.lease_owner:
+        raise RuntimeError("outbox claim lease owner changed before publication")
+    membership = con.execute(
+        """
+        SELECT event_id FROM control_outbox_batch_events
+         WHERE batch_id = ? ORDER BY ordinal
+        """,
+        [claim.batch_id],
+    ).fetchall()
+    event_ids = tuple(str(row[0]) for row in membership)
+    if int(batch[2]) != len(claim.event_ids) or event_ids != claim.event_ids:
+        raise RuntimeError("outbox claim membership changed before publication")
+
+
+def _validate_existing_batch(path: Path, expected: pa.Table) -> None:
+    """Accept a crash-retry file only when every claimed logical fact agrees."""
+    try:
+        existing = pq.ParquetFile(path).read()
+    except Exception as exc:
+        raise RuntimeError("existing outbox batch is unreadable") from exc
+    if (
+        existing.schema.remove_metadata() != expected.schema.remove_metadata()
+        or existing.to_pylist() != expected.to_pylist()
+    ):
+        raise RuntimeError("existing outbox batch does not match claimed membership")
+
+
 def publish_outbox_batch(
     con: object,
     claim: OutboxClaim,
@@ -325,6 +364,7 @@ def publish_outbox_batch(
     """Publish one claim to a fixed immutable path, then make it visible in SQL."""
     if not is_postgres_connection(con):
         raise ValueError("the control outbox requires a PostgreSQL connection")
+    _validate_claim_for_publication(con, claim)
     rows = _claim_rows(con, claim)
     if tuple(str(row["event_id"]) for row in rows) != claim.event_ids:
         raise RuntimeError("outbox claim membership changed before publication")
@@ -344,7 +384,9 @@ def publish_outbox_batch(
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         # A crash after rename but before SQL publication is a retry, never a
-        # second logical batch.  Validate that its immutable bytes agree.
+        # second logical batch. Validate schema, ordinal membership, and every
+        # raw payload before a stale same-name file can become visible.
+        _validate_existing_batch(path, table)
         content_hash = _file_sha256(path)
     else:
         atomic_write_table(table, path, compression="zstd")
@@ -371,6 +413,10 @@ def publish_outbox_batch(
             ).fetchone()
             if existing is None or existing[0] not in {"published", "acknowledged"}:
                 raise RuntimeError("outbox claim is no longer publishable")
+            if existing[1] != content_hash or Path(str(existing[2])) != path:
+                raise RuntimeError(
+                    "published outbox batch receipt does not match immutable file"
+                )
             con.execute("COMMIT")
             return PublishedBatch(
                 claim.batch_id,
@@ -501,39 +547,26 @@ def outbox_status(con: object) -> dict[str, Any]:
     }
 
 
-def prune_verified_payloads(
-    con: object,
-    *,
-    resolver: "ArchiveResolver | None",
-    limit: int = 100,
-    now: datetime | None = None,
-) -> dict[str, int]:
-    """Prune at most ``limit`` hot envelopes after all durable dependencies.
-
-    Completion alone is deliberately insufficient.  A payload stays hot while
-    its session is active, until its event has an acknowledged immutable batch,
-    and until the harness usage source has processed every event currently in
-    the session.  Each byte is read back through the injected archive resolver
-    and hash-checked before its hot row is deleted.
-    """
-    result = {
-        "pruned": 0,
-        "protected_active": 0,
-        "protected_dependency": 0,
-        "verification_failed": 0,
-    }
-    if not is_postgres_connection(con):
-        return result
+def _payload_prune_candidates(
+    con: object, *, limit: int, event_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Detach hot-payload retention facts from a short PostgreSQL read."""
+    filter_sql = "WHERE p.event_id = ?" if event_id is not None else ""
+    params: list[Any] = [event_id] if event_id is not None else []
+    params.append(max(1, int(limit)))
     rows = con.execute(
-        """
+        f"""
         WITH session_progress AS (
           SELECT session_id, count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
             FROM harness_events GROUP BY session_id
         )
-        SELECT p.event_id, p.payload_json, p.payload_sha256,
+        SELECT p.event_id, p.payload_sha256,
                s.status, o.state AS outbox_state, o.batch_id, b.state AS batch_state,
                progress.event_count, progress.max_seq,
-               usage.source_event_count, usage.source_seq
+               usage.source_event_count, usage.source_seq,
+               recap_job.status AS recap_status,
+               recap_job.desired_source_seq AS recap_desired_source_seq,
+               recap.source_seq AS recap_source_seq
           FROM harness_event_payloads p
           JOIN harness_events e ON e.event_id = p.event_id
           LEFT JOIN harness_sessions s ON s.session_id = e.session_id
@@ -542,63 +575,125 @@ def prune_verified_payloads(
           LEFT JOIN session_progress progress ON progress.session_id = e.session_id
           LEFT JOIN session_usage_sources usage
             ON usage.session_id = e.session_id AND usage.source = 'harness_events'
+          LEFT JOIN live_recap_jobs recap_job ON recap_job.session_id = e.session_id
+          LEFT JOIN live_session_recaps recap ON recap.session_id = e.session_id
+          {filter_sql}
          ORDER BY e.created_at, e.event_id
          LIMIT ?
         """,
-        [max(1, int(limit))],
+        params,
     )
     columns = [item[0] for item in rows.description]
-    candidates = [dict(zip(columns, row)) for row in rows.fetchall()]
+    return [dict(zip(columns, row)) for row in rows.fetchall()]
+
+
+def _payload_prune_protection(row: dict[str, Any]) -> str | None:
     terminal = {"completed", "terminated", "errored", "failed"}
+    if str(row.get("status") or "") not in terminal:
+        return "active"
+    if (
+        row.get("outbox_state") != "acknowledged"
+        or row.get("batch_id") is None
+        or row.get("batch_state") != "acknowledged"
+        or row.get("source_event_count") is None
+        or int(row["source_event_count"]) < int(row.get("event_count") or 0)
+        or int(row.get("source_seq") or 0) < int(row.get("max_seq") or 0)
+        or row.get("recap_status") != "done"
+        or int(row.get("recap_desired_source_seq") or 0) < int(row.get("max_seq") or 0)
+        or int(row.get("recap_source_seq") or 0) < int(row.get("max_seq") or 0)
+    ):
+        return "dependency"
+    return None
+
+
+def prune_verified_payloads(
+    control_path: Path,
+    *,
+    resolver: "ArchiveResolver | None",
+    limit: int = 100,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Prune verified payloads without retaining a PostgreSQL slot during RPC.
+
+    The caller supplies a configured control-store path, never an open
+    connection. Candidate references are read and released before archive
+    resolution. Each verified reference is then re-read in a fresh transaction
+    before its immutable receipt and conditional payload deletion are written.
+    """
+    from drover.server.control_store import is_postgres_control_store
+    from drover.server.db import control_plane_connection
+
+    result = {
+        "pruned": 0,
+        "protected_active": 0,
+        "protected_dependency": 0,
+        "verification_failed": 0,
+    }
+    control_path = Path(control_path)
+    if not is_postgres_control_store(control_path):
+        return result
+    with control_plane_connection(control_path) as con:
+        candidates = _payload_prune_candidates(con, limit=limit)
     stamp = _utc_now(now)
-    for row in candidates:
-        status = str(row.get("status") or "")
-        if status not in terminal:
+    for candidate in candidates:
+        protection = _payload_prune_protection(candidate)
+        if protection == "active":
             result["protected_active"] += 1
             continue
-        if (
-            row.get("outbox_state") != "acknowledged"
-            or row.get("batch_id") is None
-            or row.get("batch_state") != "acknowledged"
-            or row.get("source_event_count") is None
-            or int(row["source_event_count"]) < int(row.get("event_count") or 0)
-            or int(row.get("source_seq") or 0) < int(row.get("max_seq") or 0)
-        ):
+        if protection == "dependency":
             result["protected_dependency"] += 1
             continue
-        expected_hash = str(row.get("payload_sha256") or "")
-        if not expected_hash or resolver is None:
+        expected_hash = str(candidate.get("payload_sha256") or "")
+        batch_id = candidate.get("batch_id")
+        if not expected_hash or not isinstance(batch_id, str) or resolver is None:
             result["verification_failed"] += 1
             continue
         payload = resolver.resolve(
-            event_id=str(row["event_id"]),
-            batch_id=str(row["batch_id"]),
+            event_id=str(candidate["event_id"]),
+            batch_id=batch_id,
             payload_sha256=expected_hash,
         )
         if payload is None or payload_sha256(payload) != expected_hash:
             result["verification_failed"] += 1
             continue
-        con.execute("BEGIN")
-        try:
-            con.execute(
-                """
-                INSERT INTO harness_event_archives
-                  (event_id, batch_id, payload_sha256, verified_at, payload_pruned_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (event_id) DO UPDATE SET
-                  batch_id = excluded.batch_id, payload_sha256 = excluded.payload_sha256,
-                  verified_at = excluded.verified_at, payload_pruned_at = excluded.payload_pruned_at
-                """,
-                [row["event_id"], row["batch_id"], expected_hash, stamp, stamp],
-            )
-            deleted = con.execute(
-                "DELETE FROM harness_event_payloads WHERE event_id = ? RETURNING event_id",
-                [row["event_id"]],
-            ).fetchone()
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
+        with control_plane_connection(control_path) as con:
+            con.execute("BEGIN")
+            try:
+                current = _payload_prune_candidates(
+                    con, limit=1, event_id=str(candidate["event_id"])
+                )
+                if (
+                    len(current) != 1
+                    or current[0].get("payload_sha256") != expected_hash
+                    or current[0].get("batch_id") != batch_id
+                    or _payload_prune_protection(current[0]) is not None
+                ):
+                    con.execute("ROLLBACK")
+                    result["protected_dependency"] += 1
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO harness_event_archives
+                      (event_id, batch_id, payload_sha256, verified_at, payload_pruned_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (event_id) DO UPDATE SET
+                      batch_id = excluded.batch_id, payload_sha256 = excluded.payload_sha256,
+                      verified_at = excluded.verified_at, payload_pruned_at = excluded.payload_pruned_at
+                    """,
+                    [candidate["event_id"], batch_id, expected_hash, stamp, stamp],
+                )
+                deleted = con.execute(
+                    """
+                    DELETE FROM harness_event_payloads
+                     WHERE event_id = ? AND payload_sha256 = ?
+                    RETURNING event_id
+                    """,
+                    [candidate["event_id"], expected_hash],
+                ).fetchone()
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         if deleted is not None:
             result["pruned"] += 1
     return result
