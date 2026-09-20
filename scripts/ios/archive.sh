@@ -11,6 +11,9 @@ usage() {
 Usage: scripts/ios/archive.sh --version VERSION --build BUILD --output DIRECTORY \
   --signing-config PATH [--channel testflight-internal --staging-url HTTPS_URL]
 
+Channels are distribution, testflight-internal (stage-locked), and
+testflight-production (unrestricted hub pairing).
+
 Creates DIRECTORY/Drover.xcarchive, an archive zip and an archive-record.json.
 DIRECTORY must not already exist. PATH is a private Xcode config with reviewed
 manual team, certificate, profile, and temporary-keychain references.
@@ -144,8 +147,8 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 STAGING_URL_SHA256=""
-STAGE_SETTINGS=()
-STAGE_VERIFY_ARGS=()
+CHANNEL_SETTINGS=()
+CHANNEL_VERIFY_ARGS=()
 case "$CHANNEL" in
   testflight-internal)
     [[ -n "$STAGING_URL" ]] || fail "staging URL is required for testflight-internal"
@@ -160,8 +163,13 @@ except ArtifactVerificationError:
 PY
     )" || fail "staging URL must be a root HTTPS URL"
     STAGING_URL_SHA256="$(printf '%s' "$STAGING_URL" | shasum -a 256 | awk '{ print $1 }')"
-    STAGE_SETTINGS=("DROVER_TESTFLIGHT_STAGE_ONLY=YES" "DROVER_TESTFLIGHT_STAGING_URL=$STAGING_URL" "DROVER_ALLOW_ARBITRARY_LOADS=NO")
-    STAGE_VERIFY_ARGS=(--expected-staging-url "$STAGING_URL")
+    CHANNEL_SETTINGS=("DROVER_TESTFLIGHT_STAGE_ONLY=YES" "DROVER_TESTFLIGHT_STAGING_URL=$STAGING_URL" "DROVER_ALLOW_ARBITRARY_LOADS=NO")
+    CHANNEL_VERIFY_ARGS=(--expected-staging-url "$STAGING_URL")
+    ;;
+  testflight-production)
+    [[ -z "$STAGING_URL" ]] || fail "staging URL requires the testflight-internal channel"
+    CHANNEL_SETTINGS=("DROVER_TESTFLIGHT_STAGE_ONLY=NO" "DROVER_TESTFLIGHT_STAGING_URL=" "DROVER_ALLOW_ARBITRARY_LOADS=YES")
+    CHANNEL_VERIFY_ARGS=(--expected-unrestricted-hubs)
     ;;
   distribution)
     [[ -z "$STAGING_URL" ]] || fail "staging URL requires the testflight-internal channel"
@@ -245,7 +253,7 @@ if ! xcodebuild \
   -archivePath "$ARCHIVE_PATH" \
   "MARKETING_VERSION=$VERSION" \
   "CURRENT_PROJECT_VERSION=$BUILD" \
-  ${STAGE_SETTINGS[@]+"${STAGE_SETTINGS[@]}"} \
+  ${CHANNEL_SETTINGS[@]+"${CHANNEL_SETTINGS[@]}"} \
   archive >"$LOG_DIRECTORY/archive.log" 2>&1; then
   fail "archive failed; no signing details were printed"
 fi
@@ -254,7 +262,7 @@ if ! python3 "$VERIFY_SCRIPT" \
   --app "$ARCHIVE_PATH" \
   --expected-version "$VERSION" \
   --expected-build "$BUILD" \
-  ${STAGE_VERIFY_ARGS[@]+"${STAGE_VERIFY_ARGS[@]}"} \
+  ${CHANNEL_VERIFY_ARGS[@]+"${CHANNEL_VERIFY_ARGS[@]}"} \
   --minimum-ios-sdk "$REQUIRED_IOS_SDK" >"$LOG_DIRECTORY/verify.log" 2>&1; then
   fail "archive verification failed; signed artifact was rejected"
 fi

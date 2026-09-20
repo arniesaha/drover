@@ -100,6 +100,65 @@ def test_internal_testflight_repeats_the_required_ios_slices() -> None:
         assert "if" not in actual
 
 
+def test_production_testflight_is_manual_unrestricted_and_credential_isolated() -> None:
+    path = WORKFLOWS_DIR / "ios-testflight-production.yml"
+    assert path.exists(), "production TestFlight workflow is missing"
+    workflow = load_workflow(path.name)
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert set(workflow["on"]["workflow_dispatch"]["inputs"]) == {
+        "version",
+        "build",
+    }
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["jobs"]) == {"archive-upload"}
+    upload = workflow["jobs"]["archive-upload"]
+    assert upload["if"] == "github.ref == 'refs/heads/main'"
+    assert upload["environment"] == "ios-testflight-upload"
+    assert upload["runs-on"] == "macos-26"
+    assert (
+        upload["env"]["DEVELOPER_DIR"]
+        == "/Applications/Xcode_26.6.app/Contents/Developer"
+    )
+    assert "DROVER_TESTFLIGHT_STAGING_URL" not in upload["env"]
+    assert "preflight" not in str(workflow).lower()
+    commands = "\n".join(step.get("run", "") for step in upload["steps"])
+    assert "--channel testflight-production" in commands
+    assert "--unrestricted-hubs" in commands
+    assert "--staging-url" not in commands
+    for script in (
+        "setup_distribution_signing.sh",
+        "archive.sh",
+        "export_ipa.sh",
+        "upload_testflight.sh",
+        "cleanup_distribution_signing.sh",
+    ):
+        assert script in commands
+    cleanup = next(
+        s for s in upload["steps"] if s.get("name") == "Remove temporary credentials"
+    )
+    assert cleanup["if"] == "always()"
+
+
+def test_production_testflight_repeats_the_required_ios_slices() -> None:
+    steps = load_workflow("ios-testflight-production.yml")["jobs"]["archive-upload"][
+        "steps"
+    ]
+    existing = load_workflow("ios.yml")["jobs"]["build-and-test"]["steps"]
+    for name in (
+        "Generate Xcode project",
+        "Run DroverKit package tests",
+        "Select iPhone simulator",
+        "Resolve Swift packages",
+        "Run app unit tests",
+        "Run deterministic UI journey",
+    ):
+        actual = next(s for s in steps if s.get("name") == name)
+        expected = next(s for s in existing if s.get("name") == name)
+        assert actual["run"] == expected["run"]
+        assert actual["working-directory"] == "apps/drover"
+        assert "if" not in actual
+
+
 def _run_internal_python_step(name, monkeypatch, tmp_path):
     """Execute the real embedded workflow program; callers stub external tools."""
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))

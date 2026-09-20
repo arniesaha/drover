@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Export a stage-locked internal candidate; retain only the IPA and safe evidence.
+# Export an internal candidate; retain only the IPA and safe evidence.
 set +x
 set -euo pipefail
 umask 077
@@ -74,6 +74,7 @@ def verified(app, args, staging_url):
             expected_build=args.build,
             sdk_floor="26.0",
             expected_staging_url=staging_url,
+            expected_unrestricted_hubs=args.unrestricted_hubs,
         )
     except ArtifactVerificationError as error:
         raise Rejected("signed artifact verification failed") from error
@@ -165,14 +166,18 @@ def main():
     parser.add_argument("--export-options", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--build", required=True)
-    parser.add_argument("--staging-url", required=True)
+    policy = parser.add_mutually_exclusive_group(required=True)
+    policy.add_argument("--staging-url")
+    policy.add_argument("--unrestricted-hubs", action="store_true")
     args = parser.parse_args()
     require(
         VERSION_PATTERN.fullmatch(args.version)
         and VERSION_PATTERN.fullmatch(args.build),
         "version and build must be expanded numeric values",
     )
-    staging_url = normalize_staging_url(args.staging_url)
+    staging_url = (
+        normalize_staging_url(args.staging_url) if args.staging_url is not None else None
+    )
     require(args.output.is_absolute(), "output must be an absolute path")
     require(
         not args.output.exists() and not args.output.is_symlink(),
@@ -237,7 +242,11 @@ def main():
             "build": identity.build,
             "bundle_identifier": identity.bundle_identifier,
             "ipa_sha256": digest,
-            "staging_url_sha256": hashlib.sha256(staging_url.encode()).hexdigest(),
+            "staging_url_sha256": (
+                hashlib.sha256(staging_url.encode()).hexdigest()
+                if staging_url is not None
+                else None
+            ),
         }
         args.output.mkdir(mode=0o700)
         shutil.copyfile(ipas[0], args.output / "Drover.ipa")
