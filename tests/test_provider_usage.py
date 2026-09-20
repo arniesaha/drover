@@ -608,12 +608,15 @@ def test_provider_refresh_is_atomic_deduplicated_and_records_every_attempt(
     provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
     provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
 
-    parts = list(
-        (provider_service.parquet_dir / "provider_usage_snapshots").glob("*.parquet")
-    )
-    temporary_parts = list(
-        (provider_service.parquet_dir / "provider_usage_snapshots").glob("*.tmp")
-    )
+    # Snapshots live under a `date=` partition now; the assertion is still
+    # that one part was written for the refresh.
+    snapshot_dir = provider_service.parquet_dir / "provider_usage_snapshots"
+    parts = [
+        path
+        for path in snapshot_dir.rglob("*.parquet")
+        if path.parent.name.startswith("date=")
+    ]
+    temporary_parts = list(snapshot_dir.rglob("*.tmp"))
     con = duckdb.connect(str(provider_service.duckdb_path))
     try:
         snapshot_count = con.execute(
@@ -656,7 +659,11 @@ def test_identical_success_advances_effective_freshness_without_new_snapshot(
     service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
 
     account = service.latest_accounts()
-    parts = list((parquet_dir / "provider_usage_snapshots").glob("*.parquet"))
+    parts = [
+        path
+        for path in (parquet_dir / "provider_usage_snapshots").rglob("*.parquet")
+        if path.parent.name.startswith("date=")
+    ]
     with duckdb.connect(str(duckdb_path)) as con:
         snapshot_count = con.execute(
             "SELECT count(DISTINCT snapshot_id) FROM provider_usage_snapshots"
