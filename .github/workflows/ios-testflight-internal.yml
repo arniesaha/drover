@@ -170,21 +170,6 @@ jobs:
         scripts/ios/setup_distribution_signing.sh \
           --workspace "$RUNNER_TEMP/drover-distribution-signing" \
           --github-output "$GITHUB_OUTPUT"
-    - name: Make temporary signing identity discoverable for export
-      run: |
-        python3 - <<'PY'
-        import json, os, subprocess
-        from pathlib import Path
-        try:
-            root = Path(os.environ["RUNNER_TEMP"])
-            original = json.loads((root / "drover-keychain-state/keychain-search-list.json").read_text())
-            keychain = root / "drover-distribution-signing/distribution.keychain-db"
-            if not keychain.is_file() or keychain.is_symlink():
-                raise ValueError()
-            subprocess.run(["security", "list-keychains", "-d", "user", "-s", *original, str(keychain)], capture_output=True, check=True)
-        except Exception:
-            raise SystemExit("keychain discovery failed; private diagnostics discarded")
-        PY
     - name: Archive and verify internal candidate
       run: |
         scripts/ios/archive.sh \
@@ -240,6 +225,7 @@ jobs:
         from pathlib import Path
         root = Path(os.environ["RUNNER_TEMP"])
         failed = False
+        signing_cleanup_failed = False
         snapshot = root / "drover-keychain-state/keychain-search-list.json"
         try:
             if snapshot.is_file():
@@ -253,7 +239,15 @@ jobs:
                 subprocess.run(["scripts/ios/cleanup_distribution_signing.sh", "--state", str(state)], capture_output=True, check=True)
         except Exception:
             failed = True
-        for name in ("private_keys", "drover-distribution-signing", "drover-keychain-state"):
+            signing_cleanup_failed = True
+        recovery = root / "drover-distribution-signing/cleanup-recovery"
+        if recovery.is_file() or recovery.is_symlink():
+            failed = True
+            signing_cleanup_failed = True
+        cleanup_names = ["private_keys", "drover-keychain-state"]
+        if not signing_cleanup_failed:
+            cleanup_names.append("drover-distribution-signing")
+        for name in cleanup_names:
             try:
                 directory = root / name
                 if directory.exists():

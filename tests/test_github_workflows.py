@@ -66,6 +66,10 @@ def test_internal_testflight_is_manual_main_and_credential_isolated() -> None:
     ):
         assert script in commands
     assert "--channel testflight-internal" in commands
+    assert all(
+        step.get("name") != "Make temporary signing identity discoverable for export"
+        for step in upload["steps"]
+    ), "signing setup must retain sole control of the active keychain search list"
     cleanup = next(
         s for s in upload["steps"] if s.get("name") == "Remove temporary credentials"
     )
@@ -142,6 +146,63 @@ def test_internal_cleanup_restores_search_list_and_removes_credentials(
         str(signing / "signing-state"),
     ]
     assert not keys.exists() and not signing.exists() and not snapshot.exists()
+
+
+def test_internal_cleanup_retains_signing_recovery_state_when_cleanup_fails(
+    monkeypatch, tmp_path
+):
+    import json
+    import subprocess
+
+    snapshot = tmp_path / "drover-keychain-state"
+    snapshot.mkdir()
+    (snapshot / "keychain-search-list.json").write_text(
+        json.dumps(["/private/runner/login.keychain-db"])
+    )
+    signing = tmp_path / "drover-distribution-signing"
+    signing.mkdir()
+    state = signing / "signing-state"
+    state.write_text("recovery state")
+    keys = tmp_path / "private_keys"
+    keys.mkdir()
+    (keys / "AuthKey_EXAMPLE123.p8").write_text("private key")
+
+    def external(command, **kwargs):
+        if command[0] == "scripts/ios/cleanup_distribution_signing.sh":
+            raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", external)
+    with pytest.raises(SystemExit, match="credential cleanup failed"):
+        _run_internal_python_step(
+            "Remove temporary credentials", monkeypatch, tmp_path
+        )
+
+    assert signing.is_dir()
+    assert state.is_file()
+    assert not keys.exists()
+    assert not snapshot.exists()
+
+
+def test_internal_cleanup_retains_setup_failure_recovery_state(
+    monkeypatch, tmp_path
+):
+    signing = tmp_path / "drover-distribution-signing"
+    signing.mkdir()
+    recovery = signing / "cleanup-recovery"
+    recovery.write_text("keychain=/private/runner/drover.keychain-db\n")
+    keys = tmp_path / "private_keys"
+    keys.mkdir()
+    (keys / "AuthKey_EXAMPLE123.p8").write_text("private key")
+
+    with pytest.raises(SystemExit, match="credential cleanup failed"):
+        _run_internal_python_step(
+            "Remove temporary credentials", monkeypatch, tmp_path
+        )
+
+    assert signing.is_dir()
+    assert recovery.is_file()
+    assert not keys.exists()
 
 
 def test_internal_apple_key_is_private_and_cleanup_survives_tool_failure(
