@@ -158,6 +158,40 @@ def validate_distribution_metadata(
     if not _version_at_least(sdk_version, sdk_floor):
         raise ArtifactVerificationError("artifact SDK is below the required floor")
 
+    allowed_orientations = {
+        "UIInterfaceOrientationPortrait",
+        "UIInterfaceOrientationPortraitUpsideDown",
+        "UIInterfaceOrientationLandscapeLeft",
+        "UIInterfaceOrientationLandscapeRight",
+    }
+    orientations = info.get("UISupportedInterfaceOrientations")
+    if (
+        not isinstance(orientations, list)
+        or not orientations
+        or any(
+            not isinstance(value, str) or value not in allowed_orientations
+            for value in orientations
+        )
+    ):
+        raise ArtifactVerificationError(
+            "supported interface orientations are missing or invalid"
+        )
+    if (
+        2 in info.get("UIDeviceFamily", [])
+        and info.get("UIRequiresFullScreen") is not True
+    ):
+        ipad_orientations = info.get(
+            "UISupportedInterfaceOrientations~ipad", orientations
+        )
+        if (
+            not isinstance(ipad_orientations, list)
+            or not all(isinstance(value, str) for value in ipad_orientations)
+            or set(ipad_orientations) != allowed_orientations
+        ):
+            raise ArtifactVerificationError(
+                "iPad multitasking requires all four orientations"
+            )
+
     if expected_staging_url is not None:
         staging_url = normalize_staging_url(expected_staging_url)
         if info.get("DROVER_TESTFLIGHT_STAGING_URL") != staging_url:

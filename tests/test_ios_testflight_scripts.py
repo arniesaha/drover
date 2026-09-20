@@ -653,6 +653,12 @@ def test_generated_project_processes_typed_ats_metadata(
         / "Info.plist"
     )
     info = plistlib.loads(processed.read_bytes())
+    assert set(info["UISupportedInterfaceOrientations"]) == {
+        "UIInterfaceOrientationPortrait",
+        "UIInterfaceOrientationPortraitUpsideDown",
+        "UIInterfaceOrientationLandscapeLeft",
+        "UIInterfaceOrientationLandscapeRight",
+    }
     assert info["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is expected
     assert info["DROVER_TESTFLIGHT_STAGE_ONLY"] == stage_only
     assert info["DROVER_TESTFLIGHT_STAGING_URL"] == STAGE
