@@ -41,6 +41,7 @@ from drover.schema import (
     prune_legacy_control_plane_tables,
 )
 from drover.server import ledger_shadow
+from drover.server.control_store import configure_control_store
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
@@ -429,8 +430,14 @@ high_water = 1000
 def _resolve_config(path: Optional[str]) -> DroverConfig:
     p = Path(path) if path else _DEFAULT_CONFIG_PATH
     if p.exists():
-        return load_config(p)
-    return default_config()
+        cfg = load_config(p)
+    else:
+        cfg = default_config()
+    # The central API process explicitly registers its configured path. This
+    # is deliberately absent from harnessd, which keeps its host-local DuckDB
+    # store even when a hub has PostgreSQL credentials in its environment.
+    configure_control_store(cfg.duckdb_path, cfg.control_store)
+    return cfg
 
 
 def _advertised_host_port(cfg: DroverConfig) -> str:

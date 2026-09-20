@@ -23,6 +23,8 @@ from drover.server.web.credentials import (
     CREDENTIALS_FILENAME,
     Credential,
     CredentialStore,
+    PostgresCredentialStore,
+    credential_store_for_control_path,
 )
 
 _TOKEN_FILENAME = "api_token"
@@ -34,7 +36,7 @@ class AuthSettings:
     api_token: str
     session_ttl_seconds: int = 30 * 86400
     cookie_name: str = "drover_session"
-    credentials: CredentialStore | None = None
+    credentials: CredentialStore | PostgresCredentialStore | None = None
     legacy_token_enabled: bool = True
 
 
@@ -67,7 +69,9 @@ def load_auth(cfg: DroverConfig, token_home: Path | None = None) -> AuthSettings
     return AuthSettings(
         enabled=True,
         api_token=token,
-        credentials=CredentialStore(home / CREDENTIALS_FILENAME),
+        credentials=credential_store_for_control_path(
+            cfg.duckdb_path, home / CREDENTIALS_FILENAME
+        ),
         legacy_token_enabled=cfg.auth_legacy_token_enabled,
     )
 

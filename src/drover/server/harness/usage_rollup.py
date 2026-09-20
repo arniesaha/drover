@@ -127,6 +127,26 @@ WHERE session_id = ?
 ORDER BY COALESCE(seq, 0), created_at, event_id
 """
 
+# PostgreSQL stores the legacy envelope as raw TEXT for lossless replay. Do
+# not cast it to JSONB here: historical malformed rows must remain countable
+# rather than making the whole rollup fail. Python already parses and validates
+# each selected envelope below, so this explicit variant trades a cheap
+# DuckDB-side JSON prefilter for correct portable behavior.
+_POSTGRES_EVENTS_SQL = """
+SELECT seq, payload_json
+FROM harness_events
+WHERE session_id = ?
+ORDER BY COALESCE(seq, 0), created_at, event_id
+"""
+
+
+def _events_sql(con: duckdb.DuckDBPyConnection) -> str:
+    return (
+        _POSTGRES_EVENTS_SQL
+        if getattr(con, "dialect", None) == "postgres"
+        else _EVENTS_SQL
+    )
+
 
 def _load_events(
     con: duckdb.DuckDBPyConnection, session_id: str
@@ -141,7 +161,7 @@ def _load_events(
     spread in last because many rows carry a column value but no envelope
     ``seq`` at all.
     """
-    return _parse_event_rows(con.execute(_EVENTS_SQL, [session_id]).fetchall())
+    return _parse_event_rows(con.execute(_events_sql(con), [session_id]).fetchall())
 
 
 def _parse_event_rows(
@@ -210,7 +230,7 @@ def fetch_event_rows(
     con: duckdb.DuckDBPyConnection, session_id: str
 ) -> list[tuple[Any, Any]]:
     """The session's raw event rows, unparsed."""
-    return con.execute(_EVENTS_SQL, [session_id]).fetchall()
+    return con.execute(_events_sql(con), [session_id]).fetchall()
 
 
 def store_rolled_usage(

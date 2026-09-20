@@ -32,7 +32,10 @@ from drover.server.db import (
     control_plane_path,
     sql_path_literal,
 )
-from drover.server.control_store import is_postgres_control_store, postgres_control_store
+from drover.server.control_store import (
+    is_postgres_control_store,
+    postgres_control_store,
+)
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
 
@@ -2342,8 +2345,11 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_ARTIFACTS_DDL)
         con.execute(_ADVISORY_CHECK_REQUESTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
+        postgres_control = is_postgres_control_store(duckdb_path)
         bootstrap_control_plane_store(duckdb_path)
-        copied_control_plane_rows = migrate_control_plane_tables(con, duckdb_path)
+        copied_control_plane_rows = (
+            {} if postgres_control else migrate_control_plane_tables(con, duckdb_path)
+        )
         if copied_control_plane_rows.get("session_usage"):
             # The first control-plane bootstrap runs before migration. Reopen
             # it only when a legacy compatibility row was copied so the

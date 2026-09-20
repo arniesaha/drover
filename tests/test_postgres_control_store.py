@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -52,9 +53,7 @@ def test_postgres_control_store_requires_a_secret_environment_name(tmp_path: Pat
     """A config file contains an env *name*, never a PostgreSQL DSN."""
     config_path = tmp_path / "postgres.toml"
     config_path.write_text(
-        "[control_store]\n"
-        "backend = 'postgres'\n"
-        "dsn_env = ''\n",
+        "[control_store]\n" "backend = 'postgres'\n" "dsn_env = ''\n",
         encoding="utf-8",
     )
 
@@ -91,7 +90,9 @@ def test_qmark_binder_preserves_question_marks_in_sql_literals_and_comments():
 def test_qmark_binder_keeps_dollar_literals_and_escapes_percent_for_psycopg():
     from drover.server.control_store import bind_qmark_parameters
 
-    sql = "SELECT $$?%$$, payload ?? 'flag' FROM events WHERE label LIKE '%hot%' AND id=?"
+    sql = (
+        "SELECT $$?%$$, payload ?? 'flag' FROM events WHERE label LIKE '%hot%' AND id=?"
+    )
 
     assert bind_qmark_parameters(sql) == (
         "SELECT $$?%%$$, payload ? 'flag' FROM events "
@@ -143,9 +144,12 @@ def test_postgres_control_store_rolls_back_a_control_plane_transaction(
         con.execute("ROLLBACK")
 
     with control_plane_connection(control_path) as con:
-        assert con.execute(
-            "SELECT host_id FROM harness_hosts WHERE host_id = ?", ["rollback-host"]
-        ).fetchone() is None
+        assert (
+            con.execute(
+                "SELECT host_id FROM harness_hosts WHERE host_id = ?", ["rollback-host"]
+            ).fetchone()
+            is None
+        )
 
 
 def test_postgres_bootstrap_creates_the_registered_schema(postgres_control_store):
@@ -353,7 +357,9 @@ def test_postgres_advisory_observe_serializes_one_finding(postgres_control_store
     def observe() -> None:
         try:
             barrier.wait(timeout=2)
-            finding_ids.append(repository.observe(candidate, run_id="pg-concurrent").finding_id)
+            finding_ids.append(
+                repository.observe(candidate, run_id="pg-concurrent").finding_id
+            )
         except Exception as exc:  # pragma: no cover - asserted by parent thread
             errors.append(exc)
 
@@ -368,7 +374,9 @@ def test_postgres_advisory_observe_serializes_one_finding(postgres_control_store
     assert len(set(finding_ids)) == 1
     with control_plane_connection(control_path) as con:
         assert con.execute("SELECT count(*) FROM advisory_findings").fetchone() == (1,)
-        assert con.execute("SELECT count(*) FROM advisory_occurrences").fetchone() == (2,)
+        assert con.execute("SELECT count(*) FROM advisory_occurrences").fetchone() == (
+            2,
+        )
 
 
 def test_postgres_snapshot_bridges_only_analytical_control_facts(
@@ -376,11 +384,16 @@ def test_postgres_snapshot_bridges_only_analytical_control_facts(
 ):
     """Analytics sees a consistent temp snapshot without event payload history."""
     control_path, _ = postgres_control_store
-    from drover.server.db import attached_control_plane_snapshot, control_plane_connection
+    from drover.server.db import (
+        attached_control_plane_snapshot,
+        control_plane_connection,
+    )
     from drover.server.harness.registry import HarnessRegistry
 
     registry = HarnessRegistry(control_path)
-    registry.register_host(host_id="pg-snapshot-host", display_name="Snapshot", kind="test")
+    registry.register_host(
+        host_id="pg-snapshot-host", display_name="Snapshot", kind="test"
+    )
     registry.create_session(
         host_id="pg-snapshot-host",
         harness="codex",
@@ -399,9 +412,9 @@ def test_postgres_snapshot_bridges_only_analytical_control_facts(
 
     with duckdb.connect(":memory:") as analytical:
         with attached_control_plane_snapshot(analytical, control_path):
-            assert analytical.execute("SELECT host_id FROM harness_hosts").fetchall() == [
-                ("pg-snapshot-host",)
-            ]
+            assert analytical.execute(
+                "SELECT host_id FROM harness_hosts"
+            ).fetchall() == [("pg-snapshot-host",)]
             assert analytical.execute(
                 "SELECT session_id FROM harness_sessions"
             ).fetchall() == [("pg-snapshot-session",)]
@@ -410,3 +423,133 @@ def test_postgres_snapshot_bridges_only_analytical_control_facts(
             ).fetchall() == [("pg-snapshot-session",)]
             with pytest.raises(duckdb.CatalogException):
                 analytical.execute("SELECT * FROM harness_events")
+
+
+def test_postgres_credentials_observe_cross_process_revocation(postgres_control_store):
+    """A cached API process cannot continue honoring a revoked credential."""
+    control_path, _ = postgres_control_store
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    issuer = PostgresCredentialStore(control_path)
+    verifier = PostgresCredentialStore(control_path)
+    credential, token = issuer.issue(scope="device", label="PostgreSQL phone")
+
+    assert verifier.find_active(token).id == credential.id
+    assert issuer.revoke(credential.id) is True
+    assert verifier.find_active(token) is None
+    assert issuer.server_id == verifier.server_id
+
+
+def test_load_auth_uses_postgres_credentials_for_the_registered_control_path(
+    postgres_control_store, tmp_path: Path
+):
+    control_path, config = postgres_control_store
+    from drover.config import default_config
+    from drover.server.web.auth import load_auth
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    cfg = replace(default_config(), duckdb_path=control_path, control_store=config)
+    auth = load_auth(cfg, token_home=tmp_path)
+
+    assert isinstance(auth.credentials, PostgresCredentialStore)
+    assert not (tmp_path / "credentials.json").exists()
+
+
+def test_server_config_registers_only_its_explicit_control_path(
+    postgres_control_store, monkeypatch, tmp_path: Path
+):
+    control_path, config = postgres_control_store
+    from drover.config import default_config
+    from drover.server import __main__ as server_main
+    from drover.server.control_store import (
+        close_control_store,
+        is_postgres_control_store,
+    )
+
+    configured_path = control_path.with_name("server-control.duckdb")
+    cfg = replace(default_config(), duckdb_path=configured_path, control_store=config)
+    monkeypatch.setattr(server_main, "load_config", lambda _: cfg)
+    config_path = tmp_path / "postgres-control.toml"
+    config_path.write_text("[control_store]\nbackend = 'postgres'\n", encoding="utf-8")
+
+    try:
+        assert server_main._resolve_config(str(config_path)) is cfg
+        assert is_postgres_control_store(configured_path) is True
+        assert is_postgres_control_store(control_path) is True
+    finally:
+        close_control_store(configured_path)
+
+
+def test_postgres_pool_and_statement_deadlines_are_bounded():
+    """A busy pool and a slow statement fail inside the configured deadlines."""
+    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+
+    from drover.config import ControlStoreConfig
+    from drover.server.postgres_control_store import (
+        ControlStoreBusy,
+        PostgresControlStore,
+    )
+    from psycopg.errors import QueryCanceled
+
+    config = ControlStoreConfig(
+        backend="postgres",
+        dsn_env="DROVER_TEST_POSTGRES_DSN",
+        pool_min_size=1,
+        pool_max_size=1,
+        acquire_timeout_seconds=0.05,
+        statement_timeout_seconds=0.05,
+        schema=f"drover_test_{uuid4().hex}",
+    )
+    store = PostgresControlStore(config)
+    try:
+        with store.connection():
+            with pytest.raises(ControlStoreBusy, match="pool was busy"):
+                with store.connection():
+                    pass
+        with store.connection() as con:
+            with pytest.raises(QueryCanceled, match="statement timeout"):
+                con.execute("SELECT pg_sleep(?)", [0.2])
+    finally:
+        store.close()
+
+
+def test_postgres_usage_rollup_preserves_source_usage_projection(
+    postgres_control_store,
+):
+    """Event payload text rolls up without invoking DuckDB JSON SQL helpers."""
+    control_path, _ = postgres_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.usage_rollup import rollup_pending_sessions
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(host_id="pg-usage-host", display_name="Usage", kind="test")
+    registry.create_session(
+        host_id="pg-usage-host",
+        harness="claude-code",
+        command="claude",
+        session_id="pg-usage-session",
+    )
+    registry.append_event(
+        session_id="pg-usage-session",
+        event_id="pg-usage-event",
+        event_type="assistant_output",
+        seq=1,
+        payload={
+            "native_event_id": "pg-message-1",
+            "usage": {"input_tokens": 12, "output_tokens": 3},
+        },
+    )
+
+    with control_plane_connection(control_path) as con:
+        report = rollup_pending_sessions(con)
+        row = con.execute(
+            "SELECT input_tokens, output_tokens, exact, source, source_seq, "
+            "source_event_count FROM session_usage WHERE session_id = ?",
+            ["pg-usage-session"],
+        ).fetchone()
+
+    assert (report.candidates, report.rolled, report.malformed_events) == (1, 1, 0)
+    assert row == (12, 3, True, "harness_events", 1, 1)
