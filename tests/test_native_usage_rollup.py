@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 
 import duckdb
 import pytest
@@ -93,6 +94,51 @@ def test_native_usage_rollup_materializes_typed_usage_by_session(tmp_path):
             )
         )
     assert rollup_pending_native_usage(duckdb_path).partitions == 0
+
+
+def test_native_usage_rollup_keeps_naive_utc_clock_in_non_utc_duckdb_session(
+    tmp_path, monkeypatch
+):
+    """DuckDB TIMESTAMP receives the legacy naive UTC wall clock unchanged."""
+    from drover.server import native_usage_rollup
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return cls(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
+
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    monkeypatch.setattr(native_usage_rollup, "datetime", FrozenDatetime)
+
+    with duckdb.connect(str(control_plane_path(duckdb_path))) as con:
+        con.execute("SET TimeZone = 'America/New_York'")
+        native_usage_rollup._rebuild_partition(
+            con,
+            partition_date="2026-09-20",
+            source_activity_at=datetime(2026, 9, 20, 11, 0),
+            totals=[
+                native_usage_rollup._PartitionTotals(
+                    session_id="legacy-clock-session",
+                    input_tokens=1,
+                    output_tokens=None,
+                    cache_read_tokens=None,
+                    cache_write_tokens=None,
+                    reasoning_tokens=None,
+                    turn_count=1,
+                    event_count=1,
+                )
+            ],
+        )
+        observed_at, rolled_at = con.execute(
+            "SELECT observed_at, rolled_at FROM native_usage_partition_totals "
+            "JOIN native_usage_partition_watermarks USING (partition_date)"
+        ).fetchone()
+
+    assert observed_at == datetime(2026, 9, 20, 12, 0)
+    assert rolled_at == datetime(2026, 9, 20, 12, 0)
 
 
 def test_native_usage_rollup_aggregates_one_session_across_changed_dates(tmp_path):

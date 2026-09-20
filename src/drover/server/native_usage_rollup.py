@@ -149,7 +149,11 @@ def _rebuild_partition(
         [partition_date],
     )
     source_activity_at = _known_utc_timestamp_for_control(con, source_activity_at)
-    rolled_at = _known_utc_timestamp_for_control(con, datetime.now(timezone.utc))
+    # Preserve the original naive UTC clock for DuckDB TIMESTAMP.  The
+    # PostgreSQL boundary converts this known UTC producer to TIMESTAMPTZ.
+    rolled_at = _known_utc_timestamp_for_control(
+        con, datetime.now(timezone.utc).replace(tzinfo=None)
+    )
     for total in totals:
         con.execute(
             """
