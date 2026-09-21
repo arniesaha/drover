@@ -735,3 +735,117 @@ def test_control_store_cli_exposes_only_explicit_offline_lifecycle_commands():
     assert "import" in result.output
     assert "verify" in result.output
     assert "status" in result.output
+
+
+def test_credential_document_in_runtime_shape_is_rejected(tmp_path: Path):
+    """A runtime credentials.json must not import as zero identity and zero credentials.
+
+    The runtime file uses server_id/fleet_name/credentials. The importer reads
+    control_server_identity/control_credentials. Accepting the runtime shape made
+    both .get() calls return empty, so the import wrote no identity and no
+    verifiers while verification still reported ok, because expected and actual
+    were both derived from the same empty parse. The hub then generated a fresh
+    random server_id and every paired device was silently revoked.
+    """
+    from zoneinfo import ZoneInfo
+
+    from drover.server.control_migration import _credential_rows
+
+    document = tmp_path / "credentials.json"
+    document.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "server_id": "2bf7acd9-5ae0-4526-8373-363ceb413bb5",
+                "fleet_name": "drover",
+                "credentials": [
+                    {
+                        "id": "credential-1",
+                        "scope": "device",
+                        "label": "iPhone",
+                        "verifier": "hash:legacy",
+                        "created_at": "2026-09-20T12:00:00Z",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _credential_rows(document, ZoneInfo("America/Los_Angeles"))
+
+    message = str(excinfo.value)
+    assert "control_server_identity" in message
+    assert "control_credentials" in message
+    # "fleet_name" cannot appear unless the error echoes the keys actually
+    # present, so this cannot pass on a generic message the way a bare
+    # "server_id" check did: that is a substring of "control_server_identity".
+    assert "fleet_name" in message, "must name the unexpected top-level keys it found"
+
+
+def test_credential_document_with_no_identity_and_no_credentials_is_rejected(
+    tmp_path: Path,
+):
+    """Passing a document explicitly means importing something from it."""
+    from zoneinfo import ZoneInfo
+
+    from drover.server.control_migration import _credential_rows
+
+    document = tmp_path / "empty.json"
+    document.write_text(
+        json.dumps({"control_server_identity": {}, "control_credentials": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        _credential_rows(document, ZoneInfo("America/Los_Angeles"))
+
+
+def test_credential_document_may_be_omitted_entirely():
+    """Omitting --credentials stays the supported no-credential path."""
+    from zoneinfo import ZoneInfo
+
+    from drover.server.control_migration import _credential_rows
+
+    assert _credential_rows(None, ZoneInfo("America/Los_Angeles")) == {
+        "control_server_identity": [],
+        "control_credentials": [],
+    }
+
+
+def test_import_failure_names_the_orphan_events_that_caused_it(
+    postgres_target, tmp_path: Path
+):
+    """An opaque verification failure is unactionable on a real hub.
+
+    A long-lived hub sweeps harness_sessions independently of harness_events, so
+    events outlive their session row. Verification correctly refuses to import,
+    but reported only "import verification failed before readiness marker",
+    which names neither the failing check nor how many rows tripped it.
+    """
+    from drover.server.control_migration import import_legacy_snapshot
+    from drover.server.db import control_plane_path
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    with duckdb.connect(str(control_plane_path(tmp_path / "legacy.duckdb"))) as con:
+        con.execute(
+            """
+            INSERT INTO harness_events
+              (event_id, session_id, event_type, payload_json, created_at, seq, dedup_key)
+            VALUES ('orphan-1', 'swept-session', 'assistant_output', '{}', ?, 1, 'dedup-orphan')
+            """,
+            [datetime(2026, 9, 20, 12, 0, 0)],
+        )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        import_legacy_snapshot(
+            postgres_target,
+            source_snapshot=source,
+            source_timezone="America/Los_Angeles",
+            credential_document=None,
+        )
+
+    message = str(excinfo.value)
+    assert "events_missing_session" in message
+    assert "1" in message
