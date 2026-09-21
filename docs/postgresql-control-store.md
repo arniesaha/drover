@@ -216,3 +216,30 @@ recover pruned archive payloads. The validated procedure covers an interrupted
 pre-cutover import, a PostgreSQL-only restore that explicitly fails cold
 payload lookup, and a paired restore at the original archive path. It does not
 prove PITR, TLS, power-loss durability, capacity, or a production cutover.
+
+## Workload validation before cutover
+
+Point `DROVER_TEST_POSTGRES_DSN` at a **disposable PostgreSQL instance**, then
+run the synthetic workload from a source checkout:
+
+```sh
+uv run --extra postgres python scripts/benchmark_postgres_control_plane.py \
+  --hosts 4 --sessions 200 --events 75000 --phase-requests 5000 \
+  --drain-timeout-seconds 3600 \
+  --output /tmp/drover-postgres-benchmark.json \
+  --work-root /tmp/drover-postgres-benchmark
+```
+
+This starts isolated API and analytics processes and exercises worker outage,
+export and verified retention. Allow tens of minutes for the default worker
+to drain the fixture. Ingestion uses direct registry writes, so this does not
+measure host-relay or HTTP ingestion throughput. Startup is measured before
+event ingestion; recap completion uses synthetic receipts without LLM calls.
+
+Read the API latency/error distributions, background sampling-error counts,
+and export/retention duration together. A transient background sampling
+failure can be retried within the overall deadline; API response errors fail
+the run. The result is synthetic evidence, not a production capacity estimate.
+Before cutover, compare the expected event arrival rate with the worker's drain
+rate and monitor outstanding export age. The current batch, polling and
+retention limits are fixed implementation values, not configuration options.
