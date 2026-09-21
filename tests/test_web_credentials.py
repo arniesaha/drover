@@ -81,7 +81,9 @@ def test_issue_preflight_cli_mints_through_the_running_server(monkeypatch, tmp_p
         sent.update({"method": method, "path": path, "payload": payload})
         return {"token": "preflight-token", "credential_id": "cred-1"}
 
-    monkeypatch.setattr(server_main, "_resolve_config", lambda path: default_config())
+    monkeypatch.setattr(
+        server_main, "_resolve_config", lambda path, **_kwargs: default_config()
+    )
     monkeypatch.setattr(server_main, "_local_api_request", fake_request)
 
     result = CliRunner().invoke(

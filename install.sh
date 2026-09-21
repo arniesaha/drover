@@ -261,6 +261,27 @@ resolve_version() {
 }
 
 # --- install -----------------------------------------------------------------
+runtime_supports_postgres_default() {
+  local runtime_python="$1"
+  local runtime_server="$2"
+  "$runtime_python" - <<'PY'
+import inspect
+from dataclasses import fields
+
+from drover.config import DroverConfig
+from drover.server.service_units import render_launchd, render_systemd
+
+if "control_store" not in {field.name for field in fields(DroverConfig)}:
+    raise SystemExit(1)
+if "environment_file" not in inspect.signature(render_launchd).parameters:
+    raise SystemExit(1)
+if "environment_file" not in inspect.signature(render_systemd).parameters:
+    raise SystemExit(1)
+PY
+  [ "$?" -eq 0 ] || return 1
+  "$runtime_server" control-store init --help >/dev/null 2>&1
+}
+
 install_runtime() {
   # Two statements, not one. Under `set -u`, bash declares every name in a
   # single `local` before assigning any of them, so a later assignment that
@@ -268,7 +289,10 @@ install_runtime() {
   # "install.sh: line N: version: unbound variable", at install time, on
   # someone else's machine.
   local version="$1"
-  local target="$DROVER_HOME/runtime/$version"
+  local runtime_root="$DROVER_HOME/runtime"
+  local target="$runtime_root/$version"
+  local staging="$runtime_root/.${version}.install.$$"
+  local backup=""
   local base="https://github.com/${REPO}/releases/download/v${version}"
   local tmp; tmp="$(mktemp -d)"
 
@@ -300,20 +324,47 @@ install_runtime() {
     || fail "refusing to install: requirements.lock.txt failed verification"
   success "artifacts verified"
 
-  mkdir -p "$DROVER_HOME/runtime"
-  uv venv "$target" >/dev/null 2>&1 || fail "could not create a venv at $target"
+  mkdir -p "$runtime_root"
+  rm -rf "$staging"
+  uv venv --relocatable "$staging" >/dev/null 2>&1 \
+    || fail "could not create a venv at $target"
   # Dependencies are hash-pinned; the wheel is installed --no-deps because it
   # has already been verified against the manifest itself.
-  uv pip install --python "$target/bin/python" --require-hashes \
+  uv pip install --python "$staging/bin/python" --require-hashes \
     -r "$tmp/requirements.lock.txt" >/dev/null \
     || fail "dependency install failed (hash mismatch?)"
-  uv pip install --python "$target/bin/python" --no-deps "$tmp/$wheel" >/dev/null \
+  uv pip install --python "$staging/bin/python" --no-deps "$tmp/$wheel" >/dev/null \
     || fail "installing $wheel failed"
   rm -rf "$tmp"
 
-  # A version that cannot state its own version never gets the symlink.
-  "$target/bin/drover-server" --version >/dev/null 2>&1 \
+  # A version that cannot state its own version or support PostgreSQL-default
+  # setup never replaces runtime/current. Stage first so an incompatible pin
+  # cannot modify a currently active runtime of the same version either.
+  "$staging/bin/drover-server" --version >/dev/null 2>&1 \
     || fail "$version failed its smoke test; leaving the current install alone"
+  if ! runtime_supports_postgres_default "$staging/bin/python" "$staging/bin/drover-server"; then
+    rm -rf "$staging"
+    fail "release v${version} predates PostgreSQL-default setup; choose a current release"
+  fi
+
+  # The active target might name the requested version. Preserve it until the
+  # relocatable staged entry point has been verified at its final path, so a
+  # failed replacement can be restored without leaving runtime/current broken.
+  if [ -e "$target" ]; then
+    backup="$runtime_root/.${version}.previous.$$"
+    rm -rf "$backup"
+    mv "$target" "$backup" || fail "could not prepare the current runtime for replacement"
+  fi
+  if ! mv "$staging" "$target"; then
+    [ -z "$backup" ] || mv "$backup" "$target" || true
+    fail "could not activate the verified runtime"
+  fi
+  if ! "$target/bin/drover-server" --version >/dev/null 2>&1; then
+    rm -rf "$target"
+    [ -z "$backup" ] || mv "$backup" "$target" || true
+    fail "$version failed its final runtime smoke test; leaving the current install alone"
+  fi
+  [ -z "$backup" ] || rm -rf "$backup"
 
   ln -sfn "$version" "$DROVER_HOME/runtime/.current.new"
   mv -f "$DROVER_HOME/runtime/.current.new" "$DROVER_HOME/runtime/current"

@@ -72,6 +72,7 @@ REMOTE="$WORK/remote"
 FAKE_BIN="$REMOTE/bin"
 FAKE_SERVER="$FAKE_BIN/drover-server"
 PYTHON="$(command -v python3)"
+INCOMPATIBLE_RUNTIME_PYTHON="$FAKE_BIN/incompatible-runtime-python"
 WHEEL_CONTENT='test wheel'
 LOCK_CONTENT='test lock'
 WHEEL_SHA="$(printf '%s' "$WHEEL_CONTENT" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
@@ -80,11 +81,16 @@ mkdir -p "$FAKE_BIN"
 
 export FIXTURE_REPO="$REPO"
 export FIXTURE_PYTHON="$PYTHON"
+export FIXTURE_INCOMPATIBLE_RUNTIME_PYTHON="$INCOMPATIBLE_RUNTIME_PYTHON"
 export FIXTURE_SERVER="$FAKE_SERVER"
 export FIXTURE_WHEEL_CONTENT="$WHEEL_CONTENT"
 export FIXTURE_LOCK_CONTENT="$LOCK_CONTENT"
 export FIXTURE_WHEEL_SHA="$WHEEL_SHA"
 export FIXTURE_LOCK_SHA="$LOCK_SHA"
+
+printf '%s\n' '#!/usr/bin/env bash' 'cat >/dev/null' 'exit 1' \
+  > "$INCOMPATIBLE_RUNTIME_PYTHON"
+chmod +x "$INCOMPATIBLE_RUNTIME_PYTHON"
 
 printf '%s\n' \
   '#!/usr/bin/env bash' \
@@ -136,9 +142,13 @@ printf '%s\n' \
   'set -eu' \
   'case "$1" in' \
   '  venv)' \
-  '    target="$2"' \
+  '    if [ "${2:-}" = "--relocatable" ]; then target="$3"; else target="$2"; fi' \
   '    mkdir -p "$target/bin"' \
-  '    ln -sf "$FIXTURE_PYTHON" "$target/bin/python"' \
+  '    if [ "${FIXTURE_RUNTIME_CAPABILITY:-postgres-default}" = "legacy" ]; then' \
+  '      ln -sf "$FIXTURE_INCOMPATIBLE_RUNTIME_PYTHON" "$target/bin/python"' \
+  '    else' \
+  '      ln -sf "$FIXTURE_PYTHON" "$target/bin/python"' \
+  '    fi' \
   '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover-server"' \
   '    ;;' \
   '  pip) ;;' \
@@ -158,6 +168,7 @@ printf '%s\n' \
   '  control-store)' \
   '    case "${2:-}" in' \
   '      init)' \
+  '        if [ "${3:-}" = "--help" ]; then exit 0; fi' \
   '        [ -n "${DROVER_CONTROL_DSN:-}" ] || { printf "missing control DSN\\n" >&2; exit 1; }' \
   '        [ "${FIXTURE_CONTROL_INIT_MODE:-ready}" != "fail" ] || { printf "control init failed\\n" >&2; exit 1; }' \
   '        if [ -n "${FIXTURE_EXPECTED_DSN+x}" ]; then [ "$DROVER_CONTROL_DSN" = "$FIXTURE_EXPECTED_DSN" ] || exit 1; fi' \
@@ -329,6 +340,62 @@ check_status "missing PostgreSQL DSN does not write a config" \
   "$([ -e "$HOME_DIR/.drover/config.toml" ] && echo present || echo absent)" "absent"
 check_event_absent "missing PostgreSQL DSN does not initialize a store" "$EVENT_LOG" 'control-init'
 check_event_absent "missing PostgreSQL DSN does not start the hub" "$EVENT_LOG" 'server-start'
+
+new_case incompatible-runtime-fresh
+export FIXTURE_RUNTIME_CAPABILITY=legacy
+OUT="$(run_new_fleet linux ready '100.64.0.10:7099')"
+RESULT=$?
+unset FIXTURE_RUNTIME_CAPABILITY
+check_status "incompatible pinned runtime rejects fresh install" "$RESULT" "1"
+check_contains "incompatible pinned runtime explains PostgreSQL-default requirement" \
+  <(printf '%s' "$OUT") 'predates PostgreSQL-default setup'
+check_status "incompatible fresh runtime leaves current absent" \
+  "$([ -e "$HOME_DIR/.drover/runtime/current" ] && echo present || echo absent)" "absent"
+check_status "incompatible fresh runtime leaves config absent" \
+  "$([ -e "$HOME_DIR/.drover/config.toml" ] && echo present || echo absent)" "absent"
+check_status "incompatible fresh runtime leaves private environment absent" \
+  "$([ -e "$HOME_DIR/.drover/server.env" ] && echo present || echo absent)" "absent"
+check_status "incompatible fresh runtime leaves units absent" \
+  "$([ -e "$HOME_DIR/.config/systemd/user/drover-server.service" ] && echo present || echo absent)" "absent"
+
+new_case incompatible-runtime-existing-postgres
+mkdir -p "$HOME_DIR/.drover/runtime/previous" "$HOME_DIR/.config/systemd/user"
+ln -s previous "$HOME_DIR/.drover/runtime/current"
+printf '%s\n' '[control_store]' 'backend = "postgres"' 'dsn_env = "DROVER_CONTROL_DSN"' \
+  > "$HOME_DIR/.drover/config.toml"
+printf '%s\n' 'DROVER_CONTROL_DSN="postgresql://prior"' > "$HOME_DIR/.drover/server.env"
+printf '%s\n' 'prior server unit' > "$HOME_DIR/.config/systemd/user/drover-server.service"
+PREVIOUS_CONFIG="$(/bin/cat "$HOME_DIR/.drover/config.toml")"
+PREVIOUS_ENV="$(/bin/cat "$HOME_DIR/.drover/server.env")"
+PREVIOUS_UNIT="$(/bin/cat "$HOME_DIR/.config/systemd/user/drover-server.service")"
+export FIXTURE_RUNTIME_CAPABILITY=legacy
+OUT="$(run_new_fleet linux ready '100.64.0.10:7099')"
+RESULT=$?
+unset FIXTURE_RUNTIME_CAPABILITY
+check_status "incompatible pinned runtime rejects existing PostgreSQL install" "$RESULT" "1"
+check_status "incompatible existing runtime keeps current target" \
+  "$(readlink "$HOME_DIR/.drover/runtime/current")" "previous"
+check_status "incompatible existing runtime keeps PostgreSQL config" \
+  "$(/bin/cat "$HOME_DIR/.drover/config.toml")" "$PREVIOUS_CONFIG"
+check_status "incompatible existing runtime keeps private environment" \
+  "$(/bin/cat "$HOME_DIR/.drover/server.env")" "$PREVIOUS_ENV"
+check_status "incompatible existing runtime keeps server unit" \
+  "$(/bin/cat "$HOME_DIR/.config/systemd/user/drover-server.service")" "$PREVIOUS_UNIT"
+
+new_case incompatible-runtime-join
+mkdir -p "$HOME_DIR/.drover/runtime/previous" "$HOME_DIR/.config/systemd/user"
+ln -s previous "$HOME_DIR/.drover/runtime/current"
+printf '%s\n' 'existing host unit' > "$HOME_DIR/.config/systemd/user/drover-harnessd.service"
+PREVIOUS_JOIN_UNIT="$(/bin/cat "$HOME_DIR/.config/systemd/user/drover-harnessd.service")"
+export FIXTURE_RUNTIME_CAPABILITY=legacy
+OUT="$(run_join)"
+RESULT=$?
+unset FIXTURE_RUNTIME_CAPABILITY
+check_status "incompatible pinned runtime rejects join" "$RESULT" "1"
+check_status "incompatible join runtime keeps current target" \
+  "$(readlink "$HOME_DIR/.drover/runtime/current")" "previous"
+check_status "incompatible join runtime keeps host unit" \
+  "$(/bin/cat "$HOME_DIR/.config/systemd/user/drover-harnessd.service")" "$PREVIOUS_JOIN_UNIT"
 
 new_case control-init-failure
 export FIXTURE_CONTROL_INIT_MODE=fail

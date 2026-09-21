@@ -492,6 +492,21 @@ def test_central_config_resolution_refuses_a_missing_config_before_bootstrap(tmp
     assert not control_plane_path(tmp_path / "drover.duckdb").exists()
 
 
+def test_configless_central_run_refuses_before_creating_a_control_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Only the central startup path must not fall back to a fresh DuckDB store."""
+    config = tmp_path / ".drover" / "config.toml"
+    monkeypatch.setattr(server_main, "_DEFAULT_CONFIG_PATH", config)
+
+    result = CliRunner().invoke(main, ["run"])
+
+    assert result.exit_code != 0
+    assert "config does not exist" in result.output
+    assert not config.exists()
+    assert not control_plane_path(tmp_path / ".drover" / "drover.duckdb").exists()
+
+
 def test_central_config_resolution_keeps_omitted_backend_on_duckdb(tmp_path):
     """Existing configs without the new section retain their established backend."""
     config = _make_config(tmp_path)
@@ -1319,7 +1334,7 @@ def test_setup_check_sanitizes_oversized_config_token_before_worker(
         default_config(),
         auth_api_token="private-token-" + ("x" * (64 * 1024)),
     )
-    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path, **_kwargs: cfg)
     monkeypatch.setattr(
         server_main, "_setup_check_liveness", lambda *args, **kwargs: True
     )
@@ -1466,7 +1481,7 @@ def test_setup_check_sanitizes_config_failure_before_evaluation(monkeypatch):
     """A configuration error cannot put a host, project, or token detail in JSON."""
     secret = "token private-token /private/config.toml"
 
-    def fail_config(_path):
+    def fail_config(_path, **_kwargs):
         raise click.ClickException(secret)
 
     monkeypatch.setattr(server_main, "_resolve_config", fail_config)
@@ -1513,7 +1528,7 @@ def test_setup_check_sanitizes_token_resolution_failure(monkeypatch):
     """Credential lookup errors are classified without opening a control request."""
     secret = "token private-token /private/api_token"
     cfg = replace(default_config(), auth_api_token="")
-    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path, **_kwargs: cfg)
     monkeypatch.setattr(
         server_main, "_setup_check_liveness", lambda *args, **kwargs: True
     )
@@ -1548,7 +1563,7 @@ def test_setup_check_sanitizes_token_resolution_failure(monkeypatch):
 def test_setup_check_sanitizes_request_construction_failure(monkeypatch):
     """A malformed local request cannot expose the command's private arguments."""
     cfg = replace(default_config(), auth_api_token="test-token")
-    monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _path, **_kwargs: cfg)
     monkeypatch.setattr(
         server_main, "_setup_check_liveness", lambda *args, **kwargs: True
     )
@@ -1602,7 +1617,9 @@ def test_setup_check_verbose_suppresses_transport_log_details(monkeypatch, caplo
             server_metrics_host="127.0.0.1",
             metrics_http_port=server.server_port,
         )
-        monkeypatch.setattr(server_main, "_resolve_config", lambda _path: cfg)
+        monkeypatch.setattr(
+            server_main, "_resolve_config", lambda _path, **_kwargs: cfg
+        )
 
         def evaluate_with_transport(cfg, target, *, liveness, request_json):
             assert target.host_id == "private-host"

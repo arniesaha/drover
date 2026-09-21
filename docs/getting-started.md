@@ -24,7 +24,9 @@ Useful flags:
 
 - `--dry-run` prints exactly what it would do and changes nothing.
 - `--url <host:port>` overrides address detection. Private addresses only.
-- `--version vX.Y.Z` pins a release instead of taking the latest.
+- `--version vX.Y.Z` pins a release instead of taking the latest. The pinned
+  release must support PostgreSQL-default setup; older releases are rejected
+  before the installer changes the active runtime.
 
 The PostgreSQL database is an operator-managed dependency. Drover does not
 install or manage its server process. [PostgreSQL control store](postgresql-control-store.md)

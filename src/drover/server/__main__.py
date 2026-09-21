@@ -31,6 +31,7 @@ from drover.config import (
     AdvisoryContentConfig,
     DroverConfig,
     config_home,
+    default_config,
     default_config_path,
     default_token_file,
     load_config,
@@ -484,9 +485,15 @@ high_water = 1000
 """
 
 
-def _resolve_config(path: Optional[str]) -> DroverConfig:
+def _resolve_config(
+    path: Optional[str], *, allow_missing_default: bool = False
+) -> DroverConfig:
     p = Path(path) if path else _DEFAULT_CONFIG_PATH
     if not p.exists():
+        if path is None and allow_missing_default:
+            cfg = default_config()
+            configure_control_store(cfg.duckdb_path, cfg.control_store)
+            return cfg
         raise click.ClickException(
             f"config does not exist: {p}; run drover-server init first"
         )
@@ -945,7 +952,7 @@ def setup_check(
 ) -> None:
     """Report read-only first-computer setup readiness."""
     try:
-        cfg = _resolve_config(ctx.obj["config_path"])
+        cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
         deadline = time.monotonic() + _SETUP_CHECK_TOTAL_TIMEOUT_SECONDS
         with suppress_setup_check_transport_logs():
             report = evaluate_setup(
@@ -1610,7 +1617,7 @@ def archive_coverage_cmd(
 @click.pass_context
 def pair_cmd(ctx: click.Context, label: str) -> None:
     """Print a QR code that pairs a phone with this fleet."""
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     minted = _local_api_request(
         cfg, "POST", "/auth/pair-codes", {"scope": "device", "label": label}
     )
@@ -1642,7 +1649,7 @@ def pair_cmd(ctx: click.Context, label: str) -> None:
 @click.pass_context
 def pair_host_cmd(ctx: click.Context, name: str) -> None:
     """Print the one-liner that joins another machine to this fleet."""
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     minted = _local_api_request(
         cfg,
         "POST",
@@ -1734,7 +1741,7 @@ def rollback_cmd(target: str | None) -> None:
 @click.pass_context
 def update_cmd(ctx: click.Context, check: bool) -> None:
     """Report what version this fleet is converging on."""
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     layout = RuntimeLayout(config_home())
     planner = UpdatePlanner(cfg, layout)
     planner.refresh()
@@ -1757,7 +1764,7 @@ def credentials_cmd() -> None:
 @credentials_cmd.command(name="list")
 @click.pass_context
 def credentials_list_cmd(ctx: click.Context) -> None:
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     listing = _local_api_request(cfg, "GET", "/auth/credentials")
     rows = listing.get("credentials") or []
     if not rows:
@@ -1785,7 +1792,7 @@ def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
     from here would never be honoured by the server the staging gate calls,
     and that server's next write would delete it again.
     """
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     minted = _local_api_request(
         cfg, "POST", "/auth/credentials", {"scope": "preflight", "label": label}
     )
@@ -1796,7 +1803,7 @@ def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
 @click.argument("credential_id")
 @click.pass_context
 def credentials_revoke_cmd(ctx: click.Context, credential_id: str) -> None:
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     _local_api_request(cfg, "DELETE", f"/auth/credentials/{credential_id}")
     click.echo(f"Revoked {credential_id}.")
 
@@ -2038,7 +2045,7 @@ def mcp_tools_cmd(ctx: click.Context, url: Optional[str], timeout: float) -> Non
     """List tools exposed by the Drover MCP server."""
     from drover.server.mcp.client import list_tools
 
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     tools = list_tools(url or _default_mcp_url(cfg), timeout=timeout)
     click.echo(json.dumps(tools, indent=2, sort_keys=True))
 
@@ -2082,7 +2089,7 @@ def mcp_call_cmd(
         raise click.ClickException("--args-json must decode to an object")
     arguments.update(_parse_json_arg_pairs(arg_pairs))
 
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
     result = call_tool(
         url or _default_mcp_url(cfg), tool_name, arguments, timeout=timeout
     )
@@ -4200,7 +4207,9 @@ def audit_sessions_cmd(
     Exits non-zero when drift is found or when sessions is a legacy base table.
     No repair or backfill is attempted.
     """
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=duckdb_path is not None
+    )
     with _diagnostic_db_path(duckdb_path or cfg.duckdb_path) as db_path:
         report = audit_session_consistency_db(db_path)
     if as_json:
@@ -4245,7 +4254,9 @@ def runtime_audit_cmd(
     deep: bool,
 ) -> None:
     """Read-only operational audit of Drover runtime state."""
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=duckdb_path is not None
+    )
     source_db = duckdb_path or cfg.duckdb_path
     with _diagnostic_db_path(source_db) as db_path:
         diagnostic_db = db_path if Path(db_path) != Path(source_db) else None
@@ -4315,7 +4326,9 @@ def quality_cmd(
     """Read-only Drover data-quality snapshot."""
     if as_json and as_prometheus:
         raise click.UsageError("choose only one output mode: --json or --prometheus")
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=duckdb_path is not None
+    )
     with _diagnostic_db_path(duckdb_path or cfg.duckdb_path) as db_path:
         snapshot = quality_snapshot(
             duckdb_path=db_path,
@@ -4488,7 +4501,9 @@ def retry_summarize_jobs(
     duckdb_path: Optional[Path],
 ) -> None:
     """Requeue errored summarize_jobs caused by auth/rate-limit/runtime failures."""
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=duckdb_path is not None
+    )
     db_path = duckdb_path or cfg.duckdb_path
     if duckdb_path is None:
         bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
