@@ -100,6 +100,133 @@ ArchivePayloadResolver = Callable[[str, str, str], str | None]
 WorkerHealthProvider = Callable[[], Mapping[str, Any]]
 
 
+def _bounded_http_response(
+    *,
+    method: str,
+    target: str,
+    headers: dict[str, str],
+    body: bytes,
+    config: AnalyticsBoundaryConfig,
+    deadline: float,
+    error_type: type[AnalyticsBoundaryUnavailable] | type[HostDataBridgeUnavailable],
+    error_message: str,
+) -> BoundaryResponse:
+    """Run one stdlib HTTP exchange under an absolute monotonic deadline.
+
+    ``http.client`` applies its socket timeout to each receive.  A peer can
+    therefore keep a header or body read alive indefinitely by sending one
+    byte just before that inactivity timeout.  The watchdog owns the original
+    request deadline, closes the socket at that point, and lets the exchange
+    thread unwind.  This includes connect, request writes, headers, and body
+    reads without forwarding a caller's credentials or reusing a connection.
+    """
+
+    parsed = urlsplit(target)
+    if parsed.hostname not in _LOOPBACK_HOSTS or parsed.scheme != "http":
+        raise error_type(error_message)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise error_type(error_message)
+    connection = http.client.HTTPConnection(
+        parsed.hostname,
+        parsed.port,
+        timeout=min(config.connect_timeout_seconds, remaining),
+    )
+    completed = threading.Event()
+    result: list[BoundaryResponse] = []
+    failure: list[BaseException] = []
+    active_response: list[http.client.HTTPResponse] = []
+
+    def exchange() -> None:
+        try:
+            if deadline - time.monotonic() <= 0:
+                raise error_type(error_message)
+            connection.connect()
+            if connection.sock is None or deadline - time.monotonic() <= 0:
+                raise error_type(error_message)
+            # This inactivity timeout is still useful for a silent peer.  The
+            # outer watchdog is what makes slow-but-non-silent peers finite.
+            connection.sock.settimeout(max(0.001, deadline - time.monotonic()))
+            request_target = parsed.path or "/"
+            if parsed.query:
+                request_target += "?" + parsed.query
+            request_headers = (
+                {**headers, "Content-Type": "application/json"} if body else headers
+            )
+            connection.request(
+                method, request_target, body=body or None, headers=request_headers
+            )
+            response = connection.getresponse()
+            active_response.append(response)
+            length = response.getheader("Content-Length")
+            if length is not None and int(length) > config.max_response_bytes:
+                raise error_type(error_message)
+            result.append(
+                BoundaryResponse(
+                    status=response.status,
+                    content_type=response.getheader("Content-Type")
+                    or "application/json",
+                    body=response.read(config.max_response_bytes + 1),
+                )
+            )
+        except (OSError, ValueError, http.client.HTTPException, socket.timeout) as exc:
+            failure.append(exc)
+        except Exception as exc:  # local validation also fails the boundary closed
+            failure.append(exc)
+        finally:
+            _abort_http_connection(
+                connection, active_response[0] if active_response else None
+            )
+            completed.set()
+
+    worker = threading.Thread(target=exchange, name="drover-boundary-http", daemon=True)
+    worker.start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not completed.wait(remaining):
+        _abort_http_connection(
+            connection, active_response[0] if active_response else None
+        )
+        # Closing an HTTPConnection interrupts every stdlib socket operation.
+        # Do not wait beyond the original request budget for a pathological
+        # peer; the daemon thread cannot retain a caller slot after this raise.
+        worker.join(timeout=0.05)
+        raise error_type(error_message)
+    worker.join()
+    if failure or not result:
+        raise error_type(error_message) from (failure[0] if failure else None)
+    return result[0]
+
+
+def _abort_http_connection(
+    connection: http.client.HTTPConnection,
+    response: http.client.HTTPResponse | None = None,
+) -> None:
+    """Interrupt a response reader running in another thread before closing."""
+
+    # HTTPConnection clears ``sock`` once it hands a close-delimited response
+    # to HTTPResponse.  Closing HTTPResponse here can itself block in the
+    # buffered reader, so reach its underlying socket and shut that down first.
+    sock = connection.sock or _response_socket(response)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+    connection.close()
+
+
+def _response_socket(response: http.client.HTTPResponse | None) -> socket.socket | None:
+    if response is None or response.fp is None:
+        return None
+    raw = getattr(response.fp, "raw", None)
+    candidate = getattr(raw, "_sock", None)
+    return candidate if isinstance(candidate, socket.socket) else None
+
+
 def _split_path(path: str) -> tuple[str, ...]:
     return tuple(part for part in path.split("/") if part)
 
@@ -201,7 +328,7 @@ class AnalyticsBoundaryClient:
     ) -> None:
         self._config = config
         self._token = token.strip()
-        self._transport = transport or self._http_transport
+        self._transport = transport
         self._slots = threading.BoundedSemaphore(config.max_concurrent_requests)
 
     @property
@@ -235,7 +362,7 @@ class AnalyticsBoundaryClient:
             target = self._config.worker_url + path
             if query:
                 target += "?" + query
-            response = self._transport(
+            response = self._request_transport(
                 method,
                 target,
                 {
@@ -243,6 +370,7 @@ class AnalyticsBoundaryClient:
                     API_TO_WORKER_HEADER: self._token,
                 },
                 body,
+                deadline=deadline,
             )
             if (
                 not 100 <= response.status <= 599
@@ -314,7 +442,7 @@ class AnalyticsBoundaryClient:
         if not self._slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
             return None
         try:
-            response = self._transport(
+            response = self._request_transport(
                 "POST",
                 self._config.worker_url + "/_internal/analytics/archive-payload",
                 {
@@ -322,6 +450,7 @@ class AnalyticsBoundaryClient:
                     API_TO_WORKER_HEADER: self._token,
                 },
                 body,
+                deadline=deadline,
             )
             if (
                 response.status != 200
@@ -348,11 +477,12 @@ class AnalyticsBoundaryClient:
         if not self._slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
             return "unavailable"
         try:
-            response = self._transport(
+            response = self._request_transport(
                 "GET",
                 self._config.worker_url + "/_internal/analytics/health",
                 {"Accept": "application/json", API_TO_WORKER_HEADER: self._token},
                 b"",
+                deadline=deadline,
             )
             if (
                 response.status != 200
@@ -367,48 +497,38 @@ class AnalyticsBoundaryClient:
         finally:
             self._slots.release()
 
-    def _http_transport(
-        self, method: str, target: str, headers: dict[str, str], body: bytes
+    def _request_transport(
+        self,
+        method: str,
+        target: str,
+        headers: dict[str, str],
+        body: bytes,
+        *,
+        deadline: float,
     ) -> BoundaryResponse:
-        parsed = urlsplit(target)
-        if parsed.hostname not in _LOOPBACK_HOSTS or parsed.scheme != "http":
-            raise AnalyticsBoundaryUnavailable("analytics worker unavailable")
-        deadline = time.monotonic() + self._config.request_timeout_seconds
-        connection = http.client.HTTPConnection(
-            parsed.hostname,
-            parsed.port,
-            timeout=self._config.connect_timeout_seconds,
+        if self._transport is not None:
+            return self._transport(method, target, headers, body)
+        return self._http_transport(method, target, headers, body, deadline=deadline)
+
+    def _http_transport(
+        self,
+        method: str,
+        target: str,
+        headers: dict[str, str],
+        body: bytes,
+        *,
+        deadline: float,
+    ) -> BoundaryResponse:
+        return _bounded_http_response(
+            method=method,
+            target=target,
+            headers=headers,
+            body=body,
+            config=self._config,
+            deadline=deadline,
+            error_type=AnalyticsBoundaryUnavailable,
+            error_message="analytics worker unavailable",
         )
-        try:
-            connection.connect()
-            if connection.sock is None:
-                raise AnalyticsBoundaryUnavailable("analytics worker unavailable")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AnalyticsBoundaryUnavailable("analytics worker unavailable")
-            connection.sock.settimeout(remaining)
-            request_target = parsed.path or "/"
-            if parsed.query:
-                request_target += "?" + parsed.query
-            if body:
-                headers = {**headers, "Content-Type": "application/json"}
-            connection.request(
-                method, request_target, body=body or None, headers=headers
-            )
-            response = connection.getresponse()
-            length = response.getheader("Content-Length")
-            if length is not None and int(length) > self._config.max_response_bytes:
-                raise AnalyticsBoundaryUnavailable("analytics response too large")
-            payload = response.read(self._config.max_response_bytes + 1)
-            return BoundaryResponse(
-                status=response.status,
-                content_type=response.getheader("Content-Type") or "application/json",
-                body=payload,
-            )
-        except (OSError, ValueError, http.client.HTTPException, socket.timeout) as exc:
-            raise AnalyticsBoundaryUnavailable("analytics worker unavailable") from exc
-        finally:
-            connection.close()
 
 
 class _PageArchiveResolver:
@@ -634,7 +754,7 @@ class HostDataBridgeClient:
     ) -> None:
         self._config = config
         self._token = token.strip()
-        self._transport = transport or self._http_transport
+        self._transport = transport
         self._slots = threading.BoundedSemaphore(config.max_concurrent_requests)
 
     def fetch_provider_usage(self, host_id: str) -> Mapping[str, Any]:
@@ -729,7 +849,7 @@ class HostDataBridgeClient:
         if not self._slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
             raise HostDataBridgeUnavailable("API host bridge unavailable")
         try:
-            response = self._transport(
+            response = self._request_transport(
                 method,
                 self._config.api_url + path,
                 {
@@ -737,6 +857,7 @@ class HostDataBridgeClient:
                     WORKER_TO_API_HEADER: self._token,
                 },
                 body,
+                deadline=deadline,
             )
             if len(response.body) > min(
                 response_limit, self._config.max_response_bytes
@@ -750,37 +871,35 @@ class HostDataBridgeClient:
         finally:
             self._slots.release()
 
-    def _http_transport(
-        self, method: str, target: str, headers: dict[str, str], body: bytes
+    def _request_transport(
+        self,
+        method: str,
+        target: str,
+        headers: dict[str, str],
+        body: bytes,
+        *,
+        deadline: float,
     ) -> BoundaryResponse:
-        parsed = urlsplit(target)
-        if parsed.hostname not in _LOOPBACK_HOSTS or parsed.scheme != "http":
-            raise HostDataBridgeUnavailable("API host bridge unavailable")
-        deadline = time.monotonic() + self._config.request_timeout_seconds
-        connection = http.client.HTTPConnection(
-            parsed.hostname,
-            parsed.port,
-            timeout=self._config.connect_timeout_seconds,
+        if self._transport is not None:
+            return self._transport(method, target, headers, body)
+        return self._http_transport(method, target, headers, body, deadline=deadline)
+
+    def _http_transport(
+        self,
+        method: str,
+        target: str,
+        headers: dict[str, str],
+        body: bytes,
+        *,
+        deadline: float,
+    ) -> BoundaryResponse:
+        return _bounded_http_response(
+            method=method,
+            target=target,
+            headers=headers,
+            body=body,
+            config=self._config,
+            deadline=deadline,
+            error_type=HostDataBridgeUnavailable,
+            error_message="API host bridge unavailable",
         )
-        try:
-            connection.connect()
-            if connection.sock is None:
-                raise HostDataBridgeUnavailable("API host bridge unavailable")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HostDataBridgeUnavailable("API host bridge unavailable")
-            connection.sock.settimeout(remaining)
-            if body:
-                headers = {**headers, "Content-Type": "application/json"}
-            connection.request(method, parsed.path, body=body or None, headers=headers)
-            response = connection.getresponse()
-            payload = response.read(self._config.max_response_bytes + 1)
-            return BoundaryResponse(
-                response.status,
-                response.getheader("Content-Type") or "application/json",
-                payload,
-            )
-        except (OSError, ValueError, http.client.HTTPException, socket.timeout) as exc:
-            raise HostDataBridgeUnavailable("API host bridge unavailable") from exc
-        finally:
-            connection.close()

@@ -784,7 +784,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/_internal/analytics/"):
-            self._handle_host_data_bridge(path)
+            self._handle_host_data_bridge(path, parsed.query)
             return
         if not self._gate(path):
             return
@@ -1107,7 +1107,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/_internal/analytics/"):
-            self._handle_host_data_bridge(path)
+            self._handle_host_data_bridge(path, parsed.query)
             return
         if not self._gate(path):
             return
@@ -2141,7 +2141,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return None
         return value if isinstance(value, dict) else None
 
-    def _handle_host_data_bridge(self, path: str) -> None:
+    def _handle_host_data_bridge(self, path: str, query: str) -> None:
         """Serve only the worker's fixed relay-sensitive host operations."""
 
         token = self.host_data_bridge_token
@@ -2153,6 +2153,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
         ):
             self._send(401, "application/json", '{"error":"unauthorized"}\n')
+            return
+        if query:
+            self._send(404, "application/json", '{"error":"not found"}\n')
             return
         parts = [part for part in path.split("/") if part]
         try:
