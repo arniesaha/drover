@@ -44,9 +44,9 @@ Analytics expands provider-reported quota windows and usage distributions.
 - The **context plane** collects durable agent events and spans into local
   Parquet and DuckDB storage, then derives summaries, project briefs, and
   embeddings for recall.
-- An optional **PostgreSQL control store** separates central fleet serving from
-  analytical work. It is configured explicitly; local DuckDB mode and each
-  host daemon's local spool remain the default. The analytics role exports
+- A new central installation uses a **PostgreSQL control store** for fleet
+  serving. Existing DuckDB configurations and every host daemon's local spool
+  remain compatible until an operator completes the explicit migration. The analytics role exports
   central events into immutable Parquet batches, records their manifest, then
   acknowledges them; acknowledgement gates retention and replay.
 - The **MCP surface** exposes that context to coding agents as `drover_*` tools.
@@ -66,12 +66,17 @@ an explicit central serving store should read [PostgreSQL control store](docs/po
 Requires macOS or Linux with Python 3.11+.
 
 ```bash
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
 curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
 ```
 
-This installs a checksum-verified release, starts the server and a local
-harness host, detects an address your phone can reach, and prints a QR code.
-Scan it with the app and you are connected: no token is typed or copied.
+Before running the installer on the first central machine, provision a
+reachable empty PostgreSQL database and export its DSN. The installer validates
+the connection, initializes the empty control store, then starts the server and
+a local harness host. It detects an address your phone can reach and prints a
+QR code. Scan it with the app and you are connected: no token is typed or
+copied. It stores the DSN in a private service environment file, not in the
+generated TOML configuration or service logs.
 
 It also links `drover-server` into `~/.local/bin`, so it is on your PATH. When
 that directory is not on your PATH, the installer says so and prints the line

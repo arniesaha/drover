@@ -26,6 +26,14 @@ check_contains() {
   fi
 }
 
+check_absent() {
+  if /usr/bin/grep -F -q -- "$3" "$2"; then
+    fail "$1 (unexpected '$3')"
+  else
+    pass "$1"
+  fi
+}
+
 check_event_absent() {
   if /usr/bin/grep -F -q -- "$3" "$2"; then
     fail "$1 (unexpected '$3')"
@@ -47,6 +55,16 @@ check_event_before() {
     pass "$1"
   else
     fail "$1 (wanted '$3' before '$4')"
+  fi
+}
+
+check_event_count() {
+  local actual
+  actual="$(/usr/bin/grep -F -c -- "$3" "$2" || true)"
+  if [ "$actual" = "$4" ]; then
+    pass "$1"
+  else
+    fail "$1 (found $actual '$3' events, wanted $4)"
   fi
 }
 
@@ -133,7 +151,22 @@ printf '%s\n' \
   'set -eu' \
   'case "${1:-}" in' \
   '  --version) printf "0.0.0\\n" ;;' \
-  '  init) exit 0 ;;' \
+  '  init)' \
+  '    mkdir -p "$HOME/.drover"' \
+  '    printf "%s\\n" "[control_store]" "backend = \"postgres\"" "dsn_env = \"DROVER_CONTROL_DSN\"" > "$HOME/.drover/config.toml"' \
+  '    ;;' \
+  '  control-store)' \
+  '    case "${2:-}" in' \
+  '      init)' \
+  '        [ -n "${DROVER_CONTROL_DSN:-}" ] || { printf "missing control DSN\\n" >&2; exit 1; }' \
+  '        [ "${FIXTURE_CONTROL_INIT_MODE:-ready}" != "fail" ] || { printf "control init failed\\n" >&2; exit 1; }' \
+  '        if [ -n "${FIXTURE_EXPECTED_DSN+x}" ]; then [ "$DROVER_CONTROL_DSN" = "$FIXTURE_EXPECTED_DSN" ] || exit 1; fi' \
+  '        printf "control-init\\n" >> "$FIXTURE_EVENT_LOG"' \
+  '        ;;' \
+  '      status) printf "control-status\\n" >> "$FIXTURE_EVENT_LOG"; echo '\''{"ready":true}'\'' ;;' \
+  '      *) exit 1 ;;' \
+  '    esac' \
+  '    ;;' \
   '  pair) printf "pair\\n" >> "$FIXTURE_EVENT_LOG" ;;' \
   '  *) exit 1 ;;' \
   'esac' > "$FAKE_SERVER"
@@ -182,10 +215,22 @@ run_new_fleet() {
   health_mode="$2"
   address="$3"
   shift 3
+  local dsn="${FIXTURE_INSTALL_DSN-postgresql://fixture-control}"
   /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS="$os" DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
-    USER=installer FIXTURE_HEALTH_MODE="$health_mode" \
+    USER=installer FIXTURE_HEALTH_MODE="$health_mode" DROVER_CONTROL_DSN="$dsn" \
     bash -s -- --version 0.0.0 --url "$address" "$@" 2>&1
+}
+
+run_existing_fleet_without_dsn() {
+  local os
+  local address
+  os="$1"
+  address="$2"
+  /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+    PYTHONPATH="$REPO/src" DROVER_OS="$os" DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
+    USER=installer FIXTURE_HEALTH_MODE=ready DROVER_CONTROL_DSN="" \
+    bash -s -- --version 0.0.0 --url "$address" --no-start 2>&1
 }
 
 run_join() {
@@ -211,13 +256,33 @@ run_order_case() {
     'server-start' 'health-ready http://100.64.0.10:7099/healthz'
   check_event_before "$label starts the harness after configured health" "$EVENT_LOG" \
     'health-ready http://100.64.0.10:7099/healthz' 'harness-start'
+  check_event_before "$label initializes the PostgreSQL control store before hub startup" "$EVENT_LOG" \
+    'control-init' 'server-start'
   if [ "$os" = linux ]; then
     unit="$HOME_DIR/.config/systemd/user/drover-harnessd.service"
+    server_unit="$HOME_DIR/.config/systemd/user/drover-server.service"
   else
     unit="$HOME_DIR/Library/LaunchAgents/com.drover.harnessd.plist"
+    server_unit="$HOME_DIR/Library/LaunchAgents/com.drover.server.plist"
   fi
   check_contains "$label harness uses the configured hub URL" "$unit" \
     'http://100.64.0.10:7099'
+  check_contains "$label config selects PostgreSQL" "$HOME_DIR/.drover/config.toml" \
+    'backend = "postgres"'
+  check_contains "$label config names the PostgreSQL environment variable" "$HOME_DIR/.drover/config.toml" \
+    'dsn_env = "DROVER_CONTROL_DSN"'
+  check_contains "$label stores the PostgreSQL DSN privately" "$HOME_DIR/.drover/server.env" \
+    'DROVER_CONTROL_DSN='
+  check_absent "$label config does not contain the PostgreSQL DSN" "$HOME_DIR/.drover/config.toml" \
+    'postgresql://fixture-control'
+  check_absent "$label unit does not contain the PostgreSQL DSN" "$server_unit" \
+    'postgresql://fixture-control'
+  output="$(run_new_fleet "$os" ready '100.64.0.10:7099')"
+  result=$?
+  check_status "$label existing PostgreSQL install validates before restart" "$result" "0"
+  check_contains "$label checks existing PostgreSQL readiness" "$EVENT_LOG" 'control-status'
+  check_event_count "$label does not reinitialize an existing PostgreSQL store" "$EVENT_LOG" \
+    'control-init' 1
 }
 
 run_failure_case() {
@@ -242,6 +307,50 @@ run_order_case linux systemd
 run_order_case darwin launchd
 run_failure_case linux systemd
 run_failure_case darwin launchd
+
+new_case escaped-dsn
+export FIXTURE_INSTALL_DSN='host=127.0.0.1 application_name=has space password=it'\''s\\path $literal `tick` "double"'
+export FIXTURE_EXPECTED_DSN="$FIXTURE_INSTALL_DSN"
+OUT="$(run_new_fleet linux ready '100.64.0.10:7099' --no-start)"
+RESULT=$?
+unset FIXTURE_EXPECTED_DSN FIXTURE_INSTALL_DSN
+check_status "fresh install preserves an escaped PostgreSQL DSN" "$RESULT" "0"
+check_contains "escaped PostgreSQL DSN is stored in a private environment file" \
+  "$HOME_DIR/.drover/server.env" 'DROVER_CONTROL_DSN='
+
+new_case missing-dsn
+export FIXTURE_INSTALL_DSN=""
+OUT="$(run_new_fleet linux ready '100.64.0.10:7099')"
+RESULT=$?
+unset FIXTURE_INSTALL_DSN
+check_status "fresh install refuses a missing PostgreSQL DSN" "$RESULT" "1"
+check_contains "missing PostgreSQL DSN is actionable" <(printf '%s' "$OUT") 'DROVER_CONTROL_DSN'
+check_status "missing PostgreSQL DSN does not write a config" \
+  "$([ -e "$HOME_DIR/.drover/config.toml" ] && echo present || echo absent)" "absent"
+check_event_absent "missing PostgreSQL DSN does not initialize a store" "$EVENT_LOG" 'control-init'
+check_event_absent "missing PostgreSQL DSN does not start the hub" "$EVENT_LOG" 'server-start'
+
+new_case control-init-failure
+export FIXTURE_CONTROL_INIT_MODE=fail
+OUT="$(run_new_fleet linux ready '100.64.0.10:7099')"
+RESULT=$?
+unset FIXTURE_CONTROL_INIT_MODE
+check_status "failed PostgreSQL initialization stops installation" "$RESULT" "1"
+check_contains "failed PostgreSQL initialization is actionable" <(printf '%s' "$OUT") \
+  'PostgreSQL control-store initialization failed'
+check_event_absent "failed PostgreSQL initialization does not start the hub" "$EVENT_LOG" 'server-start'
+check_event_absent "failed PostgreSQL initialization does not start the harness" "$EVENT_LOG" 'harness-start'
+
+new_case reused-private-env
+OUT="$(run_new_fleet linux ready '100.64.0.10:7099' --no-start)"
+RESULT=$?
+check_status "fresh install creates a reusable private environment" "$RESULT" "0"
+chmod 0644 "$HOME_DIR/.drover/server.env"
+OUT="$(run_existing_fleet_without_dsn linux '100.64.0.10:7099')"
+RESULT=$?
+check_status "existing PostgreSQL install accepts its private environment" "$RESULT" "0"
+MODE="$($PYTHON -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$HOME_DIR/.drover/server.env")"
+check_status "existing PostgreSQL environment is owner-only" "$MODE" "0o600"
 
 new_case no-start
 OUT="$(run_new_fleet linux fail '100.64.0.10:7099' --no-start)"

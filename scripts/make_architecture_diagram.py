@@ -206,7 +206,7 @@ T(514, 312, "Harness API", 15, DEMI)
 T(514, 338, "HTTP + WebSocket · :7080", 11, REG, (40, 96, 90), mono=True)
 box(718, 300, 940, 372, TINT_TEAL, (206, 232, 228), r=9)
 T(734, 312, "Control store", 15, DEMI)
-T(734, 338, "PostgreSQL optional · fleet state", 11, REG, (71, 85, 105))
+T(734, 338, "PostgreSQL default · fleet state", 11, REG, (71, 85, 105))
 box(498, 384, 940, 456, TINT_TEAL, (206, 232, 228), r=9)
 T(514, 396, "Command coordinator", 15, DEMI)
 T(
@@ -390,7 +390,7 @@ d.line(
 T(
     1492,
     994,
-    "Host daemon owns execution. PostgreSQL optionally serves control.",
+    "Host daemon owns execution. PostgreSQL serves central control.",
     12,
     REG,
     MUTED,

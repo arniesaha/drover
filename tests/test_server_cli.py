@@ -447,6 +447,8 @@ def test_cli_init_writes_default_config(tmp_path):
     target = tmp_path / "myconf.toml"
     res = runner.invoke(main, ["--config", str(target), "init"])
     assert res.exit_code == 0, res.output
+    assert "DROVER_CONTROL_DSN" in res.output
+    assert "control-store init" in res.output
     assert target.exists()
     text = target.read_text()
     assert "[paths]" in text
@@ -458,8 +460,72 @@ def test_cli_init_writes_default_config(tmp_path):
     assert "192.168." not in text
     assert "10.10." not in text
     cfg = load_config(target)
+    assert cfg.control_store.backend == "postgres"
+    assert cfg.control_store.dsn_env == "DROVER_CONTROL_DSN"
     assert cfg.archive.enabled is False
     assert cfg.archive.base_url == ""
+
+
+def test_cli_init_can_explicitly_write_legacy_duckdb_config(tmp_path):
+    """A fresh central config uses PostgreSQL unless the operator opts into legacy mode."""
+    runner = CliRunner()
+    target = tmp_path / "legacy.toml"
+
+    result = runner.invoke(
+        main, ["--config", str(target), "init", "--control-store", "duckdb"]
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = load_config(target)
+    assert cfg.control_store.backend == "duckdb"
+    assert cfg.control_store.dsn_env == ""
+
+
+def test_central_config_resolution_refuses_a_missing_config_before_bootstrap(tmp_path):
+    """A typo or first run cannot create a legacy control store implicitly."""
+    missing = tmp_path / "missing.toml"
+
+    with pytest.raises(click.ClickException, match="config does not exist"):
+        server_main._resolve_config(str(missing))
+
+    assert not (tmp_path / "drover.duckdb").exists()
+    assert not control_plane_path(tmp_path / "drover.duckdb").exists()
+
+
+def test_central_config_resolution_keeps_omitted_backend_on_duckdb(tmp_path):
+    """Existing configs without the new section retain their established backend."""
+    config = _make_config(tmp_path)
+
+    cfg = server_main._resolve_config(str(config))
+
+    assert cfg.control_store.backend == "duckdb"
+
+
+def test_control_store_init_refuses_an_existing_legacy_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """An empty PostgreSQL target never replaces a local serving store implicitly."""
+    legacy_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=legacy_path)
+    config = tmp_path / "postgres.toml"
+    config.write_text(textwrap.dedent(f"""\
+            [paths]
+            incoming_dir = "{tmp_path / 'incoming'}"
+            parquet_dir = "{tmp_path / 'parquet'}"
+            duckdb_path = "{legacy_path}"
+
+            [control_store]
+            backend = "postgres"
+            dsn_env = "DROVER_TEST_POSTGRES_DSN"
+            """))
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", "postgresql://not-used")
+
+    result = CliRunner().invoke(
+        main, ["--config", str(config), "control-store", "init"]
+    )
+
+    assert result.exit_code != 0
+    assert "legacy control-store data" in result.output
 
 
 def test_run_help_uses_loopback_bind_defaults():

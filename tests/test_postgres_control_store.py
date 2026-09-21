@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from dataclasses import replace
@@ -10,8 +11,10 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from click.testing import CliRunner
 
 from drover.config import load_config
+from drover.server.__main__ import main
 
 
 @pytest.fixture
@@ -74,6 +77,52 @@ def test_postgres_control_store_rejects_an_invalid_pool_range(tmp_path: Path):
 
     with pytest.raises(ValueError, match="pool_min_size"):
         load_config(config_path)
+
+
+def test_cli_default_config_initializes_a_disposable_postgres_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Fresh CLI config generation reaches ready PostgreSQL without DuckDB fallback."""
+    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+
+    from drover.server.control_store import close_control_store
+
+    schema = f"drover_default_{uuid4().hex}"
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    runner = CliRunner()
+    generated = runner.invoke(main, ["--config", str(config_path), "init"])
+    assert generated.exit_code == 0, generated.output
+    assert 'backend = "postgres"' in config_path.read_text(encoding="utf-8")
+
+    generated_config = config_path.read_text(encoding="utf-8")
+    assert str(tmp_path / "home") in generated_config
+    generated_config = generated_config.replace(
+        'schema = "drover_control"', f'schema = "{schema}"'
+    )
+    config_path.write_text(generated_config, encoding="utf-8")
+    monkeypatch.setenv("DROVER_CONTROL_DSN", dsn)
+
+    try:
+        initialized = runner.invoke(
+            main, ["--config", str(config_path), "control-store", "init"]
+        )
+        assert initialized.exit_code == 0, initialized.output
+        assert json.loads(initialized.output)["ready"] is True
+
+        status = runner.invoke(
+            main, ["--config", str(config_path), "control-store", "status"]
+        )
+        assert status.exit_code == 0, status.output
+        assert json.loads(status.output)["ready"] is True
+    finally:
+        close_control_store(load_config(config_path).duckdb_path)
+        import psycopg
+
+        with psycopg.connect(dsn, autocommit=True) as con:
+            con.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
 def test_qmark_binder_preserves_question_marks_in_sql_literals_and_comments():

@@ -1,9 +1,10 @@
 # Architecture
 
-Drover has a command plane and a context plane. The default installation keeps
-both control and analytical state local. An explicit PostgreSQL control store
-can separate central API serving from analytical work without changing the
-host-local harness daemon.
+Drover has a command plane and a context plane. A fresh central installation
+uses PostgreSQL for control state and keeps analytical state local. Existing
+DuckDB control configurations remain supported until an explicit migration.
+PostgreSQL can separate central API serving from analytical work without
+changing the host-local harness daemon.
 
 ![Drover architecture](drover-architecture.png)
 
@@ -40,12 +41,17 @@ The context plane turns local agent activity into durable, queryable memory:
 See [Context Store](context-store.md) for table ownership, identity, and
 provenance rules.
 
-## Optional PostgreSQL Serving Store
+## PostgreSQL Serving Store
 
-When `[control_store] backend = "postgres"` is explicitly configured, the
-central serving store owns fleet hosts and sessions, harness event metadata and
+Fresh `drover-server init` configuration sets `[control_store] backend =
+"postgres"`. The central serving store owns fleet hosts and sessions, harness event metadata and
 payload projections, live recap state, central credentials, server identity,
 and content-consent state. It does not replace the analytical lake.
+
+An existing config that omits `[control_store]` retains its DuckDB control
+store. `drover-server init --control-store duckdb` creates an explicit fresh
+legacy configuration. Neither path creates or migrates a control store without
+the corresponding operator command.
 
 The analytics role exports pending central harness events into immutable Parquet
 batches, records them in a PostgreSQL manifest, then acknowledges them. DuckDB
@@ -61,10 +67,10 @@ cold archived payload reads.
 | iOS app | iPhone or simulator | Presentation, local settings, token in Keychain |
 | `drover-server` API role | Central machine | Fleet API, pairing, relay, push, PostgreSQL control readiness |
 | `drover-server` analytics role | Central machine | Ingest, immutable export, archive resolution, derived workers, MCP, OTLP |
-| `drover-server` all role | Central machine | Legacy combined startup order and local DuckDB default |
+| `drover-server` all role | Central machine | Combined API and analytics startup, with the configured control backend |
 | `drover-harnessd` | Every harness host | Agent processes, adapters, PTY, terminal stream |
 | `drover-collect` | Source hosts | Local log parsing and source-side attribution |
-| PostgreSQL control store | Optional central storage | Fleet serving state, credentials, consent, durable export manifest |
+| PostgreSQL control store | Default fresh central storage | Fleet serving state, credentials, consent, durable export manifest |
 | DuckDB + Parquet | Local or analytics storage | Durable analytical facts, views, derived context, ledger |
 | Redis Streams | Optional central dependency | Retry coordination only |
 

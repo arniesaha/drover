@@ -556,6 +556,7 @@ def test_release_workflow_is_tag_triggered_and_publishes_three_artifacts() -> No
     steps = " ".join(step.get("run", "") for step in job["steps"])
     assert "uv build" in steps
     assert "uv export" in steps
+    assert "--extra postgres" in steps
     assert "sha256sum" in steps
     assert "SHA256SUMS.txt" in steps
     # An export that silently drops hashes would make --require-hashes a

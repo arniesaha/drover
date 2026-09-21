@@ -9,6 +9,8 @@ directory would make an update a no-op rather than a symlink flip.
 from __future__ import annotations
 
 import plistlib
+import subprocess
+import sys
 from pathlib import Path
 
 from drover.server.service_units import render_launchd, render_systemd, runtime_bin
@@ -65,6 +67,54 @@ def test_launchd_unit_escapes_xml_in_arguments():
     assert parsed["ProgramArguments"][2] == "A & B <c>"
 
 
+def test_launchd_reads_service_environment_from_a_private_file():
+    rendered = render_launchd(
+        "com.drover.server",
+        "/home/x/.drover/runtime/current/bin/drover-server",
+        ["run"],
+        home=Path("/home/x"),
+        path_entries=["/usr/bin"],
+        environment_file=Path("/home/x/.drover/server.env"),
+    )
+
+    parsed = plistlib.loads(rendered.encode("utf-8"))
+    assert parsed["EnvironmentVariables"] == {"PATH": "/usr/bin"}
+    assert parsed["ProgramArguments"] == [
+        "/bin/sh",
+        "-c",
+        'set -a; . "$1"; shift; exec "$@"',
+        "drover-service-env",
+        "/home/x/.drover/server.env",
+        "/home/x/.drover/runtime/current/bin/drover-server",
+        "run",
+    ]
+
+
+def test_launchd_environment_file_reaches_the_daemon(tmp_path: Path):
+    env_file = tmp_path / "server.env"
+    env_file.write_text("DROVER_CONTROL_DSN='postgresql://private-target'\n")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os\n"
+        "import sys\n"
+        f"assert sys.argv == [{str(probe)!r}, 'run']\n"
+        "print(os.environ['DROVER_CONTROL_DSN'])\n"
+    )
+    rendered = render_launchd(
+        "com.drover.server",
+        sys.executable,
+        [str(probe), "run"],
+        home=tmp_path,
+        path_entries=["/usr/bin"],
+        environment_file=env_file,
+    )
+    argv = plistlib.loads(rendered.encode("utf-8"))["ProgramArguments"]
+
+    result = subprocess.run(argv, check=True, capture_output=True, text=True)
+
+    assert result.stdout == "postgresql://private-target\n"
+
+
 def test_systemd_unit_sets_path_and_restarts():
     rendered = render_systemd(
         "Drover harness daemon",
@@ -79,6 +129,31 @@ def test_systemd_unit_sets_path_and_restarts():
         "ExecStart=/home/x/.drover/runtime/current/bin/drover-harnessd "
         "--host-id build-mac" in rendered
     )
+
+
+def test_systemd_reads_service_environment_from_a_private_file():
+    rendered = render_systemd(
+        "Drover server",
+        "/home/x/.drover/runtime/current/bin/drover-server",
+        ["run"],
+        path_entries=["/home/x/.drover/runtime/current/bin", "/usr/bin"],
+        environment_file=Path("/home/x/.drover/server.env"),
+    )
+
+    assert "EnvironmentFile=/home/x/.drover/server.env" in rendered
+    assert "DROVER_CONTROL_DSN" not in rendered
+
+
+def test_systemd_quotes_an_environment_file_path_with_spaces():
+    rendered = render_systemd(
+        "Drover server",
+        "/bin/true",
+        [],
+        path_entries=["/usr/bin"],
+        environment_file=Path("/home/Build User/.drover/server.env"),
+    )
+
+    assert 'EnvironmentFile="/home/Build User/.drover/server.env"' in rendered
 
 
 def test_systemd_quotes_arguments_containing_spaces():

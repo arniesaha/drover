@@ -7,9 +7,10 @@ Drover's context store preserves:
 - **How results were produced** - derivation history and provenance
 
 It uses Parquet for durable telemetry facts and DuckDB for query views plus
-derived state. The default local installation also uses DuckDB for command
-serving state. An explicitly configured central PostgreSQL control store moves
-only that central serving state to PostgreSQL.
+derived state. Fresh central configs use PostgreSQL for command serving state,
+while existing configs that omit `[control_store]` retain DuckDB until an
+explicit migration. PostgreSQL moves only central serving state; it does not
+change a host daemon's local spool.
 
 ## Design Goals
 
@@ -80,9 +81,11 @@ The separate file gives it its own instance and its own budget.
 The host daemon remains authoritative for live processes. Registry rows describe
 and route those processes; they do not replace host-local process state.
 
-### 3. Optional Central PostgreSQL Control Store
+### 3. Central PostgreSQL Control Store
 
-PostgreSQL is selected only by the configured central control path. It owns the
+Fresh `drover-server init` selects PostgreSQL with
+`DROVER_CONTROL_DSN`. PostgreSQL is selected only by the configured central
+control path. It owns the
 central fleet registry, event metadata and hot payload projections, live recap
 state, server identity, credential verifiers, content-consent state, and the
 durable event-export manifest. A PostgreSQL process does not redirect a

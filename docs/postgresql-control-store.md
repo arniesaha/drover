@@ -1,10 +1,10 @@
 # PostgreSQL control store
 
-Drover normally keeps its control state in local DuckDB and starts with the
-legacy combined `drover-server run` command. PostgreSQL is an explicit option
-for a central control store. It allows the public API and analytical work to
-run as separate processes while each harness host continues to keep its own
-local DuckDB spool.
+Fresh central Drover installations use PostgreSQL for their control store.
+They can run the public API and analytical work as separate processes while
+each harness host continues to keep its own local DuckDB spool. Existing
+configurations that omit `[control_store]` keep their established DuckDB
+control store until an operator performs an explicit migration.
 
 This guide is for an operator preparing a new central store or an offline
 cutover. It does not perform a live migration, change a running service, or
@@ -12,15 +12,44 @@ turn a local harness daemon into a PostgreSQL client.
 
 ## Install and configure
 
-Install the optional PostgreSQL client dependency in the environment that
-runs the central server:
+The PostgreSQL client is part of the default central-server dependency set.
+Install the project normally in the environment that runs the central server:
 
 ```sh
-uv sync --extra postgres
+uv sync
 ```
+
+The release installer includes the same dependency in its hash-pinned
+requirements export. The `postgres` extra remains available for compatibility
+with existing source-install commands.
 
 Put the connection string in a named environment variable. The configuration
 contains that variable's name, never the connection string itself.
+
+For a fresh source installation, generate the PostgreSQL configuration first,
+then explicitly initialize its empty target:
+
+```sh
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
+uv run drover-server init
+uv run drover-server control-store init
+uv run drover-server control-store status
+```
+
+`init` writes the configuration only. `control-store init` connects to the
+configured PostgreSQL target, bootstraps its schema, and writes its empty-store
+readiness marker. Do not start a serving role until `status` reports
+`"ready": true`.
+
+For a fresh legacy deployment, make the exception explicit instead:
+
+```sh
+uv run drover-server init --control-store duckdb
+```
+
+The command never rewrites an existing config. A missing central config is an
+error rather than permission to create a DuckDB store. Keep existing DuckDB
+configs unchanged until their offline migration is ready.
 
 ```toml
 [paths]
@@ -81,13 +110,13 @@ separate export CLI or a promise of unlimited throughput.
 
 ## Run combined or split roles
 
-The legacy default remains:
+The generated PostgreSQL config supports the combined process:
 
 ```sh
 uv run drover-server --config central.toml run
 ```
 
-Separate roles require the PostgreSQL configuration above. Start the API and
+Separate roles also require the PostgreSQL configuration above. Start the API and
 analytics roles with the same central configuration and the generated service
 environment tokens:
 
@@ -105,7 +134,21 @@ serve `/harness`; analytical routes return an explicit unavailable response
 until the worker returns. `drover-harnessd` is unchanged and retains its
 host-local DuckDB spool even when its environment contains a central DSN.
 
-## New empty store and offline cutover
+## Installer behavior, empty stores, and offline cutover
+
+For a new central installation, export `DROVER_CONTROL_DSN` before running the
+installer. It writes a mode `0600` service environment file and references that
+file from the server's launchd or systemd definition. The DSN value is absent
+from the TOML configuration and service arguments. The installer validates and
+initializes a fresh empty PostgreSQL target before it starts the server. A
+missing DSN fails before it writes the fresh config. An initialization failure
+leaves the generated config for remediation but starts no service.
+
+When the installer is run again with an existing PostgreSQL configuration, it
+loads the private environment file and checks `control-store status`; it does
+not initialize the target again. A migrated ready target can therefore retain
+its fenced DuckDB source files. An interrupted import remains unready until its
+explicit import and verification sequence finishes.
 
 For a deliberate empty central store, initialize it offline:
 

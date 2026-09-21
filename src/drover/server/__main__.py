@@ -31,7 +31,6 @@ from drover.config import (
     AdvisoryContentConfig,
     DroverConfig,
     config_home,
-    default_config,
     default_config_path,
     default_token_file,
     load_config,
@@ -363,11 +362,11 @@ duckdb_path  = "{home}/.drover/drover.duckdb"
 processed_retention_days = 7
 
 [control_store]
-# Legacy all-in-one installations keep DuckDB.  Standalone api/analytics
-# roles require postgres so independent processes never contend for DuckDB's
-# single-writer file lock.  Put the DSN in this named environment variable.
-backend = "duckdb"
-dsn_env = ""
+# New central installations use PostgreSQL. Put its DSN in the named
+# environment variable before initializing the empty control store. Choose
+# `drover-server init --control-store duckdb` only for legacy compatibility.
+backend = "{control_store_backend}"
+dsn_env = "{control_store_dsn_env}"
 pool_min_size = 1
 pool_max_size = 4
 acquire_timeout_seconds = 2.0
@@ -487,10 +486,11 @@ high_water = 1000
 
 def _resolve_config(path: Optional[str]) -> DroverConfig:
     p = Path(path) if path else _DEFAULT_CONFIG_PATH
-    if p.exists():
-        cfg = load_config(p)
-    else:
-        cfg = default_config()
+    if not p.exists():
+        raise click.ClickException(
+            f"config does not exist: {p}; run drover-server init first"
+        )
+    cfg = load_config(p)
     # The central API process explicitly registers its configured path. This
     # is deliberately absent from harnessd, which keeps its host-local DuckDB
     # store even when a hub has PostgreSQL credentials in its environment.
@@ -1024,6 +1024,22 @@ def _bootstrap_harnessd_schema(cfg: DroverConfig) -> bool:
     return bootstrap_harnessd_schema(cfg)
 
 
+def _reject_legacy_control_store_replacement(cfg: DroverConfig) -> None:
+    """Keep an empty PostgreSQL initialization from bypassing migration.
+
+    The registry companion is the authoritative pre-PostgreSQL serving store.
+    Its presence means the operator must take a fenced snapshot and use the
+    explicit import/verify lifecycle instead of treating the target as empty.
+    """
+    registry_path = control_plane_path(cfg.duckdb_path)
+    if registry_path.exists():
+        raise click.ClickException(
+            "legacy control-store data may exist at "
+            f"{registry_path}; use control-store import and verify with a "
+            "fenced snapshot instead of control-store init"
+        )
+
+
 def _parse_listen_address(value: str) -> tuple[str, int]:
     from drover.server.harness.cli import parse_listen_address
 
@@ -1065,6 +1081,8 @@ def control_store_status_cmd(ctx: click.Context) -> None:
 def control_store_init_cmd(ctx: click.Context) -> None:
     """Explicitly initialize a new, verified-empty PostgreSQL control store."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    if cfg.control_store.backend == "postgres":
+        _reject_legacy_control_store_replacement(cfg)
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     try:
         report = initialize_empty_control_store(cfg.duckdb_path)
@@ -2515,8 +2533,15 @@ def ledger_replay_cmd(
 
 
 @main.command()
+@click.option(
+    "--control-store",
+    type=click.Choice(["postgres", "duckdb"], case_sensitive=False),
+    default="postgres",
+    show_default=True,
+    help="Central control-store backend for the generated config.",
+)
 @click.pass_context
-def init(ctx: click.Context) -> None:
+def init(ctx: click.Context, control_store: str) -> None:
     """Write a default config file at --config (defaults to ~/.drover/config.toml)."""
     p = Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     if p.exists():
@@ -2525,10 +2550,23 @@ def init(ctx: click.Context) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     home = os.path.expanduser("~")
     default_agent_id = os.uname().nodename.split(".")[0] + "-agent"
+    selected_store = control_store.lower()
     p.write_text(
-        _DEFAULT_CONFIG_TEMPLATE.format(home=home, default_agent_id=default_agent_id)
+        _DEFAULT_CONFIG_TEMPLATE.format(
+            home=home,
+            default_agent_id=default_agent_id,
+            control_store_backend=selected_store,
+            control_store_dsn_env=(
+                "DROVER_CONTROL_DSN" if selected_store == "postgres" else ""
+            ),
+        )
     )
     click.echo(f"wrote {p}")
+    if selected_store == "postgres":
+        click.echo(
+            "Next: export DROVER_CONTROL_DSN, then run "
+            f"drover-server --config {p} control-store init"
+        )
 
 
 @main.command()

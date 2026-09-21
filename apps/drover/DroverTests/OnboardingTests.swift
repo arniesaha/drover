@@ -32,7 +32,7 @@ final class OnboardingTests: XCTestCase {
         XCTAssertEqual(mode.commandTitle, "Install Command")
         XCTAssertEqual(
             mode.guidanceText,
-            "Run the command in your terminal on your machine. When it finishes, it will print a pairing QR code."
+            "Before running this on the primary hub, provision PostgreSQL and export DROVER_CONTROL_DSN in that terminal. The installer validates and initializes the empty control store, then prints a pairing QR code."
         )
         XCTAssertEqual(mode.copyButtonLabel, "Copy Command")
     }
