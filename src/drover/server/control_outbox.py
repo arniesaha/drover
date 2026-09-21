@@ -7,20 +7,52 @@ its payload, cheap serving projection, and export intent in the same unit.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
+import os
+import stat
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from drover.server.parquet_io import atomic_write_table
-
 PUBLISHED_BATCHES_DIR = "control_outbox_batches"
 EXPORTED_HARNESS_EVENTS_RELATION = "harness_exported_events"
+
+
+def _load_exclusive_rename() -> tuple[Any | None, int]:
+    """Return the platform primitive that refuses to replace an existing entry."""
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "darwin":
+            function = library.renameatx_np
+            flag = 0x00000004  # RENAME_EXCL
+        elif sys.platform.startswith("linux"):
+            function = library.renameat2
+            flag = 0x00000001  # RENAME_NOREPLACE
+        else:
+            return None, 0
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        function.restype = ctypes.c_int
+        return function, flag
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None, 0
+
+
+_EXCLUSIVE_RENAME, _EXCLUSIVE_RENAME_FLAG = _load_exclusive_rename()
 
 
 def is_postgres_connection(con: object) -> bool:
@@ -343,6 +375,8 @@ def _validate_claim_for_publication(con: object, claim: OutboxClaim) -> None:
 
 def _validate_existing_batch(path: Path, expected: pa.Table) -> None:
     """Accept a crash-retry file only when every claimed logical fact agrees."""
+    descriptor = _open_regular_file(path)
+    os.close(descriptor)
     try:
         existing = pq.ParquetFile(path).read()
     except Exception as exc:
@@ -354,44 +388,161 @@ def _validate_existing_batch(path: Path, expected: pa.Table) -> None:
         raise RuntimeError("existing outbox batch does not match claimed membership")
 
 
-def publish_outbox_batch(
+def _open_regular_file(path: Path) -> int:
+    """Open one local regular file without accepting a symlinked batch."""
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(errno.EINVAL, "outbox batch is not a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        after = os.fstat(descriptor)
+        if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            os.close(descriptor)
+            raise OSError(errno.EINVAL, "outbox batch changed while opening")
+        return descriptor
+    except OSError as exc:
+        raise RuntimeError("existing outbox batch is not a regular local file") from exc
+
+
+def _sync_regular_file(path: Path) -> None:
+    """Flush a validated regular file before publishing its directory entry."""
+    descriptor = _open_regular_file(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    return os.open(path, flags)
+
+
+def _ensure_publication_directory(path: Path) -> None:
+    """Create the one private batch directory and persist a new parent entry."""
+    try:
+        existing = os.lstat(path)
+    except FileNotFoundError:
+        _ensure_publication_directory(path.parent)
+        try:
+            path.mkdir()
+        except FileExistsError:
+            existing = os.lstat(path)
+            if not stat.S_ISDIR(existing.st_mode):
+                raise RuntimeError("outbox publication path is not a directory")
+        else:
+            parent_descriptor = _open_directory(path.parent)
+            try:
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+        return
+    if not stat.S_ISDIR(existing.st_mode):
+        raise RuntimeError("outbox publication path is not a directory")
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _rename_noreplace_at(
+    source_descriptor: int,
+    source_name: str,
+    destination_descriptor: int,
+    destination_name: str,
+) -> None:
+    """Atomically link the attempt to its final name only if final is absent."""
+    function = _EXCLUSIVE_RENAME
+    flag = _EXCLUSIVE_RENAME_FLAG
+    if function is None or flag == 0:
+        raise OSError(errno.ENOTSUP, "exclusive outbox publication unsupported")
+    ctypes.set_errno(0)
+    result = function(
+        source_descriptor,
+        os.fsencode(source_name),
+        destination_descriptor,
+        os.fsencode(destination_name),
+        flag,
+    )
+    if result == 0:
+        return
+    raise OSError(
+        ctypes.get_errno() or errno.EIO,
+        "exclusive outbox publication failed",
+    )
+
+
+def _durably_validate_existing_batch(
+    path: Path, expected: pa.Table, directory_descriptor: int
+) -> str:
+    """Recover an already-written final only after logical and sync barriers."""
+    _validate_existing_batch(path, expected)
+    _sync_regular_file(path)
+    os.fsync(directory_descriptor)
+    return _file_sha256(path)
+
+
+def _publish_immutable_batch(table: pa.Table, path: Path) -> str:
+    """Return a durable immutable final file, without making an SQL receipt."""
+    _ensure_publication_directory(path.parent)
+    directory_descriptor = _open_directory(path.parent)
+    temporary_path: Path | None = None
+    renamed = False
+    try:
+        if _entry_exists(path):
+            return _durably_validate_existing_batch(path, table, directory_descriptor)
+        if _EXCLUSIVE_RENAME is None or _EXCLUSIVE_RENAME_FLAG == 0:
+            raise OSError(errno.ENOTSUP, "exclusive outbox publication unsupported")
+        temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        pq.write_table(table, temporary_path, compression="zstd")
+        _sync_regular_file(temporary_path)
+        try:
+            _rename_noreplace_at(
+                directory_descriptor,
+                temporary_path.name,
+                directory_descriptor,
+                path.name,
+            )
+        except FileExistsError:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            temporary_path = None
+            return _durably_validate_existing_batch(path, table, directory_descriptor)
+        renamed = True
+        temporary_path = None
+        _validate_existing_batch(path, table)
+        _sync_regular_file(path)
+        os.fsync(directory_descriptor)
+        return _file_sha256(path)
+    finally:
+        if temporary_path is not None and not renamed:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+        os.close(directory_descriptor)
+
+
+def _record_published_batch(
     con: object,
     claim: OutboxClaim,
     *,
-    parquet_dir: Path,
-    now: datetime | None = None,
+    path: Path,
+    content_hash: str,
+    member_count: int,
+    stamp: datetime,
 ) -> PublishedBatch:
-    """Publish one claim to a fixed immutable path, then make it visible in SQL."""
-    if not is_postgres_connection(con):
-        raise ValueError("the control outbox requires a PostgreSQL connection")
-    _validate_claim_for_publication(con, claim)
-    rows = _claim_rows(con, claim)
-    if tuple(str(row["event_id"]) for row in rows) != claim.event_ids:
-        raise RuntimeError("outbox claim membership changed before publication")
-    for row in rows:
-        payload = row.get("payload_json")
-        if not isinstance(payload, str):
-            raise RuntimeError(
-                f"outbox event {row['event_id']} has no retained payload"
-            )
-        expected = str(row.get("payload_sha256") or "")
-        actual = payload_sha256(payload)
-        if expected and expected != actual:
-            raise RuntimeError(f"outbox event {row['event_id']} payload hash mismatch")
-        row["payload_sha256"] = actual
-    table = pa.Table.from_pylist(rows)
-    path = _batch_path(Path(parquet_dir), claim.batch_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        # A crash after rename but before SQL publication is a retry, never a
-        # second logical batch. Validate schema, ordinal membership, and every
-        # raw payload before a stale same-name file can become visible.
-        _validate_existing_batch(path, table)
-        content_hash = _file_sha256(path)
-    else:
-        atomic_write_table(table, path, compression="zstd")
-        content_hash = _file_sha256(path)
-    stamp = _utc_now(now)
+    """Make an already durable immutable batch visible in the SQL manifest."""
     con.execute("BEGIN")
     try:
         result = con.execute(
@@ -437,7 +588,49 @@ def publish_outbox_batch(
     except Exception:
         con.execute("ROLLBACK")
         raise
-    return PublishedBatch(claim.batch_id, str(path), content_hash, len(rows), stamp)
+    return PublishedBatch(claim.batch_id, str(path), content_hash, member_count, stamp)
+
+
+def publish_outbox_batch(
+    con: object,
+    claim: OutboxClaim,
+    *,
+    parquet_dir: Path,
+    now: datetime | None = None,
+) -> PublishedBatch:
+    """Publish one claim to a fixed immutable path, then make it visible in SQL."""
+    if not is_postgres_connection(con):
+        raise ValueError("the control outbox requires a PostgreSQL connection")
+    _validate_claim_for_publication(con, claim)
+    rows = _claim_rows(con, claim)
+    if tuple(str(row["event_id"]) for row in rows) != claim.event_ids:
+        raise RuntimeError("outbox claim membership changed before publication")
+    for row in rows:
+        payload = row.get("payload_json")
+        if not isinstance(payload, str):
+            raise RuntimeError(
+                f"outbox event {row['event_id']} has no retained payload"
+            )
+        expected = str(row.get("payload_sha256") or "")
+        actual = payload_sha256(payload)
+        if expected and expected != actual:
+            raise RuntimeError(f"outbox event {row['event_id']} payload hash mismatch")
+        row["payload_sha256"] = actual
+    table = pa.Table.from_pylist(rows)
+    path = _batch_path(Path(parquet_dir), claim.batch_id)
+    # A crash after final publication but before the SQL receipt is a retry,
+    # never a second logical batch. The helper validates schema, ordinal
+    # membership, and every raw payload before it can expose that final path.
+    content_hash = _publish_immutable_batch(table, path)
+    stamp = _utc_now(now)
+    return _record_published_batch(
+        con,
+        claim,
+        path=path,
+        content_hash=content_hash,
+        member_count=len(rows),
+        stamp=stamp,
+    )
 
 
 def acknowledge_outbox_batch(

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import stat
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -77,6 +79,35 @@ def postgres_single_connection_control_store(tmp_path: Path, monkeypatch):
 
         with psycopg.connect(dsn, autocommit=True) as con:
             con.execute(f'DROP SCHEMA IF EXISTS "{config.schema}" CASCADE')
+
+
+def _seed_outbox_claim(control_path: Path, *, event_id: str):
+    """Create one claimed, unmanifested event for publication fault tests."""
+    from drover.server.control_outbox import claim_outbox_batch
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(
+        host_id=f"{event_id}-host", display_name="Export", kind="test"
+    )
+    registry.create_session(
+        host_id=f"{event_id}-host",
+        harness="codex",
+        command="codex",
+        session_id=f"{event_id}-session",
+    )
+    registry.append_event(
+        session_id=f"{event_id}-session",
+        event_id=event_id,
+        event_type="assistant_output",
+        payload={"text": f"durable immutable {event_id}"},
+        seq=1,
+    )
+    with control_plane_connection(control_path) as con:
+        claim = claim_outbox_batch(con, owner="publisher", limit=10)
+        assert claim is not None
+        return claim
 
 
 def test_postgres_event_write_commits_payload_preview_and_outbox_atomically(
@@ -518,6 +549,254 @@ def test_outbox_rejects_a_stale_final_path_before_it_becomes_manifested(
             "SELECT state, content_sha256, archive_path FROM control_outbox_batches WHERE batch_id = ?",
             [claim.batch_id],
         ).fetchone() == ("claimed", None, None)
+
+
+def test_outbox_file_sync_failure_never_manifests_acknowledges_or_prunes(
+    postgres_control_store, monkeypatch
+):
+    """A file-durability failure leaves the claimed payload fully protected."""
+    control_path, parquet_dir = postgres_control_store
+    import drover.server.control_outbox as outbox
+    from drover.server.control_outbox import (
+        acknowledge_outbox_batch,
+        prune_verified_payloads,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+
+    claim = _seed_outbox_claim(control_path, event_id="file-sync-event")
+    actual_fsync = os.fsync
+
+    def fail_regular_file_sync(descriptor: int) -> None:
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("injected file sync failure")
+        actual_fsync(descriptor)
+
+    # The reviewed publisher never touched os.fsync, so this must be RED
+    # before the durable publisher is implemented.
+    monkeypatch.setattr(outbox, "os", os, raising=False)
+    monkeypatch.setattr(os, "fsync", fail_regular_file_sync)
+    with control_plane_connection(control_path) as con:
+        with pytest.raises(OSError, match="injected file sync failure"):
+            publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+        assert published_batches(con) == []
+        assert acknowledge_outbox_batch(con, claim.batch_id) is False
+        assert con.execute(
+            "SELECT state, content_sha256, archive_path FROM control_outbox_batches WHERE batch_id = ?",
+            [claim.batch_id],
+        ).fetchone() == ("claimed", None, None)
+
+    HarnessRegistry(control_path).update_session_status(
+        "file-sync-event-session", "completed"
+    )
+    retention = prune_verified_payloads(control_path, resolver=None)
+    assert retention["pruned"] == 0
+    assert retention["protected_dependency"] == 1
+
+
+def test_outbox_directory_sync_failure_retries_existing_final_before_manifesting(
+    postgres_control_store, monkeypatch
+):
+    """A final entry survives a failed directory sync only as an unmanifested retry."""
+    control_path, parquet_dir = postgres_control_store
+    import drover.server.control_outbox as outbox
+    from drover.server.control_outbox import (
+        PUBLISHED_BATCHES_DIR,
+        acknowledge_outbox_batch,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+
+    claim = _seed_outbox_claim(control_path, event_id="directory-sync-event")
+    path = parquet_dir / PUBLISHED_BATCHES_DIR / f"{claim.batch_id}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    actual_fsync = os.fsync
+
+    def fail_directory_sync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected directory sync failure")
+        actual_fsync(descriptor)
+
+    monkeypatch.setattr(outbox, "os", os, raising=False)
+    with monkeypatch.context() as failure:
+        failure.setattr(os, "fsync", fail_directory_sync)
+        with control_plane_connection(control_path) as con:
+            with pytest.raises(OSError, match="injected directory sync failure"):
+                publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+            assert published_batches(con) == []
+            assert acknowledge_outbox_batch(con, claim.batch_id) is False
+            assert con.execute(
+                "SELECT state, content_sha256, archive_path FROM control_outbox_batches WHERE batch_id = ?",
+                [claim.batch_id],
+            ).fetchone() == ("claimed", None, None)
+    assert path.is_file()
+    crash_hash = outbox._file_sha256(path)
+
+    def fail_existing_file_sync(descriptor: int) -> None:
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("injected existing file sync failure")
+        actual_fsync(descriptor)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, "fsync", fail_existing_file_sync)
+        with control_plane_connection(control_path) as con:
+            with pytest.raises(OSError, match="injected existing file sync failure"):
+                publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+            assert published_batches(con) == []
+
+    with control_plane_connection(control_path) as con:
+        published = publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+        assert published.content_sha256 == crash_hash
+        assert acknowledge_outbox_batch(con, published.batch_id) is True
+
+
+def test_outbox_syncs_file_and_directory_before_sql_manifest(
+    postgres_control_store, monkeypatch
+):
+    """The SQL receipt cannot become visible before the durable final entry."""
+    control_path, parquet_dir = postgres_control_store
+    import drover.server.control_outbox as outbox
+    from drover.server.control_outbox import publish_outbox_batch
+    from drover.server.db import control_plane_connection
+
+    claim = _seed_outbox_claim(control_path, event_id="sync-order-event")
+    (parquet_dir / outbox.PUBLISHED_BATCHES_DIR).mkdir(parents=True, exist_ok=True)
+    actual_fsync = os.fsync
+    synced: list[str] = []
+
+    def record_sync(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        synced.append("file" if stat.S_ISREG(mode) else "directory")
+        actual_fsync(descriptor)
+
+    class OrderedConnection:
+        dialect = "postgres"
+
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def execute(self, query, *args, **kwargs):
+            if "UPDATE control_outbox_batches" in str(
+                query
+            ) and "SET state = 'published'" in str(query):
+                assert "file" in synced
+                assert synced[-1] == "directory"
+            return self._wrapped.execute(query, *args, **kwargs)
+
+    monkeypatch.setattr(outbox, "os", os, raising=False)
+    monkeypatch.setattr(os, "fsync", record_sync)
+    with control_plane_connection(control_path) as con:
+        receipt = publish_outbox_batch(
+            OrderedConnection(con), claim, parquet_dir=parquet_dir
+        )
+    assert receipt.batch_id == claim.batch_id
+
+
+def test_outbox_fails_closed_without_supported_no_clobber_rename(
+    postgres_control_store, monkeypatch
+):
+    """Unsupported platforms leave a new claim unmanifested rather than replace."""
+    control_path, parquet_dir = postgres_control_store
+    import drover.server.control_outbox as outbox
+    from drover.server.control_outbox import publish_outbox_batch, published_batches
+    from drover.server.db import control_plane_connection
+
+    claim = _seed_outbox_claim(control_path, event_id="unsupported-rename-event")
+    monkeypatch.setattr(outbox, "_EXCLUSIVE_RENAME", None, raising=False)
+    monkeypatch.setattr(outbox, "_EXCLUSIVE_RENAME_FLAG", 0, raising=False)
+    with control_plane_connection(control_path) as con:
+        with pytest.raises(OSError, match="exclusive outbox publication unsupported"):
+            publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+        assert published_batches(con) == []
+        assert con.execute(
+            "SELECT state, content_sha256 FROM control_outbox_batches WHERE batch_id = ?",
+            [claim.batch_id],
+        ).fetchone() == ("claimed", None)
+
+
+def test_outbox_overlapping_leases_keep_the_first_immutable_winner(
+    postgres_control_store, monkeypatch
+):
+    """An expired publisher cannot share a temp name or overwrite the new lease's final."""
+    control_path, parquet_dir = postgres_control_store
+    import drover.server.control_outbox as outbox
+    from drover.server.control_outbox import (
+        claim_outbox_batch,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+
+    started = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    with control_plane_connection(control_path) as con:
+        first = _seed_outbox_claim(control_path, event_id="overlap-event")
+        # The helper claims with the default lease; make expiry deterministic.
+        con.execute(
+            "UPDATE control_outbox_batches SET lease_until = ? WHERE batch_id = ?",
+            [started + timedelta(seconds=1), first.batch_id],
+        )
+    entered = threading.Event()
+    release = threading.Event()
+    temporary_names: list[str] = []
+    original_rename = getattr(outbox, "_rename_noreplace_at", None)
+
+    def pause_first_rename(source_fd, source_name, destination_fd, destination_name):
+        temporary_names.append(source_name)
+        if threading.current_thread().name == "outbox-old-lease":
+            entered.set()
+            assert release.wait(timeout=5)
+        assert original_rename is not None
+        return original_rename(source_fd, source_name, destination_fd, destination_name)
+
+    monkeypatch.setattr(
+        outbox, "_rename_noreplace_at", pause_first_rename, raising=False
+    )
+    old_result: list[object] = []
+    old_errors: list[BaseException] = []
+
+    def publish_old_lease() -> None:
+        try:
+            with control_plane_connection(control_path) as con:
+                old_result.append(
+                    publish_outbox_batch(
+                        con, first, parquet_dir=parquet_dir, now=started
+                    )
+                )
+        except BaseException as exc:  # surfaced in the main test thread
+            old_errors.append(exc)
+
+    old_thread = threading.Thread(target=publish_old_lease, name="outbox-old-lease")
+    old_thread.start()
+    assert entered.wait(timeout=5)
+    with control_plane_connection(control_path) as con:
+        recovered = claim_outbox_batch(
+            con,
+            owner="outbox-new-lease",
+            limit=10,
+            lease_seconds=30,
+            now=started + timedelta(seconds=2),
+        )
+        assert recovered is not None
+        assert recovered.batch_id == first.batch_id
+        new_result = publish_outbox_batch(
+            con, recovered, parquet_dir=parquet_dir, now=started + timedelta(seconds=2)
+        )
+    winner_path = Path(new_result.archive_path)
+    winner_hash = outbox._file_sha256(winner_path)
+    release.set()
+    old_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+    assert old_errors == []
+    assert len(old_result) == 1
+    assert old_result[0].content_sha256 == winner_hash
+    assert len(set(temporary_names)) == 2
+    assert outbox._file_sha256(winner_path) == winner_hash
+    assert list(winner_path.parent.glob(f".{winner_path.name}.*.tmp")) == []
+    with control_plane_connection(control_path) as con:
+        assert [batch.batch_id for batch in published_batches(con)] == [first.batch_id]
 
 
 def test_outbox_claims_a_late_old_event_after_newer_work_was_acknowledged(
