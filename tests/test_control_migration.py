@@ -21,8 +21,8 @@ def postgres_target(tmp_path: Path, monkeypatch):
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
     from drover.config import ControlStoreConfig
-    from drover.server.control_store import close_control_store, configure_control_store
     from drover.schema import bootstrap
+    from drover.server.control_store import close_control_store, configure_control_store
 
     path = tmp_path / "target.duckdb"
     config = ControlStoreConfig(

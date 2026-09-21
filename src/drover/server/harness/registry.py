@@ -13,7 +13,6 @@ from uuid import uuid4
 
 import duckdb
 
-from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.control_outbox import (
     canonical_payload,
     event_archive_join,
@@ -24,6 +23,7 @@ from drover.server.control_outbox import (
     record_event_side_effects,
     resolve_event_payload_reference,
 )
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.identity import harness_event_identity

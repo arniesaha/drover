@@ -25,16 +25,16 @@ import duckdb
 
 from drover.agent_aliases import canonicalize_sql
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.control_store import (
+    is_postgres_control_store,
+    postgres_control_store,
+)
 from drover.server.db import (
     CONTROL_PLANE_PRIMARY_KEYS,
     CONTROL_PLANE_TABLES,
     control_plane_connection,
     control_plane_path,
     sql_path_literal,
-)
-from drover.server.control_store import (
-    is_postgres_control_store,
-    postgres_control_store,
 )
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.schema import bootstrap_harness_tables
