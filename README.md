@@ -44,6 +44,11 @@ Analytics expands provider-reported quota windows and usage distributions.
 - The **context plane** collects durable agent events and spans into local
   Parquet and DuckDB storage, then derives summaries, project briefs, and
   embeddings for recall.
+- An optional **PostgreSQL control store** separates central fleet serving from
+  analytical work. It is configured explicitly; local DuckDB mode and each
+  host daemon's local spool remain the default. The analytics role exports
+  acknowledged central events into immutable Parquet batches for retention and
+  replay.
 - The **MCP surface** exposes that context to coding agents as `drover_*` tools.
 - An optional **session archive** enriches recall across harnesses. Point
   Drover at a local [Pond](https://github.com/tenequm/pond) HTTP endpoint and
@@ -53,7 +58,8 @@ Analytics expands provider-reported quota windows and usage distributions.
   the enrichment.
 
 See [Architecture](docs/architecture.md) for the component boundaries and
-[Context Store](docs/context-store.md) for the data model.
+[Context Store](docs/context-store.md) for the data model. Operators planning
+an explicit central serving store should read [PostgreSQL control store](docs/postgresql-control-store.md).
 
 ## Quickstart
 
@@ -232,6 +238,7 @@ device signing, and server configuration.
 - [Getting Started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
 - [Context Store](docs/context-store.md)
+- [PostgreSQL Control Store](docs/postgresql-control-store.md)
 - [Integrations](docs/integrations.md)
 - [Multi-Host](docs/multi-host.md)
 - [Security](docs/security.md)

@@ -7,7 +7,9 @@ Drover's context store preserves:
 - **How results were produced** - derivation history and provenance
 
 It uses Parquet for durable telemetry facts and DuckDB for query views plus
-mutable serving state.
+derived state. The default local installation also uses DuckDB for command
+serving state. An explicitly configured central PostgreSQL control store moves
+only that central serving state to PostgreSQL.
 
 ## Design Goals
 
@@ -50,7 +52,7 @@ cross-source relationships without rewriting the fact rows.
 - Spans capture trace-level data with model tokens, costs, and cache info when
   an external OTLP producer is configured
 
-### 2. Operational State
+### 2. Operational State In The Default Local Mode
 
 The command plane keeps mutable state in a **separate DuckDB database**,
 `~/.drover/registry.duckdb`, beside the lakehouse file:
@@ -78,7 +80,40 @@ The separate file gives it its own instance and its own budget.
 The host daemon remains authoritative for live processes. Registry rows describe
 and route those processes; they do not replace host-local process state.
 
-### 3. Derived Context
+### 3. Optional Central PostgreSQL Control Store
+
+PostgreSQL is selected only by the configured central control path. It owns the
+central fleet registry, event metadata and hot payload projections, live recap
+state, server identity, credential verifiers, content-consent state, and the
+durable event-export manifest. A PostgreSQL process does not redirect a
+host-local harness daemon merely because that process inherited a DSN.
+
+The split API role reads central control state but does not open the analytical
+lake. The analytics role owns ingestion, archive resolution, usage and recap
+work, and export. It forwards only allowlisted analytical requests through an
+authenticated loopback boundary. A worker failure leaves fleet requests
+available and reports analytical data as unavailable where necessary.
+
+Central harness events have two storage forms:
+
+| Form | Owner and purpose |
+| --- | --- |
+| PostgreSQL metadata and hot payload | Fast fleet/session serving and durable outbox membership |
+| Immutable `control_outbox_batches` Parquet | Verified archival replay after export and retention |
+| `harness_exported_events` DuckDB relation | Analytics-only view built from the PostgreSQL manifest, never a directory glob |
+
+Retention deletes a hot payload only after its immutable batch is acknowledged,
+usage is complete, terminal recap work is complete, and the archive hash has
+been verified. An unavailable archive stays an explicit unavailable payload
+state. It is not replaced with a preview, an empty object, or a missing-session
+response.
+
+The store's initialization marker is separate from schema bootstrap. A new
+target is unready until an explicit empty initialization or an offline import
+and verification completes. The control-store lifecycle, paired archive backup,
+and forward-recovery boundary are documented in the [PostgreSQL control store guide](postgresql-control-store.md).
+
+### 4. Derived Context
 
 Workers and explicit curation create mutable context records:
 
@@ -112,7 +147,7 @@ derivation inspectable.
 }
 ```
 
-### 4. Pipeline Provenance
+### 5. Pipeline Provenance
 
 The durable pipeline ledger captures derivation history and separates intent from execution:
 

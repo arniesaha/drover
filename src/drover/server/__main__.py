@@ -2863,7 +2863,7 @@ def run(
     no_briefs: bool,
     no_embeddings: bool,
 ) -> None:
-    """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
+    """Run the selected all, API, or analytics role in the foreground."""
     _register_stack_dump()
     cfg = _resolve_config(ctx.obj["config_path"])
     runtime_config_path = (
