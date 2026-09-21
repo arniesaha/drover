@@ -1114,7 +1114,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/auth/login":
             self._handle_login()
             return
-        if self._is_analytics_public_path(path):
+        if self.analytics_boundary is not None and self._is_analytics_public_path(path):
             body = self._read_boundary_body()
             if body is None:
                 return

@@ -17,11 +17,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 from uuid import uuid4
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 PUBLISHED_BATCHES_DIR = "control_outbox_batches"
 EXPORTED_HARNESS_EVENTS_RELATION = "harness_exported_events"
@@ -375,6 +375,8 @@ def _validate_claim_for_publication(con: object, claim: OutboxClaim) -> None:
 
 def _validate_existing_batch(path: Path, expected: pa.Table) -> None:
     """Accept a crash-retry file only when every claimed logical fact agrees."""
+    import pyarrow.parquet as pq
+
     descriptor = _open_regular_file(path)
     os.close(descriptor)
     try:
@@ -496,6 +498,8 @@ def _durably_validate_existing_batch(
 
 def _publish_immutable_batch(table: pa.Table, path: Path) -> str:
     """Return a durable immutable final file, without making an SQL receipt."""
+    import pyarrow.parquet as pq
+
     _ensure_publication_directory(path.parent)
     directory_descriptor = _open_directory(path.parent)
     temporary_path: Path | None = None
@@ -603,6 +607,8 @@ def publish_outbox_batch(
     now: datetime | None = None,
 ) -> PublishedBatch:
     """Publish one claim to a fixed immutable path, then make it visible in SQL."""
+    import pyarrow as pa
+
     if not is_postgres_connection(con):
         raise ValueError("the control outbox requires a PostgreSQL connection")
     _validate_claim_for_publication(con, claim)
@@ -932,6 +938,8 @@ class LocalVerifiedArchiveResolver:
     def resolve(
         self, *, event_id: str, batch_id: str, payload_sha256: str
     ) -> str | None:
+        import pyarrow.parquet as pq
+
         if batch_id not in self._manifest_reader():
             return None
         path = _batch_path(self._parquet_dir, batch_id)
