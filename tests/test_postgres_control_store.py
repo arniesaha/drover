@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -745,3 +745,42 @@ def test_postgres_native_usage_rollup_keeps_known_utc_watermarks_comparable(
             )
     finally:
         close_control_store(analytics_path)
+
+
+def test_postgres_advisory_occurrence_sweep_counts_empty_and_keeps_newest_failing(
+    postgres_control_store,
+):
+    """PostgreSQL sweep uses one aggregate CTE count, not a DELETE cursor."""
+    control_path, _ = postgres_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.watcher import sweep_advisory_occurrences
+
+    # A plain PostgreSQL DELETE has no result set. This is the production
+    # failure path: an empty sweep must return zero rather than raise.
+    assert sweep_advisory_occurrences(control_path, retention_days=7).occurrences == 0
+
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    newest_failing = datetime.now(timezone.utc) - timedelta(days=20)
+    with control_plane_connection(control_path) as con:
+        con.executemany(
+            "INSERT INTO advisory_occurrences "
+            "(occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("pg-superseded", "pg-finding", "old-run", "failing", old, old),
+                (
+                    "pg-newest-failing",
+                    "pg-finding",
+                    "new-run",
+                    "failing",
+                    newest_failing,
+                    newest_failing,
+                ),
+            ],
+        )
+
+    assert sweep_advisory_occurrences(control_path, retention_days=7).occurrences == 1
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT occurrence_id FROM advisory_occurrences ORDER BY occurrence_id"
+        ).fetchall() == [("pg-newest-failing",)]

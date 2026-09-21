@@ -23,6 +23,7 @@ import duckdb
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from drover.server.control_store import is_postgres_control_store
 from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.ingest import ingest_file
 from drover.server.providers.service import compact_closed_snapshot_partitions
@@ -418,21 +419,26 @@ def sweep_advisory_occurrences(
         return OccurrenceSweepResult()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    delete_sql = """
+        DELETE FROM advisory_occurrences o
+        WHERE o.recorded_at < ?
+          AND EXISTS (
+              SELECT 1 FROM advisory_occurrences newer
+               WHERE newer.finding_id = o.finding_id AND newer.outcome = 'failing'
+                 AND (newer.recorded_at > o.recorded_at
+                      OR (newer.recorded_at = o.recorded_at
+                          AND newer.occurrence_id > o.occurrence_id))
+          )
+    """
+    if is_postgres_control_store(duckdb_path):
+        # DuckDB's DELETE returns a count; PostgreSQL's plain DELETE has no
+        # result set. Aggregate in SQL so cleanup never fetches every deleted ID.
+        delete_sql = f"""
+            WITH removed AS ({delete_sql} RETURNING 1)
+            SELECT count(*) FROM removed
+        """
     with control_plane_connection(duckdb_path) as con:
-        removed = con.execute(
-            """
-            DELETE FROM advisory_occurrences o
-            WHERE o.recorded_at < ?
-              AND EXISTS (
-                  SELECT 1 FROM advisory_occurrences newer
-                   WHERE newer.finding_id = o.finding_id AND newer.outcome = 'failing'
-                     AND (newer.recorded_at > o.recorded_at
-                          OR (newer.recorded_at = o.recorded_at
-                              AND newer.occurrence_id > o.occurrence_id))
-              )
-            """,
-            [cutoff],
-        ).fetchone()
+        removed = con.execute(delete_sql, [cutoff]).fetchone()
 
     count = int(removed[0]) if removed and removed[0] is not None else 0
     if count:

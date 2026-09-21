@@ -498,7 +498,10 @@ def _record_http_phase(
             error = "url_error"
         except TimeoutError:
             error = "timeout"
-        except (OSError, ValueError, BenchmarkContractError) as exc:
+        except BenchmarkContractError as exc:
+            # These messages describe fixed synthetic response contracts only.
+            error = str(exc)
+        except (OSError, ValueError) as exc:
             error = type(exc).__name__
         finally:
             with lock:
@@ -509,6 +512,23 @@ def _record_http_phase(
     with ThreadPoolExecutor(max_workers=clients) as pool:
         list(pool.map(request_one, range(attempts)))
     return summarize_phase(name, latencies, errors=errors)
+
+
+def record_checked_http_phase(report: dict[str, Any], name: str, **kwargs: Any) -> None:
+    """Preserve a failed phase and stop before spending time draining its workload."""
+    report["stage"] = name
+    phase = _record_http_phase(name, **kwargs)
+    report["phases"].append(phase)
+    if phase["errors"]:
+        raise BenchmarkContractError(f"HTTP phase {name} recorded errors")
+
+
+def complete_benchmark_sessions(registry: Any, session_ids: list[str]) -> None:
+    """Keep both known sentinels visible within the default completed-session cap."""
+    for session_id in dict.fromkeys(
+        session_ids[1:-1] + [session_ids[0], session_ids[-1]]
+    ):
+        registry.update_session_status(session_id, "completed")
 
 
 def _archive_bytes(parquet_dir: Path) -> int:
@@ -904,6 +924,8 @@ def main() -> int:
                 "retention_limit": 100,
             },
             "real_worker_drain_timeout_seconds": args.drain_timeout_seconds,
+            "fleet_path": "/harness",
+            "completed_session_sentinels": "most recently completed within default archive window",
         },
     }
     try:
@@ -967,16 +989,15 @@ def main() -> int:
         startup_seconds = time.monotonic() - api_started
         report["startup_seconds"] = round(startup_seconds, 3)
         report["stage"] = "startup_http"
-        report["phases"].append(
-            _record_http_phase(
-                "startup",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0]},
-                expected_session_ids={session_ids[0]},
-            )
+        record_checked_http_phase(
+            report,
+            "startup",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0]},
+            expected_session_ids={session_ids[0]},
         )
 
         report["stage"] = "worker_startup"
@@ -1026,16 +1047,15 @@ def main() -> int:
         writer = threading.Thread(target=seed, name="synthetic-benchmark-writer")
         writer.start()
         report["stage"] = "normal_concurrent_ingest"
-        report["phases"].append(
-            _record_http_phase(
-                "normal_concurrent_ingest",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0], host_ids[-1]},
-                expected_session_ids={session_ids[0], session_ids[-1]},
-            )
+        record_checked_http_phase(
+            report,
+            "normal_concurrent_ingest",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0], host_ids[-1]},
+            expected_session_ids={session_ids[0], session_ids[-1]},
         )
         writer.join(timeout=300)
         if writer.is_alive():
@@ -1045,16 +1065,15 @@ def main() -> int:
         report["concurrent_ingest_seconds"] = round(time.monotonic() - seeded_at, 3)
         report["full_scale_committed_events"] = args.events
         report["stage"] = "normal_steady_after_ingest"
-        report["phases"].append(
-            _record_http_phase(
-                "normal_steady_after_ingest",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0], host_ids[-1]},
-                expected_session_ids={session_ids[0], session_ids[-1]},
-            )
+        record_checked_http_phase(
+            report,
+            "normal_steady_after_ingest",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0], host_ids[-1]},
+            expected_session_ids={session_ids[0], session_ids[-1]},
         )
         normal_backlog = _outbox_status_for_path(control_path)
         normal_after = _wait_for_worker_progress(
@@ -1069,9 +1088,6 @@ def main() -> int:
             "acknowledged_delta": normal_after["acknowledged"]
             - normal_backlog["acknowledged"],
         }
-
-        for session_id in session_ids:
-            registry.update_session_status(session_id, "completed")
 
         report["stage"] = "worker_outage"
         _stop_process(worker_process)
@@ -1096,16 +1112,15 @@ def main() -> int:
                 "worker-outage synthetic ingest did not commit"
             )
         outage_event_ids = [str(record["event_id"]) for record in outage_records]
-        report["phases"].append(
-            _record_http_phase(
-                "worker_outage",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0], host_ids[-1]},
-                expected_session_ids={session_ids[0], session_ids[-1]},
-            )
+        record_checked_http_phase(
+            report,
+            "worker_outage",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0], host_ids[-1]},
+            expected_session_ids={session_ids[0], session_ids[-1]},
         )
         outage_status, outage_payload = _request_json(
             api_port, "/metrics", token=api_token
@@ -1143,16 +1158,15 @@ def main() -> int:
             token=api_token,
             headers={"X-Drover-Api-To-Analytics": api_to_worker_token},
         )
-        report["phases"].append(
-            _record_http_phase(
-                "worker_recovery",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0], host_ids[-1]},
-                expected_session_ids={session_ids[0], session_ids[-1]},
-            )
+        record_checked_http_phase(
+            report,
+            "worker_recovery",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0], host_ids[-1]},
+            expected_session_ids={session_ids[0], session_ids[-1]},
         )
         recovery_after = _wait_for_worker_progress(
             process=worker_process,
@@ -1169,16 +1183,15 @@ def main() -> int:
 
         # The configured default-role exporter remains the only drain. Its
         # bounded deadline and settings are reported with the actual progress.
-        report["phases"].append(
-            _record_http_phase(
-                "worker_export",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0], host_ids[-1]},
-                expected_session_ids={session_ids[0], session_ids[-1]},
-            )
+        record_checked_http_phase(
+            report,
+            "worker_export",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0], host_ids[-1]},
+            expected_session_ids={session_ids[0], session_ids[-1]},
         )
         report["stage"] = "worker_export_drain"
         export_drain_started = time.monotonic()
@@ -1195,8 +1208,7 @@ def main() -> int:
             "outage_added_events_committed": outage_committed,
             "outage_added_events_acknowledged": len(outage_event_ids),
         }
-        for session_id in session_ids:
-            registry.update_session_status(session_id, "completed")
+        complete_benchmark_sessions(registry, session_ids)
         report["stage"] = "usage_validation"
         usage_wait_seconds = _wait_for_exact_usage_watermarks(
             control_path=control_path, session_ids=session_ids
@@ -1206,16 +1218,15 @@ def main() -> int:
             raise BenchmarkContractError(
                 "synthetic terminal sessions lacked recap dependencies"
             )
-        report["phases"].append(
-            _record_http_phase(
-                "retention",
-                port=api_port,
-                token=api_token,
-                attempts=args.phase_requests,
-                clients=args.clients,
-                expected_host_ids={host_ids[0], host_ids[-1]},
-                expected_session_ids={session_ids[0], session_ids[-1]},
-            )
+        record_checked_http_phase(
+            report,
+            "retention",
+            port=api_port,
+            token=api_token,
+            attempts=args.phase_requests,
+            clients=args.clients,
+            expected_host_ids={host_ids[0], host_ids[-1]},
+            expected_session_ids={session_ids[0], session_ids[-1]},
         )
         report["stage"] = "retention"
         retention_started = time.monotonic()

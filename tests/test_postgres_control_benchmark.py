@@ -331,3 +331,37 @@ def test_usage_validator_accepts_sessions_already_current_in_postgres(
         BENCHMARK._missing_exact_usage_sessions(control_path, ["benchmark-session-000"])
         == []
     )
+
+
+def test_completed_benchmark_sentinels_remain_in_default_archive_window(
+    benchmark_postgres_control_store,
+):
+    from drover.server.harness.registry import HarnessRegistry
+
+    control_path, _, _ = benchmark_postgres_control_store
+    registry = HarnessRegistry(control_path)
+    registry.register_host(host_id="fixture-host", display_name="Fixture", kind="test")
+    sessions = [f"fixture-session-{index:03d}" for index in range(25)]
+    for session_id in sessions:
+        registry.create_session(
+            host_id="fixture-host",
+            harness="codex",
+            command="synthetic",
+            session_id=session_id,
+        )
+    BENCHMARK.complete_benchmark_sessions(registry, sessions)
+    visible = {
+        session.session_id for session in registry.list_sessions(archived_limit=20)
+    }
+    assert {sessions[0], sessions[-1]} <= visible
+    assert len(visible) == 20
+    assert all(session.status == "completed" for session in registry.list_sessions())
+
+
+def test_invalid_http_phase_stops_before_background_drain(monkeypatch):
+    failed = BENCHMARK.summarize_phase("outage", [0.001] * 100, errors=["identity"])
+    monkeypatch.setattr(BENCHMARK, "_record_http_phase", lambda *args, **kwargs: failed)
+    report = {"phases": [], "stage": "outage"}
+    with pytest.raises(BENCHMARK.BenchmarkContractError, match="outage.*errors"):
+        BENCHMARK.record_checked_http_phase(report, "outage")
+    assert report["phases"] == [failed]
