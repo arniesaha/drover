@@ -125,8 +125,13 @@ check_equal "transport failure waits two seconds after every attempt" \
 REMOTE="$WORK/remote"
 FAKE_BIN="$REMOTE/bin"
 HOME_DIR="$REMOTE/home"
-mkdir -p "$FAKE_BIN" "$HOME_DIR"
+mkdir -p "$FAKE_BIN" "$HOME_DIR/.drover"
 /bin/cp "$REPO/install.sh" "$REMOTE/install.sh"
+
+# This fixture verifies installation health probing. Give it the existing
+# DuckDB-compatible control-store configuration so PostgreSQL provisioning is
+# intentionally outside this test's scope.
+printf '%s\n' '[control_store]' 'backend = "duckdb"' > "$HOME_DIR/.drover/config.toml"
 
 WHEEL_CONTENT='test wheel'
 LOCK_CONTENT='test lock'
@@ -172,7 +177,7 @@ printf '%s\n' \
   'set -eu' \
   'case "$1" in' \
   '  venv)' \
-  '    target="$2"' \
+  '    if [ "${2:-}" = "--relocatable" ]; then target="$3"; else target="$2"; fi' \
   '    mkdir -p "$target/bin"' \
   '    /bin/cp "$(dirname "$0")/python" "$target/bin/python"' \
   '    /bin/cp "$(dirname "$0")/drover-server" "$target/bin/drover-server"' \
@@ -188,6 +193,8 @@ printf '%s\n' \
   'set -eu' \
   'if [ "$1" != "-" ]; then exit 1; fi' \
   'shift' \
+  'if [ "$#" -eq 0 ]; then exit 0; fi' \
+  'if [ "$#" -eq 1 ]; then printf "duckdb\\tDROVER_CONTROL_DSN\\n"; exit 0; fi' \
   'if [ "$1" = "darwin" ] || [ "$1" = "linux" ]; then' \
   '  os="$1"; home="$2"' \
   '  if [ "$os" = "darwin" ]; then' \
@@ -206,6 +213,7 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'case "${1:-}" in' \
   '  --version) printf "0.0.0\n" ;;' \
+  '  control-store) [ "${2:-}" = "init" ] && [ "${3:-}" = "--help" ] && exit 0; exit 1 ;;' \
   '  *) exit 0 ;;' \
   'esac' > "$FAKE_BIN/drover-server"
 chmod +x "$FAKE_BIN/drover-server"
