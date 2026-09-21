@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,23 @@ from uuid import uuid4
 
 import duckdb
 
+from drover.server.control_outbox import (
+    canonical_payload,
+    event_archive_join,
+    event_payload_expression,
+    event_payload_join,
+    event_payload_reference,
+    is_postgres_connection,
+    record_event_side_effects,
+    resolve_event_payload_reference,
+)
 from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.model_catalog import CatalogEnvelope
 from drover.server.harness.models import (
+    EventPayloadStatus,
     HarnessEvent,
     HarnessEventPage,
     HarnessHost,
@@ -43,6 +55,21 @@ ARCHIVED_SESSION_STATUSES: tuple[str, ...] = (
     "errored",
     "failed",
 )
+
+
+def _is_unique_constraint_violation(exc: BaseException) -> bool:
+    """Recognize only the backends' specific uniqueness exceptions.
+
+    The client-session idempotency path retries a duplicate-key winner.  It
+    must not turn arbitrary PostgreSQL errors into a successful lookup.
+    """
+    if isinstance(exc, duckdb.ConstraintException):
+        return True
+    try:
+        from psycopg.errors import UniqueViolation
+    except ImportError:  # Legacy DuckDB installations do not need psycopg.
+        return False
+    return isinstance(exc, UniqueViolation)
 
 
 def _as_utc_datetime(value: Any) -> datetime | None:
@@ -243,17 +270,24 @@ def _enqueue_recap_if_completion(
     return enqueue_live_recap(con, session_id, seq)
 
 
-def _enqueue_latest_stored_completion(
-    con: duckdb.DuckDBPyConnection, session_id: str
-) -> bool:
+def _enqueue_latest_stored_completion(con: object, session_id: str) -> bool:
     """Recover the newest completion that arrived before session metadata."""
-    rows = con.execute(
-        """SELECT payload_json, seq
-             FROM harness_events
-            WHERE session_id = ? AND event_type = 'status' AND seq IS NOT NULL
-            ORDER BY seq DESC, created_at DESC""",
-        [session_id],
-    ).fetchall()
+    if is_postgres_connection(con):
+        rows = con.execute(
+            f"""SELECT {event_payload_expression(con)} AS payload_json, e.seq
+                 FROM harness_events e {event_payload_join(con)}
+                WHERE e.session_id = ? AND e.event_type = 'status' AND e.seq IS NOT NULL
+                ORDER BY e.seq DESC, e.created_at DESC""",
+            [session_id],
+        ).fetchall()
+    else:
+        rows = con.execute(
+            """SELECT payload_json, seq
+                 FROM harness_events
+                WHERE session_id = ? AND event_type = 'status' AND seq IS NOT NULL
+                ORDER BY seq DESC, created_at DESC""",
+            [session_id],
+        ).fetchall()
     for payload_json, seq in rows:
         try:
             payload = json.loads(payload_json)
@@ -277,6 +311,24 @@ def _rows(
     result = con.execute(query, params)
     cols = [desc[0] for desc in result.description]
     return [dict(zip(cols, row)) for row in result.fetchall()]
+
+
+def _event_select_columns(con: object, alias: str = "e") -> str:
+    """Select an event with its PostgreSQL side payload attached last."""
+    columns = f"{alias}.*, {event_payload_expression(con, alias)} AS payload_json"
+    if is_postgres_connection(con):
+        columns += f""",
+        CASE
+          WHEN p.event_id IS NOT NULL OR {alias}.payload_json IS NOT NULL THEN 'hot'
+          WHEN a.event_id IS NOT NULL THEN 'archive'
+          ELSE 'unavailable'
+        END AS payload_state,
+        CASE WHEN a.event_id IS NOT NULL THEN 'archive_resolver_required' END AS payload_reason"""
+    return columns
+
+
+def _event_read_join(con: object, alias: str = "e") -> str:
+    return f"{event_payload_join(con, alias)} {event_archive_join(con, alias)}"
 
 
 class HarnessRegistry:
@@ -542,19 +594,23 @@ class HarnessRegistry:
                     ],
                 )
                 con.execute("COMMIT")
-            except duckdb.ConstraintException:
+            except Exception as exc:
                 # Another caller got there between the lookup above and this
                 # insert. That is the case the index exists for: re-read and
                 # hand back their session rather than failing a request that
                 # asked for exactly this.
                 con.execute("ROLLBACK")
-                if client_session_id:
-                    existing = self.session_by_client_id(client_session_id)
-                    if existing is not None:
-                        return existing
-                raise
-            except Exception:
-                con.execute("ROLLBACK")
+                if not _is_unique_constraint_violation(exc) or not client_session_id:
+                    raise
+                # Reuse the just-rolled-back connection. Opening a second
+                # pool session here can deadlock an already-full small pool.
+                rows = _rows(
+                    con,
+                    "SELECT * FROM harness_sessions WHERE client_session_id = ?",
+                    [client_session_id],
+                )
+                if rows:
+                    return HarnessSession.from_row(rows[0])
                 raise
             con.execute("BEGIN TRANSACTION")
             try:
@@ -590,11 +646,22 @@ class HarnessRegistry:
         if not dedup_key:
             return None
         with self._connect() as con:
-            rows = _rows(
-                con,
-                "SELECT * FROM harness_events WHERE dedup_key = ?",
-                [dedup_key],
-            )
+            if is_postgres_connection(con):
+                rows = _rows(
+                    con,
+                    f"""
+                    SELECT {_event_select_columns(con)}
+                      FROM harness_events e {_event_read_join(con)}
+                     WHERE e.dedup_key = ?
+                    """,
+                    [dedup_key],
+                )
+            else:
+                rows = _rows(
+                    con,
+                    "SELECT * FROM harness_events WHERE dedup_key = ?",
+                    [dedup_key],
+                )
         return HarnessEvent.from_row(rows[0]) if rows else None
 
     def get_session(self, session_id: str) -> HarnessSession | None:
@@ -822,7 +889,7 @@ class HarnessRegistry:
         """
         rows = con.execute(
             """
-            SELECT content_preview, payload_json, event_type
+            SELECT content_preview, event_type
               FROM harness_events
              WHERE session_id = ?
                AND event_type = 'assistant_output'
@@ -831,7 +898,7 @@ class HarnessRegistry:
             """,
             [session_id, _SESSION_PREVIEW_CANDIDATE_LIMIT],
         ).fetchall()
-        for content_preview, payload_json, event_type in rows:
+        for content_preview, event_type in rows:
             candidate = str(content_preview or "").strip()
             if not candidate or candidate == str(event_type or ""):
                 continue
@@ -910,6 +977,7 @@ class HarnessRegistry:
             created_at=created_at,
             payload=payload,
         )
+        payload_json = canonical_payload(payload)
         with self._connect() as con:
             con.execute("BEGIN TRANSACTION")
             try:
@@ -944,7 +1012,7 @@ class HarnessRegistry:
                             normalized["normalized_type"],
                             normalized["normalized_source"],
                             normalized["content_preview"],
-                            _json_dumps(payload),
+                            None if is_postgres_connection(con) else payload_json,
                             created_at,
                             seq,
                             dedup_key,
@@ -953,6 +1021,16 @@ class HarnessRegistry:
                     is not None
                 )
                 if inserted:
+                    record_event_side_effects(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        content_preview=normalized["content_preview"],
+                        payload_json=payload_json,
+                        created_at=created_at,
+                        seq=seq,
+                    )
                     # Only for a genuinely new event: a re-delivered
                     # completion must not enqueue a second recap for work
                     # that was already summarised.
@@ -1012,7 +1090,9 @@ class HarnessRegistry:
                 ).fetchall()
             }
             params = []
-            inserted_records: list[tuple[dict[str, Any], int | None]] = []
+            inserted_records: list[
+                tuple[dict[str, Any], int | None, dict[str, Any], datetime, str]
+            ] = []
             for event_id, record in unique.items():
                 if event_id in existing:
                     continue
@@ -1028,6 +1108,7 @@ class HarnessRegistry:
                 if not isinstance(seq, int) or isinstance(seq, bool):
                     seq = None
                 created_at = _as_utc_datetime(record.get("created_at")) or _now()
+                payload_json = canonical_payload(record.get("payload"))
                 params.append(
                     [
                         event_id,
@@ -1036,7 +1117,7 @@ class HarnessRegistry:
                         normalized["normalized_type"],
                         normalized["normalized_source"],
                         normalized["content_preview"],
-                        _json_dumps(record.get("payload")),
+                        None if is_postgres_connection(con) else payload_json,
                         created_at,
                         seq,
                         harness_event_identity(
@@ -1048,7 +1129,9 @@ class HarnessRegistry:
                         ),
                     ]
                 )
-                inserted_records.append((record, seq))
+                inserted_records.append(
+                    (record, seq, normalized, created_at, payload_json)
+                )
             if not params:
                 return 0
             con.execute("BEGIN TRANSACTION")
@@ -1057,18 +1140,62 @@ class HarnessRegistry:
                 # into `existing` narrows the batch, but it is still a
                 # check-then-act, and two batches carrying the same
                 # re-delivered event both pass it.
-                con.executemany(
-                    """
+                insert_sql = """
                     INSERT INTO harness_events (
                       event_id, session_id, event_type, normalized_type,
                       normalized_source, content_preview, payload_json, created_at, seq, dedup_key
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT DO NOTHING
-                    """,
-                    params,
-                )
-                for record, seq in inserted_records:
+                """
+                if is_postgres_connection(con):
+                    # PostgreSQL must use the result of *our* inserts. A
+                    # post-insert SELECT could mistake a concurrent winner
+                    # for this writer and attach this delivery's payload or
+                    # recap intent to another immutable event.
+                    inserted_ids = {
+                        str(row[0])
+                        for values in params
+                        if (
+                            row := con.execute(
+                                insert_sql + " RETURNING event_id", values
+                            ).fetchone()
+                        )
+                        is not None
+                    }
+                else:
+                    con.executemany(insert_sql, params)
+                    inserted_ids = {
+                        str(row[0])
+                        for row in con.execute(
+                            "SELECT event_id FROM harness_events WHERE event_id IN ("
+                            + ", ".join("?" for _ in inserted_records)
+                            + ")",
+                            [
+                                str(record["event_id"])
+                                for record, *_ in inserted_records
+                            ],
+                        ).fetchall()
+                    }
+                for (
+                    record,
+                    seq,
+                    normalized,
+                    created_at,
+                    payload_json,
+                ) in inserted_records:
+                    if str(record["event_id"]) not in inserted_ids:
+                        continue
+                    record_event_side_effects(
+                        con,
+                        event_id=str(record["event_id"]),
+                        session_id=str(record["session_id"]),
+                        event_type=str(record["event_type"]),
+                        content_preview=normalized["content_preview"],
+                        payload_json=payload_json,
+                        created_at=created_at,
+                        seq=seq,
+                    )
                     _enqueue_recap_if_completion(
                         con,
                         session_id=record["session_id"],
@@ -1080,7 +1207,7 @@ class HarnessRegistry:
             except Exception:
                 con.execute("ROLLBACK")
                 raise
-        return len(params)
+        return len(inserted_ids)
 
     def ingest_structured_events(self, records: list[dict[str, Any]]) -> int:
         """Atomically insert remote structured events and project session state.
@@ -1159,6 +1286,7 @@ class HarnessRegistry:
                     if not isinstance(seq, int) or isinstance(seq, bool):
                         seq = None
                     created_at = _as_utc_datetime(record.get("created_at")) or _now()
+                    payload_json = canonical_payload(payload)
                     normalized = normalize_harness_event(
                         event_type=event_type,
                         payload=payload,
@@ -1182,7 +1310,7 @@ class HarnessRegistry:
                             normalized["normalized_type"],
                             normalized["normalized_source"],
                             normalized["content_preview"],
-                            _json_dumps(payload),
+                            None if is_postgres_connection(con) else payload_json,
                             created_at,
                             seq,
                             harness_event_identity(
@@ -1196,6 +1324,16 @@ class HarnessRegistry:
                     ).fetchone()
                     if inserted is None:
                         continue
+                    record_event_side_effects(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        content_preview=normalized["content_preview"],
+                        payload_json=payload_json,
+                        created_at=created_at,
+                        seq=seq,
+                    )
                     _enqueue_recap_if_completion(
                         con,
                         session_id=session_id,
@@ -1224,14 +1362,28 @@ class HarnessRegistry:
                         for event in inserted_events
                     )
                     if rebuild:
-                        raw_projection_events = _rows(
-                            con,
-                            "SELECT event_id, event_type, payload_json, "
-                            "created_at, seq FROM harness_events "
-                            "WHERE session_id = ? AND seq IS NOT NULL AND seq > 0 "
-                            "ORDER BY seq, created_at, event_id",
-                            [session_id],
-                        )
+                        if is_postgres_connection(con):
+                            raw_projection_events = _rows(
+                                con,
+                                f"""
+                                SELECT e.event_id, e.event_type,
+                                       {event_payload_expression(con)} AS payload_json,
+                                       e.created_at, e.seq
+                                  FROM harness_events e {event_payload_join(con)}
+                                 WHERE e.session_id = ? AND e.seq IS NOT NULL AND e.seq > 0
+                                 ORDER BY e.seq, e.created_at, e.event_id
+                                """,
+                                [session_id],
+                            )
+                        else:
+                            raw_projection_events = _rows(
+                                con,
+                                "SELECT event_id, event_type, payload_json, "
+                                "created_at, seq FROM harness_events "
+                                "WHERE session_id = ? AND seq IS NOT NULL AND seq > 0 "
+                                "ORDER BY seq, created_at, event_id",
+                                [session_id],
+                            )
                         projection_events = [
                             {
                                 **event,
@@ -1355,15 +1507,31 @@ class HarnessRegistry:
             ).fetchone()
         return int(row[0] or 0)
 
-    def list_events_after(self, session_id: str, after_seq: int) -> list[HarnessEvent]:
+    def list_events_after(
+        self, session_id: str, after_seq: int, *, resolver: Any | None = None
+    ) -> list[HarnessEvent]:
         with self._connect() as con:
-            rows = _rows(
-                con,
-                "SELECT * FROM harness_events WHERE session_id = ? "
-                "AND seq IS NOT NULL AND seq > ? ORDER BY seq",
-                [session_id, after_seq],
-            )
-        return [HarnessEvent.from_row(row) for row in rows]
+            if is_postgres_connection(con):
+                rows = _rows(
+                    con,
+                    f"""
+                    SELECT {_event_select_columns(con)}
+                      FROM harness_events e {_event_read_join(con)}
+                     WHERE e.session_id = ? AND e.seq IS NOT NULL AND e.seq > ?
+                     ORDER BY e.seq
+                    """,
+                    [session_id, after_seq],
+                )
+            else:
+                rows = _rows(
+                    con,
+                    "SELECT * FROM harness_events WHERE session_id = ? "
+                    "AND seq IS NOT NULL AND seq > ? ORDER BY seq",
+                    [session_id, after_seq],
+                )
+        return self._restore_archived_payloads(
+            [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+        )
 
     def list_event_page(
         self,
@@ -1373,6 +1541,7 @@ class HarnessRegistry:
         before_seq: int | None = None,
         through_seq: int | None = None,
         limit: int | None = None,
+        resolver: Any | None = None,
     ) -> HarnessEventPage:
         page_limit = limit or 200
         with self._connect() as con:
@@ -1387,32 +1556,61 @@ class HarnessRegistry:
                 max_seq = through_seq
 
             if after_seq is not None:
-                rows = _rows(
-                    con,
-                    "SELECT * FROM harness_events WHERE session_id = ? "
-                    "AND seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?",
-                    [session_id, after_seq, max_seq, page_limit + 1],
-                )
+                if is_postgres_connection(con):
+                    rows = _rows(
+                        con,
+                        f"""
+                        SELECT {_event_select_columns(con)}
+                          FROM harness_events e {_event_read_join(con)}
+                         WHERE e.session_id = ? AND e.seq > ? AND e.seq <= ?
+                         ORDER BY e.seq ASC LIMIT ?
+                        """,
+                        [session_id, after_seq, max_seq, page_limit + 1],
+                    )
+                else:
+                    rows = _rows(
+                        con,
+                        "SELECT * FROM harness_events WHERE session_id = ? "
+                        "AND seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?",
+                        [session_id, after_seq, max_seq, page_limit + 1],
+                    )
                 has_newer = len(rows) > page_limit
                 rows = rows[:page_limit]
                 has_older = after_seq > 0
             else:
                 upper_bound = before_seq if before_seq is not None else max_seq + 1
-                rows = _rows(
-                    con,
-                    "SELECT * FROM ("
-                    "SELECT * FROM harness_events WHERE session_id = ? "
-                    "AND seq IS NOT NULL AND seq > 0 AND seq < ? "
-                    "ORDER BY seq DESC LIMIT ?"
-                    ") page ORDER BY seq ASC",
-                    [session_id, upper_bound, page_limit + 1],
-                )
+                if is_postgres_connection(con):
+                    rows = _rows(
+                        con,
+                        f"""
+                        SELECT * FROM (
+                          SELECT {_event_select_columns(con)}
+                            FROM harness_events e {_event_read_join(con)}
+                           WHERE e.session_id = ? AND e.seq IS NOT NULL
+                             AND e.seq > 0 AND e.seq < ?
+                           ORDER BY e.seq DESC LIMIT ?
+                        ) page ORDER BY seq ASC
+                        """,
+                        [session_id, upper_bound, page_limit + 1],
+                    )
+                else:
+                    rows = _rows(
+                        con,
+                        "SELECT * FROM ("
+                        "SELECT * FROM harness_events WHERE session_id = ? "
+                        "AND seq IS NOT NULL AND seq > 0 AND seq < ? "
+                        "ORDER BY seq DESC LIMIT ?"
+                        ") page ORDER BY seq ASC",
+                        [session_id, upper_bound, page_limit + 1],
+                    )
                 has_older = len(rows) > page_limit
                 if has_older:
                     rows = rows[1:]
                 has_newer = before_seq is not None and before_seq <= max_seq
 
-        events = [HarnessEvent.from_row(row) for row in rows]
+        events = self._restore_archived_payloads(
+            [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+        )
         sequences = [event.seq for event in events if event.seq is not None]
         return HarnessEventPage(
             events=events,
@@ -1423,29 +1621,125 @@ class HarnessRegistry:
             has_newer=has_newer,
         )
 
-    def get_event(self, event_id: str) -> HarnessEvent | None:
+    def get_event(
+        self, event_id: str, *, resolver: Any | None = None
+    ) -> HarnessEvent | None:
         with self._connect() as con:
-            rows = _rows(
-                con,
-                "SELECT * FROM harness_events WHERE event_id = ?",
-                [event_id],
-            )
-        return HarnessEvent.from_row(rows[0]) if rows else None
-
-    def list_events(self, session_id: str) -> list[HarnessEvent]:
-        with self._connect() as con:
-            return [
-                HarnessEvent.from_row(row)
-                for row in _rows(
+            if is_postgres_connection(con):
+                rows = _rows(
                     con,
-                    """
-                    SELECT * FROM harness_events
-                    WHERE session_id = ?
-                    ORDER BY created_at, event_id
+                    f"""
+                    SELECT {_event_select_columns(con)}
+                      FROM harness_events e {_event_read_join(con)}
+                     WHERE e.event_id = ?
                     """,
-                    [session_id],
+                    [event_id],
                 )
-            ]
+            else:
+                rows = _rows(
+                    con,
+                    "SELECT * FROM harness_events WHERE event_id = ?",
+                    [event_id],
+                )
+        events = self._restore_archived_payloads(
+            [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+        )
+        return events[0] if events else None
+
+    def lookup_event_payload(
+        self, event_id: str, *, resolver: Any | None = None
+    ) -> Any:
+        """Return hot payload bytes or delegate retained history to ``resolver``.
+
+        API-only processes pass their bounded worker RPC resolver here.  The
+        registry itself never opens a lake path, keeping cold replay optional
+        and explicit when the worker is unavailable.
+        """
+        # The reference query is short and releases its bounded PG connection
+        # before the injected resolver can make a worker RPC.  A worker outage
+        # therefore cannot consume API pool slots while cold reads wait.
+        with self._connect() as con:
+            reference = event_payload_reference(con, event_id)
+        return resolve_event_payload_reference(
+            reference, event_id=event_id, resolver=resolver
+        )
+
+    def _restore_archived_payloads(
+        self, events: list[HarnessEvent], *, resolver: Any | None
+    ) -> list[HarnessEvent]:
+        """Hydrate a cold event only when the caller supplied a worker resolver.
+
+        A normal hot read remains one narrow PostgreSQL query.  API-only
+        callers that need cold history opt in with the worker RPC resolver;
+        this registry never turns that option into a direct Parquet read.
+        """
+        hydrated: list[HarnessEvent] = []
+        for event in events:
+            if event.payload_status.state == "hot":
+                hydrated.append(event)
+                continue
+            if event.payload_status.state == "unavailable":
+                hydrated.append(event)
+                continue
+            lookup = self.lookup_event_payload(event.event_id, resolver=resolver)
+            if lookup.state == "archive" and lookup.payload_json is not None:
+                try:
+                    payload = json.loads(lookup.payload_json)
+                except (TypeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict):
+                    hydrated.append(
+                        replace(
+                            event,
+                            payload=payload,
+                            payload_status=EventPayloadStatus("archive"),
+                        )
+                    )
+                    continue
+                reason = "archive_payload_invalid"
+            else:
+                reason = lookup.reason or "archive_verification_failed"
+            hydrated.append(
+                replace(
+                    event,
+                    payload={},
+                    payload_status=EventPayloadStatus("unavailable", reason),
+                )
+            )
+        return hydrated
+
+    def list_events(
+        self, session_id: str, *, resolver: Any | None = None
+    ) -> list[HarnessEvent]:
+        with self._connect() as con:
+            if is_postgres_connection(con):
+                events = [
+                    HarnessEvent.from_row(row)
+                    for row in _rows(
+                        con,
+                        f"""
+                        SELECT {_event_select_columns(con)}
+                          FROM harness_events e {_event_read_join(con)}
+                         WHERE e.session_id = ?
+                         ORDER BY e.created_at, e.event_id
+                        """,
+                        [session_id],
+                    )
+                ]
+            else:
+                events = [
+                    HarnessEvent.from_row(row)
+                    for row in _rows(
+                        con,
+                        """
+                        SELECT * FROM harness_events
+                        WHERE session_id = ?
+                        ORDER BY created_at, event_id
+                        """,
+                        [session_id],
+                    )
+                ]
+        return self._restore_archived_payloads(events, resolver=resolver)
 
     def recent_user_input_turn_ids(self, session_id: str, *, limit: int) -> list[str]:
         """Return a bounded oldest-to-newest window of durable user turn IDs.
@@ -1457,19 +1751,34 @@ class HarnessRegistry:
         if limit <= 0:
             return []
         with self._connect() as con:
-            rows = _rows(
-                con,
-                """
-                SELECT payload_json FROM (
-                  SELECT payload_json
-                  FROM harness_events
-                  WHERE session_id = ? AND event_type = 'user_input'
-                  ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
-                  LIMIT ?
-                ) recent
-                """,
-                [session_id, limit],
-            )
+            if is_postgres_connection(con):
+                rows = _rows(
+                    con,
+                    f"""
+                    SELECT payload_json FROM (
+                      SELECT {event_payload_expression(con)} AS payload_json
+                        FROM harness_events e {event_payload_join(con)}
+                       WHERE e.session_id = ? AND e.event_type = 'user_input'
+                       ORDER BY COALESCE(e.seq, 0) DESC, e.created_at DESC, e.event_id DESC
+                       LIMIT ?
+                    ) recent
+                    """,
+                    [session_id, limit],
+                )
+            else:
+                rows = _rows(
+                    con,
+                    """
+                    SELECT payload_json FROM (
+                      SELECT payload_json
+                      FROM harness_events
+                      WHERE session_id = ? AND event_type = 'user_input'
+                      ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
+                      LIMIT ?
+                    ) recent
+                    """,
+                    [session_id, limit],
+                )
         turn_ids: list[str] = []
         # Preserve chronological insertion order for the LRU cache.
         for row in reversed(rows):
@@ -1499,6 +1808,46 @@ class HarnessRegistry:
             return {}
         placeholders = ", ".join("?" for _ in session_ids)
         with self._connect() as con:
+            if is_postgres_connection(con):
+                # PostgreSQL keeps this serving projection current with the
+                # event transaction.  Fleet polling therefore stays bounded
+                # as history grows and never opens the payload relation unless
+                # the projection itself carries no usable text.
+                rows = _rows(
+                    con,
+                    f"""
+                    SELECT session_id, event_id, event_type, content_preview
+                      FROM harness_session_previews
+                     WHERE session_id IN ({placeholders})
+                     ORDER BY session_id
+                    """,
+                    session_ids,
+                )
+                previews: dict[str, str] = {}
+                pending: list[dict[str, Any]] = []
+                for row in rows:
+                    stored = str(row.get("content_preview") or "").strip()
+                    preview = HarnessRegistry._safe_session_preview(stored)
+                    if preview:
+                        previews[str(row["session_id"])] = preview
+                    else:
+                        pending.append(row)
+                payloads = self._event_payloads(
+                    con, [str(row.get("event_id") or "") for row in pending]
+                )
+                for row in pending:
+                    session_id = str(row.get("session_id") or "")
+                    preview = self._session_event_preview(
+                        {
+                            **row,
+                            "payload_json": payloads.get(
+                                str(row.get("event_id") or "")
+                            ),
+                        }
+                    )
+                    if session_id and preview:
+                        previews[session_id] = preview
+                return previews
             rows = _rows(
                 con,
                 f"""
@@ -1573,12 +1922,23 @@ class HarnessRegistry:
         if not event_ids:
             return {}
         placeholders = ", ".join("?" for _ in event_ids)
-        rows = _rows(
-            con,
-            f"SELECT event_id, payload_json FROM harness_events "
-            f"WHERE event_id IN ({placeholders})",
-            list(event_ids),
-        )
+        if is_postgres_connection(con):
+            rows = _rows(
+                con,
+                f"""
+                SELECT e.event_id, {event_payload_expression(con)} AS payload_json
+                  FROM harness_events e {event_payload_join(con)}
+                 WHERE e.event_id IN ({placeholders})
+                """,
+                list(event_ids),
+            )
+        else:
+            rows = _rows(
+                con,
+                f"SELECT event_id, payload_json FROM harness_events "
+                f"WHERE event_id IN ({placeholders})",
+                list(event_ids),
+            )
         return {
             str(row.get("event_id") or ""): str(row.get("payload_json") or "")
             for row in rows
@@ -1641,18 +2001,32 @@ class HarnessRegistry:
         Returns "" when the session has no content-bearing events.
         """
         with self._connect() as con:
-            rows = _rows(
-                con,
-                """
-                SELECT event_type, payload_json
-                FROM harness_events
-                WHERE session_id = ? AND event_type IN
-                      ('user_input', 'assistant_output', 'tool_action',
-                       'tool_result', 'terminal.output')
-                ORDER BY COALESCE(seq, 0), created_at, event_id
-                """,
-                [session_id],
-            )
+            if is_postgres_connection(con):
+                rows = _rows(
+                    con,
+                    f"""
+                    SELECT e.event_type, {event_payload_expression(con)} AS payload_json
+                      FROM harness_events e {event_payload_join(con)}
+                     WHERE e.session_id = ? AND e.event_type IN
+                           ('user_input', 'assistant_output', 'tool_action',
+                            'tool_result', 'terminal.output')
+                     ORDER BY COALESCE(e.seq, 0), e.created_at, e.event_id
+                    """,
+                    [session_id],
+                )
+            else:
+                rows = _rows(
+                    con,
+                    """
+                    SELECT event_type, payload_json
+                    FROM harness_events
+                    WHERE session_id = ? AND event_type IN
+                          ('user_input', 'assistant_output', 'tool_action',
+                           'tool_result', 'terminal.output')
+                    ORDER BY COALESCE(seq, 0), created_at, event_id
+                    """,
+                    [session_id],
+                )
         lines: list[str] = []
         for row in rows[-limit:]:
             try:
@@ -1684,11 +2058,13 @@ class HarnessRegistry:
         cursor_event_id = after_event_id or ""
         after_created_at = _as_db_timestamp(after_created_at)
         with self._connect() as con:
+            event_columns = _event_select_columns(con)
+            payload_join = _event_read_join(con)
             rows = _rows(
                 con,
-                """
-                SELECT e.*
-                FROM harness_events e
+                f"""
+                SELECT {event_columns}
+                FROM harness_events e {payload_join}
                 LEFT JOIN harness_sessions s ON e.session_id = s.session_id
                 WHERE (
                     e.normalized_source = 'structured'

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 from click.testing import CliRunner
 
@@ -92,7 +93,7 @@ def _pair_cli(monkeypatch, cfg):
     """
     import drover.server.__main__ as server_main
 
-    monkeypatch.setattr(server_main, "_resolve_config", lambda path: cfg)
+    monkeypatch.setattr(server_main, "_resolve_config", lambda path, **_kwargs: cfg)
     monkeypatch.setattr(
         server_main,
         "_local_api_request",
@@ -233,3 +234,12 @@ def test_unreachable_hub_is_a_clear_error(monkeypatch):
     result = CliRunner().invoke(main, ["pair"])
     assert result.exit_code != 0
     assert "is it running?" in result.output
+
+
+def test_pair_rejects_an_explicit_missing_config(tmp_path: Path):
+    result = CliRunner().invoke(
+        main, ["--config", str(tmp_path / "missing.toml"), "pair"]
+    )
+
+    assert result.exit_code != 0
+    assert "config does not exist" in result.output

@@ -55,7 +55,7 @@ enum ServerSetupMode: String, CaseIterable, Identifiable, Sendable {
     var guidanceText: String {
         switch self {
         case .hub:
-            return "Run the command in your terminal on your machine. When it finishes, it will print a pairing QR code."
+            return "Before running this on the primary hub, provision PostgreSQL and export DROVER_CONTROL_DSN in that terminal. The installer validates and initializes the empty control store, then prints a pairing QR code."
         case .host:
             return "Run this command on the primary hub. Then run the installer command it prints on the additional machine."
         }

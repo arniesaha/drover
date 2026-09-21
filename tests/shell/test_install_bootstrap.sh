@@ -98,7 +98,7 @@ printf '%s\n' \
   'set -eu' \
   'case "$1" in' \
   '  venv)' \
-  '    target="$2"' \
+  '    if [ "${2:-}" = "--relocatable" ]; then target="$3"; else target="$2"; fi' \
   '    printf "venv\\n" >> "$FIXTURE_UV_LOG"' \
   '    mkdir -p "$target/bin"' \
   '    ln -s "$FIXTURE_PYTHON" "$target/bin/python"' \
@@ -114,6 +114,7 @@ printf '%s\n' \
   'case "${1:-}" in' \
   '  --version) printf "0.0.0\\n" ;;' \
   '  init|pair) exit 0 ;;' \
+  '  control-store) [ "${2:-}" = "init" ] && [ "${3:-}" = "--help" ] && exit 0; exit 1 ;;' \
   '  *) exit 1 ;;' \
   'esac' > "$FAKE_BIN/drover-server"
 chmod +x "$FAKE_BIN/drover-server"

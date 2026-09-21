@@ -22,6 +22,14 @@ def runtime_bin(home: Path) -> Path:
     return Path(home) / "runtime" / "current" / "bin"
 
 
+def _systemd_unit_path(path: Path) -> str:
+    """Render a unit-file path without applying shell-only quoting rules."""
+    raw = str(path)
+    if all(character.isalnum() or character in "/._-" for character in raw):
+        return raw
+    return '"' + raw.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def render_launchd(
     label: str,
     program: str,
@@ -30,6 +38,7 @@ def render_launchd(
     home: Path,
     path_entries: list[str],
     keep_alive: bool = True,
+    environment_file: Path | None = None,
 ) -> str:
     """A launchd job as plist XML.
 
@@ -45,9 +54,22 @@ def render_launchd(
     """
     log_dir = Path(home) / "Library" / "Logs" / "drover"
     short = label.rsplit(".", 1)[-1]
+    program_arguments = [program, *arguments]
+    if environment_file is not None:
+        # launchd has no EnvironmentFile equivalent. Keep the secret in the
+        # private file and use a fixed shell wrapper to export it before the
+        # daemon starts, rather than writing the value into the plist.
+        program_arguments = [
+            "/bin/sh",
+            "-c",
+            'set -a; . "$1"; shift; exec "$@"',
+            "drover-service-env",
+            str(environment_file),
+            *program_arguments,
+        ]
     payload = {
         "Label": label,
-        "ProgramArguments": [program, *arguments],
+        "ProgramArguments": program_arguments,
         "EnvironmentVariables": {"PATH": ":".join(path_entries)},
         "KeepAlive": keep_alive,
         "RunAtLoad": True,
@@ -63,6 +85,7 @@ def render_systemd(
     arguments: list[str],
     *,
     path_entries: list[str],
+    environment_file: Path | None = None,
 ) -> str:
     """A systemd user unit.
 
@@ -74,6 +97,11 @@ def render_systemd(
         f'"{argument}"' if " " in argument else argument for argument in arguments
     )
     exec_start = f"{program} {rendered_args}".rstrip()
+    environment_file_line = (
+        f"EnvironmentFile={_systemd_unit_path(environment_file)}\n"
+        if environment_file is not None
+        else ""
+    )
     return f"""[Unit]
 Description={description}
 After=network-online.target
@@ -81,7 +109,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=PATH={":".join(path_entries)}
-ExecStart={exec_start}
+{environment_file_line}ExecStart={exec_start}
 Restart=always
 RestartSec=5
 

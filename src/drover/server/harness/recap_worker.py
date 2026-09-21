@@ -279,7 +279,7 @@ class LiveRecapWorker:
     ) -> bool:
         con.execute("BEGIN TRANSACTION")
         persisted = con.execute(
-            """INSERT OR REPLACE INTO live_session_recaps
+            """INSERT INTO live_session_recaps
                (session_id, recap_text, source_seq, generator_model, generated_at)
                SELECT ?, ?, ?, ?, now()
                WHERE EXISTS (
@@ -287,6 +287,11 @@ class LiveRecapWorker:
                   WHERE session_id=? AND desired_source_seq=?
                     AND status='running' AND attempts=?
                )
+               ON CONFLICT (session_id) DO UPDATE SET
+                 recap_text=excluded.recap_text,
+                 source_seq=excluded.source_seq,
+                 generator_model=excluded.generator_model,
+                 generated_at=excluded.generated_at
                RETURNING session_id""",
             [
                 claim.session_id,

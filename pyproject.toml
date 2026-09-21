@@ -42,6 +42,10 @@ dependencies = [
     # construction if the h2 package is missing.
     "httpx[http2]>=0.27",
     "cryptography>=42.0",
+    # Central installations now select PostgreSQL by default. Keep the driver
+    # in the base distribution so a generated config never points at an extra
+    # that the release installer did not install.
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 
 [project.scripts]
@@ -65,6 +69,9 @@ dev = [
 ]
 redis = [
     "redis>=5.0",
+]
+postgres = [
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 
 [tool.setuptools.package-data]

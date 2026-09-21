@@ -8,7 +8,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from drover.server.compact import compact_partition
+from drover.server.compact import compact_partition, compact_table
 
 
 def _write_parquet(path: Path, ids: list[str]) -> None:
@@ -169,3 +169,42 @@ def test_compact_dedups_when_dedup_column_present(tmp_path: Path) -> None:
     table = pq.ParquetFile(next(partition.glob("*.parquet"))).read()
     assert sorted(table.column("dedup_key").to_pylist()) == ["a", "b", "c"]
     assert result.rows == 3
+
+
+def test_compact_table_never_rewrites_immutable_control_outbox_batches(
+    tmp_path: Path,
+) -> None:
+    """A generic recursive glob must not invalidate published batch receipts."""
+    immutable = tmp_path / "control_outbox_batches"
+    immutable.mkdir()
+    first = _written(immutable / "batch-a.parquet", ["a"])
+    second = _written(immutable / "batch-b.parquet", ["b"])
+    mutable = tmp_path / "agent_events" / "date=2026-09-20" / "agent_id=codex"
+    mutable.mkdir(parents=True)
+    _written(mutable / "part-a.parquet", ["a"])
+    _written(mutable / "part-b.parquet", ["b"])
+
+    summary = compact_table(tmp_path, dedup_column="dedup_key")
+
+    assert summary["partitions"] == 1
+    assert first.exists() and second.exists()
+    assert sorted(path.name for path in immutable.glob("*.parquet")) == [
+        "batch-a.parquet",
+        "batch-b.parquet",
+    ]
+
+
+def test_compact_table_uses_no_dedup_key_for_provider_usage_snapshots(
+    tmp_path: Path,
+) -> None:
+    """Table-aware safety keeps distinct provider observations with one source key."""
+    snapshots = tmp_path / "provider_usage_snapshots" / "date=2026-09-20"
+    snapshots.mkdir(parents=True)
+    _write_parquet(snapshots / "part-a.parquet", ["same-source"])
+    _write_parquet(snapshots / "part-b.parquet", ["same-source"])
+
+    summary = compact_table(tmp_path)
+
+    assert summary["rows"] == 2
+    table = pq.ParquetFile(next(snapshots.glob("*.parquet"))).read()
+    assert table.num_rows == 2

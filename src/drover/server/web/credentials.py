@@ -266,3 +266,203 @@ class CredentialStore:
             handle.write("\n")
         os.replace(tmp, self._path)
         os.chmod(self._path, 0o600)
+
+
+_CREDENTIAL_COLUMNS = """
+credential_id, scope, label, verifier, created_at, host_id, last_used_at,
+revoked_at, apns_token, apns_environment
+"""
+
+
+def _credential_from_row(row: tuple[object, ...]) -> Credential:
+    def timestamp(value: object) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
+
+    created_at = timestamp(row[4])
+    assert created_at is not None
+    return Credential(
+        id=str(row[0]),
+        scope=str(row[1]),
+        label=str(row[2]),
+        verifier=str(row[3]),
+        created_at=created_at,
+        host_id=str(row[5]) if row[5] is not None else None,
+        last_used_at=timestamp(row[6]),
+        revoked_at=timestamp(row[7]),
+        apns_token=str(row[8]) if row[8] is not None else None,
+        apns_environment=str(row[9]) if row[9] is not None else None,
+    )
+
+
+class PostgresCredentialStore:
+    """Credential verifier repository shared safely by API processes.
+
+    Active-verifier lookups always read PostgreSQL. A process may debounce its
+    own ``last_used_at`` writes, but it never caches authorization state, so a
+    revocation by another API process takes effect on the next request.
+    """
+
+    def __init__(self, control_path: Path) -> None:
+        self._control_path = Path(control_path)
+        self._lock = threading.Lock()
+        self._touched_at: dict[str, float] = {}
+        self._server_id = self._identity("server_id", str(uuid4()))
+        self._fleet_name = self._identity("fleet_name", "drover")
+
+    @property
+    def server_id(self) -> str:
+        return self._server_id
+
+    @property
+    def fleet_name(self) -> str:
+        return self._fleet_name
+
+    def issue(
+        self, *, scope: str, label: str, host_id: str | None = None
+    ) -> tuple[Credential, str]:
+        if scope not in SCOPES:
+            raise ValueError(f"unknown scope: {scope}")
+        token = secrets.token_urlsafe(TOKEN_BYTES)
+        credential = Credential(
+            id=str(uuid4()),
+            scope=scope,
+            label=label,
+            verifier=verifier_from_token(token),
+            created_at=_now_iso(),
+            host_id=host_id,
+        )
+        with self._connection() as con:
+            con.execute(
+                """INSERT INTO control_credentials
+                   (credential_id, scope, label, verifier, created_at, host_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    credential.id,
+                    credential.scope,
+                    credential.label,
+                    credential.verifier,
+                    credential.created_at,
+                    credential.host_id,
+                ],
+            )
+        return credential, token
+
+    def find_active(self, token: str) -> Credential | None:
+        verifier = verifier_from_token(token)
+        with self._connection() as con:
+            row = con.execute(
+                f"SELECT {_CREDENTIAL_COLUMNS} FROM control_credentials "
+                "WHERE verifier = ? AND revoked_at IS NULL",
+                [verifier],
+            ).fetchone()
+        return _credential_from_row(row) if row is not None else None
+
+    def get(self, credential_id: str) -> Credential | None:
+        with self._connection() as con:
+            row = con.execute(
+                f"SELECT {_CREDENTIAL_COLUMNS} FROM control_credentials "
+                "WHERE credential_id = ?",
+                [credential_id],
+            ).fetchone()
+        return _credential_from_row(row) if row is not None else None
+
+    def set_apns_registration(
+        self, credential_id: str, *, token: str, environment: str
+    ) -> bool:
+        if environment not in APNS_ENVIRONMENTS:
+            raise ValueError(f"unknown APNs environment: {environment}")
+        with self._connection() as con:
+            row = con.execute(
+                """UPDATE control_credentials
+                   SET apns_token = ?, apns_environment = ?
+                   WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device'
+                   RETURNING credential_id""",
+                [token, environment, credential_id],
+            ).fetchone()
+        return row is not None
+
+    def clear_apns_registration(
+        self, credential_id: str, *, expected_token: str | None = None
+    ) -> bool:
+        sql = (
+            "UPDATE control_credentials SET apns_token = NULL, apns_environment = NULL "
+            "WHERE credential_id = ? AND apns_token IS NOT NULL"
+        )
+        params: list[object] = [credential_id]
+        if expected_token is not None:
+            sql += " AND apns_token = ?"
+            params.append(expected_token)
+        sql += " RETURNING credential_id"
+        with self._connection() as con:
+            row = con.execute(sql, params).fetchone()
+        return row is not None
+
+    def touch(self, credential_id: str, *, now: float | None = None) -> None:
+        moment = time.time() if now is None else now
+        with self._lock:
+            last = self._touched_at.get(credential_id, 0.0)
+            if moment - last < TOUCH_DEBOUNCE_SECONDS:
+                return
+        with self._connection() as con:
+            touched = con.execute(
+                """UPDATE control_credentials SET last_used_at = ?
+                   WHERE credential_id = ? AND revoked_at IS NULL
+                   RETURNING credential_id""",
+                [_now_iso(), credential_id],
+            ).fetchone()
+        if touched is not None:
+            with self._lock:
+                self._touched_at[credential_id] = moment
+
+    def revoke(self, credential_id: str) -> bool:
+        with self._connection() as con:
+            row = con.execute(
+                """UPDATE control_credentials
+                   SET revoked_at = ?, apns_token = NULL, apns_environment = NULL
+                   WHERE credential_id = ? AND revoked_at IS NULL
+                   RETURNING credential_id""",
+                [_now_iso(), credential_id],
+            ).fetchone()
+        return row is not None
+
+    def list_all(self) -> list[Credential]:
+        with self._connection() as con:
+            rows = con.execute(
+                f"SELECT {_CREDENTIAL_COLUMNS} FROM control_credentials "
+                "ORDER BY created_at"
+            ).fetchall()
+        return [_credential_from_row(row) for row in rows]
+
+    def _identity(self, key: str, fallback: str) -> str:
+        with self._connection() as con:
+            con.execute(
+                """INSERT INTO control_server_identity (identity_key, identity_value)
+                   VALUES (?, ?) ON CONFLICT (identity_key) DO NOTHING""",
+                [key, fallback],
+            )
+            row = con.execute(
+                "SELECT identity_value FROM control_server_identity WHERE identity_key = ?",
+                [key],
+            ).fetchone()
+        assert row is not None
+        return str(row[0])
+
+    def _connection(self):
+        from drover.server.db import control_plane_connection
+
+        return control_plane_connection(self._control_path)
+
+
+def credential_store_for_control_path(
+    control_path: Path, fallback_path: Path
+) -> CredentialStore | PostgresCredentialStore:
+    """Choose the explicit central backend without changing host-local paths."""
+    from drover.server.control_store import is_postgres_control_store
+
+    if is_postgres_control_store(control_path):
+        return PostgresCredentialStore(control_path)
+    return CredentialStore(fallback_path)

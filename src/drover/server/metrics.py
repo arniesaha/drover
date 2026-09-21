@@ -13,10 +13,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlencode, urlparse
 
 from drover.config import FavoriteCwd
+from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
     control_plane_connection,
     control_plane_path,
@@ -379,7 +380,7 @@ def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, i
     writes, as before.
     """
     source = control_plane_path(db_path)
-    if not source.exists():
+    if not source.exists() and not is_postgres_control_store(db_path):
         return {
             "null_event_count": 0,
             "all_null_sessions": 0,
@@ -1025,11 +1026,27 @@ class MetricsCollector:
     max_stale_seconds: float = 300.0
     cockpit_service: "CockpitService | None" = None
     advisory_service: "InsightsService | None" = None
+    # API-only role reads this narrow central state without constructing an
+    # InsightsService (which owns analytical DuckDB work).  All-in-one and
+    # worker collectors keep the established service-backed behavior.
+    content_consent_reader: Callable[[], Mapping[str, Any]] | None = None
+    content_consent_propagator: Callable[[bool, int], list[dict[str, str]]] | None = (
+        None
+    )
     # Where InsightsService reads config and, beside it, the durable
     # content-consent state. None means the real user config path, which is
     # right in production and untestable everywhere else: without an override
     # a test reads the running server's own consent epoch off the machine.
     config_path: Path | None = None
+    # API readiness is control-store readiness.  The analytical worker is
+    # surfaced separately and can be unavailable without ejecting a healthy
+    # fleet/control API from a load balancer.
+    include_analytical_readiness: bool = True
+    analytics_worker_state: str | Callable[[], str] | None = None
+    # The API role injects the bounded worker RPC resolver.  It is intentionally
+    # absent in legacy/all mode until retained history is configured there.
+    archive_resolver: Any | None = None
+    archive_resolver_factory: Callable[[], Any] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -1067,9 +1084,37 @@ class MetricsCollector:
         """
         with self._readiness_guard:
             if self._readiness is None:
-                self._readiness = ReadinessProbe(self.duckdb_path)
+                self._readiness = ReadinessProbe(
+                    self.duckdb_path,
+                    include_analytical=self.include_analytical_readiness,
+                )
             probe = self._readiness
-        return probe.check().as_response(include_detail=include_detail)
+        status, body = probe.check().as_response(include_detail=include_detail)
+        if self.analytics_worker_state is None:
+            return status, body
+        try:
+            analytics_state = (
+                self.analytics_worker_state()
+                if callable(self.analytics_worker_state)
+                else self.analytics_worker_state
+            )
+        except Exception:  # noqa: BLE001 - control readiness remains independent
+            analytics_state = "unavailable"
+        if analytics_state not in {"ok", "degraded", "unavailable"}:
+            analytics_state = "unavailable"
+        payload = json.loads(body)
+        stores = payload.get("stores")
+        if isinstance(stores, list):
+            stores.append(
+                {
+                    "store": "analytics_worker",
+                    "state": analytics_state,
+                    "detail": "" if not include_detail else "reported separately",
+                }
+            )
+        # The aggregate stays the control verdict.  Analytics failure is a
+        # degraded feature response, not a reason to stop host lifecycle.
+        return status, json.dumps(payload, sort_keys=True) + "\n"
 
     def render_prometheus(self) -> str:
         self._refresh_if_needed()
@@ -1215,9 +1260,21 @@ class MetricsCollector:
                 self.duckdb_path, config_path=self.config_path
             )
         self.advisory_service.set_content_consent_propagator(
-            self._propagate_content_consent
+            self.content_consent_propagator or self._propagate_content_consent
         )
         return self.advisory_service
+
+    def content_consent_state(self) -> dict[str, Any]:
+        if self.content_consent_reader is not None:
+            state = self.content_consent_reader()
+            enabled = state.get("enabled") is True
+            epoch = state.get("epoch")
+            if type(epoch) is not int or epoch < 0:
+                # An unavailable or malformed central read must close the
+                # content gate; a heartbeat must never turn it into consent.
+                return {"enabled": False, "epoch": 0}
+            return {"enabled": enabled, "epoch": epoch}
+        return self._insights().content_consent_state()
 
     def render_insights_json(self, filters: "InsightFilters") -> tuple[int, str]:
         return _insight_response(lambda: self._insights().list_insights(filters))
@@ -1361,7 +1418,7 @@ class MetricsCollector:
             return _json_response(500, {"error": str(exc)})
         body = {
             "host": host.__dict__,
-            "content_consent": self._insights().content_consent_state(),
+            "content_consent": self.content_consent_state(),
         }
         # Every harnessd already polls this endpoint every 15 seconds, so the
         # fleet's target version rides this response rather than needing a
@@ -1432,7 +1489,7 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             raise ValueError(f"unknown harness host: {host_id}")
-        consent = self._insights().content_consent_state()
+        consent = self.content_consent_state()
         if not consent["enabled"] or int(consent["epoch"]) <= 0:
             raise RuntimeError("content analysis is disabled")
         reconciliation = self._push_content_consent(host, consent)
@@ -1475,7 +1532,7 @@ class MetricsCollector:
         host = self._harness_host(host_id)
         if host is None:
             raise ValueError(f"unknown harness host: {host_id}")
-        consent = self._insights().content_consent_state()
+        consent = self.content_consent_state()
         if not consent["enabled"] or int(consent["epoch"]) <= 0:
             raise RuntimeError("content analysis is disabled")
         reconciliation = self._push_content_consent(host, consent)
@@ -2112,15 +2169,6 @@ class MetricsCollector:
     ) -> dict[str, Any]:
         from drover.server.cockpit.service import COCKPIT_SECTIONS
 
-        source = Path(self.duckdb_path)
-        if not source.exists():
-            return {
-                "cockpit_api_version": 1,
-                "cockpit_sections": list(COCKPIT_SECTIONS),
-                "hosts": [],
-                "sessions": [],
-                "error": f"DuckDB file does not exist: {source}",
-            }
         try:
             # Query the live database rather than copying it: the file is
             # ~483MB and this runs on every fleet poll (measured 0.78s per
@@ -2131,7 +2179,12 @@ class MetricsCollector:
             # open_duckdb_connection's docstring.
             if archived_limit is _UNSET_ARCHIVED_LIMIT:
                 archived_limit = self.archived_session_limit
-            registry = HarnessRegistry(source)
+            # ``duckdb_path`` remains the stable control-store selector.  In
+            # PostgreSQL mode its legacy sidecar does not exist, and requiring
+            # it here made an API role report an empty fleet even though the
+            # registered central store was healthy.  HarnessRegistry resolves
+            # the selected control backend without consulting the lake.
+            registry = HarnessRegistry(self.duckdb_path)
             hosts = registry.list_hosts() if include_hosts else []
             sessions = (
                 registry.list_sessions(archived_limit=archived_limit)
@@ -2171,18 +2224,17 @@ class MetricsCollector:
             return {"hosts": [], "sessions": [], "error": str(exc)}
 
     def harness_session_snapshot(self, session_id: str) -> dict[str, Any]:
-        source = Path(self.duckdb_path)
-        if not source.exists():
-            return {"error": f"DuckDB file does not exist: {source}"}
         try:
             self._reconcile_harness_session_from_host(session_id)
             # Live read, same reasoning as harness_snapshot above.
-            registry = HarnessRegistry(source)
+            registry = HarnessRegistry(self.duckdb_path)
             session = registry.get_session(session_id)
             if session is None:
                 return {"error": f"unknown harness session: {session_id}"}
             host = registry.get_host(session.host_id)
-            events = registry.list_events(session_id)
+            events = registry.list_events(
+                session_id, resolver=self._archive_resolver_for_request()
+            )
             native_transcript: dict[str, Any] | None = None
             status, body = self.proxy_harness_native_transcript(session_id)
             if 200 <= status < 300:
@@ -2201,6 +2253,11 @@ class MetricsCollector:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render harness session %s: %s", session_id, exc)
             return {"error": str(exc)}
+
+    def _archive_resolver_for_request(self) -> Any | None:
+        if self.archive_resolver_factory is not None:
+            return self.archive_resolver_factory()
+        return self.archive_resolver
 
     def _harness_host(self, host_id: str) -> Any | None:
         try:

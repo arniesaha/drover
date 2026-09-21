@@ -11,6 +11,7 @@ import _thread
 import logging
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -187,11 +188,164 @@ class FavoriteCwd:
         return cls(path=path, host_id=host_id.strip() or None)
 
 
+_CONTROL_STORE_BACKENDS = ("duckdb", "postgres")
+_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_RUNTIME_ROLES = ("all", "api", "analytics")
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+@dataclass(frozen=True)
+class ControlStoreConfig:
+    """Explicit selection and bounds for the central serving store.
+
+    The DSN is deliberately referenced by environment-variable name. Config
+    files remain safe to inspect and a host-local path stays on DuckDB unless
+    the caller registers this PostgreSQL configuration for that exact path.
+    """
+
+    backend: str
+    dsn_env: str
+    pool_min_size: int
+    pool_max_size: int
+    acquire_timeout_seconds: float
+    statement_timeout_seconds: float
+    schema: str = "drover_control"
+
+    def __post_init__(self) -> None:
+        if self.backend not in _CONTROL_STORE_BACKENDS:
+            raise ValueError(
+                "control_store.backend must be one of "
+                f"{', '.join(_CONTROL_STORE_BACKENDS)}"
+            )
+        if self.backend == "postgres" and not _ENV_NAME.fullmatch(self.dsn_env):
+            raise ValueError(
+                "control_store.dsn_env must name the environment variable "
+                "holding the PostgreSQL DSN"
+            )
+        if self.backend == "duckdb" and self.dsn_env:
+            raise ValueError("control_store.dsn_env is only valid for postgres")
+        if type(self.pool_min_size) is not int or self.pool_min_size < 1:
+            raise ValueError("control_store.pool_min_size must be a positive integer")
+        if (
+            type(self.pool_max_size) is not int
+            or self.pool_max_size < self.pool_min_size
+        ):
+            raise ValueError(
+                "control_store.pool_max_size must be an integer at least "
+                "control_store.pool_min_size"
+            )
+        for name in ("acquire_timeout_seconds", "statement_timeout_seconds"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"control_store.{name} must be a finite positive number"
+                )
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", self.schema):
+            raise ValueError("control_store.schema must be a lowercase SQL identifier")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    """Explicit process role selection.
+
+    ``all`` remains the compatibility default.  A role is configuration, not
+    an inference from which filesystem paths happen to be readable.
+    """
+
+    role: str = "all"
+
+    def __post_init__(self) -> None:
+        if self.role not in _RUNTIME_ROLES:
+            raise ValueError("runtime.role must be one of all, api, analytics")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyticsBoundaryConfig:
+    """Loopback-only limits and credential references for role separation."""
+
+    worker_url: str = "http://127.0.0.1:7082"
+    api_url: str = "http://127.0.0.1:7080"
+    api_to_worker_token_env: str = "DROVER_API_TO_ANALYTICS_TOKEN"
+    worker_to_api_token_env: str = "DROVER_ANALYTICS_TO_API_TOKEN"
+    connect_timeout_seconds: float = 0.25
+    request_timeout_seconds: float = 10.0
+    max_request_bytes: int = 262_144
+    max_response_bytes: int = 4_194_304
+    max_concurrent_requests: int = 8
+
+    def __post_init__(self) -> None:
+        for field_name in ("worker_url", "api_url"):
+            value = getattr(self, field_name)
+            try:
+                parsed = urlsplit(value)
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(
+                    f"analytics_boundary.{field_name} must be a valid URL"
+                ) from exc
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname not in _LOOPBACK_HOSTS
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in {"", "/"}
+                or port is None
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError(
+                    f"analytics_boundary.{field_name} must be a loopback HTTP root URL"
+                )
+            if parsed.path == "/":
+                object.__setattr__(self, field_name, value[:-1])
+        for name in ("api_to_worker_token_env", "worker_to_api_token_env"):
+            if not _ENV_NAME.fullmatch(getattr(self, name)):
+                raise ValueError(
+                    f"analytics_boundary.{name} must name an environment variable"
+                )
+        if self.api_to_worker_token_env == self.worker_to_api_token_env:
+            raise ValueError(
+                "analytics boundary credentials must use distinct variables"
+            )
+        for name in ("connect_timeout_seconds", "request_timeout_seconds"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"analytics_boundary.{name} must be a finite positive number"
+                )
+        if self.connect_timeout_seconds > self.request_timeout_seconds:
+            raise ValueError(
+                "analytics_boundary.connect_timeout_seconds must not exceed request_timeout_seconds"
+            )
+        for name, minimum, maximum in (
+            ("max_request_bytes", 1, 262_144),
+            ("max_response_bytes", 1, 4_194_304),
+            ("max_concurrent_requests", 1, 64),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError(
+                    f"analytics_boundary.{name} must be between {minimum} and {maximum}"
+                )
+
+
 @dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
     parquet_dir: Path
     duckdb_path: Path
+    control_store: ControlStoreConfig
+    runtime: RuntimeConfig
+    analytics_boundary: AnalyticsBoundaryConfig
     processed_retention_days: int
     receipt_retention_days: int
     advisory_occurrence_retention_days: int
@@ -313,6 +467,27 @@ _DEFAULTS = {
         # advisory_occurrences (#302): 30 days, the same window insights and
         # the dismissal-regression check treat as "recent enough to matter".
         "advisory_occurrence_retention_days": 30,
+    },
+    "control_store": {
+        "backend": "duckdb",
+        "dsn_env": "",
+        "pool_min_size": 1,
+        "pool_max_size": 4,
+        "acquire_timeout_seconds": 2.0,
+        "statement_timeout_seconds": 5.0,
+        "schema": "drover_control",
+    },
+    "runtime": {"role": "all"},
+    "analytics_boundary": {
+        "worker_url": "http://127.0.0.1:7082",
+        "api_url": "http://127.0.0.1:7080",
+        "api_to_worker_token_env": "DROVER_API_TO_ANALYTICS_TOKEN",
+        "worker_to_api_token_env": "DROVER_ANALYTICS_TO_API_TOKEN",
+        "connect_timeout_seconds": 0.25,
+        "request_timeout_seconds": 10.0,
+        "max_request_bytes": 262_144,
+        "max_response_bytes": 4_194_304,
+        "max_concurrent_requests": 8,
     },
     "server": {
         "otlp_grpc_port": 4317,
@@ -478,6 +653,23 @@ def _from_dict(d: dict) -> DroverConfig:
     j = d["redis_jobs"]
     archive = d["archive"]
     content = d["advisory_content"]
+    control_store = d["control_store"]
+    runtime = d["runtime"]
+    boundary = d["analytics_boundary"]
+    control_store_config = ControlStoreConfig(
+        backend=str(control_store["backend"]).strip().lower(),
+        dsn_env=str(control_store["dsn_env"]).strip(),
+        pool_min_size=control_store["pool_min_size"],
+        pool_max_size=control_store["pool_max_size"],
+        acquire_timeout_seconds=control_store["acquire_timeout_seconds"],
+        statement_timeout_seconds=control_store["statement_timeout_seconds"],
+        schema=str(control_store["schema"]).strip(),
+    )
+    runtime_config = RuntimeConfig(role=str(runtime["role"]).strip().lower())
+    if runtime_config.role != "all" and control_store_config.backend != "postgres":
+        raise ValueError(
+            "runtime.role api or analytics requires control_store.backend=postgres"
+        )
     provider_freshness_threshold = d["provider"]["freshness_threshold_seconds"]
     if (
         type(provider_freshness_threshold) not in (int, float)
@@ -492,6 +684,19 @@ def _from_dict(d: dict) -> DroverConfig:
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
         duckdb_path=Path(d["paths"]["duckdb_path"]),
+        control_store=control_store_config,
+        runtime=runtime_config,
+        analytics_boundary=AnalyticsBoundaryConfig(
+            worker_url=str(boundary["worker_url"]).strip(),
+            api_url=str(boundary["api_url"]).strip(),
+            api_to_worker_token_env=str(boundary["api_to_worker_token_env"]).strip(),
+            worker_to_api_token_env=str(boundary["worker_to_api_token_env"]).strip(),
+            connect_timeout_seconds=boundary["connect_timeout_seconds"],
+            request_timeout_seconds=boundary["request_timeout_seconds"],
+            max_request_bytes=boundary["max_request_bytes"],
+            max_response_bytes=boundary["max_response_bytes"],
+            max_concurrent_requests=boundary["max_concurrent_requests"],
+        ),
         processed_retention_days=int(d["paths"]["processed_retention_days"]),
         receipt_retention_days=int(d["paths"].get("receipt_retention_days", 7)),
         advisory_occurrence_retention_days=int(

@@ -27,6 +27,21 @@ log = logging.getLogger("drover.native_usage_rollup")
 DEFAULT_PARTITION_LIMIT = 1
 
 
+def _known_utc_timestamp_for_control(con: object, value: datetime) -> datetime:
+    """Bind native-ingest UTC clocks correctly for the selected control store.
+
+    The analytical activity table deliberately remains DuckDB ``TIMESTAMP``;
+    its values are naive but are produced by native ingestion as UTC.  Only
+    those known clocks cross into the PostgreSQL ``TIMESTAMPTZ`` tables.  This
+    preserves legacy DuckDB's naive timestamp behavior for its control store.
+    """
+    if getattr(con, "dialect", None) != "postgres":
+        return value
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class NativeUsageRollupReport:
     partitions: int
@@ -58,9 +73,10 @@ def _pending_partitions(duckdb_path: Path, *, limit: int) -> list[tuple[str, dat
                 FROM native_usage_partition_watermarks
                 """).fetchall()}
     return [
-        (str(date), observed_at)
+        (str(date), _known_utc_timestamp_for_control(con, observed_at))
         for date, observed_at in activity
-        if watermarks.get(str(date)) is None or watermarks[str(date)] < observed_at
+        if watermarks.get(str(date)) is None
+        or watermarks[str(date)] < _known_utc_timestamp_for_control(con, observed_at)
     ][:limit]
 
 
@@ -132,7 +148,12 @@ def _rebuild_partition(
         "DELETE FROM native_usage_partition_totals WHERE partition_date = ?",
         [partition_date],
     )
-    rolled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    source_activity_at = _known_utc_timestamp_for_control(con, source_activity_at)
+    # Preserve the original naive UTC clock for DuckDB TIMESTAMP.  The
+    # PostgreSQL boundary converts this known UTC producer to TIMESTAMPTZ.
+    rolled_at = _known_utc_timestamp_for_control(
+        con, datetime.now(timezone.utc).replace(tzinfo=None)
+    )
     for total in totals:
         con.execute(
             """

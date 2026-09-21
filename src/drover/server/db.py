@@ -60,6 +60,13 @@ from typing import Mapping, Optional
 
 import duckdb
 
+from drover.server.control_store import (
+    close_all_postgres_control_stores,
+    is_postgres_control_store,
+    postgres_control_store,
+)
+from drover.server.postgres_control_store import ControlStoreBusy
+
 log = logging.getLogger("drover.db")
 
 #: Parallelism ceiling for the ``snapshot`` role. Measured against the live
@@ -189,6 +196,73 @@ CONTROL_PLANE_PRIMARY_KEYS = {
     "session_usage_sources": "source_usage_id",
     "native_usage_partition_totals": "native_usage_partition_id",
     "native_usage_partition_watermarks": "partition_date",
+}
+
+# The only central facts analytical readers currently join. The bridge keeps a
+# schema-shaped, repeatable-read DuckDB snapshot for these narrow projections;
+# it intentionally does not make event payload history, recap queues, or
+# advisory state appear as analytical relations.
+_POSTGRES_ANALYTICS_SNAPSHOT_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
+    "harness_hosts": (
+        ("host_id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("kind", "VARCHAR"),
+        ("local_url", "VARCHAR"),
+        ("tailscale_url", "VARCHAR"),
+        ("connection_kind", "VARCHAR"),
+        ("status", "VARCHAR"),
+        ("capabilities_json", "VARCHAR"),
+        ("model_catalogs_json", "VARCHAR"),
+        ("agent_version", "VARCHAR"),
+        ("update_json", "VARCHAR"),
+        ("last_seen_at", "TIMESTAMPTZ"),
+        ("created_at", "TIMESTAMPTZ"),
+        ("updated_at", "TIMESTAMPTZ"),
+    ),
+    "harness_sessions": (
+        ("session_id", "VARCHAR"),
+        ("host_id", "VARCHAR"),
+        ("harness", "VARCHAR"),
+        ("repo_owner", "VARCHAR"),
+        ("repo_name", "VARCHAR"),
+        ("branch", "VARCHAR"),
+        ("cwd", "VARCHAR"),
+        ("command", "VARCHAR"),
+        ("status", "VARCHAR"),
+        ("started_at", "TIMESTAMPTZ"),
+        ("updated_at", "TIMESTAMPTZ"),
+        ("ended_at", "TIMESTAMPTZ"),
+        ("last_error", "VARCHAR"),
+        ("summary_session_id", "VARCHAR"),
+        ("native_session_id", "VARCHAR"),
+        ("native_resume_label", "VARCHAR"),
+        ("source_session_id", "VARCHAR"),
+        ("handoff_mode", "VARCHAR"),
+        ("mode", "VARCHAR"),
+        ("awaiting", "VARCHAR"),
+        ("last_activity", "TIMESTAMPTZ"),
+        ("permission_mode", "VARCHAR"),
+        ("model", "VARCHAR"),
+        ("thinking_effort", "VARCHAR"),
+        ("recap_reconcile_needed", "BOOLEAN"),
+        ("client_session_id", "VARCHAR"),
+    ),
+    "session_usage": (
+        ("session_id", "VARCHAR"),
+        ("host_id", "VARCHAR"),
+        ("harness", "VARCHAR"),
+        ("input_tokens", "BIGINT"),
+        ("output_tokens", "BIGINT"),
+        ("cache_read_tokens", "BIGINT"),
+        ("cache_write_tokens", "BIGINT"),
+        ("reasoning_tokens", "BIGINT"),
+        ("turn_count", "INTEGER"),
+        ("exact", "BOOLEAN"),
+        ("source", "VARCHAR"),
+        ("source_seq", "INTEGER"),
+        ("source_event_count", "INTEGER"),
+        ("observed_at", "TIMESTAMPTZ"),
+    ),
 }
 
 #: Appended to the analytical store's stem, so ``drover.duckdb`` is joined by
@@ -436,6 +510,12 @@ def pin_control_plane_connection(duckdb_path: str | Path) -> bool:
     harnessd and the CLI never do. ``duckdb_path`` may be either the analytical
     path or the control-plane path; it is resolved either way.
     """
+    if is_postgres_control_store(duckdb_path):
+        # A PostgreSQL pool holds no process-wide file lock. Opening it here
+        # validates an explicit serving-store registration without importing or
+        # pinning any DuckDB instance.
+        postgres_control_store(duckdb_path)
+        return True
     duckdb_path = control_plane_path(duckdb_path)
     if os.environ.get("DROVER_CONTROL_PLANE_PIN", "0").strip().lower() not in {
         "1",
@@ -482,6 +562,7 @@ def close_control_plane_connections() -> None:
             con.close()
         except Exception:  # noqa: BLE001 - shutdown is best effort
             log.debug("failed to close the control-plane connection for %s", key)
+    close_all_postgres_control_stores()
 
 
 #: A control-plane connect collides only with another process's *window*, and
@@ -616,6 +697,14 @@ def control_plane_connection(
     right for every caller that has work to do and wrong only for one that has
     to answer a monitor now (#181).
     """
+    if is_postgres_control_store(duckdb_path):
+        try:
+            with postgres_control_store(duckdb_path).connection(timeout=timeout) as con:
+                yield con
+        except ControlStoreBusy as exc:
+            raise ControlPlaneBusy(str(exc)) from exc
+        return
+
     key = _path_key(control_plane_path(duckdb_path))
     with _held_control_plane_lock(duckdb_path, timeout):
         with _CONTROL_PLANE_GUARD:
@@ -1085,6 +1174,51 @@ def _remove_snapshot(entry: _CachedSnapshot) -> None:
 
 
 @contextmanager
+def _postgres_control_plane_snapshot(
+    con: duckdb.DuckDBPyConnection, duckdb_path: str | Path
+) -> Iterator[None]:
+    """Materialize the small analytical central projection from PostgreSQL.
+
+    PostgreSQL owns the authoritative serving rows. DuckDB receives only the
+    three relations analytics currently joins, all read in one repeatable-read
+    transaction and exposed as temporary tables for this connection. Event
+    payload history is deliberately absent from this bridge.
+    """
+    created: list[str] = []
+    with postgres_control_store(duckdb_path).connection() as pg:
+        pg.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        try:
+            for table, columns in _POSTGRES_ANALYTICS_SNAPSHOT_TABLES.items():
+                names = ", ".join(f'"{name}"' for name, _ in columns)
+                definitions = ", ".join(
+                    f'"{name}" {data_type}' for name, data_type in columns
+                )
+                rows = pg.execute(f'SELECT {names} FROM "{table}"').fetchall()
+                con.execute(f"CREATE OR REPLACE TEMP TABLE {table} ({definitions})")
+                created.append(table)
+                if rows:
+                    placeholders = ", ".join("?" for _ in columns)
+                    con.executemany(
+                        f"INSERT INTO {table} VALUES ({placeholders})", rows
+                    )
+            pg.execute("COMMIT")
+        except Exception:
+            try:
+                pg.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001 - preserve the materialization error
+                pass
+            raise
+    try:
+        yield
+    finally:
+        for table in reversed(created):
+            try:
+                con.execute(f"DROP TABLE IF EXISTS temp.{table}")
+            except Exception:  # noqa: BLE001 - preserve the caller's error
+                log.debug("failed to drop PostgreSQL snapshot table %s", table)
+
+
+@contextmanager
 def attached_control_plane_snapshot(
     con: duckdb.DuckDBPyConnection,
     duckdb_path: str | Path,
@@ -1116,6 +1250,10 @@ def attached_control_plane_snapshot(
     with "database with name ... already exists" and then detach the first one's
     snapshot out from under its query.
     """
+    if is_postgres_control_store(duckdb_path):
+        with _postgres_control_plane_snapshot(con, duckdb_path):
+            yield
+        return
     with control_plane_snapshot(duckdb_path) as snapshot:
         if snapshot is None:
             yield

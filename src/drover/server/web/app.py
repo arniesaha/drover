@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hmac
 import json
 import logging
 import os
@@ -21,6 +22,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, unquote_to_bytes, urlparse
 
+from drover.server.analytics_boundary import (
+    ANALYTICS_UNAVAILABLE_BODY,
+    ANALYTICS_UNAVAILABLE_HEADERS,
+    AnalyticsBoundaryClient,
+    AnalyticsBoundaryRequestInvalid,
+    AnalyticsBoundaryUnavailable,
+    BoundaryResponse,
+)
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_protocol import (
@@ -748,6 +757,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     collector: "MetricsCollector"
     auth: AuthSettings = DISABLED
     pairing: PairingCodes | None = None
+    analytics_boundary: AnalyticsBoundaryClient | None = None
+    host_data_bridge_token: str = ""
 
     def _gate(self, path: str) -> bool:
         """Authorize the request or write the refusal response.
@@ -772,6 +783,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/_internal/analytics/"):
+            self._handle_host_data_bridge(path, parsed.query)
+            return
         if not self._gate(path):
             return
         if path == "/healthz":
@@ -829,6 +843,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(
                 200, "text/html; charset=utf-8", load_page("harness_terminal.html")
             )
+            return
+        if self._is_analytics_public_path(path) and self._forward_analytics(
+            parsed.path, parsed.query, b""
+        ):
             return
         if path == "/observability":
             self._send(200, "application/json", self.collector.render_json())
@@ -1038,7 +1056,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             if compatibility_mode:
                 events = registry.list_events_after(
-                    session_id, query.after_seq if query.after_seq is not None else 0
+                    session_id,
+                    query.after_seq if query.after_seq is not None else 0,
+                    resolver=self._archive_resolver_for_request(),
                 )
                 payload = {
                     "messages": [event.wire_payload() for event in events],
@@ -1051,6 +1071,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     before_seq=query.before_seq,
                     through_seq=query.through_seq,
                     limit=query.limit or _MESSAGE_PAGE_DEFAULT,
+                    resolver=self._archive_resolver_for_request(),
                 )
                 payload = {
                     "messages": [event.wire_payload() for event in page.events],
@@ -1085,11 +1106,20 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/_internal/analytics/"):
+            self._handle_host_data_bridge(path, parsed.query)
+            return
         if not self._gate(path):
             return
         if path == "/auth/login":
             self._handle_login()
             return
+        if self.analytics_boundary is not None and self._is_analytics_public_path(path):
+            body = self._read_boundary_body()
+            if body is None:
+                return
+            if self._forward_analytics(parsed.path, parsed.query, body):
+                return
         if path == "/insights/content-analysis/consent":
             body = self._read_json()
             if body is None:
@@ -1321,6 +1351,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/auth/credentials/"):
             self._revoke_credential(unquote(path.removeprefix("/auth/credentials/")))
+            return
+        if self._is_analytics_public_path(path) and self._forward_analytics(
+            parsed.path, parsed.query, b""
+        ):
             return
         if path == "/insights/content-excerpts":
             status, payload = self.collector.purge_content_excerpts()
@@ -1675,6 +1709,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)
 
+    def _archive_resolver_for_request(self) -> Any | None:
+        factory = getattr(self.collector, "archive_resolver_factory", None)
+        if callable(factory):
+            return factory()
+        return getattr(self.collector, "archive_resolver", None)
+
     def _stream_session_messages(self, session_id: str, *, after_seq: int = 0) -> None:
         """WS handler: push new structured events for a session as they land.
 
@@ -1707,7 +1747,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         last_seq = after_seq
         try:
             while True:
-                for event in registry.list_events_after(session_id, last_seq):
+                for event in registry.list_events_after(
+                    session_id,
+                    last_seq,
+                    resolver=self._archive_resolver_for_request(),
+                ):
                     if event.seq is not None:
                         last_seq = event.seq
                     send_frame(
@@ -2097,6 +2141,209 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return None
         return value if isinstance(value, dict) else None
 
+    def _handle_host_data_bridge(self, path: str, query: str) -> None:
+        """Serve only the worker's fixed relay-sensitive host operations."""
+
+        token = self.host_data_bridge_token
+        if (
+            not token
+            or self.client_address[0] not in {"127.0.0.1", "::1", "localhost"}
+            or not hmac.compare_digest(
+                self.headers.get("X-Drover-Analytics-To-Api", ""), token
+            )
+        ):
+            self._send(401, "application/json", '{"error":"unauthorized"}\n')
+            return
+        if query:
+            self._send(404, "application/json", '{"error":"not found"}\n')
+            return
+        parts = [part for part in path.split("/") if part]
+        try:
+            if (
+                self.command == "GET"
+                and len(parts) == 5
+                and parts[:3] == ["_internal", "analytics", "hosts"]
+                and parts[4] == "provider-usage"
+            ):
+                host = self._harness_registry().get_host(unquote(parts[3]))
+                if host is None:
+                    self._send(404, "application/json", '{"error":"not found"}\n')
+                    return
+                payload = self.collector.fetch_harness_provider_usage(host)
+                self._send(200, "application/json", json.dumps(payload) + "\n")
+                return
+            if (
+                self.command == "POST"
+                and len(parts) == 5
+                and parts[:3] == ["_internal", "analytics", "hosts"]
+                and parts[4] in {"content-bundle", "content-version"}
+            ):
+                body = self._read_boundary_body_for_host_bridge()
+                if body is None:
+                    return
+                target_ids = body.get("target_ids")
+                if (
+                    not isinstance(target_ids, list)
+                    or not 1 <= len(target_ids) <= 256
+                    or len(set(target_ids)) != len(target_ids)
+                    or any(
+                        not isinstance(target_id, str)
+                        or not target_id
+                        or len(target_id) > 256
+                        or target_id.strip() != target_id
+                        for target_id in target_ids
+                    )
+                ):
+                    raise ValueError("target_ids must be a list")
+                host_id = unquote(parts[3])
+                payload = (
+                    self.collector.fetch_advisory_content_bundle(host_id, target_ids)
+                    if parts[4] == "content-bundle"
+                    else self.collector.fetch_advisory_content_version(
+                        host_id, target_ids
+                    )
+                )
+                self._send(200, "application/json", json.dumps(payload) + "\n")
+                return
+            if self.command == "POST" and parts == [
+                "_internal",
+                "analytics",
+                "content-consent",
+            ]:
+                body = self._read_boundary_body_for_host_bridge()
+                if body is None:
+                    return
+                enabled, epoch = body.get("enabled"), body.get("epoch")
+                if type(enabled) is not bool or type(epoch) is not int or epoch < 0:
+                    raise ValueError("invalid content consent")
+                self._send(
+                    200,
+                    "application/json",
+                    json.dumps(
+                        {
+                            "hosts": self.collector._propagate_content_consent(
+                                enabled, epoch
+                            )
+                        }
+                    )
+                    + "\n",
+                )
+                return
+        except Exception:  # noqa: BLE001 - worker only needs bounded unavailable
+            self._send(503, "application/json", '{"error":"host bridge unavailable"}\n')
+            return
+        self._send(404, "application/json", '{"error":"not found"}\n')
+
+    def _read_boundary_body_for_host_bridge(self) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 262_144:
+            self._send(
+                400, "application/json", '{"error":"invalid host bridge request"}\n'
+            )
+            return None
+        try:
+            value = (
+                json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            value = None
+        if not isinstance(value, dict):
+            self._send(
+                400, "application/json", '{"error":"invalid host bridge request"}\n'
+            )
+            return None
+        return value
+
+    def _read_boundary_body(self) -> bytes | None:
+        """Read one bounded raw body for an allowlisted internal route.
+
+        The worker retains ownership of JSON action validation, so this is raw
+        by design.  It exists only to enforce the cross-process byte limit
+        before a public client can make the API buffer an arbitrary body.
+        """
+
+        boundary = self.analytics_boundary
+        assert boundary is not None
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send(
+                400, "application/json", '{"error":"invalid analytics request"}\n'
+            )
+            return None
+        if length < 0 or length > boundary.config.max_request_bytes:
+            self._send(
+                400, "application/json", '{"error":"invalid analytics request"}\n'
+            )
+            return None
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            self._send(
+                400, "application/json", '{"error":"invalid analytics request"}\n'
+            )
+            return None
+        return body
+
+    def _is_analytics_public_path(self, path: str) -> bool:
+        if path in {
+            "/metrics",
+            "/observability",
+            "/cockpit/overview",
+            "/analytics",
+            "/insights",
+            "/insights/content-analysis",
+            "/insights/content-analysis/consent",
+            "/insights/content-analysis/revoke",
+            "/insights/content-excerpts",
+        }:
+            return True
+        return path.startswith("/insights/")
+
+    def _forward_analytics(self, path: str, query: str, body: bytes) -> bool:
+        """Use the fixed worker boundary when this is an API-only listener."""
+
+        boundary = self.analytics_boundary
+        if boundary is None:
+            return False
+        try:
+            response = boundary.request(
+                self.command,
+                path,
+                query,
+                body,
+                public_headers=self.headers,
+            )
+            text = response.body.decode("utf-8")
+        except AnalyticsBoundaryRequestInvalid:
+            self._send(
+                400, "application/json", '{"error":"invalid analytics request"}\n'
+            )
+        except (AnalyticsBoundaryUnavailable, UnicodeDecodeError):
+            self._send(
+                503,
+                "application/json",
+                ANALYTICS_UNAVAILABLE_BODY,
+                extra_headers=dict(ANALYTICS_UNAVAILABLE_HEADERS),
+            )
+        else:
+            # BoundaryResponse has already been capped and only carries this
+            # one response metadata field.  Never mirror worker or caller
+            # authorization, cookies, forwarding, or hop-by-hop headers.
+            content_type = response.content_type.split(";", 1)[0].strip().lower()
+            if content_type not in {"application/json", "text/plain"}:
+                self._send(
+                    503,
+                    "application/json",
+                    ANALYTICS_UNAVAILABLE_BODY,
+                    extra_headers=dict(ANALYTICS_UNAVAILABLE_HEADERS),
+                )
+            else:
+                self._send(response.status, response.content_type, text)
+        return True
+
     def _send(
         self,
         status: int,
@@ -2167,6 +2414,8 @@ def start_metrics_server(
     collector: "MetricsCollector",
     auth: AuthSettings | None = None,
     pairing: PairingCodes | None = None,
+    analytics_boundary: AnalyticsBoundaryClient | None = None,
+    host_data_bridge_token: str = "",
 ) -> ThreadingHTTPServer:
     """Start the Drover metrics HTTP server in a daemon thread."""
     from drover.server.relay_manager import RelayManager
@@ -2175,7 +2424,13 @@ def start_metrics_server(
     handler = type(
         "DroverMetricsHandler",
         (_MetricsHandler,),
-        {"collector": collector, "auth": auth or DISABLED, "pairing": pairing},
+        {
+            "collector": collector,
+            "auth": auth or DISABLED,
+            "pairing": pairing,
+            "analytics_boundary": analytics_boundary,
+            "host_data_bridge_token": host_data_bridge_token,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(
@@ -2183,3 +2438,101 @@ def start_metrics_server(
     )
     thread.start()
     return server
+
+
+def analytics_boundary_dispatcher(
+    collector: "MetricsCollector",
+):
+    """Return the worker-side implementation of the fixed analytics surface.
+
+    The public handler and the internal listener deliberately call the same
+    collector methods, so route status/body contracts remain identical while
+    only the internal listener receives analytical work in a split install.
+    """
+
+    def response(status: int, content_type: str, body: str) -> BoundaryResponse:
+        return BoundaryResponse(status, content_type, body.encode("utf-8"))
+
+    def body_object(body: bytes) -> dict[str, Any] | None:
+        try:
+            value = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def dispatch(method: str, path: str, query: str, body: bytes) -> BoundaryResponse:
+        if method == "GET":
+            if path == "/metrics":
+                return response(
+                    200,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    collector.render_prometheus(),
+                )
+            if path == "/observability":
+                return response(200, "application/json", collector.render_json())
+            if path in {"/cockpit/overview", "/analytics"}:
+                try:
+                    filters = _parse_cockpit_query(query)
+                except ValueError as exc:
+                    return response(
+                        400, "application/json", json.dumps({"error": str(exc)}) + "\n"
+                    )
+                status, rendered = (
+                    collector.render_cockpit_overview_json(filters)
+                    if path == "/cockpit/overview"
+                    else collector.render_analytics_json(filters)
+                )
+                return response(status, "application/json", rendered)
+            if path == "/insights":
+                try:
+                    status, rendered = collector.render_insights_json(
+                        _parse_insight_query(query)
+                    )
+                except ValueError as exc:
+                    status, rendered = 400, json.dumps({"error": str(exc)}) + "\n"
+                return response(status, "application/json", rendered)
+            if path == "/insights/content-analysis":
+                status, rendered = collector.render_content_analysis_status_json()
+                return response(status, "application/json", rendered)
+            check_route = _parse_insight_check_status_route(path)
+            if check_route is not None:
+                status, rendered = collector.render_insight_check_status_json(
+                    *check_route
+                )
+                return response(status, "application/json", rendered)
+            insight_route = _parse_insight_route(path)
+            if insight_route is not None and insight_route[1] is None:
+                status, rendered = collector.render_insight_json(insight_route[0])
+                return response(status, "application/json", rendered)
+        if method == "POST":
+            decoded = body_object(body)
+            if decoded is None:
+                return response(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+            if path == "/insights/content-analysis/consent":
+                status, rendered = collector.consent_content_analysis(decoded)
+                return response(status, "application/json", rendered)
+            if path == "/insights/content-analysis/revoke":
+                status, rendered = collector.revoke_content_analysis(decoded)
+                return response(status, "application/json", rendered)
+            insight_route = _parse_insight_route(path)
+            if insight_route is not None and insight_route[1] in {
+                "acknowledge",
+                "dismiss",
+                "check",
+            }:
+                status, rendered = collector.act_on_insight(
+                    insight_route[0], insight_route[1], decoded
+                )
+                return response(status, "application/json", rendered)
+        if method == "DELETE" and path == "/insights/content-excerpts":
+            status, rendered = collector.purge_content_excerpts()
+            return response(status, "application/json", rendered)
+        # The server revalidates before dispatch, but a defensive 404 here
+        # means a future caller cannot turn this closure into a generic proxy.
+        return response(404, "application/json", '{"error":"not found"}\n')
+
+    return dispatch

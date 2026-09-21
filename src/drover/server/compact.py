@@ -22,6 +22,18 @@ import pyarrow.parquet as pq
 
 from drover.server.parquet_io import atomic_write_table
 
+# Published control-outbox batches are immutable receipts.  They are visible
+# only through their PostgreSQL manifest and may be replayed by a byte/hash
+# reference, so the generic recursive compactor must never rewrite them.
+_IMMUTABLE_TABLE_ROOTS = frozenset({"control_outbox_batches"})
+
+# A dedup key is only meaningful at the table's actual row grain.  Provider
+# usage snapshots intentionally retain observations/windows that may share a
+# source key, so applying the historical global CLI default would lose facts.
+_TABLE_DEDUP_COLUMNS: dict[str, Optional[str]] = {
+    "provider_usage_snapshots": None,
+}
+
 log = logging.getLogger("drover.compact")
 
 
@@ -132,16 +144,27 @@ def _dedup(table: pa.Table, key_col: str) -> pa.Table:
 
 
 def compact_table(parquet_dir: Path, *, dedup_column: Optional[str] = None) -> dict:
-    """Compact every leaf partition under ``parquet_dir``."""
+    """Compact mutable leaf partitions with a table-grain dedup policy."""
     parquet_dir = Path(parquet_dir)
     results: list[CompactResult] = []
     # Leaf partitions are dirs that contain *.parquet files directly
     for d in parquet_dir.rglob("*"):
         if not d.is_dir():
             continue
+        try:
+            table_root = d.relative_to(parquet_dir).parts[0]
+        except IndexError:
+            continue
+        if table_root in _IMMUTABLE_TABLE_ROOTS:
+            continue
         if not any(d.glob("*.parquet")):
             continue
-        results.append(compact_partition(d, dedup_column=dedup_column))
+        effective_dedup = (
+            dedup_column
+            if dedup_column is not None
+            else _TABLE_DEDUP_COLUMNS.get(table_root, "dedup_key")
+        )
+        results.append(compact_partition(d, dedup_column=effective_dedup))
     return {
         "partitions": len(results),
         "files_before": sum(r.files_before for r in results),

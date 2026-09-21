@@ -7,19 +7,31 @@ only after you can complete a small task in a project the agent can read.
 ## Install
 
 ```bash
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
 curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
 ```
 
-That installs a verified release into `~/.drover/runtime/<version>`, starts the
-hub and local harness, detects a private address your phone can reach, and
-prints a QR code to pair with. It refuses to run if it finds a Drover service
-it did not create; pass `--adopt` to migrate an existing source install.
+Before running this on the first central machine, provision a reachable empty
+PostgreSQL database and export its DSN. The installer validates the connection,
+initializes the empty control store, then installs a verified release into
+`~/.drover/runtime/<version>`, starts the hub and local harness, detects a
+private address your phone can reach, and prints a QR code to pair with. It
+stores the DSN in a private service environment file, not `config.toml` or
+service logs. It refuses to run if it finds a Drover service it did not create;
+pass `--adopt` to migrate an existing source install.
 
 Useful flags:
 
 - `--dry-run` prints exactly what it would do and changes nothing.
 - `--url <host:port>` overrides address detection. Private addresses only.
-- `--version vX.Y.Z` pins a release instead of taking the latest.
+- `--version vX.Y.Z` pins a release instead of taking the latest. The pinned
+  release must support PostgreSQL-default setup; older releases are rejected
+  before the installer changes the active runtime.
+
+The PostgreSQL database is an operator-managed dependency. Drover does not
+install or manage its server process. [PostgreSQL control store](postgresql-control-store.md)
+describes provisioning, initialization, explicit DuckDB compatibility, and
+offline migration.
 
 Add a second machine only after this first-computer path works. The existing
 hub prints its one pasted setup command with `drover-server pair-host`; see
@@ -46,7 +58,9 @@ git clone https://github.com/arniesaha/drover.git
 cd drover
 uv sync --extra dev
 git config core.hooksPath .githooks
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
 uv run drover-server init
+uv run drover-server control-store init
 ```
 
 `git config core.hooksPath .githooks` is a one-time step per clone, and git
@@ -59,9 +73,15 @@ without the hook the author gets no signal and everyone else gets a red main.
 Use `git commit --no-verify` to bypass the hook deliberately.
 
 The generated config lives at `~/.drover/config.toml` and enables the local
-cockpit on port `7080`:
+cockpit on port `7080`. For a fresh central installation it also names the
+PostgreSQL control store; it contains the DSN environment variable name, never
+the DSN itself:
 
 ```toml
+[control_store]
+backend = "postgres"
+dsn_env = "DROVER_CONTROL_DSN"
+
 [server]
 otlp_grpc_port = 4317
 mcp_http_port = 7077
@@ -79,7 +99,8 @@ uv run drover-server run
 ```
 
 This starts the incoming-event watcher, local context store, MCP endpoint, and
-the port `7080` HTTP surface used by the app. Optional summarization and
+the port `7080` HTTP surface used by the app. A source-managed process needs
+`DROVER_CONTROL_DSN` in its environment every time it starts. Optional summarization and
 embedding workers remain idle when no model backend is configured.
 
 Verify authenticated access from another terminal:

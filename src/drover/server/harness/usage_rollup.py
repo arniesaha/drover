@@ -70,6 +70,7 @@ class RollupReport:
     candidates: int
     rolled: int
     malformed_events: int
+    incomplete_sessions: int = 0
 
 
 @dataclass(frozen=True)
@@ -127,9 +128,39 @@ WHERE session_id = ?
 ORDER BY COALESCE(seq, 0), created_at, event_id
 """
 
+# PostgreSQL stores the legacy envelope as raw TEXT for lossless replay. Do
+# not cast it to JSONB here: historical malformed rows must remain countable
+# rather than making the whole rollup fail. Python already parses and validates
+# each selected envelope below, so this explicit variant trades a cheap
+# DuckDB-side JSON prefilter for correct portable behavior.
+_POSTGRES_EVENTS_SQL = """
+SELECT e.seq, COALESCE(p.payload_json, e.payload_json) AS payload_json,
+       e.event_id, a.batch_id, a.payload_sha256
+FROM harness_events e
+LEFT JOIN harness_event_payloads p ON p.event_id = e.event_id
+LEFT JOIN harness_event_archives a ON a.event_id = e.event_id
+WHERE e.session_id = ?
+ORDER BY COALESCE(e.seq, 0), e.created_at, e.event_id
+"""
+
+
+def _events_sql(con: duckdb.DuckDBPyConnection) -> str:
+    return (
+        _POSTGRES_EVENTS_SQL
+        if getattr(con, "dialect", None) == "postgres"
+        else _EVENTS_SQL
+    )
+
+
+class IncompleteArchiveError(RuntimeError):
+    """An exact re-roll must retry after one retained payload is unavailable."""
+
 
 def _load_events(
-    con: duckdb.DuckDBPyConnection, session_id: str
+    con: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    resolver: Any | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Return registry event envelopes (column ``seq`` wins) and the malformed count.
 
@@ -141,11 +172,13 @@ def _load_events(
     spread in last because many rows carry a column value but no envelope
     ``seq`` at all.
     """
-    return _parse_event_rows(con.execute(_EVENTS_SQL, [session_id]).fetchall())
+    return _parse_event_rows(
+        con.execute(_events_sql(con), [session_id]).fetchall(), resolver=resolver
+    )
 
 
 def _parse_event_rows(
-    rows: list[tuple[Any, Any]],
+    rows: list[tuple[Any, ...]], *, resolver: Any | None = None
 ) -> tuple[list[dict[str, Any]], int]:
     """Parse fetched rows. Pure, so a caller can run it off the lock.
 
@@ -156,7 +189,26 @@ def _parse_event_rows(
     """
     events: list[dict[str, Any]] = []
     malformed = 0
-    for seq, payload_json in rows:
+    for row in rows:
+        seq, payload_json = row[:2]
+        if payload_json is None and len(row) == 5:
+            _seq, _payload, event_id, batch_id, payload_sha256 = row
+            if (
+                resolver is None
+                or not isinstance(event_id, str)
+                or not isinstance(batch_id, str)
+                or not isinstance(payload_sha256, str)
+            ):
+                raise IncompleteArchiveError("archived harness usage is unavailable")
+            # Callers that pass a resolver have already released the control
+            # slot.  A partial event list must never overwrite exact totals.
+            payload_json = resolver.resolve(
+                event_id=event_id,
+                batch_id=batch_id,
+                payload_sha256=payload_sha256,
+            )
+            if not isinstance(payload_json, str):
+                raise IncompleteArchiveError("archived harness usage is unavailable")
         try:
             payload = json.loads(payload_json) if payload_json else {}
         except (TypeError, ValueError):
@@ -170,9 +222,13 @@ def _parse_event_rows(
 
 
 def _rollup_one(
-    con: duckdb.DuckDBPyConnection, candidate: _Candidate, now: datetime
+    con: duckdb.DuckDBPyConnection,
+    candidate: _Candidate,
+    now: datetime,
+    *,
+    resolver: Any | None = None,
 ) -> int:
-    events, malformed = _load_events(con, candidate.session_id)
+    events, malformed = _load_events(con, candidate.session_id, resolver=resolver)
     totals = session_totals(candidate.harness, events)
     upsert_source_usage(
         con,
@@ -185,7 +241,7 @@ def _rollup_one(
         source_event_count=candidate.event_count,
         host_id=candidate.host_id,
         harness=candidate.harness,
-        observed_at=now,
+        observed_at=_known_utc_rollup_timestamp(con, now),
     )
     if malformed:
         log.warning(
@@ -208,9 +264,9 @@ def load_pending_candidates(
 
 def fetch_event_rows(
     con: duckdb.DuckDBPyConnection, session_id: str
-) -> list[tuple[Any, Any]]:
+) -> list[tuple[Any, ...]]:
     """The session's raw event rows, unparsed."""
-    return con.execute(_EVENTS_SQL, [session_id]).fetchall()
+    return con.execute(_events_sql(con), [session_id]).fetchall()
 
 
 def store_rolled_usage(
@@ -233,7 +289,7 @@ def store_rolled_usage(
         source_event_count=candidate.event_count,
         host_id=candidate.host_id,
         harness=candidate.harness,
-        observed_at=now,
+        observed_at=_known_utc_rollup_timestamp(con, now),
     )
     if malformed:
         log.warning(
@@ -243,11 +299,26 @@ def store_rolled_usage(
         )
 
 
+def _known_utc_rollup_timestamp(con: object, value: datetime) -> datetime:
+    """Make this rollup's generated UTC clock explicit for PostgreSQL writes.
+
+    This module has always generated its default rollup time as naive UTC for
+    DuckDB.  Keep that legacy value unchanged there; PostgreSQL's TIMESTAMPTZ
+    control tables instead receive the same instant as an aware UTC value.
+    """
+    if getattr(con, "dialect", None) != "postgres":
+        return value
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def rollup_pending_sessions(
     con: duckdb.DuckDBPyConnection,
     *,
     limit: int = DEFAULT_BATCH_SIZE,
     now: datetime | None = None,
+    resolver: Any | None = None,
 ) -> RollupReport:
     """Re-roll every session whose events moved past its watermark.
 
@@ -261,13 +332,22 @@ def rollup_pending_sessions(
         _Candidate(str(r[0]), str(r[1]), str(r[2]), int(r[3]), int(r[4])) for r in rows
     ]
     malformed_total = 0
+    incomplete = 0
     for candidate in candidates:
-        malformed_total += _rollup_one(con, candidate, rollup_at)
+        try:
+            malformed_total += _rollup_one(con, candidate, rollup_at, resolver=resolver)
+        except IncompleteArchiveError:
+            incomplete += 1
+            log.warning(
+                "usage rollup deferred session %s: archived payload unavailable",
+                candidate.session_id,
+            )
     _bump(len(candidates), malformed_total)
     return RollupReport(
         candidates=len(candidates),
-        rolled=len(candidates),
+        rolled=len(candidates) - incomplete,
         malformed_events=malformed_total,
+        incomplete_sessions=incomplete,
     )
 
 
@@ -293,10 +373,12 @@ class UsageRollupWorker:
         duckdb_path: Path,
         poll_interval_s: float = 60.0,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        archive_resolver: Any | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.poll_interval_s = poll_interval_s
         self.batch_size = batch_size
+        self.archive_resolver = archive_resolver
         self.last_pass_seconds: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -340,12 +422,25 @@ class UsageRollupWorker:
             candidates = load_pending_candidates(con, limit=self.batch_size)
 
         malformed_total = 0
+        incomplete = 0
         for candidate in candidates:
             with control_plane_connection(registry_path) as con:
                 rows = fetch_event_rows(con, candidate.session_id)
             # Off the lock: one json.loads per event, and a busy session has
             # tens of thousands of them.
-            events, malformed = _parse_event_rows(rows)
+            try:
+                # This is deliberately after the `with` above: a slow local
+                # archive verifier never occupies a PostgreSQL pool slot.
+                events, malformed = _parse_event_rows(
+                    rows, resolver=self.archive_resolver
+                )
+            except IncompleteArchiveError:
+                incomplete += 1
+                log.warning(
+                    "usage rollup deferred session %s: archived payload unavailable",
+                    candidate.session_id,
+                )
+                continue
             malformed_total += malformed
             with control_plane_connection(registry_path) as con:
                 store_rolled_usage(con, candidate, events, malformed, rollup_at)
@@ -353,8 +448,9 @@ class UsageRollupWorker:
         _bump(len(candidates), malformed_total)
         report = RollupReport(
             candidates=len(candidates),
-            rolled=len(candidates),
+            rolled=len(candidates) - incomplete,
             malformed_events=malformed_total,
+            incomplete_sessions=incomplete,
         )
         elapsed = time.monotonic() - started
         self.last_pass_seconds = elapsed

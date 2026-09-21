@@ -209,6 +209,7 @@ class InsightsService:
         *,
         config_path: str | Path | None = None,
         consent_propagator: Callable[[bool, int], list[dict[str, str]]] | None = None,
+        central_consent: Any | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.config_path = Path(config_path or default_config_path()).expanduser()
@@ -232,6 +233,7 @@ class InsightsService:
         )
         self._content_consent = DurableContentConsent(consent_path)
         self._consent_propagator = consent_propagator
+        self._central_consent = central_consent
 
     def set_content_consent_propagator(
         self, propagator: Callable[[bool, int], list[dict[str, str]]]
@@ -239,6 +241,8 @@ class InsightsService:
         self._consent_propagator = propagator
 
     def content_consent_state(self) -> dict[str, Any]:
+        if self._central_consent is not None:
+            return self._central_consent.state().heartbeat()
         with _CONTENT_CONSENT_COORDINATOR.mutation():
             config = (
                 load_config(self.config_path).advisory_content
@@ -251,6 +255,16 @@ class InsightsService:
     def content_analysis_status(self) -> dict[str, Any]:
         """Return central truth plus a serialized current-epoch fleet reconcile."""
 
+        if self._central_consent is not None:
+            state = self._central_consent.state()
+            result = {
+                "enabled": state.enabled,
+                "backend": state.backend,
+                "external_disclosure_accepted": state.external_disclosure_accepted,
+                "pending_model_jobs": self._pending_model_job_count(),
+            }
+            self._append_propagation(result, state.heartbeat())
+            return result
         # A status read may perform bounded, idempotent host consent pushes at
         # exactly the already-durable epoch. Serialize that reconciliation with
         # mutations so a slow GET cannot publish an older fleet result after an
@@ -282,6 +296,11 @@ class InsightsService:
         backend: str,
         external_disclosure_accepted: bool,
     ) -> dict[str, Any]:
+        if self._central_consent is not None:
+            return self._central_consent_content_analysis(
+                backend=backend,
+                external_disclosure_accepted=external_disclosure_accepted,
+            )
         with _CONTENT_CONSENT_COORDINATOR.mutation():
             return self._consent_content_analysis(
                 backend=backend,
@@ -325,9 +344,43 @@ class InsightsService:
         self._append_propagation(result, consent)
         return result
 
+    def _central_consent_content_analysis(
+        self, *, backend: str, external_disclosure_accepted: bool
+    ) -> dict[str, Any]:
+        if backend not in {"local", "cloud"}:
+            raise InvalidInsightRequest("backend must be local or cloud")
+        if type(external_disclosure_accepted) is not bool:
+            raise InvalidInsightRequest(
+                "external_disclosure_accepted must be a boolean"
+            )
+        if backend == "cloud" and not external_disclosure_accepted:
+            raise InvalidInsightRequest(
+                "cloud analysis requires explicit external disclosure acceptance"
+            )
+        disclosure = backend == "cloud" and external_disclosure_accepted
+        with _CONTENT_CONSENT_COORDINATOR.mutation():
+            with CONTENT_CONSENT_FENCE:
+                _CONTENT_CONSENT_COORDINATOR.wait_for_revocation()
+                state = self._central_consent.update(
+                    enabled=True,
+                    backend=backend,
+                    external_disclosure_accepted=disclosure,
+                )
+                _CONTENT_CONSENT_COORDINATOR.advance_generation()
+            result = {
+                "enabled": True,
+                "backend": backend,
+                "external_disclosure_accepted": disclosure,
+                "pending_model_jobs": self._pending_model_job_count(),
+            }
+            self._append_propagation(result, state.heartbeat())
+            return result
+
     def revoke_content_analysis(self) -> dict[str, Any]:
         """Disable model analysis before atomically cancelling runnable jobs."""
 
+        if self._central_consent is not None:
+            return self._central_revoke_content_analysis()
         with _CONTENT_CONSENT_COORDINATOR.mutation():
             return self._revoke_content_analysis()
 
@@ -364,6 +417,38 @@ class InsightsService:
         }
         self._append_propagation(result, consent, hosts=hosts)
         return result
+
+    def _central_revoke_content_analysis(self) -> dict[str, Any]:
+        with _CONTENT_CONSENT_COORDINATOR.mutation():
+            with CONTENT_CONSENT_FENCE:
+                _CONTENT_CONSENT_COORDINATOR.begin_revocation()
+                try:
+                    state = self._central_consent.update(
+                        enabled=False,
+                        backend="local",
+                        external_disclosure_accepted=False,
+                    )
+                    _CONTENT_CONSENT_COORDINATOR.advance_generation()
+                except Exception:
+                    _CONTENT_CONSENT_COORDINATOR.finish_revocation()
+                    raise
+            hosts = self._propagate_content_consent(state.heartbeat())
+            with CONTENT_CONSENT_FENCE:
+                try:
+                    _CONTENT_CONSENT_COORDINATOR.wait_for_idle()
+                    cancelled = self._cancel_pending_model_jobs()
+                    pending = self._pending_model_job_count()
+                finally:
+                    _CONTENT_CONSENT_COORDINATOR.finish_revocation()
+            result = {
+                "enabled": False,
+                "backend": "local",
+                "external_disclosure_accepted": False,
+                "pending_model_jobs": pending,
+                "cancelled_model_jobs": cancelled,
+            }
+            self._append_propagation(result, state.heartbeat(), hosts=hosts)
+            return result
 
     def _advance_content_consent(self, *, enabled: bool) -> dict[str, Any]:
         current = self._content_consent.snapshot()

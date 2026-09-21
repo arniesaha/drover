@@ -1,6 +1,10 @@
 # Architecture
 
-Drover has two cooperating planes backed by one local data boundary.
+Drover has a command plane and a context plane. A fresh central installation
+uses PostgreSQL for control state and keeps analytical state local. Existing
+DuckDB control configurations remain supported until an explicit migration.
+PostgreSQL can separate central API serving from analytical work without
+changing the host-local harness daemon.
 
 ![Drover architecture](drover-architecture.png)
 
@@ -37,15 +41,37 @@ The context plane turns local agent activity into durable, queryable memory:
 See [Context Store](context-store.md) for table ownership, identity, and
 provenance rules.
 
+## PostgreSQL Serving Store
+
+Fresh `drover-server init` configuration sets `[control_store] backend =
+"postgres"`. The central serving store owns fleet hosts and sessions, harness event metadata and
+payload projections, live recap state, central credentials, server identity,
+and content-consent state. It does not replace the analytical lake.
+
+An existing config that omits `[control_store]` retains its DuckDB control
+store. `drover-server init --control-store duckdb` creates an explicit fresh
+legacy configuration. Neither path creates or migrates a control store without
+the corresponding operator command.
+
+The analytics role exports pending central harness events into immutable Parquet
+batches, records them in a PostgreSQL manifest, then acknowledges them. DuckDB
+remains the home for analytical views, derived context, MCP and OTLP work, and
+the local-first default. A central API role reads PostgreSQL and has no direct lake fallback;
+it uses a bounded authenticated loopback boundary for analytical routes and
+cold archived payload reads.
+
 ## Process Boundaries
 
 | Component | Runs on | Owns |
 | --- | --- | --- |
 | iOS app | iPhone or simulator | Presentation, local settings, token in Keychain |
-| `drover-server` | Central machine | Fleet API, ingest, local store, workers, MCP |
+| `drover-server` API role | Central machine | Fleet API, pairing, relay, push, PostgreSQL control readiness |
+| `drover-server` analytics role | Central machine | Ingest, immutable export, archive resolution, derived workers, MCP, OTLP |
+| `drover-server` all role | Central machine | Combined API and analytics startup, with the configured control backend |
 | `drover-harnessd` | Every harness host | Agent processes, adapters, PTY, terminal stream |
 | `drover-collect` | Source hosts | Local log parsing and source-side attribution |
-| DuckDB + Parquet | Central storage | Durable facts, serving state, derived context, ledger |
+| PostgreSQL control store | Default fresh central storage | Fleet serving state, credentials, consent, durable export manifest |
+| DuckDB + Parquet | Local or analytics storage | Durable analytical facts, views, derived context, ledger |
 | Redis Streams | Optional central dependency | Retry coordination only |
 
 ## Interfaces
@@ -55,6 +81,8 @@ provenance rules.
 - MCP: streamable HTTP at `/mcp`, normally port `7077`
 - OTLP: gRPC ingest, normally port `4317`
 - Files: JSONL inputs under `~/.drover/incoming/`
+- API and analytics boundary: loopback-only HTTP, normally API port `7080` and
+  worker port `7082`
 
 All central listeners bind to localhost by default. Ports and bind addresses
 are configurable for deliberate private-LAN or private-Tailscale deployments.
@@ -69,7 +97,30 @@ Public-internet exposure is not supported for v0.3.
   artifacts record supersession explicitly.
 - Optional workers can remain unavailable without stopping the command plane or
   durable ingest.
+- With PostgreSQL split roles, a worker outage is reported separately from API
+  readiness. Fleet and session requests remain central-store reads; analytical
+  requests return an explicit unavailable result until the worker recovers.
+- A pruned central payload requires its verified immutable archive. PostgreSQL
+  state alone cannot reconstruct cold history after retention.
 - Redis coordination can be disabled or rebuilt from durable DuckDB intent.
+
+## PostgreSQL data flow
+
+```mermaid
+flowchart LR
+  app[Authenticated client] --> api[API role]
+  api --> pg[(PostgreSQL control store)]
+  api <-->|bounded loopback| worker[Analytics role]
+  worker --> pg
+  worker --> batches[Immutable Parquet batches]
+  worker --> lake[(DuckDB analytical views and derived context)]
+  host[Host-local harnessd] --> api
+  host --> spool[(Host-local DuckDB spool)]
+```
+
+The worker reads only manifest-published batches. Generic Parquet compaction
+does not own those immutable files. See [PostgreSQL control store](postgresql-control-store.md)
+for configuration, offline cutover, retention, and recovery operations.
 
 ## Compatibility
 

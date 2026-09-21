@@ -4088,6 +4088,11 @@ def _harness_name_for_command(command: tuple[str, ...]) -> str:
 
 def _event_json(event: Any) -> dict[str, Any]:
     item = dict(event.__dict__)
+    payload_status = item.pop("payload_status", None)
+    if getattr(payload_status, "state", None) == "unavailable":
+        item["payload_unavailable"] = {
+            "reason": getattr(payload_status, "reason", None)
+        }
     created_at = item.get("created_at")
     if hasattr(created_at, "isoformat"):
         item["created_at"] = created_at.isoformat()

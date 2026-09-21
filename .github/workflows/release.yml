@@ -76,7 +76,7 @@ jobs:
 
     - name: Export a hash-pinned universal lockfile
       run: |
-        uv export --no-emit-project --no-dev --format requirements-txt \
+        uv export --no-emit-project --no-dev --extra postgres --format requirements-txt \
           > dist/requirements.lock.txt
         # Load-bearing: a lockfile without hashes makes --require-hashes a
         # no-op at install time, which would leave "checksum verified" true

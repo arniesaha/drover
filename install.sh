@@ -261,6 +261,27 @@ resolve_version() {
 }
 
 # --- install -----------------------------------------------------------------
+runtime_supports_postgres_default() {
+  local runtime_python="$1"
+  local runtime_server="$2"
+  "$runtime_python" - <<'PY'
+import inspect
+from dataclasses import fields
+
+from drover.config import DroverConfig
+from drover.server.service_units import render_launchd, render_systemd
+
+if "control_store" not in {field.name for field in fields(DroverConfig)}:
+    raise SystemExit(1)
+if "environment_file" not in inspect.signature(render_launchd).parameters:
+    raise SystemExit(1)
+if "environment_file" not in inspect.signature(render_systemd).parameters:
+    raise SystemExit(1)
+PY
+  [ "$?" -eq 0 ] || return 1
+  "$runtime_server" control-store init --help >/dev/null 2>&1
+}
+
 install_runtime() {
   # Two statements, not one. Under `set -u`, bash declares every name in a
   # single `local` before assigning any of them, so a later assignment that
@@ -268,7 +289,10 @@ install_runtime() {
   # "install.sh: line N: version: unbound variable", at install time, on
   # someone else's machine.
   local version="$1"
-  local target="$DROVER_HOME/runtime/$version"
+  local runtime_root="$DROVER_HOME/runtime"
+  local target="$runtime_root/$version"
+  local staging="$runtime_root/.${version}.install.$$"
+  local backup=""
   local base="https://github.com/${REPO}/releases/download/v${version}"
   local tmp; tmp="$(mktemp -d)"
 
@@ -300,20 +324,47 @@ install_runtime() {
     || fail "refusing to install: requirements.lock.txt failed verification"
   success "artifacts verified"
 
-  mkdir -p "$DROVER_HOME/runtime"
-  uv venv "$target" >/dev/null 2>&1 || fail "could not create a venv at $target"
+  mkdir -p "$runtime_root"
+  rm -rf "$staging"
+  uv venv --relocatable "$staging" >/dev/null 2>&1 \
+    || fail "could not create a venv at $target"
   # Dependencies are hash-pinned; the wheel is installed --no-deps because it
   # has already been verified against the manifest itself.
-  uv pip install --python "$target/bin/python" --require-hashes \
+  uv pip install --python "$staging/bin/python" --require-hashes \
     -r "$tmp/requirements.lock.txt" >/dev/null \
     || fail "dependency install failed (hash mismatch?)"
-  uv pip install --python "$target/bin/python" --no-deps "$tmp/$wheel" >/dev/null \
+  uv pip install --python "$staging/bin/python" --no-deps "$tmp/$wheel" >/dev/null \
     || fail "installing $wheel failed"
   rm -rf "$tmp"
 
-  # A version that cannot state its own version never gets the symlink.
-  "$target/bin/drover-server" --version >/dev/null 2>&1 \
+  # A version that cannot state its own version or support PostgreSQL-default
+  # setup never replaces runtime/current. Stage first so an incompatible pin
+  # cannot modify a currently active runtime of the same version either.
+  "$staging/bin/drover-server" --version >/dev/null 2>&1 \
     || fail "$version failed its smoke test; leaving the current install alone"
+  if ! runtime_supports_postgres_default "$staging/bin/python" "$staging/bin/drover-server"; then
+    rm -rf "$staging"
+    fail "release v${version} predates PostgreSQL-default setup; choose a current release"
+  fi
+
+  # The active target might name the requested version. Preserve it until the
+  # relocatable staged entry point has been verified at its final path, so a
+  # failed replacement can be restored without leaving runtime/current broken.
+  if [ -e "$target" ]; then
+    backup="$runtime_root/.${version}.previous.$$"
+    rm -rf "$backup"
+    mv "$target" "$backup" || fail "could not prepare the current runtime for replacement"
+  fi
+  if ! mv "$staging" "$target"; then
+    [ -z "$backup" ] || mv "$backup" "$target" || true
+    fail "could not activate the verified runtime"
+  fi
+  if ! "$target/bin/drover-server" --version >/dev/null 2>&1; then
+    rm -rf "$target"
+    [ -z "$backup" ] || mv "$backup" "$target" || true
+    fail "$version failed its final runtime smoke test; leaving the current install alone"
+  fi
+  [ -z "$backup" ] || rm -rf "$backup"
 
   ln -sfn "$version" "$DROVER_HOME/runtime/.current.new"
   mv -f "$DROVER_HOME/runtime/.current.new" "$DROVER_HOME/runtime/current"
@@ -321,10 +372,142 @@ install_runtime() {
 }
 
 # --- config ------------------------------------------------------------------
+control_store_settings() {
+  "$DROVER_HOME/runtime/current/bin/python" - "$DROVER_HOME/config.toml" <<'PY'
+import sys
+from pathlib import Path
+
+from drover.config import load_config
+
+path = Path(sys.argv[1])
+if path.exists():
+    config = load_config(path)
+    print(f"{config.control_store.backend}\t{config.control_store.dsn_env}")
+else:
+    # This is the one new-central-install policy. Existing files still pass
+    # through load_config(), whose omitted control_store section remains
+    # DuckDB-compatible.
+    print("postgres\tDROVER_CONTROL_DSN")
+PY
+}
+
+write_control_store_environment() {
+  local dsn_env="$1"
+  local value
+  CONTROL_STORE_ENV_FILE="$DROVER_HOME/server.env"
+  value="$(printenv "$dsn_env" 2>/dev/null || true)"
+  if [ -z "$value" ]; then
+    if [ -r "$CONTROL_STORE_ENV_FILE" ]; then
+      "$DROVER_HOME/runtime/current/bin/python" - "$CONTROL_STORE_ENV_FILE" \
+        "$dsn_env" <<'PY' || fail "PostgreSQL control-store environment is invalid; set $dsn_env and rerun the installer"
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+name = sys.argv[2]
+metadata = path.lstat()
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+    raise SystemExit(1)
+if stat.S_IMODE(metadata.st_mode) & 0o077:
+    os.chmod(path, 0o600)
+line = path.read_text(encoding="utf-8")
+prefix = f'{name}="'
+if not line.startswith(prefix) or not line.endswith('"\n'):
+    raise SystemExit(1)
+body = line[len(prefix):-2]
+decoded: list[str] = []
+index = 0
+while index < len(body):
+    character = body[index]
+    if character != "\\":
+        decoded.append(character)
+        index += 1
+        continue
+    index += 1
+    if index == len(body) or body[index] not in {'\\', '"', '$', '`'}:
+        raise SystemExit(1)
+    decoded.append(body[index])
+    index += 1
+if not "".join(decoded):
+    raise SystemExit(1)
+PY
+      return
+    fi
+    fail "PostgreSQL control store requires $dsn_env; export it and rerun the installer"
+  fi
+
+  "$DROVER_HOME/runtime/current/bin/python" - "$CONTROL_STORE_ENV_FILE" \
+    "$dsn_env" <<'PY' || fail "could not safely persist the PostgreSQL control-store environment"
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+name = sys.argv[2]
+value = os.environ.get(name, "")
+if not value or "\x00" in value or "\n" in value or "\r" in value:
+    raise SystemExit(1)
+
+def environment_file_value(raw: str) -> str:
+    # Both POSIX sh and systemd's EnvironmentFile parser accept this strict
+    # double-quoted subset. Do not use shlex.quote(): an apostrophe becomes
+    # concatenated shell fragments that systemd does not parse the same way.
+    escaped = raw.replace("\\", "\\\\")
+    for character in ('"', '$', '`'):
+        escaped = escaped.replace(character, f"\\{character}")
+    return f'"{escaped}"'
+
+path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(f"{name}={environment_file_value(value)}\n")
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+initialize_control_store() {
+  (
+    set -a
+    # The file is generated with mode 0600 above. Source it only for this
+    # short-lived explicit lifecycle command; neither config.toml nor service
+    # definitions contain the DSN value.
+    . "$CONTROL_STORE_ENV_FILE"
+    exec "$DROVER_HOME/runtime/current/bin/drover-server" control-store init
+  ) >/dev/null || fail "PostgreSQL control-store initialization failed; service units were not started"
+  success "PostgreSQL control store initialized"
+}
+
+verify_control_store_ready() {
+  local status
+  status="$(
+    set -a
+    . "$CONTROL_STORE_ENV_FILE"
+    "$DROVER_HOME/runtime/current/bin/drover-server" control-store status
+  )" || fail "could not check PostgreSQL control-store readiness"
+  DROVER_CONTROL_STORE_STATUS="$status" \
+    "$DROVER_HOME/runtime/current/bin/python" -c \
+    'import json, os, sys; sys.exit(0 if json.loads(os.environ["DROVER_CONTROL_STORE_STATUS"]).get("ready") is True else 1)' \
+    || fail "PostgreSQL control store is not ready; finish the explicit init or import/verify procedure before starting services"
+  success "PostgreSQL control store is ready"
+}
+
 write_config() {
   local address="$1" host="${1%%:*}" port="${1##*:}"
   [ -f "$DROVER_HOME/config.toml" ] \
-    || "$DROVER_HOME/runtime/current/bin/drover-server" init >/dev/null 2>&1 || true
+    || "$DROVER_HOME/runtime/current/bin/drover-server" init >/dev/null 2>&1 \
+    || fail "could not create the initial config.toml"
   # The bind and the advertised address live in config, never only in a unit's
   # argv: a regenerated unit that dropped the flag would silently revert the
   # server to loopback, which has happened before and is invisible until the
@@ -359,11 +542,11 @@ PY
 #   mode "join"  installs harnessd only: a joining machine must not start a
 #                second hub, which would give the fleet two control planes.
 install_units() {
-  local mode="$1" central_url="$2" extra="${3:-}"
+  local mode="$1" central_url="$2" extra="${3:-}" server_env_file="${4:-}"
   local host_id; host_id="$(hostname -s 2>/dev/null || echo drover-host)"
   local bin="$DROVER_HOME/runtime/current/bin"
   "$bin/python" - "$OS" "$HOME" "$DROVER_HOME" "$host_id" "$mode" \
-    "$central_url" "$extra" <<'PY'
+    "$central_url" "$extra" "$server_env_file" <<'PY'
 import sys
 from pathlib import Path
 from drover.server.service_units import render_launchd, render_systemd, runtime_bin
@@ -371,7 +554,7 @@ from drover.server.service_units import render_launchd, render_systemd, runtime_
 os_name = sys.argv[1]
 home = Path(sys.argv[2])
 drover_home = Path(sys.argv[3])
-host_id, mode, central_url, extra = sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
+host_id, mode, central_url, extra, server_env_file = sys.argv[4:]
 
 bin_dir = runtime_bin(drover_home)
 path_entries = [str(bin_dir), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
@@ -379,26 +562,47 @@ path_entries = [str(bin_dir), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin",
 harnessd_args = ["--host-id", host_id, "--central-url", central_url]
 harnessd_args += [part for part in extra.split() if part]
 
-jobs = [("harnessd", str(bin_dir / "drover-harnessd"), harnessd_args)]
+jobs = [("harnessd", str(bin_dir / "drover-harnessd"), harnessd_args, None)]
 if mode == "fleet":
-    jobs.insert(0, ("server", str(bin_dir / "drover-server"), ["run"]))
+    jobs.insert(
+        0,
+        (
+            "server",
+            str(bin_dir / "drover-server"),
+            ["run"],
+            Path(server_env_file) if server_env_file else None,
+        ),
+    )
 
 if os_name == "darwin":
     target = home / "Library" / "LaunchAgents"
     target.mkdir(parents=True, exist_ok=True)
     (home / "Library" / "Logs" / "drover").mkdir(parents=True, exist_ok=True)
-    for short, program, args in jobs:
+    for short, program, args, environment_file in jobs:
         label = f"com.drover.{short}"
         (target / f"{label}.plist").write_text(
-            render_launchd(label, program, args, home=home, path_entries=path_entries)
+            render_launchd(
+                label,
+                program,
+                args,
+                home=home,
+                path_entries=path_entries,
+                environment_file=environment_file,
+            )
         )
         print(str(target / f"{label}.plist"))
 else:
     target = home / ".config" / "systemd" / "user"
     target.mkdir(parents=True, exist_ok=True)
-    for short, program, args in jobs:
+    for short, program, args, environment_file in jobs:
         (target / f"drover-{short}.service").write_text(
-            render_systemd(f"Drover {short}", program, args, path_entries=path_entries)
+            render_systemd(
+                f"Drover {short}",
+                program,
+                args,
+                path_entries=path_entries,
+                environment_file=environment_file,
+            )
         )
         print(str(target / f"drover-{short}.service"))
 PY
@@ -570,8 +774,28 @@ if [ -n "$JOIN_URL" ]; then
   info "This machine is now part of the fleet at $HUB_ADDRESS."
   info "It will appear in the app shortly."
 else
+  fresh_central_config=0
+  [ -f "$DROVER_HOME/config.toml" ] || fresh_central_config=1
+  control_store_settings="$(control_store_settings)" \
+    || fail "could not read the existing control-store configuration"
+  IFS=$'\t' read -r control_store_backend control_store_dsn_env <<EOF
+$control_store_settings
+EOF
+  [ -n "$control_store_backend" ] \
+    || fail "could not determine the control-store configuration"
+  CONTROL_STORE_ENV_FILE=""
+  if [ "$control_store_backend" = "postgres" ]; then
+    write_control_store_environment "$control_store_dsn_env"
+  fi
   write_config "$ADDRESS"
-  install_units fleet "http://${ADDRESS}"
+  if [ "$control_store_backend" = "postgres" ]; then
+    if [ "$fresh_central_config" -eq 1 ]; then
+      initialize_control_store
+    else
+      verify_control_store_ready
+    fi
+  fi
+  install_units fleet "http://${ADDRESS}" "" "$CONTROL_STORE_ENV_FILE"
   if [ "$NO_START" -eq 1 ]; then
     info "automation mode: service definitions were written but services were not started; hub readiness and pairing were not checked"
   else

@@ -106,6 +106,7 @@ from pathlib import Path
 
 import duckdb
 
+from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
     ControlPlaneBusy,
     control_plane_connection,
@@ -270,6 +271,7 @@ class ReadinessProbe:
         self,
         duckdb_path: str | Path,
         *,
+        include_analytical: bool = True,
         cache_seconds: float | None = None,
         busy_grace_seconds: float = DEFAULT_BUSY_GRACE_SECONDS,
         connect_failure_window: float = DEFAULT_CONNECT_FAILURE_WINDOW_SECONDS,
@@ -278,6 +280,7 @@ class ReadinessProbe:
         time_source=time.monotonic,
     ) -> None:
         self._duckdb_path = Path(duckdb_path)
+        self._include_analytical = include_analytical
         self._cache_seconds = (
             _cache_seconds_default()
             if cache_seconds is None
@@ -320,25 +323,27 @@ class ReadinessProbe:
         if cached is not None:
             return cached
         now = self._time()
-        analytical = self._probe_analytical(now)
+        analytical = self._probe_analytical(now) if self._include_analytical else None
         if self._probe_gate.acquire(blocking=False):
             try:
                 with self._lock:
                     self._probe_started_at = now
                 control_plane = self._probe_control_plane(now)
-                report = ReadinessReport(
-                    stores=(analytical, control_plane), checked_at=time.time()
+                stores = (
+                    (control_plane,)
+                    if analytical is None
+                    else (analytical, control_plane)
                 )
+                report = ReadinessReport(stores=stores, checked_at=time.time())
                 self._remember(report)
                 return report
             finally:
                 with self._lock:
                     self._probe_started_at = None
                 self._probe_gate.release()
-        return ReadinessReport(
-            stores=(analytical, self._control_plane_while_probing(now)),
-            checked_at=time.time(),
-        )
+        control_plane = self._control_plane_while_probing(now)
+        stores = (control_plane,) if analytical is None else (analytical, control_plane)
+        return ReadinessReport(stores=stores, checked_at=time.time())
 
     def _fresh_verdict(self) -> ReadinessReport | None:
         """The cached verdict, while it is both good and recent enough."""
@@ -494,7 +499,7 @@ class ReadinessProbe:
         still a failure: the bound is on waiting, not on believing.
         """
         path = control_plane_path(self._duckdb_path)
-        if not path.exists():
+        if not path.exists() and not is_postgres_control_store(self._duckdb_path):
             # Connecting would create it. A readiness poll must not bootstrap
             # a store as a side effect.
             return StoreProbe(

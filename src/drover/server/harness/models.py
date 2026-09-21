@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 #: How long a direct host may go without a heartbeat before it counts as stale.
 #:
@@ -155,6 +155,14 @@ class HarnessSession:
 
 
 @dataclass(frozen=True)
+class EventPayloadStatus:
+    """Availability of the complete envelope, separate from its preview."""
+
+    state: Literal["hot", "archive", "unavailable"] = "hot"
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class HarnessEvent:
     event_id: str
     session_id: str
@@ -163,6 +171,7 @@ class HarnessEvent:
     normalized_source: str | None = None
     content_preview: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+    payload_status: EventPayloadStatus = field(default_factory=EventPayloadStatus)
     created_at: datetime | None = None
     seq: int | None = None
 
@@ -173,6 +182,10 @@ class HarnessEvent:
         payload["event_id"] = self.event_id
         payload["session_id"] = self.session_id
         payload["seq"] = self.seq
+        if self.payload_status.state == "unavailable":
+            # Never substitute a preview for missing archival bytes.  Task 3
+            # maps this explicit marker to its API response.
+            payload["payload_unavailable"] = {"reason": self.payload_status.reason}
         # Shell output already rides in `text`. The codex adapter used to put
         # a second copy in the payload as well, which on a live session was
         # 992KB across 236 tool results — for a field nothing has ever read.
@@ -188,6 +201,12 @@ class HarnessEvent:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "HarnessEvent":
+        raw_state = str(row.get("payload_state") or "hot")
+        state: Literal["hot", "archive", "unavailable"] = (
+            raw_state
+            if raw_state in {"hot", "archive", "unavailable"}
+            else "unavailable"
+        )  # type: ignore[assignment]
         return cls(
             event_id=row["event_id"],
             session_id=row["session_id"],
@@ -196,6 +215,9 @@ class HarnessEvent:
             normalized_source=row.get("normalized_source"),
             content_preview=row.get("content_preview"),
             payload=_loads_object(row.get("payload_json")),
+            payload_status=EventPayloadStatus(
+                state=state, reason=row.get("payload_reason")
+            ),
             created_at=row.get("created_at"),
             seq=row.get("seq"),
         )

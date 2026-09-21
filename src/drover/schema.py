@@ -25,6 +25,10 @@ import duckdb
 
 from drover.agent_aliases import canonicalize_sql
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.control_store import (
+    is_postgres_control_store,
+    postgres_control_store,
+)
 from drover.server.db import (
     CONTROL_PLANE_PRIMARY_KEYS,
     CONTROL_PLANE_TABLES,
@@ -1882,6 +1886,9 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
     that repeatedly wedged the hub.
     """
     registry_path = control_plane_path(duckdb_path)
+    if is_postgres_control_store(duckdb_path):
+        postgres_control_store(duckdb_path).bootstrap()
+        return registry_path
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     with control_plane_connection(registry_path) as con:
         con.execute(_LIVE_SESSION_RECAPS_DDL)
@@ -2338,8 +2345,11 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
         con.execute(_PIPELINE_ARTIFACTS_DDL)
         con.execute(_ADVISORY_CHECK_REQUESTS_DDL)
         con.execute(_PROVIDER_CONNECTIONS_DDL)
+        postgres_control = is_postgres_control_store(duckdb_path)
         bootstrap_control_plane_store(duckdb_path)
-        copied_control_plane_rows = migrate_control_plane_tables(con, duckdb_path)
+        copied_control_plane_rows = (
+            {} if postgres_control else migrate_control_plane_tables(con, duckdb_path)
+        )
         if copied_control_plane_rows.get("session_usage"):
             # The first control-plane bootstrap runs before migration. Reopen
             # it only when a legacy compatibility row was copied so the

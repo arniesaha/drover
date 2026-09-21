@@ -205,8 +205,8 @@ box(498, 300, 706, 372, TINT_TEAL, (206, 232, 228), r=9)
 T(514, 312, "Harness API", 15, DEMI)
 T(514, 338, "HTTP + WebSocket · :7080", 11, REG, (40, 96, 90), mono=True)
 box(718, 300, 940, 372, TINT_TEAL, (206, 232, 228), r=9)
-T(734, 312, "Fleet registry", 15, DEMI)
-T(734, 338, "host state + session routing", 11, REG, (71, 85, 105))
+T(734, 312, "Control store", 15, DEMI)
+T(734, 338, "PostgreSQL default · fleet state", 11, REG, (71, 85, 105))
 box(498, 384, 940, 456, TINT_TEAL, (206, 232, 228), r=9)
 T(514, 396, "Command coordinator", 15, DEMI)
 T(
@@ -323,11 +323,11 @@ box(668, 668, 1092, 930)
 T(692, 686, "Local data boundary", 17, DEMI)
 T(1068, 690, "~/.drover/", 11, REG, MUTED, anchor="ra", mono=True)
 box(692, 724, 1068, 802, TINT_AMB, (240, 220, 187), r=9)
-T(708, 734, "Parquet facts", 15, DEMI)
+T(708, 734, "Parquet facts + batches", 15, DEMI)
 T(
     708,
     758,
-    "agent_events · spans · pr_events · routing",
+    "facts · immutable control batches",
     11,
     REG,
     (120, 88, 45),
@@ -336,11 +336,11 @@ T(
 T(708, 779, "Append-oriented durable system of record", 11, REG, (146, 110, 61))
 arrow(880, 806, 880, 826, AMBER)
 box(692, 832, 1068, 910, TINT_BLUE, (223, 232, 238), r=9)
-T(708, 842, "DuckDB", 15, DEMI)
+T(708, 842, "Analytical DuckDB", 15, DEMI)
 T(
     708,
     866,
-    "normalized views · operational state · pipeline ledger",
+    "normalized views · derived state · pipeline ledger",
     11,
     REG,
     (71, 85, 105),
@@ -348,7 +348,7 @@ T(
 T(
     708,
     886,
-    "harness hosts/sessions/events/tasks + derived serving state",
+    "tasks + derived context; no split-role control serving",
     11,
     REG,
     (100, 116, 139),
@@ -390,7 +390,7 @@ d.line(
 T(
     1492,
     994,
-    "The host daemon owns execution. Parquet owns durable facts.",
+    "Host daemon owns execution. PostgreSQL serves central control.",
     12,
     REG,
     MUTED,
