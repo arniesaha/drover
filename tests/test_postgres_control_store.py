@@ -22,8 +22,8 @@ def postgres_control_store(tmp_path: Path, monkeypatch):
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 
     from drover.config import ControlStoreConfig
-    from drover.server.control_store import close_control_store, configure_control_store
     from drover.schema import bootstrap_control_plane_store
+    from drover.server.control_store import close_control_store, configure_control_store
 
     schema = f"drover_test_{uuid4().hex}"
     monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
@@ -280,7 +280,7 @@ def test_postgres_bootstrap_serializes_concurrent_starters(tmp_path: Path):
             rows = con.execute(
                 f'SELECT version FROM "{schema}".control_schema_migrations'
             ).fetchall()
-        assert rows == [(1,), (2,)]
+        assert rows == [(1,), (2,), (3,)]
     finally:
         for store in starters:
             store.close()
@@ -321,6 +321,43 @@ def test_postgres_registry_round_trip_preserves_duplicate_event_replay(
     assert [event.event_id for event in registry.list_events(session.session_id)] == [
         "pg-event-1"
     ]
+
+
+def test_postgres_central_content_consent_is_fail_closed_and_monotonic(
+    postgres_control_store, tmp_path: Path
+):
+    control_path, _ = postgres_control_store
+    from drover.config import AdvisoryContentConfig
+    from drover.server.control_consent import CentralContentConsent
+
+    config_path = tmp_path / "config.toml"
+    reader = CentralContentConsent(control_path, legacy_config_path=config_path)
+    config = AdvisoryContentConfig(
+        enabled=False,
+        backend_policy="local",
+        external_consent=False,
+        targets=(),
+        allowed_roots=(),
+        max_file_bytes=1,
+        max_bundle_bytes=1,
+        excerpt_max_chars=1,
+    )
+
+    assert reader.initialize(config).heartbeat() == {"enabled": False, "epoch": 0}
+    enabled = reader.update(
+        enabled=True,
+        backend="local",
+        external_disclosure_accepted=False,
+    )
+    revoked = reader.update(
+        enabled=False,
+        backend="local",
+        external_disclosure_accepted=False,
+    )
+
+    assert enabled.heartbeat() == {"enabled": True, "epoch": 1}
+    assert revoked.heartbeat() == {"enabled": False, "epoch": 2}
+    assert reader.state().heartbeat() == {"enabled": False, "epoch": 2}
 
 
 def test_postgres_client_session_id_concurrency_returns_the_insert_winner(
@@ -600,12 +637,13 @@ def test_postgres_pool_and_statement_deadlines_are_bounded():
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 
+    from psycopg.errors import QueryCanceled
+
     from drover.config import ControlStoreConfig
     from drover.server.postgres_control_store import (
         ControlStoreBusy,
         PostgresControlStore,
     )
-    from psycopg.errors import QueryCanceled
 
     config = ControlStoreConfig(
         backend="postgres",

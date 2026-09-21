@@ -211,6 +211,23 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        3,
+        (
+            # This state is deliberately central rather than a shared config
+            # sidecar: API heartbeats and worker mutations can run on different
+            # machines, while hosts must always see the current epoch.
+            """
+            CREATE TABLE IF NOT EXISTS control_content_consent (
+              singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+              enabled BOOLEAN NOT NULL, epoch BIGINT NOT NULL CHECK (epoch >= 0),
+              backend TEXT NOT NULL, external_disclosure_accepted BOOLEAN NOT NULL,
+              migrated_from_legacy BOOLEAN NOT NULL DEFAULT FALSE,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+        ),
+    ),
 )
 
 

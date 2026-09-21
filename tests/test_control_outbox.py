@@ -20,8 +20,8 @@ def postgres_control_store(tmp_path: Path, monkeypatch):
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 
     from drover.config import ControlStoreConfig
-    from drover.server.control_store import close_control_store, configure_control_store
     from drover.schema import bootstrap
+    from drover.server.control_store import close_control_store, configure_control_store
 
     control_path = tmp_path / "control.duckdb"
     config = ControlStoreConfig(
@@ -53,8 +53,8 @@ def postgres_single_connection_control_store(tmp_path: Path, monkeypatch):
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
     from drover.config import ControlStoreConfig
-    from drover.server.control_store import close_control_store, configure_control_store
     from drover.schema import bootstrap
+    from drover.server.control_store import close_control_store, configure_control_store
 
     control_path = tmp_path / "single-slot-control.duckdb"
     config = ControlStoreConfig(
@@ -404,9 +404,9 @@ def test_outbox_reclaims_stable_batch_and_publishes_only_manifested_parquet(
     from drover.server.control_outbox import (
         acknowledge_outbox_batch,
         claim_outbox_batch,
-        register_published_harness_events_relation,
         publish_outbox_batch,
         published_batches,
+        register_published_harness_events_relation,
     )
     from drover.server.db import control_plane_connection
     from drover.server.harness.registry import HarnessRegistry
@@ -846,3 +846,120 @@ def test_retention_releases_the_only_postgres_slot_before_archive_resolution(
         "protected_dependency": 0,
         "verification_failed": 0,
     }
+
+
+def test_reopened_session_usage_retries_until_archived_payloads_are_verified(
+    postgres_control_store,
+):
+    """Cold historical usage cannot replace an exact total with a partial one."""
+    control_path, parquet_dir = postgres_control_store
+    from drover.server.control_outbox import (
+        LocalVerifiedArchiveResolver,
+        acknowledge_outbox_batch,
+        claim_outbox_batch,
+        prune_verified_payloads,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.recap_worker import LiveRecapWorker
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.usage_rollup import (
+        UsageRollupWorker,
+        rollup_pending_sessions,
+    )
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(host_id="reopen-host", display_name="Reopen", kind="test")
+    registry.create_session(
+        host_id="reopen-host",
+        harness="claude-code",
+        command="claude",
+        session_id="reopen-session",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id="reopen-session",
+        event_id="reopen-history",
+        event_type="assistant_output",
+        content_preview="earlier bounded recap context",
+        payload={
+            "native_event_id": "reopen-history-native",
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+        },
+        seq=1,
+    )
+    registry.append_event(
+        session_id="reopen-session",
+        event_id="reopen-complete",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=2,
+    )
+    registry.update_session_status("reopen-session", "completed")
+
+    with control_plane_connection(control_path) as con:
+        claim = claim_outbox_batch(con, owner="worker", limit=10)
+        assert claim is not None
+        assert acknowledge_outbox_batch(
+            con, publish_outbox_batch(con, claim, parquet_dir=parquet_dir).batch_id
+        )
+        assert rollup_pending_sessions(con).rolled == 1
+        con.execute("""INSERT INTO live_session_recaps
+               (session_id, recap_text, source_seq, generated_at)
+               VALUES ('reopen-session', 'done', 2, now())""")
+        con.execute(
+            "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
+            ["reopen-session"],
+        )
+
+    def manifest_ids() -> set[str]:
+        with control_plane_connection(control_path) as manifest_con:
+            return {batch.batch_id for batch in published_batches(manifest_con)}
+
+    resolver = LocalVerifiedArchiveResolver(parquet_dir, manifest_reader=manifest_ids)
+    assert prune_verified_payloads(control_path, resolver=resolver)["pruned"] == 2
+    registry.mark_session_recovered("reopen-session", "native-reopen")
+    registry.append_event(
+        session_id="reopen-session",
+        event_id="reopen-new",
+        event_type="assistant_output",
+        content_preview="later bounded recap context",
+        payload={
+            "native_event_id": "reopen-new-native",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        },
+        seq=3,
+    )
+
+    unavailable = UsageRollupWorker(
+        duckdb_path=control_path, archive_resolver=None
+    ).drain_once()
+    assert (unavailable.rolled, unavailable.incomplete_sessions) == (0, 1)
+    with control_plane_connection(control_path) as con:
+        # The old exact total is retained until every archive member is
+        # verified. It is never overwritten by only the newly reopened turn.
+        assert con.execute(
+            "SELECT input_tokens, output_tokens, exact, source_event_count "
+            "FROM session_usage WHERE session_id = ?",
+            ["reopen-session"],
+        ).fetchone() == (10, 1, True, 2)
+
+    recovered = UsageRollupWorker(
+        duckdb_path=control_path, archive_resolver=resolver
+    ).drain_once()
+    assert (recovered.rolled, recovered.incomplete_sessions) == (1, 0)
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT input_tokens, output_tokens, exact, source_event_count "
+            "FROM session_usage WHERE session_id = ?",
+            ["reopen-session"],
+        ).fetchone() == (15, 3, True, 3)
+
+    # Recaps consume the retained bounded preview projection, not an invented
+    # raw payload. A reopened generation still sees both history and new work.
+    previews = LiveRecapWorker(duckdb_path=control_path)._load_events("reopen-session")
+    assert [item["content_preview"] for item in previews] == [
+        "earlier bounded recap context",
+        "later bounded recap context",
+    ]

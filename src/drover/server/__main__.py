@@ -15,9 +15,11 @@ import textwrap
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import urlsplit
 
 import click
 import duckdb
@@ -38,10 +40,10 @@ from drover.config import (
 from drover.schema import (
     EXPECTED_TABLES,
     bootstrap,
+    bootstrap_control_plane_store,
     prune_legacy_control_plane_tables,
 )
 from drover.server import ledger_shadow
-from drover.server.control_store import configure_control_store
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
@@ -54,6 +56,11 @@ from drover.server.advisory.worker import (
     load_operational_snapshot,
     operational_analyzers,
     operational_snapshot_source_version,
+)
+from drover.server.analytics_boundary import (
+    AnalyticsBoundaryClient,
+    HostDataBridgeClient,
+    start_analytics_boundary_server,
 )
 from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
 from drover.server.archive import (
@@ -92,12 +99,6 @@ from drover.server.briefs.worker import (
 from drover.server.cockpit.analytics import AnalyticsFilters
 from drover.server.cockpit.service import CockpitService, ProviderRefreshLoop
 from drover.server.compact import compact_table
-from drover.server.control_migration import (
-    control_store_status,
-    import_legacy_snapshot,
-    initialize_empty_control_store,
-    verify_legacy_import,
-)
 from drover.server.context_catalog import (
     diff_bundle,
     format_diff,
@@ -105,6 +106,17 @@ from drover.server.context_catalog import (
     import_bundle,
     load_bundle,
 )
+from drover.server.control_consent import CentralContentConsent
+from drover.server.control_exporter import ControlOutboxExporter
+from drover.server.control_migration import (
+    control_store_status,
+    import_legacy_snapshot,
+    initialize_empty_control_store,
+    require_control_store_ready,
+    verify_legacy_import,
+)
+from drover.server.control_outbox import LocalVerifiedArchiveResolver, published_batches
+from drover.server.control_store import configure_control_store
 from drover.server.db import (
     CONTROL_PLANE_TABLES,
     close_control_plane_connections,
@@ -166,6 +178,7 @@ from drover.server.watcher import (
     ingest_incoming_file_once,
     sweep_processed,
 )
+from drover.server.web.app import analytics_boundary_dispatcher
 from drover.server.web.auth import load_auth
 from drover.server.web.pairing import PairingCodes
 from drover.server.web.qr import pairing_url, qr_lines
@@ -288,20 +301,29 @@ def _create_content_analysis_worker(
     metrics_collector: MetricsCollector,
     backend_config: SummarizerBackendConfig,
     consent_reader: Callable[[], AdvisoryContentConfig],
+    host_bridge: HostDataBridgeClient | None = None,
 ) -> ContentAnalysisWorker:
     """Compose the content worker from production routing and backend policy."""
 
     def _fetch(host_id: str, target_ids: tuple[str, ...]):
-        payload = metrics_collector.fetch_advisory_content_bundle(
-            host_id, list(target_ids)
+        payload = (
+            host_bridge.fetch_content_bundle(host_id, list(target_ids))
+            if host_bridge is not None
+            else metrics_collector.fetch_advisory_content_bundle(
+                host_id, list(target_ids)
+            )
         )
         return content_bundle_from_payload(
             payload, host_id=host_id, requested_ids=target_ids
         )
 
     def _probe(host_id: str, target_ids: tuple[str, ...]) -> str:
-        payload = metrics_collector.fetch_advisory_content_version(
-            host_id, list(target_ids)
+        payload = (
+            host_bridge.fetch_content_version(host_id, list(target_ids))
+            if host_bridge is not None
+            else metrics_collector.fetch_advisory_content_version(
+                host_id, list(target_ids)
+            )
         )
         bundle_hash = payload.get("bundle_hash")
         if not isinstance(bundle_hash, str):
@@ -339,6 +361,36 @@ incoming_dir = "{home}/.drover/incoming"
 parquet_dir  = "{home}/.drover/parquet"
 duckdb_path  = "{home}/.drover/drover.duckdb"
 processed_retention_days = 7
+
+[control_store]
+# Legacy all-in-one installations keep DuckDB.  Standalone api/analytics
+# roles require postgres so independent processes never contend for DuckDB's
+# single-writer file lock.  Put the DSN in this named environment variable.
+backend = "duckdb"
+dsn_env = ""
+pool_min_size = 1
+pool_max_size = 4
+acquire_timeout_seconds = 2.0
+statement_timeout_seconds = 5.0
+schema = "drover_control"
+
+[runtime]
+# all preserves legacy startup. api owns fleet/control/relay serving; analytics
+# owns ingest, maintenance, derived work, export, and the internal boundary.
+role = "all"
+
+[analytics_boundary]
+# Split roles communicate only on loopback with distinct service-environment
+# tokens. These names reference environment variables; never paste secrets here.
+worker_url = "http://127.0.0.1:7082"
+api_url = "http://127.0.0.1:7080"
+api_to_worker_token_env = "DROVER_API_TO_ANALYTICS_TOKEN"
+worker_to_api_token_env = "DROVER_ANALYTICS_TO_API_TOKEN"
+connect_timeout_seconds = 0.25
+request_timeout_seconds = 10.0
+max_request_bytes = 262144
+max_response_bytes = 4194304
+max_concurrent_requests = 8
 
 [server]
 otlp_grpc_port = 4317
@@ -2646,7 +2698,123 @@ def export_bundle_cmd(
         click.echo(f"wrote {output_path}")
 
 
+def _run_api_role(
+    *,
+    cfg: DroverConfig,
+    config_path: Path,
+    metrics_host: str,
+) -> None:
+    """Run the public/control role without opening any analytical resource."""
+
+    bootstrap_control_plane_store(cfg.duckdb_path)
+    require_control_store_ready(cfg.duckdb_path)
+    consent = CentralContentConsent(cfg.duckdb_path, legacy_config_path=config_path)
+    # An existing file can be migrated once. Missing or malformed state is
+    # inserted disabled, so separating roles never expands content consent.
+    consent.initialize(cfg.advisory_content)
+    auth = load_auth(cfg)
+    _configure_push(cfg, auth)
+    stop = threading.Event()
+    boundary = AnalyticsBoundaryClient(
+        cfg.analytics_boundary,
+        token=os.environ.get(cfg.analytics_boundary.api_to_worker_token_env, ""),
+    )
+    collector = MetricsCollector(
+        duckdb_path=cfg.duckdb_path,
+        incoming_dir=cfg.incoming_dir,
+        summarizer_report={},
+        api_token=auth.api_token if auth.enabled else "",
+        favorite_cwds=cfg.harness_favorite_cwds,
+        content_consent_reader=lambda: consent.state().heartbeat(),
+        include_analytical_readiness=False,
+        analytics_worker_state=boundary.health_state,
+        archive_resolver=boundary,
+        archive_resolver_factory=boundary.page_resolver,
+    )
+    if cfg.update_enabled:
+        planner = UpdatePlanner(cfg, RuntimeLayout(config_home()))
+        collector.update_planner = planner
+        _start_update_checker(planner, cfg, stop)
+    pairing = PairingCodes()
+    metrics_server = start_metrics_server(
+        host=metrics_host,
+        port=cfg.metrics_http_port,
+        collector=collector,
+        auth=auth,
+        pairing=pairing,
+        analytics_boundary=boundary,
+        host_data_bridge_token=os.environ.get(
+            cfg.analytics_boundary.worker_to_api_token_env, ""
+        ),
+    )
+
+    def _on_signal(signum, _frame):
+        log.info("received signal %d; shutting down", signum)
+        stop.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    try:
+        stop.wait()
+    finally:
+        metrics_server.shutdown()
+        metrics_server.server_close()
+        close_control_plane_connections()
+
+
+def _worker_archive_payload_resolver(
+    cfg: DroverConfig,
+) -> LocalVerifiedArchiveResolver | None:
+    """Return a local verifier only for the analytics-capable roles.
+
+    The manifest query is its own short pooled control window; the resolver
+    then opens archive bytes after that connection has been returned.  The
+    API role never calls this helper, so it cannot fall back to direct lake
+    access during a worker outage.
+    """
+    if cfg.control_store.backend != "postgres":
+        return None
+
+    def manifest_reader() -> set[str]:
+        with control_plane_connection(cfg.duckdb_path) as control:
+            return {batch.batch_id for batch in published_batches(control)}
+
+    return LocalVerifiedArchiveResolver(cfg.parquet_dir, manifest_reader)
+
+
+def _analytics_worker_health(
+    exporter: ControlOutboxExporter | None,
+) -> dict[str, Any]:
+    """Expose export lag separately from API control readiness."""
+    if exporter is None:
+        return {"state": "degraded", "outbox": {"enabled": False}}
+    health = exporter.health()
+    oldest = health.get("oldest_outstanding_at")
+    outbox = {
+        key: health.get(key)
+        for key in (
+            "enabled",
+            "pending",
+            "claimed",
+            "published_unacknowledged",
+            "retention_pruned",
+            "retention_verification_failed",
+            "last_error",
+        )
+    }
+    outbox["oldest_outstanding_at"] = (
+        oldest.isoformat() if isinstance(oldest, datetime) else None
+    )
+    return {"state": "degraded" if health.get("last_error") else "ok", "outbox": outbox}
+
+
 @main.command()
+@click.option(
+    "--role",
+    type=click.Choice(["all", "api", "analytics"], case_sensitive=False),
+    default=None,
+    help="Runtime role. Defaults to [runtime] role, then legacy all-in-one mode.",
+)
 @click.option("--no-otlp", is_flag=True, help="Skip starting the OTLP gRPC receiver")
 @click.option(
     "--otlp-host",
@@ -2684,6 +2852,7 @@ def export_bundle_cmd(
 @click.pass_context
 def run(
     ctx: click.Context,
+    role: str | None,
     no_otlp: bool,
     otlp_host: str,
     no_mcp: bool,
@@ -2697,7 +2866,75 @@ def run(
     """Run the watcher + OTLP + MCP + summarizer (foreground).  Ctrl-C to stop."""
     _register_stack_dump()
     cfg = _resolve_config(ctx.obj["config_path"])
+    runtime_config_path = (
+        Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
+    )
+    selected_role = (role or cfg.runtime.role).lower()
+    if selected_role != "all" and cfg.control_store.backend != "postgres":
+        raise click.ClickException(
+            "--role api or analytics requires [control_store] backend = 'postgres'"
+        )
+    if (
+        selected_role == "analytics"
+        and not os.environ.get(
+            cfg.analytics_boundary.api_to_worker_token_env, ""
+        ).strip()
+    ):
+        raise click.ClickException(
+            "--role analytics requires "
+            f"{cfg.analytics_boundary.api_to_worker_token_env}"
+        )
+    if (
+        selected_role == "analytics"
+        and not os.environ.get(
+            cfg.analytics_boundary.worker_to_api_token_env, ""
+        ).strip()
+    ):
+        raise click.ClickException(
+            "--role analytics requires "
+            f"{cfg.analytics_boundary.worker_to_api_token_env}"
+        )
+    if selected_role == "api":
+        ignored = [
+            name
+            for name, present in {
+                "--no-otlp": no_otlp,
+                "--no-mcp": no_mcp,
+                "--no-summarizer": no_summarizer,
+                "--no-briefs": no_briefs,
+                "--no-embeddings": no_embeddings,
+            }.items()
+            if present
+        ]
+        if ignored or no_metrics:
+            flags = ", ".join([*ignored, *(["--no-metrics"] if no_metrics else [])])
+            raise click.UsageError(f"{flags} does not apply to --role api")
+        api_metrics_host = metrics_host or cfg.server_metrics_host
+        _run_api_role(
+            cfg=cfg, config_path=runtime_config_path, metrics_host=api_metrics_host
+        )
+        return
+    if selected_role == "analytics" and (no_metrics or metrics_host is not None):
+        raise click.UsageError(
+            "--no-metrics and --metrics-host do not apply to --role analytics"
+        )
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    central_consent: CentralContentConsent | None = None
+    if cfg.control_store.backend == "postgres":
+        require_control_store_ready(cfg.duckdb_path)
+        central_consent = CentralContentConsent(
+            cfg.duckdb_path, legacy_config_path=runtime_config_path
+        )
+        central_consent.initialize(cfg.advisory_content)
+    host_bridge = (
+        HostDataBridgeClient(
+            cfg.analytics_boundary,
+            token=os.environ.get(cfg.analytics_boundary.worker_to_api_token_env, ""),
+        )
+        if selected_role == "analytics"
+        else None
+    )
+    worker_archive_resolver = _worker_archive_payload_resolver(cfg)
     # After bootstrap, which is what creates and migrates the control-plane
     # store, and before any worker starts, so the one moment the control plane
     # touches a connect lock is a moment when nothing is scanning. Pins the
@@ -2756,6 +2993,24 @@ def run(
         advisory_occurrence_retention_days=cfg.advisory_occurrence_retention_days,
     )
     watcher.start()
+
+    # PostgreSQL events become analytical input only through the durable
+    # manifest relation.  This starts after bootstrap and before derived jobs,
+    # so a worker can resume a published-but-unacknowledged batch before any
+    # analytical reader observes the next pass.
+    outbox_exporter: ControlOutboxExporter | None = None
+    if cfg.control_store.backend == "postgres":
+        try:
+            outbox_exporter = ControlOutboxExporter(
+                control_path=cfg.duckdb_path,
+                analytical_path=cfg.duckdb_path,
+                parquet_dir=cfg.parquet_dir,
+            )
+            outbox_exporter.start(shutdown_event=stop)
+            log.info("control outbox exporter ready")
+        except Exception:  # noqa: BLE001 - control remains available, export lags
+            log.exception("control outbox exporter failed to start")
+            outbox_exporter = None
 
     # One gate per process, shared by the foreground cockpit build and every
     # background analytical pass (#331).
@@ -2829,7 +3084,10 @@ def run(
 
     usage_rollup: UsageRollupWorker | None = None
     try:
-        usage_rollup = UsageRollupWorker(duckdb_path=cfg.duckdb_path)
+        usage_rollup = UsageRollupWorker(
+            duckdb_path=cfg.duckdb_path,
+            archive_resolver=worker_archive_resolver,
+        )
         usage_rollup.start()
         log.info(
             "usage rollup worker ready (interval=%.0fs)", usage_rollup.poll_interval_s
@@ -2933,8 +3191,20 @@ def run(
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
                 advisory_service=InsightsService(
-                    cfg.duckdb_path, config_path=config_path
+                    cfg.duckdb_path,
+                    config_path=config_path,
+                    central_consent=central_consent,
                 ),
+                content_consent_propagator=(
+                    (
+                        lambda enabled, epoch: host_bridge.propagate_content_consent(
+                            enabled=enabled, epoch=epoch
+                        )
+                    )
+                    if host_bridge is not None
+                    else None
+                ),
+                archive_resolver=worker_archive_resolver,
             )
             provider_usage = ProviderUsageService(
                 duckdb_path=cfg.duckdb_path,
@@ -2967,19 +3237,41 @@ def run(
                 metrics_collector.update_planner = planner
                 _start_update_checker(planner, cfg, stop)
 
-            metrics_server = start_metrics_server(
-                host=metrics_host,
-                port=cfg.metrics_http_port,
-                collector=metrics_collector,
-                auth=auth,
-                pairing=pairing,
-            )
+            if selected_role == "analytics":
+                worker_url = urlsplit(cfg.analytics_boundary.worker_url)
+                metrics_server = start_analytics_boundary_server(
+                    host=worker_url.hostname or "127.0.0.1",
+                    port=worker_url.port or 7082,
+                    token=os.environ[cfg.analytics_boundary.api_to_worker_token_env],
+                    config=cfg.analytics_boundary,
+                    dispatch=analytics_boundary_dispatcher(metrics_collector),
+                    archive_payload_resolver=(
+                        worker_archive_resolver.resolve
+                        if worker_archive_resolver is not None
+                        else None
+                    ),
+                    health_provider=lambda: _analytics_worker_health(outbox_exporter),
+                )
+            else:
+                metrics_server = start_metrics_server(
+                    host=metrics_host,
+                    port=cfg.metrics_http_port,
+                    collector=metrics_collector,
+                    auth=auth,
+                    pairing=pairing,
+                )
             _warm_metrics(metrics_collector)
             provider_refresh = ProviderRefreshLoop(
                 provider_usage=provider_usage,
                 registry=HarnessRegistry(cfg.duckdb_path),
                 shutdown_event=stop,
-                fetch=metrics_collector.fetch_harness_provider_usage,
+                fetch=(
+                    lambda host: (
+                        host_bridge.fetch_provider_usage(host.host_id)
+                        if host_bridge is not None
+                        else metrics_collector.fetch_harness_provider_usage(host)
+                    )
+                ),
                 operational_source_version=provider_usage.operational_source_version,
                 on_operational_change=lambda host_id, source_version: enqueue_operational_checks(
                     cfg.duckdb_path,
@@ -2988,11 +3280,17 @@ def run(
                 ),
             )
             provider_refresh.start()
-            log.info(
-                "metrics server starting on %s:%d",
-                metrics_host,
-                cfg.metrics_http_port,
-            )
+            if selected_role == "analytics":
+                log.info(
+                    "analytics boundary starting on %s",
+                    cfg.analytics_boundary.worker_url,
+                )
+            else:
+                log.info(
+                    "metrics server starting on %s:%d",
+                    metrics_host,
+                    cfg.metrics_http_port,
+                )
             if auth.enabled:
                 click.echo(
                     "metrics API auth: enabled "
@@ -3019,8 +3317,20 @@ def run(
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
                 advisory_service=InsightsService(
-                    cfg.duckdb_path, config_path=config_path
+                    cfg.duckdb_path,
+                    config_path=config_path,
+                    central_consent=central_consent,
                 ),
+                content_consent_propagator=(
+                    (
+                        lambda enabled, epoch: host_bridge.propagate_content_consent(
+                            enabled=enabled, epoch=epoch
+                        )
+                    )
+                    if host_bridge is not None
+                    else None
+                ),
+                archive_resolver=worker_archive_resolver,
             )
         content_backend_cfg = SummarizerBackendConfig.from_runtime(
             api_model=cfg.summarizer_api_model,
@@ -3032,11 +3342,25 @@ def run(
             gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
             wake_timeout_s=cfg.summarizer_wake_timeout_s,
         )
+        if central_consent is None:
+            consent_reader = lambda: load_config(config_path).advisory_content
+        else:
+
+            def consent_reader() -> AdvisoryContentConfig:
+                state = central_consent.state()
+                return replace(
+                    cfg.advisory_content,
+                    enabled=state.enabled,
+                    backend_policy=state.backend,
+                    external_consent=state.external_disclosure_accepted,
+                )
+
         content_advisory_worker = _create_content_analysis_worker(
             cfg=cfg,
             metrics_collector=metrics_collector,
             backend_config=content_backend_cfg,
-            consent_reader=lambda: load_config(config_path).advisory_content,
+            consent_reader=consent_reader,
+            host_bridge=host_bridge,
         )
         content_advisory_worker.start(
             shutdown_event=stop,
@@ -3213,8 +3537,11 @@ def run(
             usage_rollup.stop()
         if native_usage_rollup is not None:
             native_usage_rollup.stop()
+        if outbox_exporter is not None:
+            outbox_exporter.stop()
         if metrics_server is not None:
             metrics_server.shutdown()
+            metrics_server.server_close()
         if receiver is not None:
             receiver.stop()
         watcher.stop()

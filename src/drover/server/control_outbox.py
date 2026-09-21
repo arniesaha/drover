@@ -530,20 +530,31 @@ def register_published_harness_events_relation(
 def outbox_status(con: object) -> dict[str, Any]:
     """Return bounded exporter freshness without suggesting a global cursor."""
     if not is_postgres_connection(con):
-        return {"enabled": False, "pending": 0, "oldest_pending_at": None}
+        return {
+            "enabled": False,
+            "pending": 0,
+            "claimed": 0,
+            "published_unacknowledged": 0,
+            "oldest_pending_at": None,
+            "oldest_outstanding_at": None,
+        }
     row = con.execute("""
         SELECT count(*) FILTER (WHERE state = 'pending'),
                min(committed_at) FILTER (WHERE state = 'pending'),
+               count(*) FILTER (WHERE state = 'claimed'),
                count(*) FILTER (WHERE state = 'published'),
-               count(*) FILTER (WHERE state = 'acknowledged')
+               count(*) FILTER (WHERE state = 'acknowledged'),
+               min(committed_at) FILTER (WHERE state IN ('pending', 'claimed', 'published'))
           FROM control_outbox_events
         """).fetchone()
     return {
         "enabled": True,
         "pending": int(row[0] or 0),
         "oldest_pending_at": row[1],
-        "published_unacknowledged": int(row[2] or 0),
-        "acknowledged": int(row[3] or 0),
+        "claimed": int(row[2] or 0),
+        "published_unacknowledged": int(row[3] or 0),
+        "acknowledged": int(row[4] or 0),
+        "oldest_outstanding_at": row[5],
     }
 
 
