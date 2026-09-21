@@ -365,3 +365,130 @@ def test_invalid_http_phase_stops_before_background_drain(monkeypatch):
     with pytest.raises(BENCHMARK.BenchmarkContractError, match="outage.*errors"):
         BENCHMARK.record_checked_http_phase(report, "outage")
     assert report["phases"] == [failed]
+
+
+def test_background_progress_probe_retries_one_query_canceled_then_progresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    psycopg_errors = pytest.importorskip("psycopg.errors")
+    probe = BENCHMARK.BackgroundProgressProbe()
+    status_calls = 0
+
+    def status(_control_path: Path) -> dict[str, int]:
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls == 1:
+            raise psycopg_errors.QueryCanceled("temporary statement deadline")
+        return {
+            "pending": 0,
+            "claimed": 0,
+            "published_unacknowledged": 0,
+            "acknowledged": 1,
+        }
+
+    class RunningProcess:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(BENCHMARK, "_outbox_status_for_path", status)
+    monkeypatch.setattr(BENCHMARK.time, "sleep", lambda _seconds: None)
+
+    assert (
+        BENCHMARK._wait_for_worker_progress(
+            process=RunningProcess(),
+            control_path=Path("synthetic-control"),
+            baseline_acknowledged=0,
+            minimum_acknowledged=1,
+            progress_probe=probe,
+        )["acknowledged"]
+        == 1
+    )
+    assert probe.error_counts == {"postgres_query_canceled": 1}
+    assert probe.consecutive_failures == 0
+    assert BENCHMARK.BACKGROUND_PROGRESS_PROBE_INTERVAL_SECONDS == 1.0
+
+
+def test_background_progress_probe_retries_control_store_busy_then_progresses() -> None:
+    from drover.server.postgres_control_store import ControlStoreBusy
+
+    probe = BENCHMARK.BackgroundProgressProbe()
+    attempts = 0
+
+    def sampled() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ControlStoreBusy("pool exhausted")
+        return "sampled"
+
+    assert probe.sample(sampled) is None
+    assert probe.sample(sampled) == "sampled"
+    assert probe.error_counts == {"control_store_busy": 1}
+    assert probe.consecutive_failures == 0
+
+
+def test_background_progress_probe_fails_after_three_consecutive_transients() -> None:
+    from drover.server.postgres_control_store import ControlStoreBusy
+
+    probe = BENCHMARK.BackgroundProgressProbe()
+
+    assert (
+        probe.sample(lambda: (_ for _ in ()).throw(ControlStoreBusy("first"))) is None
+    )
+    assert (
+        probe.sample(lambda: (_ for _ in ()).throw(ControlStoreBusy("second"))) is None
+    )
+    with pytest.raises(
+        BENCHMARK.BenchmarkContractError,
+        match="background progress probe failed three consecutive times",
+    ):
+        probe.sample(lambda: (_ for _ in ()).throw(ControlStoreBusy("third")))
+    assert probe.error_counts == {"control_store_busy": 3}
+
+
+def test_background_progress_probe_does_not_swallow_nontransient_faults() -> None:
+    probe = BENCHMARK.BackgroundProgressProbe()
+
+    with pytest.raises(RuntimeError, match="unexpected query fault"):
+        probe.sample(
+            lambda: (_ for _ in ()).throw(RuntimeError("unexpected query fault"))
+        )
+    assert probe.error_counts == {}
+
+
+def test_failure_report_preserves_probe_counters_and_safe_fixed_reason() -> None:
+    probe = BENCHMARK.BackgroundProgressProbe()
+    probe.error_counts.update({"postgres_query_canceled": 2, "control_store_busy": 1})
+    report = {"stage": "worker_export_drain"}
+
+    BENCHMARK.record_benchmark_failure(
+        report,
+        BENCHMARK.BenchmarkContractError(
+            BENCHMARK.BACKGROUND_PROGRESS_PROBE_FAILURE_REASON
+        ),
+        progress_probe=probe,
+    )
+
+    assert report["background_progress_probe_errors"] == {
+        "control_store_busy": 1,
+        "postgres_query_canceled": 2,
+    }
+    assert report["failure"] == {
+        "stage": "worker_export_drain",
+        "type": "BenchmarkContractError",
+        "reason": "background progress probe failed three consecutive times",
+    }
+
+    unsafe_report = {"stage": "worker_export_drain"}
+    BENCHMARK.record_benchmark_failure(
+        unsafe_report,
+        BENCHMARK.BenchmarkContractError("postgresql://sensitive@localhost"),
+        progress_probe=probe,
+    )
+    assert "reason" not in unsafe_report["failure"]
+    assert (
+        unsafe_report["background_progress_probe_errors"]
+        == report["background_progress_probe_errors"]
+    )

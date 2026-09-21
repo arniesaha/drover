@@ -32,7 +32,8 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,10 +50,73 @@ WRITER_THREADS = 4
 INSERT_BATCH_SIZE = 100
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 1_800
 EXPECTED_WORKER_OUTAGE_ERROR = "analytics worker unavailable"
+BACKGROUND_PROGRESS_PROBE_INTERVAL_SECONDS = 1.0
+MAX_CONSECUTIVE_BACKGROUND_PROGRESS_PROBE_FAILURES = 3
+BACKGROUND_PROGRESS_PROBE_FAILURE_REASON = (
+    "background progress probe failed three consecutive times"
+)
+_SAFE_BENCHMARK_FAILURE_REASONS = frozenset(
+    {
+        BACKGROUND_PROGRESS_PROBE_FAILURE_REASON,
+        "analytics worker did not acknowledge its declared backlog",
+        "configured analytics worker did not drain the export backlog",
+        "configured analytics worker did not finish retention",
+    }
+)
 
 
 class BenchmarkContractError(RuntimeError):
     """The workload did not demonstrate the bounded benchmark contract."""
+
+
+def _transient_background_progress_probe_error(
+    exc: BaseException,
+) -> str | None:
+    """Classify only locally retryable serving-store probe failures.
+
+    The benchmark is importable in legacy environments without the PostgreSQL
+    extra, so QueryCanceled remains a local import rather than a module import.
+    """
+
+    from drover.server.postgres_control_store import ControlStoreBusy
+
+    if isinstance(exc, ControlStoreBusy):
+        return "control_store_busy"
+    try:
+        from psycopg.errors import QueryCanceled
+    except ImportError:
+        return None
+    if isinstance(exc, QueryCanceled):
+        return "postgres_query_canceled"
+    return None
+
+
+@dataclass
+class BackgroundProgressProbe:
+    """Bound transient monitor reads without hiding a failed benchmark."""
+
+    error_counts: Counter[str] = field(default_factory=Counter)
+    consecutive_failures: int = 0
+
+    def sample(self, operation: Callable[[], Any]) -> Any | None:
+        try:
+            result = operation()
+        except Exception as exc:
+            error_kind = _transient_background_progress_probe_error(exc)
+            if error_kind is None:
+                raise
+            self.error_counts[error_kind] += 1
+            self.consecutive_failures += 1
+            if (
+                self.consecutive_failures
+                >= MAX_CONSECUTIVE_BACKGROUND_PROGRESS_PROBE_FAILURES
+            ):
+                raise BenchmarkContractError(
+                    BACKGROUND_PROGRESS_PROBE_FAILURE_REASON
+                ) from exc
+            return None
+        self.consecutive_failures = 0
+        return result
 
 
 def synthetic_child_environment(
@@ -201,6 +265,38 @@ def finalize_benchmark_outcome(report: dict[str, Any]) -> int:
         return 1
     report["outcome"] = "passed"
     return 0
+
+
+def record_background_progress_probe_errors(
+    report: dict[str, Any], progress_probe: BackgroundProgressProbe
+) -> None:
+    """Persist sanitized monitor error counts for successful and failed runs."""
+
+    report["background_progress_probe_errors"] = dict(
+        sorted(progress_probe.error_counts.items())
+    )
+
+
+def record_benchmark_failure(
+    report: dict[str, Any],
+    exc: BaseException,
+    *,
+    progress_probe: BackgroundProgressProbe,
+) -> None:
+    """Record only a whitelisted benchmark reason alongside probe counters."""
+
+    record_background_progress_probe_errors(report, progress_probe)
+    report["outcome"] = "failed"
+    failure = {
+        "stage": str(report.get("stage", "bootstrap")),
+        "type": type(exc).__name__,
+    }
+    if (
+        isinstance(exc, BenchmarkContractError)
+        and str(exc) in _SAFE_BENCHMARK_FAILURE_REASONS
+    ):
+        failure["reason"] = str(exc)
+    report["failure"] = failure
 
 
 def _free_loopback_port() -> int:
@@ -553,19 +649,24 @@ def _wait_for_worker_progress(
     control_path: Path,
     baseline_acknowledged: int,
     minimum_acknowledged: int,
+    progress_probe: BackgroundProgressProbe | None = None,
 ) -> dict[str, int]:
     """Require the actual analytics process to make bounded export progress."""
 
+    progress_probe = progress_probe or BackgroundProgressProbe()
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise BenchmarkContractError(
                 f"analytics worker exited while draining ({process.returncode})"
             )
-        status = _outbox_status_for_path(control_path)
-        if status["acknowledged"] >= baseline_acknowledged + minimum_acknowledged:
+        status = progress_probe.sample(lambda: _outbox_status_for_path(control_path))
+        if (
+            status is not None
+            and status["acknowledged"] >= baseline_acknowledged + minimum_acknowledged
+        ):
             return status
-        time.sleep(0.1)
+        time.sleep(BACKGROUND_PROGRESS_PROBE_INTERVAL_SECONDS)
     raise BenchmarkContractError(
         "analytics worker did not acknowledge its declared backlog"
     )
@@ -590,9 +691,11 @@ def _wait_for_real_worker_drain(
     control_path: Path,
     required_event_ids: list[str],
     timeout_seconds: float,
+    progress_probe: BackgroundProgressProbe | None = None,
 ) -> dict[str, int]:
     """Wait for the configured runtime exporter, with periodic progress output."""
 
+    progress_probe = progress_probe or BackgroundProgressProbe()
     deadline = time.monotonic() + timeout_seconds
     next_progress = 0.0
     while time.monotonic() < deadline:
@@ -600,24 +703,30 @@ def _wait_for_real_worker_drain(
             raise BenchmarkContractError(
                 f"analytics worker exited while draining ({process.returncode})"
             )
-        status = _outbox_status_for_path(control_path)
-        states = _outbox_event_states(control_path, required_event_ids)
-        if (
-            len(states) == len(required_event_ids)
-            and all(state == "acknowledged" for state in states.values())
-            and status["pending"] == 0
-            and status["claimed"] == 0
-            and status["published_unacknowledged"] == 0
-        ):
-            return status
+        sample = progress_probe.sample(
+            lambda: (
+                _outbox_status_for_path(control_path),
+                _outbox_event_states(control_path, required_event_ids),
+            )
+        )
+        if sample is not None:
+            status, states = sample
+            if (
+                len(states) == len(required_event_ids)
+                and all(state == "acknowledged" for state in states.values())
+                and status["pending"] == 0
+                and status["claimed"] == 0
+                and status["published_unacknowledged"] == 0
+            ):
+                return status
         now = time.monotonic()
-        if now >= next_progress:
+        if sample is not None and now >= next_progress:
             print(
                 "worker export progress " + json.dumps(status, sort_keys=True),
                 flush=True,
             )
             next_progress = now + 30
-        time.sleep(0.25)
+        time.sleep(BACKGROUND_PROGRESS_PROBE_INTERVAL_SECONDS)
     raise BenchmarkContractError(
         "configured analytics worker did not drain the export backlog"
     )
@@ -628,11 +737,21 @@ def _wait_for_real_worker_retention(
     process: subprocess.Popen[bytes],
     control_path: Path,
     timeout_seconds: float,
+    progress_probe: BackgroundProgressProbe | None = None,
 ) -> int:
     """Wait for the runtime worker's declared 100-candidate retention passes."""
 
     from drover.server.db import control_plane_connection
 
+    def remaining_hot_payloads() -> int:
+        with control_plane_connection(control_path) as connection:
+            return int(
+                connection.execute(
+                    "SELECT count(*) FROM harness_event_payloads"
+                ).fetchone()[0]
+            )
+
+    progress_probe = progress_probe or BackgroundProgressProbe()
     deadline = time.monotonic() + timeout_seconds
     next_progress = 0.0
     while time.monotonic() < deadline:
@@ -640,22 +759,17 @@ def _wait_for_real_worker_retention(
             raise BenchmarkContractError(
                 f"analytics worker exited during retention ({process.returncode})"
             )
-        with control_plane_connection(control_path) as connection:
-            remaining = int(
-                connection.execute(
-                    "SELECT count(*) FROM harness_event_payloads"
-                ).fetchone()[0]
-            )
+        remaining = progress_probe.sample(remaining_hot_payloads)
         if remaining == 0:
             return remaining
         now = time.monotonic()
-        if now >= next_progress:
+        if remaining is not None and now >= next_progress:
             print(
                 f"worker retention progress remaining_hot_payloads={remaining}",
                 flush=True,
             )
             next_progress = now + 30
-        time.sleep(0.25)
+        time.sleep(BACKGROUND_PROGRESS_PROBE_INTERVAL_SECONDS)
     raise BenchmarkContractError("configured analytics worker did not finish retention")
 
 
@@ -734,19 +848,29 @@ def _missing_exact_usage_sessions(
 
 
 def _wait_for_exact_usage_watermarks(
-    *, control_path: Path, session_ids: list[str], timeout_seconds: float = 90.0
+    *,
+    control_path: Path,
+    session_ids: list[str],
+    timeout_seconds: float = 90.0,
+    progress_probe: BackgroundProgressProbe | None = None,
 ) -> float:
     """Require the running worker to persist exact current session usage."""
 
+    progress_probe = progress_probe or BackgroundProgressProbe()
     started = time.monotonic()
     deadline = started + timeout_seconds
+    missing_count = len(session_ids)
     while time.monotonic() < deadline:
-        if not _missing_exact_usage_sessions(control_path, session_ids):
+        missing = progress_probe.sample(
+            lambda: _missing_exact_usage_sessions(control_path, session_ids)
+        )
+        if missing is not None:
+            missing_count = len(missing)
+        if missing == []:
             return time.monotonic() - started
-        time.sleep(0.25)
-    missing = len(_missing_exact_usage_sessions(control_path, session_ids))
+        time.sleep(BACKGROUND_PROGRESS_PROBE_INTERVAL_SECONDS)
     raise BenchmarkContractError(
-        f"analytics worker did not persist exact usage for {missing} session(s)"
+        f"analytics worker did not persist exact usage for {missing_count} session(s)"
     )
 
 
@@ -905,6 +1029,7 @@ def main() -> int:
     worker_process: subprocess.Popen[bytes] | None = None
     api_log = (run_root / "api.log").open("wb")
     worker_log = (run_root / "worker.log").open("wb")
+    progress_probe = BackgroundProgressProbe()
     fixture_started = time.monotonic()
     report: dict[str, Any] = {
         "benchmark": "postgres_control_plane_synthetic_http",
@@ -912,6 +1037,7 @@ def main() -> int:
         "outcome": "running",
         "stage": "bootstrap",
         "phases": [],
+        "background_progress_probe_errors": {},
         "limits": {
             "p99_target_ms": 250,
             "minimum_percentile_samples": MIN_PERCENTILE_SAMPLES,
@@ -1081,6 +1207,7 @@ def main() -> int:
             control_path=control_path,
             baseline_acknowledged=normal_backlog["acknowledged"],
             minimum_acknowledged=100,
+            progress_probe=progress_probe,
         )
         report["analytics_worker_normal_progress"] = {
             "before": normal_backlog,
@@ -1173,6 +1300,7 @@ def main() -> int:
             control_path=control_path,
             baseline_acknowledged=outage_backlog["acknowledged"],
             minimum_acknowledged=100,
+            progress_probe=progress_probe,
         )
         report["analytics_worker_recovery_progress"] = {
             "before": outage_backlog,
@@ -1200,6 +1328,7 @@ def main() -> int:
             control_path=control_path,
             required_event_ids=outage_event_ids,
             timeout_seconds=args.drain_timeout_seconds,
+            progress_probe=progress_probe,
         )
         report["analytics_worker_full_export_drain"] = {
             "elapsed_seconds": round(time.monotonic() - export_drain_started, 3),
@@ -1211,7 +1340,9 @@ def main() -> int:
         complete_benchmark_sessions(registry, session_ids)
         report["stage"] = "usage_validation"
         usage_wait_seconds = _wait_for_exact_usage_watermarks(
-            control_path=control_path, session_ids=session_ids
+            control_path=control_path,
+            session_ids=session_ids,
+            progress_probe=progress_probe,
         )
         recap_rows = _mark_terminal_recap_dependencies_done(control_path)
         if recap_rows != args.sessions:
@@ -1234,6 +1365,7 @@ def main() -> int:
             process=worker_process,
             control_path=control_path,
             timeout_seconds=args.drain_timeout_seconds,
+            progress_probe=progress_probe,
         )
         report["analytics_worker_retention"] = {
             "elapsed_seconds": round(time.monotonic() - retention_started, 3),
@@ -1288,17 +1420,14 @@ def main() -> int:
                 "one or more benchmark phases lacked p99 samples"
             )
         outcome_status = finalize_benchmark_outcome(report)
+        record_background_progress_probe_errors(report, progress_probe)
         args.output.write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         print(json.dumps(report, indent=2, sort_keys=True))
         return outcome_status
     except BaseException as exc:
-        report["outcome"] = "failed"
-        report["failure"] = {
-            "stage": str(report.get("stage", "bootstrap")),
-            "type": type(exc).__name__,
-        }
+        record_benchmark_failure(report, exc, progress_probe=progress_probe)
         args.output.write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
