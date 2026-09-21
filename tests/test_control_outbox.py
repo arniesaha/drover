@@ -613,10 +613,15 @@ def test_outbox_directory_sync_failure_retries_existing_final_before_manifesting
     claim = _seed_outbox_claim(control_path, event_id="directory-sync-event")
     path = parquet_dir / PUBLISHED_BATCHES_DIR / f"{claim.batch_id}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
+    batches_identity = os.stat(path.parent)
     actual_fsync = os.fsync
 
     def fail_directory_sync(descriptor: int) -> None:
-        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) == (
+            batches_identity.st_dev,
+            batches_identity.st_ino,
+        ):
             raise OSError("injected directory sync failure")
         actual_fsync(descriptor)
 
@@ -651,6 +656,73 @@ def test_outbox_directory_sync_failure_retries_existing_final_before_manifesting
         published = publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
         assert published.content_sha256 == crash_hash
         assert acknowledge_outbox_batch(con, published.batch_id) is True
+
+
+def test_outbox_retries_new_batch_directory_parent_sync_before_manifesting(
+    postgres_control_store, monkeypatch
+):
+    """A created batches directory remains unmanifested until its parent syncs."""
+    control_path, parquet_dir = postgres_control_store
+    import drover.server.control_outbox as outbox
+    from drover.server.control_outbox import (
+        PUBLISHED_BATCHES_DIR,
+        acknowledge_outbox_batch,
+        prune_verified_payloads,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+
+    claim = _seed_outbox_claim(control_path, event_id="new-directory-parent-event")
+    batches_directory = parquet_dir / PUBLISHED_BATCHES_DIR
+    final_path = batches_directory / f"{claim.batch_id}.parquet"
+    parent_identity = os.stat(parquet_dir)
+    actual_fsync = os.fsync
+
+    def fail_new_batches_parent_sync(descriptor: int) -> None:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) == (
+            parent_identity.st_dev,
+            parent_identity.st_ino,
+        ):
+            raise OSError("injected new batches parent sync failure")
+        actual_fsync(descriptor)
+
+    monkeypatch.setattr(outbox, "os", os, raising=False)
+    with monkeypatch.context() as failure:
+        failure.setattr(os, "fsync", fail_new_batches_parent_sync)
+        with control_plane_connection(control_path) as con:
+            with pytest.raises(
+                OSError, match="injected new batches parent sync failure"
+            ):
+                publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+            assert batches_directory.is_dir()
+            assert not final_path.exists()
+            assert published_batches(con) == []
+            assert acknowledge_outbox_batch(con, claim.batch_id) is False
+
+        # The original publisher sees the created directory and skips this
+        # parent barrier, making this second assertion RED before the fix.
+        with control_plane_connection(control_path) as con:
+            with pytest.raises(
+                OSError, match="injected new batches parent sync failure"
+            ):
+                publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+            assert published_batches(con) == []
+            assert acknowledge_outbox_batch(con, claim.batch_id) is False
+
+    HarnessRegistry(control_path).update_session_status(
+        "new-directory-parent-event-session", "completed"
+    )
+    retention = prune_verified_payloads(control_path, resolver=None)
+    assert retention["pruned"] == 0
+    assert retention["protected_dependency"] == 1
+
+    with control_plane_connection(control_path) as con:
+        published = publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+        assert published.archive_path == str(final_path)
+        assert acknowledge_outbox_batch(con, claim.batch_id) is True
 
 
 def test_outbox_syncs_file_and_directory_before_sql_manifest(

@@ -423,7 +423,7 @@ def _open_directory(path: Path) -> int:
 
 
 def _ensure_publication_directory(path: Path) -> None:
-    """Create the one private batch directory and persist a new parent entry."""
+    """Persist every helper-created directory entry before publication continues."""
     try:
         existing = os.lstat(path)
     except FileNotFoundError:
@@ -435,14 +435,18 @@ def _ensure_publication_directory(path: Path) -> None:
             if not stat.S_ISDIR(existing.st_mode):
                 raise RuntimeError("outbox publication path is not a directory")
         else:
-            parent_descriptor = _open_directory(path.parent)
-            try:
-                os.fsync(parent_descriptor)
-            finally:
-                os.close(parent_descriptor)
-        return
+            existing = os.lstat(path)
     if not stat.S_ISDIR(existing.st_mode):
         raise RuntimeError("outbox publication path is not a directory")
+    # A previous attempt can create this path and fail before this barrier.
+    # Existing is not durable: retry the parent entry sync for this directory
+    # and every recursively ensured ancestor before publishing any batch.
+    if path.parent != path:
+        parent_descriptor = _open_directory(path.parent)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
 
 
 def _entry_exists(path: Path) -> bool:
