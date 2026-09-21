@@ -9,8 +9,11 @@ ready for Task 3's API role.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -115,16 +118,175 @@ _REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
 }
 
 
-def _source_fingerprint(path: Path, credential_document: Path | None) -> str:
+@dataclass(frozen=True, slots=True)
+class _CapturedSourceInputs:
+    """Stable source content plus the per-run identities that carried it."""
+
+    content_fingerprint: str
+    identity_fingerprint: str
+    credential_content: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FencedSource:
+    """One read-only DuckDB snapshot held through import or verification."""
+
+    connection: Any
+    snapshot: Path
+    credential_document: Path | None
+    captured: _CapturedSourceInputs
+
+    @property
+    def fingerprint(self) -> str:
+        """Persistent content fingerprint, independent of the input pathname."""
+        return self.captured.content_fingerprint
+
+    @property
+    def credential_content(self) -> bytes | None:
+        return self.captured.credential_content
+
+    def require_unchanged(self, *, operation: str) -> None:
+        current = _capture_source_inputs(self.snapshot, self.credential_document)
+        if (
+            current.content_fingerprint != self.captured.content_fingerprint
+            or current.identity_fingerprint != self.captured.identity_fingerprint
+        ):
+            raise RuntimeError(f"fenced source inputs changed during {operation}")
+
+
+def _source_artifact(
+    path: Path,
+    *,
+    role: str,
+    required: bool,
+    retain_content: bool,
+) -> tuple[dict[str, Any], bytes | None]:
+    if not path.exists():
+        if required:
+            if role == "credential_document":
+                raise ValueError(
+                    "credential_document must be an explicit readable JSON file"
+                )
+            raise ValueError("source_snapshot must be an explicit readable DuckDB file")
+        return {"role": role, "present": False}, None
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        if role == "credential_document":
+            raise ValueError(
+                "credential_document must be an explicit readable JSON file"
+            )
+        raise ValueError("source_snapshot must be an explicit readable DuckDB file")
     digest = hashlib.sha256()
-    for item in (path, credential_document):
-        if item is None:
-            continue
-        digest.update(item.name.encode("utf-8"))
-        with item.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-    return digest.hexdigest()
+    retained: bytearray | None = bytearray() if retain_content else None
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+            if retained is not None:
+                retained.extend(block)
+    after = path.stat()
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise RuntimeError("fenced source inputs changed while reading")
+    return (
+        {
+            "role": role,
+            "present": True,
+            "sha256": digest.hexdigest(),
+            "size": before.st_size,
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+        },
+        bytes(retained) if retained is not None else None,
+    )
+
+
+def _capture_source_inputs(
+    snapshot: Path, credential_document: Path | None
+) -> _CapturedSourceInputs:
+    """Capture content identity plus per-run file identity for every input."""
+    snapshot = Path(snapshot)
+    source, _ = _source_artifact(
+        snapshot, role="source_snapshot", required=True, retain_content=False
+    )
+    wal, _ = _source_artifact(
+        snapshot.with_name(snapshot.name + ".wal"),
+        role="source_wal",
+        required=False,
+        retain_content=False,
+    )
+    if credential_document is None:
+        credentials = {"role": "credential_document", "present": False}
+        credential_content = None
+    else:
+        credentials, credential_content = _source_artifact(
+            Path(credential_document),
+            role="credential_document",
+            required=True,
+            retain_content=True,
+        )
+    artifacts = (source, wal, credentials)
+    content = [
+        {
+            key: artifact[key]
+            for key in ("role", "present", "sha256", "size")
+            if key in artifact
+        }
+        for artifact in artifacts
+    ]
+    content_fingerprint = hashlib.sha256(
+        json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    identity_fingerprint = hashlib.sha256(
+        json.dumps(artifacts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return _CapturedSourceInputs(
+        content_fingerprint=content_fingerprint,
+        identity_fingerprint=identity_fingerprint,
+        credential_content=credential_content,
+    )
+
+
+@contextmanager
+def _fenced_source(snapshot: Path, credential_document: Path | None):
+    """Hold one read-only DuckDB transaction while target work consumes it."""
+    snapshot = Path(snapshot)
+    captured = _capture_source_inputs(snapshot, credential_document)
+    connection = duckdb.connect(str(snapshot), read_only=True)
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        yield _FencedSource(
+            connection=connection,
+            snapshot=snapshot,
+            credential_document=credential_document,
+            captured=captured,
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        try:
+            connection.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        connection.close()
+
+
+def _source_fingerprint(path: Path, credential_document: Path | None) -> str:
+    """Return only source content, so an unchanged snapshot copy verifies too."""
+    return _capture_source_inputs(path, credential_document).content_fingerprint
 
 
 def _zone(name: str) -> ZoneInfo:
@@ -178,46 +340,52 @@ def _row_hash(row: dict[str, Any]) -> str:
 
 
 def _source_table_rows(
-    snapshot: Path, source_zone: ZoneInfo, *, include_events: bool = False
+    snapshot: Path | Any, source_zone: ZoneInfo, *, include_events: bool = False
 ) -> dict[str, list[dict[str, Any]]]:
-    if not snapshot.is_file():
-        raise ValueError("source_snapshot must be an explicit readable DuckDB file")
-    output: dict[str, list[dict[str, Any]]] = {}
-    with duckdb.connect(str(snapshot), read_only=True) as con:
-        tables = {
-            str(row[0])
-            for row in con.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
-            ).fetchall()
-        }
-        missing = [table for table in CONTROL_PLANE_TABLES if table not in tables]
-        if missing:
-            raise ValueError(
-                "legacy snapshot is missing central table(s): " + ", ".join(missing)
+    if isinstance(snapshot, Path):
+        if not snapshot.is_file():
+            raise ValueError("source_snapshot must be an explicit readable DuckDB file")
+        with duckdb.connect(str(snapshot), read_only=True) as source:
+            return _source_table_rows(
+                source, source_zone, include_events=include_events
             )
-        for table in CONTROL_PLANE_TABLES:
-            if table == "harness_events" and not include_events:
-                continue
-            result = con.execute(f"SELECT * FROM {table}")
-            columns = [item[0] for item in result.description]
-            output[table] = [
-                {
-                    column: _normalise_value(table, column, value, source_zone)
-                    for column, value in zip(columns, row)
-                }
-                for row in result.fetchall()
-            ]
+    output: dict[str, list[dict[str, Any]]] = {}
+    tables = {
+        str(row[0])
+        for row in snapshot.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+        ).fetchall()
+    }
+    missing = [table for table in CONTROL_PLANE_TABLES if table not in tables]
+    if missing:
+        raise ValueError(
+            "legacy snapshot is missing central table(s): " + ", ".join(missing)
+        )
+    for table in CONTROL_PLANE_TABLES:
+        if table == "harness_events" and not include_events:
+            continue
+        result = snapshot.execute(f"SELECT * FROM {table}")
+        columns = [item[0] for item in result.description]
+        output[table] = [
+            {
+                column: _normalise_value(table, column, value, source_zone)
+                for column, value in zip(columns, row)
+            }
+            for row in result.fetchall()
+        ]
     return output
 
 
-def _source_columns(snapshot: Path, table: str) -> list[str]:
-    with duckdb.connect(str(snapshot), read_only=True) as con:
-        result = con.execute(f"SELECT * FROM {table} LIMIT 0")
-        return [item[0] for item in result.description]
+def _source_columns(snapshot: Path | Any, table: str) -> list[str]:
+    if isinstance(snapshot, Path):
+        with duckdb.connect(str(snapshot), read_only=True) as source:
+            return _source_columns(source, table)
+    result = snapshot.execute(f"SELECT * FROM {table} LIMIT 0")
+    return [item[0] for item in result.description]
 
 
 def _iter_source_rows(
-    snapshot: Path,
+    snapshot: Path | Any,
     table: str,
     source_zone: ZoneInfo,
     *,
@@ -229,41 +397,53 @@ def _iter_source_rows(
     thousands of wide envelopes, so import and canonical verification never
     build a second in-memory copy of it.
     """
-    key = CONTROL_PLANE_PRIMARY_KEYS[table]
-    with duckdb.connect(str(snapshot), read_only=True) as con:
-        columns = _source_columns(snapshot, table)
-        last_key: Any | None = None
-        key_order = f'{key} COLLATE "C"' if table == "harness_events" else key
-        while True:
-            where = "" if last_key is None else f"WHERE {key_order} > ?"
-            params = [] if last_key is None else [last_key]
-            result = con.execute(
-                f"SELECT * FROM {table} {where} ORDER BY {key_order} LIMIT ?",
-                [*params, max(1, int(batch_size))],
+    if isinstance(snapshot, Path):
+        with duckdb.connect(str(snapshot), read_only=True) as source:
+            yield from _iter_source_rows(
+                source, table, source_zone, batch_size=batch_size
             )
-            rows = result.fetchall()
-            if not rows:
-                break
-            last_key = rows[-1][columns.index(key)]
-            yield [
-                {
-                    column: _normalise_value(table, column, value, source_zone)
-                    for column, value in zip(columns, row)
-                }
-                for row in rows
-            ]
+        return
+    key = CONTROL_PLANE_PRIMARY_KEYS[table]
+    columns = _source_columns(snapshot, table)
+    last_key: Any | None = None
+    key_order = f'{key} COLLATE "C"' if table == "harness_events" else key
+    while True:
+        where = "" if last_key is None else f"WHERE {key_order} > ?"
+        params = [] if last_key is None else [last_key]
+        result = snapshot.execute(
+            f"SELECT * FROM {table} {where} ORDER BY {key_order} LIMIT ?",
+            [*params, max(1, int(batch_size))],
+        )
+        rows = result.fetchall()
+        if not rows:
+            break
+        last_key = rows[-1][columns.index(key)]
+        yield [
+            {
+                column: _normalise_value(table, column, value, source_zone)
+                for column, value in zip(columns, row)
+            }
+            for row in rows
+        ]
 
 
 def _credential_rows(
-    document: Path | None, source_zone: ZoneInfo
+    document: Path | None,
+    source_zone: ZoneInfo,
+    *,
+    content: bytes | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     if document is None:
         return {"control_server_identity": [], "control_credentials": []}
     if not document.is_file():
         raise ValueError("credential_document must be an explicit readable JSON file")
     try:
-        body = json.loads(document.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        body = json.loads(
+            content.decode("utf-8")
+            if content is not None
+            else document.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("credential_document must contain valid JSON") from exc
     if not isinstance(body, dict):
         raise ValueError("credential_document must be a JSON object")
@@ -320,7 +500,7 @@ def _target_columns(con: object, table: str) -> set[str]:
 def _validate_source_inventory(
     con: object,
     *,
-    source_snapshot: Path,
+    source_snapshot: Path | Any,
     credential_rows: dict[str, list[dict[str, Any]]],
 ) -> None:
     """Fence every supplied source column before writing any target row."""
@@ -570,7 +750,7 @@ def _verify_rows(
     *,
     source_rows: dict[str, list[dict[str, Any]]],
     credential_rows: dict[str, list[dict[str, Any]]],
-    source_snapshot: Path,
+    source_snapshot: Path | Any,
     source_zone: ZoneInfo,
 ) -> dict[str, Any]:
     tables: dict[str, Any] = {}
@@ -706,126 +886,136 @@ def import_legacy_snapshot(
             "offline import target must be an explicit PostgreSQL control store"
         )
     zone = _zone(source_timezone)
-    source_rows = _source_table_rows(source_snapshot, zone)
-    credential_rows = _credential_rows(credential_document, zone)
-    fingerprint = _source_fingerprint(source_snapshot, credential_document)
-    with control_plane_connection(control_path) as con:
-        owns_initialization = False
-        try:
-            # Commit the admission marker while holding the target-wide lock.
-            # A waiting different snapshot then sees `initializing` instead of
-            # an apparently empty target, even if this process subsequently
-            # dies between transactions.
-            con.execute("BEGIN")
-            _lock_import_admission(con)
-            current = con.execute(
-                "SELECT state FROM control_store_initialization WHERE singleton = TRUE"
-            ).fetchone()
-            if current is not None and current[0] == "ready":
-                raise RuntimeError(
-                    "target is already ready; use forward recovery after PostgreSQL writes"
+    with _fenced_source(source_snapshot, credential_document) as source:
+        source_rows = _source_table_rows(source.connection, zone)
+        credential_rows = _credential_rows(
+            credential_document, zone, content=source.credential_content
+        )
+        fingerprint = source.fingerprint
+        with control_plane_connection(control_path) as con:
+            owns_initialization = False
+            try:
+                # Commit the admission marker while holding the target-wide lock.
+                # A waiting different snapshot then sees `initializing` instead of
+                # an apparently empty target, even if this process subsequently
+                # dies between transactions.
+                con.execute("BEGIN")
+                _lock_import_admission(con)
+                current = con.execute(
+                    "SELECT state FROM control_store_initialization WHERE singleton = TRUE"
+                ).fetchone()
+                if current is not None and current[0] == "ready":
+                    raise RuntimeError(
+                        "target is already ready; use forward recovery after PostgreSQL writes"
+                    )
+                if current is not None and current[0] == "initializing":
+                    raise RuntimeError(
+                        "another snapshot import is already initializing this target"
+                    )
+                existing = sum(
+                    int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                    for table in _ALL_TABLES
                 )
-            if current is not None and current[0] == "initializing":
-                raise RuntimeError(
-                    "another snapshot import is already initializing this target"
-                )
-            existing = sum(
-                int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-                for table in _ALL_TABLES
-            )
-            if existing:
-                raise RuntimeError("refusing import into a populated unready target")
-            _validate_source_inventory(
-                con,
-                source_snapshot=source_snapshot,
-                credential_rows=credential_rows,
-            )
-            _mark_state(
-                con,
-                state="initializing",
-                mode="import",
-                fingerprint=fingerprint,
-                source_timezone=source_timezone,
-                details={
-                    "source_tables": {
-                        **{key: len(value) for key, value in source_rows.items()},
-                        "harness_events": _stream_summary(
-                            _iter_source_rows(source_snapshot, "harness_events", zone)
-                        )["count"],
-                    }
-                },
-                verified=False,
-            )
-            con.execute("COMMIT")
-            owns_initialization = True
-
-            con.execute("BEGIN")
-            _lock_import_admission(con)
-            for table in CONTROL_PLANE_TABLES:
-                if table == "harness_events":
-                    for rows in _iter_source_rows(source_snapshot, table, zone):
-                        metadata = []
-                        payloads = []
-                        for row in rows:
-                            payload = row.get("payload_json")
-                            if payload is None:
-                                payload = "{}"
-                            payload = str(payload)
-                            metadata.append({**row, "payload_json": None})
-                            payloads.append(
-                                {
-                                    "event_id": row["event_id"],
-                                    "payload_json": payload,
-                                    "payload_sha256": payload_sha256(payload),
-                                }
-                            )
-                        _insert_rows(con, table, metadata)
-                        _insert_rows(con, "harness_event_payloads", payloads)
-                        _insert_rows(
-                            con,
-                            "control_outbox_events",
-                            [
-                                {"event_id": row["event_id"], "state": "pending"}
-                                for row in rows
-                            ],
-                        )
-                else:
-                    _insert_rows(con, table, source_rows[table])
-            for table in _EXTRA_TABLES:
-                _insert_rows(con, table, credential_rows[table])
-            _rebuild_previews(con)
-            verification = _verify_rows(
-                con,
-                source_rows=source_rows,
-                credential_rows=credential_rows,
-                source_snapshot=source_snapshot,
-                source_zone=zone,
-            )
-            if not verification["ok"]:
-                raise RuntimeError("import verification failed before readiness marker")
-            _mark_state(
-                con,
-                state="ready",
-                mode="import",
-                fingerprint=fingerprint,
-                source_timezone=source_timezone,
-                details={
-                    **verification,
-                    "recovery": "forward-recovery-only-after-writes",
-                },
-                verified=True,
-            )
-            con.execute("COMMIT")
-        except Exception as exc:
-            con.execute("ROLLBACK")
-            if owns_initialization:
-                _mark_import_failed_if_owned(
+                if existing:
+                    raise RuntimeError(
+                        "refusing import into a populated unready target"
+                    )
+                _validate_source_inventory(
                     con,
+                    source_snapshot=source.connection,
+                    credential_rows=credential_rows,
+                )
+                _mark_state(
+                    con,
+                    state="initializing",
+                    mode="import",
                     fingerprint=fingerprint,
                     source_timezone=source_timezone,
-                    error=exc,
+                    details={
+                        "source_tables": {
+                            **{key: len(value) for key, value in source_rows.items()},
+                            "harness_events": _stream_summary(
+                                _iter_source_rows(
+                                    source.connection, "harness_events", zone
+                                )
+                            )["count"],
+                        }
+                    },
+                    verified=False,
                 )
-            raise
+                con.execute("COMMIT")
+                owns_initialization = True
+
+                con.execute("BEGIN")
+                _lock_import_admission(con)
+                for table in CONTROL_PLANE_TABLES:
+                    if table == "harness_events":
+                        for rows in _iter_source_rows(source.connection, table, zone):
+                            metadata = []
+                            payloads = []
+                            for row in rows:
+                                payload = row.get("payload_json")
+                                if payload is None:
+                                    payload = "{}"
+                                payload = str(payload)
+                                metadata.append({**row, "payload_json": None})
+                                payloads.append(
+                                    {
+                                        "event_id": row["event_id"],
+                                        "payload_json": payload,
+                                        "payload_sha256": payload_sha256(payload),
+                                    }
+                                )
+                            _insert_rows(con, table, metadata)
+                            _insert_rows(con, "harness_event_payloads", payloads)
+                            _insert_rows(
+                                con,
+                                "control_outbox_events",
+                                [
+                                    {"event_id": row["event_id"], "state": "pending"}
+                                    for row in rows
+                                ],
+                            )
+                    else:
+                        _insert_rows(con, table, source_rows[table])
+                for table in _EXTRA_TABLES:
+                    _insert_rows(con, table, credential_rows[table])
+                _rebuild_previews(con)
+                verification = _verify_rows(
+                    con,
+                    source_rows=source_rows,
+                    credential_rows=credential_rows,
+                    source_snapshot=source.connection,
+                    source_zone=zone,
+                )
+                if not verification["ok"]:
+                    raise RuntimeError(
+                        "import verification failed before readiness marker"
+                    )
+                source.require_unchanged(operation="import")
+                _mark_state(
+                    con,
+                    state="ready",
+                    mode="import",
+                    fingerprint=fingerprint,
+                    source_timezone=source_timezone,
+                    details={
+                        **verification,
+                        "recovery": "forward-recovery-only-after-writes",
+                    },
+                    verified=True,
+                )
+                con.execute("COMMIT")
+            except Exception as exc:
+                con.execute("ROLLBACK")
+                if owns_initialization:
+                    _mark_import_failed_if_owned(
+                        con,
+                        fingerprint=fingerprint,
+                        source_timezone=source_timezone,
+                        error=exc,
+                    )
+                raise
     return control_store_status(control_path)
 
 
@@ -844,28 +1034,44 @@ def verify_legacy_import(
         )
     zone = _zone(source_timezone)
     source_snapshot = Path(source_snapshot)
-    source_rows = _source_table_rows(source_snapshot, zone)
-    credential_rows = _credential_rows(
-        Path(credential_document) if credential_document else None, zone
-    )
-    with control_plane_connection(control_path) as con:
-        con.execute("BEGIN")
-        try:
-            _validate_source_inventory(
-                con,
-                source_snapshot=source_snapshot,
-                credential_rows=credential_rows,
-            )
-            report = _verify_rows(
-                con,
-                source_rows=source_rows,
-                credential_rows=credential_rows,
-                source_snapshot=source_snapshot,
-                source_zone=zone,
-            )
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
+    credential_document = Path(credential_document) if credential_document else None
+    with _fenced_source(source_snapshot, credential_document) as source:
+        source_rows = _source_table_rows(source.connection, zone)
+        credential_rows = _credential_rows(
+            credential_document, zone, content=source.credential_content
+        )
+        with control_plane_connection(control_path) as con:
+            con.execute("BEGIN")
+            try:
+                _validate_source_inventory(
+                    con,
+                    source_snapshot=source.connection,
+                    credential_rows=credential_rows,
+                )
+                marker = con.execute("""
+                    SELECT state, mode, source_fingerprint
+                      FROM control_store_initialization WHERE singleton = TRUE
+                    """).fetchone()
+                if (
+                    marker is not None
+                    and marker[0] == "ready"
+                    and marker[1] == "import"
+                    and marker[2] != source.fingerprint
+                ):
+                    raise RuntimeError(
+                        "verification source fingerprint does not match imported content"
+                    )
+                report = _verify_rows(
+                    con,
+                    source_rows=source_rows,
+                    credential_rows=credential_rows,
+                    source_snapshot=source.connection,
+                    source_zone=zone,
+                )
+                source.require_unchanged(operation="verification")
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
     report["status"] = control_store_status(control_path)
     return report

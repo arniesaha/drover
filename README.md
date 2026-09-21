@@ -47,8 +47,8 @@ Analytics expands provider-reported quota windows and usage distributions.
 - An optional **PostgreSQL control store** separates central fleet serving from
   analytical work. It is configured explicitly; local DuckDB mode and each
   host daemon's local spool remain the default. The analytics role exports
-  acknowledged central events into immutable Parquet batches for retention and
-  replay.
+  central events into immutable Parquet batches, records their manifest, then
+  acknowledges them; acknowledgement gates retention and replay.
 - The **MCP surface** exposes that context to coding agents as `drover_*` tools.
 - An optional **session archive** enriches recall across harnesses. Point
   Drover at a local [Pond](https://github.com/tenequm/pond) HTTP endpoint and

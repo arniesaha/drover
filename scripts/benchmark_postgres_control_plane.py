@@ -48,6 +48,7 @@ DEFAULT_CLIENTS = 4
 WRITER_THREADS = 4
 INSERT_BATCH_SIZE = 100
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 1_800
+EXPECTED_WORKER_OUTAGE_ERROR = "analytics worker unavailable"
 
 
 class BenchmarkContractError(RuntimeError):
@@ -115,6 +116,17 @@ def validate_harness_response(
         )
 
 
+def validate_worker_outage_response(payload: object) -> None:
+    """Require the API's explicit bounded worker-unavailable envelope."""
+    if not isinstance(payload, Mapping):
+        raise BenchmarkContractError("worker outage error body was not a JSON object")
+    error = payload.get("error")
+    if not isinstance(error, str) or error != EXPECTED_WORKER_OUTAGE_ERROR:
+        raise BenchmarkContractError(
+            "worker outage error body was not the expected analytics worker error"
+        )
+
+
 def _percentile_ms(samples: list[float], percentile: float) -> float:
     index = max(0, math.ceil(len(samples) * percentile) - 1)
     return round(samples[index] * 1_000, 3)
@@ -152,6 +164,43 @@ def summarize_phase(
         "errors": dict(sorted(error_counts.items())),
         "percentiles": percentiles,
     }
+
+
+def p99_target_misses(
+    phases: Iterable[Mapping[str, Any]], *, target_ms: float
+) -> list[dict[str, float | str]]:
+    """Return measured phases over the declared p99 target without hiding data."""
+    misses: list[dict[str, float | str]] = []
+    for phase in phases:
+        percentiles = phase.get("percentiles")
+        p99_ms = (
+            percentiles.get("p99_ms")
+            if isinstance(percentiles, Mapping)
+            and percentiles.get("status") == "measured"
+            else None
+        )
+        if isinstance(p99_ms, (int, float)) and p99_ms > target_ms:
+            name = phase.get("name")
+            misses.append(
+                {
+                    "name": str(name) if isinstance(name, str) else "unknown",
+                    "p99_ms": float(p99_ms),
+                }
+            )
+    return misses
+
+
+def finalize_benchmark_outcome(report: dict[str, Any]) -> int:
+    """Record the p99 assessment and return the process result for the run."""
+    report["p99_target_misses"] = p99_target_misses(
+        report["phases"], target_ms=report["limits"]["p99_target_ms"]
+    )
+    report["stage"] = "complete"
+    if report["p99_target_misses"]:
+        report["outcome"] = "target_missed"
+        return 1
+    report["outcome"] = "passed"
+    return 0
 
 
 def _free_loopback_port() -> int:
@@ -590,7 +639,7 @@ def _wait_for_real_worker_retention(
     raise BenchmarkContractError("configured analytics worker did not finish retention")
 
 
-def _postgres_sizes(dsn: str, schema: str) -> dict[str, int | str]:
+def _postgres_sizes(dsn: str, schema: str) -> dict[str, Any]:
     import psycopg
 
     with psycopg.connect(dsn) as connection:
@@ -607,12 +656,22 @@ def _postgres_sizes(dsn: str, schema: str) -> dict[str, int | str]:
         database_bytes = connection.execute(
             "SELECT pg_database_size(current_database())"
         ).fetchone()[0]
+        settings = connection.execute("""
+            SELECT current_setting('server_version'),
+                   current_setting('max_connections'),
+                   current_setting('shared_buffers')
+            """).fetchone()
     return {
         "benchmark_schema_physical_bytes": int(schema_bytes),
         "benchmark_schema_physical_bytes_method": (
             "sum pg_total_relation_size for tables and materialized views only"
         ),
         "whole_disposable_database_bytes": int(database_bytes),
+        "postgres": {
+            "server_version": str(settings[0]),
+            "max_connections": str(settings[1]),
+            "shared_buffers": str(settings[2]),
+        },
     }
 
 
@@ -1051,10 +1110,9 @@ def main() -> int:
         outage_status, outage_payload = _request_json(
             api_port, "/metrics", token=api_token
         )
-        if outage_status != 503 or not isinstance(outage_payload, Mapping):
-            raise BenchmarkContractError(
-                "worker outage did not produce the bounded analytics response"
-            )
+        if outage_status != 503:
+            raise BenchmarkContractError("worker outage did not produce HTTP 503")
+        validate_worker_outage_response(outage_payload)
 
         report["stage"] = "worker_recovery"
         worker_process = subprocess.Popen(
@@ -1218,13 +1276,12 @@ def main() -> int:
             raise BenchmarkContractError(
                 "one or more benchmark phases lacked p99 samples"
             )
-        report["outcome"] = "passed"
-        report["stage"] = "complete"
+        outcome_status = finalize_benchmark_outcome(report)
         args.output.write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         print(json.dumps(report, indent=2, sort_keys=True))
-        return 0
+        return outcome_status
     except BaseException as exc:
         report["outcome"] = "failed"
         report["failure"] = {

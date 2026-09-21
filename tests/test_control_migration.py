@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -397,6 +398,155 @@ def test_import_uses_portable_binary_event_order_for_streamed_verification(
             postgres_target, source_snapshot=source, source_timezone="UTC"
         )["ok"]
         is True
+    )
+
+
+def test_import_fails_closed_when_source_changes_between_event_phases(
+    postgres_target, tmp_path: Path, monkeypatch
+):
+    """One target cannot become ready from old metadata and later event history."""
+    import drover.server.control_migration as migration
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    original_iter = migration._iter_source_rows
+    event_streams = 0
+
+    def replace_source_after_first_event_stream(snapshot, table, source_zone, **kwargs):
+        nonlocal event_streams
+        if table == "harness_events":
+            event_streams += 1
+            if event_streams == 2:
+                replacement = tmp_path / "changed-source.duckdb"
+                shutil.copy2(source, replacement)
+                with duckdb.connect(str(replacement)) as con:
+                    con.execute(
+                        """
+                        INSERT INTO harness_events
+                          (event_id, session_id, event_type, payload_json, created_at, seq, dedup_key)
+                        VALUES ('changed-between-phases', 'legacy-session', 'assistant_output',
+                                '{"text":"late source change"}', ?, 9, 'changed-between-phases')
+                        """,
+                        [datetime(2026, 9, 20, 12, 3)],
+                    )
+                os.replace(replacement, source)
+        yield from original_iter(snapshot, table, source_zone, **kwargs)
+
+    monkeypatch.setattr(
+        migration, "_iter_source_rows", replace_source_after_first_event_stream
+    )
+    with pytest.raises(RuntimeError, match="fenced source inputs changed"):
+        migration.import_legacy_snapshot(
+            postgres_target, source_snapshot=source, source_timezone="UTC"
+        )
+
+    status = migration.control_store_status(postgres_target)
+    assert status["state"] == "failed"
+    assert status["ready"] is False
+
+
+def test_import_fails_closed_when_credential_document_changes(
+    postgres_target, tmp_path: Path, monkeypatch
+):
+    """A credential document is part of the fenced import input, not side data."""
+    import drover.server.control_migration as migration
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    credentials = tmp_path / "credentials.json"
+    credentials.write_text(
+        json.dumps(
+            {
+                "control_server_identity": {"server_id": "original"},
+                "control_credentials": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_rebuild = migration._rebuild_previews
+
+    def mutate_credentials(con):
+        credentials.write_text(
+            json.dumps(
+                {
+                    "control_server_identity": {"server_id": "changed"},
+                    "control_credentials": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        original_rebuild(con)
+
+    monkeypatch.setattr(migration, "_rebuild_previews", mutate_credentials)
+    with pytest.raises(RuntimeError, match="fenced source inputs changed"):
+        migration.import_legacy_snapshot(
+            postgres_target,
+            source_snapshot=source,
+            source_timezone="UTC",
+            credential_document=credentials,
+        )
+
+    status = migration.control_store_status(postgres_target)
+    assert status["state"] == "failed"
+    assert status["ready"] is False
+
+
+def test_verify_rejects_source_mutation_after_a_matching_comparison(
+    postgres_target, tmp_path: Path, monkeypatch
+):
+    """Read-only verification cannot certify a source that changed during it."""
+    import drover.server.control_migration as migration
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    assert (
+        migration.import_legacy_snapshot(
+            postgres_target, source_snapshot=source, source_timezone="UTC"
+        )["state"]
+        == "ready"
+    )
+    original_verify = migration._verify_rows
+
+    def mutate_after_compare(*args, **kwargs):
+        report = original_verify(*args, **kwargs)
+        replacement = tmp_path / "verify-changed-source.duckdb"
+        shutil.copy2(source, replacement)
+        with duckdb.connect(str(replacement)) as con:
+            con.execute(
+                "UPDATE harness_events SET payload_json = ? WHERE event_id = ?",
+                ['{"text":"changed"}', "legacy-null"],
+            )
+        os.replace(replacement, source)
+        return report
+
+    monkeypatch.setattr(migration, "_verify_rows", mutate_after_compare)
+    with pytest.raises(RuntimeError, match="fenced source inputs changed"):
+        migration.verify_legacy_import(
+            postgres_target, source_snapshot=source, source_timezone="UTC"
+        )
+    # This previously verified import is still the only ready target state;
+    # read-only verification cannot rewrite it.
+    assert migration.control_store_status(postgres_target)["ready"] is True
+
+
+def test_verify_accepts_an_unchanged_snapshot_copy_at_another_path(
+    postgres_target, tmp_path: Path
+):
+    """Persistent content identity does not make a source pathname part of import."""
+    import drover.server.control_migration as migration
+
+    source = _legacy_snapshot(tmp_path, created_at=datetime(2026, 9, 20, 12, 0, 0))
+    snapshot_copy = tmp_path / "unchanged-copy.duckdb"
+    shutil.copy2(source, snapshot_copy)
+    imported = migration.import_legacy_snapshot(
+        postgres_target, source_snapshot=source, source_timezone="UTC"
+    )
+
+    assert (
+        migration.verify_legacy_import(
+            postgres_target, source_snapshot=snapshot_copy, source_timezone="UTC"
+        )["ok"]
+        is True
+    )
+    assert imported["source_fingerprint"] == migration._source_fingerprint(
+        snapshot_copy, None
     )
 
 

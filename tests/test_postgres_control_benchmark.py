@@ -194,6 +194,80 @@ def test_json_request_returns_an_expected_http_error_envelope(
     )
 
 
+def test_worker_outage_requires_the_expected_nonempty_error_body() -> None:
+    BENCHMARK.validate_worker_outage_response({"error": "analytics worker unavailable"})
+
+    for payload in ({}, {"error": ""}, {"error": "wrong worker error"}):
+        with pytest.raises(BENCHMARK.BenchmarkContractError, match="outage error"):
+            BENCHMARK.validate_worker_outage_response(payload)
+
+
+def test_p99_target_miss_is_reported_as_non_successful_evidence() -> None:
+    phases = [
+        {
+            "name": "worker_outage",
+            "percentiles": {"status": "measured", "p99_ms": 251.0},
+        },
+        {
+            "name": "recovery",
+            "percentiles": {"status": "measured", "p99_ms": 249.0},
+        },
+    ]
+
+    report = {
+        "phases": phases,
+        "limits": {"p99_target_ms": 250},
+    }
+    assert BENCHMARK.finalize_benchmark_outcome(report) == 1
+    assert report["outcome"] == "target_missed"
+    assert report["stage"] == "complete"
+    assert report["p99_target_misses"] == [{"name": "worker_outage", "p99_ms": 251.0}]
+
+
+def test_postgres_size_evidence_captures_sanitized_server_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Result:
+        def __init__(self, one=None):
+            self._one = one
+
+        def fetchone(self):
+            return self._one
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query, _params=None):
+            text = str(query)
+            if "pg_total_relation_size" in text:
+                return Result((101,))
+            if "pg_database_size" in text:
+                return Result((202,))
+            if "server_version" in text:
+                return Result(("17.11", "16", "128MB"))
+            raise AssertionError(text)
+
+    class Psycopg:
+        @staticmethod
+        def connect(_dsn):
+            return Connection()
+
+    monkeypatch.setitem(sys.modules, "psycopg", Psycopg())
+    evidence = BENCHMARK._postgres_sizes("postgresql://secret@host/db", "benchmark")
+
+    assert evidence["benchmark_schema_physical_bytes"] == 101
+    assert evidence["whole_disposable_database_bytes"] == 202
+    assert evidence["postgres"] == {
+        "server_version": "17.11",
+        "max_connections": "16",
+        "shared_buffers": "128MB",
+    }
+
+
 def test_process_readiness_failure_reports_the_last_http_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
