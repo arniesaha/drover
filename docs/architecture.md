@@ -48,6 +48,14 @@ Fresh `drover-server init` configuration sets `[control_store] backend =
 payload projections, live recap state, central credentials, server identity,
 and content-consent state. It does not replace the analytical lake.
 
+The reference hub migrated its own control store from DuckDB to PostgreSQL on
+2026-09-21 using the offline import, and runs the combined role. Its analytical
+lake and every host-local harness spool remain DuckDB. Once a control store has
+accepted PostgreSQL writes, recovery is forward-only: it needs the PostgreSQL
+state together with the immutable archive files its published manifest
+references. A pre-migration DuckDB file is an audit record of earlier history,
+not a rollback target.
+
 An existing config that omits `[control_store]` retains its DuckDB control
 store. `drover-server init --control-store duckdb` creates an explicit fresh
 legacy configuration. Neither path creates or migrates a control store without
