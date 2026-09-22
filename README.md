@@ -44,6 +44,8 @@ Analytics expands provider-reported quota windows and usage distributions.
 - The **context plane** collects durable agent events and spans into local
   Parquet and DuckDB storage, then derives summaries, project briefs, and
   embeddings for recall.
+- The reference hub runs a PostgreSQL control store, migrated from DuckDB on
+  2026-09-21; its analytical lake and every host-local spool stay DuckDB.
 - A new central installation uses a **PostgreSQL control store** for fleet
   serving. Existing DuckDB configurations and every host daemon's local spool
   remain compatible until an operator completes the explicit migration. The analytics role exports

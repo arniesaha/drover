@@ -89,7 +89,9 @@ control path. It owns the
 central fleet registry, event metadata and hot payload projections, live recap
 state, server identity, credential verifiers, content-consent state, and the
 durable event-export manifest. A PostgreSQL process does not redirect a
-host-local harness daemon merely because that process inherited a DSN.
+host-local harness daemon merely because that process inherited a DSN. The
+reference hub migrated this store from DuckDB on 2026-09-21; its analytical
+store stays DuckDB, as does every host-local spool.
 
 The split API role reads central control state but does not open the analytical
 lake. The analytics role owns ingestion, archive resolution, usage and recap
