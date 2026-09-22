@@ -761,12 +761,86 @@ def outbox_status(con: object) -> dict[str, Any]:
     }
 
 
+#: Mirrors ``_payload_prune_protection`` in SQL so a bounded candidate read
+#: returns rows that can actually prune. Kept beside that predicate on purpose:
+#: the two must change together.
+_PRUNE_ELIGIBLE_SQL = """
+        WHERE s.status IN ('completed', 'terminated', 'errored', 'failed')
+          AND o.state = 'acknowledged'
+          AND o.batch_id IS NOT NULL
+          AND b.state = 'acknowledged'
+          AND usage.source_event_count IS NOT NULL
+          AND usage.source_event_count >= COALESCE(progress.event_count, 0)
+          AND COALESCE(usage.source_seq, 0) >= COALESCE(progress.max_seq, 0)
+          AND recap_job.status = 'done'
+          AND COALESCE(recap_job.desired_source_seq, 0) >= COALESCE(progress.max_seq, 0)
+          AND COALESCE(recap.source_seq, 0) >= COALESCE(progress.max_seq, 0)
+"""
+
+
+def _payload_protection_counts(con: object) -> dict[str, int]:
+    """Count every protected hot payload, not just those in one pass window.
+
+    Retention reports why it is not pruning. Once the candidate read filters
+    protected rows out, a per-pass tally would always be zero and an operator
+    would lose the signal that distinguishes "nothing left to prune" from
+    "everything is waiting on recap".
+    """
+    row = con.execute("""
+        WITH session_progress AS (
+          SELECT session_id, count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
+            FROM harness_events GROUP BY session_id
+        )
+        SELECT
+          count(*) FILTER (
+            WHERE s.status IS NULL
+               OR s.status NOT IN ('completed', 'terminated', 'errored', 'failed')
+          ) AS active,
+          count(*) FILTER (
+            WHERE s.status IN ('completed', 'terminated', 'errored', 'failed')
+              AND NOT (
+                    o.state = 'acknowledged'
+                AND o.batch_id IS NOT NULL
+                AND b.state = 'acknowledged'
+                AND usage.source_event_count IS NOT NULL
+                AND usage.source_event_count >= COALESCE(progress.event_count, 0)
+                AND COALESCE(usage.source_seq, 0) >= COALESCE(progress.max_seq, 0)
+                AND recap_job.status = 'done'
+                AND COALESCE(recap_job.desired_source_seq, 0) >= COALESCE(progress.max_seq, 0)
+                AND COALESCE(recap.source_seq, 0) >= COALESCE(progress.max_seq, 0)
+              )
+          ) AS dependency
+          FROM harness_event_payloads p
+          JOIN harness_events e ON e.event_id = p.event_id
+          LEFT JOIN harness_sessions s ON s.session_id = e.session_id
+          LEFT JOIN control_outbox_events o ON o.event_id = e.event_id
+          LEFT JOIN control_outbox_batches b ON b.batch_id = o.batch_id
+          LEFT JOIN session_progress progress ON progress.session_id = e.session_id
+          LEFT JOIN session_usage_sources usage
+            ON usage.session_id = e.session_id AND usage.source = 'harness_events'
+          LEFT JOIN live_recap_jobs recap_job ON recap_job.session_id = e.session_id
+          LEFT JOIN live_session_recaps recap ON recap.session_id = e.session_id
+        """).fetchone()
+    return {"active": int(row[0] or 0), "dependency": int(row[1] or 0)}
+
+
 def _payload_prune_candidates(
     con: object, *, limit: int, event_id: str | None = None
 ) -> list[dict[str, Any]]:
     """Detach hot-payload retention facts from a short PostgreSQL read."""
-    filter_sql = "WHERE p.event_id = ?" if event_id is not None else ""
-    params: list[Any] = [event_id] if event_id is not None else []
+    # Selecting a bounded set without this filter lets rows that cannot prune
+    # yet consume the whole pass; because the ordering is stable, the next pass
+    # re-reads the same rows and retention livelocks while eligible payloads sit
+    # further down. The filter mirrors ``_payload_prune_protection``, which stays
+    # the authoritative gate: the single-event re-read below deliberately skips
+    # this clause so that predicate still judges the row inside the
+    # transaction.
+    if event_id is not None:
+        filter_sql = "WHERE p.event_id = ?"
+        params: list[Any] = [event_id]
+    else:
+        filter_sql = _PRUNE_ELIGIBLE_SQL
+        params = []
     params.append(max(1, int(limit)))
     rows = con.execute(
         f"""
@@ -847,14 +921,20 @@ def prune_verified_payloads(
     if not is_postgres_control_store(control_path):
         return result
     with control_plane_connection(control_path) as con:
+        protection = _payload_protection_counts(con)
+        result["protected_active"] = protection["active"]
+        result["protected_dependency"] = protection["dependency"]
         candidates = _payload_prune_candidates(con, limit=limit)
     stamp = _utc_now(now)
     for candidate in candidates:
-        protection = _payload_prune_protection(candidate)
-        if protection == "active":
+        # The candidate read already excluded protected rows, so reaching this
+        # branch means the row changed between that read and now. Still count
+        # it: a refusal an operator cannot see is a refusal they cannot debug.
+        raced = _payload_prune_protection(candidate)
+        if raced == "active":
             result["protected_active"] += 1
             continue
-        if protection == "dependency":
+        if raced == "dependency":
             result["protected_dependency"] += 1
             continue
         expected_hash = str(candidate.get("payload_sha256") or "")
