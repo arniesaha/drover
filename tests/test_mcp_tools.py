@@ -630,7 +630,17 @@ def test_search_defaults_to_recent_bounded_window_when_unscoped(
     assert out["scoped"] is False
     assert out["default_since_days"] == 30
     assert [r["content"] for r in out["results"]] == ["needle from recent history"]
-    assert "date >=" in " ".join(statements[0].split()).lower()
+    # Match the search statement by content rather than by position, so an
+    # extra query inside drover_search cannot silently shift the index.
+    searches = [
+        " ".join(s.split()).lower() for s in statements if "candidate_agent_events" in s
+    ]
+    assert len(searches) == 1
+    assert "date >=" in searches[0]
+    # Partitions are UTC dates; formatting now() in the session zone would
+    # clip the oldest day of the window on hosts east of UTC.
+    assert "timezone('utc', now())" in searches[0]
+    statements.clear()
 
     explicit = drover_search(
         duckdb_path=duckdb_path,
@@ -640,7 +650,11 @@ def test_search_defaults_to_recent_bounded_window_when_unscoped(
     )
 
     assert [r["content"] for r in explicit["results"]] == ["needle from recent history"]
-    assert "date >=" in " ".join(statements[1].split()).lower()
+    searches = [
+        " ".join(s.split()).lower() for s in statements if "candidate_agent_events" in s
+    ]
+    assert len(searches) == 1
+    assert "date >=" in searches[0]
 
 
 def test_files_touched_pulls_from_tool_use_blocks(tmp_path: Path) -> None:
@@ -950,3 +964,87 @@ def test_active_sessions_hides_the_unattributed_event_bucket(tmp_path: Path) -> 
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     out = drover_active_sessions(duckdb_path=duckdb_path)
     assert out["active_sessions"] == []
+
+
+def _write_legacy_varchar_events(
+    parquet_dir: Path, date: str, rows: list[dict]
+) -> None:
+    """Write an older-style part whose timestamp column is text.
+
+    The reference hub's lake mixes these with timestamp-typed parts. Read
+    together with union_by_name, the view's timestamp column becomes VARCHAR,
+    which is the condition that turned `timestamp >= ?` into a string compare.
+    """
+    d = parquet_dir / "agent_events" / f"date={date}" / "agent_id=legacy"
+    d.mkdir(parents=True, exist_ok=True)
+    names = ["id", "session_id", "agent_id", "timestamp", "event_type", "content"]
+    table = pa.table(
+        {n: pa.array([r.get(n) for r in rows], type=pa.string()) for n in names}
+    )
+    pq.write_table(table, d / "part-legacy.parquet")
+
+
+@pytest.mark.parametrize(
+    "since",
+    [
+        "2026-09-21T22:00:00Z",
+        "2026-09-21T15:00:00-07:00",
+        "2026-09-22T03:30:00+05:30",
+    ],
+)
+def test_search_since_is_an_instant_not_a_string(tmp_path: Path, since: str) -> None:
+    """Every spelling of one instant must return the same events.
+
+    On a lake whose timestamp column is VARCHAR, `timestamp >= ?` compared
+    strings, and ' ' sorts before 'T', so ISO-8601 bounds dropped 60 to 100
+    percent of matching events on the reference hub. Partitions are UTC dates,
+    so a partition bound taken from the literal text of a +05:30 value would
+    also skip the UTC day the instant actually falls in.
+    """
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    base = datetime(2026, 9, 21, 22, 0, tzinfo=timezone.utc)
+
+    def row(i: int, ts: datetime) -> dict:
+        return {
+            "id": f"e-{i}",
+            "session_id": "S",
+            "agent_id": "agent",
+            "timestamp": ts,
+            "event_type": "assistant_output",
+            "content": f"needle {i}",
+            "dedup_key": f"d-{i}",
+        }
+
+    _write_agent_events(
+        parquet_dir,
+        [
+            row(0, base - timedelta(minutes=30)),  # before the bound
+            row(1, base + timedelta(minutes=30)),  # UTC date 2026-09-21
+            row(2, base + timedelta(hours=1, minutes=30)),  # UTC date 2026-09-21
+            row(3, base + timedelta(hours=3)),  # UTC date 2026-09-22
+        ],
+    )
+    _write_legacy_varchar_events(
+        parquet_dir,
+        "2026-09-21",
+        [
+            {
+                "id": "e-legacy",
+                "session_id": "S",
+                "agent_id": "legacy",
+                "timestamp": "2026-09-21 16:45:00-07",  # 23:45Z, after the bound
+                "event_type": "assistant_output",
+                "content": "needle legacy",
+            }
+        ],
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+
+    out = drover_search(duckdb_path=duckdb_path, query="needle", since=since, limit=50)
+
+    assert sorted(r["content"] for r in out["results"]) == [
+        "needle 1",
+        "needle 2",
+        "needle 3",
+        "needle legacy",
+    ]
