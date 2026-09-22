@@ -1314,3 +1314,104 @@ def test_reopened_session_usage_retries_until_archived_payloads_are_verified(
         "earlier bounded recap context",
         "later bounded recap context",
     ]
+
+
+def test_dependency_protected_events_do_not_starve_prunable_ones(
+    postgres_control_store,
+):
+    """A protected head of the ordering must not livelock retention.
+
+    Candidates are read with ORDER BY created_at LIMIT n and no prunability
+    filter, so a bounded pass could be filled entirely by rows that can never
+    prune yet. The next pass re-read the identical rows, so retention made no
+    progress while eligible payloads sat further down the ordering. Observed on
+    a real hub: 78,985 hot payloads, zero pruned, because the oldest 100 all
+    belonged to sessions with no recap job. The synthetic fixtures gave every
+    session a complete recap, so the head was always prunable.
+    """
+    control_path, parquet_dir = postgres_control_store
+    from drover.server.control_outbox import (
+        LocalVerifiedArchiveResolver,
+        acknowledge_outbox_batch,
+        claim_outbox_batch,
+        prune_verified_payloads,
+        publish_outbox_batch,
+        published_batches,
+    )
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.usage_rollup import rollup_pending_sessions
+
+    registry = HarnessRegistry(control_path)
+    registry.register_host(host_id="host-starve", display_name="Host", kind="test")
+    for session_id in ("stuck-session", "fresh-session"):
+        registry.create_session(
+            host_id="host-starve",
+            harness="codex",
+            command="codex",
+            session_id=session_id,
+            mode="structured",
+        )
+    # Appended first, so it sorts first under ORDER BY created_at.
+    registry.append_event(
+        session_id="stuck-session",
+        event_id="stuck-event",
+        event_type="assistant_output",
+        payload={"text": "older, permanently dependency protected"},
+        seq=1,
+    )
+    registry.append_event(
+        session_id="fresh-session",
+        event_id="fresh-event",
+        event_type="assistant_output",
+        payload={"text": "newer, fully eligible"},
+        seq=1,
+    )
+    registry.update_session_status("stuck-session", "completed")
+    registry.update_session_status("fresh-session", "completed")
+
+    with control_plane_connection(control_path) as con:
+        claim = claim_outbox_batch(con, owner="worker", limit=10)
+        assert claim is not None
+        published = publish_outbox_batch(con, claim, parquet_dir=parquet_dir)
+        assert acknowledge_outbox_batch(con, published.batch_id)
+        rollup_pending_sessions(con)
+        # Only the newer session's recap dependency completes. The older one
+        # keeps a pending recap job, exactly like a pre-recap-era session.
+        con.execute("""
+            INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at)
+            VALUES ('fresh-session', 'done', 1, now())
+            """)
+        # A recap job is only enqueued by a completion event, so insert the
+        # row a completed session would have. stuck-session deliberately gets
+        # none, which is the real pre-recap-era shape: 6,710 payloads on the
+        # reference hub are blocked exactly this way.
+        con.execute("""
+            INSERT INTO live_recap_jobs
+              (session_id, desired_source_seq, status, attempts, enqueued_at, updated_at)
+            VALUES ('fresh-session', 1, 'done', 1, now(), now())
+            """)
+
+    def manifest_ids() -> set[str]:
+        with control_plane_connection(manifest_con_path) as manifest_con:
+            return {batch.batch_id for batch in published_batches(manifest_con)}
+
+    manifest_con_path = control_path
+    resolver = LocalVerifiedArchiveResolver(parquet_dir, manifest_reader=manifest_ids)
+
+    # One candidate per pass. The older event can never prune, so a pass that
+    # returns only it makes no progress no matter how often it runs.
+    result = prune_verified_payloads(control_path, resolver=resolver, limit=1)
+    assert result["pruned"] == 1, (
+        "a bounded pass must reach an eligible payload instead of re-reading "
+        f"the protected head forever: {result}"
+    )
+
+    with control_plane_connection(control_path) as con:
+        remaining = {
+            row[0]
+            for row in con.execute(
+                "SELECT event_id FROM harness_event_payloads"
+            ).fetchall()
+        }
+    assert remaining == {"stuck-event"}
