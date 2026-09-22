@@ -8,9 +8,17 @@ own worktree on a ``drover/<session-id>`` branch: a broad ``git add -A``
 sweeps only that session's files, and its commits sit on the session branch
 until the user merges them deliberately.
 
-Every function here is best-effort and never raises: a host where ``cwd``
-isn't a git repo (or git itself misbehaves) falls back to running the
-session in place, which is exactly the pre-worktree behavior.
+A host where ``cwd`` isn't a git repo, or has no commits yet, falls back to
+running the session in place: that is the pre-worktree behavior and there is
+no isolation to lose.
+
+A worktree that *fails* is different, and raises ``WorktreeIsolationUnavailable``
+rather than falling back. Conflating the two is how a transient git stall came
+to silently strip isolation from a full-auto session: on the reference hub
+``git worktree add`` took 103 seconds against 94 accumulated worktrees, blew the
+15 second timeout, and two codex sessions ran with ``danger-full-access`` on
+``main`` in the user's shared checkout. Running in place is a correct answer to
+"no worktree is possible" and a dangerous one to "the worktree broke".
 """
 
 from __future__ import annotations
@@ -25,6 +33,15 @@ log = logging.getLogger("drover.harnessd")
 _GIT_TIMEOUT_SECONDS = 15
 
 
+class WorktreeIsolationUnavailable(RuntimeError):
+    """Isolation was required, attempted, and could not be established.
+
+    Raised only for a genuine failure (git timed out, git errored, the
+    worktrees directory could not be created). Never raised for a directory
+    that simply cannot host a worktree, which returns None instead.
+    """
+
+
 @dataclass(frozen=True)
 class SessionWorktree:
     repo_root: str
@@ -33,8 +50,14 @@ class SessionWorktree:
     base_sha: str
 
 
-def _git(cwd: str, *args: str) -> str | None:
-    """Run git, returning stripped stdout, or None on any failure."""
+def _git(cwd: str, *args: str, required: bool = False) -> str | None:
+    """Run git, returning stripped stdout, or None on any failure.
+
+    ``required`` marks a call whose failure means isolation could not be
+    established, as opposed to a probe whose negative answer is information.
+    A required call raises instead of returning None, so the caller cannot
+    accidentally treat "it broke" as "it does not apply".
+    """
     try:
         result = subprocess.run(
             ["git", "-C", cwd, *args],
@@ -44,9 +67,17 @@ def _git(cwd: str, *args: str) -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.debug("git %s failed in %s: %s", args, cwd, exc)
+        if required:
+            raise WorktreeIsolationUnavailable(
+                f"git {' '.join(args)} failed in {cwd}: {exc}"
+            ) from exc
         return None
     if result.returncode != 0:
         log.debug("git %s failed in %s: %s", args, cwd, result.stderr.strip())
+        if required:
+            raise WorktreeIsolationUnavailable(
+                f"git {' '.join(args)} failed in {cwd}: {result.stderr.strip()}"
+            )
         return None
     return result.stdout.strip()
 
@@ -56,9 +87,10 @@ def create_session_worktree(
 ) -> SessionWorktree | None:
     """Create a worktree for one session, or None to run in place.
 
-    None (not an exception) covers every unsuitable case: ``cwd`` outside a
-    git repo, a repo with no commits yet (nothing to base a worktree on), or
-    a git failure.
+    None covers the unsuitable cases, where there is no isolation to lose:
+    ``cwd`` outside a git repo, or a repo with no commits yet. A git failure
+    raises ``WorktreeIsolationUnavailable`` instead, because falling back
+    would hand a full-auto session the user's own checkout.
     """
     repo_root = _git(cwd, "rev-parse", "--show-toplevel")
     if repo_root is None:
@@ -73,10 +105,10 @@ def create_session_worktree(
         worktrees_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         log.debug("cannot create worktrees dir %s: %s", worktrees_dir, exc)
-        return None
-    added = _git(repo_root, "worktree", "add", str(path), "-b", branch)
-    if added is None:
-        return None
+        raise WorktreeIsolationUnavailable(
+            f"cannot create worktrees dir {worktrees_dir}: {exc}"
+        ) from exc
+    _git(repo_root, "worktree", "add", str(path), "-b", branch, required=True)
     return SessionWorktree(
         repo_root=repo_root,
         path=str(path),

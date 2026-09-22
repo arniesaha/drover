@@ -84,6 +84,7 @@ from drover.server.harness.websocket import (
 )
 from drover.server.harness.worktree import (
     SessionWorktree,
+    WorktreeIsolationUnavailable,
     cleanup_session_worktree,
     create_session_worktree,
 )
@@ -2378,9 +2379,34 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         session_cwd = str(cwd) if cwd is not None else None
         session_worktree: SessionWorktree | None = None
         if harness in _WORKTREE_HARNESSES and session_cwd is not None:
-            session_worktree = create_session_worktree(
-                session_cwd, session_id, worktrees_dir
-            )
+            # These harnesses run full-auto with no approval channel, so the
+            # worktree is the only thing standing between the session and the
+            # user's checkout. A directory that cannot host one (no repo, no
+            # commits) returns None and running in place is correct. A failure
+            # raises, and must not be downgraded into that same fallback.
+            try:
+                session_worktree = create_session_worktree(
+                    session_cwd, session_id, worktrees_dir
+                )
+            except WorktreeIsolationUnavailable as exc:
+                log.warning(
+                    "refusing full-auto %s session: worktree isolation "
+                    "unavailable in %s: %s",
+                    harness,
+                    session_cwd,
+                    exc,
+                )
+                self._write_json(
+                    {
+                        "error": (
+                            f"worktree isolation unavailable for {harness}: {exc}. "
+                            "Refusing to run a full-auto session in the requested "
+                            "directory. Retry, or reduce accumulated worktrees."
+                        )
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             if session_worktree is not None:
                 session_cwd = session_worktree.path
 
