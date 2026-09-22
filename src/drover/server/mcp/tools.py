@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -259,6 +259,28 @@ def drover_active_sessions(
 # --- drover_search ------------------------------------------------------------
 
 
+def _utc_partition_date(since: str) -> str | None:
+    """The UTC date partition that contains the instant ``since`` names.
+
+    agent_events partitions are keyed by UTC date. Taking the first ten
+    characters of ``since`` instead is wrong for any positive offset:
+    ``2026-09-22T03:30+05:30`` is 2026-09-21 in UTC, and bounding on 09-22
+    skips the partition the instant falls in.
+
+    A naive value is compared in the DuckDB session zone, which this function
+    cannot see, so it gets one day of slack: that is safe for any real offset
+    and costs at most one extra partition. Unparseable input returns None,
+    which only forgoes pruning; the timestamp predicate still applies.
+    """
+    try:
+        instant = datetime.fromisoformat(since.strip().replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if instant.tzinfo is None:
+        return (instant.date() - timedelta(days=1)).isoformat()
+    return instant.astimezone(timezone.utc).date().isoformat()
+
+
 def drover_search(
     *,
     duckdb_path: Path,
@@ -289,9 +311,23 @@ def drover_search(
         where.append("(repo_owner || '/' || repo_name) = ?")
         params.append(repo)
     if since:
-        where.append("timestamp >= ?")
+        partition_date = _utc_partition_date(since)
+        if partition_date is not None:
+            where.append("date >= ?")
+            params.append(partition_date)
+        # The view reads mixed-era Parquet with union_by_name, so `timestamp`
+        # can surface as VARCHAR. A bare `timestamp >= ?` then compares text,
+        # and ' ' sorts before 'T': ISO-8601 bounds silently dropped 60 to 100
+        # percent of matching events on the reference hub. Compare instants.
+        where.append("TRY_CAST(timestamp AS TIMESTAMPTZ) >= CAST(? AS TIMESTAMPTZ)")
         params.append(since)
     elif not scoped and default_since_days > 0:
+        # Partitions are UTC dates; strftime(now()) would format in the
+        # session zone, which clips the window's oldest day east of UTC.
+        where.append(
+            "date >= strftime(timezone('UTC', now()) - "
+            f"INTERVAL {int(default_since_days)} DAY, '%Y-%m-%d')"
+        )
         where.append(
             f"TRY_CAST(timestamp AS TIMESTAMPTZ) >= now() - INTERVAL {int(default_since_days)} DAY"
         )
