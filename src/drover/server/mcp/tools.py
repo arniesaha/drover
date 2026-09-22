@@ -289,9 +289,19 @@ def drover_search(
         where.append("(repo_owner || '/' || repo_name) = ?")
         params.append(repo)
     if since:
+        try:
+            partition_date = datetime.fromisoformat(since[:10]).date().isoformat()
+        except (TypeError, ValueError):
+            partition_date = None
+        if partition_date is not None:
+            where.append("date >= ?")
+            params.append(partition_date)
         where.append("timestamp >= ?")
         params.append(since)
     elif not scoped and default_since_days > 0:
+        where.append(
+            f"date >= strftime(now() - INTERVAL {int(default_since_days)} DAY, '%Y-%m-%d')"
+        )
         where.append(
             f"TRY_CAST(timestamp AS TIMESTAMPTZ) >= now() - INTERVAL {int(default_since_days)} DAY"
         )

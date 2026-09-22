@@ -10,6 +10,7 @@ import duckdb
 import pytest
 import requests
 
+import drover.server.embeddings.worker as embedding_worker_module
 from drover.schema import bootstrap
 from drover.server.embeddings.client import (
     ApiEmbedder,
@@ -583,6 +584,59 @@ def test_worker_acks_session_stream_redelivery_when_embedding_already_done(
         con.close()
     stream = JobStream("embed_jobs", visibility_timeout_ms=0)
     stream.add({"session_id": "S-stream-done"})
+
+    worker = EmbedWorker(
+        duckdb_path=duckdb_path,
+        embedder=_StubEmbedder(),
+        session_job_stream=stream,
+        worker_id="embed-worker-b",
+    )
+
+    assert worker.drain_batch(max_jobs=1) == 0
+    assert stream.pending() == []
+    assert stream.length() == 0
+
+
+def test_worker_acks_versioned_session_stream_redelivery_when_embedding_already_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duckdb_path = _seed(tmp_path)
+    _insert_summary(duckdb_path, "S-versioned-done", "finished summary")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "INSERT INTO summarize_jobs (session_id, status, source_version) "
+            "VALUES ('S-versioned-done', 'done', 'v1')"
+        )
+        con.execute(
+            "INSERT INTO embed_jobs (session_id, status, attempts, source_version) "
+            "VALUES ('S-versioned-done', 'done', 1, 'v1')"
+        )
+    finally:
+        con.close()
+
+    class _RejectTerminalUpdate:
+        def __init__(self, path: Path) -> None:
+            self._con = duckdb.connect(str(path))
+
+        def execute(self, query: str, parameters=None):
+            if "UPDATE embed_jobs e" in query:
+                raise AssertionError("terminal embed job must not be updated")
+            if parameters is None:
+                return self._con.execute(query)
+            return self._con.execute(query, parameters)
+
+        def close(self) -> None:
+            self._con.close()
+
+    monkeypatch.setattr(
+        embedding_worker_module,
+        "open_duckdb_connection",
+        lambda path: _RejectTerminalUpdate(path),
+    )
+    stream = JobStream("embed_jobs", visibility_timeout_ms=0)
+    stream.add({"session_id": "S-versioned-done", "source_version": "v1"})
 
     worker = EmbedWorker(
         duckdb_path=duckdb_path,

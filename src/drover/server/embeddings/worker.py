@@ -441,6 +441,9 @@ class EmbedWorker:
                          FROM embed_jobs WHERE session_id=?""",
                     [session_id],
                 ).fetchone()
+                if job and job[0] in ("done", "superseded"):
+                    self.session_job_stream.ack(delivery.id)
+                    continue
                 if delivery_source_version is not None:
                     if job is None:
                         self.session_job_stream.ack(delivery.id)
@@ -487,9 +490,6 @@ class EmbedWorker:
                             "_delivery": delivery,
                         }
                     )
-                    continue
-                if job and job[0] == "done":
-                    self.session_job_stream.ack(delivery.id)
                     continue
                 summary = con.execute(
                     "SELECT summary_md FROM session_summaries WHERE session_id=?",

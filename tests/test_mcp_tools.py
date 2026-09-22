@@ -561,7 +561,9 @@ def test_search_finds_by_content(tmp_path: Path) -> None:
     assert any("lakehouse rewrite" in r["content"] for r in out["results"])
 
 
-def test_search_defaults_to_recent_bounded_window_when_unscoped(tmp_path: Path) -> None:
+def test_search_defaults_to_recent_bounded_window_when_unscoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     now = datetime.now(timezone.utc)
     _write_agent_events(
@@ -603,11 +605,42 @@ def test_search_defaults_to_recent_bounded_window_when_unscoped(tmp_path: Path) 
     )
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
 
+    statements: list[str] = []
+    real_connect = mcp_tools._connect
+
+    class _RecordingConnection:
+        def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+            self._inner = inner
+
+        def execute(self, sql: str, *args, **kwargs):
+            statements.append(sql)
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(
+        mcp_tools,
+        "_connect",
+        lambda path: _RecordingConnection(real_connect(path)),
+    )
+
     out = drover_search(duckdb_path=duckdb_path, query="needle", limit=10)
 
     assert out["scoped"] is False
     assert out["default_since_days"] == 30
     assert [r["content"] for r in out["results"]] == ["needle from recent history"]
+    assert "date >=" in " ".join(statements[0].split()).lower()
+
+    explicit = drover_search(
+        duckdb_path=duckdb_path,
+        query="needle",
+        since=(now - timedelta(days=2)).date().isoformat(),
+        limit=10,
+    )
+
+    assert [r["content"] for r in explicit["results"]] == ["needle from recent history"]
+    assert "date >=" in " ".join(statements[1].split()).lower()
 
 
 def test_files_touched_pulls_from_tool_use_blocks(tmp_path: Path) -> None:
