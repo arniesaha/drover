@@ -110,3 +110,43 @@ def test_cleanup_of_already_deleted_worktree_reports_missing(repo, tmp_path):
     # The stale registration must not linger and block a future worktree at
     # the same path.
     assert "harness-gone" not in _git(wt.repo_root, "worktree", "list")
+
+
+def test_git_timeout_raises_instead_of_silently_running_in_place(tmp_path, monkeypatch):
+    """A failed worktree is not the same as a worktree being inapplicable.
+
+    Both used to return None, so a transient git stall silently dropped the
+    isolation that makes full-auto execution safe. Observed on the reference
+    hub: `git worktree add` took 103s against 94 accumulated worktrees, blew
+    the 15s timeout, and two codex sessions ran with --sandbox
+    danger-full-access on main in the shared checkout.
+    """
+    from drover.server.harness.worktree import WorktreeIsolationUnavailable
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    real_run = subprocess.run
+
+    def fail_on_worktree_add(cmd, *args, **kwargs):
+        if "worktree" in cmd and "add" in cmd:
+            raise subprocess.TimeoutExpired(cmd, 15)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fail_on_worktree_add)
+
+    with pytest.raises(WorktreeIsolationUnavailable):
+        create_session_worktree(str(repo), "harness-timeout", tmp_path / "worktrees")
+
+
+def test_a_directory_that_cannot_host_a_worktree_still_returns_none(tmp_path):
+    """The legitimate fallback must survive: no repo means run in place."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert create_session_worktree(str(plain), "harness-x", tmp_path / "wt") is None

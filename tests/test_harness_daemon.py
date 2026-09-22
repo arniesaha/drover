@@ -4464,3 +4464,42 @@ def test_recover_answers_409_when_the_staging_key_is_unusable(
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def test_structured_launch_refuses_when_worktree_isolation_fails(monkeypatch, tmp_path):
+    """A full-auto session must not fall back to the user's own checkout.
+
+    daemon.py guarded with `if session_worktree is not None`, so a raised or
+    None result both left session_cwd as the caller's directory. On the
+    reference hub that put two codex sessions with --sandbox
+    danger-full-access on main in the shared checkout, silently.
+    """
+    from drover.server.harness.worktree import WorktreeIsolationUnavailable
+
+    server, state, base_url = _start_test_server(tmp_path)
+    state.model_catalog_service = _FakeModelCatalogService()
+    state.structured = _FakeStructuredManager()
+    state.attachments_dir = tmp_path / "attachments"
+
+    def isolation_failed(*args, **kwargs):
+        raise WorktreeIsolationUnavailable("git worktree add timed out")
+
+    monkeypatch.setattr(harness_daemon, "create_session_worktree", isolation_failed)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "codex",
+                    "mode": "structured",
+                    "cwd": str(tmp_path),
+                    "prompt": "hello",
+                },
+            )
+        assert exc_info.value.code == 503
+        detail = exc_info.value.read().decode()
+        assert "isolation" in detail.lower()
+        # and no session may have been recorded against the unisolated cwd
+        assert state.registry.list_sessions() == []
+    finally:
+        server.shutdown()
