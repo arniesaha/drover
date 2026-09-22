@@ -460,6 +460,21 @@ def _credential_rows(
         isinstance(row, dict) for row in credentials
     ):
         raise ValueError("control_credentials must be a list of objects")
+    if not identity and not credentials:
+        # Both reads are .get() with empty defaults, so a document in the wrong
+        # shape imports nothing and still verifies: expected and actual are
+        # derived from the same empty parse. A hub started on that target
+        # generates a fresh server_id and silently drops every paired
+        # credential. Name the keys that were actually present so an operator
+        # can tell a wrong-shaped document from a genuinely empty one.
+        found = ", ".join(sorted(str(key) for key in body)) or "no top-level keys"
+        raise ValueError(
+            "credential_document contained neither control_server_identity nor "
+            f"control_credentials; found {found}. An explicitly supplied "
+            "document must import something, so this is refused rather than "
+            "imported as an empty identity. Omit --credentials for the "
+            "no-credential path."
+        )
     return {
         "control_server_identity": [
             {"identity_key": key, "identity_value": value}
@@ -745,6 +760,26 @@ def _project_columns(
     return [{column: row.get(column) for column in columns} for row in rows]
 
 
+def _describe_verification_failure(verification: dict[str, Any]) -> str:
+    """Say which check failed and by how much.
+
+    The bare message named neither the failing relation nor the count, which on
+    a real hub is the difference between a one line fix and an opaque refusal.
+    Relationship counts come first: a swept ``harness_sessions`` row leaves its
+    events behind, and that is the common real-world cause.
+    """
+    parts: list[str] = []
+    for name, count in sorted(verification.get("relationships", {}).items()):
+        if count:
+            parts.append(f"{name}={count}")
+    for table, item in sorted(verification.get("tables", {}).items()):
+        if not item.get("match"):
+            parts.append(
+                f"{table} expected {item.get('expected')} got {item.get('actual')}"
+            )
+    return "; ".join(parts) if parts else "no failing check reported"
+
+
 def _verify_rows(
     con: object,
     *,
@@ -990,7 +1025,8 @@ def import_legacy_snapshot(
                 )
                 if not verification["ok"]:
                     raise RuntimeError(
-                        "import verification failed before readiness marker"
+                        "import verification failed before readiness marker: "
+                        + _describe_verification_failure(verification)
                     )
                 source.require_unchanged(operation="import")
                 _mark_state(
