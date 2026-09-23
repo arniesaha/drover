@@ -637,9 +637,11 @@ def test_search_defaults_to_recent_bounded_window_when_unscoped(
     ]
     assert len(searches) == 1
     assert "date >=" in searches[0]
-    # Partitions are UTC dates; formatting now() in the session zone would
-    # clip the oldest day of the window on hosts east of UTC.
-    assert "timezone('utc', now())" in searches[0]
+    # The cutoff must be a bound parameter. An expression over now() is not a
+    # plan-time constant for the production view, which reads a list of
+    # per-partition globs, so it filtered rows but pruned no partitions:
+    # measured 43.6s on the live lake either way.
+    assert "now()" not in searches[0]
     statements.clear()
 
     explicit = drover_search(
