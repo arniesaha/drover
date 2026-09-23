@@ -31,6 +31,12 @@ from pathlib import Path
 log = logging.getLogger("drover.harnessd")
 
 _GIT_TIMEOUT_SECONDS = 15
+# Creating the worktree gets a launch-sized budget rather than a probe's.
+# Process start on the reference hub's external SSD spikes past 11s
+# (drover#321), and with 15s this call timed out twice in two minutes, so the
+# fail-closed path correctly refused codex launches that would have worked.
+# It must stay under the hub's 120s CREATE_SESSION_TIMEOUT_S.
+_WORKTREE_ADD_TIMEOUT_SECONDS = 90
 
 
 class WorktreeIsolationUnavailable(RuntimeError):
@@ -50,7 +56,9 @@ class SessionWorktree:
     base_sha: str
 
 
-def _git(cwd: str, *args: str, required: bool = False) -> str | None:
+def _git(
+    cwd: str, *args: str, required: bool = False, timeout: float | None = None
+) -> str | None:
     """Run git, returning stripped stdout, or None on any failure.
 
     ``required`` marks a call whose failure means isolation could not be
@@ -63,7 +71,7 @@ def _git(cwd: str, *args: str, required: bool = False) -> str | None:
             ["git", "-C", cwd, *args],
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
+            timeout=timeout if timeout is not None else _GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.debug("git %s failed in %s: %s", args, cwd, exc)
@@ -108,7 +116,16 @@ def create_session_worktree(
         raise WorktreeIsolationUnavailable(
             f"cannot create worktrees dir {worktrees_dir}: {exc}"
         ) from exc
-    _git(repo_root, "worktree", "add", str(path), "-b", branch, required=True)
+    _git(
+        repo_root,
+        "worktree",
+        "add",
+        str(path),
+        "-b",
+        branch,
+        required=True,
+        timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
+    )
     return SessionWorktree(
         repo_root=repo_root,
         path=str(path),
