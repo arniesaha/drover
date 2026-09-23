@@ -322,15 +322,17 @@ def drover_search(
         where.append("TRY_CAST(timestamp AS TIMESTAMPTZ) >= CAST(? AS TIMESTAMPTZ)")
         params.append(since)
     elif not scoped and default_since_days > 0:
-        # Partitions are UTC dates; strftime(now()) would format in the
-        # session zone, which clips the window's oldest day east of UTC.
-        where.append(
-            "date >= strftime(timezone('UTC', now()) - "
-            f"INTERVAL {int(default_since_days)} DAY, '%Y-%m-%d')"
-        )
-        where.append(
-            f"TRY_CAST(timestamp AS TIMESTAMPTZ) >= now() - INTERVAL {int(default_since_days)} DAY"
-        )
+        # Computed here and bound as parameters, not written as SQL over now().
+        # The production view reads a list of per-partition globs, and an
+        # expression over now() is not a plan-time constant there: it filtered
+        # rows but pruned no partitions, so this path scanned the whole lake
+        # (43.6s measured) while the explicit-since path, with a bound
+        # parameter, pruned. Partitions are UTC dates, so the cutoff is UTC.
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(default_since_days))
+        where.append("date >= ?")
+        params.append(cutoff.date().isoformat())
+        where.append("TRY_CAST(timestamp AS TIMESTAMPTZ) >= CAST(? AS TIMESTAMPTZ)")
+        params.append(cutoff.isoformat())
 
     sql = f"""
       WITH candidate_agent_events AS (
