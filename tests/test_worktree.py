@@ -150,3 +150,34 @@ def test_a_directory_that_cannot_host_a_worktree_still_returns_none(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     assert create_session_worktree(str(plain), "harness-x", tmp_path / "wt") is None
+
+
+def test_worktree_add_gets_a_launch_sized_timeout(tmp_path, monkeypatch):
+    """A probe may fail fast; creating the worktree must not.
+
+    On the reference hub, process start on the external SSD spikes from 0.05s to
+    over 11s (drover#321). With the same 15s budget as a read-only probe,
+    `git worktree add` timed out twice in two minutes and, correctly failing
+    closed, refused two codex launches that would have succeeded. The hub's own
+    create budget is 120s, so the add fits well inside it.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    seen = {}
+    real_run = subprocess.run
+
+    def record(cmd, *args, **kwargs):
+        if "worktree" in cmd and "add" in cmd:
+            seen["timeout"] = kwargs.get("timeout")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    assert create_session_worktree(str(repo), "harness-t", tmp_path / "wt") is not None
+    assert seen["timeout"] is not None and 60 <= seen["timeout"] < 120
