@@ -351,3 +351,23 @@ def test_the_watchdog_stops_waiting_as_soon_as_registration_lands(tmp_path):
 
     assert len(naps) == 1
     assert layout.active_version() == "0.1.4"
+
+
+def test_run_harnessd_places_worktrees_where_config_says(monkeypatch, tmp_path):
+    """The configured worktree location has to reach the daemon's state.
+
+    On the reference hub the default, ~/.drover/worktrees, sits on a USB SSD
+    whose read stalls blocked every session launch.
+    """
+    target = tmp_path / "internal" / "worktrees"
+    cfg = dataclasses.replace(default_config(), worktrees_dir=target)
+
+    state = _run_harnessd_capturing_state(monkeypatch, tmp_path, cfg)
+
+    assert state.worktrees_dir == target
+
+
+def test_run_harnessd_keeps_the_default_worktrees_dir_when_unset(monkeypatch, tmp_path):
+    state = _run_harnessd_capturing_state(monkeypatch, tmp_path, default_config())
+
+    assert not hasattr(state, "worktrees_dir")

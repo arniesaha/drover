@@ -451,6 +451,11 @@ class DroverConfig:
     apns_key_id: str
     apns_team_id: str
     apns_bundle_id: str
+    # Where harnessd puts per-session git worktrees. None keeps the historical
+    # ~/.drover/worktrees. Configurable because on the reference hub ~/.drover
+    # is a USB SSD whose read stalls (57-120s measured) blocked every session
+    # launch; worktree creation must not share a volume with slow bulk data.
+    worktrees_dir: Path | None = None
 
 
 _DEFAULTS = {
@@ -684,6 +689,11 @@ def _from_dict(d: dict) -> DroverConfig:
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
         duckdb_path=Path(d["paths"]["duckdb_path"]),
+        worktrees_dir=(
+            Path(str(d["paths"]["worktrees_dir"])).expanduser()
+            if d["paths"].get("worktrees_dir")
+            else None
+        ),
         control_store=control_store_config,
         runtime=runtime_config,
         analytics_boundary=AnalyticsBoundaryConfig(

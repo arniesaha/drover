@@ -352,3 +352,28 @@ def test_server_metrics_host_is_read_from_config(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[server]\nmetrics_host = "100.64.0.10"\n', encoding="utf-8")
     assert load_config(path).server_metrics_host == "100.64.0.10"
+
+
+def test_worktrees_dir_defaults_to_unset(tmp_path: Path) -> None:
+    """Unset keeps harnessd's historical ~/.drover/worktrees for everyone."""
+    cfg_path = tmp_path / "c.toml"
+    cfg_path.write_text(
+        '[paths]\nincoming_dir = "i"\nparquet_dir = "p"\nduckdb_path = "d.duckdb"\n',
+        encoding="utf-8",
+    )
+    assert load_config(cfg_path).worktrees_dir is None
+
+
+def test_worktrees_dir_can_be_placed_on_another_volume(tmp_path: Path) -> None:
+    """Session worktrees can live off a slow data volume.
+
+    On the reference hub ~/.drover is a USB SSD that went through 57-120s read
+    stalls, and a worktree created under it blocked every session launch.
+    """
+    cfg_path = tmp_path / "c.toml"
+    cfg_path.write_text(
+        '[paths]\nincoming_dir = "i"\nparquet_dir = "p"\nduckdb_path = "d.duckdb"\n'
+        'worktrees_dir = "~/internal/worktrees"\n',
+        encoding="utf-8",
+    )
+    assert load_config(cfg_path).worktrees_dir == Path.home() / "internal/worktrees"

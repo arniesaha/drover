@@ -3997,6 +3997,9 @@ def run_harnessd(
         advisory_content=advisory_content,
         content_consent=content_consent,
     )
+    if cfg is not None and cfg.worktrees_dir is not None:
+        # Off the data volume when configured: see DroverConfig.worktrees_dir.
+        state.worktrees_dir = cfg.worktrees_dir
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token
     if not state.api_token:
