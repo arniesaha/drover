@@ -35,6 +35,42 @@ def test_bootstrap_creates_parquet_dirs(tmp_lakehouse):
         assert (parquet_dir / sub).is_dir(), f"missing {sub} dir"
 
 
+def test_bootstrap_can_defer_historical_parquet_view_binding(
+    tmp_lakehouse, monkeypatch
+):
+    """Startup can create durable tables without enumerating Parquet history."""
+
+    parquet_dir, db_path = tmp_lakehouse
+
+    def fail_view_builder(*args, **kwargs):
+        raise AssertionError("historical parquet view binding should be deferred")
+
+    import drover.schema as schema
+
+    monkeypatch.setattr(schema, "_agent_events_view", fail_view_builder)
+    monkeypatch.setattr(schema, "_spans_view", fail_view_builder)
+    monkeypatch.setattr(schema, "_pr_events_view", fail_view_builder)
+    monkeypatch.setattr(schema, "_routing_view", fail_view_builder)
+    monkeypatch.setattr(schema, "_provider_usage_snapshots_view", fail_view_builder)
+
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path, bind_parquet_views=False)
+
+    con = duckdb.connect(str(db_path))
+    try:
+        assert con.execute("SELECT count(*) FROM tasks").fetchone() == (0,)
+        views = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_type='VIEW'"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+
+    assert "agent_events" not in views
+    assert "provider_usage_snapshots" not in views
+
+
 def test_bootstrap_creates_provider_storage(tmp_lakehouse):
     parquet_dir, db_path = tmp_lakehouse
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
