@@ -995,6 +995,59 @@ def _append_adoption_metrics(lines: list[str], snapshot: dict) -> None:
     )
 
 
+def _quality_unavailable_category(
+    warning: str,
+    *,
+    freshness: bool = False,
+    embedding: bool = False,
+    attribution: bool = False,
+    bundle: bool = False,
+    identity: bool = False,
+    derived: bool = False,
+    adoption: bool = False,
+) -> dict[str, Any]:
+    """Minimal category shape that keeps Prometheus rendering cheap."""
+    details: dict[str, Any] = {}
+    if freshness:
+        details.update(
+            {
+                "latest_event_age_hours_by_agent": {},
+                "latest_span_age_hours": None,
+                "unprocessed_incoming_files": 0,
+            }
+        )
+    if embedding:
+        details.update(
+            {
+                "session_embedding_coverage_percent": None,
+                "span_embedding_coverage": {},
+            }
+        )
+    if attribution:
+        details["repo_attribution_percent_by_agent"] = {}
+    if bundle:
+        details.update(
+            {
+                "recall_usable_percent": None,
+                "bundle_ready_percent": None,
+                "missing_recall_processing_summaries": None,
+                "missing_rich_evidence_summaries": None,
+            }
+        )
+    if identity:
+        details.update({"duplicate_id_values": 0, "duplicate_dedup_key_values": 0})
+    if derived:
+        details["handoff_ready"] = 0
+    if adoption:
+        details.update({"runtimes": [], "unmatched_high_volume_agent_ids": []})
+    return {
+        "status": "unknown",
+        "score": 0.0,
+        "details": details,
+        "warnings": [warning],
+    }
+
+
 @dataclass
 class MetricsCollector:
     """Cached Drover metrics renderer for Prometheus scrapes."""
@@ -1024,6 +1077,15 @@ class MetricsCollector:
     # freeze the numbers whenever refreshes keep failing, and frozen metrics
     # read as healthy ones; past this the caller waits and the error surfaces.
     max_stale_seconds: float = 300.0
+    # Heavy lakehouse audits are intentionally decoupled from the Prometheus
+    # render TTL. A scrape every 30s should refresh cheap counters only; the
+    # historical Parquet/data-quality scan is reused for this longer window and
+    # refreshed by explicit observability requests.
+    audit_ttl_seconds: float = 900.0
+    # If a heavy audit fails, keep serving the last completed audit (or an
+    # unavailable placeholder) until this backoff expires. Otherwise a broken
+    # store turns every scrape/poll into another full snapshot attempt.
+    audit_failure_backoff_seconds: float = 300.0
     cockpit_service: "CockpitService | None" = None
     advisory_service: "InsightsService | None" = None
     # API-only role reads this narrow central state without constructing an
@@ -1051,6 +1113,12 @@ class MetricsCollector:
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
     _cached_until: float = field(default=0.0, init=False)
+    _audit_quality: dict | None = field(default=None, init=False)
+    _audit_observatory: dict | None = field(default=None, init=False)
+    _audit_cached_until: float = field(default=0.0, init=False)
+    _audit_last_success: float = field(default=0.0, init=False)
+    _audit_retry_after: float = field(default=0.0, init=False)
+    _audit_last_error: str | None = field(default=None, init=False)
     #: Rendered harness snapshots by variant, each with its expiry. Keyed
     #: because `/harness/hosts` asks for `include_sessions=False` and was
     #: therefore never cached -- while being the endpoint the fleet actually
@@ -1117,11 +1185,11 @@ class MetricsCollector:
         return status, json.dumps(payload, sort_keys=True) + "\n"
 
     def render_prometheus(self) -> str:
-        self._refresh_if_needed()
+        self._refresh_if_needed(refresh_audit=False)
         return self._cached_text or ""
 
     def render_json(self) -> str:
-        self._refresh_if_needed()
+        self._refresh_if_needed(refresh_audit=True)
         return self._cached_json or "{}\n"
 
     def render_harness_json(
@@ -2560,27 +2628,32 @@ class MetricsCollector:
         first should not be the one paying that, so the server pays it itself
         -- the same bargain ``_warm_cockpit`` already makes.
         """
-        self._refresh_if_needed()
+        self._refresh_if_needed(refresh_audit=False)
 
-    def _refresh_if_needed(self) -> None:
+    def _refresh_if_needed(self, *, refresh_audit: bool) -> None:
         now = time.monotonic()
+        audit_due = refresh_audit and self._audit_refresh_due(now)
         if self._cached_text is not None:
-            if now < self._cached_until:
+            if now < self._cached_until and not audit_due:
                 return
-            if now < self._cached_until + self.max_stale_seconds:
+            if not refresh_audit and now < self._cached_until + self.max_stale_seconds:
                 # Expired but still usable. A rebuild is seconds of DuckDB
-                # work; making the scraper that happens to arrive first wait
-                # for it is what turned a 60s TTL into 7-15s scrapes. Hand
-                # back the previous render and rebuild behind the request.
-                self._refresh_in_background()
+                # work when an explicit observability request is refreshing
+                # the audit; Prometheus only refreshes cheap gauges here.
+                self._refresh_in_background(refresh_audit=False)
                 return
         with self._lock:
             now = time.monotonic()
-            if self._cached_text is not None and now < self._cached_until:
+            audit_due = refresh_audit and self._audit_refresh_due(now)
+            if (
+                self._cached_text is not None
+                and now < self._cached_until
+                and not audit_due
+            ):
                 return
-            self._rebuild()
+            self._rebuild(refresh_audit=refresh_audit)
 
-    def _refresh_in_background(self) -> None:
+    def _refresh_in_background(self, *, refresh_audit: bool) -> None:
         """Rebuild off the request path, at most one rebuild at a time."""
         with self._refresh_guard:
             if self._refreshing:
@@ -2590,7 +2663,7 @@ class MetricsCollector:
         def run() -> None:
             try:
                 with self._lock:
-                    self._rebuild()
+                    self._rebuild(refresh_audit=refresh_audit)
             except Exception as exc:  # noqa: BLE001 - a scrape must not die here
                 # The cache keeps its old timestamp, so the next scrape tries
                 # again, and once the staleness window closes the failure
@@ -2602,9 +2675,9 @@ class MetricsCollector:
 
         threading.Thread(target=run, name="drover-metrics-refresh", daemon=True).start()
 
-    def _rebuild(self) -> None:
+    def _rebuild(self, *, refresh_audit: bool) -> None:
         """Render every cached payload. Callers must hold ``self._lock``."""
-        snapshot = self._quality_snapshot()
+        snapshot, observatory = self._audit_payload(refresh=refresh_audit)
         lines = [format_prometheus(snapshot).rstrip()]
         _append_details_metrics(lines, snapshot)
         _append_operational_health_metrics(lines, self.duckdb_path, snapshot)
@@ -2615,7 +2688,7 @@ class MetricsCollector:
         _append_advisory_metrics(lines)
         _append_usage_rollup_metrics(lines)
         _append_analytics_gate_metrics(lines)
-        observatory = self._observatory_snapshot(snapshot)
+        self._append_audit_cache_metrics(lines)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"
         self._cached_json = (
@@ -2636,6 +2709,136 @@ class MetricsCollector:
         # rebuild itself takes seconds, and charging those to the TTL would
         # expire a render that is only just finished.
         self._cached_until = time.monotonic() + self.ttl_seconds
+
+    def _audit_refresh_due(self, now: float) -> bool:
+        return self._audit_quality is None or now >= self._audit_cached_until
+
+    def _audit_payload(self, *, refresh: bool) -> tuple[dict, dict]:
+        now = time.monotonic()
+        if refresh and self._audit_refresh_due(now) and now >= self._audit_retry_after:
+            try:
+                quality, observatory = self._build_audit_payload()
+            except Exception as exc:  # noqa: BLE001
+                self._audit_last_error = f"{type(exc).__name__}: {exc}"
+                self._audit_retry_after = now + self.audit_failure_backoff_seconds
+                log.warning(
+                    "metrics audit refresh failed; backing off for %.0fs: %s",
+                    self.audit_failure_backoff_seconds,
+                    exc,
+                )
+            else:
+                landed = time.monotonic()
+                self._audit_quality = quality
+                self._audit_observatory = observatory
+                self._audit_cached_until = landed + self.audit_ttl_seconds
+                self._audit_last_success = landed
+                self._audit_retry_after = 0.0
+                self._audit_last_error = None
+        if self._audit_quality is None:
+            return self._unavailable_quality_snapshot(), self._unavailable_observatory()
+        return self._audit_quality, self._audit_observatory or {}
+
+    def _build_audit_payload(self) -> tuple[dict, dict]:
+        """Build quality + observatory from one private store snapshot."""
+        source = Path(self.duckdb_path)
+        if not source.exists():
+            quality = quality_snapshot(
+                duckdb_path=source,
+                incoming_dir=self.incoming_dir,
+                deep=False,
+            )
+            return quality, {}
+
+        with tempfile.TemporaryDirectory(
+            prefix="drover-metrics-audit-", dir=snapshot_scratch_root(source)
+        ) as tmp:
+            snapshot = Path(tmp) / source.name
+            copy_duckdb_store(source, snapshot)
+            quality = quality_snapshot(
+                duckdb_path=snapshot,
+                incoming_dir=self.incoming_dir,
+                deep=False,
+                role="snapshot",
+            )
+            observatory = pipeline_observatory_snapshot(
+                duckdb_path=snapshot,
+                runtime_audit=quality.get("runtime_audit", {}),
+                max_artifacts=10,
+                max_projects=10,
+                role="snapshot",
+            )
+            return quality, observatory
+
+    def _append_audit_cache_metrics(self, lines: list[str]) -> None:
+        now = time.monotonic()
+        lines.extend(
+            [
+                "# HELP drover_metrics_audit_cache_stale Whether the cached data-quality audit is past its refresh TTL.",
+                "# TYPE drover_metrics_audit_cache_stale gauge",
+                _metric(
+                    "drover_metrics_audit_cache_stale",
+                    self._audit_quality is None or now >= self._audit_cached_until,
+                ),
+                "# HELP drover_metrics_audit_last_success_timestamp_seconds Last successful heavy audit refresh as a Unix timestamp.",
+                "# TYPE drover_metrics_audit_last_success_timestamp_seconds gauge",
+                _metric(
+                    "drover_metrics_audit_last_success_timestamp_seconds",
+                    (
+                        int(time.time() - (now - self._audit_last_success))
+                        if self._audit_last_success
+                        else 0
+                    ),
+                ),
+                "# HELP drover_metrics_audit_refresh_error Whether the last heavy audit refresh failed.",
+                "# TYPE drover_metrics_audit_refresh_error gauge",
+                _metric(
+                    "drover_metrics_audit_refresh_error",
+                    self._audit_last_error is not None,
+                ),
+                "# HELP drover_metrics_audit_retry_after_seconds Seconds until another failed heavy audit may be retried.",
+                "# TYPE drover_metrics_audit_retry_after_seconds gauge",
+                _metric(
+                    "drover_metrics_audit_retry_after_seconds",
+                    max(self._audit_retry_after - now, 0.0),
+                ),
+            ]
+        )
+
+    def _unavailable_quality_snapshot(self) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        warning = self._audit_last_error or "data-quality audit has not run yet"
+        category = _quality_unavailable_category(warning)
+        return {
+            "snapshot_version": 1,
+            "generated_at": now,
+            "duckdb_path": str(self.duckdb_path),
+            "incoming_dir": str(self.incoming_dir),
+            "hours": 24,
+            "diagnostic_depth": "standard",
+            "status": "unknown",
+            "score": 0.0,
+            "categories": {
+                "freshness": _quality_unavailable_category(warning, freshness=True),
+                "completeness": category,
+                "summary_coverage": category,
+                "embedding_coverage": _quality_unavailable_category(
+                    warning, embedding=True
+                ),
+                "attribution": _quality_unavailable_category(warning, attribution=True),
+                "bundle_quality": _quality_unavailable_category(warning, bundle=True),
+                "identity": _quality_unavailable_category(warning, identity=True),
+                "derived_context": _quality_unavailable_category(warning, derived=True),
+                "agent_adoption": _quality_unavailable_category(warning, adoption=True),
+            },
+            "warnings": [warning],
+            "runtime_audit": {"table_counts": {}},
+        }
+
+    def _unavailable_observatory(self) -> dict:
+        payload: dict[str, Any] = {"error": "data-quality audit unavailable"}
+        if self._audit_last_error:
+            payload["detail"] = self._audit_last_error
+        return payload
 
     def _quality_snapshot(self) -> dict:
         source = Path(self.duckdb_path)
