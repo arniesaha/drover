@@ -25,8 +25,10 @@ ACTIVATION_SYMLINK = "symlink"
 ACTIVATION_IN_PLACE = "in_place"
 ACTIVATION_MODES = (ACTIVATION_SYMLINK, ACTIVATION_IN_PLACE)
 
-# The default registration deadline in seconds. Kept in one place so the
-# config fallback and the updater's module-level fallback cannot drift.
+# The default registration deadline in seconds. Mirrors the updater's
+# module-level REGISTRATION_DEADLINE_SECONDS, which remains the fallback when
+# no config is supplied; config.py does not import the updater to avoid
+# coupling the two layers.
 _DEFAULT_REGISTRATION_DEADLINE_SECONDS = 90.0
 
 try:
