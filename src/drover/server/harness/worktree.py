@@ -116,16 +116,28 @@ def create_session_worktree(
         raise WorktreeIsolationUnavailable(
             f"cannot create worktrees dir {worktrees_dir}: {exc}"
         ) from exc
-    _git(
-        repo_root,
-        "worktree",
-        "add",
-        str(path),
-        "-b",
-        branch,
-        required=True,
-        timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
-    )
+    try:
+        _git(
+            repo_root,
+            "worktree",
+            "add",
+            str(path),
+            "-b",
+            branch,
+            required=True,
+            timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
+        )
+    except WorktreeIsolationUnavailable:
+        # `git worktree add -b` creates the branch before the worktree, so a
+        # failure part-way (timeout or error) can leave an orphaned
+        # drover/<session-id> branch and a half-registered worktree. Clean both
+        # up so a retry with the same session id cannot collide (#398). These
+        # are best-effort: the original failure is what matters, and it is
+        # re-raised below.
+        _git(repo_root, "worktree", "prune")
+        _git(repo_root, "worktree", "remove", "--force", str(path))
+        _git(repo_root, "branch", "-D", branch)
+        raise
     return SessionWorktree(
         repo_root=repo_root,
         path=str(path),

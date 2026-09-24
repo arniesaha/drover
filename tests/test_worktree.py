@@ -145,6 +145,48 @@ def test_git_timeout_raises_instead_of_silently_running_in_place(tmp_path, monke
         create_session_worktree(str(repo), "harness-timeout", tmp_path / "worktrees")
 
 
+def test_worktree_add_failure_cleans_orphan_branch(tmp_path, monkeypatch):
+    """A failed `git worktree add -b` must not leak its session branch.
+
+    `git worktree add -b <branch>` creates the branch before the worktree, so
+    a timeout/error part-way leaves an orphaned ``drover/<session-id>`` branch
+    with no worktree (#398). A later session reusing that id then collides on
+    the branch name. The failure must still raise -- but it must also delete
+    the branch it half-created.
+    """
+    from drover.server.harness.worktree import WorktreeIsolationUnavailable
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    real_run = subprocess.run
+
+    def create_branch_then_stall(cmd, *args, **kwargs):
+        if "worktree" in cmd and "add" in cmd:
+            # git creates the branch first, then the worktree-add stalls.
+            real_run(
+                ["git", "-C", str(repo), "branch", "drover/harness-orphan"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            raise subprocess.TimeoutExpired(cmd, 90)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", create_branch_then_stall)
+
+    with pytest.raises(WorktreeIsolationUnavailable):
+        create_session_worktree(str(repo), "harness-orphan", tmp_path / "worktrees")
+
+    assert _git(repo, "branch", "--list", "drover/harness-orphan") == ""
+
+
 def test_a_directory_that_cannot_host_a_worktree_still_returns_none(tmp_path):
     """The legitimate fallback must survive: no repo means run in place."""
     plain = tmp_path / "plain"
