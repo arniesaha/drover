@@ -16,6 +16,12 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 
+# Seconds launchd waits after SIGTERM before SIGKILL. The server checkpoints
+# on SIGTERM; killing it mid-checkpoint makes the next open pay for recovery
+# (#307: a 4.5-minute first DuckDB open). Generous enough for a clean
+# checkpoint, short enough that a genuinely wedged unit still gets reclaimed.
+EXIT_TIMEOUT_SECONDS = 300
+
 
 def runtime_bin(home: Path) -> Path:
     """Executables always resolve through the symlink, so an update is a flip."""
@@ -72,6 +78,7 @@ def render_launchd(
         "ProgramArguments": program_arguments,
         "EnvironmentVariables": {"PATH": ":".join(path_entries)},
         "KeepAlive": keep_alive,
+        "ExitTimeOut": EXIT_TIMEOUT_SECONDS,
         "RunAtLoad": True,
         "StandardOutPath": str(log_dir / f"{short}.out.log"),
         "StandardErrorPath": str(log_dir / f"{short}.err.log"),
