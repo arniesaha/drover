@@ -354,6 +354,23 @@ def test_server_metrics_host_is_read_from_config(tmp_path):
     assert load_config(path).server_metrics_host == "100.64.0.10"
 
 
+def test_registration_deadline_defaults_to_90_seconds():
+    assert default_config().update_registration_deadline_seconds == 90.0
+
+
+def test_loads_registration_deadline(tmp_path):
+    cfg_file = tmp_path / "update.toml"
+    cfg_file.write_text("[update]\nregistration_deadline_seconds = 300\n")
+    assert load_config(cfg_file).update_registration_deadline_seconds == 300.0
+
+
+@pytest.mark.parametrize("value", ["'nope'", "0", "-5", "'  '", "nan", "inf"])
+def test_bad_registration_deadline_falls_back_to_default(tmp_path, value):
+    cfg_file = tmp_path / "update.toml"
+    cfg_file.write_text(f"[update]\nregistration_deadline_seconds = {value}\n")
+    assert load_config(cfg_file).update_registration_deadline_seconds == 90.0
+
+
 def test_worktrees_dir_defaults_to_unset(tmp_path: Path) -> None:
     """Unset keeps harnessd's historical ~/.drover/worktrees for everyone."""
     cfg_path = tmp_path / "c.toml"

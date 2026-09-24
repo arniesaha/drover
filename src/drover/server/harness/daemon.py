@@ -3837,6 +3837,7 @@ def _start_rollback_watchdog(
     activation: str = ACTIVATION_SYMLINK,
     in_place_venv: str = "",
     restart_units: Sequence[str] = (),
+    deadline_seconds: float = REGISTRATION_DEADLINE_SECONDS,
 ) -> threading.Thread:
     thread = threading.Thread(
         target=_rollback_watchdog,
@@ -3845,6 +3846,7 @@ def _start_rollback_watchdog(
             "activation": activation,
             "in_place_venv": in_place_venv,
             "restart_units": tuple(restart_units),
+            "deadline_seconds": deadline_seconds,
         },
         name="drover-harnessd-watchdog",
         daemon=True,
@@ -4021,6 +4023,7 @@ def run_harnessd(
             activation=activation,
             in_place_venv=in_place_venv,
             restart_units=cfg.update_restart_units,
+            deadline_seconds=cfg.update_registration_deadline_seconds,
         )
     server = create_harness_server(
         listen_host=listen_host,

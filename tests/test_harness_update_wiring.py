@@ -205,6 +205,27 @@ def test_run_harnessd_wires_nothing_when_updates_are_disabled(monkeypatch, tmp_p
     assert state.updater is None
 
 
+def test_run_harnessd_passes_the_configured_registration_deadline(
+    monkeypatch, tmp_path
+):
+    """A host that needs longer than 90s must be able to say so (#383)."""
+    captured = {}
+    monkeypatch.setattr(
+        daemon_module,
+        "_start_rollback_watchdog",
+        lambda state, layout, **kwargs: captured.update(kwargs),
+    )
+    cfg = dataclasses.replace(
+        default_config(),
+        update_enabled=True,
+        update_registration_deadline_seconds=300.0,
+    )
+
+    _run_harnessd_capturing_state(monkeypatch, tmp_path, cfg)
+
+    assert captured["deadline_seconds"] == 300.0
+
+
 def test_run_harnessd_binds_before_it_starts_event_reconciliation(
     monkeypatch, tmp_path
 ):
