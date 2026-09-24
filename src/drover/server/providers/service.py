@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from drover.server.compact import compact_partition
 from drover.server.db import open_duckdb_connection
@@ -675,20 +676,80 @@ def _by_observed_day(
     return grouped
 
 
+def _fold_legacy_flat_snapshots(snapshot_dir: Path) -> dict:
+    """Fold pre-partition flat snapshot files into their observed-day partitions.
+
+    Before the writer partitioned by day, it wrote one file per refresh
+    directly under ``provider_usage_snapshots/``. The view's ``**/*.parquet``
+    glob still matches those flat files, so every footer is scanned at each
+    start (#382). The writer now appends only to ``date=<day>/``; moving the
+    legacy files there lets the footer scan collapse from ~18k files to ~days,
+    and the closed-day compaction below can then merge each day. A file is read
+    whole and its rows grouped by their own ``observed_at``, so one that
+    straddles midnight lands its rows in the right partitions.
+    """
+    results = {"partitions": 0, "files_before": 0, "files_after": 0, "rows": 0}
+    flat = sorted(p for p in snapshot_dir.glob("*.parquet") if p.is_file())
+    if not flat:
+        return results
+    written_days: set[str] = set()
+    for path in flat:
+        table = pq.ParquetFile(path).read()
+        results["files_before"] += 1
+        results["rows"] += table.num_rows
+        if table.num_rows == 0:
+            path.unlink()
+            continue
+        by_day: dict[str, list[int]] = {}
+        for i, ts in enumerate(table.column("observed_at").to_pylist()):
+            if ts.tzinfo is not None:
+                ts = ts.astimezone(timezone.utc)
+            by_day.setdefault(ts.date().isoformat(), []).append(i)
+        for day, idxs in by_day.items():
+            partition = snapshot_dir / f"date={day}"
+            partition.mkdir(parents=True, exist_ok=True)
+            out_path = partition / f"part-migrated-{uuid4().hex}.parquet"
+            atomic_write_table(
+                table.take(pa.array(idxs, type=pa.int64())),
+                out_path,
+                compression="zstd",
+            )
+            results["files_after"] += 1
+            written_days.add(day)
+        path.unlink()
+    results["partitions"] = len(written_days)
+    if results["files_before"]:
+        log.info(
+            "folded %d legacy flat snapshot file(s): %d -> %d files, %d rows",
+            results["files_before"],
+            results["files_before"],
+            results["files_after"],
+            results["rows"],
+        )
+    return results
+
+
 def compact_closed_snapshot_partitions(parquet_dir: Path) -> dict:
     """Merge each finished day's snapshot files into one.
 
-    Only days before today, and deliberately without deduplication: in this
-    table `dedup_key` identifies a *snapshot*, and each snapshot contributes
-    one row per window, so deduplicating on it keeps one row in four and
-    unlinks the rest (#389). Today's partition is never touched, which is what
-    makes this safe beside a live writer: writers only ever append to today.
+    First folds any pre-partition flat files into dated partitions (#382), then
+    merges each finished day. Days are merged deliberately without
+    deduplication: in this table `dedup_key` identifies a *snapshot*, and each
+    snapshot contributes one row per window, so deduplicating on it keeps one
+    row in four and unlinks the rest (#389). Today's partition is never touched,
+    which is what makes this safe beside a live writer: writers only ever
+    append to today.
     """
     snapshot_dir = Path(parquet_dir) / "provider_usage_snapshots"
     today = f"date={datetime.now(timezone.utc).date().isoformat()}"
     results = {"partitions": 0, "files_before": 0, "files_after": 0, "rows": 0}
     if not snapshot_dir.is_dir():
         return results
+    fold = _fold_legacy_flat_snapshots(snapshot_dir)
+    results["partitions"] += fold["partitions"]
+    results["files_before"] += fold["files_before"]
+    results["files_after"] += fold["files_after"]
+    results["rows"] += fold["rows"]
     for partition in sorted(snapshot_dir.glob("date=*")):
         if not partition.is_dir() or partition.name >= today:
             continue
