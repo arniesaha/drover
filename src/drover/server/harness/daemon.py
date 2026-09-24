@@ -87,6 +87,7 @@ from drover.server.harness.worktree import (
     WorktreeIsolationUnavailable,
     cleanup_session_worktree,
     create_session_worktree,
+    reclaim_stale_session_worktrees,
 )
 from drover.server.providers.inventory import DetectedProvider, detect_provider_accounts
 from drover.server.runtime import RuntimeLayout
@@ -4002,6 +4003,12 @@ def run_harnessd(
     if cfg is not None and cfg.worktrees_dir is not None:
         # Off the data volume when configured: see DroverConfig.worktrees_dir.
         state.worktrees_dir = cfg.worktrees_dir
+    try:
+        reclaimed = reclaim_stale_session_worktrees(state.worktrees_dir)
+        if any(reclaimed.values()):
+            log.info("reclaimed stale session worktrees: %s", reclaimed)
+    except Exception:  # noqa: BLE001 - cleanup must never block startup
+        log.exception("stale session worktree sweep failed")
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token
     if not state.api_token:

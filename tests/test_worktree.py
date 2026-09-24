@@ -16,6 +16,7 @@ import pytest
 from drover.server.harness.worktree import (
     cleanup_session_worktree,
     create_session_worktree,
+    reclaim_stale_session_worktrees,
 )
 
 
@@ -143,6 +144,41 @@ def test_git_timeout_raises_instead_of_silently_running_in_place(tmp_path, monke
 
     with pytest.raises(WorktreeIsolationUnavailable):
         create_session_worktree(str(repo), "harness-timeout", tmp_path / "worktrees")
+
+
+def test_reclaim_removes_stale_clean_worktree(repo, tmp_path):
+    """A clean worktree left by a prior run is reclaimed on the next start.
+
+    The daemon's in-memory ``session_worktrees`` map is lost on restart, so a
+    clean worktree created before a crash/restart is otherwise never cleaned up
+    (#398). The sweep reconstructs the worktree and reuses the same
+    "keep only if there is work" policy as session-end cleanup.
+    """
+    worktrees_dir = tmp_path / "worktrees"
+    create_session_worktree(str(repo), "harness-stale", worktrees_dir)
+    result = reclaim_stale_session_worktrees(worktrees_dir)
+    assert result["removed"] == 1
+    assert not (worktrees_dir / "harness-stale").exists()
+    assert _git(repo, "branch", "--list", "drover/harness-stale") == ""
+
+
+def test_reclaim_keeps_stale_dirty_worktree(repo, tmp_path):
+    worktrees_dir = tmp_path / "worktrees"
+    create_session_worktree(str(repo), "harness-dirty-stale", worktrees_dir)
+    (worktrees_dir / "harness-dirty-stale" / "wip.txt").write_text("wip\n")
+    result = reclaim_stale_session_worktrees(worktrees_dir)
+    assert result["kept"] == 1
+    assert (worktrees_dir / "harness-dirty-stale" / "wip.txt").is_file()
+
+
+def test_reclaim_ignores_non_session_entries(repo, tmp_path):
+    worktrees_dir = tmp_path / "worktrees"
+    worktrees_dir.mkdir()
+    (worktrees_dir / "notes.txt").write_text("not a worktree\n")
+    result = reclaim_stale_session_worktrees(worktrees_dir)
+    assert result["removed"] == 0
+    assert result["kept"] == 0
+    assert (worktrees_dir / "notes.txt").is_file()
 
 
 def test_worktree_add_failure_cleans_orphan_branch(tmp_path, monkeypatch):

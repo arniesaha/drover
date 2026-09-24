@@ -146,6 +146,64 @@ def create_session_worktree(
     )
 
 
+def reclaim_stale_session_worktrees(worktrees_dir: Path) -> dict[str, int]:
+    """Reclaim session worktrees left behind by a previous daemon run.
+
+    The daemon tracks live session worktrees in an in-memory map that a restart
+    drops, so a clean worktree created before a crash/restart would otherwise
+    sit on disk forever (#398). Each directory under ``worktrees_dir`` is
+    reconstructed into a ``SessionWorktree`` and put through the same
+    keep-if-there-is-work policy as session-end cleanup.
+
+    Returns counts keyed by the cleanup outcome (``removed``/``kept``/
+    ``missing``), plus ``skipped`` for entries that are not a drover session
+    worktree.
+    """
+    counts: dict[str, int] = {"removed": 0, "kept": 0, "missing": 0, "skipped": 0}
+    worktrees_dir = Path(worktrees_dir)
+    if not worktrees_dir.is_dir():
+        return counts
+    for entry in sorted(worktrees_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        wt = _reconstruct_worktree(entry)
+        if wt is None:
+            counts["skipped"] += 1
+            continue
+        counts[cleanup_session_worktree(wt)] += 1
+    return counts
+
+
+def _reconstruct_worktree(path: Path) -> SessionWorktree | None:
+    """Rebuild a ``SessionWorktree`` from its directory alone.
+
+    Returns None when the directory is not a drover session worktree (no git
+    metadata, a detached HEAD, or a non-``drover/`` branch), which the sweep
+    skips rather than guessing at. ``repo_root`` is the shared checkout's top
+    level, recovered through the common git dir so ``worktree remove`` and
+    ``branch -D`` run from a worktree git will not refuse to act on.
+    """
+    common_dir = _git(str(path), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common_dir is None:
+        return None
+    repo_root = str(Path(common_dir).resolve().parent)
+    branch = _git(str(path), "rev-parse", "--abbrev-ref", "HEAD")
+    if branch is None or branch == "HEAD" or not branch.startswith("drover/"):
+        return None
+    # The fork point is where the session branch left the main branch, which is
+    # what create_session_worktree captured as base_sha. merge-base stays put as
+    # the main branch advances after the worktree was created.
+    base_sha = _git(repo_root, "merge-base", branch, "HEAD")
+    if base_sha is None:
+        return None
+    return SessionWorktree(
+        repo_root=repo_root,
+        path=str(path),
+        branch=branch,
+        base_sha=base_sha,
+    )
+
+
 def cleanup_session_worktree(wt: SessionWorktree) -> str:
     """Reclaim a session worktree if (and only if) the session left no work.
 
