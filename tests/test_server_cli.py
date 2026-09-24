@@ -344,7 +344,17 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
     worker_configs: dict[str, object] = {}
 
     class ImmediateStopEvent:
+        def __init__(self) -> None:
+            self._set = False
+
+        def clear(self) -> None:
+            self._set = False
+
+        def is_set(self) -> bool:
+            return self._set
+
         def set(self) -> None:
+            self._set = True
             events.append(("event", "set"))
 
         def wait(self, _timeout=None) -> bool:
@@ -419,6 +429,7 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
     monkeypatch.setattr(server_main, "SummarizerWorker", RecordingSummarizerWorker)
     monkeypatch.setattr(server_main, "LiveRecapWorker", RecordingLiveRecapWorker)
     monkeypatch.setattr(server_main, "_summarizer_backend_available", lambda _cfg: True)
+    monkeypatch.setattr(server_main, "bootstrap", lambda **_kwargs: None)
     monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
 
     result = CliRunner().invoke(
