@@ -521,6 +521,9 @@ def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp
         ttl_seconds=60,
     )
 
+    # Prometheus renders are intentionally lightweight; the explicit
+    # observability JSON surface owns the heavy data-quality audit cadence.
+    collector.render_json()
     text = collector.render_prometheus()
 
     assert 'drover_quality_score{category="overall"} 0.85' in text
@@ -593,6 +596,7 @@ def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
         ttl_seconds=60,
     )
 
+    collector.render_json()
     text = collector.render_prometheus()
 
     assert "drover_harness_legacy_unsequenced_events 2" in text
@@ -669,6 +673,78 @@ def test_metrics_collector_json_surface(monkeypatch, tmp_path):
     assert '"summarize"' in body
     assert '"pending": 1' in body
     assert '"undelivered": 3' in body
+
+
+def test_prometheus_render_does_not_start_heavy_audit(monkeypatch, tmp_path):
+    calls = {"quality": 0}
+
+    def fake_quality(**kwargs):
+        calls["quality"] += 1
+        return _snapshot()
+
+    monkeypatch.setattr(metrics, "quality_snapshot", fake_quality)
+    collector = MetricsCollector(
+        duckdb_path=tmp_path / "missing.duckdb",
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=0,
+    )
+
+    first = collector.render_prometheus()
+    second = collector.render_prometheus()
+
+    assert calls["quality"] == 0
+    assert 'drover_quality_status{category="overall",status="unknown"} 1' in first
+    assert "drover_metrics_audit_cache_stale 1" in second
+
+
+def test_observability_audit_failure_backs_off(monkeypatch, tmp_path):
+    calls = {"quality": 0}
+
+    def failing_quality(**kwargs):
+        calls["quality"] += 1
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(metrics, "quality_snapshot", failing_quality)
+    collector = MetricsCollector(
+        duckdb_path=tmp_path / "missing.duckdb",
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=0,
+        audit_failure_backoff_seconds=60,
+    )
+
+    first = json.loads(collector.render_json())
+    second = json.loads(collector.render_json())
+
+    assert calls["quality"] == 1
+    assert first["quality"]["status"] == "unknown"
+    assert second["quality"]["status"] == "unknown"
+    assert "RuntimeError: audit unavailable" in second["observatory"]["detail"]
+
+
+def test_observability_refresh_reuses_one_snapshot_copy(tmp_path, monkeypatch):
+    collector = _make_collector(tmp_path)
+    live = Path(collector.duckdb_path).resolve()
+    seen: list[Path] = []
+
+    def fake_quality(*, duckdb_path, **kwargs):
+        seen.append(Path(duckdb_path).resolve())
+        return _snapshot()
+
+    def fake_observatory(*, duckdb_path, **kwargs):
+        seen.append(Path(duckdb_path).resolve())
+        return {"ok": True}
+
+    monkeypatch.setattr(metrics, "quality_snapshot", fake_quality)
+    monkeypatch.setattr(metrics, "pipeline_observatory_snapshot", fake_observatory)
+
+    payload = json.loads(collector.render_json())
+
+    assert payload["observatory"] == {"ok": True}
+    assert len(seen) == 2
+    assert seen[0] == seen[1]
+    assert seen[0] != live
 
 
 def test_metrics_http_server_serves_observatory_ui(monkeypatch, tmp_path):
@@ -4940,21 +5016,20 @@ class _CountingQuality:
 
 
 def test_warm_takes_the_cold_render_off_the_request_path(tmp_path, monkeypatch):
-    """Nothing warmed the metrics cache after a restart, so the first scrape
-    paid for the cold DuckDB open and the whole parquet glob: 35.6s measured
-    on the Mac hub (#78). The server should pay that itself, as it already
-    does for the cockpit.
+    """Warm builds only the cheap scrape render, not the heavy audit.
+
+    The historical quality/observatory audit is now on its own slower cadence;
+    startup warmup must not perform the full Parquet scan just to protect the
+    first Prometheus scrape.
     """
     collector = _make_collector(tmp_path)
     quality = _CountingQuality(monkeypatch)
 
     collector.warm()
-    assert len(quality.threads) == 1, "warm should build the render"
+    assert len(quality.threads) == 0, "warm must not run the heavy audit"
 
     collector.render_prometheus()
-    assert (
-        len(quality.threads) == 1
-    ), "the first scrape after warm should be a cache hit"
+    assert len(quality.threads) == 0, "Prometheus should reuse the cheap warm render"
 
 
 def test_expired_metrics_cache_is_served_stale_while_it_refreshes(
@@ -4980,22 +5055,9 @@ def test_expired_metrics_cache_is_served_stale_while_it_refreshes(
     assert stale["quality"]["score"] == 1.0, "should serve the previous render"
     assert elapsed < 2.0, f"stale read blocked for {elapsed:.1f}s"
 
-    quality.wait_for_render(2)
     assert (
-        quality.threads[1] != quality.threads[0]
-    ), "the rebuild must not run on the calling thread"
-
-    quality.release.set()
-    deadline = monotonic() + 30
-    while monotonic() < deadline:
-        if json.loads(collector.render_json())["quality"]["score"] == 2.0:
-            break
-        # The production caller is a periodic scraper, not a hot loop. Yield
-        # here so the test itself does not starve the background renderer it is
-        # trying to observe under a loaded test host.
-        sleep(0.01)
-    else:  # pragma: no cover - only on a hung refresh
-        pytest.fail("background refresh never replaced the stale render")
+        len(quality.threads) == 1
+    ), "cheap cache refresh must not rerun the heavy audit"
 
 
 def test_expired_cache_triggers_only_one_background_refresh(tmp_path, monkeypatch):
@@ -5010,11 +5072,9 @@ def test_expired_cache_triggers_only_one_background_refresh(tmp_path, monkeypatc
     for _ in range(5):
         collector.render_json()
 
-    quality.wait_for_render(2)
-    quality.release.set()
     assert (
-        len(quality.threads) == 2
-    ), f"expected one background rebuild, got {len(quality.threads) - 1}"
+        len(quality.threads) == 1
+    ), "expired render cache should reuse the audit snapshot"
 
 
 def test_cache_older_than_the_stale_window_is_rebuilt_synchronously(
@@ -5032,8 +5092,8 @@ def test_cache_older_than_the_stale_window_is_rebuilt_synchronously(
 
     payload = json.loads(collector.render_json())
 
-    assert quality.threads == [threading.current_thread().name] * 2
-    assert payload["quality"]["score"] == 2.0
+    assert quality.threads == [threading.current_thread().name]
+    assert payload["quality"]["score"] == 1.0
 
 
 def test_harness_snapshot_works_while_this_process_holds_the_db(tmp_path):

@@ -2963,7 +2963,17 @@ def run(
         raise click.UsageError(
             "--no-metrics and --metrics-host do not apply to --role analytics"
         )
-    bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    # Bring up durable tables/control state first, but do not bind the
+    # historical Parquet views yet. DuckDB resolves read_parquet(...,
+    # union_by_name=true) metadata while creating those views; on a degraded
+    # external SSD that blocked all-role startup for >10 minutes before MCP or
+    # OTLP could bind. The analytical views are finalized after the network
+    # surfaces are listening.
+    bootstrap(
+        parquet_dir=cfg.parquet_dir,
+        duckdb_path=cfg.duckdb_path,
+        bind_parquet_views=False,
+    )
     central_consent: CentralContentConsent | None = None
     if cfg.control_store.backend == "postgres":
         require_control_store_ready(cfg.duckdb_path)
@@ -3206,6 +3216,19 @@ def run(
         except Exception:  # noqa: BLE001
             log.exception("MCP server failed to start; continuing without it")
             mcp_thread = None
+
+    def _finish_analytical_bootstrap() -> None:
+        try:
+            bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+            log.info("analytical Parquet views ready")
+        except Exception:  # noqa: BLE001
+            log.exception("analytical Parquet view bootstrap failed")
+
+    threading.Thread(
+        target=_finish_analytical_bootstrap,
+        name="analytical-bootstrap",
+        daemon=True,
+    ).start()
 
     metrics_server = None
     metrics_collector: MetricsCollector | None = None

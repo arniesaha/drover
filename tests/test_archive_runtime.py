@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import requests
 
+from drover import schema
 from drover.config import default_config
 from drover.server import __main__ as server_main
 from drover.server.archive import PondArchiveClient
@@ -40,6 +42,52 @@ def test_archive_client_construction_never_performs_a_network_request(
         assert isinstance(archive, PondArchiveClient)
     else:
         assert archive is None
+
+
+def test_lightweight_startup_bootstrap_does_not_bind_historical_parquet_views(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """MCP/OTLP startup bootstrap must not enumerate historical Parquet files."""
+
+    def fail_if_view_bound(_parquet_dir: Path) -> str:
+        pytest.fail("startup bootstrap bound agent_events read_parquet view")
+
+    monkeypatch.setattr(schema, "_agent_events_view", fail_if_view_bound)
+    monkeypatch.setattr(
+        schema,
+        "_provider_usage_snapshots_view",
+        lambda _parquet_dir: pytest.fail(
+            "startup bootstrap bound provider_usage_snapshots read_parquet view"
+        ),
+    )
+
+    schema.bootstrap(
+        parquet_dir=tmp_path / "parquet",
+        duckdb_path=tmp_path / "drover.duckdb",
+        bind_parquet_views=False,
+    )
+
+
+def test_runtime_mcp_factory_does_not_open_duckdb_or_scan_parquet(
+    monkeypatch,
+) -> None:
+    cfg = _runtime_config(enabled=False)
+    built_server = object()
+
+    def fail_connect(*_args, **_kwargs):
+        pytest.fail("runtime MCP construction must not open DuckDB")
+
+    monkeypatch.setattr(server_main.duckdb, "connect", fail_connect)
+    monkeypatch.setattr(server_main, "build_mcp_server", lambda **_kwargs: built_server)
+
+    result = server_main._build_runtime_mcp_server(
+        cfg=cfg,
+        host="127.0.0.1",
+        backend_config=SummarizerBackendConfig(),
+        summarize_job_stream=None,
+    )
+
+    assert result is built_server
 
 
 def test_runtime_mcp_factory_injects_the_exact_enabled_archive_client(

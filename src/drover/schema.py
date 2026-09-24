@@ -2304,8 +2304,16 @@ def migrate_control_plane_tables(
     return copied
 
 
-def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
-    """Create directories, tables, and views.  Idempotent."""
+def bootstrap(
+    *, parquet_dir: Path, duckdb_path: Path, bind_parquet_views: bool = True
+) -> None:
+    """Create directories, tables, and views.  Idempotent.
+
+    ``bind_parquet_views=False`` performs only bounded catalog/control-store
+    setup. Runtime startup uses it before network listeners bind so DuckDB does
+    not synchronously enumerate historical read_parquet(..., union_by_name=true)
+    files on the MCP/OTLP critical path.
+    """
     parquet_dir = Path(parquet_dir)
     duckdb_path = Path(duckdb_path)
     duckdb_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2355,18 +2363,19 @@ def bootstrap(*, parquet_dir: Path, duckdb_path: Path) -> None:
             # it only when a legacy compatibility row was copied so the
             # source ledger receives that row in this same startup.
             bootstrap_control_plane_store(duckdb_path)
-        con.execute(_agent_events_view(parquet_dir))
-        con.execute(_spans_view(parquet_dir))
-        con.execute(_span_query_macros(parquet_dir))
-        _refresh_span_partition_activity(con)
-        _refresh_agent_event_partition_activity(con, parquet_dir)
-        refresh_agent_event_day_summary(con)
-        con.execute(_SESSION_LINKS_VIEW)
-        con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
-        con.execute(_pr_events_view(parquet_dir))
-        con.execute(_routing_view(parquet_dir))
-        con.execute(_provider_usage_snapshots_view(parquet_dir))
-        con.execute(_SESSIONS_VIEW)
-        con.execute(_ACTIVE_SESSIONS_VIEW)
+        if bind_parquet_views:
+            con.execute(_agent_events_view(parquet_dir))
+            con.execute(_spans_view(parquet_dir))
+            con.execute(_span_query_macros(parquet_dir))
+            _refresh_span_partition_activity(con)
+            _refresh_agent_event_partition_activity(con, parquet_dir)
+            refresh_agent_event_day_summary(con)
+            con.execute(_SESSION_LINKS_VIEW)
+            con.execute(_OPENCLAW_SPAN_LINKS_VIEW)
+            con.execute(_pr_events_view(parquet_dir))
+            con.execute(_routing_view(parquet_dir))
+            con.execute(_provider_usage_snapshots_view(parquet_dir))
+            con.execute(_SESSIONS_VIEW)
+            con.execute(_ACTIVE_SESSIONS_VIEW)
     finally:
         con.close()
