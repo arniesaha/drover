@@ -825,10 +825,14 @@ def test_postgres_advisory_occurrence_sweep_counts_empty_and_keeps_newest_failin
                     newest_failing,
                     newest_failing,
                 ),
+                *[
+                    (f"pg-old-{i}", "pg-finding", "old-run", "failing", old, old)
+                    for i in range(260)
+                ],
             ],
         )
 
-    assert sweep_advisory_occurrences(control_path, retention_days=7).occurrences == 1
+    assert sweep_advisory_occurrences(control_path, retention_days=7).occurrences == 261
     with control_plane_connection(control_path) as con:
         assert con.execute(
             "SELECT occurrence_id FROM advisory_occurrences ORDER BY occurrence_id"
