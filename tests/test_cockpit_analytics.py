@@ -1341,6 +1341,7 @@ def test_file_backed_activity_keeps_maintenance_out_while_child_runs(
         advisory_repository=SimpleNamespace(list_findings=lambda: []),
         maintenance_gate=gate,
     )
+    monkeypatch.setattr(service, "_can_isolate_activity", lambda: True)
 
     observed_admission = []
 
@@ -1356,6 +1357,28 @@ def test_file_backed_activity_keeps_maintenance_out_while_child_runs(
     assert observed_admission == [False]
     assert gate.try_begin_maintenance()
     gate.end_maintenance()
+
+
+def test_file_backed_activity_uses_live_reader_without_atomic_clone(
+    tmp_path, monkeypatch
+):
+    from drover.server.cockpit import service as service_module
+
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    monkeypatch.setattr(
+        service_module, "supports_atomic_duckdb_clone", lambda source: False
+    )
+    service = CockpitService(
+        duckdb_path=db_path,
+        provider_usage=None,
+        advisory_repository=SimpleNamespace(list_findings=lambda: []),
+    )
+
+    activity = service.overview(AnalyticsFilters(days=7))["activity"]
+
+    assert activity["status"] == "ok"
+    assert not service._isolated_reader_supported
 
 
 def test_cockpit_overview_counts_actionable_insights_by_severity(tmp_path):

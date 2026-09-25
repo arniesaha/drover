@@ -18,7 +18,7 @@ from drover.server.cockpit.analytics import (
 from drover.server.control_store import configure_control_store
 from drover.server.db import (
     attached_control_plane_snapshot,
-    copy_duckdb_store,
+    copy_duckdb_store_with_wal,
     open_duckdb_connection,
 )
 
@@ -35,10 +35,9 @@ def run(payload: dict) -> dict:
     control_store = payload.get("control_store")
     if control_store is not None:
         configure_control_store(source, ControlStoreConfig(**control_store))
-    # On APFS, clonefile gives this process a separate DuckDB instance without
-    # reading the live file in chunks. Do not checkpoint the live instance
-    # merely to answer a foreground request (#363).
-    copy_duckdb_store(source, snapshot, checkpoint=False)
+    # Clone the stable database/WAL pair on the source volume. This includes
+    # recent writes without forcing a checkpoint on the live instance (#363).
+    copy_duckdb_store_with_wal(source, snapshot)
     con = open_duckdb_connection(
         snapshot,
         read_only=True,
@@ -46,7 +45,7 @@ def run(payload: dict) -> dict:
         settings_overrides={"threads": "1"},
     )
     try:
-        with attached_control_plane_snapshot(con, source):
+        with attached_control_plane_snapshot(con, source, include_wal=True):
             result = activity_analytics(
                 con,
                 AnalyticsFilters(**payload["filters"]),

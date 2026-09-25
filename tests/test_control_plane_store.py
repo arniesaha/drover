@@ -468,17 +468,26 @@ def test_the_cockpit_activity_query_still_sees_control_plane_sessions(tmp_path):
     from drover.server.cockpit.service import CockpitService
 
     duckdb_path = _db(tmp_path)
+    # Keep the control instance open so new sessions remain in its WAL while
+    # the cockpit child clones it from another process.
+    keeper = duckdb.connect(str(control_plane_path(duckdb_path)))
     registry = HarnessRegistry(duckdb_path)
-    registry.register_host(host_id="mac-mini", display_name="Mac mini", kind="darwin")
-    registry.create_session(
-        host_id="mac-mini", harness="codex", command="codex", session_id="s1"
-    )
+    try:
+        registry.register_host(
+            host_id="mac-mini", display_name="Mac mini", kind="darwin"
+        )
+        registry.create_session(
+            host_id="mac-mini", harness="codex", command="codex", session_id="s1"
+        )
+        assert control_plane_path(duckdb_path).with_suffix(".duckdb.wal").exists()
 
-    service = CockpitService(duckdb_path=duckdb_path, provider_usage=None)
-    activity = service.analytics(AnalyticsFilters(days=7))["activity"]
+        service = CockpitService(duckdb_path=duckdb_path, provider_usage=None)
+        activity = service.analytics(AnalyticsFilters(days=7))["activity"]
 
-    assert activity["status"] == "ok", activity
-    assert activity["data"]["totals"]["session_count"] == 1
+        assert activity["status"] == "ok", activity
+        assert activity["data"]["totals"]["session_count"] == 1
+    finally:
+        keeper.close()
 
 
 def test_a_window_can_be_given_a_budget_instead_of_waiting(tmp_path):

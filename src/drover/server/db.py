@@ -908,7 +908,9 @@ def sql_path_literal(value: str | Path) -> str:
 
 
 @contextmanager
-def control_plane_snapshot(duckdb_path: str | Path) -> Iterator[Path | None]:
+def control_plane_snapshot(
+    duckdb_path: str | Path, *, include_wal: bool = False
+) -> Iterator[Path | None]:
     """Yield a private copy of the control-plane store, or None if it is absent.
 
     The copy is #76's pattern applied to a much smaller file. It is isolation,
@@ -935,7 +937,7 @@ def control_plane_snapshot(duckdb_path: str | Path) -> Iterator[Path | None]:
         log.debug("no control-plane store at %s; skipping snapshot", source)
         yield None
         return
-    entry = _acquire_control_plane_snapshot(source)
+    entry = _acquire_control_plane_snapshot(source, include_wal=include_wal)
     try:
         yield entry.path
     finally:
@@ -948,6 +950,7 @@ class _CachedSnapshot:
 
     path: Path
     signature: tuple[int, int, int, int]
+    include_wal: bool = False
     busy: bool = False
 
 
@@ -966,6 +969,71 @@ _SNAPSHOT_GUARD = threading.Lock()
 def _write_ahead_log(source: Path) -> Path:
     """DuckDB's WAL for ``source``, whether or not it currently exists."""
     return source.with_name(source.name + ".wal")
+
+
+class AtomicCloneUnavailable(RuntimeError):
+    """The source volume cannot make an atomic copy for a live reader."""
+
+
+def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _database_and_wal_signature(
+    source: Path,
+) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+    return _file_signature(source), _file_signature(_write_ahead_log(source))
+
+
+def supports_atomic_duckdb_clone(source: Path) -> bool:
+    """Check the actual source volume before choosing the isolated reader."""
+    if not source.exists():
+        return False
+    with tempfile.TemporaryDirectory(
+        prefix="drover-clone-probe-", dir=snapshot_scratch_root(source)
+    ) as directory:
+        return _clone_file(source, Path(directory) / source.name)
+
+
+def copy_duckdb_store_with_wal(
+    source: Path, destination: Path, *, attempts: int = 4
+) -> None:
+    """Atomically clone a stable database/WAL pair without a live checkpoint.
+
+    Each clonefile call is atomic, but the two files are not copied together.
+    Accept the pair only when file identity, size, and timestamps agree before
+    and after both clones. A concurrent write or checkpoint changes that
+    signature and causes a bounded retry. The caller owns and removes partial
+    copies when the source remains busy.
+    """
+    source_wal = _write_ahead_log(source)
+    destination_wal = _write_ahead_log(destination)
+    for _ in range(attempts):
+        destination.unlink(missing_ok=True)
+        destination_wal.unlink(missing_ok=True)
+        before = _database_and_wal_signature(source)
+        if before[0] is None:
+            raise FileNotFoundError(source)
+        if not _clone_file(source, destination):
+            if before != _database_and_wal_signature(source):
+                continue
+            raise AtomicCloneUnavailable(f"atomic clone unavailable for {source}")
+        if before[1] is not None:
+            if not _clone_file(source_wal, destination_wal):
+                if before != _database_and_wal_signature(source):
+                    continue
+                raise AtomicCloneUnavailable(
+                    f"atomic WAL clone unavailable for {source_wal}"
+                )
+        if before == _database_and_wal_signature(source):
+            return
+    destination.unlink(missing_ok=True)
+    destination_wal.unlink(missing_ok=True)
+    raise RuntimeError(f"database changed during {attempts} snapshot attempts")
 
 
 def _snapshot_signature(source: Path) -> tuple[int, int, int, int]:
@@ -1071,9 +1139,7 @@ def _clone_file(source: Path, destination: Path) -> bool:
     return False
 
 
-def copy_duckdb_store(
-    source: Path, destination: Path, *, checkpoint: bool = True
-) -> None:
+def copy_duckdb_store(source: Path, destination: Path) -> None:
     """Capture a DuckDB store as a snapshot that always opens.
 
     Two properties, learned the hard way when a snapshot invalidated the live
@@ -1088,17 +1154,10 @@ def copy_duckdb_store(
     two instants, so a copy taking both can only vouch for the pair by luck,
     and the existence check ahead of it races a checkpoint deleting the file.
     A store on its own is a valid database as of its last checkpoint, so the
-    cost is staleness rather than corruption. By default a checkpoint first
-    keeps even that small; foreground readers can skip it when forcing one
-    would compete with the live instance. Stale is a trade a snapshot can
-    make; unopenable is not.
+    cost is staleness rather than corruption -- and a checkpoint first keeps
+    even that small. Stale is a trade a snapshot can make; unopenable is not.
     """
-    # A foreground read must not force a checkpoint on the busy live instance:
-    # a checkpoint OOM can invalidate the entire analytical store (#363).
-    # It may accept the last checkpoint's state instead, with its normal
-    # observed_at timestamp showing the age of the data.
-    if checkpoint:
-        _checkpoint_before_snapshot(source)
+    _checkpoint_before_snapshot(source)
     if not _clone_file(source, destination):
         # Off-APFS or across volumes. Still no WAL, so the pairing hazard is
         # gone, but a chunked read can tear on its own -- callers treat a
@@ -1127,7 +1186,9 @@ def _checkpoint_before_snapshot(source: Path) -> None:
         log.debug("checkpoint before snapshot of %s skipped: %s", source, exc)
 
 
-def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
+def _acquire_control_plane_snapshot(
+    source: Path, *, include_wal: bool = False
+) -> _CachedSnapshot:
     """Return a copy of ``source`` as it is now, marked as in use.
 
     Reuses the idle copy when the store has not changed since it was taken.
@@ -1139,7 +1200,11 @@ def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
     signature = _snapshot_signature(source)
     with _SNAPSHOT_GUARD:
         idle = _SNAPSHOT_IDLE.get(key)
-        if idle is not None and idle.signature == signature:
+        if (
+            idle is not None
+            and idle.signature == signature
+            and idle.include_wal == include_wal
+        ):
             del _SNAPSHOT_IDLE[key]
             idle.busy = True
             return idle
@@ -1155,12 +1220,17 @@ def _acquire_control_plane_snapshot(source: Path) -> _CachedSnapshot:
         fresh = Path(directory.name) / (
             f"{source.stem}-{next(_SNAPSHOT_SEQUENCE)}{source.suffix}"
         )
-        copy_duckdb_store(source, fresh)
+        if include_wal:
+            copy_duckdb_store_with_wal(source, fresh)
+        else:
+            copy_duckdb_store(source, fresh)
         # Stamped with the signature read *before* the copy, not after. The
         # bytes describe the store as it was going in, so claiming they match
         # what it became on the way out is how a copy taken across a change got
         # served again and again to later readers (#171).
-        return _CachedSnapshot(path=fresh, signature=signature, busy=True)
+        return _CachedSnapshot(
+            path=fresh, signature=signature, include_wal=include_wal, busy=True
+        )
 
 
 def _release_control_plane_snapshot(source: Path, entry: _CachedSnapshot) -> None:
@@ -1231,6 +1301,8 @@ def _postgres_control_plane_snapshot(
 def attached_control_plane_snapshot(
     con: duckdb.DuckDBPyConnection,
     duckdb_path: str | Path,
+    *,
+    include_wal: bool = False,
 ) -> Iterator[None]:
     """Let one analytical connection read control-plane tables, from a copy.
 
@@ -1263,7 +1335,7 @@ def attached_control_plane_snapshot(
         with _postgres_control_plane_snapshot(con, duckdb_path):
             yield
         return
-    with control_plane_snapshot(duckdb_path) as snapshot:
+    with control_plane_snapshot(duckdb_path, include_wal=include_wal) as snapshot:
         if snapshot is None:
             yield
             return

@@ -25,11 +25,13 @@ from drover.server.cockpit.analytics import (
     AnalyticsSnapshotChangedError,
     activity_analytics,
 )
-from drover.server.control_store import control_store_config
+from drover.server.control_store import control_store_config, is_postgres_control_store
 from drover.server.db import (
     attached_control_plane_snapshot,
+    control_plane_path,
     open_duckdb_connection,
     snapshot_scratch_root,
+    supports_atomic_duckdb_clone,
 )
 
 log = logging.getLogger("drover.cockpit")
@@ -82,6 +84,7 @@ class CockpitService:
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
         self._connect = connect
+        self._isolated_reader_supported: bool | None = None
         if advisory_repository is None and self.duckdb_path is not None:
             from drover.server.advisory.repository import AdvisoryRepository
 
@@ -317,7 +320,11 @@ class CockpitService:
         The child is killed at the budget; the injected connection is
         interrupted. A budget alone would leave the query holding memory.
         """
-        if self._connect is None and self.duckdb_path is not None:
+        if (
+            self._connect is None
+            and self.duckdb_path is not None
+            and self._can_isolate_activity()
+        ):
             gate = self.maintenance_gate
             foreground = (
                 gate.foreground() if gate is not None else contextlib.nullcontext()
@@ -407,6 +414,27 @@ class CockpitService:
         if "error" in outcome:
             raise outcome["error"]
         return outcome["result"]
+
+    def _can_isolate_activity(self) -> bool:
+        """Keep the original live path on volumes without atomic clones."""
+        if self._isolated_reader_supported is None:
+            assert self.duckdb_path is not None
+            source = self.duckdb_path.resolve()
+            try:
+                supported = supports_atomic_duckdb_clone(source)
+                control_path = control_plane_path(source)
+                if (
+                    supported
+                    and not is_postgres_control_store(source)
+                    and control_path.exists()
+                ):
+                    supported = supports_atomic_duckdb_clone(control_path)
+            except OSError:
+                supported = False
+            self._isolated_reader_supported = supported
+            if not supported:
+                log.info("atomic clone unavailable; using the existing activity reader")
+        return self._isolated_reader_supported
 
     def _activity_in_reader_process(self, filters: AnalyticsFilters) -> dict[str, Any]:
         """Bound foreground memory to a child lifetime and a private DB file."""
