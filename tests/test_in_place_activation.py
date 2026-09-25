@@ -18,6 +18,7 @@ it is currently running.
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from dataclasses import replace
 from functools import partial
@@ -207,6 +208,42 @@ def test_in_place_activation_installs_into_the_configured_venv(tmp_path):
     assert any(str(cached.wheel) in line for line in flat)
     # A new venv is exactly what loses the TCC grant.
     assert not any("uv venv" in line for line in flat)
+
+
+def test_custom_runtime_refuses_activation_from_another_venv(tmp_path):
+    venv = _venv(tmp_path)
+    cfg = replace(_in_place_cfg(venv), update_runtime_root=tmp_path / "boot-runtime")
+    calls = []
+    layout, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=lambda *args: calls.append(args) or True,
+    )
+    updater.observe(_beat("0.1.4"))
+
+    assert updater.maybe_activate() is False
+    assert updater.status()["reason"] == "runtime_venv_mismatch"
+    assert layout.active_version() == "0.1.3"
+    assert calls == []
+
+
+def test_custom_runtime_activates_when_daemon_execs_configured_venv(
+    tmp_path, monkeypatch
+):
+    venv = _venv(tmp_path)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    cfg = replace(_in_place_cfg(venv), update_runtime_root=tmp_path / "boot-runtime")
+    calls = []
+    layout, updater = _updater(
+        tmp_path,
+        cfg=cfg,
+        in_place_installer=lambda *args: calls.append(args) or True,
+    )
+    updater.observe(_beat("0.1.4"))
+
+    assert updater.maybe_activate() is True
+    assert layout.active_version() == "0.1.4"
+    assert len(calls) == 1
 
 
 def test_in_place_activation_flips_the_record_symlink(tmp_path):

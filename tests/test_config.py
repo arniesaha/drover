@@ -358,6 +358,38 @@ def test_registration_deadline_defaults_to_90_seconds():
     assert default_config().update_registration_deadline_seconds == 90.0
 
 
+def test_in_place_update_can_stage_runtime_outside_config_home(tmp_path):
+    runtime_root = tmp_path / "boot-runtime"
+    cfg_file = tmp_path / "update.toml"
+    cfg_file.write_text(
+        f'[update]\nactivation = "in_place"\nin_place_venv = "/tmp/venv"\n'
+        f'runtime_root = "{runtime_root}"\n'
+    )
+
+    assert load_config(cfg_file).update_runtime_root == runtime_root
+
+
+@pytest.mark.parametrize(
+    "activation,in_place_venv,runtime_root",
+    [
+        ("in_place", "/tmp/venv", "relative/runtime"),
+        ("symlink", "/tmp/venv", "/tmp/drover-runtime"),
+        ("in_place", "", "/tmp/drover-runtime"),
+    ],
+)
+def test_runtime_root_rejects_unsafe_activation_or_relative_path(
+    tmp_path, activation, in_place_venv, runtime_root
+):
+    cfg_file = tmp_path / "update.toml"
+    cfg_file.write_text(
+        f'[update]\nactivation = "{activation}"\n'
+        f'in_place_venv = "{in_place_venv}"\nruntime_root = "{runtime_root}"\n'
+    )
+
+    with pytest.raises(ValueError, match="update.runtime_root"):
+        load_config(cfg_file)
+
+
 def test_loads_registration_deadline(tmp_path):
     cfg_file = tmp_path / "update.toml"
     cfg_file.write_text("[update]\nregistration_deadline_seconds = 300\n")
