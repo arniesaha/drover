@@ -91,7 +91,7 @@ def test_internal_testflight_repeats_the_required_ios_slices() -> None:
         "Select iPhone simulator",
         "Resolve Swift packages",
         "Run app unit tests",
-        "Run deterministic UI journey",
+        "Run deterministic and accessibility UI journeys",
     ):
         actual = next(s for s in steps if s.get("name") == name)
         expected = next(s for s in existing if s.get("name") == name)
@@ -150,7 +150,7 @@ def test_production_testflight_repeats_the_required_ios_slices() -> None:
         "Select iPhone simulator",
         "Resolve Swift packages",
         "Run app unit tests",
-        "Run deterministic UI journey",
+        "Run deterministic and accessibility UI journeys",
     ):
         actual = next(s for s in steps if s.get("name") == name)
         expected = next(s for s in existing if s.get("name") == name)

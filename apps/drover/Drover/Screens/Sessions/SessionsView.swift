@@ -119,6 +119,7 @@ struct SessionsView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 16)
             }
+            .accessibilityIdentifier("fleet-list")
             .refreshable {
                 await store.refresh()
                 if let snapshot = store.snapshot {
