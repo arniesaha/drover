@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1297,6 +1298,89 @@ def test_cockpit_analytics_isolates_activity_failure():
     assert payload["provider_capacity"]["status"] == "unavailable"
     assert payload["activity"]["status"] == "error"
     assert payload["activity"]["data"] is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
+def test_file_backed_activity_runs_outside_the_server_duckdb_instance(
+    tmp_path, monkeypatch
+):
+    """The foreground scan must not open the live analytical file in-process."""
+    from drover.server.cockpit import service as service_module
+
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+
+    def refuse_live_connection(*args, **kwargs):
+        raise AssertionError("foreground activity opened DuckDB in the server")
+
+    monkeypatch.setattr(
+        service_module, "open_duckdb_connection", refuse_live_connection
+    )
+    service = CockpitService(
+        duckdb_path=db_path,
+        provider_usage=None,
+        advisory_repository=SimpleNamespace(list_findings=lambda: []),
+    )
+
+    activity = service.overview(AnalyticsFilters(days=7))["activity"]
+
+    assert activity["status"] == "ok"
+    assert activity["data"]["totals"]["session_count"] == 0
+    # A child has exited by the time its result is returned, so the next
+    # distinct request must be admitted instead of seeing a stuck slot.
+    assert service.overview(AnalyticsFilters(days=8))["activity"]["status"] == "ok"
+
+
+def test_file_backed_activity_keeps_maintenance_out_while_child_runs(
+    tmp_path, monkeypatch
+):
+    from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
+
+    gate = AnalyticalMaintenanceGate()
+    service = CockpitService(
+        duckdb_path=tmp_path / "drover.duckdb",
+        provider_usage=None,
+        advisory_repository=SimpleNamespace(list_findings=lambda: []),
+        maintenance_gate=gate,
+    )
+    monkeypatch.setattr(service, "_can_isolate_activity", lambda: True)
+
+    observed_admission = []
+
+    def inspect_gate(filters):
+        admitted = gate.try_begin_maintenance()
+        observed_admission.append(admitted)
+        if admitted:
+            gate.end_maintenance()
+        raise RuntimeError("probe complete")
+
+    monkeypatch.setattr(service, "_activity_in_reader_process", inspect_gate)
+    assert service.overview(AnalyticsFilters(days=7))["activity"]["status"] == "error"
+    assert observed_admission == [False]
+    assert gate.try_begin_maintenance()
+    gate.end_maintenance()
+
+
+def test_file_backed_activity_uses_live_reader_without_atomic_clone(
+    tmp_path, monkeypatch
+):
+    from drover.server.cockpit import service as service_module
+
+    db_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db_path)
+    monkeypatch.setattr(
+        service_module, "supports_atomic_duckdb_clone", lambda source: False
+    )
+    service = CockpitService(
+        duckdb_path=db_path,
+        provider_usage=None,
+        advisory_repository=SimpleNamespace(list_findings=lambda: []),
+    )
+
+    activity = service.overview(AnalyticsFilters(days=7))["activity"]
+
+    assert activity["status"] == "ok"
+    assert not service._isolated_reader_supported
 
 
 def test_cockpit_overview_counts_actionable_insights_by_severity(tmp_path):

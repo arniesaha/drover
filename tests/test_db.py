@@ -317,6 +317,80 @@ def test_the_store_is_cloned_rather_than_read_in_chunks(tmp_path, monkeypatch):
         snap.close()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
+def test_foreground_snapshot_does_not_checkpoint_the_live_store(tmp_path, monkeypatch):
+    from drover.server.db import copy_duckdb_store_with_wal
+
+    source = tmp_path / "live.duckdb"
+    with duckdb.connect(str(source)) as con:
+        con.execute("CREATE TABLE t AS SELECT 1 AS a")
+
+    def refuse_checkpoint(path):
+        raise AssertionError("foreground reader forced a live checkpoint")
+
+    monkeypatch.setattr(db_module, "_checkpoint_before_snapshot", refuse_checkpoint)
+    destination = tmp_path / "snap.duckdb"
+    copy_duckdb_store_with_wal(source, destination)
+
+    with duckdb.connect(str(destination), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM t").fetchone() == (1,)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
+def test_consistent_snapshot_includes_rows_still_in_the_live_wal(tmp_path):
+    from drover.server.db import copy_duckdb_store_with_wal
+
+    source = tmp_path / "live.duckdb"
+    writer = duckdb.connect(str(source))
+    try:
+        writer.execute("CREATE TABLE t (value INTEGER)")
+        writer.execute("CHECKPOINT")
+        writer.execute("INSERT INTO t VALUES (42)")
+        assert (tmp_path / "live.duckdb.wal").exists()
+
+        destination = tmp_path / "snapshot.duckdb"
+        copy_duckdb_store_with_wal(source, destination)
+        with duckdb.connect(str(destination)) as reader:
+            assert reader.execute("SELECT value FROM t").fetchall() == [(42,)]
+    finally:
+        writer.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
+def test_consistent_snapshot_retries_a_write_between_file_clones(tmp_path, monkeypatch):
+    from drover.server.db import copy_duckdb_store_with_wal
+
+    source = tmp_path / "live.duckdb"
+    writer = duckdb.connect(str(source))
+    try:
+        writer.execute("CREATE TABLE t (value INTEGER)")
+        writer.execute("CHECKPOINT")
+        writer.execute("INSERT INTO t VALUES (1)")
+        clone = db_module._clone_file
+        attempts = 0
+
+        def write_during_first_clone(src, dst):
+            nonlocal attempts
+            copied = clone(src, dst)
+            if src == source:
+                attempts += 1
+                if attempts == 1:
+                    writer.execute("INSERT INTO t VALUES (2)")
+            return copied
+
+        monkeypatch.setattr(db_module, "_clone_file", write_during_first_clone)
+        destination = tmp_path / "snapshot.duckdb"
+        copy_duckdb_store_with_wal(source, destination)
+        assert attempts >= 2
+        with duckdb.connect(str(destination)) as reader:
+            assert reader.execute("SELECT value FROM t ORDER BY value").fetchall() == [
+                (1,),
+                (2,),
+            ]
+    finally:
+        writer.close()
+
+
 def test_a_store_that_cannot_be_cloned_is_still_captured_without_its_wal(
     tmp_path, monkeypatch
 ):

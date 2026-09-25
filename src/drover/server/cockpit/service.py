@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import os
 import secrets
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict
@@ -17,9 +22,17 @@ from drover.server.cockpit.analytics import (
     ActivityAnalytics,
     AnalyticsCursorCodec,
     AnalyticsFilters,
+    AnalyticsSnapshotChangedError,
     activity_analytics,
 )
-from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
+from drover.server.control_store import control_store_config, is_postgres_control_store
+from drover.server.db import (
+    attached_control_plane_snapshot,
+    control_plane_path,
+    open_duckdb_connection,
+    snapshot_scratch_root,
+    supports_atomic_duckdb_clone,
+)
 
 log = logging.getLogger("drover.cockpit")
 
@@ -71,17 +84,17 @@ class CockpitService:
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
         self._connect = connect
+        self._isolated_reader_supported: bool | None = None
         if advisory_repository is None and self.duckdb_path is not None:
             from drover.server.advisory.repository import AdvisoryRepository
 
             advisory_repository = AdvisoryRepository(self.duckdb_path)
         self.advisory_repository = advisory_repository
-        self._cursor_codec = AnalyticsCursorCodec(
-            cursor_secret or secrets.token_bytes(32)
-        )
-        # One activity query at a time. Released by the worker, not the caller,
-        # so a query abandoned at its budget still blocks the next attempt until
-        # it has actually finished and closed its connection.
+        self._cursor_secret = cursor_secret or secrets.token_bytes(32)
+        self._cursor_codec = AnalyticsCursorCodec(self._cursor_secret)
+        # One activity query at a time. The injected-connection worker owns
+        # its slot until it closes the connection; the production child owns
+        # its slot until it exits or is killed at the budget.
         self._activity_slot = threading.BoundedSemaphore(1)
         # The slot stops *concurrent* queries; it does nothing about
         # back-to-back ones. Several clients polling every 30s produced a
@@ -255,11 +268,22 @@ class CockpitService:
             return _section("error", data=None, coverage=None)
         try:
             result = self._activity_within_budget(filters)
+            data = asdict(result) if isinstance(result, ActivityAnalytics) else result
+            observed_at = (
+                result.metadata.observed_at
+                if isinstance(result, ActivityAnalytics)
+                else result["metadata"]["observed_at"]
+            )
+            coverage = (
+                asdict(result.coverage)
+                if isinstance(result, ActivityAnalytics)
+                else result["coverage"]
+            )
             section = _section(
                 "ok",
-                data=asdict(result),
-                observed_at=result.metadata.observed_at,
-                coverage=asdict(result.coverage),
+                data=data,
+                observed_at=observed_at,
+                coverage=coverage,
             )
             with self._activity_lock:
                 self._activity_cache = (cache_key, section, time.monotonic())
@@ -276,8 +300,10 @@ class CockpitService:
                 return stale
             return _section("error", data=None, coverage=None)
 
-    def _activity_within_budget(self, filters: AnalyticsFilters) -> ActivityAnalytics:
-        """Run the activity query, but never for longer than its budget.
+    def _activity_within_budget(
+        self, filters: AnalyticsFilters
+    ) -> ActivityAnalytics | dict[str, Any]:
+        """Run the activity query within its budget.
 
         The overview is assembled from several sections and returned as one
         response, so the slowest section sets the client's wait. The iOS client
@@ -285,14 +311,30 @@ class CockpitService:
         lost, taking provider capacity and insight counts -- which had both
         succeeded -- down with it.
 
-        The worker owns its connection from open to close. An earlier cut had
-        the caller close it in a `finally` while the abandoned worker was still
-        using it, which wedged the whole HTTP server rather than just this
-        section. Whoever opens it closes it, and only after it is done with it.
+        The production path owns a short-lived child and a cloned DB file, so
+        its memory leaves with the child. Injected connections still use the
+        original thread path: that worker owns its connection from open to
+        close. An earlier cut had the caller close it while the abandoned
+        worker was still using it, which wedged the HTTP server.
 
-        `interrupt()` is what actually stops the query; a budget alone would
-        stop us waiting while it kept running and kept holding memory.
+        The child is killed at the budget; the injected connection is
+        interrupted. A budget alone would leave the query holding memory.
         """
+        if (
+            self._connect is None
+            and self.duckdb_path is not None
+            and self._can_isolate_activity()
+        ):
+            gate = self.maintenance_gate
+            foreground = (
+                gate.foreground() if gate is not None else contextlib.nullcontext()
+            )
+            try:
+                with foreground:
+                    return self._activity_in_reader_process(filters)
+            finally:
+                self._activity_slot.release()
+
         outcome: dict[str, Any] = {}
         done = threading.Event()
         released = threading.Event()
@@ -372,6 +414,81 @@ class CockpitService:
         if "error" in outcome:
             raise outcome["error"]
         return outcome["result"]
+
+    def _can_isolate_activity(self) -> bool:
+        """Keep the original live path on volumes without atomic clones."""
+        if self._isolated_reader_supported is None:
+            assert self.duckdb_path is not None
+            source = self.duckdb_path.resolve()
+            try:
+                supported = supports_atomic_duckdb_clone(source)
+                control_path = control_plane_path(source)
+                if (
+                    supported
+                    and not is_postgres_control_store(source)
+                    and control_path.exists()
+                ):
+                    supported = supports_atomic_duckdb_clone(control_path)
+            except OSError:
+                supported = False
+            self._isolated_reader_supported = supported
+            if not supported:
+                log.info("atomic clone unavailable; using the existing activity reader")
+        return self._isolated_reader_supported
+
+    def _activity_in_reader_process(self, filters: AnalyticsFilters) -> dict[str, Any]:
+        """Bound foreground memory to a child lifetime and a private DB file."""
+        assert self.duckdb_path is not None
+        source = self.duckdb_path.resolve()
+        config = control_store_config(source)
+        request = {
+            "source": str(source),
+            "filters": asdict(filters),
+            "cursor_secret": self._cursor_secret.hex(),
+            "control_store": asdict(config) if config is not None else None,
+        }
+        # The parent owns the directory so even a killed or crashed child
+        # cannot leave a 3GB snapshot behind until the next startup sweep.
+        with tempfile.TemporaryDirectory(
+            prefix="drover-cockpit-", dir=snapshot_scratch_root(source)
+        ) as directory:
+            request["snapshot"] = str(Path(directory) / source.name)
+            environment = os.environ.copy()
+            source_root = str(Path(__file__).resolve().parents[3])
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (source_root, environment.get("PYTHONPATH", ""))
+            )
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-m", "drover.server.cockpit.activity_reader"],
+                    input=json.dumps(request),
+                    text=True,
+                    capture_output=True,
+                    timeout=ACTIVITY_BUDGET_SECONDS,
+                    env=environment,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(
+                    f"activity query exceeded {ACTIVITY_BUDGET_SECONDS:g}s budget"
+                ) from exc
+        try:
+            response = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"activity reader exited {completed.returncode} without a response"
+            ) from exc
+        if not response.get("ok"):
+            kind = response.get("kind")
+            message = response.get("error", "activity reader failed")
+            if kind == "snapshot_changed":
+                raise AnalyticsSnapshotChangedError()
+            if kind == "value":
+                raise ValueError(message)
+            raise RuntimeError(message)
+        if completed.returncode != 0:
+            raise RuntimeError(f"activity reader exited {completed.returncode}")
+        return response["result"]
 
     def _insight_counts(self) -> dict[str, int] | None:
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
