@@ -278,6 +278,71 @@ def test_run_harnessd_binds_before_it_starts_event_reconciliation(
     assert order == ["bound", "reconciliation-wired"]
 
 
+def test_stale_worktree_sweep_cannot_block_harnessd_serving(monkeypatch, tmp_path):
+    """A slow disk sweep must not hold the daemon socket closed at startup."""
+    entered = threading.Event()
+    release = threading.Event()
+    serving = threading.Event()
+    failures = []
+
+    class _State:
+        api_token = ""
+        host_token = None
+        updater = None
+        worktrees_dir = tmp_path / "worktrees"
+        pty = SimpleNamespace(close_all=lambda: None)
+        auth = SimpleNamespace(close_all=lambda: None)
+
+    class _Server:
+        def serve_forever(self):
+            serving.set()
+            raise RuntimeError("stop")
+
+        def server_close(self):
+            pass
+
+    def slow_sweep(_path, *, candidates=None):
+        entered.set()
+        release.wait(timeout=3)
+        return {"removed": 0}
+
+    monkeypatch.setattr(daemon_module, "HarnessDaemonState", lambda **_kw: _State())
+    monkeypatch.setattr(daemon_module, "reclaim_stale_session_worktrees", slow_sweep)
+    monkeypatch.setattr(daemon_module, "resolve_daemon_token", lambda _token: "token")
+    monkeypatch.setattr(daemon_module, "create_harness_server", lambda **_kw: _Server())
+    monkeypatch.setattr(daemon_module, "wire_event_pusher", lambda _state: None)
+    monkeypatch.setattr(daemon_module, "register_daemon_host", lambda _state: None)
+    monkeypatch.setattr(
+        daemon_module, "register_daemon_host_remote", lambda _state: None
+    )
+    monkeypatch.setattr(daemon_module, "start_remote_heartbeat", lambda _state: None)
+
+    def run():
+        try:
+            daemon_module.run_harnessd(
+                host_id="test-host",
+                display_name="Test Host",
+                kind="mac",
+                duckdb_path=tmp_path / "drover.duckdb",
+                listen_host="127.0.0.1",
+                listen_port=0,
+                cfg=dataclasses.replace(default_config(), update_enabled=False),
+            )
+        except RuntimeError as exc:
+            if str(exc) != "stop":
+                failures.append(exc)
+
+    runner = threading.Thread(target=run)
+    runner.start()
+    try:
+        assert entered.wait(timeout=2), "the startup sweep did not start"
+        assert serving.wait(timeout=0.3), "the slow sweep blocked serving"
+        assert not failures
+    finally:
+        release.set()
+        runner.join(timeout=3)
+
+
 def test_the_harnessd_cli_passes_the_config_through(monkeypatch, tmp_path):
     """Without this the daemon gets cfg=None and updates are off everywhere."""
     from drover.server.harness import cli as cli_module

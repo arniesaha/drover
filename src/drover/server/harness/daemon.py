@@ -85,6 +85,7 @@ from drover.server.harness.websocket import (
 from drover.server.harness.worktree import (
     SessionWorktree,
     WorktreeIsolationUnavailable,
+    claim_worktrees_directory,
     cleanup_session_worktree,
     create_session_worktree,
     reclaim_stale_session_worktrees,
@@ -4003,12 +4004,6 @@ def run_harnessd(
     if cfg is not None and cfg.worktrees_dir is not None:
         # Off the data volume when configured: see DroverConfig.worktrees_dir.
         state.worktrees_dir = cfg.worktrees_dir
-    try:
-        reclaimed = reclaim_stale_session_worktrees(state.worktrees_dir)
-        if any(reclaimed.values()):
-            log.info("reclaimed stale session worktrees: %s", reclaimed)
-    except Exception:  # noqa: BLE001 - cleanup must never block startup
-        log.exception("stale session worktree sweep failed")
     state.api_token = resolve_daemon_token(host_token)
     state.host_token = state.api_token
     if not state.api_token:
@@ -4032,42 +4027,100 @@ def run_harnessd(
             restart_units=cfg.update_restart_units,
             deadline_seconds=cfg.update_registration_deadline_seconds,
         )
-    server = create_harness_server(
-        listen_host=listen_host,
-        listen_port=listen_port,
-        state=state,
+    worktrees_dir = getattr(state, "worktrees_dir", None)
+    owner_lock_fd = (
+        claim_worktrees_directory(worktrees_dir) if worktrees_dir is not None else None
     )
-    # Bind before any historical replay starts. A large durable ledger must
-    # never hold the daemon socket closed or trip the updater's liveness
-    # watchdog during an otherwise healthy restart.
-    pusher = wire_event_pusher(state)
-    register_daemon_host(state)
-    _heartbeat_once(state)
-    start_remote_heartbeat(state)
-    # After create_harness_server, and on its *bound* port: announcing a live
-    # relay before the socket is bound gives the hub a window in which every
-    # proxied call 502s, and listen_port is 0 whenever the port is ephemeral.
-    # Binding is enough - connections queue in the backlog until serve_forever.
-    relay_client: RelayClient | None = None
-    if relay:
-        if state.central_url and state.api_token:
-            relay_client = RelayClient(
-                state.central_url, state.host_id, state.api_token, server.server_port
-            )
-            relay_client.start()
-        else:
-            # Serving locally is still useful; the hub just cannot reach us.
-            log.error("--relay ignored: it needs both --central-url and an API token")
     try:
-        server.serve_forever()
+        server = create_harness_server(
+            listen_host=listen_host,
+            listen_port=listen_port,
+            state=state,
+        )
+        # Capture only paths from the previous daemon run. The sweep itself runs
+        # concurrently with serving, so scanning the directory later could pick
+        # up and remove a new session's still-clean worktree.
+        try:
+            stale_worktree_paths = (
+                tuple(worktrees_dir.iterdir())
+                if worktrees_dir is not None and worktrees_dir.is_dir()
+                else ()
+            )
+        except OSError:
+            log.exception("could not list stale session worktrees")
+            stale_worktree_paths = ()
+        # Bind before any historical replay starts. A large durable ledger must
+        # never hold the daemon socket closed or trip the updater's liveness
+        # watchdog during an otherwise healthy restart.
+        pusher = wire_event_pusher(state)
+        register_daemon_host(state)
+        _heartbeat_once(state)
+        start_remote_heartbeat(state)
+        # After create_harness_server, and on its *bound* port: announcing a live
+        # relay before the socket is bound gives the hub a window in which every
+        # proxied call 502s, and listen_port is 0 whenever the port is ephemeral.
+        # Binding is enough - connections queue in the backlog until serve_forever.
+        relay_client: RelayClient | None = None
+        if relay:
+            if state.central_url and state.api_token:
+                relay_client = RelayClient(
+                    state.central_url,
+                    state.host_id,
+                    state.api_token,
+                    server.server_port,
+                )
+                relay_client.start()
+            else:
+                # Serving locally is still useful; the hub just cannot reach us.
+                log.error(
+                    "--relay ignored: it needs both --central-url and an API token"
+                )
+
+        # A cold Git worktree scan can take longer than the liveness watchdog.
+        # Start it only after the socket is bound, and never make serving wait for
+        # it. The sweep retains worktrees with uncommitted or committed work.
+        # A duplicate fd keeps ownership held if shutdown starts mid-sweep.
+        sweep_lock_fd = os.dup(owner_lock_fd) if owner_lock_fd is not None else None
+
+        def reclaim_stale_worktrees() -> None:
+            try:
+                if worktrees_dir is None:
+                    return
+                try:
+                    reclaimed = reclaim_stale_session_worktrees(
+                        worktrees_dir, candidates=stale_worktree_paths
+                    )
+                    if any(reclaimed.values()):
+                        log.info("reclaimed stale session worktrees: %s", reclaimed)
+                except Exception:  # noqa: BLE001 - cleanup must never block startup
+                    log.exception("stale session worktree sweep failed")
+            finally:
+                if sweep_lock_fd is not None:
+                    os.close(sweep_lock_fd)
+
+        try:
+            threading.Thread(
+                target=reclaim_stale_worktrees,
+                name="drover-stale-worktree-sweep",
+                daemon=True,
+            ).start()
+        except Exception:
+            if sweep_lock_fd is not None:
+                os.close(sweep_lock_fd)
+            raise
+        try:
+            server.serve_forever()
+        finally:
+            state.pty.close_all()
+            state.auth.close_all()
+            if relay_client is not None:
+                relay_client.stop()
+            if pusher is not None:
+                pusher.stop()
+            server.server_close()
     finally:
-        state.pty.close_all()
-        state.auth.close_all()
-        if relay_client is not None:
-            relay_client.stop()
-        if pusher is not None:
-            pusher.stop()
-        server.server_close()
+        if owner_lock_fd is not None:
+            os.close(owner_lock_fd)
 
 
 def _command_label(command: Any) -> str:

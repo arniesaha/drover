@@ -9,11 +9,14 @@ user's main checkout, and everything the session commits lands on a
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
 
 from drover.server.harness.worktree import (
+    WorktreeIsolationUnavailable,
+    claim_worktrees_directory,
     cleanup_session_worktree,
     create_session_worktree,
     reclaim_stale_session_worktrees,
@@ -54,6 +57,26 @@ def test_create_makes_worktree_on_session_branch(repo, tmp_path):
     assert wt.base_sha == _git(repo, "rev-parse", "HEAD")
 
 
+def test_worktrees_directory_has_one_daemon_owner(tmp_path):
+    worktrees_dir = tmp_path / "worktrees"
+    first = claim_worktrees_directory(worktrees_dir)
+    sweep_copy = os.dup(first)
+    try:
+        with pytest.raises(WorktreeIsolationUnavailable, match="already in use"):
+            claim_worktrees_directory(worktrees_dir)
+    finally:
+        os.close(first)
+
+    try:
+        with pytest.raises(WorktreeIsolationUnavailable, match="already in use"):
+            claim_worktrees_directory(worktrees_dir)
+    finally:
+        os.close(sweep_copy)
+
+    second = claim_worktrees_directory(worktrees_dir)
+    os.close(second)
+
+
 def test_create_from_subdirectory_roots_at_toplevel(repo, tmp_path):
     sub = repo / "nested"
     sub.mkdir()
@@ -84,11 +107,37 @@ def test_cleanup_removes_untouched_worktree_and_branch(repo, tmp_path):
     assert branches == ""
 
 
+def test_cleanup_removes_branch_after_primary_checkout_changes(repo, tmp_path):
+    wt = create_session_worktree(str(repo), "harness-clean", tmp_path / "worktrees")
+    _git(repo, "checkout", "--orphan", "unrelated")
+    (repo / "file.txt").unlink()
+    (repo / "unrelated.txt").write_text("different history\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "unrelated root")
+
+    assert cleanup_session_worktree(wt) == "removed"
+    assert _git(repo, "branch", "--list", wt.branch) == ""
+
+
 def test_cleanup_keeps_dirty_worktree(repo, tmp_path):
     wt = create_session_worktree(str(repo), "harness-dirty", tmp_path / "worktrees")
     (tmp_path / "worktrees" / "harness-dirty" / "wip.txt").write_text("wip\n")
     assert cleanup_session_worktree(wt) == "kept"
     assert (tmp_path / "worktrees" / "harness-dirty" / "wip.txt").is_file()
+
+
+def test_cleanup_keeps_ignored_only_worktree_files(repo, tmp_path):
+    """Ignored session output can still be the user's only copy."""
+    (repo / ".gitignore").write_text("scratch.txt\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore scratch")
+    wt = create_session_worktree(str(repo), "harness-ignored", tmp_path / "worktrees")
+    assert wt is not None
+    scratch = tmp_path / "worktrees" / "harness-ignored" / "scratch.txt"
+    scratch.write_text("only copy\n")
+
+    assert cleanup_session_worktree(wt) == "kept"
+    assert scratch.read_text() == "only copy\n"
 
 
 def test_cleanup_keeps_worktree_with_new_commits(repo, tmp_path):
@@ -171,6 +220,20 @@ def test_reclaim_keeps_stale_dirty_worktree(repo, tmp_path):
     assert (worktrees_dir / "harness-dirty-stale" / "wip.txt").is_file()
 
 
+def test_reclaim_skips_worktrees_created_after_startup_snapshot(repo, tmp_path):
+    """An asynchronous sweep must not remove a newly launched session."""
+    worktrees_dir = tmp_path / "worktrees"
+    create_session_worktree(str(repo), "harness-old", worktrees_dir)
+    initial_paths = tuple(worktrees_dir.iterdir())
+    create_session_worktree(str(repo), "harness-new", worktrees_dir)
+
+    result = reclaim_stale_session_worktrees(worktrees_dir, candidates=initial_paths)
+
+    assert result["removed"] == 1
+    assert not (worktrees_dir / "harness-old").exists()
+    assert (worktrees_dir / "harness-new").is_dir()
+
+
 def test_reclaim_ignores_non_session_entries(repo, tmp_path):
     worktrees_dir = tmp_path / "worktrees"
     worktrees_dir.mkdir()
@@ -182,14 +245,7 @@ def test_reclaim_ignores_non_session_entries(repo, tmp_path):
 
 
 def test_worktree_add_failure_cleans_orphan_branch(tmp_path, monkeypatch):
-    """A failed `git worktree add -b` must not leak its session branch.
-
-    `git worktree add -b <branch>` creates the branch before the worktree, so
-    a timeout/error part-way leaves an orphaned ``drover/<session-id>`` branch
-    with no worktree (#398). A later session reusing that id then collides on
-    the branch name. The failure must still raise -- but it must also delete
-    the branch it half-created.
-    """
+    """A failed add removes only the branch this invocation reserved (#398)."""
     from drover.server.harness.worktree import WorktreeIsolationUnavailable
 
     repo = tmp_path / "repo"
@@ -205,13 +261,14 @@ def test_worktree_add_failure_cleans_orphan_branch(tmp_path, monkeypatch):
 
     def create_branch_then_stall(cmd, *args, **kwargs):
         if "worktree" in cmd and "add" in cmd:
-            # git creates the branch first, then the worktree-add stalls.
-            real_run(
-                ["git", "-C", str(repo), "branch", "drover/harness-orphan"],
+            # The branch is reserved before a potentially slow worktree add.
+            reserved = real_run(
+                ["git", "-C", str(repo), "branch", "--list", "drover/harness-orphan"],
                 capture_output=True,
                 text=True,
                 check=True,
             )
+            assert reserved.stdout.strip()
             raise subprocess.TimeoutExpired(cmd, 90)
         return real_run(cmd, *args, **kwargs)
 
@@ -221,6 +278,37 @@ def test_worktree_add_failure_cleans_orphan_branch(tmp_path, monkeypatch):
         create_session_worktree(str(repo), "harness-orphan", tmp_path / "worktrees")
 
     assert _git(repo, "branch", "--list", "drover/harness-orphan") == ""
+
+
+def test_repeated_session_id_preserves_existing_dirty_worktree(repo, tmp_path):
+    """A failed add cannot claim ownership of an earlier session's work."""
+    from drover.server.harness.worktree import WorktreeIsolationUnavailable
+
+    worktrees_dir = tmp_path / "worktrees"
+    wt = create_session_worktree(str(repo), "harness-existing", worktrees_dir)
+    assert wt is not None
+    path = worktrees_dir / "harness-existing"
+    (path / "wip.txt").write_text("only copy\n")
+
+    with pytest.raises(WorktreeIsolationUnavailable):
+        create_session_worktree(str(repo), "harness-existing", worktrees_dir)
+
+    assert (path / "wip.txt").read_text() == "only copy\n"
+    assert _git(repo, "branch", "--list", wt.branch) != ""
+
+
+def test_failed_add_does_not_delete_an_existing_orphan_branch(repo, tmp_path):
+    """A branch present before the add belongs to an earlier attempt."""
+    from drover.server.harness.worktree import WorktreeIsolationUnavailable
+
+    branch = "drover/harness-existing-orphan"
+    _git(repo, "branch", branch)
+    before = _git(repo, "rev-parse", branch)
+
+    with pytest.raises(WorktreeIsolationUnavailable):
+        create_session_worktree(str(repo), "harness-existing-orphan", tmp_path / "wt")
+
+    assert _git(repo, "rev-parse", branch) == before
 
 
 def test_a_directory_that_cannot_host_a_worktree_still_returns_none(tmp_path):
