@@ -147,6 +147,7 @@ def compact_table(parquet_dir: Path, *, dedup_column: Optional[str] = None) -> d
     """Compact mutable leaf partitions with a table-grain dedup policy."""
     parquet_dir = Path(parquet_dir)
     results: list[CompactResult] = []
+    partitions: list[tuple[Path, str]] = []
     # Leaf partitions are dirs that contain *.parquet files directly
     for d in parquet_dir.rglob("*"):
         if not d.is_dir():
@@ -159,6 +160,26 @@ def compact_table(parquet_dir: Path, *, dedup_column: Optional[str] = None) -> d
             continue
         if not any(d.glob("*.parquet")):
             continue
+        partitions.append((d, table_root))
+
+    # Validate a global override before changing any files. A snapshot's
+    # dedup_key identifies its observation, not each window row; applying an
+    # explicit CLI override here silently discards most usage rows (#389).
+    unsafe = sorted(
+        {
+            table_root
+            for _, table_root in partitions
+            if dedup_column
+            and _TABLE_DEDUP_COLUMNS.get(table_root, "dedup_key") is None
+        }
+    )
+    if unsafe:
+        raise ValueError(
+            f"global dedup override is unsafe for {', '.join(unsafe)}; "
+            "use the per-table default"
+        )
+
+    for d, table_root in partitions:
         effective_dedup = (
             dedup_column
             if dedup_column is not None

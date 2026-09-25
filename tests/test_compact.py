@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from drover.server.compact import compact_partition, compact_table
 
@@ -208,3 +209,23 @@ def test_compact_table_uses_no_dedup_key_for_provider_usage_snapshots(
     assert summary["rows"] == 2
     table = pq.ParquetFile(next(snapshots.glob("*.parquet"))).read()
     assert table.num_rows == 2
+
+
+def test_global_dedup_override_refuses_snapshot_loss_before_any_rewrite(
+    tmp_path: Path,
+) -> None:
+    """An explicit global override must not collapse distinct usage windows."""
+    events = tmp_path / "agent_events" / "date=2026-09-20"
+    events.mkdir(parents=True)
+    _write_parquet(events / "part-a.parquet", ["event"])
+    _write_parquet(events / "part-b.parquet", ["event"])
+    snapshots = tmp_path / "provider_usage_snapshots" / "date=2026-09-20"
+    snapshots.mkdir(parents=True)
+    _write_parquet(snapshots / "part-a.parquet", ["same-source"])
+    _write_parquet(snapshots / "part-b.parquet", ["same-source"])
+
+    with pytest.raises(ValueError, match="provider_usage_snapshots"):
+        compact_table(tmp_path, dedup_column="dedup_key")
+
+    assert len(list(events.glob("*.parquet"))) == 2
+    assert len(list(snapshots.glob("*.parquet"))) == 2
