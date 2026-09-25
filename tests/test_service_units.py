@@ -55,6 +55,25 @@ def test_launchd_logs_land_under_the_given_home():
     assert parsed["StandardErrorPath"] == "/home/x/Library/Logs/drover/harnessd.err.log"
 
 
+def test_launchd_gives_a_clean_shutdown_exit_timeout():
+    """SIGTERM must get a checkpoint window before launchd SIGKILLs (#307).
+
+    A server killed mid-checkpoint starts the next open from a SIGKILLed file
+    and pays for recovery, which on the reference hub was a 4.5-minute first
+    DuckDB open. A generous ExitTimeOut lets the SIGTERM handler finish its
+    checkpoint and exit cleanly.
+    """
+    rendered = render_launchd(
+        "com.drover.server",
+        "/home/x/.drover/runtime/current/bin/drover-server",
+        ["run"],
+        home=Path("/home/x"),
+        path_entries=["/usr/bin"],
+    )
+    parsed = plistlib.loads(rendered.encode("utf-8"))
+    assert parsed["ExitTimeOut"] == 300
+
+
 def test_launchd_unit_escapes_xml_in_arguments():
     rendered = render_launchd(
         "com.drover.server",

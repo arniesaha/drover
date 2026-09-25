@@ -173,6 +173,10 @@ systemd user units on Linux, with lingering enabled so they survive a logout.
 Both point at `~/.drover/runtime/current`, so an upgrade is a symlink flip
 rather than a unit rewrite, and both set `PATH` explicitly, because a unit
 that inherits nothing cannot find the agent CLIs it exists to drive.
+Runtime updates do not rewrite existing service units. On macOS, regenerate
+and reload an installed launchd plist to pick up service-unit changes such as
+the longer clean-shutdown timeout; updating the wheel alone leaves the old
+plist settings in effect.
 
 To see what would be written without touching anything:
 
@@ -215,8 +219,19 @@ Two safety rails, neither optional:
 
 - A version that cannot report its own version never gets the symlink.
 - Before flipping, the host records what it is leaving. If the new version
-  cannot reach the hub within ninety seconds, it puts the symlink back. A bad
-  release costs ninety seconds rather than physical access to the machine.
+  cannot reach the hub within the registration deadline, it puts the symlink
+  back. A bad release costs one deadline rather than physical access to the
+  machine. The deadline defaults to ninety seconds, and a host whose healthy
+  start regularly exceeds it can raise it so a slow bootstrap is not mistaken
+  for a bad release:
+
+  ```toml
+  [update]
+  registration_deadline_seconds = 300
+  ```
+
+  An unrecognised or non-positive value falls back to ninety seconds rather
+  than stopping the daemon.
 
 `rollback` covers the other case: a version that starts, registers, and is
 still wrong.

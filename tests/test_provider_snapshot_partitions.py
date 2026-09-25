@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pytest
 
 from drover.schema import bootstrap
 from drover.server.providers.service import (
@@ -148,6 +150,98 @@ def test_compaction_preserves_every_row(tmp_path: Path) -> None:
     before = keys()
     compact_closed_snapshot_partitions(service.parquet_dir)
     assert keys() == before == {"dedup-a", "dedup-b", "dedup-c"}
+
+
+def test_legacy_flat_snapshots_are_folded_into_dated_partitions(
+    tmp_path: Path,
+) -> None:
+    """Pre-#393 flat files are moved into day partitions on the next sweep.
+
+    The writer once wrote one file per refresh directly under
+    ``provider_usage_snapshots/``; 18,583 such flat files made the
+    ``union_by_name=true`` view footer-scan every file at startup (#382). The
+    maintenance pass must fold those legacy files into the same ``date=``
+    partitions the writer now uses, so the scan count collapses to days.
+    """
+    from drover.server.parquet_io import atomic_write_table
+    from drover.server.providers.types import provider_snapshot_table
+
+    service = _service(tmp_path)
+    when = datetime(2026, 9, 17, 9, 30, tzinfo=timezone.utc)
+    legacy = service.snapshot_dir / "part-legacy-abc.parquet"
+    atomic_write_table(
+        provider_snapshot_table(_snapshot("legacy", when)),
+        legacy,
+        compression="zstd",
+    )
+    assert legacy.is_file()
+
+    result = compact_closed_snapshot_partitions(service.parquet_dir)
+
+    assert not legacy.exists(), "the flat legacy file must be folded away"
+    partition = service.snapshot_dir / "date=2026-09-17"
+    assert list(partition.glob("*.parquet")), "rows must land in a dated partition"
+
+    con = duckdb.connect(str(service.duckdb_path))
+    try:
+        keys = {
+            row[0]
+            for row in con.execute(
+                "SELECT dedup_key FROM provider_usage_snapshots"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert keys == {"dedup-legacy"}
+    assert result["files_before"] == 1
+    assert result["rows"] == 1
+
+
+def test_legacy_fold_retry_does_not_duplicate_a_partially_moved_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A crash after the first replacement write must leave a retry safe."""
+    from drover.server.parquet_io import atomic_write_table
+    from drover.server.providers import service as service_module
+    from drover.server.providers.types import provider_snapshot_table
+
+    service = _service(tmp_path)
+    first = datetime(2026, 9, 17, 23, 50, tzinfo=timezone.utc)
+    second = first + timedelta(minutes=20)
+    legacy = service.snapshot_dir / "part-legacy-retry.parquet"
+    atomic_write_table(
+        pa.concat_tables(
+            [
+                provider_snapshot_table(_snapshot("first", first)),
+                provider_snapshot_table(_snapshot("second", second)),
+            ]
+        ),
+        legacy,
+        compression="zstd",
+    )
+
+    def write_then_interrupt(table, path, **kwargs):
+        atomic_write_table(table, path, **kwargs)
+        raise RuntimeError("interrupted after replacement write")
+
+    monkeypatch.setattr(service_module, "atomic_write_table", write_then_interrupt)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        compact_closed_snapshot_partitions(service.parquet_dir)
+    assert legacy.is_file()
+
+    monkeypatch.setattr(service_module, "atomic_write_table", atomic_write_table)
+    compact_closed_snapshot_partitions(service.parquet_dir)
+
+    con = duckdb.connect(str(service.duckdb_path))
+    try:
+        rows = con.execute(
+            "SELECT dedup_key, count(*) FROM provider_usage_snapshots "
+            "WHERE dedup_key IN ('dedup-first', 'dedup-second') "
+            "GROUP BY dedup_key ORDER BY dedup_key"
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows == [("dedup-first", 1), ("dedup-second", 1)]
 
 
 def test_the_watcher_sweep_compacts_closed_partitions(

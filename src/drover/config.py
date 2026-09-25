@@ -25,6 +25,12 @@ ACTIVATION_SYMLINK = "symlink"
 ACTIVATION_IN_PLACE = "in_place"
 ACTIVATION_MODES = (ACTIVATION_SYMLINK, ACTIVATION_IN_PLACE)
 
+# The default registration deadline in seconds. Mirrors the updater's
+# module-level REGISTRATION_DEADLINE_SECONDS, which remains the fallback when
+# no config is supplied; config.py does not import the updater to avoid
+# coupling the two layers.
+_DEFAULT_REGISTRATION_DEADLINE_SECONDS = 90.0
+
 try:
     import tomllib  # Python 3.11+
 except ImportError:
@@ -432,6 +438,11 @@ class DroverConfig:
     # it", which is true of every host but the mac-mini hub. Names are the
     # service manager's own: launchd labels on macOS, systemd units on Linux.
     update_restart_units: tuple[str, ...]
+    # How long a freshly restarted server has to register with the hub before
+    # the updater rolls the release back. The default matches a healthy start,
+    # but a host whose bootstrap regularly exceeds it (#382) must be able to
+    # raise it rather than loop "installed → timed out → rolled back" forever.
+    update_registration_deadline_seconds: float
     # "Favorite" cwd suggestions surfaced in the New Session sheet, on top of
     # recent-session cwds. Empty by default — set per install, never in code.
     # Each carries the host it belongs to, or None for every host.
@@ -574,6 +585,7 @@ _DEFAULTS = {
         "activation": ACTIVATION_SYMLINK,
         "in_place_venv": "",
         "restart_units": [],
+        "registration_deadline_seconds": 90.0,
     },
     "harness": {
         "favorite_cwds": [],
@@ -649,6 +661,27 @@ def _restart_units(value: object) -> tuple[str, ...]:
         for name in (str(entry).strip() for entry in value if isinstance(entry, str))
         if name
     )
+
+
+def _registration_deadline(value: object) -> float:
+    """Normalise `update.registration_deadline_seconds`, falling back rather
+    than raising. A typo here must never stop the daemon starting: the
+    fallback is the deadline every host has always used, so the cost of
+    getting it wrong is a host that still self-heals in 90s, not a host that
+    is down.
+    """
+    try:
+        seconds = float(value) if not isinstance(value, bool) else float("nan")
+    except (TypeError, ValueError):
+        seconds = float("nan")
+    if not math.isfinite(seconds) or seconds <= 0:
+        log.warning(
+            "unknown update.registration_deadline_seconds %r; falling back to %r",
+            value,
+            _DEFAULT_REGISTRATION_DEADLINE_SECONDS,
+        )
+        return _DEFAULT_REGISTRATION_DEADLINE_SECONDS
+    return seconds
 
 
 def _from_dict(d: dict) -> DroverConfig:
@@ -770,6 +803,9 @@ def _from_dict(d: dict) -> DroverConfig:
         update_activation=_activation_mode(d["update"]["activation"]),
         update_in_place_venv=str(d["update"]["in_place_venv"]).strip(),
         update_restart_units=_restart_units(d["update"]["restart_units"]),
+        update_registration_deadline_seconds=_registration_deadline(
+            d["update"]["registration_deadline_seconds"]
+        ),
         harness_favorite_cwds=tuple(
             favorite
             for favorite in (
