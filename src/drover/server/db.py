@@ -1071,7 +1071,9 @@ def _clone_file(source: Path, destination: Path) -> bool:
     return False
 
 
-def copy_duckdb_store(source: Path, destination: Path) -> None:
+def copy_duckdb_store(
+    source: Path, destination: Path, *, checkpoint: bool = True
+) -> None:
     """Capture a DuckDB store as a snapshot that always opens.
 
     Two properties, learned the hard way when a snapshot invalidated the live
@@ -1086,10 +1088,17 @@ def copy_duckdb_store(source: Path, destination: Path) -> None:
     two instants, so a copy taking both can only vouch for the pair by luck,
     and the existence check ahead of it races a checkpoint deleting the file.
     A store on its own is a valid database as of its last checkpoint, so the
-    cost is staleness rather than corruption -- and a checkpoint first keeps
-    even that small. Stale is a trade a snapshot can make; unopenable is not.
+    cost is staleness rather than corruption. By default a checkpoint first
+    keeps even that small; foreground readers can skip it when forcing one
+    would compete with the live instance. Stale is a trade a snapshot can
+    make; unopenable is not.
     """
-    _checkpoint_before_snapshot(source)
+    # A foreground read must not force a checkpoint on the busy live instance:
+    # a checkpoint OOM can invalidate the entire analytical store (#363).
+    # It may accept the last checkpoint's state instead, with its normal
+    # observed_at timestamp showing the age of the data.
+    if checkpoint:
+        _checkpoint_before_snapshot(source)
     if not _clone_file(source, destination):
         # Off-APFS or across volumes. Still no WAL, so the pairing hazard is
         # gone, but a chunked read can tear on its own -- callers treat a

@@ -317,6 +317,22 @@ def test_the_store_is_cloned_rather_than_read_in_chunks(tmp_path, monkeypatch):
         snap.close()
 
 
+def test_foreground_snapshot_does_not_checkpoint_the_live_store(tmp_path, monkeypatch):
+    source = tmp_path / "live.duckdb"
+    with duckdb.connect(str(source)) as con:
+        con.execute("CREATE TABLE t AS SELECT 1 AS a")
+
+    def refuse_checkpoint(path):
+        raise AssertionError("foreground reader forced a live checkpoint")
+
+    monkeypatch.setattr(db_module, "_checkpoint_before_snapshot", refuse_checkpoint)
+    destination = tmp_path / "snap.duckdb"
+    copy_duckdb_store(source, destination, checkpoint=False)
+
+    with duckdb.connect(str(destination), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM t").fetchone() == (1,)
+
+
 def test_a_store_that_cannot_be_cloned_is_still_captured_without_its_wal(
     tmp_path, monkeypatch
 ):
