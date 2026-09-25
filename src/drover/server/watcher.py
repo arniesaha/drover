@@ -382,6 +382,10 @@ class OccurrenceSweepResult:
     occurrences: int = 0
 
 
+_ADVISORY_OCCURRENCE_SWEEP_BATCH_SIZE = 128
+_ADVISORY_OCCURRENCE_CANDIDATE_PAGE_SIZE = 8192
+
+
 def sweep_advisory_occurrences(
     duckdb_path: Path, *, retention_days: int
 ) -> OccurrenceSweepResult:
@@ -419,16 +423,29 @@ def sweep_advisory_occurrences(
         return OccurrenceSweepResult()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    candidate_sql = """
+        WITH newest_failing AS (
+            SELECT finding_id, recorded_at, occurrence_id FROM (
+                SELECT finding_id, recorded_at, occurrence_id,
+                       row_number() OVER (
+                           PARTITION BY finding_id
+                           ORDER BY recorded_at DESC, occurrence_id DESC
+                       ) AS position
+                  FROM advisory_occurrences
+                 WHERE outcome = 'failing'
+            ) ranked WHERE position = 1
+        )
+        SELECT o.occurrence_id FROM advisory_occurrences o
+          JOIN newest_failing newer ON newer.finding_id = o.finding_id
+         WHERE o.recorded_at < ?
+           AND (newer.recorded_at > o.recorded_at
+                OR (newer.recorded_at = o.recorded_at
+                    AND newer.occurrence_id > o.occurrence_id))
+         LIMIT ?
+    """
     delete_sql = """
-        DELETE FROM advisory_occurrences o
-        WHERE o.recorded_at < ?
-          AND EXISTS (
-              SELECT 1 FROM advisory_occurrences newer
-               WHERE newer.finding_id = o.finding_id AND newer.outcome = 'failing'
-                 AND (newer.recorded_at > o.recorded_at
-                      OR (newer.recorded_at = o.recorded_at
-                          AND newer.occurrence_id > o.occurrence_id))
-          )
+        DELETE FROM advisory_occurrences
+         WHERE occurrence_id = ANY(?)
     """
     if is_postgres_control_store(duckdb_path):
         # DuckDB's DELETE returns a count; PostgreSQL's plain DELETE has no
@@ -437,10 +454,30 @@ def sweep_advisory_occurrences(
             WITH removed AS ({delete_sql} RETURNING 1)
             SELECT count(*) FROM removed
         """
-    with control_plane_connection(duckdb_path) as con:
-        removed = con.execute(delete_sql, [cutoff]).fetchone()
-
-    count = int(removed[0]) if removed and removed[0] is not None else 0
+    count = 0
+    while True:
+        # Find the newest failing row once per finding, then discover eligible
+        # IDs once per page. A correlated self-join grows quadratically for a
+        # finding with a long history and can OOM the 256 MB control store.
+        with control_plane_connection(duckdb_path) as con:
+            candidates = [
+                row[0]
+                for row in con.execute(
+                    candidate_sql, [cutoff, _ADVISORY_OCCURRENCE_CANDIDATE_PAGE_SIZE]
+                ).fetchall()
+            ]
+        if not candidates:
+            break
+        for start in range(0, len(candidates), _ADVISORY_OCCURRENCE_SWEEP_BATCH_SIZE):
+            batch = candidates[start : start + _ADVISORY_OCCURRENCE_SWEEP_BATCH_SIZE]
+            # A primary-key delete is short. Release the lock and give any
+            # waiting fleet read a chance before the next batch.
+            with control_plane_connection(duckdb_path) as con:
+                removed = con.execute(delete_sql, [batch]).fetchone()
+            count += int(removed[0]) if removed and removed[0] is not None else 0
+            time.sleep(0.005)
+        if len(candidates) < _ADVISORY_OCCURRENCE_CANDIDATE_PAGE_SIZE:
+            break
     if count:
         log.info(
             "reclaimed %d advisory occurrence(s) older than %d day(s); the file "

@@ -6,6 +6,7 @@ import os
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -960,6 +961,130 @@ def test_advisory_occurrence_sweep_reclaims_old_superseded_rows(tmp_path: Path) 
     }
 
 
+def test_advisory_occurrence_sweep_releases_control_window_before_finishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large retention pass must leave a window for fleet reads (#388)."""
+    import drover.server.watcher as watcher
+
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        con.executemany(
+            "INSERT INTO advisory_occurrences "
+            "(occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (f"occ-c-extra-{i:03d}", "finding-c", "run-old", "failing", old, old)
+                for i in range(260)
+            ],
+        )
+    finally:
+        con.close()
+
+    real_connection = watcher.control_plane_connection
+    remaining_after_window: list[int] = []
+    reader_counts: list[int] = []
+    reader_errors: list[Exception] = []
+    reader: threading.Thread | None = None
+    candidate_scans = 0
+
+    def fleet_read() -> None:
+        try:
+            with real_connection(duckdb_path) as connection:
+                reader_counts.append(
+                    int(
+                        connection.execute(
+                            "SELECT count(*) FROM advisory_occurrences"
+                        ).fetchone()[0]
+                    )
+                )
+        except Exception as exc:
+            reader_errors.append(exc)
+
+    class ObservedConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, params):
+            nonlocal reader, candidate_scans
+            if "SELECT o.occurrence_id" in sql:
+                candidate_scans += 1
+            if sql.lstrip().startswith("DELETE") and reader is None:
+                # Queue a real fleet reader while the DELETE holds the lock.
+                reader = threading.Thread(target=fleet_read)
+                reader.start()
+            return self.connection.execute(sql, params)
+
+    @contextmanager
+    def observe_control_window(path: Path):
+        with real_connection(path) as connection:
+            yield ObservedConnection(connection)
+        if reader is not None and not reader_counts:
+            reader.join(timeout=5)
+        remaining_after_window.append(len(_occurrence_ids(duckdb_path)))
+
+    monkeypatch.setattr(watcher, "control_plane_connection", observe_control_window)
+    result = sweep_advisory_occurrences(duckdb_path, retention_days=7)
+
+    assert result.occurrences == 261
+    assert candidate_scans == 1
+    assert not reader_errors
+    assert len(reader_counts) == 1
+    assert 4 < reader_counts[0] < 265
+    assert any(4 < remaining < 265 for remaining in remaining_after_window)
+    assert remaining_after_window[-1] == 4
+
+
+def test_advisory_occurrence_candidate_scan_stays_short_for_one_busy_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One finding's history must not make the fleet wait on a quadratic scan."""
+    import drover.server.watcher as watcher
+
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+    old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    recent = datetime.now(timezone.utc)
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        con.execute(
+            "INSERT INTO advisory_occurrences "
+            "(occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at) "
+            "VALUES ('busy-newest', 'finding-busy', 'run-new', 'failing', ?, ?)",
+            [recent, recent],
+        )
+        con.execute(
+            "INSERT INTO advisory_occurrences "
+            "(occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at) "
+            "SELECT 'busy-old-' || i::VARCHAR, 'finding-busy', 'run-old', "
+            "'failing', ?, ? FROM range(20000) t(i)",
+            [old, old],
+        )
+    finally:
+        con.close()
+
+    real_connection = watcher.control_plane_connection
+    scan_seconds: list[float] = []
+
+    class StopAfterScan(Exception):
+        pass
+
+    @contextmanager
+    def observe_first_window(path: Path):
+        start = time.perf_counter()
+        with real_connection(path) as connection:
+            yield connection
+        scan_seconds.append(time.perf_counter() - start)
+        raise StopAfterScan
+
+    monkeypatch.setattr(watcher, "control_plane_connection", observe_first_window)
+    with pytest.raises(StopAfterScan):
+        sweep_advisory_occurrences(duckdb_path, retention_days=7)
+
+    assert scan_seconds[0] < 2.0
+
+
 def test_advisory_occurrence_sweep_keeps_newest_failing_occurrence_however_old(
     tmp_path: Path,
 ) -> None:
@@ -972,6 +1097,35 @@ def test_advisory_occurrence_sweep_keeps_newest_failing_occurrence_however_old(
     sweep_advisory_occurrences(duckdb_path, retention_days=7)
 
     assert "occ-b-ancient-failing" in _occurrence_ids(duckdb_path)
+
+
+def test_advisory_occurrence_sweep_uses_id_to_break_failing_timestamp_ties(
+    tmp_path: Path,
+) -> None:
+    duckdb_path = _seeded_occurrence_store(tmp_path)
+    failing_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    passing_at = datetime(2021, 1, 1, tzinfo=timezone.utc)
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        con.executemany(
+            "INSERT INTO advisory_occurrences "
+            "(occurrence_id, finding_id, run_id, outcome, observed_at, recorded_at) "
+            "VALUES (?, 'finding-tie', 'run', ?, ?, ?)",
+            [
+                ("tie-a", "failing", failing_at, failing_at),
+                ("tie-z", "failing", failing_at, failing_at),
+                ("tie-passing-later", "passing", passing_at, passing_at),
+            ],
+        )
+    finally:
+        con.close()
+
+    result = sweep_advisory_occurrences(duckdb_path, retention_days=7)
+
+    assert result.occurrences == 2  # tie-a and the fixture's occ-c-old-failing
+    ids = _occurrence_ids(duckdb_path)
+    assert "tie-a" not in ids
+    assert {"tie-z", "tie-passing-later"} <= ids
 
 
 def test_advisory_occurrence_sweep_leaves_rows_younger_than_cutoff(
