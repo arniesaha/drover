@@ -3735,8 +3735,11 @@ def doctor(ctx: click.Context) -> None:
 def compact(ctx: click.Context, dedup_column: str) -> None:
     """Combine small parquet files within each leaf partition."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    try:
+        summary = compact_table(cfg.parquet_dir, dedup_column=dedup_column or None)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-    summary = compact_table(cfg.parquet_dir, dedup_column=dedup_column or None)
     click.echo(
         f"compacted {summary['partitions']} partitions: "
         f"{summary['files_before']} → {summary['files_after']} files, "

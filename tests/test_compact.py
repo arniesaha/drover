@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+from click.testing import CliRunner
 
+from drover.server.__main__ import main
 from drover.server.compact import compact_partition, compact_table
 
 
@@ -208,3 +211,47 @@ def test_compact_table_uses_no_dedup_key_for_provider_usage_snapshots(
     assert summary["rows"] == 2
     table = pq.ParquetFile(next(snapshots.glob("*.parquet"))).read()
     assert table.num_rows == 2
+
+
+def test_global_dedup_override_refuses_snapshot_loss_before_any_rewrite(
+    tmp_path: Path,
+) -> None:
+    """An explicit global override must not collapse distinct usage windows."""
+    events = tmp_path / "agent_events" / "date=2026-09-20"
+    events.mkdir(parents=True)
+    _write_parquet(events / "part-a.parquet", ["event"])
+    _write_parquet(events / "part-b.parquet", ["event"])
+    snapshots = tmp_path / "provider_usage_snapshots" / "date=2026-09-20"
+    snapshots.mkdir(parents=True)
+    _write_parquet(snapshots / "part-a.parquet", ["same-source"])
+    _write_parquet(snapshots / "part-b.parquet", ["same-source"])
+
+    with pytest.raises(ValueError, match="provider_usage_snapshots"):
+        compact_table(tmp_path, dedup_column="dedup_key")
+
+    assert len(list(events.glob("*.parquet"))) == 2
+    assert len(list(snapshots.glob("*.parquet"))) == 2
+
+
+def test_cli_refuses_unsafe_override_before_bootstrap(tmp_path, monkeypatch):
+    snapshots = tmp_path / "provider_usage_snapshots" / "date=2026-09-20"
+    snapshots.mkdir(parents=True)
+    _write_parquet(snapshots / "part-a.parquet", ["same-source"])
+    _write_parquet(snapshots / "part-b.parquet", ["same-source"])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f'[paths]\nparquet_dir = "{tmp_path}"\n'
+        f'duckdb_path = "{tmp_path / "drover.duckdb"}"\n'
+    )
+    import drover.server.__main__ as cli
+
+    bootstraps = []
+    monkeypatch.setattr(cli, "bootstrap", lambda **kwargs: bootstraps.append(kwargs))
+
+    result = CliRunner().invoke(
+        main, ["--config", str(cfg), "compact", "--dedup-column", "dedup_key"]
+    )
+
+    assert result.exit_code != 0
+    assert "provider_usage_snapshots" in result.output
+    assert bootstraps == []
