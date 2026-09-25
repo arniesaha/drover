@@ -364,7 +364,9 @@ def test_loads_registration_deadline(tmp_path):
     assert load_config(cfg_file).update_registration_deadline_seconds == 300.0
 
 
-@pytest.mark.parametrize("value", ["'nope'", "0", "-5", "'  '", "nan", "inf"])
+@pytest.mark.parametrize(
+    "value", ["'nope'", "0", "-5", "'  '", "nan", "inf", "true", "false"]
+)
 def test_bad_registration_deadline_falls_back_to_default(tmp_path, value):
     cfg_file = tmp_path / "update.toml"
     cfg_file.write_text(f"[update]\nregistration_deadline_seconds = {value}\n")

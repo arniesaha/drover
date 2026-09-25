@@ -671,7 +671,7 @@ def _registration_deadline(value: object) -> float:
     is down.
     """
     try:
-        seconds = float(value)
+        seconds = float(value) if not isinstance(value, bool) else float("nan")
     except (TypeError, ValueError):
         seconds = float("nan")
     if not math.isfinite(seconds) or seconds <= 0:

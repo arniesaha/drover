@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pytest
 
 from drover.schema import bootstrap
 from drover.server.providers.service import (
@@ -193,6 +195,53 @@ def test_legacy_flat_snapshots_are_folded_into_dated_partitions(
     assert keys == {"dedup-legacy"}
     assert result["files_before"] == 1
     assert result["rows"] == 1
+
+
+def test_legacy_fold_retry_does_not_duplicate_a_partially_moved_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A crash after the first replacement write must leave a retry safe."""
+    from drover.server.parquet_io import atomic_write_table
+    from drover.server.providers import service as service_module
+    from drover.server.providers.types import provider_snapshot_table
+
+    service = _service(tmp_path)
+    first = datetime(2026, 9, 17, 23, 50, tzinfo=timezone.utc)
+    second = first + timedelta(minutes=20)
+    legacy = service.snapshot_dir / "part-legacy-retry.parquet"
+    atomic_write_table(
+        pa.concat_tables(
+            [
+                provider_snapshot_table(_snapshot("first", first)),
+                provider_snapshot_table(_snapshot("second", second)),
+            ]
+        ),
+        legacy,
+        compression="zstd",
+    )
+
+    def write_then_interrupt(table, path, **kwargs):
+        atomic_write_table(table, path, **kwargs)
+        raise RuntimeError("interrupted after replacement write")
+
+    monkeypatch.setattr(service_module, "atomic_write_table", write_then_interrupt)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        compact_closed_snapshot_partitions(service.parquet_dir)
+    assert legacy.is_file()
+
+    monkeypatch.setattr(service_module, "atomic_write_table", atomic_write_table)
+    compact_closed_snapshot_partitions(service.parquet_dir)
+
+    con = duckdb.connect(str(service.duckdb_path))
+    try:
+        rows = con.execute(
+            "SELECT dedup_key, count(*) FROM provider_usage_snapshots "
+            "WHERE dedup_key IN ('dedup-first', 'dedup-second') "
+            "GROUP BY dedup_key ORDER BY dedup_key"
+        ).fetchall()
+    finally:
+        con.close()
+    assert rows == [("dedup-first", 1), ("dedup-second", 1)]
 
 
 def test_the_watcher_sweep_compacts_closed_partitions(

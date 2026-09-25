@@ -708,7 +708,11 @@ def _fold_legacy_flat_snapshots(snapshot_dir: Path) -> dict:
         for day, idxs in by_day.items():
             partition = snapshot_dir / f"date={day}"
             partition.mkdir(parents=True, exist_ok=True)
-            out_path = partition / f"part-migrated-{uuid4().hex}.parquet"
+            # A retry after an interrupted fold must replace the same output,
+            # not append a second copy of the source rows. The source filename
+            # is unique within this table, and one source has at most one
+            # output per observed day.
+            out_path = partition / f"part-migrated-{path.stem}.parquet"
             atomic_write_table(
                 table.take(pa.array(idxs, type=pa.int64())),
                 out_path,

@@ -173,6 +173,10 @@ systemd user units on Linux, with lingering enabled so they survive a logout.
 Both point at `~/.drover/runtime/current`, so an upgrade is a symlink flip
 rather than a unit rewrite, and both set `PATH` explicitly, because a unit
 that inherits nothing cannot find the agent CLIs it exists to drive.
+Runtime updates do not rewrite existing service units. On macOS, regenerate
+and reload an installed launchd plist to pick up service-unit changes such as
+the longer clean-shutdown timeout; updating the wheel alone leaves the old
+plist settings in effect.
 
 To see what would be written without touching anything:
 
