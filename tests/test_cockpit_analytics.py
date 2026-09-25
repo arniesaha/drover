@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1299,6 +1300,7 @@ def test_cockpit_analytics_isolates_activity_failure():
     assert payload["activity"]["data"] is None
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
 def test_file_backed_activity_runs_outside_the_server_duckdb_instance(
     tmp_path, monkeypatch
 ):

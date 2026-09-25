@@ -25,6 +25,7 @@ analytical queries that genuinely join across both worlds.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
@@ -470,7 +471,11 @@ def test_the_cockpit_activity_query_still_sees_control_plane_sessions(tmp_path):
     duckdb_path = _db(tmp_path)
     # Keep the control instance open so new sessions remain in its WAL while
     # the cockpit child clones it from another process.
-    keeper = duckdb.connect(str(control_plane_path(duckdb_path)))
+    keeper = (
+        duckdb.connect(str(control_plane_path(duckdb_path)))
+        if sys.platform == "darwin"
+        else None
+    )
     registry = HarnessRegistry(duckdb_path)
     try:
         registry.register_host(
@@ -479,7 +484,8 @@ def test_the_cockpit_activity_query_still_sees_control_plane_sessions(tmp_path):
         registry.create_session(
             host_id="mac-mini", harness="codex", command="codex", session_id="s1"
         )
-        assert control_plane_path(duckdb_path).with_suffix(".duckdb.wal").exists()
+        if keeper is not None:
+            assert control_plane_path(duckdb_path).with_suffix(".duckdb.wal").exists()
 
         service = CockpitService(duckdb_path=duckdb_path, provider_usage=None)
         activity = service.analytics(AnalyticsFilters(days=7))["activity"]
@@ -487,9 +493,11 @@ def test_the_cockpit_activity_query_still_sees_control_plane_sessions(tmp_path):
         assert activity["status"] == "ok", activity
         assert activity["data"]["totals"]["session_count"] == 1
     finally:
-        keeper.close()
+        if keeper is not None:
+            keeper.close()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
 def test_isolated_control_snapshot_stays_inside_request_scratch(tmp_path):
     duckdb_path = _db(tmp_path)
     request_scratch = tmp_path / "request"

@@ -317,6 +317,7 @@ def test_the_store_is_cloned_rather_than_read_in_chunks(tmp_path, monkeypatch):
         snap.close()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
 def test_foreground_snapshot_does_not_checkpoint_the_live_store(tmp_path, monkeypatch):
     from drover.server.db import copy_duckdb_store_with_wal
 
@@ -335,6 +336,7 @@ def test_foreground_snapshot_does_not_checkpoint_the_live_store(tmp_path, monkey
         assert con.execute("SELECT count(*) FROM t").fetchone() == (1,)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
 def test_consistent_snapshot_includes_rows_still_in_the_live_wal(tmp_path):
     from drover.server.db import copy_duckdb_store_with_wal
 
@@ -354,6 +356,7 @@ def test_consistent_snapshot_includes_rows_still_in_the_live_wal(tmp_path):
         writer.close()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
 def test_consistent_snapshot_retries_a_write_between_file_clones(tmp_path, monkeypatch):
     from drover.server.db import copy_duckdb_store_with_wal
 
