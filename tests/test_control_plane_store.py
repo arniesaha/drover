@@ -490,6 +490,18 @@ def test_the_cockpit_activity_query_still_sees_control_plane_sessions(tmp_path):
         keeper.close()
 
 
+def test_isolated_control_snapshot_stays_inside_request_scratch(tmp_path):
+    duckdb_path = _db(tmp_path)
+    request_scratch = tmp_path / "request"
+    request_scratch.mkdir()
+
+    with control_plane_snapshot(
+        duckdb_path, include_wal=True, scratch_root=request_scratch
+    ) as snapshot:
+        assert snapshot is not None
+        assert snapshot.parent.parent == request_scratch
+
+
 def test_a_window_can_be_given_a_budget_instead_of_waiting(tmp_path):
     """Issue #181. A caller that must answer on a deadline needs a way out.
 

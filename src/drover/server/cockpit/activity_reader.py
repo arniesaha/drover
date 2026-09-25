@@ -45,7 +45,9 @@ def run(payload: dict) -> dict:
         settings_overrides={"threads": "1"},
     )
     try:
-        with attached_control_plane_snapshot(con, source, include_wal=True):
+        with attached_control_plane_snapshot(
+            con, source, include_wal=True, scratch_root=snapshot.parent
+        ):
             result = activity_analytics(
                 con,
                 AnalyticsFilters(**payload["filters"]),

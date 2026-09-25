@@ -909,7 +909,10 @@ def sql_path_literal(value: str | Path) -> str:
 
 @contextmanager
 def control_plane_snapshot(
-    duckdb_path: str | Path, *, include_wal: bool = False
+    duckdb_path: str | Path,
+    *,
+    include_wal: bool = False,
+    scratch_root: Path | None = None,
 ) -> Iterator[Path | None]:
     """Yield a private copy of the control-plane store, or None if it is absent.
 
@@ -936,6 +939,20 @@ def control_plane_snapshot(
     if not source.exists():
         log.debug("no control-plane store at %s; skipping snapshot", source)
         yield None
+        return
+    if scratch_root is not None:
+        # A one-shot child is killed on its query deadline. Put its control
+        # copy under the parent's request directory so that even SIGKILL
+        # cannot strand another snapshot on the data volume.
+        with tempfile.TemporaryDirectory(
+            prefix="drover-control-plane-", dir=scratch_root
+        ) as directory:
+            fresh = Path(directory) / source.name
+            if include_wal:
+                copy_duckdb_store_with_wal(source, fresh)
+            else:
+                copy_duckdb_store(source, fresh)
+            yield fresh
         return
     entry = _acquire_control_plane_snapshot(source, include_wal=include_wal)
     try:
@@ -1303,6 +1320,7 @@ def attached_control_plane_snapshot(
     duckdb_path: str | Path,
     *,
     include_wal: bool = False,
+    scratch_root: Path | None = None,
 ) -> Iterator[None]:
     """Let one analytical connection read control-plane tables, from a copy.
 
@@ -1335,7 +1353,9 @@ def attached_control_plane_snapshot(
         with _postgres_control_plane_snapshot(con, duckdb_path):
             yield
         return
-    with control_plane_snapshot(duckdb_path, include_wal=include_wal) as snapshot:
+    with control_plane_snapshot(
+        duckdb_path, include_wal=include_wal, scratch_root=scratch_root
+    ) as snapshot:
         if snapshot is None:
             yield
             return
