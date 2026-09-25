@@ -23,8 +23,11 @@ to silently strip isolation from a full-auto session: on the reference hub
 
 from __future__ import annotations
 
+import fcntl
 import logging
+import os
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +49,32 @@ class WorktreeIsolationUnavailable(RuntimeError):
     worktrees directory could not be created). Never raised for a directory
     that simply cannot host a worktree, which returns None instead.
     """
+
+
+def claim_worktrees_directory(worktrees_dir: Path) -> int:
+    """Hold exclusive ownership until the daemon closes the returned fd.
+
+    A second daemon must not sweep clean worktrees belonging to live sessions
+    in the first daemon. The lock file is never unlinked: a new inode would
+    let another daemon acquire an independent lock for the same directory.
+    """
+    try:
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            worktrees_dir / ".drover-owner.lock", os.O_CREAT | os.O_RDWR, 0o600
+        )
+    except OSError as exc:
+        raise WorktreeIsolationUnavailable(
+            f"cannot claim worktrees directory {worktrees_dir}: {exc}"
+        ) from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise WorktreeIsolationUnavailable(
+            f"worktrees directory is already in use: {worktrees_dir}"
+        ) from exc
+    return fd
 
 
 @dataclass(frozen=True)
@@ -116,16 +145,107 @@ def create_session_worktree(
         raise WorktreeIsolationUnavailable(
             f"cannot create worktrees dir {worktrees_dir}: {exc}"
         ) from exc
-    _git(
-        repo_root,
-        "worktree",
-        "add",
-        str(path),
-        "-b",
-        branch,
-        required=True,
-        timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
+    # A repeated session id can name a real, dirty worktree. Reserve the
+    # branch separately: `git branch` fails atomically if another session
+    # already owns it, and a later add failure then cannot claim that branch.
+    if os.path.lexists(path):
+        raise WorktreeIsolationUnavailable(
+            f"session worktree path already exists: {path}"
+        )
+    _git(repo_root, "branch", branch, base_sha, required=True)
+    try:
+        _git(
+            repo_root,
+            "worktree",
+            "add",
+            str(path),
+            branch,
+            required=True,
+            timeout=_WORKTREE_ADD_TIMEOUT_SECONDS,
+        )
+    except WorktreeIsolationUnavailable:
+        # Never remove the path here: a concurrent creator could have put
+        # files in it after our absence check, including ignored-only files.
+        # The branch was reserved by this invocation. If no path exists and it
+        # still points to our base, Git may safely delete it; otherwise leave
+        # the partial worktree for the later, conservative startup sweep.
+        _git(repo_root, "worktree", "prune")
+        if (
+            not os.path.lexists(path)
+            and _git(repo_root, "rev-parse", branch) == base_sha
+        ):
+            _git(repo_root, "branch", "-d", branch)
+        raise
+    return SessionWorktree(
+        repo_root=repo_root,
+        path=str(path),
+        branch=branch,
+        base_sha=base_sha,
     )
+
+
+def reclaim_stale_session_worktrees(
+    worktrees_dir: Path, *, candidates: Iterable[Path] | None = None
+) -> dict[str, int]:
+    """Reclaim session worktrees left behind by a previous daemon run.
+
+    The daemon tracks live session worktrees in an in-memory map that a restart
+    drops, so a clean worktree created before a crash/restart would otherwise
+    sit on disk forever (#398). Each directory under ``worktrees_dir`` is
+    reconstructed into a ``SessionWorktree`` and put through the same
+    keep-if-there-is-work policy as session-end cleanup.
+
+    Returns counts keyed by the cleanup outcome (``removed``/``kept``/
+    ``missing``/``orphaned``), plus ``skipped`` for entries that are not a
+    drover session worktree.
+    """
+    counts: dict[str, int] = {
+        "removed": 0,
+        "kept": 0,
+        "missing": 0,
+        "orphaned": 0,
+        "skipped": 0,
+    }
+    worktrees_dir = Path(worktrees_dir)
+    if not worktrees_dir.is_dir():
+        return counts
+    for entry in sorted(
+        candidates if candidates is not None else worktrees_dir.iterdir()
+    ):
+        if not entry.is_dir():
+            continue
+        wt = _reconstruct_worktree(entry)
+        if wt is None:
+            counts["skipped"] += 1
+            continue
+        counts[cleanup_session_worktree(wt)] += 1
+    return counts
+
+
+def _reconstruct_worktree(path: Path) -> SessionWorktree | None:
+    """Rebuild a ``SessionWorktree`` from its directory alone.
+
+    Returns None when the directory is not a drover session worktree (no git
+    metadata, a detached HEAD, or a non-``drover/`` branch), which the sweep
+    skips rather than guessing at. ``repo_root`` is the shared checkout's top
+    level, recovered through the common git dir so ``worktree remove`` and
+    ``update-ref`` run from a worktree git will not refuse to act on.
+    """
+    common_dir = _git(
+        str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    if common_dir is None:
+        return None
+    repo_root = str(Path(common_dir).resolve().parent)
+    branch = _git(str(path), "rev-parse", "--abbrev-ref", "HEAD")
+    if branch is None or branch == "HEAD" or not branch.startswith("drover/"):
+        return None
+    # The fork point is where the session branch left the main branch, which is
+    # what create_session_worktree captured as base_sha. merge-base stays put as
+    # the main branch advances after the worktree was created.
+    base_sha = _git(repo_root, "merge-base", branch, "HEAD")
+    if base_sha is None:
+        return None
     return SessionWorktree(
         repo_root=repo_root,
         path=str(path),
@@ -141,12 +261,19 @@ def cleanup_session_worktree(wt: SessionWorktree) -> str:
     commits past base) and both it and its branch were deleted;
     ``"kept"`` when there is uncommitted or committed session work to
     preserve; ``"missing"`` when the worktree directory no longer exists
-    (its stale registration is pruned so the path can be reused).
+    (its stale registration is pruned so the path can be reused);
+    ``"orphaned"`` when the worktree was removed but its branch changed or
+    could not be deleted safely.
     """
     if not Path(wt.path).is_dir():
         _git(wt.repo_root, "worktree", "prune")
         return "missing"
-    status = _git(wt.path, "status", "--porcelain")
+    # Git's worktree removal deletes ignored files too. They can contain the
+    # only copy of session output, so a normal porcelain status is not enough
+    # evidence that this directory is disposable.
+    status = _git(
+        wt.path, "status", "--porcelain", "--ignored", "--untracked-files=all"
+    )
     if status is None or status != "":
         return "kept"
     head = _git(wt.path, "rev-parse", "HEAD")
@@ -154,5 +281,17 @@ def cleanup_session_worktree(wt: SessionWorktree) -> str:
         return "kept"
     if _git(wt.repo_root, "worktree", "remove", wt.path) is None:
         return "kept"
-    _git(wt.repo_root, "branch", "-D", wt.branch)
+    # Compare-and-delete the exact original ref. `branch -D` could discard a
+    # concurrent commit; `branch -d` depends on the primary checkout's HEAD.
+    if (
+        _git(
+            wt.repo_root,
+            "update-ref",
+            "-d",
+            f"refs/heads/{wt.branch}",
+            wt.base_sha,
+        )
+        is None
+    ):
+        return "orphaned"
     return "removed"
