@@ -128,7 +128,7 @@ jobs:
           -destination "$SIMULATOR_DESTINATION" \
           -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
           test
-    - name: Run deterministic UI journey
+    - name: Run deterministic and accessibility UI journeys
       working-directory: apps/drover
       run: |
         set -o pipefail
@@ -137,6 +137,7 @@ jobs:
           -destination "$SIMULATOR_DESTINATION" \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
           -only-testing:DroverUITests/InsightDetailFixtureUITests \
+          -only-testing:DroverUITests/AccessibilityJourneyUITests \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test
     - name: Snapshot runner keychain search list
