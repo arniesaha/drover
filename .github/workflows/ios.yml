@@ -89,10 +89,7 @@ jobs:
           -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
           test
 
-    # AccessibilityJourneyUITests is deliberately not listed: it has never
-    # passed a full run, on CI or locally, and gating every iOS PR on it
-    # would make a red build carry no information. See the follow-up issue.
-    - name: Run deterministic UI journey
+    - name: Run deterministic and accessibility UI journeys
       if: steps.scope.outputs.ios == 'true'
       run: |
         set -o pipefail
@@ -101,6 +98,7 @@ jobs:
           -destination "$SIMULATOR_DESTINATION" \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
           -only-testing:DroverUITests/InsightDetailFixtureUITests \
+          -only-testing:DroverUITests/AccessibilityJourneyUITests \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test
 

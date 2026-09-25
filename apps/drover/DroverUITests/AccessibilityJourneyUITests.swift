@@ -85,16 +85,24 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let session = app.buttons["fixture-session"]
         XCTAssertTrue(session.waitForExistence(timeout: timeout))
 
-        // XXXL can place this particular fixture row just above the viewport.
-        // Walk the real fleet list back toward its start, with a fixed bound,
-        // then retain the reachability assertion below.
-        let fleet = app.scrollViews.firstMatch
+        // The pinned status header also contains a scroll view. At XXXL the
+        // session row can be partly below the fleet viewport, where XCTest
+        // still calls it hittable but a center tap targets the next row.
+        let fleet = app.scrollViews["fleet-list"]
         XCTAssertTrue(fleet.exists, "the fleet list should remain scrollable at XXXL")
-        for _ in 0..<2 where !session.isHittable {
-            fleet.swipeDown()
+        for _ in 0..<3 where !fleet.frame.contains(session.frame) {
+            fleet.swipeUp()
         }
+        XCTAssertTrue(fleet.frame.contains(session.frame), "the session should fit inside the fleet viewport")
         XCTAssertTrue(session.isHittable, "the fleet session should remain reachable at XXXL")
         session.tap()
+
+        let recap = app.staticTexts["chat-recap-title"]
+        let primarySessionLoaded = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "Fixture core journey"),
+            object: recap
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [primarySessionLoaded], timeout: timeout), .completed)
 
         let composer = app.textFields["composer-input"]
         XCTAssertTrue(composer.waitForExistence(timeout: timeout))
