@@ -8,7 +8,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from click.testing import CliRunner
 
+from drover.server.__main__ import main
 from drover.server.compact import compact_partition, compact_table
 
 
@@ -229,3 +231,27 @@ def test_global_dedup_override_refuses_snapshot_loss_before_any_rewrite(
 
     assert len(list(events.glob("*.parquet"))) == 2
     assert len(list(snapshots.glob("*.parquet"))) == 2
+
+
+def test_cli_refuses_unsafe_override_before_bootstrap(tmp_path, monkeypatch):
+    snapshots = tmp_path / "provider_usage_snapshots" / "date=2026-09-20"
+    snapshots.mkdir(parents=True)
+    _write_parquet(snapshots / "part-a.parquet", ["same-source"])
+    _write_parquet(snapshots / "part-b.parquet", ["same-source"])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f'[paths]\nparquet_dir = "{tmp_path}"\n'
+        f'duckdb_path = "{tmp_path / "drover.duckdb"}"\n'
+    )
+    import drover.server.__main__ as cli
+
+    bootstraps = []
+    monkeypatch.setattr(cli, "bootstrap", lambda **kwargs: bootstraps.append(kwargs))
+
+    result = CliRunner().invoke(
+        main, ["--config", str(cfg), "compact", "--dedup-column", "dedup_key"]
+    )
+
+    assert result.exit_code != 0
+    assert "provider_usage_snapshots" in result.output
+    assert bootstraps == []
