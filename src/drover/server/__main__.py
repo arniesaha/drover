@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 import drover
 from drover.agent_aliases import canonicalize
 from drover.config import (
+    ACTIVATION_IN_PLACE,
     AdvisoryContentConfig,
     DroverConfig,
     config_home,
@@ -1703,13 +1704,15 @@ def _start_update_checker(planner, cfg: DroverConfig, stop) -> None:
 
 @main.command(name="rollback")
 @click.option("--to", "target", default=None, help="Version to activate")
-def rollback_cmd(target: str | None) -> None:
+@click.pass_context
+def rollback_cmd(ctx: click.Context, target: str | None) -> None:
     """Point the runtime symlink at an earlier installed version.
 
     The watchdog already handles a version that cannot come up at all. This is
     for the other case: it starts, registers, and is still wrong.
     """
-    layout = RuntimeLayout(config_home())
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    layout = RuntimeLayout(config_home(), root=cfg.update_runtime_root)
     installed = layout.installed_versions()
     active = layout.active_version()
 
@@ -1728,6 +1731,22 @@ def rollback_cmd(target: str | None) -> None:
     else:
         target = target.lstrip("v")
 
+    if cfg.update_activation == ACTIVATION_IN_PLACE:
+        from drover.server.harness.updater import resolve_activation
+        from drover.server.updates import install_cached_into_venv
+
+        activation, in_place_venv = resolve_activation(cfg)
+        if activation != ACTIVATION_IN_PLACE:
+            raise click.ClickException("in-place rollback needs update.in_place_venv")
+        # The symlink only records the version on this host. Restore the wheel
+        # into the executable venv before changing that record.
+        layout.write_marker(active or "", target)
+        if not install_cached_into_venv(layout, target, in_place_venv):
+            raise click.ClickException(
+                f"could not install {target} into {in_place_venv}; "
+                "the runtime record was not changed"
+            )
+
     layout.flip(target)
     # Otherwise the next start sees a marker for a flip we just undid and
     # rolls back again on top of this.
@@ -1742,7 +1761,7 @@ def rollback_cmd(target: str | None) -> None:
 def update_cmd(ctx: click.Context, check: bool) -> None:
     """Report what version this fleet is converging on."""
     cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
-    layout = RuntimeLayout(config_home())
+    layout = RuntimeLayout(config_home(), root=cfg.update_runtime_root)
     planner = UpdatePlanner(cfg, layout)
     planner.refresh()
     target = planner.target()
@@ -2777,7 +2796,9 @@ def _run_api_role(
         archive_resolver_factory=boundary.page_resolver,
     )
     if cfg.update_enabled:
-        planner = UpdatePlanner(cfg, RuntimeLayout(config_home()))
+        planner = UpdatePlanner(
+            cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
+        )
         collector.update_planner = planner
         _start_update_checker(planner, cfg, stop)
     pairing = PairingCodes()
@@ -3301,7 +3322,9 @@ def run(
             # collector rather than threaded through, because the only thing
             # that reads it is the registration response.
             if cfg.update_enabled:
-                planner = UpdatePlanner(cfg, RuntimeLayout(config_home()))
+                planner = UpdatePlanner(
+                    cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
+                )
                 metrics_collector.update_planner = planner
                 _start_update_checker(planner, cfg, stop)
 

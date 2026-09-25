@@ -33,6 +33,13 @@ log = logging.getLogger("drover.runtime")
 MARKER_FILENAME = "pending_verification.json"
 SMOKE_TIMEOUT_SECONDS = 30
 
+
+def _smoke_excerpt(output: str | bytes | None) -> str:
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    return " | ".join((output or "").strip().splitlines()[:4])[:2048] or "no output"
+
+
 # Where a version keeps the artifacts it was built from. Inside the version
 # tree on purpose: `prune` already drops whole version directories, so the
 # cache inherits that lifetime rather than needing one of its own to get wrong.
@@ -71,14 +78,15 @@ def compare_versions(left: str, right: str) -> int:
 
 
 class RuntimeLayout:
-    """Reads and mutates ``<home>/runtime``. Never touches state beside it."""
+    """Reads and mutates a runtime root, defaulting to ``<home>/runtime``."""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, *, root: Path | None = None) -> None:
         self._home = Path(home)
+        self._root = Path(root) if root is not None else self._home / "runtime"
 
     @property
     def root(self) -> Path:
-        return self._home / "runtime"
+        return self._root
 
     @property
     def current(self) -> Path:
@@ -172,19 +180,42 @@ class RuntimeLayout:
     def smoke_test(self, version: str) -> bool:
         """A version that cannot state its own version never gets the symlink."""
         binary = self.executable("drover-server", version)
-        if not binary.exists():
+        try:
+            binary.stat()
+        except FileNotFoundError:
+            log.warning("smoke test executable is missing: %s", binary)
+            return False
+        except OSError as exc:
+            log.warning("smoke test cannot access %s: %s", binary, exc)
             return False
         try:
             result = subprocess.run(
                 [str(binary), "--version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                errors="replace",
                 timeout=SMOKE_TIMEOUT_SECONDS,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired as exc:
+            log.warning(
+                "smoke test timed out for %s: %s",
+                binary,
+                _smoke_excerpt(exc.stderr or exc.stdout),
+            )
             return False
-        return result.returncode == 0
+        except OSError as exc:
+            log.warning("smoke test could not run %s: %s", binary, exc)
+            return False
+        if result.returncode != 0:
+            log.warning(
+                "smoke test failed for %s (exit %s): %s",
+                binary,
+                result.returncode,
+                _smoke_excerpt(result.stderr or result.stdout),
+            )
+            return False
+        return True
 
     def prune(self, keep: int) -> list[str]:
         """Drop old versions, never the active one however old it is."""

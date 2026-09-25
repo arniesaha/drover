@@ -4013,7 +4013,7 @@ def run_harnessd(
     if cfg is not None and cfg.update_enabled:
         # Constructed here rather than passed into the state, because it takes
         # the state itself to ask whether this host is idle.
-        layout = RuntimeLayout(config_home())
+        layout = RuntimeLayout(config_home(), root=cfg.update_runtime_root)
         state.updater = HostUpdater(state, layout, cfg)
         # Resolved once, here, so the watchdog and the updater cannot disagree
         # about how this host activates.

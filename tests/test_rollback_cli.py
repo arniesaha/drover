@@ -44,6 +44,60 @@ def test_rollback_to_an_explicit_version(tmp_path, monkeypatch):
     assert layout.active_version() == "0.1.1"
 
 
+def test_rollback_uses_configured_in_place_runtime_root(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "boot-runtime"
+    layout = RuntimeLayout(tmp_path / ".drover", root=runtime_root)
+    for version in ("0.1.3", "0.1.4"):
+        _installed(layout, version)
+    layout.flip("0.1.4")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'[update]\nactivation = "in_place"\nin_place_venv = "{tmp_path / "venv"}"\n'
+        f'runtime_root = "{runtime_root}"\n',
+        encoding="utf-8",
+    )
+    from drover.server import updates
+
+    installs = []
+
+    def install(current_layout, version, venv):
+        installs.append((current_layout.root, version, venv))
+        return True
+
+    monkeypatch.setattr(updates, "install_cached_into_venv", install)
+
+    result = CliRunner().invoke(main, ["--config", str(config), "rollback"])
+
+    assert result.exit_code == 0, result.output
+    assert layout.active_version() == "0.1.3"
+    assert installs == [(runtime_root, "0.1.3", str(tmp_path / "venv"))]
+
+
+def test_in_place_rollback_refuses_to_flip_when_restore_fails(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "boot-runtime"
+    layout = RuntimeLayout(tmp_path / ".drover", root=runtime_root)
+    for version in ("0.1.3", "0.1.4"):
+        _installed(layout, version)
+    layout.flip("0.1.4")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'[update]\nactivation = "in_place"\nin_place_venv = "{tmp_path / "venv"}"\n'
+        f'runtime_root = "{runtime_root}"\n',
+        encoding="utf-8",
+    )
+    from drover.server import updates
+
+    monkeypatch.setattr(updates, "install_cached_into_venv", lambda *args: False)
+
+    result = CliRunner().invoke(main, ["--config", str(config), "rollback"])
+
+    assert result.exit_code != 0
+    assert "could not install" in result.output
+    assert layout.active_version() == "0.1.4"
+
+
 def test_rollback_refuses_an_uninstalled_version(tmp_path, monkeypatch):
     layout = RuntimeLayout(tmp_path / ".drover")
     _installed(layout, "0.1.4")

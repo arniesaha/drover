@@ -432,6 +432,9 @@ class DroverConfig:
     # guessing one is how the wrong environment gets overwritten.
     update_activation: str
     update_in_place_venv: str
+    # Staging location for in-place updates. Hosts whose config home is on an
+    # external volume can use a boot-volume directory launchd can execute.
+    update_runtime_root: Path | None
     # Other service units that exec the same venv as this daemon. In-place
     # activation rewrites that venv underneath them, so they are restarted
     # before this process restarts itself. Empty means "nothing else shares
@@ -584,6 +587,7 @@ _DEFAULTS = {
         "repo": "arniesaha/drover",
         "activation": ACTIVATION_SYMLINK,
         "in_place_venv": "",
+        "runtime_root": "",
         "restart_units": [],
         "registration_deadline_seconds": 90.0,
     },
@@ -718,6 +722,18 @@ def _from_dict(d: dict) -> DroverConfig:
             "provider.freshness_threshold_seconds must be a finite positive number"
         )
     provider_freshness_threshold_seconds = float(provider_freshness_threshold)
+    update_activation = _activation_mode(d["update"]["activation"])
+    runtime_root_raw = str(d["update"]["runtime_root"]).strip()
+    update_runtime_root = (
+        Path(runtime_root_raw).expanduser() if runtime_root_raw else None
+    )
+    if update_runtime_root is not None:
+        if not update_runtime_root.is_absolute():
+            raise ValueError("update.runtime_root must be an absolute path")
+        if update_activation != ACTIVATION_IN_PLACE:
+            raise ValueError("update.runtime_root requires update.activation=in_place")
+        if not str(d["update"]["in_place_venv"]).strip():
+            raise ValueError("update.runtime_root requires update.in_place_venv")
     return DroverConfig(
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
@@ -800,8 +816,9 @@ def _from_dict(d: dict) -> DroverConfig:
         update_quiesce_timeout_hours=int(d["update"]["quiesce_timeout_hours"]),
         update_keep_versions=int(d["update"]["keep_versions"]),
         update_repo=str(d["update"]["repo"]),
-        update_activation=_activation_mode(d["update"]["activation"]),
+        update_activation=update_activation,
         update_in_place_venv=str(d["update"]["in_place_venv"]).strip(),
+        update_runtime_root=update_runtime_root,
         update_restart_units=_restart_units(d["update"]["restart_units"]),
         update_registration_deadline_seconds=_registration_deadline(
             d["update"]["registration_deadline_seconds"]

@@ -385,6 +385,22 @@ class HostUpdater:
             target = self._pending
         if target is None:
             return False
+        if (
+            self._cfg.update_runtime_root is not None
+            and self._activation == ACTIVATION_IN_PLACE
+            and Path(sys.prefix).resolve() != Path(self._in_place_venv).resolve()
+        ):
+            # Installer-generated units may still exec runtime/current while
+            # the updater is configured to rewrite a different, fixed venv.
+            # Flipping the custom-root record in that state would falsely
+            # report a deployed version after restart.
+            log.error(
+                "runtime_root requires harnessd to run from %s; current prefix is %s",
+                self._in_place_venv,
+                sys.prefix,
+            )
+            self._record_refusal(target, "runtime_venv_mismatch")
+            return False
         if not self._layout.smoke_test(target):
             # The installer may have reported success; this is the last gate
             # before the symlink moves.

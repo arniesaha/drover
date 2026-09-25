@@ -8,6 +8,7 @@ so these tests pin the properties that make it so.
 from __future__ import annotations
 
 import os
+import subprocess
 
 import pytest
 
@@ -48,6 +49,14 @@ def test_flip_points_current_at_a_version(tmp_path):
     assert layout.current.is_symlink()
 
 
+def test_runtime_root_can_live_beside_the_in_place_venv(tmp_path):
+    layout = RuntimeLayout(tmp_path / "external-config", root=tmp_path / "boot-runtime")
+    _install(layout, "0.1.4")
+
+    assert layout.root == tmp_path / "boot-runtime"
+    assert layout.smoke_test("0.1.4") is True
+
+
 def test_flip_replaces_an_existing_symlink(tmp_path):
     layout = RuntimeLayout(tmp_path)
     _install(layout, "0.1.3")
@@ -86,6 +95,57 @@ def test_smoke_test_fails_for_a_broken_version(tmp_path):
     layout = RuntimeLayout(tmp_path)
     _install(layout, "0.1.4", exit_code=1)
     assert layout.smoke_test("0.1.4") is False
+
+
+def test_smoke_test_logs_staged_interpreter_error(tmp_path, caplog):
+    layout = RuntimeLayout(tmp_path)
+    binary = layout.version_dir("0.1.4") / "bin" / "drover-server"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/bin/sh\necho 'PermissionError: pyvenv.cfg' >&2\nexit 1\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    with caplog.at_level("WARNING"):
+        assert layout.smoke_test("0.1.4") is False
+
+    assert "PermissionError: pyvenv.cfg" in caplog.text
+
+
+def test_smoke_test_reports_inaccessible_staged_executable(
+    tmp_path, monkeypatch, caplog
+):
+    layout = RuntimeLayout(tmp_path)
+    binary = layout.executable("drover-server", "0.1.4")
+    real_stat = type(binary).stat
+
+    def inaccessible(path, *args, **kwargs):
+        if path == binary:
+            raise PermissionError(1, "Operation not permitted", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(binary), "stat", inaccessible)
+
+    with caplog.at_level("WARNING"):
+        assert layout.smoke_test("0.1.4") is False
+
+    assert "Operation not permitted" in caplog.text
+
+
+def test_smoke_test_logs_output_before_timeout(tmp_path, monkeypatch, caplog):
+    layout = RuntimeLayout(tmp_path)
+    _install(layout, "0.1.4")
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 30, stderr=b"staged venv denied\n")
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    with caplog.at_level("WARNING"):
+        assert layout.smoke_test("0.1.4") is False
+
+    assert "staged venv denied" in caplog.text
 
 
 def test_smoke_test_fails_for_a_missing_version(tmp_path):
