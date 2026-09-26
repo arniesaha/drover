@@ -3099,13 +3099,14 @@ def run(
             analyzer_ids=(item.analyzer_id for item in advisory_analyzers),
             full_review_interval_seconds=cfg.advisory_full_review_interval_seconds,
             source_version_factory=lambda analyzer_id, target_id: operational_snapshot_source_version(
-                cfg.duckdb_path, analyzer_id, target_id
+                cfg.duckdb_path, analyzer_id, target_id, isolated_snapshots=True
             ),
         )
         advisory_worker = AdvisoryWorker(
             duckdb_path=cfg.duckdb_path,
             maintenance_gate=analytics_gate,
             repository=AdvisoryRepository(cfg.duckdb_path),
+            isolated_snapshots=True,
             snapshot_factory=lambda analyzer_id, target_id, source_version: load_operational_snapshot(
                 cfg.duckdb_path, analyzer_id, target_id, source_version
             ),
@@ -3283,6 +3284,7 @@ def run(
                     cfg.duckdb_path,
                     config_path=config_path,
                     central_consent=central_consent,
+                    isolated_snapshots=True,
                 ),
                 content_consent_propagator=(
                     (
@@ -3411,6 +3413,7 @@ def run(
                     cfg.duckdb_path,
                     config_path=config_path,
                     central_consent=central_consent,
+                    isolated_snapshots=True,
                 ),
                 content_consent_propagator=(
                     (
