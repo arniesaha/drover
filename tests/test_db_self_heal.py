@@ -17,9 +17,12 @@ import duckdb
 import pytest
 
 from drover.server.db import (
+    close_analytical_connections,
     is_invalidated_error,
     open_duckdb_connection,
+    pin_analytical_connection,
     reset_invalidated_instance,
+    supports_atomic_duckdb_clone,
 )
 
 _MESSAGE = (
@@ -99,6 +102,55 @@ def test_open_heals_an_invalidated_instance(tmp_path: Path, monkeypatch) -> None
     finally:
         healed.close()
     assert poisoned, "the poisoned connection was never opened"
+
+
+def test_open_restores_analytical_pin_after_invalidation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    probe = tmp_path / "clone-probe"
+    probe.write_bytes(b"probe")
+    if not supports_atomic_duckdb_clone(probe):
+        pytest.skip("atomic database/WAL cloning requires APFS")
+    db = tmp_path / "store.duckdb"
+    monkeypatch.setenv("DROVER_ANALYTICAL_PIN", "1")
+    assert pin_analytical_connection(db)
+    real_connect = duckdb.connect
+    poisoned = False
+
+    class Poisoned:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, *args, **kwargs):
+            raise duckdb.FatalException(_MESSAGE)
+
+        def close(self):
+            self.inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    def connect(path, *args, **kwargs):
+        nonlocal poisoned
+        inner = real_connect(path, *args, **kwargs)
+        if not poisoned:
+            poisoned = True
+            return Poisoned(inner)
+        return inner
+
+    monkeypatch.setattr(duckdb, "connect", connect)
+    try:
+        healed = open_duckdb_connection(db)
+        healed.close()
+        assert poisoned
+        writer = open_duckdb_connection(db)
+        try:
+            writer.execute("CREATE TABLE pin_recovery (id INTEGER)")
+        finally:
+            writer.close()
+        assert Path(str(db) + ".wal").exists()
+    finally:
+        close_analytical_connections()
 
 
 def test_open_does_not_reset_on_an_ordinary_error(tmp_path: Path, monkeypatch) -> None:

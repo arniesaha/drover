@@ -120,10 +120,12 @@ from drover.server.control_outbox import LocalVerifiedArchiveResolver, published
 from drover.server.control_store import configure_control_store
 from drover.server.db import (
     CONTROL_PLANE_TABLES,
+    close_analytical_connections,
     close_control_plane_connections,
     control_plane_connection,
     control_plane_path,
     open_duckdb_connection,
+    pin_analytical_connection,
     pin_control_plane_connection,
     sweep_orphaned_snapshot_scratch,
 )
@@ -2990,6 +2992,7 @@ def run(
     # external SSD that blocked all-role startup for >10 minutes before MCP or
     # OTLP could bind. The analytical views are finalized after the network
     # surfaces are listening.
+    pin_analytical_connection(cfg.duckdb_path)
     bootstrap(
         parquet_dir=cfg.parquet_dir,
         duckdb_path=cfg.duckdb_path,
@@ -3639,6 +3642,7 @@ def run(
         if receiver is not None:
             receiver.stop()
         watcher.stop()
+        close_analytical_connections()
         # Last, so nothing is still reading through it. A pin outlives every
         # worker by design, and a restart would otherwise race the database
         # lock against its own predecessor.

@@ -4911,6 +4911,46 @@ def test_quality_snapshot_includes_committed_rows_still_in_the_wal(
         writer.close()
 
 
+def test_pinned_audit_reads_wal_without_checkpoint(tmp_path, monkeypatch):
+    from drover.server import db as db_module
+
+    collector = _make_collector(tmp_path)
+    source = Path(collector.duckdb_path)
+    if not db_module.supports_atomic_duckdb_clone(source):
+        pytest.skip("atomic database/WAL cloning requires APFS")
+    monkeypatch.setenv("DROVER_ANALYTICAL_PIN", "1")
+    assert db_module.pin_analytical_connection(source)
+    try:
+        writer = db_module.open_duckdb_connection(source)
+        try:
+            writer.execute("CREATE TABLE audit_wal_probe (value VARCHAR)")
+            writer.execute("INSERT INTO audit_wal_probe VALUES ('committed')")
+        finally:
+            writer.close()
+
+        def fail_checkpoint(_source):
+            pytest.fail("pinned audit must not checkpoint the live store")
+
+        def read_copy(*, duckdb_path, **kwargs):
+            con = duckdb.connect(str(duckdb_path))
+            try:
+                value = con.execute("SELECT value FROM audit_wal_probe").fetchone()[0]
+            finally:
+                con.close()
+            return {"runtime_audit": {}, "wal_probe": value}
+
+        monkeypatch.setattr(db_module, "_checkpoint_before_snapshot", fail_checkpoint)
+        monkeypatch.setattr(metrics, "quality_snapshot", read_copy)
+        monkeypatch.setattr(
+            metrics, "pipeline_observatory_snapshot", lambda **_: {"ok": True}
+        )
+        quality, observatory = collector._build_audit_payload()
+        assert quality["wal_probe"] == "committed"
+        assert observatory == {"ok": True}
+    finally:
+        db_module.close_analytical_connections()
+
+
 def test_observatory_snapshot_includes_committed_rows_still_in_the_wal(
     tmp_path, monkeypatch
 ):

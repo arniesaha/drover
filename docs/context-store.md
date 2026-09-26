@@ -99,6 +99,17 @@ work, and export. It forwards only allowlisted analytical requests through an
 authenticated loopback boundary. A worker failure leaves fleet requests
 available and reports analytical data as unavailable where necessary.
 
+On a hub where the server is the sole process opening the analytical DuckDB
+file, `DROVER_ANALYTICAL_PIN=1` keeps one connection open across worker write
+windows. This avoids a full shutdown checkpoint after each small write to a
+large database. The pin holds DuckDB's writable file lock, so other processes
+must inspect a private copy rather than open the live file. Pinned audit
+snapshots include the WAL without checkpointing the live file; pinning is
+declined on volumes without atomic cloning support (currently APFS). DuckDB
+may still checkpoint when its WAL reaches the configured threshold (16 MiB by
+default), and the server checkpoints on a graceful shutdown. Leave the flag
+unset when another process needs direct access to that file.
+
 Central harness events have two storage forms:
 
 | Form | Owner and purpose |

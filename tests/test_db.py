@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -187,6 +188,86 @@ def test_diagnostic_open_coexists_with_live_worker_connection(tmp_path):
             diagnostic.close()
     finally:
         worker.close()
+
+
+def test_analytical_pin_defers_checkpoint_until_shutdown(tmp_path, monkeypatch):
+    """Short write windows must not restart and checkpoint a large instance."""
+    probe = tmp_path / "clone-probe"
+    probe.write_bytes(b"probe")
+    if not db_module.supports_atomic_duckdb_clone(probe):
+        pytest.skip("atomic database/WAL cloning requires APFS")
+    monkeypatch.setenv("DROVER_ANALYTICAL_PIN", "1")
+    source = tmp_path / "analytical.duckdb"
+    wal = source.with_name(source.name + ".wal")
+
+    assert db_module.pin_analytical_connection(source) is True
+    try:
+        writer = open_duckdb_connection(source, role="worker")
+        try:
+            writer.execute("CREATE TABLE pin_probe (id INTEGER)")
+            writer.execute("INSERT INTO pin_probe VALUES (7)")
+        finally:
+            writer.close()
+        assert wal.exists()
+
+        reader = open_duckdb_connection(source, read_only=True, role="diagnostic")
+        try:
+            assert reader.execute("SELECT id FROM pin_probe").fetchall() == [(7,)]
+        finally:
+            reader.close()
+        assert wal.exists()
+        assert db_module.pin_analytical_connection(source) is True
+    finally:
+        db_module.close_analytical_connections()
+
+    assert not wal.exists()
+    reader = duckdb.connect(str(source), read_only=True)
+    try:
+        assert reader.execute("SELECT id FROM pin_probe").fetchall() == [(7,)]
+    finally:
+        reader.close()
+
+
+def test_analytical_pin_is_opt_in_and_can_recover_after_invalidation(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "analytical.duckdb"
+    wal = source.with_name(source.name + ".wal")
+    monkeypatch.delenv("DROVER_ANALYTICAL_PIN", raising=False)
+    assert db_module.pin_analytical_connection(source) is False
+    assert not source.exists()
+
+    probe = tmp_path / "clone-probe"
+    probe.write_bytes(b"probe")
+    if not db_module.supports_atomic_duckdb_clone(probe):
+        pytest.skip("atomic database/WAL cloning requires APFS")
+    monkeypatch.setenv("DROVER_ANALYTICAL_PIN", "1")
+    assert db_module.pin_analytical_connection(source) is True
+    assert db_module.reset_invalidated_instance(source) >= 1
+    assert db_module.pin_analytical_connection(source) is True
+    try:
+        writer = open_duckdb_connection(source, role="worker")
+        try:
+            writer.execute("CREATE TABLE pin_probe (id INTEGER)")
+        finally:
+            writer.close()
+        assert wal.exists()
+    finally:
+        db_module.close_analytical_connections()
+    assert not wal.exists()
+
+
+def test_analytical_pin_declines_without_atomic_cloning(tmp_path, monkeypatch):
+    monkeypatch.setenv("DROVER_ANALYTICAL_PIN", "1")
+    monkeypatch.setattr(db_module, "supports_atomic_duckdb_clone", lambda _: False)
+    source = tmp_path / "analytical.duckdb"
+    assert db_module.pin_analytical_connection(source) is False
+    writer = open_duckdb_connection(source)
+    try:
+        writer.execute("CREATE TABLE pin_probe (id INTEGER)")
+    finally:
+        writer.close()
+    assert not Path(str(source) + ".wal").exists()
 
 
 def test_concurrent_role_opens_do_not_conflict(tmp_path):

@@ -317,6 +317,8 @@ class ControlPlaneBusy(RuntimeError):
 #: alive long after their owner finished with them.
 _LIVE_CONNECTIONS: dict[str, "weakref.WeakSet[duckdb.DuckDBPyConnection]"] = {}
 _LIVE_GUARD = threading.Lock()
+_ANALYTICAL_PINNED: dict[str, duckdb.DuckDBPyConnection] = {}
+_ANALYTICAL_PIN_GUARD = threading.Lock()
 
 #: Empty sets are swept once the table grows past this. The sets empty
 #: themselves, but their *keys* would not: every metrics refresh opens a
@@ -464,6 +466,71 @@ def duckdb_connect_lock(duckdb_path: str | Path) -> threading.Lock:
         if lock is None:
             lock = _CONNECT_LOCKS[key] = threading.Lock()
         return lock
+
+
+def pin_analytical_connection(duckdb_path: str | Path) -> bool:
+    """Keep the analytical instance open across short worker write windows.
+
+    The last writable connection closing checkpoints DuckDB's WAL. On the
+    production sized analytical store, even a tiny metadata write followed by
+    that close leaves hundreds of MiB in the server process (#364). This pin
+    defers that shutdown checkpoint until service shutdown; DuckDB can still
+    checkpoint automatically when the WAL grows.
+
+    Opt in because a pinned writable connection holds the file lock against
+    other processes. The hub must own this analytical file exclusively. The
+    control-plane store and harnessd are unaffected.
+    """
+    if os.environ.get("DROVER_ANALYTICAL_PIN", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return False
+    path = Path(duckdb_path)
+    key = _path_key(path)
+    with _ANALYTICAL_PIN_GUARD:
+        if key in _ANALYTICAL_PINNED:
+            return True
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        con, _ = _connect_and_probe(path, role="worker", settings_overrides=None)
+        remember_live_connection(path, con)
+    except (duckdb.Error, OSError) as exc:
+        log.warning("could not pin analytical store %s: %s", path, exc)
+        return False
+    try:
+        clone_supported = supports_atomic_duckdb_clone(path)
+    except OSError as exc:
+        log.warning("could not check analytical clone support for %s: %s", path, exc)
+        clone_supported = False
+    if not clone_supported:
+        con.close()
+        log.warning(
+            "analytical store %s not pinned: atomic database/WAL cloning "
+            "is unavailable on this volume",
+            path,
+        )
+        return False
+    with _ANALYTICAL_PIN_GUARD:
+        if key in _ANALYTICAL_PINNED:
+            con.close()
+        else:
+            _ANALYTICAL_PINNED[key] = con
+    log.info("analytical store pinned for process lifetime: %s", path)
+    return True
+
+
+def close_analytical_connections() -> None:
+    """Release analytical pins after all workers have stopped."""
+    with _ANALYTICAL_PIN_GUARD:
+        connections = list(_ANALYTICAL_PINNED.items())
+        _ANALYTICAL_PINNED.clear()
+    for key, con in connections:
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001 - shutdown is best effort
+            log.debug("failed to close the analytical connection for %s", key)
 
 
 def control_plane_lock(duckdb_path: str | Path) -> threading.Lock:
@@ -771,7 +838,14 @@ def reset_invalidated_instance(duckdb_path: str | Path) -> int:
     """
     closed = 0
     key = _path_key(duckdb_path)
-    for con in live_connections(duckdb_path):
+    # The pin participates in the live weak set below, but its strong
+    # reference must go too or a poisoned instance could remain cached.
+    with _ANALYTICAL_PIN_GUARD:
+        pinned = _ANALYTICAL_PINNED.pop(key, None)
+    handles = live_connections(duckdb_path)
+    if pinned is not None and all(con is not pinned for con in handles):
+        handles.append(pinned)
+    for con in handles:
         try:
             con.close()
         except Exception:  # noqa: BLE001 - a handle that will not close is already gone
@@ -795,7 +869,7 @@ def _connect_and_probe(
     *,
     role: str,
     settings_overrides: Optional[Mapping[str, str]],
-) -> duckdb.DuckDBPyConnection:
+) -> tuple[duckdb.DuckDBPyConnection, bool]:
     """Open, configure, and confirm the instance behind the handle is alive.
 
     The probe is one in-process statement. It exists because a connect to an
@@ -806,6 +880,7 @@ def _connect_and_probe(
     file is closed so the instance goes with them, and the open is retried
     once against a fresh one.
     """
+    restore_pin = False
     for attempt in (0, 1):
         with duckdb_connect_lock(duckdb_path):
             con = duckdb.connect(str(duckdb_path))
@@ -815,10 +890,12 @@ def _connect_and_probe(
         except Exception as exc:
             con.close()
             if attempt == 0 and is_invalidated_error(exc):
+                with _ANALYTICAL_PIN_GUARD:
+                    restore_pin = _path_key(duckdb_path) in _ANALYTICAL_PINNED
                 reset_invalidated_instance(duckdb_path)
                 continue
             raise
-        return con
+        return con, restore_pin
     raise AssertionError("unreachable: the retry either returns or raises")
 
 
@@ -844,7 +921,7 @@ def open_duckdb_connection(
             "database does not exist"
         )
     try:
-        con = _connect_and_probe(
+        con, restore_pin = _connect_and_probe(
             duckdb_path, role=role, settings_overrides=settings_overrides
         )
     except Exception as exc:
@@ -854,6 +931,8 @@ def open_duckdb_connection(
         remember_connect_failure(duckdb_path, exc)
         raise
     remember_live_connection(duckdb_path, con)
+    if restore_pin and not pin_analytical_connection(duckdb_path):
+        log.warning("analytical pin could not be restored for %s", duckdb_path)
     return con
 
 
@@ -1180,6 +1259,22 @@ def copy_duckdb_store(source: Path, destination: Path) -> None:
         # gone, but a chunked read can tear on its own -- callers treat a
         # failed snapshot as a skipped cycle.
         shutil.copy2(source, destination)
+
+
+def copy_analytical_snapshot(source: Path, destination: Path) -> None:
+    """Copy the live analytical store without checkpointing a pinned instance.
+
+    A pinned store can keep many committed rows in its WAL. Clone the stable
+    database/WAL pair so audits see them and do not force a large checkpoint
+    inside the serving process. Without a pin, preserve the existing portable
+    checkpoint-and-copy behavior.
+    """
+    with _ANALYTICAL_PIN_GUARD:
+        pinned = _path_key(source) in _ANALYTICAL_PINNED
+    if pinned:
+        copy_duckdb_store_with_wal(source, destination)
+    else:
+        copy_duckdb_store(source, destination)
 
 
 def _checkpoint_before_snapshot(source: Path) -> None:

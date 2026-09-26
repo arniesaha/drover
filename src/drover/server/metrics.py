@@ -21,7 +21,7 @@ from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
     control_plane_connection,
     control_plane_path,
-    copy_duckdb_store,
+    copy_analytical_snapshot,
     open_duckdb_connection,
     snapshot_scratch_root,
 )
@@ -2753,7 +2753,7 @@ class MetricsCollector:
             prefix="drover-metrics-audit-", dir=snapshot_scratch_root(source)
         ) as tmp:
             snapshot = Path(tmp) / source.name
-            copy_duckdb_store(source, snapshot)
+            copy_analytical_snapshot(source, snapshot)
             quality = quality_snapshot(
                 duckdb_path=snapshot,
                 incoming_dir=self.incoming_dir,
@@ -2870,7 +2870,7 @@ class MetricsCollector:
             prefix="drover-metrics-", dir=snapshot_scratch_root(source)
         ) as tmp:
             snapshot = Path(tmp) / source.name
-            copy_duckdb_store(source, snapshot)
+            copy_analytical_snapshot(source, snapshot)
             return quality_snapshot(
                 duckdb_path=snapshot,
                 incoming_dir=self.incoming_dir,
@@ -2891,7 +2891,7 @@ class MetricsCollector:
                 prefix="drover-observatory-", dir=snapshot_scratch_root(source)
             ) as tmp:
                 snapshot = Path(tmp) / source.name
-                copy_duckdb_store(source, snapshot)
+                copy_analytical_snapshot(source, snapshot)
                 return pipeline_observatory_snapshot(
                     duckdb_path=snapshot,
                     runtime_audit=audit,
