@@ -25,10 +25,7 @@ from drover.server.db import (
     open_duckdb_connection,
     snapshot_scratch_root,
 )
-from drover.server.harness.daemon import (
-    _STRUCTURED_DEFAULT_COMMANDS,
-    native_transcript_for_session,
-)
+from drover.server.harness.daemon import native_transcript_for_session
 from drover.server.harness.model_catalog import (
     MAX_CATALOG_WIRE_BYTES,
     CatalogEnvelope,
@@ -43,6 +40,7 @@ from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
 )
+from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.jobs import RedisJobStream
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -125,13 +123,14 @@ FS_COMPLETE_TIMEOUT_S = 3.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
-# Harnesses harnessd can drive as structured sessions (claude-code, codex,
-# agy). A nexus handoff to one of these launches mode="structured" and
+# A nexus handoff to a registered structured adapter launches mode="structured" and
 # delivers the handoff text as the first turn -- strictly more reliable than
 # typing it into a cold PTY (no startup-gate race).
-_STRUCTURED_HANDOFF_HARNESSES = frozenset(_STRUCTURED_DEFAULT_COMMANDS)
+_STRUCTURED_HANDOFF_HARNESSES = frozenset(BUILTIN_ADAPTERS.ids())
 _RECOVERABLE_STRUCTURED_HARNESSES = frozenset(
-    {"claude-code", "codex", "deepseek-harness"}
+    harness_id
+    for harness_id in BUILTIN_ADAPTERS.ids()
+    if BUILTIN_ADAPTERS.resolve(harness_id).recover_after_restart
 )
 _RECOVERY_UNAVAILABLE = (
     "Session cannot be resumed after the harness restart. "

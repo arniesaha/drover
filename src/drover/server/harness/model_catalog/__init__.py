@@ -1,6 +1,11 @@
 """Stable public surface for host-native model discovery."""
 
-from typing import Any, Mapping
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from drover.server.harness.adapters import HarnessAdapterRegistry
 
 from .agy import AgyCatalogAdapter
 from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
@@ -24,16 +29,20 @@ from .service import (
 
 
 def default_model_catalog_service(
-    host_id: str, presets: Mapping[str, Any]
+    host_id: str,
+    presets: Mapping[str, Any],
+    *,
+    adapters: HarnessAdapterRegistry | None = None,
 ) -> ModelCatalogService:
     """Build adapters only for enabled presets with resolved executables."""
-    adapters: dict[str, CatalogAdapter] = {}
-    for harness, adapter_type, suffix in (
-        ("codex", CodexCatalogAdapter, ("app-server", "--stdio")),
-        ("claude-code", ClaudeCatalogAdapter, ()),
-        ("agy", AgyCatalogAdapter, ()),
-        ("deepseek-harness", DeepSeekCatalogAdapter, ()),
-    ):
+    from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
+
+    registry = adapters if adapters is not None else BUILTIN_ADAPTERS
+    catalog_adapters: dict[str, CatalogAdapter] = {}
+    for harness in registry.ids():
+        drive_adapter = registry.resolve(harness)
+        if not drive_adapter.capabilities.model_catalog:
+            continue
         preset = presets.get(harness)
         executable = getattr(preset, "executable", None)
         if (
@@ -43,8 +52,8 @@ def default_model_catalog_service(
             or not executable
         ):
             continue
-        adapters[harness] = adapter_type((executable, *suffix))
-    return ModelCatalogService(host_id=host_id, adapters=adapters)
+        catalog_adapters[harness] = drive_adapter.model_catalog_adapter(executable)
+    return ModelCatalogService(host_id=host_id, adapters=catalog_adapters)
 
 
 __all__ = [

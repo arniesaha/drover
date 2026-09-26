@@ -26,6 +26,7 @@ from drover.server.__main__ import main
 from drover.server.harness import cli as harness_cli
 from drover.server.harness import daemon as harness_daemon
 from drover.server.harness import model_catalog
+from drover.server.harness.adapters import HarnessAdapterRegistry
 from drover.server.harness.auth import (
     AuthFlowManager,
     HarnessAuthStatus,
@@ -421,8 +422,9 @@ def test_model_catalog_service_is_created_lazily_once(monkeypatch, tmp_path):
     created = []
     fake = _FakeModelCatalogService()
 
-    def factory(host_id, presets):
+    def factory(host_id, presets, *, adapters):
         created.append((host_id, presets))
+        assert adapters is harness_daemon.BUILTIN_ADAPTERS
         return fake
 
     monkeypatch.setattr(harness_daemon, "default_model_catalog_service", factory)
@@ -2912,9 +2914,9 @@ def test_harnessd_recovery_is_idempotent_when_session_is_live(tmp_path):
 
 
 def test_harnessd_recovers_claude_with_native_resume_command(monkeypatch, tmp_path):
-    monkeypatch.setitem(
-        harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
-        "claude-code",
+    monkeypatch.setattr(
+        harness_daemon.BUILTIN_ADAPTERS.resolve("claude-code"),
+        "default_command",
         lambda: list(FAKE_STRUCTURED_CLI),
     )
     server, state, base_url = _start_test_server(tmp_path)
@@ -3786,9 +3788,58 @@ def test_structured_unknown_harness_rejected(tmp_path):
         server.server_close()
 
 
+def test_structured_launch_cannot_bypass_a_missing_adapter(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.adapters = HarnessAdapterRegistry()
+    state.structured.adapters = state.adapters
+    try:
+        with pytest.raises(urllib.error.HTTPError) as refusal:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "codex",
+                    "mode": "structured",
+                    "command": [sys.executable, "-c", "pass"],
+                    "cwd": str(tmp_path),
+                },
+            )
+        assert refusal.value.code == 400
+        assert "codex" in json.loads(refusal.value.read())["error"]
+        assert state.structured.session_ids() == []
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_structured_launch_rejects_unknown_worktree_policy(monkeypatch, tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    monkeypatch.setattr(
+        state.adapters.resolve("codex"), "worktree_policy", lambda: "unknown"
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as refusal:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "codex",
+                    "mode": "structured",
+                    "command": [sys.executable, "-c", "pass"],
+                    "cwd": str(tmp_path),
+                },
+            )
+        assert refusal.value.code == 400
+        assert "worktree policy" in json.loads(refusal.value.read())["error"]
+        assert state.registry.list_sessions() == []
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_structured_permission_without_approval_channel_returns_400(tmp_path):
-    # codex/agy drivers always raise RuntimeError from answer_permission
-    # (no wire-level approval channel) -- the daemon must surface that as a
+    # The adapter rejects approval when the driver has no wire channel. The
+    # daemon must surface that as a
     # 400, not a 500, and must not record a phantom approval_response event.
     server, state, base_url = _start_test_server(tmp_path)
     try:
@@ -4244,9 +4295,7 @@ def test_every_offered_preset_can_actually_be_driven():
     ``shell`` is the deliberate exception: it is a terminal session driven
     through the PTY path, never the structured one.
     """
-    from drover.server.harness.structured.manager import _FACTORIES
-
-    drivable = set(_FACTORIES) | {"shell"}
+    drivable = set(harness_daemon.BUILTIN_ADAPTERS.ids()) | {"shell"}
     offered = set(DEFAULT_PRESETS)
 
     assert (
@@ -4411,9 +4460,9 @@ def test_create_session_answers_400_when_the_staging_key_is_unusable(
     the hub reports a bare 502 and the operator gets a traceback in the
     daemon log instead of an answer.
     """
-    monkeypatch.setitem(
-        harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
-        "claude-code",
+    monkeypatch.setattr(
+        harness_daemon.BUILTIN_ADAPTERS.resolve("claude-code"),
+        "default_command",
         failure,
     )
     server, state, base_url = _start_test_server(tmp_path)
@@ -4443,9 +4492,9 @@ def test_create_session_answers_400_when_the_staging_key_is_unusable(
 def test_recover_answers_409_when_the_staging_key_is_unusable(
     monkeypatch, tmp_path, failure
 ):
-    monkeypatch.setitem(
-        harness_daemon._STRUCTURED_DEFAULT_COMMANDS,
-        "claude-code",
+    monkeypatch.setattr(
+        harness_daemon.BUILTIN_ADAPTERS.resolve("claude-code"),
+        "default_command",
         failure,
     )
     server, state, base_url = _start_test_server(tmp_path)

@@ -22,8 +22,14 @@ import duckdb
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.harness.adapters import (
+    AdapterHealth,
+    HarnessAdapter,
+    HarnessAdapterRegistry,
+    HarnessCapabilities,
+    LaunchRequest,
+)
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.structured import manager as manager_module
 from drover.server.harness.structured.driver import StructuredMessage
 from drover.server.harness.structured.manager import StructuredSessionManager
 
@@ -82,6 +88,48 @@ class _StubDriver:
         self.closed = True
 
 
+class _StubAdapter(HarnessAdapter):
+    id = "stub"
+    display_name = "Stub"
+    capabilities = HarnessCapabilities(
+        launch_modes=frozenset({"structured"}), approvals=True, interrupt=True
+    )
+
+    def __init__(self, build=None):
+        self.build = build or (
+            lambda command, cwd, emit: _StubDriver(command, cwd, emit)
+        )
+        self.driver = None
+
+    def default_command(self):
+        return ["stub"]
+
+    def start(self, request: LaunchRequest, emit):
+        self.driver = self.build(
+            list(request.command or self.default_command()), request.cwd, emit
+        )
+        return self.driver
+
+    def send_turn(
+        self, driver, text, turn_id, *, images=None, model=None, thinking_effort=None
+    ):
+        driver.send_turn(
+            text, turn_id, images=images, model=model, thinking_effort=thinking_effort
+        )
+
+    def close(self, driver):
+        driver.close()
+
+    def health(self):
+        return AdapterHealth(True)
+
+    def answer_permission(self, driver, request_id, decision, note):
+        driver.answer_permission(request_id, decision, note)
+
+    def interrupt(self, driver):
+        driver.interrupt()
+
+
 def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
@@ -95,17 +143,8 @@ def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
         mode="structured",
     )
 
-    driver_holder: dict[str, _StubDriver] = {}
-
-    def build(command, cwd, emit, native_session_id=None):
-        del native_session_id
-        driver = _StubDriver(command, cwd, emit)
-        driver_holder["driver"] = driver
-        return driver
-
-    monkeypatch.setitem(manager_module._FACTORIES, "stub", (build, lambda: ["stub"]))
-
-    mgr = StructuredSessionManager()
+    adapter = _StubAdapter()
+    mgr = StructuredSessionManager(HarnessAdapterRegistry([adapter]))
     on_messages: list[tuple[str, dict]] = []
     finalized: list[tuple[str, int]] = []
     mgr.start(
@@ -117,7 +156,7 @@ def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
         on_message=lambda sid, evt: on_messages.append((sid, evt)),
         finalize=lambda sid, rc: finalized.append((sid, rc)),
     )
-    return mgr, driver_holder["driver"], registry, on_messages, finalized
+    return mgr, adapter.driver, registry, on_messages, finalized
 
 
 def test_exit_entry_is_gone_before_its_event_is_recorded(monkeypatch, tmp_path):
@@ -376,7 +415,7 @@ def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path
     )
-    mgr._require_entry("sess-1").harness = "claude-code"
+    mgr._require_entry("sess-1").adapter.persistent_turn_guard = True
 
     first_turn = mgr.send_turn("sess-1", "first")
     with pytest.raises(RuntimeError, match="turn already in flight"):
@@ -562,16 +601,20 @@ def test_start_passes_native_session_id_to_driver_factory(monkeypatch, tmp_path)
     )
     captured: dict[str, str | None] = {}
 
-    def build(command, cwd, emit, native_session_id=None):
-        captured["native_session_id"] = native_session_id
-        return _StubDriver(command, cwd, emit)
+    class _ResumeAdapter(_StubAdapter):
+        id = "stub-resume"
+        capabilities = HarnessCapabilities(
+            launch_modes=frozenset({"structured"}),
+            approvals=True,
+            interrupt=True,
+            native_resume=True,
+        )
 
-    monkeypatch.setitem(
-        manager_module._FACTORIES,
-        "stub-resume",
-        (build, lambda: ["stub"]),
-    )
-    manager = StructuredSessionManager()
+        def resume(self, request, emit):
+            captured["native_session_id"] = request.native_session_id
+            return self.start(request, emit)
+
+    manager = StructuredSessionManager(HarnessAdapterRegistry([_ResumeAdapter()]))
 
     manager.start(
         "sess-resume",
@@ -831,18 +874,10 @@ def test_a_driver_that_fails_to_start_leaves_no_entry(monkeypatch, tmp_path):
         def start(self) -> None:
             raise RuntimeError("cwd does not exist: /nope")
 
-    monkeypatch.setitem(
-        manager_module._FACTORIES,
-        "stub",
-        (
-            lambda command, cwd, emit, native_session_id: _FailingDriver(
-                command, cwd, emit
-            ),
-            lambda: ["stub"],
-        ),
+    adapter = _StubAdapter(
+        build=lambda command, cwd, emit: _FailingDriver(command, cwd, emit)
     )
-
-    mgr = StructuredSessionManager()
+    mgr = StructuredSessionManager(HarnessAdapterRegistry([adapter]))
     with pytest.raises(RuntimeError, match="cwd does not exist"):
         mgr.start(
             "sess-1",

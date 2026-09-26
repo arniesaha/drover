@@ -218,16 +218,16 @@ def session_handler(credential_root, monkeypatch):
     def start(session_id, **kwargs):
         effects.append(("launch", kwargs["cwd"]))
 
-    monkeypatch.setattr(
-        daemon,
-        "_STRUCTURED_DEFAULT_COMMANDS",
-        {"claude-code": command, "codex": command},
-    )
+    for harness_id in ("claude-code", "codex"):
+        monkeypatch.setattr(
+            daemon.BUILTIN_ADAPTERS.resolve(harness_id), "default_command", command
+        )
     monkeypatch.setattr(daemon, "create_session_worktree", worktree)
     handler = object.__new__(daemon.HarnessRequestHandler)
     handler.server = SimpleNamespace(
         state=SimpleNamespace(
             host_id="stage-test",
+            adapters=daemon.BUILTIN_ADAPTERS,
             registry=SimpleNamespace(create_session=create_session),
             structured=SimpleNamespace(start=start),
             worktrees_dir=root / "home/.drover/worktrees",
