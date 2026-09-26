@@ -210,10 +210,13 @@ class InsightsService:
         config_path: str | Path | None = None,
         consent_propagator: Callable[[bool, int], list[dict[str, str]]] | None = None,
         central_consent: Any | None = None,
+        isolated_snapshots: bool = False,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.config_path = Path(config_path or default_config_path()).expanduser()
         self.repository = AdvisoryRepository(self.duckdb_path)
+        self.isolated_snapshots = isolated_snapshots
+        self._isolated_snapshot_supported: bool | None = None
         self._scope_cache: dict[tuple, tuple[float, Any]] = {}
         self._scope_lock = threading.Lock()
         # One expensive scope probe globally, shared by every caller asking
@@ -1312,18 +1315,32 @@ class InsightsService:
                     "finding has no executable operational target scope"
                 )
             snapshot_target = "fleet" if fleet_scoped else finding.target_id
+            from drover.server.advisory import snapshot_process
             from drover.server.advisory.worker import (
                 load_operational_snapshot,
-                operational_snapshot_source_version,
+                operational_snapshot_version,
             )
 
-            snapshot = load_operational_snapshot(
-                self.duckdb_path,
-                finding.analyzer_id,
-                snapshot_target,
-                "operational-facts:scope-probe",
-                connection_observer=self._observe_scope_connection,
-            )
+            if self.isolated_snapshots and self._isolated_snapshot_supported is None:
+                self._isolated_snapshot_supported = (
+                    snapshot_process.supports_isolated_snapshot(self.duckdb_path)
+                )
+            if self.isolated_snapshots and self._isolated_snapshot_supported:
+                snapshot = snapshot_process.read_operational_snapshot_in_child(
+                    self.duckdb_path,
+                    finding.analyzer_id,
+                    snapshot_target,
+                    "operational-facts:scope-probe",
+                    timeout_seconds=max(0.01, CHECK_SCOPE_BUDGET_SECONDS - 0.05),
+                )
+            else:
+                snapshot = load_operational_snapshot(
+                    self.duckdb_path,
+                    finding.analyzer_id,
+                    snapshot_target,
+                    "operational-facts:scope-probe",
+                    connection_observer=self._observe_scope_connection,
+                )
             facts = (
                 snapshot.hooks
                 if finding.analyzer_id == "deterministic.hook_validity"
@@ -1338,8 +1355,8 @@ class InsightsService:
                     "Check Again is unavailable because no current facts exist "
                     "for this finding target."
                 )
-            return snapshot_target, operational_snapshot_source_version(
-                self.duckdb_path, finding.analyzer_id, snapshot_target
+            return snapshot_target, operational_snapshot_version(
+                snapshot, finding.analyzer_id
             )
         raise InvalidInsightTransition(
             "scoped reanalysis is unavailable for this finding analyzer"

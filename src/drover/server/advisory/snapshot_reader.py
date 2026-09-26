@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from drover.config import ControlStoreConfig
@@ -25,6 +26,11 @@ def run(payload: dict) -> dict:
         payload["analyzer_id"],
         payload["target_id"],
         payload["source_version"],
+        analyzed_at=(
+            datetime.fromisoformat(payload["analyzed_at"])
+            if payload.get("analyzed_at") is not None
+            else None
+        ),
         control_source_path=source,
         include_control_wal=True,
         control_scratch_root=snapshot.parent,

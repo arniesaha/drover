@@ -15,7 +15,11 @@ import pytest
 from drover.schema import bootstrap
 from drover.server.advisory import snapshot_process
 from drover.server.advisory.snapshot_codec import decode_snapshot
-from drover.server.db import snapshot_scratch_root, supports_atomic_duckdb_clone
+from drover.server.db import (
+    control_plane_path,
+    snapshot_scratch_root,
+    supports_atomic_duckdb_clone,
+)
 
 
 def test_reader_process_clones_live_wal_and_returns_typed_facts(tmp_path: Path) -> None:
@@ -63,6 +67,72 @@ def test_reader_process_clones_live_wal_and_returns_typed_facts(tmp_path: Path) 
     assert snapshot.source_version == "facts:v1"
     assert any(item.provider == "openai" for item in snapshot.provider_connections)
     assert not scratch.exists()
+
+
+def test_reader_process_clones_legacy_registry_wal(tmp_path: Path) -> None:
+    source = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=source)
+    control = control_plane_path(source)
+    if not supports_atomic_duckdb_clone(source) or not supports_atomic_duckdb_clone(
+        control
+    ):
+        pytest.skip("requires atomic clones on both source volumes")
+
+    now = datetime.now(timezone.utc)
+    capabilities = {
+        "advisory": {
+            "hooks": [
+                {
+                    "hook_id": "pre-tool",
+                    "harness_id": "codex",
+                    "canonical_config_path": "/tmp/hooks.json",
+                    "canonical_executable_path": "/tmp/hook",
+                    "target_hash": "sha256:abc",
+                    "enabled": True,
+                    "executable_exists": True,
+                    "executable_is_file": True,
+                    "executable_is_executable": True,
+                    "allowlisted": True,
+                }
+            ]
+        }
+    }
+    # The control-plane row remains only in its WAL while the child clones it.
+    with duckdb.connect(str(control)) as writer:
+        writer.execute(
+            """
+            INSERT INTO harness_hosts (
+                host_id, display_name, kind, status, capabilities_json,
+                last_seen_at, updated_at
+            ) VALUES ('mac-mini', 'Mac Mini', 'local', 'online', ?, ?, ?)
+            """,
+            [json.dumps(capabilities), now, now],
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="advisory-reader-test-", dir=snapshot_scratch_root(source)
+        ) as directory:
+            request = {
+                "source": str(source),
+                "snapshot": str(Path(directory) / source.name),
+                "analyzer_id": "deterministic.hook_validity",
+                "target_id": "fleet",
+                "source_version": "facts:v1",
+                "control_store": None,
+            }
+            completed = subprocess.run(
+                [sys.executable, "-m", "drover.server.advisory.snapshot_reader"],
+                input=json.dumps(request),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            assert completed.returncode == 0, completed.stderr
+            snapshot = decode_snapshot(json.loads(completed.stdout)["snapshot"])
+
+    assert [(hook.host_id, hook.hook_id) for hook in snapshot.hooks] == [
+        ("mac-mini", "pre-tool")
+    ]
 
 
 def test_parent_removes_child_scratch_after_timeout(

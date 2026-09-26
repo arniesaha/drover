@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -199,6 +199,81 @@ def test_postgres_control_store_rolls_back_a_control_plane_transaction(
             ).fetchone()
             is None
         )
+
+
+def test_advisory_reader_uses_postgres_control_configuration(
+    postgres_control_store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A child with a cloned analytical store reads current PostgreSQL facts."""
+    import shutil
+
+    import duckdb
+
+    from drover.server.advisory.snapshot_codec import decode_snapshot
+    from drover.server.advisory.snapshot_reader import run
+    from drover.server.control_store import close_control_store
+    from drover.server.db import control_plane_connection
+
+    control_path, config = postgres_control_store
+    now = datetime.now(timezone.utc)
+    capabilities = {
+        "advisory": {
+            "hooks": [
+                {
+                    "hook_id": "pre-tool",
+                    "harness_id": "codex",
+                    "canonical_config_path": "/tmp/hooks.json",
+                    "canonical_executable_path": "/tmp/hook",
+                    "target_hash": "sha256:abc",
+                    "enabled": True,
+                    "executable_exists": True,
+                    "executable_is_file": True,
+                    "executable_is_executable": True,
+                    "allowlisted": True,
+                }
+            ]
+        }
+    }
+    with control_plane_connection(control_path) as con:
+        con.execute(
+            """
+            INSERT INTO harness_hosts (
+                host_id, display_name, kind, status, capabilities_json,
+                last_seen_at, updated_at
+            ) VALUES ('postgres-host', 'PostgreSQL Host', 'local', 'online', ?, ?, ?)
+            """,
+            [json.dumps(capabilities), now, now],
+        )
+
+    source = tmp_path / "analytical.duckdb"
+    with duckdb.connect(str(source)):
+        pass
+    snapshot_path = tmp_path / "snapshot.duckdb"
+
+    # CI PostgreSQL runs on Linux, where APFS clonefile is unavailable. This
+    # substitutes only the clone operation and exercises the actual reader.
+    def clone(src: Path, dst: Path) -> bool:
+        shutil.copy2(src, dst)
+        return True
+
+    monkeypatch.setattr("drover.server.db._clone_file", clone)
+    try:
+        response = run(
+            {
+                "source": str(source),
+                "snapshot": str(snapshot_path),
+                "analyzer_id": "deterministic.hook_validity",
+                "target_id": "fleet",
+                "source_version": "facts:v1",
+                "control_store": asdict(config),
+            }
+        )
+        snapshot = decode_snapshot(response["snapshot"])
+        assert [(hook.host_id, hook.hook_id) for hook in snapshot.hooks] == [
+            ("postgres-host", "pre-tool")
+        ]
+    finally:
+        close_control_store(source)
 
 
 def test_postgres_control_store_uses_independent_pooled_transactions(

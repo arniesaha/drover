@@ -1857,17 +1857,32 @@ def operational_snapshot_source_version(
     target_id: str,
     *,
     analyzed_at: datetime | None = None,
+    isolated_snapshots: bool = False,
 ) -> str:
     """Hash only the complete analyzer facts so unchanged reviews coalesce."""
 
     analyzed_at = analyzed_at or datetime.now(timezone.utc)
-    snapshot = load_operational_snapshot(
-        duckdb_path,
-        analyzer_id,
-        target_id,
-        "operational-facts:material",
-        analyzed_at=analyzed_at,
-    )
+    if isolated_snapshots and supports_isolated_snapshot(Path(duckdb_path)):
+        snapshot = read_operational_snapshot_in_child(
+            Path(duckdb_path),
+            analyzer_id,
+            target_id,
+            "operational-facts:material",
+            analyzed_at=analyzed_at,
+        )
+    else:
+        snapshot = load_operational_snapshot(
+            duckdb_path,
+            analyzer_id,
+            target_id,
+            "operational-facts:material",
+            analyzed_at=analyzed_at,
+        )
+    return operational_snapshot_version(snapshot, analyzer_id)
+
+
+def operational_snapshot_version(snapshot: AnalysisSnapshot, analyzer_id: str) -> str:
+    """Hash the facts already read, without another analytical query."""
     material = json.dumps(
         _operational_material(snapshot, analyzer_id),
         sort_keys=True,
@@ -1994,5 +2009,6 @@ __all__ = [
     "SnapshotFactory",
     "load_operational_snapshot",
     "operational_snapshot_source_version",
+    "operational_snapshot_version",
     "operational_analyzers",
 ]

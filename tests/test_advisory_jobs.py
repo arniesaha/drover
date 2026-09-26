@@ -213,6 +213,30 @@ def test_operational_worker_runs_snapshot_in_child_on_atomic_volume(
     assert result.failed == 0
 
 
+def test_scheduled_source_version_uses_child_without_parent_fact_read(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not supports_atomic_duckdb_clone(db_path):
+        pytest.skip("requires an atomic clone on the source volume")
+    from drover.server.advisory import worker as worker_module
+
+    analyzer_id = ConnectorFreshnessAnalyzer.analyzer_id
+    direct = operational_snapshot_source_version(
+        db_path, analyzer_id, "fleet", analyzed_at=NOW
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "load_operational_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("scheduler read facts in the parent"),
+    )
+
+    isolated = operational_snapshot_source_version(
+        db_path, analyzer_id, "fleet", analyzed_at=NOW, isolated_snapshots=True
+    )
+
+    assert isolated == direct
+
+
 def test_isolated_worker_keeps_live_reader_when_atomic_clone_is_unavailable(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4451,6 +4475,65 @@ def _telemetry_finding(repository, rule_id: str, run_id: str):
         ),
         run_id=run_id,
     )
+
+
+def test_check_again_uses_one_bounded_child_snapshot(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from drover.server.advisory import service as service_module
+    from drover.server.advisory import snapshot_process
+    from drover.server.advisory import worker as worker_module
+
+    finding = _telemetry_finding(
+        AdvisoryRepository(db_path), "telemetry.low_coverage", "run-1"
+    )
+    snapshot = AnalysisSnapshot(
+        source_version="operational-facts:scope-probe",
+        analyzed_at=NOW,
+        telemetry=(
+            TelemetryAggregate(
+                target_id="mac-mini/codex",
+                host_id="mac-mini",
+                harness_id="codex",
+                observed_at=NOW,
+                total_sessions=1,
+                sessions_with_spans=1,
+                repository_attributed_sessions=1,
+                token_observed_sessions=1,
+                cost_observed_sessions=1,
+                prompt_tokens=100,
+                cache_read_tokens=0,
+                facts_complete=True,
+                input_span_records=1,
+                source_ref="telemetry:mac-mini/codex",
+            ),
+        ),
+    )
+    calls: list[float] = []
+
+    def child_reader(*_args, timeout_seconds: float):
+        calls.append(timeout_seconds)
+        return snapshot
+
+    service = InsightsService(db_path, isolated_snapshots=True)
+    monkeypatch.setattr(snapshot_process, "supports_isolated_snapshot", lambda _: True)
+    monkeypatch.setattr(
+        snapshot_process, "read_operational_snapshot_in_child", child_reader
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "load_operational_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("scope read facts in the parent"),
+    )
+
+    target_id, source_version = service._check_scope(finding)
+
+    assert target_id == "mac-mini/codex"
+    assert source_version == worker_module.operational_snapshot_version(
+        snapshot, finding.analyzer_id
+    )
+    assert len(calls) == 1
+    assert 0 < calls[0] < service_module.CHECK_SCOPE_BUDGET_SECONDS
 
 
 def test_repeated_views_of_a_scope_cost_one_snapshot(

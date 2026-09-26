@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 from drover.server.advisory.analyzers import AnalysisSnapshot
@@ -37,7 +38,13 @@ def supports_isolated_snapshot(source: Path) -> bool:
 
 
 def read_operational_snapshot_in_child(
-    source: Path, analyzer_id: str, target_id: str, source_version: str
+    source: Path,
+    analyzer_id: str,
+    target_id: str,
+    source_version: str,
+    *,
+    analyzed_at: datetime | None = None,
+    timeout_seconds: float = SNAPSHOT_READER_BUDGET_SECONDS,
 ) -> AnalysisSnapshot:
     """Build facts on a clone so the parent's native heap cannot retain them."""
     source = source.resolve()
@@ -47,6 +54,7 @@ def read_operational_snapshot_in_child(
         "analyzer_id": analyzer_id,
         "target_id": target_id,
         "source_version": source_version,
+        "analyzed_at": analyzed_at.isoformat() if analyzed_at is not None else None,
         "control_store": asdict(config) if config is not None else None,
     }
     with tempfile.TemporaryDirectory(
@@ -64,13 +72,13 @@ def read_operational_snapshot_in_child(
                 input=json.dumps(request),
                 text=True,
                 capture_output=True,
-                timeout=SNAPSHOT_READER_BUDGET_SECONDS,
+                timeout=timeout_seconds,
                 env=environment,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(
-                f"advisory snapshot exceeded {SNAPSHOT_READER_BUDGET_SECONDS:g}s budget"
+                f"advisory snapshot exceeded {timeout_seconds:g}s budget"
             ) from exc
     try:
         response = json.loads(completed.stdout)
