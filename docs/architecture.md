@@ -24,6 +24,12 @@ The command plane carries live fleet operations:
 The central server does not execute remote commands itself. The host daemon is
 the authority for processes and filesystem access on its machine.
 
+Drive-capable harnesses are converging on a registered adapter contract and a
+versioned capability matrix consumed by web and iOS. Collection remains a
+separate context-plane boundary: observing a harness does not make it a launch
+target. See [Harness Adapter Architecture](harness-adapter-architecture.md) and
+[ADR 0001](adr/0001-harness-adapter-capability-registry.md).
+
 ## Context Plane
 
 The context plane turns local agent activity into durable, queryable memory:
