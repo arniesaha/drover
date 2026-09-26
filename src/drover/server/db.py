@@ -482,7 +482,9 @@ def pin_analytical_connection(duckdb_path: str | Path) -> bool:
     control-plane store and harnessd are unaffected.
     """
     if os.environ.get("DROVER_ANALYTICAL_PIN", "0").strip().lower() not in {
-        "1", "true", "yes",
+        "1",
+        "true",
+        "yes",
     }:
         return False
     path = Path(duckdb_path)

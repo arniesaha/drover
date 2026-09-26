@@ -19,9 +19,9 @@ from urllib.parse import quote, urlencode, urlparse
 from drover.config import FavoriteCwd
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
-    copy_analytical_snapshot,
     control_plane_connection,
     control_plane_path,
+    copy_analytical_snapshot,
     open_duckdb_connection,
     snapshot_scratch_root,
 )

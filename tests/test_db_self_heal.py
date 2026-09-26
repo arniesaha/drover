@@ -104,7 +104,9 @@ def test_open_heals_an_invalidated_instance(tmp_path: Path, monkeypatch) -> None
     assert poisoned, "the poisoned connection was never opened"
 
 
-def test_open_restores_analytical_pin_after_invalidation(tmp_path: Path, monkeypatch) -> None:
+def test_open_restores_analytical_pin_after_invalidation(
+    tmp_path: Path, monkeypatch
+) -> None:
     probe = tmp_path / "clone-probe"
     probe.write_bytes(b"probe")
     if not supports_atomic_duckdb_clone(probe):
