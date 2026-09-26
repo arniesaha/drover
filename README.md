@@ -244,6 +244,8 @@ device signing, and server configuration.
 
 - [Getting Started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
+- [Harness Adapter Architecture](docs/harness-adapter-architecture.md)
+- [ADR 0001: Harness Adapter Capability Registry](docs/adr/0001-harness-adapter-capability-registry.md)
 - [Context Store](docs/context-store.md)
 - [PostgreSQL Control Store](docs/postgresql-control-store.md)
 - [Integrations](docs/integrations.md)
