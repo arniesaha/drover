@@ -78,6 +78,9 @@ class HarnessAdapter(ABC):
     id: str
     display_name: str
     capabilities: HarnessCapabilities
+    recover_after_restart: bool = False
+    persistent_turn_guard: bool = False
+    turn_preferences_mutable: bool = True
 
     @abstractmethod
     def default_command(self) -> list[str]: ...
@@ -88,6 +91,11 @@ class HarnessAdapter(ABC):
     def start(self, request: LaunchRequest, emit: EmitFn) -> object:
         raise UnsupportedHarnessOperation("structured launch is unsupported")
 
+    def apply_preferences(
+        self, command: list[str], model: str | None, thinking_effort: str | None
+    ) -> list[str]:
+        return list(command)
+
     @abstractmethod
     def send_turn(
         self,
@@ -95,6 +103,7 @@ class HarnessAdapter(ABC):
         text: str,
         turn_id: str,
         *,
+        images: list | None = None,
         model: str | None = None,
         thinking_effort: str | None = None,
     ) -> None: ...
@@ -116,7 +125,7 @@ class HarnessAdapter(ABC):
     def resume(self, request: LaunchRequest, emit: EmitFn) -> object:
         raise UnsupportedHarnessOperation("native resume is unsupported")
 
-    def model_catalog_adapter(self) -> object:
+    def model_catalog_adapter(self, executable: str) -> object:
         raise UnsupportedHarnessOperation("model catalog is unsupported")
 
     def usage(self, driver: object) -> object:
@@ -126,11 +135,18 @@ class HarnessAdapter(ABC):
         raise UnsupportedHarnessOperation("worktree isolation is unsupported")
 
     def send_attachments(
-        self, driver: object, text: str, turn_id: str, attachments: list[dict]
+        self,
+        driver: object,
+        text: str,
+        turn_id: str,
+        attachments: list[dict],
+        *,
+        model: str | None = None,
+        thinking_effort: str | None = None,
     ) -> None:
         raise UnsupportedHarnessOperation("attachments are unsupported")
 
-    def auth_adapter(self) -> object:
+    def auth_adapter(self, *, shell: str | None = None) -> object | None:
         raise UnsupportedHarnessOperation("interactive auth is unsupported")
 
 
@@ -170,6 +186,10 @@ class HarnessAdapterRegistry:
         capabilities = getattr(adapter, "capabilities", None)
         if not isinstance(capabilities, HarnessCapabilities):
             raise InvalidHarnessAdapter(f"{harness_id}: invalid capabilities")
+        if adapter.recover_after_restart and not capabilities.native_resume:
+            raise InvalidHarnessAdapter(
+                f"{harness_id}: restart recovery requires native_resume"
+            )
         modes = capabilities.launch_modes
         if (
             not isinstance(modes, frozenset)
@@ -221,6 +241,10 @@ class HarnessAdapterRegistry:
             except InvalidHarnessAdapter as exc:
                 errors.append(exc)
         return errors
+
+    def ids(self) -> tuple[str, ...]:
+        """Stable IDs for host policy and catalog enumeration."""
+        return tuple(self._adapters)
 
     def resolve(
         self, harness_id: str, *, operation: Operation | None = None

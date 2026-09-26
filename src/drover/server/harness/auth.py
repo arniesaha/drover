@@ -13,10 +13,13 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Protocol, Sequence
 from uuid import uuid4
 
 from .pty import make_controlling_tty_preexec, resize_pty
+
+if TYPE_CHECKING:
+    from drover.server.harness.adapters import HarnessAdapterRegistry
 
 _SECRET_QUERY_KEYS = {
     "authorization",
@@ -594,60 +597,20 @@ def _command_with_args(command: Sequence[str], *args: str) -> list[str]:
     return [*expanded, *args]
 
 
-def default_auth_adapters(*, shell: str | None = None) -> dict[str, HarnessAuthAdapter]:
-    from drover.server.staging_credentials import is_staging, read_api_key
+def default_auth_adapters(
+    *, shell: str | None = None, adapters: HarnessAdapterRegistry | None = None
+) -> dict[str, HarnessAuthAdapter]:
+    from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 
-    if is_staging():
-        try:
-            read_api_key()
-            state = "authenticated"
-        except (OSError, ValueError):
-            state = "unauthenticated"
-        return {
-            "claude-code": StaticAuthAdapter(
-                "claude-code",
-                HarnessAuthStatus(
-                    "claude-code",
-                    state,
-                    detail="Dedicated staging API key; local provisioning only",
-                ),
-                sign_in="unsupported",
-            )
-        }
-    adapters: dict[str, HarnessAuthAdapter] = {}
-    claude = _resolve_login_command("claude", shell=shell)
-    if claude is not None:
-        # `claude auth login` renders its "Paste code here" prompt through
-        # ink, which needs a terminal: on a pipe it prints the authorize URL
-        # and then hangs forever without ever prompting.
-        adapters["claude-code"] = CommandAuthAdapter(
-            "claude-code",
-            _command_with_args(claude, "auth", "status", "--json"),
-            _command_with_args(claude, "auth", "login"),
-            requires_pty=True,
-        )
-    codex = _resolve_login_command("codex", shell=shell)
-    if codex is not None:
-        # The device-code flow is line-oriented and needs no terminal; the
-        # user finishes it entirely in a browser.
-        adapters["codex"] = CommandAuthAdapter(
-            "codex",
-            _command_with_args(codex, "login", "status"),
-            _command_with_args(codex, "login", "--device-auth"),
-        )
-    agy = _resolve_login_command("agy", shell=shell)
-    if agy is not None:
-        # agy exposes no login subcommand -- signing in means driving the
-        # full-screen TUI the bare binary opens, so there is nothing here a
-        # managed flow could scrape or answer.
-        adapters["agy"] = CommandAuthAdapter(
-            "agy",
-            _command_with_args(agy, "--version"),
-            list(agy),
-            requires_pty=True,
-            sign_in="terminal",
-        )
-    return adapters
+    registry = adapters if adapters is not None else BUILTIN_ADAPTERS
+    auth_adapters: dict[str, HarnessAuthAdapter] = {}
+    for harness_id in registry.ids():
+        drive_adapter = registry.resolve(harness_id)
+        if drive_adapter.capabilities.interactive_auth:
+            auth_adapter = drive_adapter.auth_adapter(shell=shell)
+            if auth_adapter is not None:
+                auth_adapters[harness_id] = auth_adapter
+    return auth_adapters
 
 
 @dataclass

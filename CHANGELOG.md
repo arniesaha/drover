@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Claude Code, Codex, agy, and DeepSeek structured sessions now resolve driver
+  construction, default commands, worktree policy, authentication, and model
+  catalogs through the validated harness adapter registry. No intentional
+  lifecycle or client behavior changes.
+
 ## [0.4.18] - 2026-09-19
 
 ### Fixed

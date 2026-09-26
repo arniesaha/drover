@@ -20,54 +20,23 @@ from collections import OrderedDict
 from typing import Any, Callable
 from uuid import uuid4
 
+from drover.server.harness.adapters import (
+    HarnessAdapter,
+    HarnessAdapterRegistry,
+    LaunchRequest,
+)
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.structured import agy, claude, codex, deepseek
+from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.harness.structured.driver import StructuredMessage
-
-# Each factory is a small builder, not a bare class -- ClaudeDriver needs a
-# sanitized child environment (claude.child_env() strips ambient CLAUDE*
-# vars so a nested harnessd doesn't leak its own session env into the
-# spawned CLI); Codex/Agy's constructors take no env kwarg at all.
-_FACTORIES: dict[str, tuple[Callable[..., Any], Callable[..., list[str]]]] = {
-    "claude-code": (
-        lambda command, cwd, emit, native_session_id: claude.ClaudeDriver(
-            claude.resume_command(command, native_session_id),
-            cwd,
-            emit,
-            env=claude.child_env(),
-        ),
-        claude.default_command,
-    ),
-    "codex": (
-        lambda command, cwd, emit, native_session_id: codex.CodexDriver(
-            command, cwd, emit, native_session_id=native_session_id
-        ),
-        codex.default_command,
-    ),
-    "agy": (
-        lambda command, cwd, emit, native_session_id: agy.AgyDriver(
-            agy.resume_command(command, native_session_id),
-            cwd,
-            emit,
-            native_session_id=native_session_id,
-        ),
-        agy.default_command,
-    ),
-    "deepseek-harness": (
-        lambda command, cwd, emit, native_session_id: deepseek.DeepSeekDriver(
-            command, cwd, emit, native_session_id=native_session_id
-        ),
-        deepseek.default_command,
-    ),
-}
 
 _MAX_ACCEPTED_CLIENT_TURNS = 128
 
 
 class _Entry:
-    def __init__(self, driver: Any, harness: str) -> None:
+    def __init__(self, driver: Any, harness: str, adapter: HarnessAdapter) -> None:
         self.driver = driver
         self.harness = harness
+        self.adapter = adapter
         self.seq = 0
         self.awaiting: str | None = None
         # Reentrant: `answer_permission` holds this across dispatch *and* the
@@ -89,7 +58,8 @@ class _Entry:
 class StructuredSessionManager:
     """Thread-safe registry of live structured-session driver instances."""
 
-    def __init__(self) -> None:
+    def __init__(self, adapters: HarnessAdapterRegistry | None = None) -> None:
+        self.adapters = adapters if adapters is not None else BUILTIN_ADAPTERS
         self._entries: dict[str, _Entry] = {}
         self._entries_lock = threading.Lock()
 
@@ -128,10 +98,11 @@ class StructuredSessionManager:
         finalize: Callable[[str, int], None],
         native_session_id: str | None = None,
     ) -> None:
-        if harness not in _FACTORIES:
+        try:
+            adapter = self.adapters.resolve(harness, operation="structured")
+        except (KeyError, ValueError):
             raise ValueError(f"harness has no structured driver: {harness}")
-        builder, default_command = _FACTORIES[harness]
-        entry = _Entry(None, harness)
+        entry = _Entry(None, harness, adapter)
         entry.seq = registry.max_event_seq(session_id)
         # The process-local map prevents duplicate dispatches while a daemon is
         # running. Populate it from the bounded durable user-input ledger as
@@ -266,8 +237,15 @@ class StructuredSessionManager:
                 finalize(session_id, int(payload["exited"]))
 
         entry.emit = emit
-        entry.driver = builder(
-            command or default_command(), cwd, emit, native_session_id
+        request = LaunchRequest(
+            command=tuple(command or adapter.default_command()),
+            cwd=cwd,
+            native_session_id=native_session_id,
+        )
+        entry.driver = (
+            adapter.resume(request, emit)
+            if native_session_id
+            else adapter.start(request, emit)
         )
         with self._entries_lock:
             self._entries[session_id] = entry
@@ -387,7 +365,9 @@ class StructuredSessionManager:
     ) -> str:
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
-        guard_persistent_turn = entry.harness == "claude-code"
+        guard_persistent_turn = bool(
+            getattr(entry.adapter, "persistent_turn_guard", False)
+        )
         if guard_persistent_turn:
             with entry.turn_lock:
                 if entry.turn_active:
@@ -398,13 +378,24 @@ class StructuredSessionManager:
         # flight" / "driver is closed") when a turn cannot be accepted, and
         # we must not record a user_input event for a turn that was never sent.
         try:
-            entry.driver.send_turn(
-                text,
-                turn_id,
-                images=images,
-                model=model,
-                thinking_effort=thinking_effort,
-            )
+            if images and entry.adapter.capabilities.attachments:
+                entry.adapter.send_attachments(
+                    entry.driver,
+                    text,
+                    turn_id,
+                    images,
+                    model=model,
+                    thinking_effort=thinking_effort,
+                )
+            else:
+                entry.adapter.send_turn(
+                    entry.driver,
+                    text,
+                    turn_id,
+                    images=images,
+                    model=model,
+                    thinking_effort=thinking_effort,
+                )
         except Exception:
             if guard_persistent_turn:
                 with entry.turn_lock:
@@ -449,7 +440,7 @@ class StructuredSessionManager:
         # without reordering anything: the pump waits, and the failure case
         # still records nothing because the raise happens before the emit.
         with entry.lock:
-            entry.driver.answer_permission(request_id, decision, note)
+            entry.adapter.answer_permission(entry.driver, request_id, decision, note)
             entry.driver.emit(
                 StructuredMessage(
                     type="approval_response",
@@ -464,13 +455,14 @@ class StructuredSessionManager:
             )
 
     def interrupt(self, session_id: str) -> None:
-        self._require_entry(session_id).driver.interrupt()
+        entry = self._require_entry(session_id)
+        entry.adapter.interrupt(entry.driver)
 
     def close(self, session_id: str) -> None:
         with self._entries_lock:
             entry = self._entries.pop(session_id, None)
         if entry is not None:
-            entry.driver.close()
+            entry.adapter.close(entry.driver)
 
     def _require_entry(self, session_id: str) -> _Entry:
         with self._entries_lock:

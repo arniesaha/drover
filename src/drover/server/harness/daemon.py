@@ -39,6 +39,10 @@ from drover.config import (
     resolve_api_token_env,
 )
 from drover.native_history_identity import native_source_fingerprint
+from drover.server.harness.adapters import (
+    HarnessAdapterRegistry,
+    UnsupportedHarnessOperation,
+)
 from drover.server.harness.auth import (
     AuthFlowInputError,
     AuthFlowLaunchError,
@@ -60,10 +64,7 @@ from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
-from drover.server.harness.structured import agy as _structured_agy
-from drover.server.harness.structured import claude as _structured_claude
-from drover.server.harness.structured import codex as _structured_codex
-from drover.server.harness.structured import deepseek as _structured_deepseek
+from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.harness.updater import (
@@ -100,24 +101,6 @@ if TYPE_CHECKING:
         ProviderAccountSnapshot,
         ProviderUsageWindow,
     )
-
-# Used only to compute a human-readable "command" label for the registry row
-# when the caller didn't supply an explicit command -- the manager itself
-# resolves the real default command independently via its own _FACTORIES.
-_STRUCTURED_DEFAULT_COMMANDS: dict[str, Callable[[], list[str]]] = {
-    "claude-code": _structured_claude.default_command,
-    "codex": _structured_codex.default_command,
-    "agy": _structured_agy.default_command,
-    "deepseek-harness": _structured_deepseek.default_command,
-}
-
-# Harnesses whose structured drivers run full-auto with no wire-level
-# approval channel (codex: --sandbox danger-full-access; agy:
-# --dangerously-skip-permissions). These get a per-session git worktree so a broad
-# `git add -A` inside the session can never sweep unrelated in-flight
-# changes from the user's main checkout. Claude keeps its interactive
-# approval flow and runs in place.
-_WORKTREE_HARNESSES = frozenset({"codex", "agy", "deepseek-harness"})
 
 log = logging.getLogger("drover.harnessd")
 
@@ -383,17 +366,9 @@ def apply_structured_preferences(
     thinking_effort: str | None,
 ) -> list[str]:
     """Add startup preferences for a persistent structured CLI process."""
-    preferred = list(command)
-    # Claude owns one process for the whole session, so its preferences must
-    # be fixed when that process starts. Codex and Gemini spawn per turn and
-    # their drivers apply the current preferences to each child process.
-    if harness != "claude-code":
-        return preferred
-    if model:
-        preferred.extend(["--model", model])
-    if thinking_effort:
-        preferred.extend(["--effort", thinking_effort])
-    return preferred
+    return BUILTIN_ADAPTERS.resolve(harness).apply_preferences(
+        command, model, thinking_effort
+    )
 
 
 def _native_resume_args(harness: str, native_resume: Any) -> list[str]:
@@ -1267,7 +1242,6 @@ def _path_hint(path: Path) -> str:
 # genuinely quiet-but-ready REPL still gets seeded.
 _SEED_SETTLE_S = 0.4
 _SEED_COLD_QUIET_S = 1.5
-_RECOVERY_HARNESSES = {"claude-code", "codex", "deepseek-harness"}
 _RECOVERY_UNAVAILABLE = (
     "Session cannot be resumed after the harness restart. "
     "Continue it in a new session."
@@ -1310,9 +1284,8 @@ class HarnessDaemonState:
     registry: HarnessRegistry
     pty: PtySessionManager
     presets: dict[str, HarnessPreset]
-    auth: AuthFlowManager = field(
-        default_factory=lambda: AuthFlowManager(default_auth_adapters())
-    )
+    adapters: HarnessAdapterRegistry = field(default_factory=lambda: BUILTIN_ADAPTERS)
+    auth: AuthFlowManager | None = None
     structured: StructuredSessionManager = field(
         default_factory=StructuredSessionManager
     )
@@ -1376,6 +1349,12 @@ class HarnessDaemonState:
     model_catalog_service: ModelCatalogService | None = None
     model_catalog_service_lock: threading.Lock = field(default_factory=threading.Lock)
 
+    def __post_init__(self) -> None:
+        if self.auth is None:
+            self.auth = AuthFlowManager(default_auth_adapters(adapters=self.adapters))
+        if isinstance(self.structured, StructuredSessionManager):
+            self.structured.adapters = self.adapters
+
     def recovery_lock_for(self, session_id: str) -> threading.Lock:
         with self.recovery_locks_guard:
             return self.recovery_locks.setdefault(session_id, threading.Lock())
@@ -1405,7 +1384,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         with state.model_catalog_service_lock:
             if state.model_catalog_service is None:
                 state.model_catalog_service = default_model_catalog_service(
-                    state.host_id, state.presets
+                    state.host_id, state.presets, adapters=state.adapters
                 )
             return state.model_catalog_service
 
@@ -2273,6 +2252,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # it is ever called directly.
         client_session_id = _optional_text(body.get("client_session_id"))
         harness = str(body.get("harness") or "")
+        try:
+            adapter = self.server.state.adapters.resolve(
+                harness, operation="structured"
+            )
+        except (KeyError, UnsupportedHarnessOperation):
+            self._write_json(
+                {"error": f"harness has no structured driver: {harness}"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         cwd = body.get("cwd")
         worktrees_dir = self.server.state.worktrees_dir
         from drover.server.staging_credentials import is_staging, staging_session_paths
@@ -2319,10 +2308,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
         command = body.get("command")
-        default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(harness)
-        if command is None and default_command_fn:
+        if command is None:
             try:
-                command = default_command_fn()
+                command = adapter.default_command()
             except (ValueError, OSError) as exc:
                 # A staging host builds its command from an explicit key file
                 # and refuses to launch without it. That has to reach the
@@ -2341,12 +2329,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
         if command is not None:
-            command = apply_structured_preferences(
-                list(command),
-                harness=harness,
-                model=model,
-                thinking_effort=thinking_effort,
-            )
+            command = adapter.apply_preferences(list(command), model, thinking_effort)
         label_source = command
         # A handoff already carries its own idempotency key: the session it
         # came from. The hub stops waiting for a create after
@@ -2380,7 +2363,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
         session_cwd = str(cwd) if cwd is not None else None
         session_worktree: SessionWorktree | None = None
-        if harness in _WORKTREE_HARNESSES and session_cwd is not None:
+        if adapter.capabilities.worktree:
+            policy = adapter.worktree_policy()
+            if policy != "isolate_if_git":
+                self._write_json(
+                    {"error": f"unsupported worktree policy for {harness}: {policy}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+        if adapter.capabilities.worktree and session_cwd is not None:
             # These harnesses run full-auto with no approval channel, so the
             # worktree is the only thing standing between the session and the
             # user's checkout. A directory that cannot host one (no repo, no
@@ -2561,7 +2552,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # Claude owns one persistent process, so later turn preferences cannot
         # affect the running model. Silently ignore overrides from older/direct
         # clients and preserve the startup preferences stored in the registry.
-        if harness == "claude-code":
+        adapter = self.server.state.adapters.resolve(harness or "")
+        if not adapter.turn_preferences_mutable:
             model = None
             thinking_effort = None
         if model is not None or thinking_effort is not None:
@@ -2632,12 +2624,23 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 self.server.state.structured.close(session_id)
 
             session = self.server.state.registry.get_session(session_id)
+            try:
+                adapter = (
+                    self.server.state.adapters.resolve(
+                        session.harness, operation="native_resume"
+                    )
+                    if session is not None
+                    else None
+                )
+            except (KeyError, UnsupportedHarnessOperation):
+                adapter = None
             if (
                 session is None
                 or session.mode != "structured"
                 or session.status != "errored"
                 or session.last_error != _ORPHANED_STRUCTURED_ERROR
-                or session.harness not in _RECOVERY_HARNESSES
+                or adapter is None
+                or not adapter.recover_after_restart
                 or not native_session_id
                 or (
                     session.native_session_id
@@ -2652,15 +2655,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            default_command_fn = _STRUCTURED_DEFAULT_COMMANDS.get(session.harness)
-            if default_command_fn is None:
-                self._write_json(
-                    {"error": _RECOVERY_UNAVAILABLE},
-                    status=HTTPStatus.CONFLICT,
-                )
-                return
             try:
-                default_command = default_command_fn()
+                default_command = adapter.default_command()
             except (ValueError, OSError):
                 # Same explicit-credential refusal as the create path. There
                 # is nothing to recover onto until the operator fixes the key.
@@ -2669,11 +2665,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.CONFLICT,
                 )
                 return
-            command = apply_structured_preferences(
-                default_command,
-                harness=session.harness,
-                model=session.model,
-                thinking_effort=session.thinking_effort,
+            command = adapter.apply_preferences(
+                default_command, session.model, session.thinking_effort
             )
             try:
                 self.server.state.structured.start(
@@ -2744,7 +2737,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.NOT_FOUND,
             )
             return
-        except RuntimeError as exc:
+        except (RuntimeError, UnsupportedHarnessOperation) as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         self._write_json({"ok": True})
