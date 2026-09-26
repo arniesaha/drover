@@ -54,6 +54,10 @@ from drover.server.advisory.model_analyzer import (
     ModelFindingError,
 )
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.snapshot_process import (
+    read_operational_snapshot_in_child,
+    supports_isolated_snapshot,
+)
 from drover.server.advisory.types import FindingCandidate
 from drover.server.analytics_maintenance import (
     AnalyticalMaintenanceGate,
@@ -714,10 +718,13 @@ class AdvisoryWorker:
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         maintenance_gate: AnalyticalMaintenanceGate | None = None,
         max_consecutive_skips: int = 10,
+        isolated_snapshots: bool = False,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.repository = repository
         self.snapshot_factory = snapshot_factory
+        self.isolated_snapshots = isolated_snapshots
+        self._isolated_snapshot_supported: bool | None = None
         self.worker_id = worker_id
         self.retry_delay = retry_delay
         # Analyzer snapshots read the shared analytical instance, so a sweep
@@ -880,9 +887,27 @@ class AdvisoryWorker:
     def _execute(self, analyzer: Analyzer, job: Job) -> None:
         target_id = job.subject_key.partition(":")[2]
         source_version = self._source_version(job.job_id)
-        snapshot = self.snapshot_factory(
-            analyzer.analyzer_id, target_id, source_version
-        )
+        if self.isolated_snapshots:
+            if self._isolated_snapshot_supported is None:
+                self._isolated_snapshot_supported = supports_isolated_snapshot(
+                    self.duckdb_path
+                )
+                if not self._isolated_snapshot_supported:
+                    log.info(
+                        "atomic clone unavailable; using the existing advisory snapshot reader"
+                    )
+            if self._isolated_snapshot_supported:
+                snapshot = read_operational_snapshot_in_child(
+                    self.duckdb_path, analyzer.analyzer_id, target_id, source_version
+                )
+            else:
+                snapshot = self.snapshot_factory(
+                    analyzer.analyzer_id, target_id, source_version
+                )
+        else:
+            snapshot = self.snapshot_factory(
+                analyzer.analyzer_id, target_id, source_version
+            )
         if snapshot.source_version != source_version:
             raise ValueError("snapshot source version does not match the durable job")
 
@@ -1180,6 +1205,9 @@ def load_operational_snapshot(
     *,
     analyzed_at: datetime | None = None,
     connection_observer: Callable[[Any | None], None] | None = None,
+    control_source_path: str | Path | None = None,
+    include_control_wal: bool = False,
+    control_scratch_root: Path | None = None,
 ) -> AnalysisSnapshot:
     """Build analyzer-scoped bounded facts from normalized runtime state.
 
@@ -1205,7 +1233,12 @@ def load_operational_snapshot(
         # database. This attaches a private copy of that (small) store so the
         # queries below can stay exactly as they were, without this analytical
         # reader ever touching the live control-plane file.
-        with attached_control_plane_snapshot(con, Path(duckdb_path)):
+        with attached_control_plane_snapshot(
+            con,
+            Path(control_source_path or duckdb_path),
+            include_wal=include_control_wal,
+            scratch_root=control_scratch_root,
+        ):
             if analyzer_id in {
                 ConnectorFreshnessAnalyzer.analyzer_id,
                 ProviderResetWindowAnalyzer.analyzer_id,

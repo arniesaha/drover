@@ -58,7 +58,7 @@ from drover.server.advisory.worker import (
     reset_plane_window_stats,
 )
 from drover.server.cockpit.service import ProviderRefreshLoop
-from drover.server.db import control_plane_path
+from drover.server.db import control_plane_path, supports_atomic_duckdb_clone
 from drover.server.harness.models import HarnessHost
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.ledger import Ledger
@@ -187,6 +187,56 @@ def db_path(tmp_path: Path) -> Path:
     path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "lake", duckdb_path=path)
     return path
+
+
+def test_operational_worker_runs_snapshot_in_child_on_atomic_volume(
+    db_path: Path,
+) -> None:
+    if not supports_atomic_duckdb_clone(db_path):
+        pytest.skip("requires an atomic clone on the source volume")
+    enqueue_advisory_check(
+        db_path,
+        analyzer_id=ConnectorFreshnessAnalyzer.analyzer_id,
+        target_id="fleet",
+        source_version="facts:v1",
+    )
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=lambda *_: pytest.fail("the live reader was used"),
+        isolated_snapshots=True,
+    )
+
+    result = worker.run_once([ConnectorFreshnessAnalyzer()])
+
+    assert result.succeeded == 1
+    assert result.failed == 0
+
+
+def test_isolated_worker_keeps_live_reader_when_atomic_clone_is_unavailable(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from drover.server.advisory import worker as worker_module
+
+    monkeypatch.setattr(worker_module, "supports_isolated_snapshot", lambda _: False)
+    enqueue_advisory_check(
+        db_path, analyzer_id="healthy", target_id="mac-mini", source_version="v1"
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    def snapshot_factory(analyzer_id: str, target_id: str, version: str):
+        calls.append((analyzer_id, target_id, version))
+        return _snapshot(version)
+
+    worker = AdvisoryWorker(
+        duckdb_path=db_path,
+        repository=AdvisoryRepository(db_path),
+        snapshot_factory=snapshot_factory,
+        isolated_snapshots=True,
+    )
+
+    assert worker.run_once([HealthyAnalyzer()]).succeeded == 1
+    assert calls == [("healthy", "mac-mini", "v1")]
 
 
 class HealthyAnalyzer:

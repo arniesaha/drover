@@ -3106,6 +3106,7 @@ def run(
             duckdb_path=cfg.duckdb_path,
             maintenance_gate=analytics_gate,
             repository=AdvisoryRepository(cfg.duckdb_path),
+            isolated_snapshots=True,
             snapshot_factory=lambda analyzer_id, target_id, source_version: load_operational_snapshot(
                 cfg.duckdb_path, analyzer_id, target_id, source_version
             ),
