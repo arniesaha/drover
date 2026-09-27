@@ -601,6 +601,26 @@ PY
   success "config.toml points at $address"
 }
 
+
+harness_url_args() {
+  local kind="$1" address="$2" url
+  url="http://${address%%:*}:7081"
+  case "$kind" in
+    tailscale) printf '%s' "--tailscale-url $url" ;;
+    loopback)  printf '%s' "--local-url $url" ;;
+    *)         printf '%s' "--local-url $url" ;;
+  esac
+}
+
+fleet_harness_args() {
+  local kind="$1" address="$2" listen_host
+  case "$kind" in
+    loopback) listen_host="127.0.0.1" ;;
+    *)        listen_host="0.0.0.0" ;;
+  esac
+  printf '%s' "--listen ${listen_host}:7081 $(harness_url_args "$kind" "$address")"
+}
+
 # --- units -------------------------------------------------------------------
 # install_units <mode> <central-url> [extra harnessd args]
 #   mode "fleet" installs the hub and a local harnessd.
@@ -609,8 +629,14 @@ PY
 install_units() {
   local mode="$1" central_url="$2" extra="${3:-}" server_env_file="${4:-}"
   local host_id; host_id="$(hostname -s 2>/dev/null || echo drover-host)"
+  local host_kind
+  case "$OS" in
+    darwin) host_kind="macos" ;;
+    linux) host_kind="linux" ;;
+    *) host_kind="$OS" ;;
+  esac
   local bin="$DROVER_HOME/runtime/current/bin"
-  "$bin/python" - "$OS" "$HOME" "$DROVER_HOME" "$host_id" "$mode" \
+  "$bin/python" - "$OS" "$HOME" "$DROVER_HOME" "$host_id" "$host_kind" "$mode" \
     "$central_url" "$extra" "$server_env_file" <<'PY'
 import sys
 from pathlib import Path
@@ -619,12 +645,19 @@ from drover.server.service_units import render_launchd, render_systemd, runtime_
 os_name = sys.argv[1]
 home = Path(sys.argv[2])
 drover_home = Path(sys.argv[3])
-host_id, mode, central_url, extra, server_env_file = sys.argv[4:]
+host_id, host_kind, mode, central_url, extra, server_env_file = sys.argv[4:]
 
 bin_dir = runtime_bin(drover_home)
-path_entries = [str(bin_dir), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
+path_entries = [
+    str(bin_dir),
+    str(home / ".local" / "bin"),
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+]
 
-harnessd_args = ["--host-id", host_id, "--central-url", central_url]
+harnessd_args = ["--host-id", host_id, "--kind", host_kind, "--central-url", central_url]
 harnessd_args += [part for part in extra.split() if part]
 
 jobs = [("harnessd", str(bin_dir / "drover-harnessd"), harnessd_args, None)]
@@ -795,7 +828,7 @@ EOF
 
   if [ "$reachable" -eq 1 ]; then
     success "hub can reach this machine; registering as a direct host"
-    listen_args="--listen 0.0.0.0:7081 --local-url http://${local_addr}:7081"
+    listen_args="--listen 0.0.0.0:7081 $(harness_url_args "$_kind" "${local_addr}:7081")"
   else
     success "hub cannot reach this machine; registering as a relay host"
     listen_args="--relay"
@@ -818,7 +851,7 @@ EOF
   success "host credential stored"
 
   # Rewrite the harnessd unit with the connection mode the probe chose.
-  install_units "$listen_args" "http://${HUB_ADDRESS}"
+  install_units join "http://${HUB_ADDRESS}" "$listen_args"
   start_units harnessd
   success "joined $HUB_ADDRESS as $host_id"
 }
@@ -891,10 +924,11 @@ EOF
     esac
   fi
   write_config "$ADDRESS"
+  FLEET_HARNESS_ARGS="$(fleet_harness_args "$ADDRESS_KIND" "$ADDRESS")"
   if [ "$control_store_backend" = "postgres" ]; then
     if [ "$fresh_central_config" -eq 1 ]; then initialize_control_store; else verify_control_store_ready; fi
   fi
-  install_units fleet "http://${ADDRESS}" "" "$CONTROL_STORE_ENV_FILE"
+  install_units fleet "http://${ADDRESS}" "$FLEET_HARNESS_ARGS" "$CONTROL_STORE_ENV_FILE"
   if [ "$NO_START" -eq 1 ]; then
     info "automation mode: service definitions were written but services were not started; hub readiness and pairing were not checked"
   else

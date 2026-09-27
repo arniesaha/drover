@@ -831,6 +831,49 @@ def test_model_preference_validation_rejects_turn_before_attachment_or_driver(
     assert not state.attachments_dir.exists()
 
 
+def test_missing_structured_executable_turn_returns_json_and_marks_session_errored(
+    tmp_path,
+):
+    class _MissingExecutableStructuredManager(_FakeStructuredManager):
+        def submit_turn(
+            self, session_id: str, *, prepare, **kwargs
+        ) -> tuple[str, bool]:
+            prepare()
+            raise FileNotFoundError(2, "No such file or directory", "codex")
+
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _MissingExecutableStructuredManager(harness="codex")
+    session = state.registry.create_session(
+        host_id=state.host_id,
+        harness="codex",
+        command="codex",
+        session_id="session-1",
+        status="running",
+        started_at=datetime.now(timezone.utc),
+        mode="structured",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/sessions/{session.session_id}/turns",
+                payload={"text": "continue"},
+            )
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+        stored = state.registry.get_session(session.session_id)
+        events = state.registry.list_events(session.session_id)
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 502
+    assert payload["error"].startswith("structured harness launch failed:")
+    assert stored is not None
+    assert stored.status == "errored"
+    assert stored.last_error == payload["error"]
+    assert any(event.event_type == "session.error" for event in events)
+
+
 def test_client_turn_id_requires_a_uuid():
     with pytest.raises(ValueError, match="client_turn_id must be a UUID"):
         harness_daemon._optional_client_turn_id("not-a-uuid")

@@ -61,6 +61,10 @@ def render_launchd(
     log_dir = Path(home) / "Library" / "Logs" / "drover"
     short = label.rsplit(".", 1)[-1]
     program_arguments = [program, *arguments]
+    environment_variables = {
+        "HOME": str(Path(home)),
+        "PATH": ":".join(path_entries),
+    }
     if environment_file is not None:
         # launchd has no EnvironmentFile equivalent. Keep the secret in the
         # private file and use a fixed shell wrapper to export it before the
@@ -68,7 +72,7 @@ def render_launchd(
         program_arguments = [
             "/bin/sh",
             "-c",
-            'set -a; . "$1"; shift; exec "$@"',
+            'set -a; . "$1" || exit $?; shift; exec "$@"',
             "drover-service-env",
             str(environment_file),
             *program_arguments,
@@ -76,7 +80,7 @@ def render_launchd(
     payload = {
         "Label": label,
         "ProgramArguments": program_arguments,
-        "EnvironmentVariables": {"PATH": ":".join(path_entries)},
+        "EnvironmentVariables": environment_variables,
         "KeepAlive": keep_alive,
         "ExitTimeOut": EXIT_TIMEOUT_SECONDS,
         "RunAtLoad": True,
