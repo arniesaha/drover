@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IMAGE='docker.io/library/postgres@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929'
+HOME_DIR="${DROVER_HOME:-$HOME/.drover}"; ENV_FILE="$HOME_DIR/server.env"
+NAME="${DROVER_POSTGRES_CONTAINER:-drover-postgres}"; VOLUME="${DROVER_POSTGRES_VOLUME:-drover-postgres-data}"; INSTANCE="${DROVER_POSTGRES_INSTANCE:-default}"; PORT="${DROVER_POSTGRES_PORT:-54329}"
+DOCKER=docker; $DOCKER version --format '{{.Server.Version}}' >/dev/null 2>&1 || { echo 'Docker-compatible runtime unavailable.' >&2; exit 1; }
+labels(){ $DOCKER inspect --format '{{index .Config.Labels "io.drover.owner"}} {{index .Config.Labels "io.drover.component"}} {{index .Config.Labels "io.drover.instance"}}' "$NAME" 2>/dev/null || true; }
+vol_labels(){ $DOCKER volume inspect --format '{{index .Labels "io.drover.owner"}} {{index .Labels "io.drover.component"}} {{index .Labels "io.drover.instance"}}' "$VOLUME" 2>/dev/null || true; }
+cid(){ $DOCKER inspect --format '{{.Id}}' "$NAME" 2>/dev/null || true; }
+vid(){ $DOCKER volume inspect --format '{{.Name}}' "$VOLUME" 2>/dev/null || true; }
+owned(){ [ "$(labels)" = "drover postgres-control-store $INSTANCE" ]; }
+mounted_volume(){ { $DOCKER inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' "$NAME" 2>/dev/null; $DOCKER inspect --format '{{range .HostConfig.Mounts}}{{if eq .Target "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}' "$NAME" 2>/dev/null; } | awk 'NF{print; exit}'; }
+publication(){ { $DOCKER port "$NAME" 5432/tcp 2>/dev/null; $DOCKER inspect --format '{{range $p,$b := .HostConfig.PortBindings}}{{if eq $p "5432/tcp"}}{{range $b}}{{.HostIp}}:{{.HostPort}}{{end}}{{end}}{{end}}' "$NAME" 2>/dev/null; } | awk 'NF{print; exit}'; }
+running(){ [ "$($DOCKER inspect --format '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; }
+loopback(){ case "$(publication)" in "127.0.0.1:$PORT"|"[::1]:$PORT") return 0;; *) return 1;; esac; }
+container_shape(){ [ -n "$(cid)" ] && owned && [ "$(mounted_volume)" = "$VOLUME" ] && loopback; }
+volume_shape(){ [ "$(vid)" = "$VOLUME" ] && [ "$(vol_labels)" = "drover postgres-control-store $INSTANCE" ]; }
+password_from_env(){ python3 - "$ENV_FILE" "$PORT" <<'PY'
+import os, stat, sys, urllib.parse
+path, expected_port = sys.argv[1], int(sys.argv[2])
+st = os.lstat(path)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+    raise SystemExit(1)
+text = open(path, encoding="utf-8").read()
+prefix = 'DROVER_CONTROL_DSN="'
+if not text.startswith(prefix) or not text.endswith('"\n') or text.count('\n') != 1:
+    raise SystemExit(1)
+body = text[len(prefix):-2]
+decoded=[]; i=0
+while i < len(body):
+    ch=body[i]
+    if ch != "\\": decoded.append(ch); i += 1; continue
+    i += 1
+    if i == len(body) or body[i] not in {'\\','"','$','`'}: raise SystemExit(1)
+    decoded.append(body[i]); i += 1
+parsed = urllib.parse.urlparse("".join(decoded))
+password = urllib.parse.unquote(parsed.password or "")
+if parsed.scheme != "postgresql" or parsed.username != "drover" or not password or parsed.hostname != "127.0.0.1" or parsed.port != expected_port or parsed.path != "/drover" or parsed.params or parsed.query or parsed.fragment:
+    raise SystemExit(1)
+print(password)
+PY
+}
+require_shape(){
+  container_shape || { echo 'managed PostgreSQL ownership, mount, or loopback endpoint mismatch; refusing.' >&2; exit 1; }
+  PG_PASS="$(password_from_env)" || { echo 'owner-only managed server.env is missing, unsafe, or targets the wrong endpoint; refusing.' >&2; exit 1; }
+}
+check_auth(){
+  running || { echo 'managed PostgreSQL container is not running.' >&2; return 1; }
+  PGPASSWORD="$PG_PASS" $DOCKER exec -e PGPASSWORD "$NAME" psql -h 127.0.0.1 -p 5432 -U drover -d drover -v ON_ERROR_STOP=1 -qAt -c 'select 1' >/dev/null 2>&1 \
+    || { echo 'managed PostgreSQL password authentication failed inside the managed container; refusing.' >&2; return 1; }
+}
+wait_auth(){ local n=30; while [ "$n" -gt 0 ]; do check_auth >/dev/null 2>&1 && return 0; n=$((n-1)); sleep 1; done; check_auth; }
+case "${1:-status}" in purge) : ;; *) require_shape ;; esac
+case "${1:-status}" in
+ status) $DOCKER ps -a --filter "name=^/${NAME}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'; if running; then check_auth || exit 1; else echo 'managed PostgreSQL is stopped; auth not checked.' >&2; fi ;;
+ start) $DOCKER start "$NAME" >/dev/null 2>&1 || true; wait_auth ;;
+ stop) running && $DOCKER stop --time 30 "$NAME" || true ;;
+ backup)
+  out="${2:?usage: backup /absolute/path/out.dump}"; case "$out" in /*) ;; *) exit 2;; esac; [ ! -e "$out" ] || { echo 'refusing overwrite' >&2; exit 2; }
+  tmp="$(mktemp "${out}.partial.XXXXXX")"; trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  wait_auth
+  PGPASSWORD="$PG_PASS" $DOCKER exec -e PGPASSWORD "$NAME" pg_dump -h 127.0.0.1 -p 5432 -U drover -d drover -Fc > "$tmp"
+  [ -s "$tmp" ] && $DOCKER exec -i "$NAME" pg_restore -l < "$tmp" >/dev/null
+  mv "$tmp" "$out"; trap - EXIT HUP INT TERM; echo "verified logical backup: $out" ;;
+ restore)
+  in="${2:?usage: restore /absolute/path/backup.dump --i-understand-this-overwrites-drover --server-stopped}"; [ "${3:-}" = '--i-understand-this-overwrites-drover' ] && [ "${4:-}" = '--server-stopped' ] || { echo 'exact confirmations required' >&2; exit 2; }
+  [ -r "$in" ] && $DOCKER exec -i "$NAME" pg_restore -l < "$in" >/dev/null || { echo 'invalid archive' >&2; exit 2; }
+  pgrep -f 'drover-server.* run' >/dev/null && { echo 'refusing restore while native drover-server is running' >&2; exit 2; }
+  wait_auth
+  PGPASSWORD="$PG_PASS" $DOCKER exec -i -e PGPASSWORD "$NAME" pg_restore -h 127.0.0.1 -p 5432 -U drover -d drover --clean --if-exists --no-owner < "$in" ;;
+ purge)
+  [ "${2:-}" = '--i-understand-this-deletes-drover-postgres-data' ] || exit 2
+  CID="$(cid)"; [ -n "$CID" ] && container_shape && volume_shape || { echo 'ownership/mount/volume mismatch; refusing purge' >&2; exit 2; }
+  $DOCKER rm -f "$CID"; [ "$(vid)" = "$VOLUME" ] && volume_shape && $DOCKER volume rm "$VOLUME" ;;
+ *) exit 2;; esac

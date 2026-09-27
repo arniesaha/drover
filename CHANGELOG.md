@@ -14,7 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogs through the validated harness adapter registry. No intentional
   lifecycle or client behavior changes.
 
-## [0.4.19] - 2026-09-26
+## [0.5.0] - 2026-09-26
+
+### Added
+- First-class explicit PostgreSQL setup choice: validated operator-owned DSN or a Drover-owned, loopback-only PostgreSQL 17 container.
+- Managed-mode health, idempotence, lifecycle, logical backup, and explicit purge boundaries.
+
 
 ### Fixed
 

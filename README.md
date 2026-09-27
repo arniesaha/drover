@@ -67,18 +67,20 @@ an explicit central serving store should read [PostgreSQL control store](docs/po
 
 Requires macOS or Linux with Python 3.11+.
 
+Choose one explicit central control-store mode:
+
 ```bash
+# Existing PostgreSQL you operate (backwards compatible when the DSN is set)
 export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
-curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --control-store existing
+
+# Fresh trusted central server: reuse Docker/OrbStack's already-running Docker CLI
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --control-store managed
 ```
 
-Before running the installer on the first central machine, provision a
-reachable empty PostgreSQL database and export its DSN. The installer validates
-the connection, initializes the empty control store, then starts the server and
-a local harness host. It detects an address your phone can reach and prints a
-QR code. Scan it with the app and you are connected: no token is typed or
-copied. It stores the DSN in a private service environment file, not in the
-generated TOML configuration or service logs.
+Existing mode validates connectivity and readiness without creating a database. Managed mode creates or reuses only a labeled Drover PostgreSQL 17 container, bound to `127.0.0.1:54329`, with a named Drover-owned volume. Drover never installs Docker, OrbStack, Podman, or another runtime; an unavailable CLI/daemon stops with guidance. The server and harnessd remain native processes.
+
+The installer initializes the control store only after PostgreSQL is healthy, then starts the server and local harness host. It stores the DSN in `~/.drover/server.env` mode `0600`, never TOML or service arguments.
 
 It also links `drover-server` into `~/.local/bin`, so it is on your PATH. When
 that directory is not on your PATH, the installer says so and prints the line

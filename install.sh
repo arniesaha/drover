@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO="arniesaha/drover"
 DROVER_HOME="${HOME}/.drover"
-JOIN_URL="" EXPLICIT_URL="" ADOPT=0 DRY_RUN=0 VERIFY_RELEASE=0 NO_START=0 WANT_VERSION=""
+JOIN_URL="" EXPLICIT_URL="" ADOPT=0 DRY_RUN=0 VERIFY_RELEASE=0 NO_START=0 WANT_VERSION="" CONTROL_STORE_MODE=""
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'; NC=$'\033[0m'
@@ -48,6 +48,7 @@ while [ $# -gt 0 ]; do
     --join)    JOIN_URL="${2:-}"; shift 2 ;;
     --url)     EXPLICIT_URL="${2:-}"; shift 2 ;;
     --version) WANT_VERSION="${2:-}"; shift 2 ;;
+    --control-store) CONTROL_STORE_MODE="${2:-}"; shift 2 ;;
     --adopt)   ADOPT=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --verify-release) VERIFY_RELEASE=1; shift ;;
@@ -61,6 +62,7 @@ done
 
 [ "$NO_START" -eq 1 ] && [ -n "$JOIN_URL" ] \
   && fail "--no-start cannot be used with --join"
+[ -n "$JOIN_URL" ] && [ -n "$CONTROL_STORE_MODE" ] && fail "--control-store cannot be used with --join"
 [ "$VERIFY_RELEASE" -eq 1 ] && [ "$DRY_RUN" -eq 1 ] \
   && fail "--verify-release cannot be combined with --dry-run"
 [ "$VERIFY_RELEASE" -eq 1 ] && [ -n "$JOIN_URL" ] \
@@ -90,10 +92,11 @@ if [ -n "$SELF_DIR" ] && [ -r "$SELF_DIR/scripts/lib/verify.sh" ]; then
   . "$SELF_DIR/scripts/lib/verify.sh"
   . "$SELF_DIR/scripts/lib/detect.sh"
   . "$SELF_DIR/scripts/lib/health.sh"
+  . "$SELF_DIR/scripts/lib/managed_postgres.sh"
 else
   LIB_TMP="$(mktemp -d)"
   trap 'rm -rf "$LIB_TMP"' EXIT
-  for lib in verify detect health; do
+  for lib in verify detect health managed_postgres; do
     curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/lib/${lib}.sh" \
       -o "$LIB_TMP/${lib}.sh" || fail "could not fetch scripts/lib/${lib}.sh"
     . "$LIB_TMP/${lib}.sh"
@@ -213,11 +216,13 @@ info "Drover installer"
 info "  platform:  $OS"
 info "  address:   $ADDRESS ($ADDRESS_KIND)"
 info "  runtime:   $DROVER_HOME/runtime"
+if [ -n "$CONTROL_STORE_MODE" ]; then info "  control store: $CONTROL_STORE_MODE"; elif [ -n "${DROVER_CONTROL_DSN:-}" ]; then info "  control store: existing (DROVER_CONTROL_DSN)"; else info "  control store: selection required"; fi
 if [ "$ADDRESS_KIND" = "loopback" ]; then
   warn "no private address found; only this machine will reach the server"
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
+  case "$CONTROL_STORE_MODE" in managed) info "  would create or reuse a Drover-owned PostgreSQL 17 container, loopback port 127.0.0.1:54329, and named volume $DROVER_POSTGRES_VOLUME" ;; existing) info "  would validate the supplied existing PostgreSQL DSN; no database would be created" ;; "") if [ -n "${DROVER_CONTROL_DSN:-}" ]; then info "  would validate the supplied existing PostgreSQL DSN; no database would be created"; else info "  control-store selection required; would make no database mutations"; fi ;; *) fail "--control-store must be existing or managed" ;; esac
   info "  would write $DROVER_HOME/config.toml with [server] advertised_url"
   if [ "$OS" = "darwin" ]; then
     info "  would install $HOME/Library/LaunchAgents/com.drover.server.plist"
@@ -831,6 +836,19 @@ if [ "$VERIFY_RELEASE" -eq 1 ]; then
   exit 0
 fi
 install_runtime "$VERSION"
+if [ "$CONTROL_STORE_MODE" = managed ]; then
+  if [ -n "$SELF_DIR" ] && [ -r "$SELF_DIR/scripts/drover-managed-postgres" ]; then
+    mkdir -p "$DROVER_HOME/bin"
+    cp "$SELF_DIR/scripts/drover-managed-postgres" "$DROVER_HOME/bin/drover-managed-postgres"
+    chmod 700 "$DROVER_HOME/bin/drover-managed-postgres"
+  elif [ -z "$SELF_DIR" ]; then
+    mkdir -p "$DROVER_HOME/bin"
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/drover-managed-postgres" \
+      -o "$DROVER_HOME/bin/drover-managed-postgres" \
+      || fail "could not fetch managed PostgreSQL lifecycle helper"
+    chmod 700 "$DROVER_HOME/bin/drover-managed-postgres"
+  fi
+fi
 # Both paths, not just the hub: a joined host runs harnessd only, but its
 # operator still needs `drover-server --version` to see what it is running.
 link_cli
@@ -854,15 +872,27 @@ EOF
     || fail "could not determine the control-store configuration"
   CONTROL_STORE_ENV_FILE=""
   if [ "$control_store_backend" = "postgres" ]; then
-    write_control_store_environment "$control_store_dsn_env"
+    case "$CONTROL_STORE_MODE" in
+      managed)
+        CONTROL_STORE_ENV_FILE="$DROVER_HOME/server.env"
+        if [ -f "$CONTROL_STORE_ENV_FILE" ]; then
+          managed_postgres_start_or_reuse "$CONTROL_STORE_ENV_FILE"
+        else
+          mkdir -p "$DROVER_HOME"
+          managed_postgres_start_or_reuse "$CONTROL_STORE_ENV_FILE"
+        fi
+        managed_postgres_wait_ready "$CONTROL_STORE_ENV_FILE"
+        ;;
+      existing|"")
+        [ -n "$CONTROL_STORE_MODE" ] || [ -n "${DROVER_CONTROL_DSN:-}" ] || [ "$fresh_central_config" -eq 0 ] || fail "choose --control-store existing with DROVER_CONTROL_DSN, or --control-store managed; refusing to create a database implicitly"
+        write_control_store_environment "$control_store_dsn_env"
+        ;;
+      *) fail "--control-store must be existing or managed" ;;
+    esac
   fi
   write_config "$ADDRESS"
   if [ "$control_store_backend" = "postgres" ]; then
-    if [ "$fresh_central_config" -eq 1 ]; then
-      initialize_control_store
-    else
-      verify_control_store_ready
-    fi
+    if [ "$fresh_central_config" -eq 1 ]; then initialize_control_store; else verify_control_store_ready; fi
   fi
   install_units fleet "http://${ADDRESS}" "" "$CONTROL_STORE_ENV_FILE"
   if [ "$NO_START" -eq 1 ]; then
