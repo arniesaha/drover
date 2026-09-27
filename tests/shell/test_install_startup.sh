@@ -486,6 +486,28 @@ check_status "existing PostgreSQL install accepts its private environment" "$RES
 MODE="$($PYTHON -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$HOME_DIR/.drover/server.env")"
 check_status "existing PostgreSQL environment is owner-only" "$MODE" "0o600"
 
+new_case tailscale-address
+TAILSCALE_BIN="$CASE_DIR/tailscale"
+printf '%s
+' \
+  '#!/usr/bin/env bash' \
+  'case "${1:-}" in' \
+  '  status) exit 0 ;;' \
+  '  ip) printf "100.80.1.2\n" ;;' \
+  '  *) exit 1 ;;' \
+  'esac' > "$TAILSCALE_BIN"
+chmod +x "$TAILSCALE_BIN"
+OUT="$(HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+  PYTHONPATH="$REPO/src" DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$TAILSCALE_BIN" \
+  USER=installer FIXTURE_HEALTH_MODE=ready DROVER_CONTROL_DSN=postgresql://fixture-control \
+  bash "$REPO/install.sh" --version 0.0.0 --no-start 2>&1)"
+RESULT=$?
+check_status "tailscale install succeeds" "$RESULT" "0"
+check_contains "tailscale harness advertises tailscale URL" \
+  "$HOME_DIR/.config/systemd/user/drover-harnessd.service" '--tailscale-url http://100.80.1.2:7081'
+check_contains "tailscale harness listens on a reachable interface" \
+  "$HOME_DIR/.config/systemd/user/drover-harnessd.service" '--listen 0.0.0.0:7081'
+
 new_case no-start
 OUT="$(run_new_fleet linux fail '100.64.0.10:7099' --no-start)"
 RESULT=$?

@@ -2535,6 +2535,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
     def _mark_structured_turn_launch_error(self, session_id: str, exc: OSError) -> None:
         message = f"structured harness launch failed: {exc}"
+        if self.server.state.structured.has(session_id):
+            self.server.state.structured.close(session_id)
         self._safe_update_session_status(
             session_id,
             "errored",
@@ -2549,6 +2551,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             normalized_source="structured",
             content_preview=message,
         )
+        self._cleanup_session_worktree(session_id)
 
     def _create_turn(self, session_id: str) -> None:
         if not self.server.state.structured.has(session_id):
