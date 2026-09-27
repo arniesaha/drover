@@ -14,6 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogs through the validated harness adapter registry. No intentional
   lifecycle or client behavior changes.
 
+## [0.4.19] - 2026-09-26
+
+### Fixed
+
+- Release publication now builds a disposable runtime from the checksum-covered
+  wheel and hash-pinned dependency lock before creating a GitHub Release. The
+  gate requires the PostgreSQL-default control-store configuration, service
+  environment-file support, and the control-store initializer, so a candidate
+  that would be rejected by the public installer never becomes latest.
+
+- The clean-install release check now provisions an isolated PostgreSQL target
+  and verifies schema readiness, service environment wiring, runtime activation,
+  pairing, and authenticated access without logging its generated DSN.
+
+- `install.sh --verify-release` now checks the selected public artifact in a
+  disposable runtime before any installation mutations. Plain `--dry-run`
+  remains an offline action preview.
+
 ## [0.4.18] - 2026-09-19
 
 ### Fixed

@@ -594,6 +594,20 @@ def test_clean_install_uses_configured_address_and_keeps_pairing_private() -> No
     assert 'echo "$PAIR_OUTPUT"' not in steps
 
 
+def test_clean_install_starts_and_waits_for_its_postgres_service() -> None:
+    steps = load_workflow("release.yml")["jobs"]["verify-install"]["steps"]
+    provision = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Provision an isolated PostgreSQL control store"
+    )
+
+    assert "sudo systemctl start postgresql" in provision
+    assert "pg_isready -q" in provision
+    assert "::add-mask::$DB_PASSWORD" in provision
+    assert "::add-mask::$DB_DSN" in provision
+
+
 def test_clean_install_suppresses_every_network_failure_diagnostic() -> None:
     """A failed curl must not expand a configured private endpoint in CI logs."""
     smoke = next(

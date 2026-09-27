@@ -29,17 +29,30 @@ is_private_address() {
 # the users who most need the tailnet. Verified on this machine: a live
 # 100.97.x.x tailnet address with no `tailscale` on PATH.
 _tailscale_bin() {
+  # An explicit candidate list is a complete test/operator override. Do not
+  # fall through to a host PATH binary: that would make a caller asking for an
+  # isolated lookup silently use a different tailnet installation.
+  if [ "${DROVER_TAILSCALE_CANDIDATES+x}" = x ]; then
+    local overridden_candidate
+    for overridden_candidate in $DROVER_TAILSCALE_CANDIDATES; do
+      if [ -x "$overridden_candidate" ]; then
+        printf '%s' "$overridden_candidate"
+        return 0
+      fi
+    done
+    return 1
+  fi
   if command -v tailscale >/dev/null 2>&1; then
     command -v tailscale
     return 0
   fi
   # Overridable so tests can isolate from the host's real install, and so a
   # user with an unusual install can point at it without editing this file.
-  local candidates="${DROVER_TAILSCALE_CANDIDATES:-\
+  local candidates="\
 /Applications/Tailscale.app/Contents/MacOS/Tailscale \
 /usr/local/bin/tailscale \
 /opt/homebrew/bin/tailscale \
-$HOME/.local/bin/tailscale}"
+$HOME/.local/bin/tailscale"
   local candidate
   for candidate in $candidates; do
     if [ -x "$candidate" ]; then

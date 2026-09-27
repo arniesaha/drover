@@ -86,7 +86,11 @@ check_absent "linux does not mention launchd" "$OUT" "LaunchAgents"
 mkdir -p "$WORK/nolan"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/nolan/ipconfig"
 chmod +x "$WORK/nolan/ipconfig"
-OUT="$(HOME="$HOME_DIR" DROVER_OS=darwin PATH="$WORK/nolan:$PATH" \
+# Stub both discovery commands. In particular, an installed real tailscale
+# must not win before the intentionally failing LAN lookup.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/nolan/tailscale"
+chmod +x "$WORK/nolan/tailscale"
+OUT="$(HOME="$HOME_DIR" DROVER_OS=darwin PATH="$WORK/nolan:/usr/bin:/bin" \
   DROVER_TAILSCALE_CANDIDATES="$WORK/no-such-tailscale" \
   bash "$REPO/install.sh" --dry-run 2>&1)"
 check_contains "warns when only loopback is available" "$OUT" "loopback"

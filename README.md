@@ -84,6 +84,12 @@ It also links `drover-server` into `~/.local/bin`, so it is on your PATH. When
 that directory is not on your PATH, the installer says so and prints the line
 to add.
 
+Use `install.sh --dry-run` for an offline, non-mutating action preview. Before
+committing a clean machine to an installation, use
+`install.sh --verify-release` to download the selected release into a
+disposable runtime, verify the published checksums, and confirm the
+PostgreSQL-default installer contract without writing `~/.drover`.
+
 Add another machine with the one-liner printed by
 `drover-server pair-host --name <host>`.
 

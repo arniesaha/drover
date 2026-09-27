@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO="arniesaha/drover"
 DROVER_HOME="${HOME}/.drover"
-JOIN_URL="" EXPLICIT_URL="" ADOPT=0 DRY_RUN=0 NO_START=0 WANT_VERSION=""
+JOIN_URL="" EXPLICIT_URL="" ADOPT=0 DRY_RUN=0 VERIFY_RELEASE=0 NO_START=0 WANT_VERSION=""
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'; NC=$'\033[0m'
@@ -50,6 +50,7 @@ while [ $# -gt 0 ]; do
     --version) WANT_VERSION="${2:-}"; shift 2 ;;
     --adopt)   ADOPT=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --verify-release) VERIFY_RELEASE=1; shift ;;
     --no-start) NO_START=1; shift ;;
     -h|--help)
       sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
@@ -60,6 +61,10 @@ done
 
 [ "$NO_START" -eq 1 ] && [ -n "$JOIN_URL" ] \
   && fail "--no-start cannot be used with --join"
+[ "$VERIFY_RELEASE" -eq 1 ] && [ "$DRY_RUN" -eq 1 ] \
+  && fail "--verify-release cannot be combined with --dry-run"
+[ "$VERIFY_RELEASE" -eq 1 ] && [ -n "$JOIN_URL" ] \
+  && fail "--verify-release cannot be used with --join"
 
 # Port syntax needs no helper library. Check it before a piped installer would
 # fetch or source helpers, so an invalid invocation is deterministic offline.
@@ -195,7 +200,9 @@ EOF
   esac
 }
 
-check_existing_install
+if [ "$VERIFY_RELEASE" -eq 0 ]; then
+  check_existing_install
+fi
 validate_explicit_url
 [ -n "$JOIN_URL" ] && parse_join_url "$JOIN_URL"
 read -r ADDRESS_KIND ADDRESS <<EOF
@@ -247,6 +254,11 @@ ensure_uv() {
   success "uv installed"
 }
 
+require_uv_for_release_verification() {
+  command -v uv >/dev/null 2>&1 && return 0
+  fail "--verify-release requires uv already on PATH; install uv first, or use --dry-run for an offline preview"
+}
+
 # --- version -----------------------------------------------------------------
 resolve_version() {
   if [ -n "$WANT_VERSION" ]; then
@@ -281,6 +293,54 @@ PY
   [ "$?" -eq 0 ] || return 1
   "$runtime_server" control-store init --help >/dev/null 2>&1
 }
+
+# Resolve and exercise a release without touching ~/.drover. This is separate
+# from --dry-run deliberately: plain dry-runs remain useful offline previews,
+# while this explicit mode downloads the selected artifacts and creates a
+# disposable runtime to prove the release can satisfy a PostgreSQL-default
+# central installation.
+verify_release_candidate() (
+  local version="$1"
+  local base="https://github.com/${REPO}/releases/download/v${version}"
+  local temporary; temporary="$(mktemp -d)"
+  local runtime="$temporary/runtime"
+  local wheel=""
+
+  cleanup_release_verification() { rm -rf "$temporary"; }
+  # `fail` exits this subshell. EXIT runs on success and every failure on
+  # Bash 3.2, unlike a RETURN trap which is skipped by `exit`.
+  trap cleanup_release_verification EXIT
+
+  curl -fsSL "$base/SHA256SUMS.txt" -o "$temporary/SHA256SUMS.txt" \
+    || fail "release v${version} has no SHA256SUMS.txt (does it have artifacts?)"
+  wheel="$(awk '$2 ~ /^\*?\.?\/?drover-.*-py3-none-any\.whl$/ {
+                  sub(/^[*.]*\//, "", $2); sub(/^\*/, "", $2); print $2; exit }' \
+           "$temporary/SHA256SUMS.txt")"
+  [ -n "$wheel" ] \
+    || fail "release v${version} lists no drover wheel in SHA256SUMS.txt"
+  curl -fsSL "$base/$wheel" -o "$temporary/$wheel" \
+    || fail "could not download $wheel from release v${version}"
+  curl -fsSL "$base/requirements.lock.txt" -o "$temporary/requirements.lock.txt" \
+    || fail "could not download requirements.lock.txt"
+  verify_against_manifest "$temporary/$wheel" "$wheel" "$temporary/SHA256SUMS.txt" \
+    || fail "refusing to verify: $wheel failed checksum verification"
+  verify_against_manifest "$temporary/requirements.lock.txt" "requirements.lock.txt" \
+    "$temporary/SHA256SUMS.txt" \
+    || fail "refusing to verify: requirements.lock.txt failed checksum verification"
+
+  uv venv --relocatable "$runtime" >/dev/null 2>&1 \
+    || fail "could not create a disposable verification runtime"
+  uv pip install --python "$runtime/bin/python" --require-hashes \
+    -r "$temporary/requirements.lock.txt" >/dev/null \
+    || fail "candidate dependency install failed (hash mismatch?)"
+  uv pip install --python "$runtime/bin/python" --no-deps "$temporary/$wheel" >/dev/null \
+    || fail "installing candidate $wheel failed"
+  "$runtime/bin/drover-server" --version >/dev/null 2>&1 \
+    || fail "release v${version} failed its candidate smoke test"
+  runtime_supports_postgres_default "$runtime/bin/python" "$runtime/bin/drover-server" \
+    || fail "release v${version} predates PostgreSQL-default setup; choose a current release"
+  success "release v${version} satisfies the PostgreSQL-default installer contract"
+)
 
 install_runtime() {
   # Two statements, not one. Under `set -u`, bash declares every name in a
@@ -758,9 +818,18 @@ EOF
   success "joined $HUB_ADDRESS as $host_id"
 }
 
-ensure_uv
+if [ "$VERIFY_RELEASE" -eq 1 ]; then
+  require_uv_for_release_verification
+else
+  ensure_uv
+fi
 VERSION="$(resolve_version)"
 info "  version:   $VERSION"
+if [ "$VERIFY_RELEASE" -eq 1 ]; then
+  verify_release_candidate "$VERSION"
+  success "release verification complete; nothing was changed"
+  exit 0
+fi
 install_runtime "$VERSION"
 # Both paths, not just the hub: a joined host runs harnessd only, but its
 # operator still needs `drover-server --version` to see what it is running.
