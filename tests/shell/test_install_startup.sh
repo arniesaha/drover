@@ -291,6 +291,21 @@ run_order_case() {
   fi
   check_contains "$label harness uses the configured hub URL" "$unit" \
     'http://100.64.0.10:7099'
+  check_contains "$label harness advertises its reachable URL" "$unit" \
+    '--local-url'
+  check_contains "$label harness listens on a reachable interface" "$unit" \
+    '--listen'
+  check_contains "$label harness records the install user's bin path" "$unit" \
+    '.local/bin'
+  if [ "$os" = darwin ]; then
+    check_contains "$label launchd harness resolves the install home" "$unit" \
+      '<key>HOME</key>'
+    check_contains "$label launchd harness records macOS host kind" "$unit" \
+      '<string>macos</string>'
+  else
+    check_contains "$label systemd harness records linux host kind" "$unit" \
+      '--kind linux'
+  fi
   check_contains "$label config selects PostgreSQL" "$HOME_DIR/.drover/config.toml" \
     'backend = "postgres"'
   check_contains "$label config names the PostgreSQL environment variable" "$HOME_DIR/.drover/config.toml" \
@@ -471,6 +486,28 @@ check_status "existing PostgreSQL install accepts its private environment" "$RES
 MODE="$($PYTHON -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$HOME_DIR/.drover/server.env")"
 check_status "existing PostgreSQL environment is owner-only" "$MODE" "0o600"
 
+new_case tailscale-address
+TAILSCALE_BIN="$CASE_DIR/tailscale"
+printf '%s
+' \
+  '#!/usr/bin/env bash' \
+  'case "${1:-}" in' \
+  '  status) exit 0 ;;' \
+  '  ip) printf "100.80.1.2\n" ;;' \
+  '  *) exit 1 ;;' \
+  'esac' > "$TAILSCALE_BIN"
+chmod +x "$TAILSCALE_BIN"
+OUT="$(HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+  PYTHONPATH="$REPO/src" DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$TAILSCALE_BIN" \
+  USER=installer FIXTURE_HEALTH_MODE=ready DROVER_CONTROL_DSN=postgresql://fixture-control \
+  bash "$REPO/install.sh" --version 0.0.0 --no-start 2>&1)"
+RESULT=$?
+check_status "tailscale install succeeds" "$RESULT" "0"
+check_contains "tailscale harness advertises tailscale URL" \
+  "$HOME_DIR/.config/systemd/user/drover-harnessd.service" '--tailscale-url http://100.80.1.2:7081'
+check_contains "tailscale harness listens on a reachable interface" \
+  "$HOME_DIR/.config/systemd/user/drover-harnessd.service" '--listen 0.0.0.0:7081'
+
 new_case no-start
 OUT="$(run_new_fleet linux fail '100.64.0.10:7099' --no-start)"
 RESULT=$?
@@ -495,6 +532,14 @@ check_status "join install succeeds without a hub health gate" "$RESULT" "0"
 check_event_absent "join does not start a local hub" "$EVENT_LOG" 'server-start'
 check_event_absent "join does not probe the hub health endpoint" "$EVENT_LOG" 'health '
 check_contains "join starts only its harness" "$EVENT_LOG" 'harness-start'
+check_contains "join writes a harness service unit" "$HOME_DIR/.config/systemd/user/drover-harnessd.service" \
+  'Drover harnessd'
+check_contains "join keeps the hub URL as central-url" "$HOME_DIR/.config/systemd/user/drover-harnessd.service" \
+  '--central-url http://100.64.0.10:7099'
+check_contains "join stores the paired credential in the token file only" "$HOME_DIR/.drover/api_token" \
+  'test-token'
+check_absent "join unit does not embed the paired credential" "$HOME_DIR/.config/systemd/user/drover-harnessd.service" \
+  'test-token'
 
 new_case no-start-join
 OUT="$(run_join --no-start)"

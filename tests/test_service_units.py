@@ -38,6 +38,7 @@ def test_launchd_unit_is_valid_plist_with_explicit_path():
     assert parsed["ProgramArguments"][1] == "run"
     assert parsed["RunAtLoad"] is True
     assert parsed["KeepAlive"] is True
+    assert parsed["EnvironmentVariables"]["HOME"] == "/home/x"
     assert "PATH" in parsed["EnvironmentVariables"]
     assert "/usr/bin" in parsed["EnvironmentVariables"]["PATH"]
 
@@ -97,11 +98,11 @@ def test_launchd_reads_service_environment_from_a_private_file():
     )
 
     parsed = plistlib.loads(rendered.encode("utf-8"))
-    assert parsed["EnvironmentVariables"] == {"PATH": "/usr/bin"}
+    assert parsed["EnvironmentVariables"] == {"HOME": "/home/x", "PATH": "/usr/bin"}
     assert parsed["ProgramArguments"] == [
         "/bin/sh",
         "-c",
-        'set -a; . "$1"; shift; exec "$@"',
+        'set -a; . "$1" || exit $?; shift; exec "$@"',
         "drover-service-env",
         "/home/x/.drover/server.env",
         "/home/x/.drover/runtime/current/bin/drover-server",
@@ -132,6 +133,26 @@ def test_launchd_environment_file_reaches_the_daemon(tmp_path: Path):
     result = subprocess.run(argv, check=True, capture_output=True, text=True)
 
     assert result.stdout == "postgresql://private-target\n"
+
+
+def test_launchd_environment_sets_home_without_secret_values():
+    rendered = render_launchd(
+        "com.drover.harnessd",
+        "/home/x/.drover/runtime/current/bin/drover-harnessd",
+        ["--host-id", "build-mac"],
+        home=Path("/home/x"),
+        path_entries=[
+            "/home/x/.drover/runtime/current/bin",
+            "/home/x/.local/bin",
+            "/usr/bin",
+        ],
+    )
+    parsed = plistlib.loads(rendered.encode("utf-8"))
+
+    assert parsed["EnvironmentVariables"]["HOME"] == "/home/x"
+    assert "/home/x/.local/bin" in parsed["EnvironmentVariables"]["PATH"]
+    assert "DROVER_API_TOKEN" not in rendered
+    assert "api_token" not in rendered
 
 
 def test_systemd_unit_sets_path_and_restarts():

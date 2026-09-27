@@ -358,15 +358,19 @@ class _FakeStructuredManager:
         self.starts = []
         self.turns = []
         self.accepted_turns = {}
+        self.closed = set()
 
     def has(self, session_id: str) -> bool:
-        return True
+        return session_id not in self.closed
 
     def harness_for(self, session_id: str) -> str:
         return self.harness
 
     def start(self, *args, **kwargs) -> None:
         self.starts.append((args, kwargs))
+
+    def close(self, session_id: str) -> None:
+        self.closed.add(session_id)
 
     def send_turn(self, session_id: str, text: str, **kwargs) -> str:
         self.turns.append((session_id, text, kwargs))
@@ -829,6 +833,118 @@ def test_model_preference_validation_rejects_turn_before_attachment_or_driver(
     }
     assert state.structured.turns == []
     assert not state.attachments_dir.exists()
+
+
+def test_initial_structured_executable_error_closes_entry_and_cleans_worktree(
+    tmp_path,
+):
+    class _InitialTurnLaunchFailure(_FakeStructuredManager):
+        def send_turn(self, session_id: str, text: str, **kwargs) -> str:
+            self.turns.append((session_id, text, kwargs))
+            raise FileNotFoundError(2, "No such file or directory", "codex")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "README.md").write_text("# test\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True
+    )
+
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _InitialTurnLaunchFailure(harness="codex")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/sessions",
+                payload={
+                    "harness": "codex",
+                    "mode": "structured",
+                    "command": [sys.executable, "-c", "print('unused')"],
+                    "cwd": str(repo),
+                    "prompt": "start",
+                },
+            )
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+        assert len(state.structured.starts) == 1
+        session_id = state.structured.starts[0][0][0]
+        stored = state.registry.get_session(session_id)
+        events = state.registry.list_events(session_id)
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 502
+    assert payload["error"].startswith("structured harness launch failed:")
+    assert stored is not None
+    assert stored.status == "errored"
+    assert stored.last_error == payload["error"]
+    assert not state.structured.has(session_id)
+    assert session_id in state.structured.closed
+    assert session_id not in state.session_worktrees
+    assert not any(state.worktrees_dir.glob(f"{session_id}*"))
+    assert any(event.event_type == "session.error" for event in events)
+
+
+def test_missing_structured_executable_turn_returns_json_and_marks_session_errored(
+    tmp_path,
+):
+    class _MissingExecutableStructuredManager(_FakeStructuredManager):
+        def submit_turn(
+            self, session_id: str, *, prepare, **kwargs
+        ) -> tuple[str, bool]:
+            prepare()
+            raise FileNotFoundError(2, "No such file or directory", "codex")
+
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _MissingExecutableStructuredManager(harness="codex")
+    session = state.registry.create_session(
+        host_id=state.host_id,
+        harness="codex",
+        command="codex",
+        session_id="session-1",
+        status="running",
+        started_at=datetime.now(timezone.utc),
+        mode="structured",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _json_request(
+                f"{base_url}/sessions/{session.session_id}/turns",
+                payload={"text": "continue"},
+            )
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+        stored = state.registry.get_session(session.session_id)
+        events = state.registry.list_events(session.session_id)
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert exc_info.value.code == 502
+    assert payload["error"].startswith("structured harness launch failed:")
+    assert stored is not None
+    assert stored.status == "errored"
+    assert stored.last_error == payload["error"]
+    assert not state.structured.has(session.session_id)
+    assert session.session_id in state.structured.closed
+    assert any(event.event_type == "session.error" for event in events)
 
 
 def test_client_turn_id_requires_a_uuid():

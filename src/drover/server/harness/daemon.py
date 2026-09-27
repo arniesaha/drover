@@ -2502,6 +2502,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+            except OSError as exc:
+                self._mark_structured_turn_launch_error(session_id, exc)
+                self._write_json(
+                    {"error": f"structured harness launch failed: {exc}"},
+                    status=HTTPStatus.BAD_GATEWAY,
+                )
+                return
             except Exception as exc:
                 # Best-effort initial turn; caller can retry via /turns.
                 # Log it so a failed first turn isn't completely traceless
@@ -2525,6 +2532,26 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             },
             status=HTTPStatus.CREATED,
         )
+
+    def _mark_structured_turn_launch_error(self, session_id: str, exc: OSError) -> None:
+        message = f"structured harness launch failed: {exc}"
+        if self.server.state.structured.has(session_id):
+            self.server.state.structured.close(session_id)
+        self._safe_update_session_status(
+            session_id,
+            "errored",
+            last_error=message,
+            ended_at=datetime.now(timezone.utc),
+        )
+        self._safe_append_event(
+            session_id=session_id,
+            event_type="session.error",
+            payload={"error": message, "error_type": type(exc).__name__},
+            normalized_type="error",
+            normalized_source="structured",
+            content_preview=message,
+        )
+        self._cleanup_session_worktree(session_id)
 
     def _create_turn(self, session_id: str) -> None:
         if not self.server.state.structured.has(session_id):
@@ -2598,6 +2625,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return
         except (PermissionError, RuntimeError) as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        except OSError as exc:
+            self._mark_structured_turn_launch_error(session_id, exc)
+            self._write_json(
+                {"error": f"structured harness launch failed: {exc}"},
+                status=HTTPStatus.BAD_GATEWAY,
+            )
             return
         self._write_json({"turn_id": turn_id}, status=HTTPStatus.ACCEPTED)
 
