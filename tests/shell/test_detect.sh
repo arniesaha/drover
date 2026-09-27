@@ -46,26 +46,28 @@ stub tailscale 'case "$1" in
   status) echo "100.64.0.10  host  linux  -" ;;
   ip)     echo "100.64.0.10" ;;
 esac'
-check "tailscale detected" "$(PATH="$WORK:$PATH" detect_address)" "tailscale 100.64.0.10"
+unset DROVER_TAILSCALE_CANDIDATES
+check "tailscale detected" "$(PATH="$WORK:/usr/bin:/bin"; hash -r; detect_address)" "tailscale 100.64.0.10"
 
 # Logged out must not win, even though the binary exists.
 stub tailscale 'case "$1" in
   status) echo "Logged out."; exit 1 ;;
   ip)     exit 1 ;;
 esac'
+export DROVER_TAILSCALE_CANDIDATES="$WORK/no-such-tailscale"
 stub ipconfig 'echo "192.168.1.5"'
 check "falls back to LAN when tailscale is logged out" \
-  "$(PATH="$WORK:$PATH" DROVER_OS=darwin detect_address)" "lan 192.168.1.5"
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_OS=darwin; hash -r; detect_address)" "lan 192.168.1.5"
 
 # A public LAN address is not usable and must not be advertised.
 stub ipconfig 'echo "203.0.113.7"'
 check "refuses a public LAN address" \
-  "$(PATH="$WORK:$PATH" DROVER_OS=darwin detect_address)" "loopback 127.0.0.1"
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_OS=darwin; hash -r; detect_address)" "loopback 127.0.0.1"
 
 # Nothing at all.
 stub ipconfig 'exit 1'
 check "falls back to loopback with nothing available" \
-  "$(PATH="$WORK:$PATH" DROVER_OS=darwin detect_address)" "loopback 127.0.0.1"
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_OS=darwin; hash -r; detect_address)" "loopback 127.0.0.1"
 
 # Linux path reads `ip -4 route get`.
 rtk_ip_stub='if [ "$1" = "-4" ]; then
@@ -74,12 +76,12 @@ fi'
 stub ip "$rtk_ip_stub"
 stub tailscale 'exit 1'
 check "linux reads src from ip route get" \
-  "$(PATH="$WORK:$PATH" DROVER_OS=linux detect_address)" "lan 192.168.1.42"
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_OS=linux; hash -r; detect_address)" "lan 192.168.1.42"
 
 # A tailscale binary that is absent entirely must not error out.
 rm -f "$WORK/tailscale"
 check "absent tailscale is not an error" \
-  "$(PATH="$WORK:$PATH" DROVER_OS=linux detect_address)" "lan 192.168.1.42"
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_OS=linux; hash -r; detect_address)" "lan 192.168.1.42"
 
 # --- the CLI is often not on PATH -------------------------------------------
 # Only Homebrew puts `tailscale` on PATH. The macOS app ships the CLI inside
@@ -97,8 +99,8 @@ STUB
 chmod +x "$FAKE_APP/Tailscale"
 
 check "finds the CLI when it is not on PATH" \
-  "$(PATH="$WORK:$PATH" DROVER_TAILSCALE_CANDIDATES="$FAKE_APP/Tailscale" \
-     DROVER_OS=darwin detect_address)" \
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_TAILSCALE_CANDIDATES="$FAKE_APP/Tailscale" \
+     DROVER_OS=darwin; hash -r; detect_address)" \
   "tailscale 100.97.15.109"
 
 # An off-PATH CLI that is logged out still must not win.
@@ -109,8 +111,8 @@ STUB
 chmod +x "$FAKE_APP/Tailscale"
 stub ipconfig 'echo "192.168.1.5"'
 check "off-PATH but logged out falls back to LAN" \
-  "$(PATH="$WORK:$PATH" DROVER_TAILSCALE_CANDIDATES="$FAKE_APP/Tailscale" \
-     DROVER_OS=darwin detect_address)" \
+  "$(PATH="$WORK:/usr/bin:/bin" DROVER_TAILSCALE_CANDIDATES="$FAKE_APP/Tailscale" \
+     DROVER_OS=darwin; hash -r; detect_address)" \
   "lan 192.168.1.5"
 
 [ "$FAILURES" -eq 0 ] || exit 1

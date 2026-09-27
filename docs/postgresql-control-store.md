@@ -10,6 +10,47 @@ This guide is for an operator preparing a new central store or an offline
 cutover. It does not perform a live migration, change a running service, or
 turn a local harness daemon into a PostgreSQL client.
 
+## Operator prerequisites and ownership
+
+PostgreSQL remains an operator-owned service on both macOS and Linux. Drover
+does not install it, start it, choose its data directory, manage upgrades, or
+take responsibility for backups and recovery. Before installing a fresh
+central server, the operator must provide an empty dedicated database and
+dedicated login role, keep the database listener loopback-only or on a private
+network, and decide how PostgreSQL is started and monitored after reboot.
+
+For a disposable readiness test, use a separate user-owned cluster, role, and
+database from production. Bind that test cluster to loopback only and discard
+it after the test. A production store needs its own lifecycle, capacity,
+upgrade, backup, restore, and access-control procedure; it is not a
+long-lived version of the readiness test.
+
+On macOS, an operator can use a user-managed PostgreSQL installation and keep
+its data directory outside Drover state. On Linux, an operator can use the
+distribution-managed PostgreSQL service or another explicitly managed service.
+In either case, restrict `listen_addresses`, host firewall rules, and
+`pg_hba.conf` to loopback or the intended private network before exposing
+Drover to a phone or another host. Do not bind PostgreSQL publicly for Drover.
+
+Create the role and database using the PostgreSQL administration procedure for
+the chosen installation. Keep the role scoped to its dedicated database and do
+not use a superuser DSN for Drover. Put the resulting DSN in the process
+environment or a secret manager, never in `config.toml`, a shell history,
+service arguments, screenshots, or repository files. The installer reads
+`DROVER_CONTROL_DSN` once and writes an owner-only service environment file.
+It does not print the DSN.
+
+Before committing installation mutations, run:
+
+```sh
+install.sh --verify-release
+```
+
+This downloads the selected public release, verifies the wheel and lockfile
+against `SHA256SUMS.txt`, and starts a disposable local runtime to prove the
+PostgreSQL-default installer contract. It does not contact the database or
+write `~/.drover`; `install.sh --dry-run` remains the offline action preview.
+
 ## Install and configure
 
 The PostgreSQL client is part of the default central-server dependency set.

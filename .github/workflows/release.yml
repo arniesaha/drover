@@ -88,7 +88,25 @@ jobs:
         cd dist
         sha256sum drover-*-py3-none-any.whl requirements.lock.txt \
           > SHA256SUMS.txt
-        cat SHA256SUMS.txt
+        sha256sum --check SHA256SUMS.txt
+
+    # This must run before `gh release create`: install the exact built wheel
+    # and its hash-pinned lock into a clean runtime, then check the same
+    # PostgreSQL-default contract install.sh requires. Source imports are not
+    # enough here: v0.4.18 had a main branch with the contract while its
+    # published wheel did not.
+    - name: Gate the candidate runtime before publication
+      run: |
+        CANDIDATE_ROOT="$(mktemp -d)"
+        trap 'rm -rf "$CANDIDATE_ROOT"' EXIT
+        uv venv --relocatable "$CANDIDATE_ROOT/runtime"
+        uv pip install --python "$CANDIDATE_ROOT/runtime/bin/python" --require-hashes \
+          -r dist/requirements.lock.txt
+        uv pip install --python "$CANDIDATE_ROOT/runtime/bin/python" --no-deps \
+          dist/drover-*-py3-none-any.whl
+        python scripts/verify_release_candidate.py \
+          --python "$CANDIDATE_ROOT/runtime/bin/python" \
+          --server "$CANDIDATE_ROOT/runtime/bin/drover-server"
 
     - name: Publish the release
       env:
@@ -118,6 +136,31 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Provision an isolated PostgreSQL control store
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes postgresql
+        sudo systemctl start postgresql
+        for _ in $(seq 1 30); do
+          sudo -u postgres pg_isready -q && break
+          sleep 1
+        done
+        sudo -u postgres pg_isready -q \
+          || { echo "PostgreSQL did not become ready" >&2; exit 1; }
+        DB_PASSWORD="$(openssl rand -hex 24)"
+        DB_DSN="postgresql://drover_release:${DB_PASSWORD}@127.0.0.1:5432/drover_release_check"
+        echo "::add-mask::$DB_PASSWORD"
+        echo "::add-mask::$DB_DSN"
+        umask 077
+        cat > "$RUNNER_TEMP/drover-release-postgres.sql" <<SQL
+        CREATE ROLE drover_release LOGIN PASSWORD '${DB_PASSWORD}';
+        CREATE DATABASE drover_release_check OWNER drover_release;
+        SQL
+        sudo -u postgres psql --set ON_ERROR_STOP=1 \
+          --file "$RUNNER_TEMP/drover-release-postgres.sql"
+        rm -f "$RUNNER_TEMP/drover-release-postgres.sql"
+        printf 'DROVER_CONTROL_DSN=%s\n' "$DB_DSN" >> "$GITHUB_ENV"
+
     - name: Wait for the release assets to be queryable
       env:
         GH_TOKEN: ${{ github.token }}
@@ -135,7 +178,7 @@ jobs:
 
     - name: Run install.sh exactly as a user would
       run: |
-        if ! bash install.sh --no-start \
+        if ! DROVER_CONTROL_DSN="$DROVER_CONTROL_DSN" bash install.sh --no-start \
           --version "${{ github.event.inputs.ref || github.ref_name }}" \
           > "$RUNNER_TEMP/drover-install.log" 2>&1; then
           echo "install stage failed" >&2
@@ -188,8 +231,20 @@ jobs:
         test -f "$HOME/.config/systemd/user/drover-harnessd.service"
         # Both properties have silently broken real hosts before.
         grep -q 'Environment=PATH=' "$UNIT"
+        grep -q 'EnvironmentFile=' "$UNIT"
         grep -q 'runtime/current/bin' "$UNIT"
         grep -qv 'runtime/0\.' "$UNIT"
+
+    - name: The installed PostgreSQL control store is initialized and ready
+      run: |
+        BIN="$HOME/.drover/runtime/current/bin"
+        set -a
+        . "$HOME/.drover/server.env"
+        set +a
+        "$BIN/drover-server" control-store status > "$RUNNER_TEMP/drover-control-store.json"
+        "$BIN/python" -c \
+          'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["ready"] else 1)' \
+          "$RUNNER_TEMP/drover-control-store.json"
 
     - name: The installed server accepts a paired device
       run: |
@@ -198,6 +253,9 @@ jobs:
         # wrote the normal config and unit definitions, but did not claim the
         # install is first-use ready; this step owns only its direct process.
         BIN="$HOME/.drover/runtime/current/bin"
+        set -a
+        . "$HOME/.drover/server.env"
+        set +a
         "$BIN/drover-server" run > "$RUNNER_TEMP/drover-server.log" 2>&1 &
         SERVER_PID=$!
         cleanup_server() {

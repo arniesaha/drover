@@ -251,6 +251,19 @@ run_join() {
     bash -s -- --version 0.0.0 --join 'drover://100.64.0.10:7099?v=1&code=JOIN-CODE' "$@" 2>&1
 }
 
+run_release_verification() {
+  mkdir -p "$CASE_DIR/verify-tmp"
+  /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+    PYTHONPATH="$REPO/src" DROVER_OS=linux TMPDIR="$CASE_DIR/verify-tmp" \
+    bash -s -- --version 0.0.0 --verify-release 2>&1
+}
+
+run_release_verification_without_uv() {
+  HOME="$HOME_DIR" PATH="$CASE_DIR/no-uv:/usr/bin:/bin" \
+    DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
+    bash "$REPO/install.sh" --version 0.0.0 --verify-release 2>&1
+}
+
 run_order_case() {
   local os
   local label
@@ -357,6 +370,45 @@ check_status "incompatible fresh runtime leaves private environment absent" \
   "$([ -e "$HOME_DIR/.drover/server.env" ] && echo present || echo absent)" "absent"
 check_status "incompatible fresh runtime leaves units absent" \
   "$([ -e "$HOME_DIR/.config/systemd/user/drover-server.service" ] && echo present || echo absent)" "absent"
+
+# This reproduces the public-feed mismatch: an older candidate can be selected
+# without touching the host, but must fail before installation when its runtime
+# lacks the PostgreSQL-default installer contract.
+new_case incompatible-release-verification
+export FIXTURE_RUNTIME_CAPABILITY=legacy
+OUT="$(run_release_verification)"
+RESULT=$?
+unset FIXTURE_RUNTIME_CAPABILITY
+check_status "incompatible release verification rejects the candidate" "$RESULT" "1"
+check_contains "incompatible release verification explains PostgreSQL-default requirement" \
+  <(printf '%s' "$OUT") 'predates PostgreSQL-default setup'
+check_status "incompatible release verification leaves Drover state absent" \
+  "$([ -e "$HOME_DIR/.drover" ] && echo present || echo absent)" "absent"
+check_status "incompatible release verification cleans its disposable runtime" \
+  "$(find "$CASE_DIR/verify-tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0"
+
+new_case compatible-release-verification
+OUT="$(run_release_verification)"
+RESULT=$?
+check_status "compatible release verification succeeds" "$RESULT" "0"
+check_contains "compatible release verification reports the contract" \
+  <(printf '%s' "$OUT") 'satisfies the PostgreSQL-default installer contract'
+check_status "compatible release verification leaves Drover state absent" \
+  "$([ -e "$HOME_DIR/.drover" ] && echo present || echo absent)" "absent"
+check_status "compatible release verification cleans its disposable runtime" \
+  "$(find "$CASE_DIR/verify-tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0"
+
+new_case release-verification-without-uv
+mkdir -p "$CASE_DIR/no-uv"
+OUT="$(run_release_verification_without_uv)"
+RESULT=$?
+check_status "release verification without uv refuses before bootstrap" "$RESULT" "1"
+check_contains "release verification without uv explains its prerequisite" \
+  <(printf '%s' "$OUT") '--verify-release requires uv already on PATH'
+check_status "release verification without uv creates no Drover state" \
+  "$([ -e "$HOME_DIR/.drover" ] && echo present || echo absent)" "absent"
+check_status "release verification without uv does not install uv" \
+  "$([ -e "$HOME_DIR/.local/bin/uv" ] && echo present || echo absent)" "absent"
 
 new_case incompatible-runtime-existing-postgres
 mkdir -p "$HOME_DIR/.drover/runtime/previous" "$HOME_DIR/.config/systemd/user"

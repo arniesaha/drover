@@ -23,6 +23,11 @@ pass `--adopt` to migrate an existing source install.
 Useful flags:
 
 - `--dry-run` prints exactly what it would do and changes nothing.
+- `--verify-release` downloads the selected release into a disposable runtime,
+  verifies its published checksums, and proves it supports the PostgreSQL-default
+  installer contract without writing `~/.drover`. Use this before a real install
+  when you need release-feed compatibility evidence; it intentionally needs
+  network access and is separate from the offline mutation preview.
 - `--url <host:port>` overrides address detection. Private addresses only.
 - `--version vX.Y.Z` pins a release instead of taking the latest. The pinned
   release must support PostgreSQL-default setup; older releases are rejected
