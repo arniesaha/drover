@@ -119,11 +119,12 @@ jobs:
     # network. Grouped per suite, and the loop keeps going so one failure
     # does not hide the others.
     - name: Run installer shell tests
-      if: steps.scope.outputs.python == 'true'
       run: |
         bash -n install.sh
         bash -n scripts/lib/verify.sh
         bash -n scripts/lib/detect.sh
+        bash -n scripts/lib/managed_postgres.sh
+        bash -n scripts/drover-managed-postgres scripts/uninstall.sh
         status=0
         for suite in tests/shell/test_*.sh; do
           echo "::group::$suite"

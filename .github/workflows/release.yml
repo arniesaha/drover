@@ -108,6 +108,57 @@ jobs:
           --python "$CANDIDATE_ROOT/runtime/bin/python" \
           --server "$CANDIDATE_ROOT/runtime/bin/drover-server"
 
+    - name: Gate managed PostgreSQL provisioner before publication
+      run: |
+        RUN_ID="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 4)"
+        export DROVER_POSTGRES_INSTANCE="$RUN_ID" DROVER_POSTGRES_CONTAINER="drover-postgres-${RUN_ID}" DROVER_POSTGRES_VOLUME="drover-postgres-data-${RUN_ID}" DROVER_POSTGRES_PORT="$(python -c 'import random; print(random.randint(20000, 60999))')"
+        export DROVER_HOME="$RUNNER_TEMP/drover-home-$RUN_ID" HOME="$RUNNER_TEMP/home-$RUN_ID"
+        mkdir -p "$DROVER_HOME/bin" "$HOME"
+        cp scripts/drover-managed-postgres "$DROVER_HOME/bin/drover-managed-postgres"
+        chmod 700 "$DROVER_HOME/bin/drover-managed-postgres"
+        CID=""; VID=""; MARKER="marker-$RUN_ID"
+        cleanup() {
+          if [ -n "$CID" ] && [ "$(docker inspect --format '{{.Id}} {{index .Config.Labels "io.drover.instance"}}' "$DROVER_POSTGRES_CONTAINER" 2>/dev/null || true)" = "$CID $RUN_ID" ]; then docker rm -f "$CID" || true; fi
+          if [ -n "$VID" ] && [ "$(docker volume inspect --format '{{.Name}} {{index .Labels "io.drover.instance"}}' "$DROVER_POSTGRES_VOLUME" 2>/dev/null || true)" = "$VID $RUN_ID" ]; then docker volume rm "$VID" || true; fi
+          rm -rf "$DROVER_HOME" "$HOME" "$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
+        }
+        trap cleanup EXIT
+        fail() { echo "$*" >&2; exit 1; }
+        . scripts/lib/managed_postgres.sh
+        ENV_FILE="$DROVER_HOME/server.env"
+        BACKUP="$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
+        managed_postgres_start_or_reuse "$ENV_FILE"
+        CID="$(docker inspect --format '{{.Id}}' "$DROVER_POSTGRES_CONTAINER")"
+        VID="$(docker volume inspect --format '{{.Name}}' "$DROVER_POSTGRES_VOLUME")"
+        managed_postgres_wait_ready "$ENV_FILE"
+        managed_postgres_start_or_reuse "$ENV_FILE"
+        PG_PASS="$(managed_postgres_env_password "$ENV_FILE")"
+        PGPASSWORD="$PG_PASS" docker exec -e PGPASSWORD "$DROVER_POSTGRES_CONTAINER" \
+          psql -h 127.0.0.1 -p 5432 -U drover -d drover -v ON_ERROR_STOP=1 \
+          -c 'create table if not exists drover_release_marker(value text primary key)' \
+          -c "insert into drover_release_marker(value) values ('$MARKER')"
+        "$DROVER_HOME/bin/drover-managed-postgres" backup "$BACKUP"
+        docker exec -i "$DROVER_POSTGRES_CONTAINER" pg_restore -l < "$BACKUP" | grep -q drover_release_marker
+        PGPASSWORD="$PG_PASS" docker exec -e PGPASSWORD "$DROVER_POSTGRES_CONTAINER" \
+          psql -h 127.0.0.1 -p 5432 -U drover -d postgres -v ON_ERROR_STOP=1 \
+          -c 'drop database if exists drover_restore_check' \
+          -c 'create database drover_restore_check owner drover'
+        PGPASSWORD="$PG_PASS" docker exec -i -e PGPASSWORD "$DROVER_POSTGRES_CONTAINER" \
+          pg_restore -h 127.0.0.1 -p 5432 -U drover -d drover_restore_check --no-owner < "$BACKUP"
+        PGPASSWORD="$PG_PASS" docker exec -e PGPASSWORD "$DROVER_POSTGRES_CONTAINER" \
+          psql -h 127.0.0.1 -p 5432 -U drover -d drover_restore_check -qAt \
+          -c 'select value from drover_release_marker' | grep -qx "$MARKER"
+        "$DROVER_HOME/bin/drover-managed-postgres" stop
+        "$DROVER_HOME/bin/drover-managed-postgres" status 2>&1 | grep -q 'auth not checked'
+        "$DROVER_HOME/bin/drover-managed-postgres" start
+        bash scripts/uninstall.sh | grep -q 'preserved'
+        [ "$(docker inspect --format '{{.Id}}' "$DROVER_POSTGRES_CONTAINER")" = "$CID" ]
+        [ "$(docker volume inspect --format '{{.Name}}' "$DROVER_POSTGRES_VOLUME")" = "$VID" ]
+        "$DROVER_HOME/bin/drover-managed-postgres" purge --i-understand-this-deletes-drover-postgres-data
+        [ -z "$(docker ps -a --filter "name=^/${DROVER_POSTGRES_CONTAINER}$" --format '{{.ID}}')" ]
+        [ -z "$(docker volume ls --filter "name=^${DROVER_POSTGRES_VOLUME}$" --format '{{.Name}}')" ]
+        CID=""; VID=""
+
     - name: Publish the release
       env:
         GH_TOKEN: ${{ github.token }}
@@ -245,6 +296,37 @@ jobs:
         "$BIN/python" -c \
           'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["ready"] else 1)' \
           "$RUNNER_TEMP/drover-control-store.json"
+
+    - name: Managed PostgreSQL install is healthy, idempotent, backed up, and preserved
+      run: |
+        MANAGED_HOME="$RUNNER_TEMP/drover-managed-home"
+        VERSION="${{ github.event.inputs.ref || github.ref_name }}"
+        RUN_ID="release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        export DROVER_POSTGRES_INSTANCE="$RUN_ID"
+        export DROVER_POSTGRES_CONTAINER="drover-postgres-${RUN_ID}"
+        export DROVER_POSTGRES_VOLUME="drover-postgres-data-${RUN_ID}"
+        export DROVER_POSTGRES_PORT="$((54000 + (GITHUB_RUN_ID % 1000)))"
+        MANAGED_CONTAINER_ID=""
+        MANAGED_VOLUME_ID=""
+        cleanup_managed() {
+          if [ -n "$MANAGED_CONTAINER_ID" ] && [ "$(docker inspect --format '{{.Id}} {{index .Config.Labels "io.drover.instance"}}' "$DROVER_POSTGRES_CONTAINER" 2>/dev/null || true)" = "$MANAGED_CONTAINER_ID $DROVER_POSTGRES_INSTANCE" ]; then docker rm -f "$DROVER_POSTGRES_CONTAINER" || true; fi
+          if [ -n "$MANAGED_VOLUME_ID" ] && [ "$(docker volume inspect --format '{{.Name}} {{index .Labels "io.drover.instance"}}' "$DROVER_POSTGRES_VOLUME" 2>/dev/null || true)" = "$MANAGED_VOLUME_ID $DROVER_POSTGRES_INSTANCE" ]; then docker volume rm "$DROVER_POSTGRES_VOLUME" || true; fi
+        }
+        trap cleanup_managed EXIT
+        HOME="$MANAGED_HOME" bash install.sh --no-start --control-store managed --version "$VERSION"
+        MANAGED_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$DROVER_POSTGRES_CONTAINER")"
+        MANAGED_VOLUME_ID="$(docker volume inspect --format '{{.Name}}' "$DROVER_POSTGRES_VOLUME")"
+        HOME="$MANAGED_HOME" bash install.sh --no-start --control-store managed --version "$VERSION"
+        test "$(docker inspect --format '{{index .Config.Labels "io.drover.instance"}}' "$DROVER_POSTGRES_CONTAINER")" = "$DROVER_POSTGRES_INSTANCE"
+        docker port "$DROVER_POSTGRES_CONTAINER" 5432/tcp | grep -E '^127\.0\.0\.1:'
+        set -a; . "$MANAGED_HOME/.drover/server.env"; set +a
+        "$MANAGED_HOME/.drover/runtime/current/bin/drover-server" control-store status | "$MANAGED_HOME/.drover/runtime/current/bin/python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["ready"] else 1)'
+        "$MANAGED_HOME/.drover/bin/drover-managed-postgres" backup "$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
+        test -s "$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
+        DROVER_HOME="$MANAGED_HOME/.drover" HOME="$MANAGED_HOME" bash scripts/uninstall.sh
+        docker volume inspect "$DROVER_POSTGRES_VOLUME" >/dev/null
+        DROVER_HOME="$MANAGED_HOME/.drover" HOME="$MANAGED_HOME" bash scripts/uninstall.sh --purge-managed-postgres --i-understand-this-deletes-drover-postgres-data
+        ! docker volume inspect "$DROVER_POSTGRES_VOLUME" >/dev/null 2>&1
 
     - name: The installed server accepts a paired device
       run: |

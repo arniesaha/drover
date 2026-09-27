@@ -12,9 +12,7 @@ turn a local harness daemon into a PostgreSQL client.
 
 ## Operator prerequisites and ownership
 
-PostgreSQL remains an operator-owned service on both macOS and Linux. Drover
-does not install it, start it, choose its data directory, manage upgrades, or
-take responsibility for backups and recovery. Before installing a fresh
+PostgreSQL has two first-class central-server modes: **existing DSN**, which remains entirely operator-owned, and **managed container** for a fresh trusted server. Drover never installs a container runtime. In managed mode it owns one labeled PostgreSQL 17 container and named volume, but the local container-runtime operator can inspect container environment metadata and therefore remains inside the trust boundary. Drover still does not manage host runtime upgrades, capacity, or recovery policy. Before installing a fresh
 central server, the operator must provide an empty dedicated database and
 dedicated login role, keep the database listener loopback-only or on a private
 network, and decide how PostgreSQL is started and monitored after reboot.
@@ -50,6 +48,24 @@ This downloads the selected public release, verifies the wheel and lockfile
 against `SHA256SUMS.txt`, and starts a disposable local runtime to prove the
 PostgreSQL-default installer contract. It does not contact the database or
 write `~/.drover`; `install.sh --dry-run` remains the offline action preview.
+
+
+### Managed-container lifecycle
+
+`install.sh --control-store managed` uses the immutable multi-architecture `postgres:17.6` manifest digest `sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929` (amd64 and arm64). Image updates are a reviewed source change: update the version and digest together after `docker buildx imagetools inspect`, run managed integration tests on both available architectures, and document the new digest in the release notes. It uses `--restart unless-stopped`, a loopback-only published port, and labels both container and `drover-postgres-data` volume. A collision with an unlabeled or foreign object fails rather than adopting it.
+
+Credentials are generated locally and saved only as the DSN in `~/.drover/server.env` (0600). Initialization needs an ephemeral private env file; credentials are never printed or passed in argv. Container operators can inspect a running container, so do not grant Docker/OrbStack access to untrusted users.
+
+Use the installed owner-only helper for diagnostics and safe lifecycle actions:
+
+```sh
+~/.drover/bin/drover-managed-postgres status
+~/.drover/bin/drover-managed-postgres stop
+~/.drover/bin/drover-managed-postgres start
+~/.drover/bin/drover-managed-postgres backup /absolute/path/outside-drover-data/drover-$(date +%F).dump
+```
+
+The backup command makes a PostgreSQL custom-format logical dump and verifies/list it with `pg_restore -l`; the destination must be outside the live volume. A volume is **not** a backup. Restore is intentionally a manual, stopped-server `pg_restore` procedure, so it cannot accidentally overwrite a live database. Normal Drover uninstall/upgrade preserves the labeled container and volume. Destruction is separate: `drover-managed-postgres purge --i-understand-this-deletes-drover-postgres-data`. Restore only after stopping native Drover: `drover-managed-postgres restore /absolute/path/backup.dump --i-understand-this-overwrites-drover`.
 
 ## Install and configure
 

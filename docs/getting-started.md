@@ -7,13 +7,15 @@ only after you can complete a small task in a project the agent can read.
 ## Install
 
 ```bash
+# Existing operator-owned PostgreSQL
 export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
-curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --control-store existing
+
+# Or a fresh central server with an already-running Docker/OrbStack Docker CLI
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh | bash -s -- --control-store managed
 ```
 
-Before running this on the first central machine, provision a reachable empty
-PostgreSQL database and export its DSN. The installer validates the connection,
-initializes the empty control store, then installs a verified release into
+Existing mode validates the reachable database and preserves the existing-DSN deployment model. Managed mode creates/reuses a Drover-owned PostgreSQL 17 container, then waits for health before it initializes the empty control store. It never installs a container runtime. The installer then installs a verified release into
 `~/.drover/runtime/<version>`, starts the hub and local harness, detects a
 private address your phone can reach, and prints a QR code to pair with. It
 stores the DSN in a private service environment file, not `config.toml` or
@@ -22,7 +24,8 @@ pass `--adopt` to migrate an existing source install.
 
 Useful flags:
 
-- `--dry-run` prints exactly what it would do and changes nothing.
+- `--control-store existing|managed` selects the central PostgreSQL mode. In automation this is required unless `DROVER_CONTROL_DSN` is supplied, which is an explicit backwards-compatible existing mode.
+- `--dry-run` previews the selected mode and mutations without contacting or creating containers.
 - `--verify-release` downloads the selected release into a disposable runtime,
   verifies its published checksums, and proves it supports the PostgreSQL-default
   installer contract without writing `~/.drover`. Use this before a real install
