@@ -317,7 +317,7 @@ jobs:
         docker port "$DROVER_POSTGRES_CONTAINER" 5432/tcp | grep -E '^127\.0\.0\.1:'
         set -a; . "$MANAGED_HOME/.drover/server.env"; set +a
         "$MANAGED_HOME/.drover/runtime/current/bin/drover-server" control-store status | "$MANAGED_HOME/.drover/runtime/current/bin/python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["ready"] else 1)'
-        "$MANAGED_HOME/.drover/bin/drover-managed-postgres" backup "$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
+        DROVER_HOME="$MANAGED_HOME/.drover" HOME="$MANAGED_HOME" "$MANAGED_HOME/.drover/bin/drover-managed-postgres" backup "$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
         test -s "$RUNNER_TEMP/drover-managed-$RUN_ID.dump"
         DROVER_HOME="$MANAGED_HOME/.drover" HOME="$MANAGED_HOME" bash scripts/uninstall.sh
         docker volume inspect "$DROVER_POSTGRES_VOLUME" >/dev/null
