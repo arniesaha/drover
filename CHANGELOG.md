@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogs through the validated harness adapter registry. No intentional
   lifecycle or client behavior changes.
 
+## [0.5.2] - 2026-09-26
+
+### Fixed
+- Fixed the post-publication managed PostgreSQL backup verifier to use the clean-install DROVER_HOME when invoking drover-managed-postgres.
+
 ## [0.5.1] - 2026-09-26
 
 ### Fixed
