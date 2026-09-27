@@ -202,14 +202,10 @@ jobs:
         DB_DSN="postgresql://drover_release:${DB_PASSWORD}@127.0.0.1:5432/drover_release_check"
         echo "::add-mask::$DB_PASSWORD"
         echo "::add-mask::$DB_DSN"
-        umask 077
-        cat > "$RUNNER_TEMP/drover-release-postgres.sql" <<SQL
+        sudo -u postgres psql --set ON_ERROR_STOP=1 <<SQL
         CREATE ROLE drover_release LOGIN PASSWORD '${DB_PASSWORD}';
         CREATE DATABASE drover_release_check OWNER drover_release;
         SQL
-        sudo -u postgres psql --set ON_ERROR_STOP=1 \
-          --file "$RUNNER_TEMP/drover-release-postgres.sql"
-        rm -f "$RUNNER_TEMP/drover-release-postgres.sql"
         printf 'DROVER_CONTROL_DSN=%s\n' "$DB_DSN" >> "$GITHUB_ENV"
 
     - name: Wait for the release assets to be queryable

@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogs through the validated harness adapter registry. No intentional
   lifecycle or client behavior changes.
 
+## [0.5.1] - 2026-09-26
+
+### Fixed
+
+- The clean-install release verifier now streams its temporary PostgreSQL setup
+  SQL over standard input, avoiding runner temp-directory permissions when
+  executing `psql` as the isolated `postgres` account.
+
 ## [0.5.0] - 2026-09-26
 
 ### Added
