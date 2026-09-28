@@ -8,6 +8,7 @@ import urllib.request
 
 import pytest
 
+from drover.server.push import set_sender
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings, mint_session
 from drover.server.web.credentials import CREDENTIALS_FILENAME, CredentialStore
@@ -19,10 +20,15 @@ class _Collector:
     relay_manager = None
 
 
+class _AvailablePushSender:
+    is_available = True
+
+
 @pytest.fixture()
 def server(tmp_path):
     store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
     auth = AuthSettings(enabled=True, api_token="cluster-token", credentials=store)
+    set_sender(_AvailablePushSender())
     httpd = start_metrics_server(
         host="127.0.0.1", port=0, collector=_Collector(), auth=auth
     )
@@ -31,6 +37,7 @@ def server(tmp_path):
         yield base, store, auth
     finally:
         httpd.shutdown()
+        set_sender(None)
 
 
 def request(server, method, path, *, token=None, json=None, cookie=None, raw=None):
@@ -79,6 +86,26 @@ def test_device_bearer_registers_and_replaces_its_apns_token(server):
     assert (status, body) == (204, b"")
     stored = store.get(device.id)
     assert (stored.apns_token, stored.apns_environment) == ("apns-2", "production")
+
+
+def test_registration_fails_closed_without_hub_push_and_does_not_store_token(server):
+    _, store, _ = server
+    device, device_token = store.issue(scope="device", label="Phone")
+    store.set_apns_registration(device.id, token="old-apns", environment="sandbox")
+    set_sender(None)
+
+    status, body = request(
+        server,
+        "PUT",
+        "/auth/device/apns",
+        token=device_token,
+        json={"token": "apns-1", "environment": "sandbox"},
+    )
+
+    assert status == 503
+    assert body == b'{"error": "hub push is unavailable"}\n'
+    stored = store.get(device.id)
+    assert (stored.apns_token, stored.apns_environment) == (None, None)
 
 
 def test_device_bearer_deletes_its_apns_token_idempotently(server):

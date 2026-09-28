@@ -85,7 +85,9 @@ struct DroverApp: App {
             return
         }
 #endif
-        _environment = State(initialValue: AppEnvironment())
+        let appEnvironment = AppEnvironment()
+        _environment = State(initialValue: appEnvironment)
+        PushRegistrar.shared.updateClient(appEnvironment.client)
         notifier = LocalNotifier()
         // Must happen before the app finishes launching, so this lives in
         // `init()` rather than an `.onAppear`/`.task` (BGTaskScheduler's
@@ -239,21 +241,17 @@ private struct RootView: View {
             BackgroundRefresh.schedule()
         }
         .onChange(of: environment.generation) { _, _ in
+            PushRegistrar.shared.updateClient(environment.client)
             Task { await requestNotificationPermissionIfConfigured() }
         }
     }
 
     private func requestNotificationPermissionIfConfigured() async {
         guard backgroundActivityEnabled else { return }
-        guard let client = environment.client else { return }
+        PushRegistrar.shared.updateClient(environment.client)
+        guard environment.client != nil else { return }
         let granted = (try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .badge, .sound])) ?? false
-
-        // Hand over the client regardless of the authorization answer: a
-        // token already registered with the hub must still be refreshed (or
-        // re-pointed at a new hub) even if the user has since turned alerts
-        // off, and a device with no token simply never uploads one.
-        PushRegistrar.shared.updateClient(client)
 
         // Asking for the token requires authorization — without it iOS never
         // calls back, and with it this is idempotent (the existing token is

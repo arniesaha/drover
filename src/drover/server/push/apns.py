@@ -239,6 +239,11 @@ class APNsSender:
             max_workers=max_workers, thread_name_prefix="apns"
         )
 
+    @property
+    def is_available(self) -> bool:
+        """True when this sender can actually deliver APNs alerts."""
+        return self._config.is_usable
+
     def _http(self):
         """Lazily build the HTTP/2 client; one connection, reused."""
         if self._client is None:
@@ -382,6 +387,29 @@ def set_sender(sender: APNsSender | None) -> None:
     global _sender
     with _sender_lock:
         _sender = sender
+
+
+def push_available() -> bool:
+    """Return whether hub push is currently able to deliver alerts.
+
+    This is intentionally read-only so request handlers can fail closed before
+    accepting a device token. A stored token means the iOS app suppresses local
+    notifications, so registration is safe only when a usable sender has been
+    registered at startup.
+    """
+    sender = _sender
+    if sender is None:
+        return False
+    availability = getattr(sender, "is_available", None)
+    if availability is None:
+        # Test doubles and future sender types are registered only after their
+        # own setup succeeds, so presence is the availability signal.
+        return True
+    try:
+        return bool(availability() if callable(availability) else availability)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("push availability check failed: %s", exc)
+        return False
 
 
 def configure(cfg, credentials) -> APNsSender | None:

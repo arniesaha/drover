@@ -12,6 +12,7 @@ from drover.server.push.apns import (
     AwaitingTransition,
     configure,
     dispatch_awaiting_transition,
+    push_available,
     set_sender,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "AwaitingTransition",
     "configure",
     "dispatch_awaiting_transition",
+    "push_available",
     "set_sender",
 ]

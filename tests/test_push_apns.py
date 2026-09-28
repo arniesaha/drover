@@ -20,6 +20,7 @@ from drover.server.push.apns import (
     _AuthToken,
     configure,
     dispatch_awaiting_transition,
+    push_available,
     set_sender,
 )
 from drover.server.web.credentials import CredentialStore
@@ -177,6 +178,18 @@ def test_configure_disables_cleanly_when_key_is_absent(tmp_path, caplog):
     # Enabled-but-broken must be loud, not silent: it is the difference
     # between "push is off" and "push is on and losing every alert".
     assert any("not usable" in record.message for record in caplog.records)
+    assert not push_available()
+
+
+def test_push_available_reports_registered_usable_sender(config, tmp_path):
+    store = CredentialStore(tmp_path / "credentials.json")
+    sender = APNsSender(config, store)
+    try:
+        set_sender(sender)
+        assert push_available()
+    finally:
+        sender.close()
+        set_sender(None)
 
 
 # --- delivery --------------------------------------------------------------
