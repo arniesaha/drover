@@ -41,7 +41,11 @@ final class PushRegistrar {
     func updateClient(_ client: DroverClient?) {
         self.client = client
         // A different hub has never seen this token, so let it be re-sent.
+        // Until that upload succeeds, the new hub is not a proven announcer:
+        // clear any stale success from the previous hub so local fallback is
+        // never suppressed during migrations or re-pairing.
         uploadedToken = nil
+        PushRegistration.setActive(false)
         uploadIfReady()
     }
 
@@ -67,8 +71,11 @@ final class PushRegistrar {
                 PushRegistration.setActive(true)
             } catch {
                 // Leave `uploadedToken` unset so the next launch or
-                // reconfigure retries. Push is best-effort; the foreground
-                // watcher and BGTask poller still cover the user meanwhile.
+                // reconfigure retries. If a previous launch believed hub push
+                // was active, clear that stale state now: a failed upload is
+                // evidence the hub cannot promise the APNs path for this
+                // install, and local notifications must resume immediately.
+                PushRegistration.setActive(false)
                 NSLog("drover: APNs token upload failed: \(error.localizedDescription)")
             }
         }

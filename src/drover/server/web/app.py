@@ -52,6 +52,7 @@ from drover.server.harness.websocket import (
     send_frame,
     send_json,
 )
+from drover.server.push import push_available
 from drover.server.release_identity import load_release_identity
 from drover.server.web.auth import (
     DISABLED,
@@ -2118,6 +2119,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if not token:
             self._send(
                 400, "application/json", '{"error": "invalid APNs registration"}\n'
+            )
+            return
+        if not push_available():
+            self.auth.credentials.clear_apns_registration(credential.id)
+            self._send(
+                503,
+                "application/json",
+                '{"error": "hub push is unavailable"}\n',
             )
             return
         self.auth.credentials.set_apns_registration(
