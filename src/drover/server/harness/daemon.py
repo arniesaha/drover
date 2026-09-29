@@ -2007,8 +2007,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            factory_observer = parse_factory_observer_launch(
-                body, host_id=self.server.state.host_id
+            # Keep ordinary launch validation independent of server state. Some
+            # staging/security paths deliberately exercise this method with a
+            # minimal handler before a server is attached.
+            factory_observer = (
+                parse_factory_observer_launch(
+                    body, host_id=self.server.state.host_id
+                )
+                if "factory_observer" in body
+                else None
             )
         except FactoryObserverRequestError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
