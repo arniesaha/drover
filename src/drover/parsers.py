@@ -16,6 +16,158 @@ from drover.attribution import (
 )
 from drover.models import AgentEvent, Message, ToolCall
 
+_TASKFLOW_REQUIRED_COLUMNS = frozenset(
+    {
+        "flow_id",
+        "controller_id",
+        "revision",
+        "status",
+        "current_step",
+        "state_json",
+        "created_at",
+        "updated_at",
+        "ended_at",
+    }
+)
+_CAPABILITY_FACTORY_PROTOCOL = "capability-factory.run.v1"
+_CAPABILITY_FACTORY_CONTROLLER = "capability-factory/taskflow-controller"
+
+
+def _sqlite_read_only_uri(db_path: str) -> str:
+    """Return a SQLite URI which cannot create or modify the source database."""
+    return Path(db_path).expanduser().resolve().as_uri() + "?mode=ro"
+
+
+def _taskflow_datetime(value: object) -> Optional[datetime]:
+    """Read OpenClaw's millisecond Unix timestamps without guessing invalid values."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000.0, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _capability_factory_run(state_json: object) -> Optional[dict[str, object]]:
+    """Extract the compact Factory run envelope, never its evidence or content."""
+    if not isinstance(state_json, str):
+        return None
+    try:
+        state = json.loads(state_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(state, dict):
+        return None
+
+    # OpenClaw wraps the plugin's state in {version, run}; tolerate a future
+    # direct envelope as well, but require the Factory protocol either way.
+    envelope = state.get("run", state)
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("protocol") != _CAPABILITY_FACTORY_PROTOCOL
+    ):
+        return None
+    run = envelope.get("run")
+    if not isinstance(run, dict):
+        return None
+    run_id = run.get("id")
+    capability = run.get("capability")
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(capability, str)
+        or not capability
+    ):
+        return None
+    return {"id": run_id, "capability": capability}
+
+
+def parse_openclaw_taskflow(
+    db_path: str,
+    *,
+    controller_id: str = _CAPABILITY_FACTORY_CONTROLLER,
+) -> List[AgentEvent]:
+    """Read minimal Capability Factory provenance from OpenClaw's ``flow_runs``.
+
+    The source database is opened with SQLite ``mode=ro`` and is schema-gated
+    before querying. It deliberately excludes goals, owners, requester origin,
+    waits, evidence, artifacts, and any message/transcript fields.
+    """
+    if not os.path.exists(db_path):
+        return []
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(flow_runs)")}
+        if not _TASKFLOW_REQUIRED_COLUMNS.issubset(columns):
+            return []
+        rows = conn.execute(
+            """
+            SELECT flow_id, controller_id, revision, status, current_step,
+                   state_json, created_at, updated_at, ended_at
+            FROM flow_runs
+            WHERE controller_id = ?
+            ORDER BY updated_at ASC, flow_id ASC
+            """,
+            (controller_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+    events: List[AgentEvent] = []
+    for row in rows:
+        flow_id = row["flow_id"]
+        revision = row["revision"]
+        status = row["status"]
+        if (
+            not isinstance(flow_id, str)
+            or not flow_id
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not isinstance(status, str)
+            or not status
+        ):
+            continue
+        run = _capability_factory_run(row["state_json"])
+        timestamp = _taskflow_datetime(row["updated_at"])
+        created_at = _taskflow_datetime(row["created_at"])
+        if run is None or timestamp is None or created_at is None:
+            continue
+        ended_at = _taskflow_datetime(row["ended_at"])
+        current_step = row["current_step"]
+        raw_data: dict[str, object] = {
+            "source": "openclaw_taskflow",
+            "flow_id": flow_id,
+            "run_id": run["id"],
+            "status": status,
+            "revision": revision,
+            "controller": controller_id,
+            "capability": run["capability"],
+            "created_at": created_at.isoformat(),
+            "updated_at": timestamp.isoformat(),
+        }
+        if isinstance(current_step, str) and current_step:
+            raw_data["current_step"] = current_step
+        if ended_at is not None:
+            raw_data["ended_at"] = ended_at.isoformat()
+        events.append(
+            AgentEvent(
+                id=f"openclaw-taskflow:{flow_id}:revision:{revision}",
+                session_id=f"openclaw-taskflow:{flow_id}",
+                timestamp=timestamp,
+                agent_id="openclaw-taskflow",
+                event_type="system_event",
+                raw_data=raw_data,
+            )
+        )
+    return events
+
 
 def _configured_claude_cwd_prefixes() -> tuple[tuple[str, str], ...]:
     """Load optional encoded-directory mappings from JSON configuration."""

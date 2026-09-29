@@ -15,6 +15,7 @@ from drover.collect.sources import (
     ClaudeMacMiniSource,
     HermesSource,
     OpenClawSource,
+    OpenClawTaskFlowSource,
     PiMonoSource,
     write_events_jsonl,
 )
@@ -262,3 +263,158 @@ def test_write_events_jsonl_no_attribution_for_missing_path(tmp_path: Path) -> N
     raw = rows[0].raw_data
     assert "_repo_owner" not in raw
     assert "_repo_name" not in raw
+
+
+# --- OpenClaw managed TaskFlow ---
+
+
+def _factory_state(
+    *, run_id: str = "9b9cc2b3", capability: str = "drover-provenance"
+) -> str:
+    return json.dumps(
+        {
+            "version": 1,
+            "run": {
+                "protocol": "capability-factory.run.v1",
+                "run": {"id": run_id, "capability": capability},
+                # This intentionally represents the only safe part of state
+                # the parser uses; evidence and approval content stay unread.
+            },
+        }
+    )
+
+
+def _create_taskflow_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE flow_runs (
+            flow_id TEXT PRIMARY KEY,
+            controller_id TEXT,
+            revision INTEGER,
+            status TEXT,
+            current_step TEXT,
+            state_json TEXT,
+            created_at INTEGER,
+            updated_at INTEGER,
+            ended_at INTEGER,
+            goal TEXT,
+            requester_origin_json TEXT,
+            wait_json TEXT
+        )""")
+    conn.execute(
+        """INSERT INTO flow_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "1e0eb224-efdf-4d20-addd-2f324fe67930",
+            "capability-factory/taskflow-controller",
+            0,
+            "blocked",
+            "intake",
+            _factory_state(),
+            1790696800000,
+            1790696800000,
+            None,
+            "private goal must not be collected",
+            '{"private":"origin"}',
+            '{"private":"approval"}',
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_openclaw_taskflow_source_collects_initial_and_changed_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "openclaw.sqlite"
+    _create_taskflow_db(db_path)
+    src = OpenClawTaskFlowSource(db_path=db_path)
+
+    initial = list(src.parse(db_path))
+    assert len(initial) == 1
+    event = initial[0]
+    assert (
+        event.id == "openclaw-taskflow:1e0eb224-efdf-4d20-addd-2f324fe67930:revision:0"
+    )
+    assert event.session_id == "openclaw-taskflow:1e0eb224-efdf-4d20-addd-2f324fe67930"
+    assert event.event_type == "system_event"
+    assert event.raw_data == {
+        "source": "openclaw_taskflow",
+        "flow_id": "1e0eb224-efdf-4d20-addd-2f324fe67930",
+        "run_id": "9b9cc2b3",
+        "status": "blocked",
+        "revision": 0,
+        "controller": "capability-factory/taskflow-controller",
+        "capability": "drover-provenance",
+        "created_at": "2026-09-29T15:46:40+00:00",
+        "updated_at": "2026-09-29T15:46:40+00:00",
+        "current_step": "intake",
+    }
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE flow_runs SET status = ?, revision = ?, current_step = ?, updated_at = ?",
+        ("waiting", 1, "install", 1790696860000),
+    )
+    conn.commit()
+    conn.close()
+
+    changed = list(src.parse(db_path))
+    assert len(changed) == 1
+    assert changed[0].id.endswith("revision:1")
+    assert changed[0].raw_data["status"] == "waiting"
+    assert changed[0].raw_data["current_step"] == "install"
+
+
+def test_openclaw_taskflow_source_detects_newer_wal_file(tmp_path: Path) -> None:
+    db_path = tmp_path / "openclaw.sqlite"
+    _create_taskflow_db(db_path)
+    wal_path = db_path.with_name("openclaw.sqlite-wal")
+    wal_path.write_bytes(b"wal")
+
+    import os
+
+    os.utime(db_path, (1790696800, 1790696800))
+    os.utime(wal_path, (1790696860, 1790696860))
+    watermark = datetime.fromtimestamp(1790696830, tz=timezone.utc)
+
+    assert OpenClawTaskFlowSource(db_path=db_path).list_files_since(watermark) == [
+        db_path
+    ]
+
+
+def test_openclaw_taskflow_source_duplicate_collection_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "openclaw.sqlite"
+    _create_taskflow_db(db_path)
+    src = OpenClawTaskFlowSource(db_path=db_path)
+
+    first = list(src.parse(db_path))
+    second = list(src.parse(db_path))
+    assert [event.id for event in second] == [event.id for event in first]
+    assert [event.model_dump() for event in second] == [
+        event.model_dump() for event in first
+    ]
+
+
+def test_openclaw_taskflow_source_skips_absent_or_malformed_schema(
+    tmp_path: Path,
+) -> None:
+    missing = OpenClawTaskFlowSource(db_path=tmp_path / "missing.sqlite")
+    assert missing.list_files_since(None) == []
+
+    malformed = tmp_path / "malformed.sqlite"
+    conn = sqlite3.connect(malformed)
+    conn.execute("CREATE TABLE flow_runs (flow_id TEXT, status TEXT)")
+    conn.commit()
+    conn.close()
+    assert list(OpenClawTaskFlowSource(db_path=malformed).parse(malformed)) == []
+
+    invalid_state = tmp_path / "invalid-state.sqlite"
+    _create_taskflow_db(invalid_state)
+    conn = sqlite3.connect(invalid_state)
+    conn.execute("UPDATE flow_runs SET state_json = ?", ("not-json",))
+    conn.commit()
+    conn.close()
+    assert (
+        list(OpenClawTaskFlowSource(db_path=invalid_state).parse(invalid_state)) == []
+    )
