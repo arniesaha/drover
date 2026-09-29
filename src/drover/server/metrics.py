@@ -939,6 +939,14 @@ def _harness_session_dict(
     recap: LiveRecap | None = None,
 ) -> dict[str, Any]:
     item = dict(session.__dict__)
+    # Factory is deliberately not a Drover ledger.  The projection is derived
+    # from existing session correlation fields and therefore vanishes with the
+    # session; it cannot approve, cancel, or advance a Factory run.
+    from drover.server.harness.factory_observer import factory_observer_projection
+
+    factory_observer = factory_observer_projection(session)
+    if factory_observer is not None:
+        item["factory_observer"] = factory_observer
     _wire_datetimes(
         item,
         ("started_at", "updated_at", "ended_at", "last_activity"),

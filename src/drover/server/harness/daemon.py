@@ -55,6 +55,10 @@ from drover.server.harness.auth import (
 )
 from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.events import normalize_harness_event
+from drover.server.harness.factory_observer import (
+    FactoryObserverRequestError,
+    parse_factory_observer_launch,
+)
 from drover.server.harness.model_catalog import (
     CatalogSelectionError,
     ModelCatalogService,
@@ -2002,6 +2006,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        try:
+            # Keep ordinary launch validation independent of server state. Some
+            # staging/security paths deliberately exercise this method with a
+            # minimal handler before a server is attached.
+            factory_observer = (
+                parse_factory_observer_launch(body, host_id=self.server.state.host_id)
+                if "factory_observer" in body
+                else None
+            )
+        except FactoryObserverRequestError as exc:
+            self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if factory_observer is not None:
+            factory_launch, body = factory_observer
+        else:
+            factory_launch = None
         from drover.server.staging_credentials import is_staging
 
         if is_staging() and (
@@ -2025,17 +2045,27 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 client_session_id
             )
             if existing is not None:
-                self._write_json(
-                    {
-                        "session_id": existing.session_id,
-                        "host_id": existing.host_id,
-                        "harness": existing.harness,
-                        "status": existing.status,
-                        "client_session_id": client_session_id,
-                        "deduplicated": True,
-                    },
-                    status=HTTPStatus.OK,
-                )
+                response = {
+                    "session_id": existing.session_id,
+                    "host_id": existing.host_id,
+                    "harness": existing.harness,
+                    "status": existing.status,
+                    "client_session_id": client_session_id,
+                    "deduplicated": True,
+                }
+                if factory_launch is not None:
+                    response["factory_observer"] = factory_launch.wire_projection(
+                        status=existing.status,
+                        worktree=(
+                            {
+                                "path": existing.cwd,
+                                "branch": f"drover/{existing.session_id}",
+                            }
+                            if existing.cwd
+                            else None
+                        ),
+                    )
+                self._write_json(response, status=HTTPStatus.OK)
                 return
 
         mode = str(body.get("mode") or "pty")
@@ -2251,6 +2281,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # Already gated in `_create_session`; re-read so this stays correct if
         # it is ever called directly.
         client_session_id = _optional_text(body.get("client_session_id"))
+        factory_launch = body.get("_factory_observer_launch")
         harness = str(body.get("harness") or "")
         try:
             adapter = self.server.state.adapters.resolve(
@@ -2402,6 +2433,12 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 return
             if session_worktree is not None:
                 session_cwd = session_worktree.path
+        if factory_launch is not None and session_worktree is None:
+            self._write_json(
+                {"error": "factory observer launch requires an isolated Git worktree"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
 
         registry_created = False
         try:
@@ -2519,19 +2556,26 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     exc,
                 )
 
-        self._write_json(
-            {
-                "session_id": session_id,
-                "host_id": self.server.state.host_id,
-                "harness": harness,
-                "status": "running",
-                "mode": "structured",
-                "model": model,
-                "thinking_effort": thinking_effort,
-                "registry_synced": registry_created,
-            },
-            status=HTTPStatus.CREATED,
-        )
+        response: dict[str, Any] = {
+            "session_id": session_id,
+            "host_id": self.server.state.host_id,
+            "harness": harness,
+            "status": "running",
+            "mode": "structured",
+            "model": model,
+            "thinking_effort": thinking_effort,
+            "registry_synced": registry_created,
+        }
+        if factory_launch is not None:
+            response["factory_observer"] = factory_launch.wire_projection(
+                status="running",
+                worktree=(
+                    {"path": session_worktree.path, "branch": session_worktree.branch}
+                    if session_worktree is not None
+                    else None
+                ),
+            )
+        self._write_json(response, status=HTTPStatus.CREATED)
 
     def _mark_structured_turn_launch_error(self, session_id: str, exc: OSError) -> None:
         message = f"structured harness launch failed: {exc}"
