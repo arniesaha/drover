@@ -31,6 +31,7 @@ from drover.config import (
     ACTIVATION_IN_PLACE,
     AdvisoryContentConfig,
     DroverConfig,
+    SetupCheckConfig,
     config_home,
     default_config,
     default_config_path,
@@ -598,25 +599,19 @@ def _local_api_request(
 #: query.
 _DAY_SUMMARY_REFRESH_SECONDS = 900.0
 
-_SETUP_CHECK_TOTAL_TIMEOUT_SECONDS = 25.0
 _SETUP_CHECK_MAX_RESPONSE_BYTES = 1_048_576
 
 
-def _setup_check_timeout(deadline: float) -> float:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("setup-check time budget exhausted")
-    return min(5.0, remaining)
-
-
-def _setup_check_liveness(url: str, *, deadline: float) -> bool:
+def _setup_check_liveness(url: str, *, budgets: SetupCheckConfig) -> bool:
     """Probe one configured listener without authenticating or decoding its body."""
     try:
         status, _ = _setup_check_http_request(
-            url, "GET", None, {}, deadline=deadline, max_response_bytes=None
+            url, "GET", None, {}, budgets=budgets, max_response_bytes=None
         )
         return 200 <= status < 300
-    except (OSError, RuntimeError, ValueError, TimeoutError):
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
@@ -626,7 +621,7 @@ def _setup_check_request_json(
     path: str,
     payload: Optional[dict],
     *,
-    deadline: float,
+    budgets: SetupCheckConfig,
 ) -> dict:
     """Make one bounded authenticated control-plane read for ``setup-check``."""
     url = f"http://{_local_api_host(cfg)}:{cfg.metrics_http_port}{path}"
@@ -640,7 +635,7 @@ def _setup_check_request_json(
         method,
         data,
         headers,
-        deadline=deadline,
+        budgets=budgets,
         max_response_bytes=_SETUP_CHECK_MAX_RESPONSE_BYTES,
     )
     if not 200 <= status < 300:
@@ -659,16 +654,17 @@ def _setup_check_http_request(
     data: bytes | None,
     headers: dict[str, str],
     *,
-    deadline: float,
+    budgets: SetupCheckConfig,
     max_response_bytes: int | None,
 ) -> tuple[int, bytes]:
-    """Perform one no-redirect request within the shared setup-check deadline."""
+    """Perform one no-redirect request with independent startup and request budgets."""
     return run_setup_check_http_request(
         url,
         method,
         data,
         headers,
-        timeout=_setup_check_timeout(deadline),
+        timeout=budgets.request_timeout_seconds,
+        spawn_timeout=budgets.spawn_timeout_seconds,
         max_response_bytes=max_response_bytes,
     )
 
@@ -956,14 +952,14 @@ def setup_check(
     """Report read-only first-computer setup readiness."""
     try:
         cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
-        deadline = time.monotonic() + _SETUP_CHECK_TOTAL_TIMEOUT_SECONDS
+        budgets = cfg.setup_check
         with suppress_setup_check_transport_logs():
             report = evaluate_setup(
                 cfg,
                 SetupTarget(host_id=host_id, harness=harness, project=project),
-                liveness=lambda url: _setup_check_liveness(url, deadline=deadline),
+                liveness=lambda url: _setup_check_liveness(url, budgets=budgets),
                 request_json=lambda method, path, payload: _setup_check_request_json(
-                    cfg, method, path, payload, deadline=deadline
+                    cfg, method, path, payload, budgets=budgets
                 ),
             )
     except Exception:  # noqa: BLE001 - setup reports never disclose local details
