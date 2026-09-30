@@ -630,6 +630,35 @@ def test_start_passes_native_session_id_to_driver_factory(monkeypatch, tmp_path)
     assert captured == {"native_session_id": "provider-thread-1"}
 
 
+@pytest.mark.parametrize("existing_seq", [1, 17])
+def test_emit_advances_past_events_written_after_start(
+    monkeypatch, tmp_path, existing_seq
+):
+    mgr, driver, registry, on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    # The manager has seeded its counter from an empty event stream. Another
+    # writer records an event before the driver's first message arrives.
+    registry.append_event(
+        session_id="sess-1", event_type="session.started", seq=existing_seq
+    )
+    for text in ("first", "second"):
+        driver.emit(
+            StructuredMessage(type="assistant_output", role="assistant", text=text)
+        )
+
+    events = registry.list_events("sess-1")
+    assert sorted(event.seq for event in events) == [
+        existing_seq,
+        existing_seq + 1,
+        existing_seq + 2,
+    ]
+    assert [event["seq"] for _sid, event in on_messages] == [
+        existing_seq + 1,
+        existing_seq + 2,
+    ]
+
+
 def test_seq_is_monotonic_across_emitted_messages(monkeypatch, tmp_path):
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path

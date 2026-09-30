@@ -174,8 +174,16 @@ class StructuredSessionManager:
                 from drover.server.harness.daemon import record_dropped_events
 
                 recorded = False
+                seq_checked = False
                 for attempt in range(3):
                     try:
+                        if not seq_checked:
+                            # Another writer may have advanced the stream since
+                            # start() (or our last emit). Keep the local floor
+                            # too: failed local writes may still reach central.
+                            seq = max(seq, registry.max_event_seq(session_id) + 1)
+                            entry.seq = event_payload["seq"] = seq
+                            seq_checked = True
                         native_session_id = payload.get("native_session_id")
                         if (
                             isinstance(native_session_id, str)
