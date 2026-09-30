@@ -345,3 +345,31 @@ def test_exempt_routes_keep_independent_bounded_capacity(
             release.set()
         assert all(f.result()[0][0] == 200 for f in pending)
     assert request(port, path, method)[0][0] == 200
+
+
+@pytest.mark.parametrize("internal", [False, True])
+def test_analytical_request_releases_idle_buffers_but_health_does_not(
+    collector, monkeypatch, internal
+):
+    from drover.server import memory
+
+    released = []
+    monkeypatch.setattr(
+        memory, "release_idle_arrow_memory", lambda: released.append(True)
+    )
+    monkeypatch.setattr(collector, "render_analytics_json", lambda filters: (200, "{}"))
+    if internal:
+        dispatch = analytics_boundary_dispatcher(collector)
+        assert dispatch("GET", "/analytics", "", b"").status == 200
+        assert released == [True]
+    else:
+        server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
+        try:
+            port = server.server_address[1]
+            assert request(port, "/healthz")[0][0] == 200
+            assert released == []
+            assert request(port, "/analytics")[0][0] == 200
+            assert released == [True]
+        finally:
+            server.shutdown()
+            server.server_close()

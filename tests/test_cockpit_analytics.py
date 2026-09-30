@@ -1329,6 +1329,8 @@ def test_file_backed_activity_runs_outside_the_server_duckdb_instance(
     # A child has exited by the time its result is returned, so the next
     # distinct request must be admitted instead of seeing a stuck slot.
     assert service.overview(AnalyticsFilters(days=8))["activity"]["status"] == "ok"
+    # Parent-owned scratch is gone before serving the next request.
+    assert not list((tmp_path / ".drover-snapshots").glob("drover-cockpit-*"))
 
 
 def test_file_backed_activity_keeps_maintenance_out_while_child_runs(

@@ -85,40 +85,20 @@ def snapshot_thread_default(cpu_count: int) -> int:
     return max(1, min(_SNAPSHOT_MAX_THREADS, int(cpu_count) - 1))
 
 
+# Roles describe callers, not budgets. Connections to the same file share both
+# memory_limit and threads (and DuckDB does not account for all process RSS).
+# These defaults are one analytical INSTANCE budget, never three allocations.
+ANALYTICAL_INSTANCE_DEFAULTS = {
+    "memory_limit": "1GB",
+    "threads": "1",
+    "preserve_insertion_order": "false",
+}
+# 512MB OOMed the 30-day cockpit build; 1GB retains the measured floor from
+# #260. Keep #331's one-thread ceiling; raising memory is not an RSS fix.
 ROLE_DEFAULTS: dict[str, dict[str, str]] = {
-    # Analytical roles sized for the post-#249/#260 loaders: 2GB was sized for
-    # the pre-#249 advisory loaders (routing loader peaked at 2210 MB); #249
-    # dropped those to ~300 MB, and the #260 fix (raw_data kept out of the
-    # cockpit dedup window) brought the worst remaining query, the 30-day
-    # cockpit activity build, to ~9-11s at ~1.6-1.7 GB RSS at both 2GB and 1GB
-    # limits (measured 2026-08-31 on a production-store copy; 512MB OOMs, so
-    # 1GB is the floor with headroom). DuckDB spills to <dbfile>.tmp (on the
-    # external data volume via the ~/.drover symlink), so an underestimate
-    # degrades to disk, not OOM-crash. Note the env override footgun in one
-    # line: `DROVER_DUCKDB_WORKER_MEMORY_LIMIT` covers worker+summarizer only;
-    # `diagnostic`/`snapshot` need their own `DROVER_DUCKDB_DIAGNOSTIC_*`/
-    # `DROVER_DUCKDB_SNAPSHOT_*` vars (see `_apply_role_settings`).
-    # One thread, not two: `threads` is instance-wide, so a background pass
-    # opening a `worker` connection raises parallelism for every other reader
-    # on that instance, including a cockpit build already running at the
-    # `diagnostic` setting of 1. On 2026-09-04 concurrent analytical work put
-    # the server at 374 percent CPU and starved the control plane until a
-    # restart (#331). These passes are seconds long and not latency-critical;
-    # the foreground query is.
-    "worker": {
-        "memory_limit": "1GB",
-        "threads": "1",
-        "preserve_insertion_order": "false",
-    },
-    "summarizer": {
-        "memory_limit": "1GB",
-        "threads": "1",
-        "preserve_insertion_order": "false",
-    },
-    "diagnostic": {
-        "memory_limit": "1GB",
-        "threads": "1",
-        "preserve_insertion_order": "false",
+    **{
+        role: ANALYTICAL_INSTANCE_DEFAULTS
+        for role in ("worker", "summarizer", "diagnostic")
     },
     # Read-only analytics against a *private copy* of the database, never the
     # live file. `threads` is a DuckDB instance-wide setting: raising it on a
@@ -151,8 +131,8 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     # widest statement here (`latest_session_previews`, a window function over
     # the events of at most ~120 sessions) touches a fraction of it. That is
     # several times the headroom it can use, and one eighth of the analytical
-    # budget -- so the two instances together stay well inside the ~6GB free on
-    # a 16GB host that is already paging. It must also be set explicitly: a
+    # budget. These limits do not bound total process RSS: Arrow, Python and
+    # other instances add to it (#364). It must also be set explicitly: a
     # fresh instance otherwise defaults to ~80% of host RAM, which on this
     # machine would be 12.7 GiB and would trade one failure for a worse one.
     #
@@ -1009,6 +989,10 @@ class _AnalyticalHandle:
                     return None  # recovery owns obsolete handles
             if name not in {"close", "interrupt"}:
                 require_analytical_store(self._key, self._generation)
+            if name == "close" and isinstance(self._inner, duckdb.DuckDBPyConnection):
+                from drover.server.memory import log_instance_memory
+
+                log_instance_memory(self._inner, self._key)
             try:
                 result = attr(*args, **kwargs)
             except Exception as exc:
@@ -1018,6 +1002,10 @@ class _AnalyticalHandle:
                         "analytical store invalidated; retry later"
                     ) from exc
                 raise
+            if name == "close":
+                # A closed cursor must not keep its parent connection (and all
+                # registered Arrow relations / attachments) alive via _owner.
+                self._owner = None
             if result is self._inner:
                 return self
             if isinstance(result, (duckdb.DuckDBPyConnection, duckdb.DuckDBPyRelation)):
@@ -1162,31 +1150,39 @@ def _apply_role_settings(
     Every one of these is a DuckDB *instance* setting, not a connection
     setting, so which file the connection is on decides who else they land on.
     """
-    settings = dict(ROLE_DEFAULTS.get(role, ROLE_DEFAULTS["worker"]))
-    prefix = f"DUCKDB_{role.upper()}"
-    # `snapshot` and `control_plane` deliberately do not fall back to the
-    # diagnostic or worker env vars: the whole point of both roles is that
-    # throttling live analytical readers must not throttle them, or vice versa.
-    fallback_prefix = (
-        prefix
-        if role in {"diagnostic", "snapshot", "control_plane"}
-        else "DUCKDB_WORKER"
-    )
-
-    def _env_setting(suffix: str, default: str) -> str:
-        for name in (
-            f"DROVER_{prefix}_{suffix}",
-            f"DROVER_{fallback_prefix}_{suffix}",
-        ):
-            value = os.environ.get(name)
-            if value is not None:
-                return value
-        return default
-
-    settings["memory_limit"] = _env_setting("MEMORY_LIMIT", settings["memory_limit"])
-    settings["threads"] = _env_setting("THREADS", settings["threads"])
+    shared = role not in {"snapshot", "control_plane"}
+    settings = dict(ROLE_DEFAULTS.get(role, ANALYTICAL_INSTANCE_DEFAULTS))
+    for setting in ("memory_limit", "threads"):
+        suffix = setting.upper()
+        if shared:
+            # Accept old names as aliases for ONE budget. Inspect all aliases
+            # on every open (including the startup pin), independent of role:
+            # connection order must never decide the instance's settings.
+            names = [
+                f"DROVER_DUCKDB_{name}_{suffix}"
+                for name in ("ANALYTICAL", "WORKER", "SUMMARIZER", "DIAGNOSTIC")
+            ]
+            configured = {
+                name: os.environ[name].strip() for name in names if name in os.environ
+            }
+            if len({value.lower() for value in configured.values()}) > 1:
+                raise ValueError(
+                    f"conflicting analytical instance {setting}: {configured}"
+                )
+            if configured:
+                settings[setting] = next(iter(configured.values()))
+        else:
+            settings[setting] = os.environ.get(
+                f"DROVER_DUCKDB_{role.upper()}_{suffix}", settings[setting]
+            )
     if settings_overrides:
-        settings.update({str(k): str(v) for k, v in settings_overrides.items()})
+        for key, value in settings_overrides.items():
+            if shared and key in {"memory_limit", "threads"}:
+                if str(value).lower() != settings[key].lower():
+                    raise ValueError(
+                        f"{key} is an analytical instance budget; use DROVER_DUCKDB_ANALYTICAL_{key.upper()}"
+                    )
+            settings[str(key)] = str(value)
 
     if role not in {"snapshot", "control_plane"}:
         # A role override must not silently raise every live reader's CPU

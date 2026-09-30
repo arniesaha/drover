@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sys
 from dataclasses import asdict
 from datetime import date, datetime
@@ -61,6 +63,8 @@ def run(payload: dict) -> dict:
 
 
 def main() -> int:
+    if os.environ.get("DROVER_DUCKDB_MEMORY_DIAGNOSTICS") == "1":
+        logging.basicConfig(level=logging.INFO)
     try:
         payload = json.load(sys.stdin)
         response = run(payload)
