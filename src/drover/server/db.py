@@ -870,7 +870,11 @@ def reset_invalidated_instance(duckdb_path: str | Path) -> int:
 
 
 class AnalyticalStoreUnavailable(RuntimeError):
-    """The analytical instance is recovering, failed, or this handle is obsolete."""
+    """The analytical instance is recovering or this handle is obsolete."""
+
+
+class AnalyticalStoreBusy(TimeoutError):
+    """A bounded analytical admission could not acquire the connect lock."""
 
 
 @dataclass
@@ -882,8 +886,9 @@ class _AnalyticalState:
 
 _ANALYTICAL_STATES: dict[str, _AnalyticalState] = {}
 _ANALYTICAL_STATE_GUARD = threading.Lock()
-_ANALYTICAL_RECOVERY_ATTEMPTS = 3
+_ANALYTICAL_RECOVERY_FAST_ATTEMPTS = 3
 _ANALYTICAL_RECOVERY_BACKOFF_SECONDS = 0.25
+_ANALYTICAL_RECOVERY_MAX_BACKOFF_SECONDS = 60.0
 
 
 def analytical_store_health(duckdb_path: str | Path) -> dict[str, object]:
@@ -942,10 +947,14 @@ def _recover_analytical_store(
         with _ANALYTICAL_PIN_GUARD:
             restore_pin = key in _ANALYTICAL_PINNED
         reset_invalidated_instance(key)
-        for attempt in range(_ANALYTICAL_RECOVERY_ATTEMPTS):
+    delay = _ANALYTICAL_RECOVERY_BACKOFF_SECONDS
+    while True:
+        # One recoverer owns the entire incident, including the slow retries.
+        # Memory pressure can last much longer than the initial fast window.
+        time.sleep(delay)
+        with duckdb_connect_lock(key):
             with _ANALYTICAL_STATE_GUARD:
-                state.attempts = attempt + 1
-            time.sleep(_ANALYTICAL_RECOVERY_BACKOFF_SECONDS * 2**attempt)
+                state.attempts += 1
             try:
                 con = _open_analytical_handle(Path(key), "worker", None)
                 if restore_pin:
@@ -956,9 +965,15 @@ def _recover_analytical_store(
                 else:
                     con.close()
             except Exception:
+                with _ANALYTICAL_STATE_GUARD:
+                    if state.attempts >= _ANALYTICAL_RECOVERY_FAST_ATTEMPTS:
+                        state.status = "failed-retrying"
                 log.exception(
-                    "analytical store %s recovery attempt %d failed", key, attempt + 1
+                    "analytical store %s recovery attempt %d failed; retrying",
+                    key,
+                    state.attempts,
                 )
+                delay = min(delay * 2, _ANALYTICAL_RECOVERY_MAX_BACKOFF_SECONDS)
                 continue
             with _LIVE_GUARD:
                 _CONNECT_FAILURES.pop(key, None)
@@ -966,11 +981,6 @@ def _recover_analytical_store(
                 state.status = "ok"
             log.info("analytical store %s recovered", key)
             return
-    with _ANALYTICAL_STATE_GUARD:
-        state.status = "failed"
-    log.error(
-        "analytical store %s recovery exhausted; operator intervention required", key
-    )
 
 
 class _AnalyticalHandle:
@@ -1019,8 +1029,10 @@ class _AnalyticalHandle:
 
         if name in {"cursor", "duplicate"}:
 
-            def open_cursor(*args, **kwargs):
-                with _analytical_open_lock(self._key, self._generation):
+            def open_cursor(*args, _connect_timeout=None, **kwargs):
+                with _analytical_open_lock(
+                    self._key, self._generation, timeout=_connect_timeout
+                ):
                     return call(*args, **kwargs)
 
             return open_cursor
@@ -1054,11 +1066,27 @@ def _open_analytical_handle(path, role, settings_overrides, *, generation=None):
     return con
 
 
+def analytical_probe_cursor(con):
+    """Borrow a readiness cursor without queueing for analytical admission.
+
+    Keep ordinary cursor creation serialized with recovery. Raw handles used
+    by diagnostics/tests have no admission wrapper and retain their own API.
+    """
+    if isinstance(con, _AnalyticalHandle):
+        return con.cursor(_connect_timeout=0.0)
+    return con.cursor()
+
+
 @contextmanager
-def _analytical_open_lock(duckdb_path: str | Path, generation: int) -> Iterator[None]:
+def _analytical_open_lock(
+    duckdb_path: str | Path, generation: int, *, timeout: float | None = None
+) -> Iterator[None]:
     lock = duckdb_connect_lock(duckdb_path)
-    while not lock.acquire(timeout=0.05):
-        require_analytical_store(duckdb_path, generation)
+    if timeout is None:
+        while not lock.acquire(timeout=0.05):
+            require_analytical_store(duckdb_path, generation)
+    elif not lock.acquire(timeout=max(0.0, timeout)):
+        raise AnalyticalStoreBusy("analytical connect lock is busy")
     try:
         require_analytical_store(duckdb_path, generation)
         yield

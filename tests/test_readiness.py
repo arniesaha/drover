@@ -42,6 +42,7 @@ from drover.server.db import (
     control_plane_connection,
     control_plane_lock,
     control_plane_path,
+    duckdb_connect_lock,
     live_connection,
     open_duckdb_connection,
     remember_live_connection,
@@ -304,7 +305,7 @@ def test_healthz_observed_health_does_not_probe_the_store(tmp_path):
 
     assert ready_status == 503
     assert health_status == 200
-    assert json.loads(health_body)["analytical_store"]["status"] == "ok"
+    assert health_body == "ok\n"
 
 
 def test_readiness_opens_no_analytical_connection(tmp_path, monkeypatch):
@@ -644,3 +645,27 @@ def test_a_bounded_probe_still_fails_an_invalidated_control_plane(
 
     assert _store_states(report)[STORE_CONTROL_PLANE] == STATE_FAILED
     assert not report.ok
+
+
+def test_analytical_connect_lock_never_queues_readiness(tmp_path):
+    duckdb_path = _db(tmp_path)
+    con = open_duckdb_connection(duckdb_path)
+    probe = ReadinessProbe(duckdb_path, cache_seconds=0.0)
+    try:
+        with duckdb_connect_lock(duckdb_path):
+            report = _run_with_deadline(probe.check, timeout=UNQUEUED_SECONDS)
+            assert _store_states(report)[STORE_ANALYTICAL] == STATE_BUSY
+            # The HTTP route must retain the same bounded behavior.
+            server, port = _serve(duckdb_path)
+            try:
+                status, body = _run_with_deadline(
+                    lambda: _get(port, "/readyz"), timeout=UNQUEUED_SECONDS
+                )
+                assert status == 200  # busy is in the existing grace window
+                assert _states(body)[STORE_ANALYTICAL] == STATE_BUSY
+            finally:
+                server.shutdown()
+                server.server_close()
+        assert _store_states(probe.check())[STORE_ANALYTICAL] == STATE_OK
+    finally:
+        con.close()

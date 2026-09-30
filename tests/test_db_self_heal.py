@@ -15,6 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -39,7 +40,7 @@ _MESSAGE = (
 
 def _wait_recovery(path, status="ok"):
     deadline = time.monotonic() + 5
-    while analytical_store_health(path)["status"] == "recovering":
+    while analytical_store_health(path)["status"] != status:
         assert time.monotonic() < deadline, "recovery did not finish"
         time.sleep(0.01)
     assert analytical_store_health(path)["status"] == status
@@ -272,36 +273,79 @@ def test_use_detects_fatal_and_recovers_once(tmp_path, monkeypatch, caplog, meth
         con.execute("SELECT 1")
 
 
-def test_recovery_is_bounded_and_leaves_control_plane_alone(tmp_path, monkeypatch):
+def test_recovery_retries_past_fast_window_without_touching_control_plane(
+    tmp_path, monkeypatch
+):
     path = tmp_path / "store.duckdb"
     con = open_duckdb_connection(path)
     monkeypatch.setenv("DROVER_CONTROL_PLANE_PIN", "1")
     assert db_module.pin_control_plane_connection(path)
     with db_module.control_plane_connection(path) as control:
         control.execute("CREATE TABLE preserved AS SELECT 9 AS n")
-    attempts = []
+    original_open = db_module._open_analytical_handle
+    original_recover = db_module._recover_analytical_store
+    slow_retry, release = threading.Event(), threading.Event()
+    delays, attempts, recoverers = [], [], []
+    first = True
 
-    def fail(*args, **kwargs):
-        attempts.append(1)
-        raise duckdb.FatalException("checkpoint fatal")
+    def recover(*args):
+        recoverers.append(threading.current_thread())
+        return original_recover(*args)
 
-    monkeypatch.setattr(db_module, "_open_analytical_handle", fail)
-    monkeypatch.setattr(db_module, "_ANALYTICAL_RECOVERY_BACKOFF_SECONDS", 0.01)
+    def fail_then_recover(*args, **kwargs):
+        nonlocal first
+        if first:
+            first = False
+            raise duckdb.FatalException("checkpoint fatal")
+        attempts.append(threading.current_thread())
+        if len(attempts) <= 11:
+            raise duckdb.OutOfMemoryException("sustained memory pressure")
+        return original_open(*args, **kwargs)
+
+    def backoff(delay):
+        delays.append(delay)
+        if len(delays) == 4:
+            slow_retry.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(db_module, "_open_analytical_handle", fail_then_recover)
+    monkeypatch.setattr(db_module, "_recover_analytical_store", recover)
+    monkeypatch.setattr(
+        db_module,
+        "time",
+        SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=backoff),
+    )
     try:
         with pytest.raises(AnalyticalStoreUnavailable):
             open_duckdb_connection(path)
-        _wait_recovery(path, "failed")
-        assert len(attempts) == 1 + db_module._ANALYTICAL_RECOVERY_ATTEMPTS
-        for _ in range(3):
-            with pytest.raises(AnalyticalStoreUnavailable):
-                open_duckdb_connection(path)
-        assert len(attempts) == 4
+        assert slow_retry.wait(2)
+        assert analytical_store_health(path) == {
+            "status": "failed-retrying",
+            "recovery_attempts": 3,
+        }
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(open_duckdb_connection, path) for _ in range(16)]
+            for future in futures:
+                with pytest.raises(AnalyticalStoreUnavailable):
+                    future.result(timeout=1)
+        db_module._invalidate_analytical_store(
+            path, 0, duckdb.FatalException("late failure")
+        )
+        assert len(recoverers) == 1
+        assert len(attempts) == 3
         with db_module.control_plane_connection(path) as same_control:
             assert same_control is control
             assert same_control.execute("SELECT * FROM preserved").fetchone() == (9,)
     finally:
+        release.set()
+        _wait_recovery(path)
         con.close()
         db_module.close_control_plane_connections()
+    assert len(recoverers) == 1
+    assert set(attempts) == set(recoverers)
+    assert len(attempts) == 12
+    assert delays == [0.25, 0.5, 1, 2, 4, 8, 16, 32, 60, 60, 60, 60]
+    assert analytical_store_health(path) == {"status": "ok", "recovery_attempts": 12}
 
 
 def test_ordinary_query_oom_does_not_invalidate(tmp_path):

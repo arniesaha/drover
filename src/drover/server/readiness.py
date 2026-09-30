@@ -108,7 +108,9 @@ import duckdb
 
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
+    AnalyticalStoreBusy,
     ControlPlaneBusy,
+    analytical_probe_cursor,
     analytical_store_health,
     control_plane_connection,
     control_plane_path,
@@ -440,7 +442,11 @@ class ReadinessProbe:
         last_failure: BaseException | None = None
         for con in handles:
             try:
-                cursor = con.cursor()
+                cursor = analytical_probe_cursor(con)
+            except AnalyticalStoreBusy as exc:
+                return self._classify(
+                    STORE_ANALYTICAL, _detail(exc), lock_conflict=True, now=now
+                )
             except duckdb.ConnectionException:
                 stale += 1
                 continue

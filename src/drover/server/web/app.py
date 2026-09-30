@@ -804,9 +804,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             health = analytical_store_health(self.collector.duckdb_path)
             self._send(
-                200 if health["status"] == "ok" else 503,
-                "application/json",
-                json.dumps({"process": "ok", "analytical_store": health}) + "\n",
+                200,
+                "text/plain; charset=utf-8",
+                "ok\n",
+                extra_headers={"X-Drover-Analytical": str(health["status"])},
             )
             return
         if path == "/release-identity":
@@ -2405,7 +2406,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if _MetricsHandler._is_analytics_public_path(path) and status not in {401, 403}:
             if (
-                self.analytics_boundary is None
+                not 200 <= status < 300
+                and self.analytics_boundary is None
                 and analytical_store_health(self.collector.duckdb_path)["status"]
                 != "ok"
             ):
@@ -2526,7 +2528,8 @@ def analytics_boundary_dispatcher(
         try:
             require_analytical_store(collector.duckdb_path)
             result = dispatch_available(method, path, query, body)
-            require_analytical_store(collector.duckdb_path)
+            if not 200 <= result.status < 300:
+                require_analytical_store(collector.duckdb_path)
             return result
         except AnalyticalStoreUnavailable:
             return response(
