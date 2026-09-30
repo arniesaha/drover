@@ -347,7 +347,7 @@ def sweep_receipts(duckdb_path: Path, *, retention_days: int) -> ReceiptSweepRes
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     placeholders = ", ".join("?" for _ in SWEEPABLE_RECEIPT_KINDS)
-    con = duckdb.connect(str(duckdb_path))
+    con = open_duckdb_connection(duckdb_path)
     try:
         removed = con.execute(
             f"""

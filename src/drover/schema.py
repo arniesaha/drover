@@ -34,6 +34,7 @@ from drover.server.db import (
     CONTROL_PLANE_TABLES,
     control_plane_connection,
     control_plane_path,
+    open_duckdb_connection,
     sql_path_literal,
 )
 from drover.server.harness.identity import harness_event_identity
@@ -1191,7 +1192,6 @@ def backfill_agent_event_day_summary(
     Returns the number of days summarised. Safe to call repeatedly: it only ever
     picks up days whose summary is missing or older than the partition.
     """
-    from drover.server.db import open_duckdb_connection
 
     done = 0
     for _ in range(max_days):
@@ -2323,7 +2323,7 @@ def bootstrap(
 
     _ensure_seed_parquet(parquet_dir)
 
-    con = duckdb.connect(str(duckdb_path))
+    con = open_duckdb_connection(duckdb_path)
     try:
         con.execute(_TASKS_DDL)
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)

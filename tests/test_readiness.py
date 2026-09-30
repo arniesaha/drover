@@ -42,6 +42,7 @@ from drover.server.db import (
     control_plane_connection,
     control_plane_lock,
     control_plane_path,
+    duckdb_connect_lock,
     live_connection,
     open_duckdb_connection,
     remember_live_connection,
@@ -290,12 +291,8 @@ def test_a_corrupt_control_plane_store_fails_readiness(tmp_path):
     assert _states(body)[STORE_CONTROL_PLANE] == STATE_FAILED
 
 
-def test_healthz_stays_up_while_readiness_is_down(tmp_path):
-    """Liveness is unchanged: the process is running, it just cannot serve.
-
-    Restart logic keys off the difference, so ``/healthz`` must not learn
-    about the database at all.
-    """
+def test_healthz_observed_health_does_not_probe_the_store(tmp_path):
+    """An unmonitored test handle affects the query probe, not observed health."""
     duckdb_path = _db(tmp_path)
     invalidated = _InvalidatedConnection()
     remember_live_connection(duckdb_path, invalidated)
@@ -648,3 +645,27 @@ def test_a_bounded_probe_still_fails_an_invalidated_control_plane(
 
     assert _store_states(report)[STORE_CONTROL_PLANE] == STATE_FAILED
     assert not report.ok
+
+
+def test_analytical_connect_lock_never_queues_readiness(tmp_path):
+    duckdb_path = _db(tmp_path)
+    con = open_duckdb_connection(duckdb_path)
+    probe = ReadinessProbe(duckdb_path, cache_seconds=0.0)
+    try:
+        with duckdb_connect_lock(duckdb_path):
+            report = _run_with_deadline(probe.check, timeout=UNQUEUED_SECONDS)
+            assert _store_states(report)[STORE_ANALYTICAL] == STATE_BUSY
+            # The HTTP route must retain the same bounded behavior.
+            server, port = _serve(duckdb_path)
+            try:
+                status, body = _run_with_deadline(
+                    lambda: _get(port, "/readyz"), timeout=UNQUEUED_SECONDS
+                )
+                assert status == 200  # busy is in the existing grace window
+                assert _states(body)[STORE_ANALYTICAL] == STATE_BUSY
+            finally:
+                server.shutdown()
+                server.server_close()
+        assert _store_states(probe.check())[STORE_ANALYTICAL] == STATE_OK
+    finally:
+        con.close()
