@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import selectors
 import subprocess
 import sys
 import time
@@ -14,12 +15,15 @@ from typing import Mapping
 
 import httpx
 
-_MAX_REAP_RESERVE_SECONDS = 0.1
 _MAX_REQUEST_BODY_BYTES = 32 * 1024
 _MAX_REQUEST_TEXT_CHARACTERS = 32 * 1024
 _MAX_SERIALIZED_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_SERIALIZED_RESULT_BYTES = 2 * _MAX_RESPONSE_BYTES
+
+
+class WorkerStartTimeout(TimeoutError):
+    """The isolated transport worker did not become ready in time."""
 
 
 def run_setup_check_http_request(
@@ -29,16 +33,18 @@ def run_setup_check_http_request(
     headers: Mapping[str, str],
     *,
     timeout: float,
+    spawn_timeout: float,
     max_response_bytes: int | None,
 ) -> tuple[int, bytes]:
     """Run one bounded request in a subprocess that can be killed after stalls."""
     if timeout <= 0:
-        raise TimeoutError("setup-check request timed out")
+        raise TimeoutError("setup-check hub did not answer in time")
+    if spawn_timeout <= 0:
+        raise WorkerStartTimeout("setup-check worker failed to start in time")
 
-    deadline = time.monotonic() + timeout
     request = _encode_request(url, method, data, headers, timeout, max_response_bytes)
-    if _communicate_timeout_seconds(deadline, timeout) <= 0:
-        raise TimeoutError("setup-check request timed out")
+    deadline = time.monotonic() + spawn_timeout
+    process = None
     try:
         process = subprocess.Popen(
             [sys.executable, "-m", "drover.server.setup_readiness_transport"],
@@ -46,21 +52,27 @@ def run_setup_check_http_request(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        stdout, _ = process.communicate(
-            input=request,
-            timeout=_communicate_timeout_seconds(deadline, timeout),
-        )
+        # A ready byte covers interpreter startup and imports. Only after it
+        # arrives do we send private input and start the full request budget.
+        # Popen itself cannot be interrupted; charge its elapsed time to startup.
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise WorkerStartTimeout("setup-check worker failed to start in time")
+            if process.stdout.read(1) != b"R":
+                raise RuntimeError("setup-check transport failed")
+        stdout, _ = process.communicate(input=request, timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_and_reap(process)
-        raise TimeoutError("setup-check request timed out") from None
+        raise TimeoutError("setup-check hub did not answer in time") from None
     except (OSError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, WorkerStartTimeout):
+            raise
         raise RuntimeError("setup-check transport failed") from exc
+    finally:
+        if process is not None:
+            _kill_and_reap(process)
     return _decode_result(stdout)
-
-
-def _communicate_timeout_seconds(deadline: float, timeout: float) -> float:
-    reserve = min(_MAX_REAP_RESERVE_SECONDS, timeout / 10)
-    return max(0.0, deadline - time.monotonic() - reserve)
 
 
 def _kill_and_reap(process: subprocess.Popen) -> None:
@@ -203,7 +215,7 @@ def _decode_result(raw: bytes) -> tuple[int, bytes]:
                 raise RuntimeError("setup-check transport failed") from exc
             return status, body
     if result.get("outcome") == "timeout":
-        raise TimeoutError("setup-check request timed out")
+        raise TimeoutError("setup-check hub did not answer in time")
     if result.get("outcome") == "response-bound":
         raise ValueError("setup-check response exceeds the configured bound")
     raise RuntimeError("setup-check transport failed")
@@ -211,6 +223,8 @@ def _decode_result(raw: bytes) -> tuple[int, bytes]:
 
 def _worker_main() -> None:
     """Receive private stdin and write one bounded typed result to stdout."""
+    sys.stdout.buffer.write(b"R")
+    sys.stdout.buffer.flush()
     try:
         request = _decode_request(
             sys.stdin.buffer.read(_MAX_SERIALIZED_REQUEST_BYTES + 1)
@@ -218,7 +232,7 @@ def _worker_main() -> None:
         with suppress_setup_check_transport_logs():
             status, body = asyncio.run(_request_async(*request))
         result = ("ok", status, body)
-    except TimeoutError:
+    except (TimeoutError, httpx.TimeoutException):
         result = ("timeout",)
     except ValueError:
         result = ("response-bound",)

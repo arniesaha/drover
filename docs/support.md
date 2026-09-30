@@ -37,6 +37,23 @@ drover-server setup-check --host HOST --harness HARNESS --project PROJECT
 Add `--json` when you need structured local diagnostics. The check does not
 change services or credentials.
 
+Each setup-check request starts a fresh worker. Worker startup and the hub
+response have independent timeouts, configurable in the existing TOML config:
+
+```toml
+[setup_check]
+spawn_timeout_seconds = 20.0
+request_timeout_seconds = 5.0
+```
+
+These defaults apply separately to each of at most five requests; there is no
+shared 25-second deadline. Values must be finite positive numbers. A slow
+interpreter does not consume the hub response budget. Timeout guidance identifies
+whether the worker failed to start or the hub did not answer. The OS process
+creation call itself cannot be interrupted; its elapsed time counts toward the
+startup allowance, and cleanup may add a little time. Worker reuse remains a
+possible follow-up.
+
 ## Notifications
 
 Notifications require the iOS permission, a device token from Apple, and a hub

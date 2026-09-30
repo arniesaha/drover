@@ -7,6 +7,7 @@ from typing import Callable
 from urllib.parse import quote
 
 from drover.config import DroverConfig
+from drover.server.setup_readiness_transport import WorkerStartTimeout
 
 _LOCAL_LIVENESS_ACTION = (
     "Start drover-server and confirm its configured listener is reachable."
@@ -131,22 +132,23 @@ def evaluate_setup(
 ) -> SetupReadinessReport:
     """Evaluate bounded existing reads without surfacing transport details."""
     checks = [
-        _check(
-            "local_liveness",
-            _safe_liveness(liveness, _local_listener_url(cfg)),
-            _LOCAL_LIVENESS_ACTION,
+        _liveness_check(
+            "local_liveness", liveness, _local_listener_url(cfg), _LOCAL_LIVENESS_ACTION
         ),
-        _check(
+        _liveness_check(
             "advertised_liveness",
-            _safe_liveness(liveness, _advertised_listener_url(cfg)),
+            liveness,
+            _advertised_listener_url(cfg),
             _ADVERTISED_LIVENESS_ACTION,
         ),
     ]
 
     try:
         hosts_response = request_json("GET", "/harness/hosts", None)
-    except Exception:  # noqa: BLE001 - recovery output is deliberately fixed
-        checks.append(_check("control_api", False, _CONTROL_API_ACTION))
+    except Exception as exc:  # noqa: BLE001 - recovery output is deliberately fixed
+        checks.append(
+            _check("control_api", False, _timeout_action(exc, _CONTROL_API_ACTION))
+        )
         checks.append(_check("host", False, _HOST_ACTION))
         return _failed_dependents(checks, _CONTROL_API_ACTION)
 
@@ -179,8 +181,10 @@ def evaluate_setup(
         auth_response = request_json(
             "GET", f"/harness/hosts/{host_id}/auth/{harness}/status", None
         )
-    except Exception:  # noqa: BLE001 - recovery output is deliberately fixed
-        checks.append(_check("harness_auth", False, _HARNESS_ACTION))
+    except Exception as exc:  # noqa: BLE001 - recovery output is deliberately fixed
+        checks.append(
+            _check("harness_auth", False, _timeout_action(exc, _HARNESS_ACTION))
+        )
         checks.append(_check("project", False, _PROJECT_DEPENDENCY_ACTION))
         return SetupReadinessReport(checks=tuple(checks))
 
@@ -202,8 +206,8 @@ def evaluate_setup(
             f"/harness/hosts/{host_id}/fs/exists",
             {"paths": [target.project]},
         )
-    except Exception:  # noqa: BLE001 - recovery output is deliberately fixed
-        checks.append(_check("project", False, _PROJECT_ACTION))
+    except Exception as exc:  # noqa: BLE001 - recovery output is deliberately fixed
+        checks.append(_check("project", False, _timeout_action(exc, _PROJECT_ACTION)))
         return SetupReadinessReport(checks=tuple(checks))
 
     exists = (
@@ -214,8 +218,19 @@ def evaluate_setup(
     return SetupReadinessReport(checks=tuple(checks))
 
 
-def _safe_liveness(liveness: Callable[[str], bool], url: str) -> bool:
+def _timeout_action(exc: Exception, fallback: str) -> str:
+    # Classify by type, never by exception text: URLs and credentials stay private.
+    if isinstance(exc, WorkerStartTimeout):
+        return "Setup-check worker failed to start in time. Increase setup_check.spawn_timeout_seconds and retry."
+    if isinstance(exc, TimeoutError):
+        return "Hub did not answer in time. Check connectivity or increase setup_check.request_timeout_seconds and retry."
+    return fallback
+
+
+def _liveness_check(
+    key: str, liveness: Callable[[str], bool], url: str, action: str
+) -> SetupCheck:
     try:
-        return liveness(url) is True
-    except Exception:  # noqa: BLE001 - recovery output is deliberately fixed
-        return False
+        return _check(key, liveness(url) is True, action)
+    except Exception as exc:  # noqa: BLE001 - recovery output is deliberately fixed
+        return _check(key, False, _timeout_action(exc, action))

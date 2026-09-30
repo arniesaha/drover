@@ -345,6 +345,24 @@ class AnalyticsBoundaryConfig:
 
 
 @dataclass(frozen=True)
+class SetupCheckConfig:
+    """Independent startup and HTTP budgets for each setup-check worker."""
+
+    spawn_timeout_seconds: float = 20.0
+    request_timeout_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        for name in ("spawn_timeout_seconds", "request_timeout_seconds"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"setup_check.{name} must be a finite positive number")
+
+
+@dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
     parquet_dir: Path
@@ -470,9 +488,14 @@ class DroverConfig:
     # is a USB SSD whose read stalls (57-120s measured) blocked every session
     # launch; worktree creation must not share a volume with slow bulk data.
     worktrees_dir: Path | None = None
+    setup_check: SetupCheckConfig = SetupCheckConfig()
 
 
 _DEFAULTS = {
+    "setup_check": {
+        "spawn_timeout_seconds": 20.0,
+        "request_timeout_seconds": 5.0,
+    },
     "paths": {
         "incoming_dir": str(config_home() / "incoming"),
         "parquet_dir": str(config_home() / "parquet"),
@@ -743,6 +766,7 @@ def _from_dict(d: dict) -> DroverConfig:
             if d["paths"].get("worktrees_dir")
             else None
         ),
+        setup_check=SetupCheckConfig(**d["setup_check"]),
         control_store=control_store_config,
         runtime=runtime_config,
         analytics_boundary=AnalyticsBoundaryConfig(
