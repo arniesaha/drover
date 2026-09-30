@@ -692,6 +692,8 @@ def start_analytics_boundary_server(
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if status == 503:
+                self.send_header("Retry-After", "1")
             self.end_headers()
             self.wfile.write(body)
 

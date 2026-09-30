@@ -717,7 +717,6 @@ class AdvisoryWorker:
         lease_duration: timedelta = timedelta(minutes=5),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         maintenance_gate: AnalyticalMaintenanceGate | None = None,
-        max_consecutive_skips: int = 10,
         isolated_snapshots: bool = False,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
@@ -729,22 +728,27 @@ class AdvisoryWorker:
         self.retry_delay = retry_delay
         # Analyzer snapshots read the shared analytical instance, so a sweep
         # beside a cockpit build competes for the same instance-wide threads
-        # and memory (#331). Stand aside while a request is in flight, but
-        # never indefinitely: findings that stop refreshing are their own bug.
-        self._admission = MaintenanceAdmission(
-            maintenance_gate, max_consecutive_skips=max_consecutive_skips
-        )
+        # and memory (#331). Stand aside while a request is in flight;
+        # deferred_sweeps exposes any resulting staleness.
+        self._admission = MaintenanceAdmission(maintenance_gate)
         if lease_duration <= timedelta(0):
             raise ValueError("lease duration must be positive")
         self.lease_duration = lease_duration
         self.clock = clock
         self._thread: threading.Thread | None = None
 
-    def run_once(self, analyzers: Iterable[Analyzer]) -> AdvisoryRunResult:
+    def run_once(
+        self,
+        analyzers: Iterable[Analyzer],
+        *,
+        scheduler: AdvisoryScheduler | None = None,
+    ) -> AdvisoryRunResult:
         with self._admission.admit() as admitted:
             if not admitted:
                 log.debug("advisory sweep deferred: a request is in flight")
                 return AdvisoryRunResult(succeeded=0, failed=0, skipped=0)
+            if scheduler is not None:
+                scheduler.enqueue_due_full_review()
             return self._run_once_admitted(analyzers)
 
     @property
@@ -802,8 +806,7 @@ class AdvisoryWorker:
         def _run() -> None:
             while not shutdown_event.is_set():
                 try:
-                    scheduler.enqueue_due_full_review()
-                    self.run_once(analyzer_set)
+                    self.run_once(analyzer_set, scheduler=scheduler)
                 except Exception:  # noqa: BLE001 - keep server alive when degraded
                     log.exception("advisory worker loop failed; continuing")
                 shutdown_event.wait(poll_interval_seconds)

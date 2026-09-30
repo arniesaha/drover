@@ -24,6 +24,10 @@ from typing import Any
 
 import duckdb
 
+from drover.server.analytics_maintenance import (
+    AnalyticalMaintenanceGate,
+    MaintenanceAdmission,
+)
 from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.usage import session_totals, usage_turn_count
 from drover.server.harness.usage_sources import (
@@ -374,11 +378,13 @@ class UsageRollupWorker:
         poll_interval_s: float = 60.0,
         batch_size: int = DEFAULT_BATCH_SIZE,
         archive_resolver: Any | None = None,
+        maintenance_gate: AnalyticalMaintenanceGate | None = None,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.poll_interval_s = poll_interval_s
         self.batch_size = batch_size
         self.archive_resolver = archive_resolver
+        self._admission = MaintenanceAdmission(maintenance_gate)
         self.last_pass_seconds: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -407,7 +413,17 @@ class UsageRollupWorker:
                 log.exception("usage rollup pass crashed")
             self._stop.wait(self.poll_interval_s)
 
+    @property
+    def deferred_passes(self) -> int:
+        return self._admission.skipped_total
+
     def drain_once(self) -> RollupReport:
+        with self._admission.admit() as admitted:
+            if not admitted:
+                return RollupReport(candidates=0, rolled=0, malformed_events=0)
+            return self._drain_once()
+
+    def _drain_once(self) -> RollupReport:
         global _last_pass_seconds
         started = time.monotonic()
         registry_path = control_plane_path(self.duckdb_path)

@@ -16,6 +16,7 @@ import queue
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -758,12 +759,27 @@ def _validate_percent_encoding(value: str) -> None:
         index += 3
 
 
+def _request_slots(name: str, default: int) -> threading.BoundedSemaphore:
+    value = int(os.environ.get(name, str(default)))
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return threading.BoundedSemaphore(value)
+
+
+def _analytical_foreground(collector: "MetricsCollector"):
+    service = getattr(collector, "cockpit_service", None)
+    gate = getattr(service, "maintenance_gate", None)
+    return gate.foreground() if gate is not None else contextlib.nullcontext()
+
+
 class _MetricsHandler(BaseHTTPRequestHandler):
     collector: "MetricsCollector"
     auth: AuthSettings = DISABLED
     pairing: PairingCodes | None = None
     analytics_boundary: AnalyticsBoundaryClient | None = None
     host_data_bridge_token: str = ""
+    analytical_slots: threading.BoundedSemaphore
+    fleet_slots: threading.BoundedSemaphore
 
     def _gate(self, path: str) -> bool:
         """Authorize the request or write the refusal response.
@@ -785,11 +801,55 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
         return False
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+    def _dispatch_request(self, dispatch: Callable[[], None]) -> None:
+        from drover.server.metrics import HarnessRenderBusy
+
+        path = urlparse(self.path).path
+        analytical = self._is_analytics_public_path(path)
+        slots = (
+            self.analytical_slots
+            if analytical
+            else self.fleet_slots if path in {"/harness", "/harness/hosts"} else None
+        )
+        # Authenticate before exposing saturation. ThreadingHTTPServer already
+        # gives control requests their own threads; nonblocking admission keeps
+        # analytical callers from accumulating work or an executor queue.
+        if slots is not None and not self._gate(path):
+            return
+        if slots is not None and not slots.acquire(blocking=False):
+            self._send(
+                503,
+                "application/json",
+                json.dumps(
+                    {"error": "analytics busy" if analytical else "fleet listing busy"}
+                )
+                + "\n",
+                extra_headers={"Retry-After": "1"},
+            )
+            return
         try:
-            self._do_GET()
+            foreground = (
+                _analytical_foreground(self.collector)
+                if analytical and self.analytics_boundary is None
+                else contextlib.nullcontext()
+            )
+            with foreground:
+                dispatch()
         except AnalyticalStoreUnavailable:
             self._send_analytical_unavailable()
+        except HarnessRenderBusy:
+            self._send(
+                503,
+                "application/json",
+                '{"error":"fleet listing busy"}\n',
+                extra_headers={"Retry-After": "2"},
+            )
+        finally:
+            if slots is not None:
+                slots.release()
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+        self._dispatch_request(self._do_GET)
 
     def _do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1120,10 +1180,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
-        try:
-            self._do_POST()
-        except AnalyticalStoreUnavailable:
-            self._send_analytical_unavailable()
+        self._dispatch_request(self._do_POST)
 
     def _do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -1357,10 +1414,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
     def do_PUT(self) -> None:  # noqa: N802 - stdlib method name
-        try:
-            self._do_PUT()
-        except AnalyticalStoreUnavailable:
-            self._send_analytical_unavailable()
+        self._dispatch_request(self._do_PUT)
 
     def _do_PUT(self) -> None:
         path = urlparse(self.path).path
@@ -1374,10 +1428,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
     def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
-        try:
-            self._do_DELETE()
-        except AnalyticalStoreUnavailable:
-            self._send_analytical_unavailable()
+        self._dispatch_request(self._do_DELETE)
 
     def _do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -2494,6 +2545,8 @@ def start_metrics_server(
             "pairing": pairing,
             "analytics_boundary": analytics_boundary,
             "host_data_bridge_token": host_data_bridge_token,
+            "analytical_slots": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
+            "fleet_slots": _request_slots("DROVER_FLEET_HTTP_CONCURRENCY", 4),
         },
     )
     server = ThreadingHTTPServer((host, port), handler)
@@ -2524,10 +2577,15 @@ def analytics_boundary_dispatcher(
             return None
         return value if isinstance(value, dict) else None
 
+    slots = _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1)
+
     def dispatch(method: str, path: str, query: str, body: bytes) -> BoundaryResponse:
+        if not slots.acquire(blocking=False):
+            return response(503, "application/json", '{"error":"analytics busy"}\n')
         try:
             require_analytical_store(collector.duckdb_path)
-            result = dispatch_available(method, path, query, body)
+            with _analytical_foreground(collector):
+                result = dispatch_available(method, path, query, body)
             if not 200 <= result.status < 300:
                 require_analytical_store(collector.duckdb_path)
             return result
@@ -2535,6 +2593,8 @@ def analytics_boundary_dispatcher(
             return response(
                 503, "application/json", '{"error":"analytical_store_unavailable"}\n'
             )
+        finally:
+            slots.release()
 
     def dispatch_available(
         method: str, path: str, query: str, body: bytes

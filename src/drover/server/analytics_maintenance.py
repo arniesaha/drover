@@ -8,8 +8,8 @@ while ``/healthz`` answered in 3 ms -- the control plane has its own instance
 and its own lock, so it was not blocked, it was starved of CPU (#331).
 
 The gate is the cheap half of the answer: background passes stand aside while
-a request is being served. Standing aside forever would be its own bug, so
-admission is bounded -- see ``MaintenanceAdmission``.
+a request is being served. A skipped tick is retried at the worker's normal
+interval; it never bypasses an active foreground build.
 
 The gate class here is taken from the closed PR #324, whose projection did
 not pay for itself but whose admission control was sound and independently
@@ -90,40 +90,22 @@ class AnalyticalMaintenanceGate:
 
 
 class MaintenanceAdmission:
-    """One worker's view of the gate, with a floor under how long it defers.
+    """Skip a background tick while foreground work or maintenance is active.
 
-    A gate on its own trades an outage for silent staleness: this hub is
-    polled by a phone every few seconds, so "run only when nothing is in
-    flight" can mean "never". After ``max_consecutive_skips`` refusals the
-    worker runs anyway, which bounds how stale its table can get at roughly
-    ``max_consecutive_skips * poll_interval``. Yielding is a courtesy, not a
-    promise.
+    Never force a pass after repeated refusals: a long foreground build is
+    precisely when competing scans would prolong an overload. Deferred-pass
+    counters expose staleness; the next idle tick resumes normal progress.
     """
 
-    def __init__(
-        self,
-        gate: "AnalyticalMaintenanceGate | None",
-        *,
-        max_consecutive_skips: int = 10,
-    ) -> None:
-        if max_consecutive_skips < 0:
-            raise ValueError("max_consecutive_skips must not be negative")
+    def __init__(self, gate: "AnalyticalMaintenanceGate | None") -> None:
         self._gate = gate
-        self._max_consecutive_skips = max_consecutive_skips
         self._lock = threading.Lock()
-        self._consecutive_skips = 0
         self._skipped_total = 0
-        self._forced_total = 0
 
     @property
     def skipped_total(self) -> int:
         with self._lock:
             return self._skipped_total
-
-    @property
-    def forced_total(self) -> int:
-        with self._lock:
-            return self._forced_total
 
     @contextmanager
     def admit(self) -> Iterator[bool]:
@@ -131,21 +113,12 @@ class MaintenanceAdmission:
         if self._gate is None:
             yield True
             return
-        if self._gate.try_begin_maintenance():
+        if not self._gate.try_begin_maintenance():
             with self._lock:
-                self._consecutive_skips = 0
-            try:
-                yield True
-            finally:
-                self._gate.end_maintenance()
+                self._skipped_total += 1
+            yield False
             return
-        with self._lock:
-            self._consecutive_skips += 1
-            self._skipped_total += 1
-            forced = self._consecutive_skips > self._max_consecutive_skips
-            if forced:
-                self._consecutive_skips = 0
-                self._forced_total += 1
-        # Deliberately unslotted: the gate refused, so this pass runs beside
-        # whatever holds it rather than pretending to own the slot.
-        yield bool(forced)
+        try:
+            yield True
+        finally:
+            self._gate.end_maintenance()
