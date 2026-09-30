@@ -1,16 +1,27 @@
 # Analytical admission and control-plane responsiveness (#331)
 
 The HTTP server uses `ThreadingHTTPServer`: each request gets a thread, and
-`/harness*` does not share an executor queue with analytical requests. Nonblocking
-semaphores now limit analytical HTTP work and fleet listings independently.
-Excess callers receive HTTP 503 with `Retry-After: 1` before rendering, scanning,
-or waiting for another render. Authentication runs before admission.
+`/harness*` does not share an executor queue with analytical requests. Heavy
+analytical requests retain a single slot by default, since concurrent scans
+still compete for instance-wide CPU and memory. Callers wait up to one second
+for that slot before receiving HTTP 503 with `Retry-After: 1`. Authentication
+runs before admission. Fleet admission remains nonblocking.
 
-The analytical limit applies to `/analytics`, `/cockpit/overview`, `/insights*`,
-`/observability`, and `/metrics`, including mutations and forwarding in an API
-process. The internal analytical dispatcher also enforces admission in an
-analytics process. Both public and internal HTTP listeners attach a retry hint
-to analytical 503 responses, including the recovery responses from #363.
+`GET /metrics` and `POST /insights/{id}/acknowledge|dismiss|check` are exempt from
+the heavy slot. They have separate nonblocking limits of two scrapes and four
+mutations, so a cockpit build cannot reject a scrape or user tap, and a flood
+of small requests cannot create unbounded concurrent work. The existing cheap
+Prometheus cache path and bounded insight check-scope probe remain in place;
+these limits bound admission, not every underlying database operation.
+
+The same classification and independent capacity apply in the public handler,
+internal worker dispatcher, and API-to-worker transport. Transport reservations
+are additional to its configured heavy/archive capacity, preventing a split
+installation from reintroducing the shared bottleneck. The heavy wait is one
+second at each admission boundary; transport retains its total request deadline.
+Both HTTP listeners attach retry hints to analytical 503 responses, including
+recovery responses from #363. Liveness and successful-response preservation
+from #363 are unchanged.
 
 Fleet admission covers `/harness` (including custom archived limits) and
 `/harness/hosts`. Both routes also translate `HarnessRenderBusy` to 503 with
@@ -25,7 +36,7 @@ All values below are positive integers, read from the environment:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `DROVER_DUCKDB_ANALYTICAL_MAX_THREADS` | `1` | Ceiling on live analytical roles, including worker, summarizer, and diagnostic, after role settings and explicit overrides |
-| `DROVER_ANALYTICAL_HTTP_CONCURRENCY` | `1` | Concurrent analytical requests per listener/dispatcher |
+| `DROVER_ANALYTICAL_HTTP_CONCURRENCY` | `1` | Concurrent heavy analytical requests per listener/dispatcher |
 | `DROVER_FLEET_HTTP_CONCURRENCY` | `4` | Concurrent fleet listing requests per listener |
 
 Existing `DROVER_DUCKDB_<ROLE>_THREADS` settings choose a role's thread count
@@ -43,13 +54,17 @@ shared ceiling. Memory settings are unchanged. This change does not implement
 ## Background work
 
 The existing foreground gate now refuses maintenance for the entire foreground
-build, even after many skipped ticks. Harness usage rollup, native usage rollup,
+build, even after many skipped ticks. Native usage rollup,
 advisory scheduling/sweeps, and the recurring event-day-summary backfill use it.
-Analytical HTTP handling registers foreground work too; activity workers retain
+Heavy analytical HTTP handling registers foreground work too; activity workers retain
 their existing gate lifetime if a build outlives its requesting thread.
 
 Only one admitted maintenance pass runs at a time. Skipped ticks return without
-opening stores and retry at their normal interval. Already-running maintenance
+opening stores and retry at their normal interval. Day-summary backfill retries
+skipped passes every 30 seconds instead of waiting its full 900-second refresh
+interval; once admitted it returns to that normal cadence. Harness usage rollup
+only touches the control store and transcript payloads, so it runs independently
+of the analytical gate. Already-running maintenance
 is not interrupted when a foreground request arrives. Continuous foreground
 traffic can delay maintenance indefinitely; deferred-pass counters on workers
 and existing gate gauges help distinguish this from a failed pass. This favors
@@ -76,4 +91,6 @@ status check), but has no automatic retry loop. Client changes are deferred.
 
 Regression tests use events to hold an analytical request in flight, verify
 both fleet routes respond in under one second, exercise actual rollup deferrals,
-and verify immediate analytical/fleet overload responses and slot release.
+and verify bounded analytical waits, immediate fleet overload responses, and
+slot release. Both all-in-one and split-runtime tests cover scrape/mutation
+exemptions, their separate capacity limits, and heavy-slot handoff.

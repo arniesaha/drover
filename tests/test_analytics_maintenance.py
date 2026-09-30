@@ -155,19 +155,41 @@ def test_the_native_rollup_defers_to_a_request(tmp_path, monkeypatch) -> None:
     assert worker.deferred_passes == 25
 
 
-def test_harness_rollup_defers_without_opening_control_store(tmp_path, monkeypatch):
-    from drover.server.harness import usage_rollup
+@pytest.mark.parametrize("skipped_ticks", [1, 3])
+def test_day_summaries_retry_promptly_after_deferral(
+    tmp_path, monkeypatch, skipped_ticks
+):
+    from drover import schema
+    from drover.server.__main__ import _backfill_day_summaries
 
     gate = AnalyticalMaintenanceGate()
-    monkeypatch.setattr(
-        usage_rollup,
-        "control_plane_connection",
-        lambda *a, **k: pytest.fail("deferred rollup opened the control store"),
-    )
-    worker = usage_rollup.UsageRollupWorker(
-        duckdb_path=tmp_path / "drover.duckdb", maintenance_gate=gate
-    )
-    with gate.foreground():
-        for _ in range(25):
-            assert worker.drain_once().rolled == 0
-    assert worker.deferred_passes == 25
+    foreground = gate.foreground()
+    foreground.__enter__()
+    waits = []
+    scans = []
+
+    class Stop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, seconds):
+            waits.append(seconds)
+            if len(waits) == skipped_ticks:
+                foreground.__exit__(None, None, None)
+            elif len(waits) > skipped_ticks:
+                self.stopped = True
+
+    def backfill(path):
+        assert not gate.stats().foreground_waiters
+        assert gate.stats().maintenance_active
+        scans.append(path)
+        return 1
+
+    monkeypatch.setattr(schema, "backfill_agent_event_day_summary", backfill)
+    path = tmp_path / "analytics.duckdb"
+    _backfill_day_summaries(path, gate, Stop())
+    assert waits == [30.0] * skipped_ticks + [900.0]
+    assert scans == [path]
+    assert not gate.stats().maintenance_active

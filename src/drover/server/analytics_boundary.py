@@ -28,6 +28,9 @@ ANALYTICS_UNAVAILABLE_BODY = (
     json.dumps({"error": "analytics worker unavailable"}, separators=(",", ":")) + "\n"
 )
 ANALYTICS_UNAVAILABLE_HEADERS = {"Retry-After": "2"}
+ANALYTICS_METRICS_CONCURRENCY = 2
+ANALYTICS_MUTATION_CONCURRENCY = 4
+ANALYTICS_ADMISSION_WAIT_SECONDS = 1.0
 API_TO_WORKER_HEADER = "X-Drover-Api-To-Analytics"
 WORKER_TO_API_HEADER = "X-Drover-Analytics-To-Api"
 
@@ -254,6 +257,15 @@ def _is_insight_mutation(parts: tuple[str, ...]) -> bool:
     )
 
 
+def analytics_request_lane(method: str, path: str) -> str:
+    """Reserve independent capacity for scrapes and small insight actions."""
+    if method == "GET" and path == "/metrics":
+        return "metrics"
+    if method == "POST" and _is_insight_mutation(_split_path(path)):
+        return "mutation"
+    return "heavy"
+
+
 def _allowed_query_fields(method: str, path: str) -> frozenset[str]:
     if method != "GET":
         return frozenset()
@@ -330,6 +342,10 @@ class AnalyticsBoundaryClient:
         self._token = token.strip()
         self._transport = transport
         self._slots = threading.BoundedSemaphore(config.max_concurrent_requests)
+        self._metrics_slots = threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY)
+        self._mutation_slots = threading.BoundedSemaphore(
+            ANALYTICS_MUTATION_CONCURRENCY
+        )
 
     @property
     def config(self) -> AnalyticsBoundaryConfig:
@@ -354,7 +370,14 @@ class AnalyticsBoundaryClient:
         if not self._token or len(body) > self._config.max_request_bytes:
             raise AnalyticsBoundaryUnavailable("analytics request is unavailable")
         deadline = time.monotonic() + self._config.request_timeout_seconds
-        if not self._slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        lane = analytics_request_lane(method, path)
+        slots = {
+            "heavy": self._slots,
+            "metrics": self._metrics_slots,
+            "mutation": self._mutation_slots,
+        }[lane]
+        wait = ANALYTICS_ADMISSION_WAIT_SECONDS if lane == "heavy" else 0.0
+        if not slots.acquire(timeout=min(wait, max(0.0, deadline - time.monotonic()))):
             raise AnalyticsBoundaryUnavailable(
                 "analytics request capacity is unavailable"
             )
@@ -386,7 +409,7 @@ class AnalyticsBoundaryClient:
         ) as exc:  # noqa: BLE001 - boundary response is intentionally opaque
             raise AnalyticsBoundaryUnavailable("analytics worker unavailable") from exc
         finally:
-            self._slots.release()
+            slots.release()
 
     def resolve(
         self, *, event_id: str, batch_id: str, payload_sha256: str

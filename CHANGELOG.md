@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep metrics scrapes and small insight actions independent of cockpit admission,
+  allow heavy requests a one-second admission wait, retry deferred day summaries
+  after 30 seconds, and let control-only usage rollups progress during analytics
+  (#331, #436).
+
 - Bound analytical CPU and HTTP concurrency, keep background rollups deferred
   throughout foreground builds, and return retry hints for saturated analytical
   and fleet listings without queueing control requests behind analytics (#331).

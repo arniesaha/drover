@@ -21,11 +21,17 @@ def request(port, path, method="GET"):
     started = time.monotonic()
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
     try:
-        response = urllib.request.urlopen(req, timeout=3)
+        response = urllib.request.urlopen(req, timeout=10)
     except urllib.error.HTTPError as exc:
         response = exc
     with response:
-        result = response.status, json.load(response), response.headers
+        raw = response.read()
+        body = (
+            json.loads(raw)
+            if response.headers.get_content_type() == "application/json"
+            else raw.decode()
+        )
+        result = response.status, body, response.headers
     return result, time.monotonic() - started
 
 
@@ -79,21 +85,14 @@ def test_long_analytics_keeps_fleet_fast_and_rejects_excess_work(
                 assert entered.wait(2)
                 gate = collector.cockpit_service.maintenance_gate
                 assert not gate.try_begin_maintenance()
-                from drover.server.harness.usage_rollup import UsageRollupWorker
                 from drover.server.native_usage_rollup import NativeUsageRollupWorker
 
-                workers = [
-                    UsageRollupWorker(
-                        duckdb_path=collector.duckdb_path, maintenance_gate=gate
-                    ),
-                    NativeUsageRollupWorker(
-                        duckdb_path=collector.duckdb_path, maintenance_gate=gate
-                    ),
-                ]
-                for worker in workers:
-                    for _ in range(25):
-                        worker.drain_once()
-                    assert worker.deferred_passes == 25
+                worker = NativeUsageRollupWorker(
+                    duckdb_path=collector.duckdb_path, maintenance_gate=gate
+                )
+                for _ in range(25):
+                    worker.drain_once()
+                assert worker.deferred_passes == 25
                 for path in ("/harness", "/harness/hosts"):
                     (status, body, _), elapsed = request(port, path)
                     assert status == 200
@@ -112,7 +111,7 @@ def test_long_analytics_keeps_fleet_fast_and_rejects_excess_work(
                     assert status == 503
                     assert body["error"] == "analytics busy"
                     assert headers["Retry-After"] == "1"
-                    assert elapsed < 1
+                    assert 0.9 <= elapsed < 2
             finally:
                 release.set()
             assert pending.result()[0][0] == 200
@@ -197,8 +196,152 @@ def test_worker_boundary_also_rejects_concurrent_analytics(collector, monkeypatc
             assert entered.wait(2)
             started = time.monotonic()
             assert dispatch("GET", "/analytics", "", b"").status == 503
-            assert time.monotonic() - started < 1
+            assert 0.9 <= time.monotonic() - started < 2
         finally:
             release.set()
         assert pending.result().status == 200
     assert dispatch("GET", "/analytics", "", b"").status == 200
+
+
+@pytest.fixture(params=[False, True], ids=["all-in-one", "split"])
+def analytical_server(collector, request):
+    from drover.config import AnalyticsBoundaryConfig
+    from drover.server.analytics_boundary import (
+        AnalyticsBoundaryClient,
+        start_analytics_boundary_server,
+    )
+
+    worker = None
+    boundary = None
+    if request.param:
+        config = AnalyticsBoundaryConfig(max_concurrent_requests=1)
+        worker = start_analytics_boundary_server(
+            host="127.0.0.1",
+            port=0,
+            token="test-token",
+            config=config,
+            dispatch=analytics_boundary_dispatcher(collector),
+        )
+        from dataclasses import replace
+
+        config = replace(
+            config, worker_url=f"http://127.0.0.1:{worker.server_address[1]}"
+        )
+        boundary = AnalyticsBoundaryClient(config, token="test-token")
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, analytics_boundary=boundary
+    )
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        if worker is not None:
+            worker.shutdown()
+            worker.server_close()
+
+
+def test_scrapes_and_small_mutations_bypass_heavy_build(
+    collector, monkeypatch, analytical_server
+):
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(filters):
+        entered.set()
+        assert release.wait(10)
+        return 200, "{}"
+
+    monkeypatch.setattr(collector, "render_cockpit_overview_json", slow)
+    monkeypatch.setattr(collector, "render_prometheus", lambda: "scrape_ok 1\n")
+    monkeypatch.setattr(
+        collector,
+        "act_on_insight",
+        lambda finding_id, action, body: (200, json.dumps({"action": action})),
+    )
+    port = analytical_server
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(request, port, "/cockpit/overview")
+        try:
+            assert entered.wait(2)
+            (status, body, _), elapsed = request(port, "/metrics")
+            assert status == 200
+            assert body == "scrape_ok 1\n"
+            assert elapsed < 1
+            for action in ("acknowledge", "dismiss", "check"):
+                (status, body, _), elapsed = request(
+                    port, f"/insights/{'a' * 32}/{action}", "POST"
+                )
+                assert status == 200
+                assert body == {"action": action}
+                assert elapsed < 1
+        finally:
+            release.set()
+        assert pending.result()[0][0] == 200
+
+
+def test_heavy_request_waits_briefly_for_released_slot(
+    collector, monkeypatch, analytical_server
+):
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(filters):
+        entered.set()
+        assert release.wait(10)
+        return 200, "{}"
+
+    monkeypatch.setattr(collector, "render_analytics_json", slow)
+    port = analytical_server
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(request, port, "/analytics")
+        timer = threading.Timer(0.2, release.set)
+        try:
+            assert entered.wait(2)
+            timer.start()
+            (status, _, _), elapsed = request(port, "/analytics")
+            assert status == 200
+            assert elapsed < 2
+        finally:
+            release.set()
+            timer.cancel()
+        assert first.result()[0][0] == 200
+
+
+@pytest.mark.parametrize("lane,capacity", [("metrics", 2), ("mutation", 4)])
+def test_exempt_routes_keep_independent_bounded_capacity(
+    collector, monkeypatch, analytical_server, lane, capacity
+):
+    entered, release = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    calls = 0
+
+    def slow(*args):
+        nonlocal calls
+        with lock:
+            calls += 1
+            if calls == capacity:
+                entered.set()
+        assert release.wait(10)
+        return "scrape_ok 1\n" if lane == "metrics" else (200, "{}")
+
+    if lane == "metrics":
+        monkeypatch.setattr(collector, "render_prometheus", slow)
+        path, method = "/metrics", "GET"
+    else:
+        monkeypatch.setattr(collector, "act_on_insight", slow)
+        path, method = f"/insights/{'a' * 32}/acknowledge", "POST"
+    monkeypatch.setattr(collector, "render_analytics_json", lambda _: (200, "{}"))
+    port = analytical_server
+    with ThreadPoolExecutor(max_workers=capacity) as pool:
+        pending = [pool.submit(request, port, path, method) for _ in range(capacity)]
+        try:
+            assert entered.wait(3)
+            (status, _, headers), elapsed = request(port, path, method)
+            assert status == 503
+            assert int(headers["Retry-After"]) >= 1
+            assert elapsed < 1
+            # A stuck small request must not occupy the heavy slot either.
+            assert request(port, "/analytics")[0][0] == 200
+        finally:
+            release.set()
+        assert all(f.result()[0][0] == 200 for f in pending)
+    assert request(port, path, method)[0][0] == 200
