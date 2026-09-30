@@ -1188,6 +1188,15 @@ def _apply_role_settings(
     if settings_overrides:
         settings.update({str(k): str(v) for k, v in settings_overrides.items()})
 
+    if role not in {"snapshot", "control_plane"}:
+        # A role override must not silently raise every live reader's CPU
+        # budget. This ceiling covers all roles sharing the analytical file;
+        # private snapshots and the separate control instance keep their own.
+        cap = int(os.environ.get("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS", "1"))
+        if cap < 1:
+            raise ValueError("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS must be positive")
+        settings["threads"] = str(min(int(settings["threads"]), cap))
+
     con.execute("SET memory_limit=?", [settings["memory_limit"]])
     con.execute("SET threads=?", [int(settings["threads"])])
     con.execute(

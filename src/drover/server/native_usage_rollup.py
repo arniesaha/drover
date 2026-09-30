@@ -272,7 +272,6 @@ class NativeUsageRollupWorker:
         duckdb_path: Path,
         poll_interval_s: float = 60.0,
         maintenance_gate: "AnalyticalMaintenanceGate | None" = None,
-        max_consecutive_skips: int = 10,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self.poll_interval_s = poll_interval_s
@@ -281,10 +280,8 @@ class NativeUsageRollupWorker:
         # This pass scans a parquet partition on the shared analytical
         # instance, whose threads and memory are instance-wide, so running it
         # beside a cockpit build makes that build slower and can starve the
-        # control plane of CPU (#331). Stand aside, but not forever.
-        self._admission = MaintenanceAdmission(
-            maintenance_gate, max_consecutive_skips=max_consecutive_skips
-        )
+        # control plane of CPU (#331). Retry on the next idle tick.
+        self._admission = MaintenanceAdmission(maintenance_gate)
 
     @property
     def deferred_passes(self) -> int:

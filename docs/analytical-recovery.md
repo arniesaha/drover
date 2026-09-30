@@ -47,6 +47,7 @@ the store before the response is sent, so clients are not told to retry a
 successful mutation. Non-2xx responses can still be replaced with the explicit
 unavailable response.
 
-Recovery does not reduce process RSS (#364) or address CPU starvation (#331).
+Recovery does not reduce process RSS (#364). CPU and request admission are
+documented in [analytical admission](analytical-admission.md) (#331).
 The regression tests inject fatal errors; production confirmation of recovery
 from an actual checkpoint OOM remains useful.

@@ -64,7 +64,10 @@ from drover.server.analytics_boundary import (
     HostDataBridgeClient,
     start_analytics_boundary_server,
 )
-from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
+from drover.server.analytics_maintenance import (
+    AnalyticalMaintenanceGate,
+    MaintenanceAdmission,
+)
 from drover.server.archive import (
     BackupConfig,
     PondArchiveClient,
@@ -3143,14 +3146,19 @@ def run(
             # exact regression this cache exists to prevent, arriving quietly.
             from drover.schema import backfill_agent_event_day_summary
 
-            while True:
+            admission = MaintenanceAdmission(analytics_gate)
+            while not stop.is_set():
                 try:
-                    summarised = backfill_agent_event_day_summary(cfg.duckdb_path)
-                    if summarised:
-                        log.info("summarised %d event partition(s)", summarised)
+                    with admission.admit() as admitted:
+                        if admitted:
+                            summarised = backfill_agent_event_day_summary(
+                                cfg.duckdb_path
+                            )
+                            if summarised:
+                                log.info("summarised %d event partition(s)", summarised)
                 except Exception:  # noqa: BLE001 - a cold cache only costs speed
                     log.exception("event day summary backfill failed; reads will scan")
-                time.sleep(_DAY_SUMMARY_REFRESH_SECONDS)
+                stop.wait(_DAY_SUMMARY_REFRESH_SECONDS)
 
         threading.Thread(
             target=_backfill_day_summaries,
@@ -3163,6 +3171,7 @@ def run(
         usage_rollup = UsageRollupWorker(
             duckdb_path=cfg.duckdb_path,
             archive_resolver=worker_archive_resolver,
+            maintenance_gate=analytics_gate,
         )
         usage_rollup.start()
         log.info(

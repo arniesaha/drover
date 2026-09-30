@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound analytical CPU and HTTP concurrency, keep background rollups deferred
+  throughout foreground builds, and return retry hints for saturated analytical
+  and fleet listings without queueing control requests behind analytics (#331).
+
 ### Changed
 
 - Claude Code, Codex, agy, and DeepSeek structured sessions now resolve driver
