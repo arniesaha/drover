@@ -303,6 +303,7 @@ def test_open_duckdb_connection_honors_role_env_overrides(tmp_path, monkeypatch)
 def test_open_duckdb_connection_honors_summarizer_env_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("DROVER_DUCKDB_SUMMARIZER_MEMORY_LIMIT", "1536MB")
     monkeypatch.setenv("DROVER_DUCKDB_SUMMARIZER_THREADS", "2")
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS", "2")
 
     con = open_duckdb_connection(tmp_path / "drover.duckdb", role="summarizer")
     try:
@@ -571,3 +572,17 @@ def test_a_background_pass_cannot_raise_parallelism_under_a_foreground_reader(
     assert int(ROLE_DEFAULTS["worker"]["threads"]) <= int(
         ROLE_DEFAULTS["diagnostic"]["threads"]
     )
+
+
+@pytest.mark.parametrize("role", ["worker", "summarizer", "diagnostic"])
+def test_analytical_ceiling_bounds_instance_wide_role_overrides(
+    tmp_path, monkeypatch, role
+):
+    monkeypatch.setenv(f"DROVER_DUCKDB_{role.upper()}_THREADS", "8")
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS", "2")
+    path = tmp_path / "shared.duckdb"
+    with open_duckdb_connection(path, role="diagnostic") as foreground:
+        with open_duckdb_connection(path, role=role):
+            assert foreground.execute(
+                "SELECT current_setting('threads')"
+            ).fetchone() == (2,)

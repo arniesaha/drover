@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +16,7 @@ from drover.server.analytics_maintenance import (
 
 def test_a_pass_stands_aside_while_a_request_is_in_flight() -> None:
     gate = AnalyticalMaintenanceGate()
-    admission = MaintenanceAdmission(gate, max_consecutive_skips=10)
+    admission = MaintenanceAdmission(gate)
 
     with gate.foreground():
         with admission.admit() as admitted:
@@ -25,35 +26,19 @@ def test_a_pass_stands_aside_while_a_request_is_in_flight() -> None:
         assert admitted is True
 
 
-def test_deferral_is_bounded_so_a_polled_hub_still_makes_progress() -> None:
-    """A phone polling every few seconds would otherwise mean "never"."""
+def test_long_build_never_forces_competing_maintenance() -> None:
     gate = AnalyticalMaintenanceGate()
-    admission = MaintenanceAdmission(gate, max_consecutive_skips=2)
+    admission = MaintenanceAdmission(gate)
 
-    outcomes = []
     with gate.foreground():
-        for _ in range(6):
+        for _ in range(25):
             with admission.admit() as admitted:
-                outcomes.append(admitted)
+                assert admitted is False
+        assert not gate.stats().maintenance_active
 
-    assert outcomes == [False, False, True, False, False, True]
-    assert admission.forced_total == 2
-
-
-def test_a_forced_pass_does_not_claim_the_slot() -> None:
-    """It runs beside the request rather than pretending to own the gate,
-    so the accounting cannot drift and strand the slot."""
-    gate = AnalyticalMaintenanceGate()
-    admission = MaintenanceAdmission(gate, max_consecutive_skips=0)
-
-    with gate.foreground():
-        with admission.admit() as admitted:
-            assert admitted is True
-            assert gate.stats().maintenance_active is False
-
-    # The slot is still free afterwards.
-    assert gate.try_begin_maintenance() is True
-    gate.end_maintenance()
+    assert admission.skipped_total == 25
+    with admission.admit() as admitted:
+        assert admitted is True
 
 
 def test_two_passes_never_hold_the_slot_at_once() -> None:
@@ -137,11 +122,13 @@ def test_the_advisory_sweep_defers_to_a_request(tmp_path) -> None:
         maintenance_gate=gate,
     )
 
+    scheduler = SimpleNamespace(enqueue_due_full_review=explode)
     with gate.foreground():
-        result = worker.run_once([])
+        for _ in range(25):
+            result = worker.run_once([], scheduler=scheduler)
 
     assert (result.succeeded, result.failed, result.skipped) == (0, 0, 0)
-    assert worker.deferred_sweeps == 1
+    assert worker.deferred_sweeps == 25
 
 
 def test_the_native_rollup_defers_to_a_request(tmp_path, monkeypatch) -> None:
@@ -161,7 +148,48 @@ def test_the_native_rollup_defers_to_a_request(tmp_path, monkeypatch) -> None:
     )
 
     with gate.foreground():
-        report = worker.drain_once()
+        for _ in range(25):
+            report = worker.drain_once()
 
     assert (report.partitions, report.sessions) == (0, 0)
-    assert worker.deferred_passes == 1
+    assert worker.deferred_passes == 25
+
+
+@pytest.mark.parametrize("skipped_ticks", [1, 3])
+def test_day_summaries_retry_promptly_after_deferral(
+    tmp_path, monkeypatch, skipped_ticks
+):
+    from drover import schema
+    from drover.server.__main__ import _backfill_day_summaries
+
+    gate = AnalyticalMaintenanceGate()
+    foreground = gate.foreground()
+    foreground.__enter__()
+    waits = []
+    scans = []
+
+    class Stop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, seconds):
+            waits.append(seconds)
+            if len(waits) == skipped_ticks:
+                foreground.__exit__(None, None, None)
+            elif len(waits) > skipped_ticks:
+                self.stopped = True
+
+    def backfill(path):
+        assert not gate.stats().foreground_waiters
+        assert gate.stats().maintenance_active
+        scans.append(path)
+        return 1
+
+    monkeypatch.setattr(schema, "backfill_agent_event_day_summary", backfill)
+    path = tmp_path / "analytics.duckdb"
+    _backfill_day_summaries(path, gate, Stop())
+    assert waits == [30.0] * skipped_ticks + [900.0]
+    assert scans == [path]
+    assert not gate.stats().maintenance_active
