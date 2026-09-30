@@ -24,12 +24,16 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, unquote_to_bytes, urlparse
 
 from drover.server.analytics_boundary import (
+    ANALYTICS_ADMISSION_WAIT_SECONDS,
+    ANALYTICS_METRICS_CONCURRENCY,
+    ANALYTICS_MUTATION_CONCURRENCY,
     ANALYTICS_UNAVAILABLE_BODY,
     ANALYTICS_UNAVAILABLE_HEADERS,
     AnalyticsBoundaryClient,
     AnalyticsBoundaryRequestInvalid,
     AnalyticsBoundaryUnavailable,
     BoundaryResponse,
+    analytics_request_lane,
 )
 from drover.server.db import (
     AnalyticalStoreUnavailable,
@@ -780,6 +784,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     host_data_bridge_token: str = ""
     analytical_slots: threading.BoundedSemaphore
     fleet_slots: threading.BoundedSemaphore
+    metrics_slots: threading.BoundedSemaphore
+    mutation_slots: threading.BoundedSemaphore
 
     def _gate(self, path: str) -> bool:
         """Authorize the request or write the refusal response.
@@ -806,17 +812,24 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 
         path = urlparse(self.path).path
         analytical = self._is_analytics_public_path(path)
+        lane = analytics_request_lane(self.command, path)
+        heavy = analytical and lane == "heavy"
         slots = (
-            self.analytical_slots
+            {
+                "heavy": self.analytical_slots,
+                "metrics": self.metrics_slots,
+                "mutation": self.mutation_slots,
+            }[lane]
             if analytical
             else self.fleet_slots if path in {"/harness", "/harness/hosts"} else None
         )
         # Authenticate before exposing saturation. ThreadingHTTPServer already
-        # gives control requests their own threads; nonblocking admission keeps
-        # analytical callers from accumulating work or an executor queue.
+        # gives control requests their own threads. Only heavy requests wait
+        # briefly; scrapes and user actions have separate bounded capacity.
         if slots is not None and not self._gate(path):
             return
-        if slots is not None and not slots.acquire(blocking=False):
+        wait = ANALYTICS_ADMISSION_WAIT_SECONDS if heavy else 0.0
+        if slots is not None and not slots.acquire(timeout=wait):
             self._send(
                 503,
                 "application/json",
@@ -830,7 +843,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         try:
             foreground = (
                 _analytical_foreground(self.collector)
-                if analytical and self.analytics_boundary is None
+                if heavy and self.analytics_boundary is None
                 else contextlib.nullcontext()
             )
             with foreground:
@@ -2546,6 +2559,10 @@ def start_metrics_server(
             "analytics_boundary": analytics_boundary,
             "host_data_bridge_token": host_data_bridge_token,
             "analytical_slots": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
+            "metrics_slots": threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY),
+            "mutation_slots": threading.BoundedSemaphore(
+                ANALYTICS_MUTATION_CONCURRENCY
+            ),
             "fleet_slots": _request_slots("DROVER_FLEET_HTTP_CONCURRENCY", 4),
         },
     )
@@ -2577,14 +2594,26 @@ def analytics_boundary_dispatcher(
             return None
         return value if isinstance(value, dict) else None
 
-    slots = _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1)
+    lanes = {
+        "heavy": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
+        "metrics": threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY),
+        "mutation": threading.BoundedSemaphore(ANALYTICS_MUTATION_CONCURRENCY),
+    }
 
     def dispatch(method: str, path: str, query: str, body: bytes) -> BoundaryResponse:
-        if not slots.acquire(blocking=False):
+        lane = analytics_request_lane(method, path)
+        slots = lanes[lane]
+        wait = ANALYTICS_ADMISSION_WAIT_SECONDS if lane == "heavy" else 0.0
+        if not slots.acquire(timeout=wait):
             return response(503, "application/json", '{"error":"analytics busy"}\n')
         try:
             require_analytical_store(collector.duckdb_path)
-            with _analytical_foreground(collector):
+            foreground = (
+                _analytical_foreground(collector)
+                if lane == "heavy"
+                else contextlib.nullcontext()
+            )
+            with foreground:
                 result = dispatch_available(method, path, query, body)
             if not 200 <= result.status < 300:
                 require_analytical_store(collector.duckdb_path)

@@ -545,3 +545,21 @@ def test_prefiltered_rollup_equals_a_full_read(tmp_path):
     assert row[1] == expected.output_tokens
     assert row[2] == (bool(expected.exact) and full_malformed == 0)
     assert row[3] == usage_turn_count(full_events)
+
+
+def test_harness_usage_rollup_progresses_during_analytical_build(tmp_path):
+    from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
+    from drover.server.harness.usage_rollup import UsageRollupWorker
+
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    with duckdb.connect(str(control_plane_path(db))) as con:
+        add_session(con, "c1", "claude-code")
+        add_event(con, "c1", 1, claude_usage("m1", inp=7, out=3))
+
+    gate = AnalyticalMaintenanceGate()
+    with gate.foreground():
+        report = UsageRollupWorker(duckdb_path=db).drain_once()
+    assert report.rolled == 1
+    with duckdb.connect(str(control_plane_path(db))) as con:
+        assert usage_row(con, "c1")[:2] == (7, 3)

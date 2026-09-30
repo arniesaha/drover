@@ -601,6 +601,34 @@ def _local_api_request(
 #: the watcher does that about hourly. A sweep that finds nothing is one indexed
 #: query.
 _DAY_SUMMARY_REFRESH_SECONDS = 900.0
+_DAY_SUMMARY_RETRY_SECONDS = 30.0
+
+
+def _backfill_day_summaries(
+    duckdb_path: Path,
+    analytics_gate: AnalyticalMaintenanceGate,
+    stop: threading.Event,
+) -> None:
+    """Retry deferred summaries promptly; refresh completed passes every 15m."""
+    from drover.schema import backfill_agent_event_day_summary
+
+    admission = MaintenanceAdmission(analytics_gate)
+    while not stop.is_set():
+        delay = _DAY_SUMMARY_REFRESH_SECONDS
+        try:
+            with admission.admit() as admitted:
+                if admitted:
+                    summarised = backfill_agent_event_day_summary(duckdb_path)
+                    if summarised:
+                        log.info("summarised %d event partition(s)", summarised)
+                else:
+                    # A busy cockpit must not postpone the projection that
+                    # makes its next build cheap by another full 15 minutes.
+                    delay = _DAY_SUMMARY_RETRY_SECONDS
+        except Exception:  # noqa: BLE001 - a cold cache only costs speed
+            log.exception("event day summary backfill failed; reads will scan")
+        stop.wait(delay)
+
 
 _SETUP_CHECK_MAX_RESPONSE_BYTES = 1_048_576
 
@@ -3138,30 +3166,9 @@ def run(
     # metrics server has nothing to make faster.
     if not no_metrics:
 
-        def _backfill_day_summaries() -> None:
-            # Keep going, not just once at startup. A day is marked stale the
-            # moment its partition is re-ingested, and the watcher re-ingests
-            # today's file every hour, so a run-once backfill lets the cache decay
-            # back to a full scan and stay there until the next restart -- the
-            # exact regression this cache exists to prevent, arriving quietly.
-            from drover.schema import backfill_agent_event_day_summary
-
-            admission = MaintenanceAdmission(analytics_gate)
-            while not stop.is_set():
-                try:
-                    with admission.admit() as admitted:
-                        if admitted:
-                            summarised = backfill_agent_event_day_summary(
-                                cfg.duckdb_path
-                            )
-                            if summarised:
-                                log.info("summarised %d event partition(s)", summarised)
-                except Exception:  # noqa: BLE001 - a cold cache only costs speed
-                    log.exception("event day summary backfill failed; reads will scan")
-                stop.wait(_DAY_SUMMARY_REFRESH_SECONDS)
-
         threading.Thread(
             target=_backfill_day_summaries,
+            args=(cfg.duckdb_path, analytics_gate, stop),
             name="agent-event-day-summary",
             daemon=True,
         ).start()
@@ -3171,7 +3178,6 @@ def run(
         usage_rollup = UsageRollupWorker(
             duckdb_path=cfg.duckdb_path,
             archive_resolver=worker_archive_resolver,
-            maintenance_gate=analytics_gate,
         )
         usage_rollup.start()
         log.info(

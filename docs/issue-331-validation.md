@@ -1,5 +1,8 @@
 # Issue #331 validation
 
+This records the original implementation. The [PR #436 follow-up report](issue-331-followup-validation.md)
+documents the rebase and subsequent admission/maintenance corrections.
+
 Validated on Arnabs-Mac-Studio.local, 2026-09-29, against base commit
 251c63e. The worktree-local environment uses Python 3.14.7 and DuckDB 1.5.5
 from uv.lock. The historical /Volumes/M2 1/drover/.venv interpreter symlink
