@@ -529,6 +529,12 @@ ${s.path}`;
       return {label: session.native_resume_label || "", id: session.native_session_id || ""};
     }
 
+    function factoryObserverInfo(session) {
+      const observer = session.factory_observer;
+      if (!observer || observer.authority !== "taskflow") return null;
+      return `Factory observer · ${observer.run_id} · expected r${observer.expected_revision} · TaskFlow authoritative`;
+    }
+
     function sessionContext(session) {
       const repo = session.repo_name
         ? (session.repo_owner ? `${session.repo_owner}/${session.repo_name}` : session.repo_name)
@@ -550,6 +556,7 @@ ${s.path}`;
           const state = sessionState(session, nowMs);
           const context = sessionContext(session);
           const resume = resumeInfo(session);
+          const factoryObserver = factoryObserverInfo(session);
           const isRunning = ["created", "starting", "running"].includes(session.status);
           const updated = parseTs(session.updated_at);
           const updatedLabel = updated == null ? "no timestamp" : relativeAge(nowMs - updated);
@@ -558,6 +565,7 @@ ${s.path}`;
             <div class="stack">
               <span class="state ${esc(state.tone)}">${esc(state.label)}</span>
               ${resume ? `<span class="badge" title="${esc(resume.id)}">resumable${resume.label ? `: ${esc(resume.label)}` : ""}</span>` : ""}
+              ${factoryObserver ? `<span class="badge" title="Observer only; controls remain in Factory/TaskFlow">Factory observer</span><div class="reason">${esc(factoryObserver)}</div>` : ""}
               <div class="reason">${esc(state.reason)}</div>
             </div>
           </td>
@@ -574,7 +582,7 @@ ${s.path}`;
                href="/ui/harness/sessions/${encodeURIComponent(session.session_id)}#continue"
                title="${resume ? esc("Native resume available - " + (resume.label || resume.id)) : "Continue this session in a CLI (Drover handoff)"}"
               >${resume ? "Resume" : "Continue"}</a>
-            ${isRunning ? `<button type="button" data-kill="${esc(session.session_id)}">Kill</button>` : ""}
+            ${isRunning && !factoryObserver ? `<button type="button" data-kill="${esc(session.session_id)}">Kill</button>` : ""}
           </td>
         </tr>`;
         }).join("")}</tbody>

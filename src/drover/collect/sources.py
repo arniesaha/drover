@@ -123,6 +123,45 @@ class PiMonoSource:
         yield from parsers.parse_task_journal(str(path))
 
 
+@dataclass(frozen=True)
+class OpenClawTaskFlowSource:
+    """Read-only Capability Factory provenance from OpenClaw managed TaskFlow."""
+
+    db_path: Path
+    controller_id: str = "capability-factory/taskflow-controller"
+    id: str = "openclaw_taskflow"
+
+    def list_files_since(self, watermark: Optional[datetime]) -> list[Path]:
+        if not self.db_path.exists():
+            return []
+        if watermark is None:
+            return [self.db_path]
+        cutoff = watermark.timestamp()
+        try:
+            if self.db_path.stat().st_mtime >= cutoff:
+                return [self.db_path]
+        except OSError:
+            return []
+
+        # SQLite commonly commits live TaskFlow updates to the WAL before the
+        # main database checkpoint changes its mtime. The parser still opens
+        # only the database read-only; this is solely a collection trigger.
+        wal_path = self.db_path.with_name(f"{self.db_path.name}-wal")
+        try:
+            with wal_path.open("rb"):
+                pass
+            if wal_path.stat().st_mtime >= cutoff:
+                return [self.db_path]
+        except OSError:
+            pass
+        return []
+
+    def parse(self, path: Path) -> Iterator[AgentEvent]:
+        yield from parsers.parse_openclaw_taskflow(
+            str(path), controller_id=self.controller_id
+        )
+
+
 def write_events_jsonl(
     events: Iterable[AgentEvent],
     staging_dir: Path,

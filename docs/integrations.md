@@ -134,3 +134,30 @@ External model providers receive the content submitted to their configured
 workers, and that includes the `claude-code` path: it runs locally but sends
 the transcript to Anthropic under your Claude Code login. Only the embeddings
 backend and advisory content analysis can be kept entirely on your hardware.
+
+### OpenClaw managed TaskFlow (Capability Factory)
+
+`drover-collect` can emit read-only provenance events from OpenClaw's managed
+TaskFlow `flow_runs` table. Enable it only with an explicit database path; the
+default example is `~/.openclaw/state/openclaw.sqlite`, but OpenClaw state can
+be relocated by its own configuration.
+
+```toml
+[sources.openclaw_taskflow]
+enabled = true
+db_path = "/absolute/path/to/openclaw.sqlite"
+controller_id = "capability-factory/taskflow-controller"
+```
+
+The collector opens SQLite in read-only mode, validates the `flow_runs` schema,
+and selects only Capability Factory rows for the configured controller. Each
+revision yields one stable `system_event` (`openclaw-taskflow:<flow-id>:revision:<n>`)
+with flow/run IDs, timestamps, status, revision, current step, controller, and
+capability. It never reads or emits goals, requester origin, waits, evidence,
+artifacts, messages, or transcripts. Missing or incompatible schemas produce no
+events and do not create a database or a second workflow ledger.
+
+Factory/OpenClaw on the NAS remains orchestration and the authoritative workflow
+ledger only. This collector is visibility-only: it does not schedule, proxy, or
+control workers. Issue execution stays on the target host through that host's
+local harness/runtime (for Drover, the Mac Studio).

@@ -21,6 +21,7 @@ from drover.collect.sources import (
     ClaudeMacMiniSource,
     HermesSource,
     OpenClawSource,
+    OpenClawTaskFlowSource,
     PiMonoSource,
     Source,
     latest_event_timestamp,
@@ -66,6 +67,13 @@ root    = "{home}/.openclaw/agents/main/sessions"
 [sources.pi_mono]
 enabled = false
 db_path = "{home}/max/data/task-journal.db"
+
+# Read-only OpenClaw managed TaskFlow provenance. The path is explicit because
+# OpenClaw's state directory can be relocated by its own configuration.
+[sources.openclaw_taskflow]
+enabled = false
+db_path = "{home}/.openclaw/state/openclaw.sqlite"
+controller_id = "capability-factory/taskflow-controller"
 
 # Tempo → OTLP relay. When enabled, `drover-collect tempo-relay` pulls
 # AgentWeave spans from Tempo and pushes them to the lakehouse's OTLP
@@ -124,6 +132,15 @@ def _build_sources(cfg: dict) -> list[Source]:
     if src_cfg.get("pi_mono", {}).get("enabled"):
         sources.append(
             PiMonoSource(db_path=Path(src_cfg["pi_mono"]["db_path"]).expanduser())
+        )
+    if src_cfg.get("openclaw_taskflow", {}).get("enabled"):
+        source_config = src_cfg["openclaw_taskflow"]
+        sources.append(
+            OpenClawTaskFlowSource(
+                db_path=Path(source_config["db_path"]).expanduser(),
+                controller_id=source_config.get("controller_id")
+                or "capability-factory/taskflow-controller",
+            )
         )
     return sources
 

@@ -267,3 +267,21 @@ root = "{home}/.hermes/profiles/jenny/sessions"
     names = {p.name.split("-")[0] for p in staging.glob("*.jsonl")}
     # claude_code missing root → no files but no error; hermes should still ship
     assert "hermes" in names
+
+
+def test_build_sources_includes_explicit_openclaw_taskflow_path() -> None:
+    cfg = {
+        "sources": {
+            "openclaw_taskflow": {
+                "enabled": True,
+                "db_path": "/var/lib/openclaw/state/openclaw.sqlite",
+                "controller_id": "capability-factory/taskflow-controller",
+            },
+        },
+    }
+    sources = _build_sources(cfg)
+    assert len(sources) == 1
+    source = sources[0]
+    assert source.id == "openclaw_taskflow"
+    assert str(source.db_path) == "/var/lib/openclaw/state/openclaw.sqlite"
+    assert source.controller_id == "capability-factory/taskflow-controller"
