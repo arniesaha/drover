@@ -109,6 +109,7 @@ import duckdb
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
     ControlPlaneBusy,
+    analytical_store_health,
     control_plane_connection,
     control_plane_path,
     last_connect_failure,
@@ -347,6 +348,11 @@ class ReadinessProbe:
 
     def _fresh_verdict(self) -> ReadinessReport | None:
         """The cached verdict, while it is both good and recent enough."""
+        if (
+            self._include_analytical
+            and analytical_store_health(self._duckdb_path)["status"] != "ok"
+        ):
+            return None
         with self._lock:
             cached = self._cached
             if cached is not None and cached.ok and self._time() < self._cached_until:
@@ -419,6 +425,11 @@ class ReadinessProbe:
         be a false alarm on every shutdown. A handle that is *open* and cannot
         answer is the failure this endpoint exists for.
         """
+        health = analytical_store_health(self._duckdb_path)
+        if health["status"] != "ok":
+            return StoreProbe(
+                STORE_ANALYTICAL, STATE_FAILED, f"analytical store {health['status']}"
+            )
         handles = live_connections(self._duckdb_path)
         if not handles:
             return self._idle_or_unopenable(

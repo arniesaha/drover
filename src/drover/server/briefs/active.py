@@ -21,6 +21,7 @@ import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
 from drover.server.briefs.active_prompt import build_active_brief_prompt
+from drover.server.db import open_duckdb_connection
 from drover.server.summarizer.backends import (
     BackendError,
     LLMBackend,
@@ -108,7 +109,7 @@ def generate_active_brief(
     duckdb_path = Path(duckdb_path)
 
     # Cheap path: cached + fresh.
-    con = duckdb.connect(str(duckdb_path))
+    con = open_duckdb_connection(duckdb_path)
     try:
         if _is_fresh_sql(con, session_id, max_age_seconds):
             row = _fetch_cached(con, session_id)
@@ -129,7 +130,7 @@ def generate_active_brief(
             raise RuntimeError(f"active brief backend selection failed: {e}") from e
 
     # Pull events (newest first → reverse to chronological for the prompt).
-    con = duckdb.connect(str(duckdb_path), read_only=True)
+    con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")
     try:
         cur = con.execute(
             f"""WITH {canonical_agent_events_cte()}
@@ -174,7 +175,7 @@ def generate_active_brief(
     events_seen = len(events)
     generator_model = getattr(resolved_backend, "model", "unknown")
 
-    con = duckdb.connect(str(duckdb_path))
+    con = open_duckdb_connection(duckdb_path)
     try:
         con.execute(
             """INSERT OR REPLACE INTO active_session_briefs

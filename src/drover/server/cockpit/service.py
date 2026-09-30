@@ -27,9 +27,11 @@ from drover.server.cockpit.analytics import (
 )
 from drover.server.control_store import control_store_config, is_postgres_control_store
 from drover.server.db import (
+    AnalyticalStoreUnavailable,
     attached_control_plane_snapshot,
     control_plane_path,
     open_duckdb_connection,
+    require_analytical_store,
     snapshot_scratch_root,
     supports_atomic_duckdb_clone,
 )
@@ -113,6 +115,8 @@ class CockpitService:
         self._activity_quiet_until = 0.0
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
+        if self.duckdb_path is not None:
+            require_analytical_store(self.duckdb_path)
         provider_capacity = self._provider_capacity(filters)
         activity = self._activity(filters)
         projects = []
@@ -131,6 +135,8 @@ class CockpitService:
         }
 
     def analytics(self, filters: AnalyticsFilters) -> dict[str, Any]:
+        if self.duckdb_path is not None:
+            require_analytical_store(self.duckdb_path)
         return {
             "cockpit_api_version": COCKPIT_API_VERSION,
             "filters": asdict(filters),
@@ -179,6 +185,8 @@ class CockpitService:
             with self._provider_lock:
                 self._provider_cache = (cache_key, section)
             return section
+        except AnalyticalStoreUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render provider capacity: %s", exc)
             # An empty `error` section draws as "no accounts", which is a
@@ -291,6 +299,8 @@ class CockpitService:
             return section
         except ValueError:
             raise
+        except AnalyticalStoreUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render observed activity: %s", exc)
             with self._activity_lock:
@@ -397,7 +407,13 @@ class CockpitService:
 
         worker = threading.Thread(target=run, name="cockpit-activity", daemon=True)
         worker.start()
-        if not done.wait(ACTIVITY_BUDGET_SECONDS):
+        deadline = time.monotonic() + ACTIVITY_BUDGET_SECONDS
+        while not done.wait(min(0.05, max(0, deadline - time.monotonic()))):
+            if self.duckdb_path is not None:
+                require_analytical_store(self.duckdb_path)
+            if time.monotonic() >= deadline:
+                break
+        if not done.is_set():
             con = outcome.get("connection")
             if con is not None:
                 try:
@@ -500,6 +516,8 @@ class CockpitService:
                     continue
                 counts[finding.severity.value] += 1
             return counts
+        except AnalyticalStoreUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 - isolate response sections
             log.warning("failed to render insight counts: %s", exc)
             return None

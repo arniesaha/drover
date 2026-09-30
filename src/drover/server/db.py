@@ -496,7 +496,7 @@ def pin_analytical_connection(duckdb_path: str | Path) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)
         con, _ = _connect_and_probe(path, role="worker", settings_overrides=None)
         remember_live_connection(path, con)
-    except (duckdb.Error, OSError) as exc:
+    except (duckdb.Error, OSError, AnalyticalStoreUnavailable) as exc:
         log.warning("could not pin analytical store %s: %s", path, exc)
         return False
     try:
@@ -512,11 +512,16 @@ def pin_analytical_connection(duckdb_path: str | Path) -> bool:
             path,
         )
         return False
-    with _ANALYTICAL_PIN_GUARD:
-        if key in _ANALYTICAL_PINNED:
-            con.close()
-        else:
-            _ANALYTICAL_PINNED[key] = con
+    try:
+        with _analytical_open_lock(path, con._generation):
+            with _ANALYTICAL_PIN_GUARD:
+                if key in _ANALYTICAL_PINNED:
+                    con.close()
+                else:
+                    _ANALYTICAL_PINNED[key] = con
+    except AnalyticalStoreUnavailable:
+        con.close()
+        return False
     log.info("analytical store pinned for process lifetime: %s", path)
     return True
 
@@ -810,7 +815,7 @@ def _discard_control_plane_connection(key: str) -> None:
 #: is stable across the versions this has been seen on (1.5.2) and documented
 #: behaviour rather than a bug: "the database must be restarted prior to being
 #: used again" (https://duckdb.org/docs/current/guides/troubleshooting/crashes).
-_INVALIDATED_MARKER = "database has been invalidated"
+_INVALIDATED_MARKER = "has been invalidated"
 
 
 def is_invalidated_error(exc: BaseException) -> bool:
@@ -820,7 +825,10 @@ def is_invalidated_error(exc: BaseException) -> bool:
     connection usable; this is the other kind, where every later statement on
     every connection to that file fails until the instance is gone.
     """
-    return _INVALIDATED_MARKER in str(exc)
+    return (
+        isinstance(exc, duckdb.FatalException)
+        or _INVALIDATED_MARKER in str(exc).lower()
+    )
 
 
 def reset_invalidated_instance(duckdb_path: str | Path) -> int:
@@ -847,21 +855,215 @@ def reset_invalidated_instance(duckdb_path: str | Path) -> int:
         handles.append(pinned)
     for con in handles:
         try:
-            con.close()
+            # Bypass owner cleanup: obsolete handles leave close to recovery,
+            # so a request's finally block cannot block on this teardown.
+            if isinstance(con, _AnalyticalHandle):
+                con._inner.close()
+            else:
+                con.close()
         except Exception:  # noqa: BLE001 - a handle that will not close is already gone
             log.debug("could not close a handle to %s while resetting", duckdb_path)
         closed += 1
     with _LIVE_GUARD:
         _LIVE_CONNECTIONS.pop(key, None)
-    # A pinned control-plane connection is not in the live set.
-    _discard_control_plane_connection(_path_key(control_plane_path(duckdb_path)))
-    if closed:
-        log.warning(
-            "closed %d handle(s) to %s after it was invalidated; reopening",
-            closed,
-            duckdb_path,
-        )
     return closed
+
+
+class AnalyticalStoreUnavailable(RuntimeError):
+    """The analytical instance is recovering, failed, or this handle is obsolete."""
+
+
+@dataclass
+class _AnalyticalState:
+    status: str = "ok"
+    generation: int = 0
+    attempts: int = 0
+
+
+_ANALYTICAL_STATES: dict[str, _AnalyticalState] = {}
+_ANALYTICAL_STATE_GUARD = threading.Lock()
+_ANALYTICAL_RECOVERY_ATTEMPTS = 3
+_ANALYTICAL_RECOVERY_BACKOFF_SECONDS = 0.25
+
+
+def analytical_store_health(duckdb_path: str | Path) -> dict[str, object]:
+    """Observed health only: never acquire a database lock or run a query."""
+    with _ANALYTICAL_STATE_GUARD:
+        state = _ANALYTICAL_STATES.get(_path_key(duckdb_path))
+        return {
+            "status": state.status if state else "ok",
+            "recovery_attempts": state.attempts if state else 0,
+        }
+
+
+def require_analytical_store(
+    duckdb_path: str | Path, generation: int | None = None
+) -> int:
+    with _ANALYTICAL_STATE_GUARD:
+        state = _ANALYTICAL_STATES.get(_path_key(duckdb_path), _AnalyticalState())
+        if state.status != "ok" or (
+            generation is not None and generation != state.generation
+        ):
+            raise AnalyticalStoreUnavailable(
+                "analytical store unavailable; retry later"
+            )
+        return state.generation
+
+
+def _invalidate_analytical_store(
+    duckdb_path: str | Path, generation: int, exc: BaseException, failed_handle=None
+) -> None:
+    key = _path_key(duckdb_path)
+    with _ANALYTICAL_STATE_GUARD:
+        state = _ANALYTICAL_STATES.setdefault(key, _AnalyticalState())
+        if state.status != "ok" or state.generation != generation:
+            return
+        state.status = "recovering"
+        state.generation += 1
+        state.attempts = 0
+    # Exactly one detector owns this incident, including the original checkpoint
+    # error/traceback. Never do close or reopen work on the request thread.
+    log.critical("analytical store %s invalidated: %s", key, exc, exc_info=exc)
+    threading.Thread(
+        target=_recover_analytical_store,
+        args=(key, state, failed_handle),
+        name="analytical-recovery",
+        daemon=True,
+    ).start()
+
+
+def _recover_analytical_store(
+    key: str, state: _AnalyticalState, failed_handle=None
+) -> None:
+    # Keep the detecting handle alive until reset has closed it on this thread.
+    # In particular, a failure on the first SET must not make the request close
+    # the last connection (and checkpoint) synchronously during stack unwinding.
+    with duckdb_connect_lock(key):
+        with _ANALYTICAL_PIN_GUARD:
+            restore_pin = key in _ANALYTICAL_PINNED
+        reset_invalidated_instance(key)
+        for attempt in range(_ANALYTICAL_RECOVERY_ATTEMPTS):
+            with _ANALYTICAL_STATE_GUARD:
+                state.attempts = attempt + 1
+            time.sleep(_ANALYTICAL_RECOVERY_BACKOFF_SECONDS * 2**attempt)
+            try:
+                con = _open_analytical_handle(Path(key), "worker", None)
+                if restore_pin:
+                    handle = _AnalyticalHandle(con, key, state.generation)
+                    remember_live_connection(key, handle)
+                    with _ANALYTICAL_PIN_GUARD:
+                        _ANALYTICAL_PINNED[key] = handle
+                else:
+                    con.close()
+            except Exception:
+                log.exception(
+                    "analytical store %s recovery attempt %d failed", key, attempt + 1
+                )
+                continue
+            with _LIVE_GUARD:
+                _CONNECT_FAILURES.pop(key, None)
+            with _ANALYTICAL_STATE_GUARD:
+                state.status = "ok"
+            log.info("analytical store %s recovered", key)
+            return
+    with _ANALYTICAL_STATE_GUARD:
+        state.status = "failed"
+    log.error(
+        "analytical store %s recovery exhausted; operator intervention required", key
+    )
+
+
+class _AnalyticalHandle:
+    """Observe connection and lazy relation failures before callers isolate them.
+
+    Old handles stay unusable after recovery; silently replaying a statement
+    could duplicate a committed write. Owners must open a new connection.
+    """
+
+    def __init__(self, inner, key, generation, owner=None):
+        self._inner = inner
+        self._key = key
+        self._generation = generation
+        self._owner = owner
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            if name == "close":
+                try:
+                    require_analytical_store(self._key, self._generation)
+                except AnalyticalStoreUnavailable:
+                    return None  # recovery owns obsolete handles
+            if name not in {"close", "interrupt"}:
+                require_analytical_store(self._key, self._generation)
+            try:
+                result = attr(*args, **kwargs)
+            except Exception as exc:
+                if is_invalidated_error(exc):
+                    _invalidate_analytical_store(self._key, self._generation, exc, self)
+                    raise AnalyticalStoreUnavailable(
+                        "analytical store invalidated; retry later"
+                    ) from exc
+                raise
+            if result is self._inner:
+                return self
+            if isinstance(result, (duckdb.DuckDBPyConnection, duckdb.DuckDBPyRelation)):
+                wrapped = _AnalyticalHandle(result, self._key, self._generation, self)
+                if isinstance(result, duckdb.DuckDBPyConnection):
+                    remember_live_connection(self._key, wrapped)
+                return wrapped
+            return result
+
+        if name in {"cursor", "duplicate"}:
+
+            def open_cursor(*args, **kwargs):
+                with _analytical_open_lock(self._key, self._generation):
+                    return call(*args, **kwargs)
+
+            return open_cursor
+        return call
+
+    def __enter__(self):
+        require_analytical_store(self._key, self._generation)
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def _open_analytical_handle(path, role, settings_overrides, *, generation=None):
+    con = duckdb.connect(str(path))
+    if generation is not None:
+        con = _AnalyticalHandle(con, _path_key(path), generation)
+        remember_live_connection(path, con)
+    try:
+        _apply_role_settings(con, role, settings_overrides=settings_overrides)
+        con.execute("SELECT 1").fetchone()
+    except AnalyticalStoreUnavailable:
+        # Recovery owns closing this handle; keep the detecting request fast.
+        raise
+    except Exception:
+        try:
+            con.close()
+        except Exception:
+            log.debug("failed to close analytical handle during setup", exc_info=True)
+        raise
+    return con
+
+
+@contextmanager
+def _analytical_open_lock(duckdb_path: str | Path, generation: int) -> Iterator[None]:
+    lock = duckdb_connect_lock(duckdb_path)
+    while not lock.acquire(timeout=0.05):
+        require_analytical_store(duckdb_path, generation)
+    try:
+        require_analytical_store(duckdb_path, generation)
+        yield
+    finally:
+        lock.release()
 
 
 def _connect_and_probe(
@@ -870,33 +1072,22 @@ def _connect_and_probe(
     role: str,
     settings_overrides: Optional[Mapping[str, str]],
 ) -> tuple[duckdb.DuckDBPyConnection, bool]:
-    """Open, configure, and confirm the instance behind the handle is alive.
-
-    The probe is one in-process statement. It exists because a connect to an
-    invalidated instance *succeeds* -- the cache hands back the poisoned
-    instance -- and only the next statement fails. Without it, every caller
-    would have to recognise the invalidated state itself, and there are 80-odd
-    of them. When the probe says the instance is dead, every handle to the
-    file is closed so the instance goes with them, and the open is retried
-    once against a fresh one.
-    """
-    restore_pin = False
-    for attempt in (0, 1):
-        with duckdb_connect_lock(duckdb_path):
-            con = duckdb.connect(str(duckdb_path))
+    # Admission, setup and registration share the connect lock with recovery.
+    # Poll admission while queued so a recovering instance never strands opens.
+    generation = require_analytical_store(duckdb_path)
+    with _analytical_open_lock(duckdb_path, generation):
         try:
-            _apply_role_settings(con, role, settings_overrides=settings_overrides)
-            con.execute("SELECT 1").fetchone()
+            con = _open_analytical_handle(
+                duckdb_path, role, settings_overrides, generation=generation
+            )
         except Exception as exc:
-            con.close()
-            if attempt == 0 and is_invalidated_error(exc):
-                with _ANALYTICAL_PIN_GUARD:
-                    restore_pin = _path_key(duckdb_path) in _ANALYTICAL_PINNED
-                reset_invalidated_instance(duckdb_path)
-                continue
+            if is_invalidated_error(exc):
+                _invalidate_analytical_store(duckdb_path, generation, exc)
+                raise AnalyticalStoreUnavailable(
+                    "analytical store invalidated; retry later"
+                ) from exc
             raise
-        return con, restore_pin
-    raise AssertionError("unreachable: the retry either returns or raises")
+        return con, False
 
 
 def open_duckdb_connection(
@@ -906,33 +1097,29 @@ def open_duckdb_connection(
     role: str = "worker",
     settings_overrides: Optional[Mapping[str, str]] = None,
 ) -> duckdb.DuckDBPyConnection:
-    """Open DuckDB and then apply role-specific connection settings.
+    """Open a monitored analytical handle; read-only retains missing-file checks.
 
-    The connection is always opened read-write: a read-only open has a
-    different connection config, which DuckDB rejects while any read-write
-    connection to the same file is alive (see module docstring). Callers
-    that used ``read_only`` were diagnostics running inside the server
-    process beside live writers. The one read-only semantic kept is that a
-    missing database file errors instead of being silently created.
+    All live handles use the same read-write instance configuration. Fatal
+    failures start one asynchronous recovery per path and fail this operation;
+    statements are never replayed, including writes with an uncertain outcome.
     """
+    require_analytical_store(duckdb_path)
     if read_only and not Path(duckdb_path).exists():
         raise duckdb.IOException(
             f"Cannot open database {str(duckdb_path)!r} in read-only mode: "
             "database does not exist"
         )
     try:
-        con, restore_pin = _connect_and_probe(
+        con, _ = _connect_and_probe(
             duckdb_path, role=role, settings_overrides=settings_overrides
         )
+    except AnalyticalStoreUnavailable:
+        # The recovery state is authoritative and must not leave a stale open
+        # failure behind after a concurrent recovery has already succeeded.
+        raise
     except Exception as exc:
-        # Remembered, then re-raised unchanged: callers keep their error, and
-        # readiness gains the one piece of evidence a borrowed handle cannot
-        # give it -- that this store cannot be opened at all (#175).
         remember_connect_failure(duckdb_path, exc)
         raise
-    remember_live_connection(duckdb_path, con)
-    if restore_pin and not pin_analytical_connection(duckdb_path):
-        log.warning("analytical pin could not be restored for %s", duckdb_path)
     return con
 
 
@@ -1269,6 +1456,7 @@ def copy_analytical_snapshot(source: Path, destination: Path) -> None:
     inside the serving process. Without a pin, preserve the existing portable
     checkpoint-and-copy behavior.
     """
+    require_analytical_store(source)
     with _ANALYTICAL_PIN_GUARD:
         pinned = _path_key(source) in _ANALYTICAL_PINNED
     if pinned:
@@ -1288,12 +1476,19 @@ def _checkpoint_before_snapshot(source: Path) -> None:
     if not source.exists():
         return
     try:
+        if _path_key(source) != _path_key(control_plane_path(source)):
+            with open_duckdb_connection(source) as con:
+                con.execute("CHECKPOINT")
+            return
+        # Control-plane snapshots keep their own instance and recovery policy.
         with duckdb_connect_lock(source):
             con = duckdb.connect(str(source))
             try:
                 con.execute("CHECKPOINT")
             finally:
                 con.close()
+    except AnalyticalStoreUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001
         log.debug("checkpoint before snapshot of %s skipped: %s", source, exc)
 

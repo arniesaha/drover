@@ -290,12 +290,8 @@ def test_a_corrupt_control_plane_store_fails_readiness(tmp_path):
     assert _states(body)[STORE_CONTROL_PLANE] == STATE_FAILED
 
 
-def test_healthz_stays_up_while_readiness_is_down(tmp_path):
-    """Liveness is unchanged: the process is running, it just cannot serve.
-
-    Restart logic keys off the difference, so ``/healthz`` must not learn
-    about the database at all.
-    """
+def test_healthz_observed_health_does_not_probe_the_store(tmp_path):
+    """An unmonitored test handle affects the query probe, not observed health."""
     duckdb_path = _db(tmp_path)
     invalidated = _InvalidatedConnection()
     remember_live_connection(duckdb_path, invalidated)
@@ -308,7 +304,7 @@ def test_healthz_stays_up_while_readiness_is_down(tmp_path):
 
     assert ready_status == 503
     assert health_status == 200
-    assert health_body == "ok\n"
+    assert json.loads(health_body)["analytical_store"]["status"] == "ok"
 
 
 def test_readiness_opens_no_analytical_connection(tmp_path, monkeypatch):

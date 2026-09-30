@@ -30,6 +30,11 @@ from drover.server.analytics_boundary import (
     AnalyticsBoundaryUnavailable,
     BoundaryResponse,
 )
+from drover.server.db import (
+    AnalyticalStoreUnavailable,
+    analytical_store_health,
+    require_analytical_store,
+)
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_protocol import (
@@ -781,6 +786,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+        try:
+            self._do_GET()
+        except AnalyticalStoreUnavailable:
+            self._send_analytical_unavailable()
+
+    def _do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/_internal/analytics/"):
@@ -788,11 +799,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if not self._gate(path):
             return
+        if self.analytics_boundary is None and self._is_analytics_public_path(path):
+            require_analytical_store(self.collector.duckdb_path)
         if path == "/healthz":
-            # Liveness, and only liveness: the process is running. Everything
-            # about the database belongs to /readyz, so that a restart trigger
-            # keyed on readiness cannot be defeated by the process being up.
-            self._send(200, "text/plain; charset=utf-8", "ok\n")
+            health = analytical_store_health(self.collector.duckdb_path)
+            self._send(
+                200 if health["status"] == "ok" else 503,
+                "application/json",
+                json.dumps({"process": "ok", "analytical_store": health}) + "\n",
+            )
             return
         if path == "/release-identity":
             try:
@@ -1104,6 +1119,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
+        try:
+            self._do_POST()
+        except AnalyticalStoreUnavailable:
+            self._send_analytical_unavailable()
+
+    def _do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/_internal/analytics/"):
@@ -1111,6 +1132,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if not self._gate(path):
             return
+        if self.analytics_boundary is None and self._is_analytics_public_path(path):
+            require_analytical_store(self.collector.duckdb_path)
         if path == "/auth/login":
             self._handle_login()
             return
@@ -1333,15 +1356,29 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
     def do_PUT(self) -> None:  # noqa: N802 - stdlib method name
+        try:
+            self._do_PUT()
+        except AnalyticalStoreUnavailable:
+            self._send_analytical_unavailable()
+
+    def _do_PUT(self) -> None:
         path = urlparse(self.path).path
         if path == "/auth/device/apns":
             self._set_device_apns_registration()
             return
         if not self._gate(path):
             return
+        if self.analytics_boundary is None and self._is_analytics_public_path(path):
+            require_analytical_store(self.collector.duckdb_path)
         self._send(404, "text/plain; charset=utf-8", "not found\n")
 
     def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
+        try:
+            self._do_DELETE()
+        except AnalyticalStoreUnavailable:
+            self._send_analytical_unavailable()
+
+    def _do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/auth/device/apns":
@@ -1349,6 +1386,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if not self._gate(path):
             return
+        if self.analytics_boundary is None and self._is_analytics_public_path(path):
+            require_analytical_store(self.collector.duckdb_path)
         if path.startswith("/auth/credentials/"):
             self._revoke_credential(unquote(path.removeprefix("/auth/credentials/")))
             return
@@ -2287,7 +2326,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return None
         return body
 
-    def _is_analytics_public_path(self, path: str) -> bool:
+    @staticmethod
+    def _is_analytics_public_path(path: str) -> bool:
         if path in {
             "/metrics",
             "/observability",
@@ -2344,6 +2384,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 self._send(response.status, response.content_type, text)
         return True
 
+    def _send_analytical_unavailable(self) -> None:
+        self._send(
+            503,
+            "application/json",
+            '{"error":"analytical_store_unavailable"}\n',
+            extra_headers={"Retry-After": "1"},
+        )
+
     def _send(
         self,
         status: int,
@@ -2354,6 +2402,20 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         route_class: str | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
+        path = urlparse(self.path).path
+        if _MetricsHandler._is_analytics_public_path(path) and status not in {401, 403}:
+            if (
+                self.analytics_boundary is None
+                and analytical_store_health(self.collector.duckdb_path)["status"]
+                != "ok"
+            ):
+                status, content_type, body = (
+                    503,
+                    "application/json",
+                    '{"error":"analytical_store_unavailable"}\n',
+                )
+            if status == 503:
+                extra_headers = {"Retry-After": "1", **(extra_headers or {})}
         started = time.monotonic()
         # Every JSON response is compressible, and the ones the phone polls
         # are the largest things this server sends: the fleet listing is about
@@ -2461,6 +2523,19 @@ def analytics_boundary_dispatcher(
         return value if isinstance(value, dict) else None
 
     def dispatch(method: str, path: str, query: str, body: bytes) -> BoundaryResponse:
+        try:
+            require_analytical_store(collector.duckdb_path)
+            result = dispatch_available(method, path, query, body)
+            require_analytical_store(collector.duckdb_path)
+            return result
+        except AnalyticalStoreUnavailable:
+            return response(
+                503, "application/json", '{"error":"analytical_store_unavailable"}\n'
+            )
+
+    def dispatch_available(
+        method: str, path: str, query: str, body: bytes
+    ) -> BoundaryResponse:
         if method == "GET":
             if path == "/metrics":
                 return response(

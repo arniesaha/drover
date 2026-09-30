@@ -3365,7 +3365,7 @@ def test_auth_healthz_open(tmp_path):
         server.shutdown()
 
     assert status == 200
-    assert body == "ok\n"
+    assert json.loads(body)["process"] == "ok"
 
 
 def test_auth_accepts_bearer(tmp_path):
