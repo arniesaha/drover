@@ -1169,6 +1169,59 @@ def test_list_sessions_treats_an_unknown_status_as_live(tmp_path):
     assert odd in ids
 
 
+def test_list_sessions_archived_mode_and_cursor_only_narrow_history(tmp_path):
+    """drover#224: harnessd pages finished structured rows behind a cursor.
+
+    Neither the mode filter nor the cursor may touch a live row, whatever its
+    mode or age -- each page of history still carries every live session.
+    """
+    reg, _ = _registry(tmp_path)
+    reg.register_host(host_id="h1", display_name="H1", kind="macos")
+    structured = []
+    for i in range(6):
+        sid = _session(reg, "h1", status="terminated", minutes_ago=i)
+        with duckdb.connect(str(reg.control_plane_path)) as con:
+            con.execute(
+                "UPDATE harness_sessions SET mode = 'structured' WHERE session_id = ?",
+                [sid],
+            )
+        structured.append(sid)
+    pty_done = _session(reg, "h1", status="completed", minutes_ago=0)
+    live_pty = _session(reg, "h1", status="running", minutes_ago=900)
+
+    def page(after=None):
+        rows = reg.list_sessions(
+            archived_limit=2, archived_mode="structured", archived_after=after
+        )
+        return rows, [s.session_id for s in rows]
+
+    rows, ids = page()
+    assert pty_done not in ids
+    assert live_pty in ids
+    assert [sid for sid in ids if sid in structured] == structured[:2]
+
+    last = next(s for s in rows if s.session_id == structured[1])
+    rows, ids = page((last.updated_at, last.session_id))
+    assert live_pty in ids
+    assert [sid for sid in ids if sid in structured] == structured[2:4]
+
+
+def test_list_sessions_cursor_breaks_updated_at_ties_by_session_id(tmp_path):
+    reg, _ = _registry(tmp_path)
+    reg.register_host(host_id="h1", display_name="H1", kind="macos")
+    tied = sorted(
+        _session(reg, "h1", status="terminated", minutes_ago=5) for _ in range(3)
+    )
+
+    first = reg.list_sessions(archived_limit=1)
+    assert [s.session_id for s in first] == tied[:1]
+    rest = reg.list_sessions(
+        archived_limit=5,
+        archived_after=(first[0].updated_at, first[0].session_id),
+    )
+    assert [s.session_id for s in rest] == tied[1:]
+
+
 # -- a mirrored event arriving twice ---------------------------------------
 #
 # The host daemon retains undelivered event batches and re-offers them (#101),

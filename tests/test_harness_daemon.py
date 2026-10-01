@@ -2754,7 +2754,8 @@ def test_harnessd_listing_registry_lookups_do_not_scale_with_session_count(tmp_p
         def measure(expected_sessions):
             calls["get_session"] = 0
             calls["list_sessions"] = 0
-            _, inventory = _json_request(f"{base_url}/sessions")
+            # Above the default archived cap, so every seeded row is listed.
+            _, inventory = _json_request(f"{base_url}/sessions?archived=100")
             assert len(inventory["sessions"]) == expected_sessions
             return dict(calls)
 
@@ -2770,6 +2771,124 @@ def test_harnessd_listing_registry_lookups_do_not_scale_with_session_count(tmp_p
         state.pty.close_all()
         server.shutdown()
         server.server_close()
+
+
+def _seed_listing_sessions(registry, *, archived: int, archived_pty: int = 0):
+    """Live and needs-you sessions created first, so they are the stalest."""
+    for session_id, awaiting in (("live-waiting", "approval"), ("live-idle", None)):
+        registry.create_session(
+            host_id="test-host",
+            harness="claude-code",
+            command="claude",
+            session_id=session_id,
+            status="running",
+            mode="structured",
+        )
+        registry.update_session_activity(session_id, awaiting=awaiting)
+    for index in range(archived_pty):
+        registry.create_session(
+            host_id="test-host",
+            harness="claude-code",
+            command="claude",
+            session_id=f"pty-done-{index:03d}",
+            status="completed",
+        )
+    for index in range(archived):
+        registry.create_session(
+            host_id="test-host",
+            harness="claude-code",
+            command="claude",
+            session_id=f"done-{index:03d}",
+            status="terminated",
+            mode="structured",
+        )
+
+
+def test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first(
+    tmp_path,
+):
+    # drover#224: GET /sessions returned all 114 sessions the mac-mini had
+    # ever run. History is now one bounded page; what the user must act on
+    # is never what gets cut, and it leads the list.
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _seed_listing_sessions(state.registry, archived=25, archived_pty=10)
+
+        _, page = _json_request(f"{base_url}/sessions")
+        ids = [session["session_id"] for session in page["sessions"]]
+
+        assert ids[:2] == ["live-waiting", "live-idle"]
+        assert page["sessions"][0]["awaiting"] == "approval"
+        archived = ids[2:]
+        # Finished PTY rows are never rendered, so they must not eat the cap.
+        assert len(archived) == harness_daemon.SESSION_LIST_DEFAULT_ARCHIVED
+        assert archived == [f"done-{index:03d}" for index in range(24, 4, -1)]
+        assert page["archived_limit"] == harness_daemon.SESSION_LIST_DEFAULT_ARCHIVED
+        assert page["next_archived_cursor"]
+
+        _, live_only = _json_request(f"{base_url}/sessions?archived=0")
+        assert [s["session_id"] for s in live_only["sessions"]] == [
+            "live-waiting",
+            "live-idle",
+        ]
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_session_listing_cursor_pages_through_history_once(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        _seed_listing_sessions(state.registry, archived=11)
+
+        seen: list[str] = []
+        url = f"{base_url}/sessions?archived=4"
+        pages = 0
+        while True:
+            _, page = _json_request(url)
+            pages += 1
+            ids = [session["session_id"] for session in page["sessions"]]
+            # Live sessions ride on every page; history advances.
+            assert ids[:2] == ["live-waiting", "live-idle"]
+            seen.extend(ids[2:])
+            cursor = page["next_archived_cursor"]
+            if cursor is None:
+                break
+            url = f"{base_url}/sessions?archived=4&archived_cursor={cursor}"
+
+        assert pages == 3
+        assert seen == [f"done-{index:03d}" for index in range(10, -1, -1)]
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_session_listing_rejects_a_forged_cursor(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _json_request(f"{base_url}/sessions?archived_cursor=not-a-cursor")
+        assert excinfo.value.code == 400
+        # A malformed count is clamped to the default rather than refused.
+        status, page = _json_request(f"{base_url}/sessions?archived=lots")
+        assert status == 200
+        assert page["archived_limit"] == harness_daemon.SESSION_LIST_DEFAULT_ARCHIVED
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_session_listing_cap_matches_the_hub_fleet_render():
+    from drover.server.metrics import MAX_ARCHIVED_SESSION_LIMIT, MetricsCollector
+
+    assert harness_daemon.SESSION_LIST_MAX_ARCHIVED == MAX_ARCHIVED_SESSION_LIMIT
+    assert (
+        harness_daemon.SESSION_LIST_DEFAULT_ARCHIVED
+        == MetricsCollector.__dataclass_fields__["archived_session_limit"].default
+    )
 
 
 def test_harnessd_reconciles_exited_sessions_out_of_live_inventory(tmp_path):

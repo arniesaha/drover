@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `repo_name` over the directory name (#444).
 - When the hub cannot send push, it refuses the device APNs registration so the
   app keeps local notifications instead of assuming push will arrive (#439).
+- harnessd `GET /sessions` no longer returns every session the host has ever
+  run. It lists every live session (sessions waiting on the user first), then
+  the newest 20 finished ones; `?archived=N` (up to 100) and
+  `?archived_cursor=` from `next_archived_cursor` page through older history.
+  The hub's `/harness` fleet view, which iOS and web read, is unchanged (#224).
 
 - Keep metrics scrapes and small insight actions independent of cockpit admission,
   allow heavy requests a one-second admission wait, retry deferred day summaries
