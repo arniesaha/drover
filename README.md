@@ -254,6 +254,8 @@ device signing, and server configuration.
 - [Architecture](docs/architecture.md)
 - [Harness Adapter Architecture](docs/harness-adapter-architecture.md)
 - [ADR 0001: Harness Adapter Capability Registry](docs/adr/0001-harness-adapter-capability-registry.md)
+- [Factory Observer Delegation Bridge](docs/factory-observer-bridge.md)
+- [iOS app](apps/drover/README.md) and [TestFlight runbook](apps/drover/docs/internal-testflight-runbook.md)
 - [Context Store](docs/context-store.md)
 - [PostgreSQL Control Store](docs/postgresql-control-store.md)
 - [Integrations](docs/integrations.md)
@@ -265,9 +267,13 @@ device signing, and server configuration.
 ## Status and limitations
 
 Drover v0.3 is source-distributed software for technical users operating a
-trusted personal fleet. The Python server and native iOS client are functional,
-but packaging, host-bound credential enforcement, timely background push
-notifications, and broader context interchange standards remain future work.
+trusted personal fleet. The Python server and native iOS client are functional.
+The iOS app is built from source or distributed to internal testers through
+TestFlight; it is not on the public App Store. Push notifications work when the
+hub is configured with an APNs key (see the
+[iOS guide](apps/drover/README.md#push-notifications)); otherwise the app falls
+back to best-effort local notifications. Packaging, host-bound credential
+enforcement, and broader context interchange standards remain future work.
 
 See [open issues](https://github.com/arniesaha/drover/issues) for current bugs
 and accepted user-visible work.

@@ -5,16 +5,34 @@ All notable changes to Drover will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## TestFlight lane decision - 2026-09-30
-
-- Retired the internal staging lane and separate staging deployment. TestFlight
-  uses the production lane with unrestricted hub pairing (#390).
-- Added a read-only, bounded live-hub smoke before upload and physical-device
-  acceptance against the operator's live hub.
-
 ## [Unreleased]
 
+### Added
+
+- Sign-out revokes the phone's own hub credential and clears its APNs
+  registration through `DELETE /auth/device/credential` (self-only and
+  idempotent). Offline or older hubs still complete local sign-out with a
+  warning and no retained credential (#443).
+- The production TestFlight lane waits up to 45 minutes for Apple processing,
+  applies the declared export-compliance answer, and assigns and verifies the
+  build in an internal beta group (#441).
+- The factory-observer delegation bridge can launch Claude Code: `thinking_effort`
+  is optional (validated when supplied), every factory launch requires an
+  isolated Git worktree, and Claude factory sessions run with
+  `--permission-mode dontAsk`, so tools that would need approval are denied
+  instead of parking the session (#445).
+
 ### Fixed
+
+- iOS honors `Retry-After` on hub `503`s across session polling, stream
+  reconnects, cockpit and insight loads, auth polling and background refresh,
+  with separate cooldowns for analytical and session reads, and shows
+  "Hub busy, retrying in Ns" instead of an error (#442).
+- Delegated (factory-observer) sessions record their isolated worktree `cwd`
+  and repository identity, so iOS and web show project labels; iOS prefers
+  `repo_name` over the directory name (#444).
+- When the hub cannot send push, it refuses the device APNs registration so the
+  app keeps local notifications instead of assuming push will arrive (#439).
 
 - Keep metrics scrapes and small insight actions independent of cockpit admission,
   allow heavy requests a one-second admission wait, retry deferred day summaries
@@ -26,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and fleet listings without queueing control requests behind analytics (#331).
 
 ### Changed
+
+- TestFlight uses the production lane with unrestricted hub pairing; the
+  internal staging lane and separate staging hub are retired. A read-only,
+  bounded live-hub smoke runs before upload, and physical-device acceptance is
+  against the operator's live hub (#390, #440).
+- Device-scoped credentials can no longer revoke other credentials by ID; a
+  phone revokes only itself through sign-out (#443).
 
 - Host and central harness listings publish bounded capability schema v1 from
   the adapter registry, with fail-closed mixed-version handling. Legacy fields

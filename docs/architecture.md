@@ -24,8 +24,11 @@ The command plane carries live fleet operations:
 The central server does not execute remote commands itself. The host daemon is
 the authority for processes and filesystem access on its machine.
 
-Drive-capable harnesses are converging on a registered adapter contract and a
-versioned capability matrix consumed by web and iOS. Collection remains a
+Drive-capable harnesses resolve through a registered adapter contract. Hosts
+and the central hub publish a bounded, versioned capability envelope (schema v1,
+#418) in `/capabilities`, `/harness` and `/harness/hosts`; web and iOS controls
+are moving onto it (#419, #420) and today still use the legacy `enabled` flag.
+Collection remains a
 separate context-plane boundary: observing a harness does not make it a launch
 target. See [Harness Adapter Architecture](harness-adapter-architecture.md) and
 [ADR 0001](adr/0001-harness-adapter-capability-registry.md).
