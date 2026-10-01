@@ -534,6 +534,7 @@ def _snapshots_from_payload(
                 dedup_key=str(account.get("dedup_key") or "").strip(),
                 provider=str(account.get("provider") or "").strip(),
                 account_label=str(account.get("account_label") or "").strip(),
+                account_identity=_optional_text(account.get("account_identity")),
                 plan_label=_optional_text(account.get("plan_label")),
                 host_id=host_id,
                 status=str(account.get("status") or "error"),  # type: ignore[arg-type]
@@ -596,6 +597,7 @@ def _snapshots_from_rows(rows: list[dict[str, Any]]) -> list[ProviderAccountSnap
                 dedup_key=first["dedup_key"],
                 provider=first["provider"],
                 account_label=first["account_label"],
+                account_identity=first.get("account_identity"),
                 plan_label=first["plan_label"],
                 host_id=first["host_id"],
                 status=first["status"],

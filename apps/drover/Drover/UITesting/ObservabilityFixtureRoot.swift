@@ -42,7 +42,7 @@ struct ObservabilityFixtureRoot: View {
 
 enum ObservabilityFixtureData {
     static let hostTitles = ["studio": "Mac Studio", "mini": "Mac Mini",
-        "laptop": "Work laptop with a long descriptive host name"]
+        "laptop": "Work laptop with a long descriptive host name", "nas": "NAS"]
 
     static var homeSnapshot: Data {
         var value = try! JSONSerialization.jsonObject(with: FixtureScenarioData.snapshotData()) as! [String: Any]
@@ -67,7 +67,11 @@ enum ObservabilityFixtureData {
         let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
             ["snapshot_id": host, "dedup_key": host, "provider": "anthropic",
              "account_label": "alex@example.com", "plan_label": "Max",
-             "host_id": host, "status": status, "observed_at": reported,
+             // Offline readings older than 72h collapse into "Stale hosts", so
+             // a fixed date would hide these chips from the journeys over time.
+             "host_id": host, "status": status,
+             "observed_at": status == "ok" ? reported
+                 : ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86400)),
              "source": "fixture-usage", "error_category": status == "ok" ? NSNull() : "host_offline",
              "windows": [["kind": "seven_day", "used_percent": used],
                          ["kind": "five_hour", "used_percent": 18]]]
@@ -75,12 +79,20 @@ enum ObservabilityFixtureData {
         let others: [[String: Any]] = (0..<10).map { index in
             let provider = index == 0 ? "openai" : index == 1 ? "google" : index == 8 ? "other" : index == 9 ? "local" : "anthropic"
             return ["snapshot_id": "other-\(index)", "dedup_key": "other-\(index)",
-                "provider": provider, "account_label": "account-\(index)@example.com", "plan_label": "Personal",
+                "provider": provider, "account_label": index == 1 ? "Antigravity" : "account-\(index)@example.com", "plan_label": index == 1 ? NSNull() : "Personal",
                 "host_id": "studio", "status": index == 2 ? "stale" : "ok", "observed_at": reported,
-                "source": "fixture-usage", "windows": [["kind": "seven_day", "used_percent": index == 2 ? 81 : index == 0 ? 28 : 0],
+                "source": index == 1 ? "agy-usage" : "fixture-usage", "windows": [["kind": "seven_day", "used_percent": index == 2 ? 81 : index == 0 ? 28 : 0],
                     ["kind": "five_hour", "used_percent": 0]]]
         }
-        return shared + others
+        let googleHistory: [[String: Any]] = [("mini", 2), ("nas", 5)].map { host, days in
+            ["snapshot_id": "google-\(host)", "dedup_key": "google-\(host)",
+             "provider": "google", "account_label": "arniesaha@gmail.com",
+             "plan_label": NSNull(), "host_id": host, "status": "stale",
+             "observed_at": ISO8601DateFormatter().string(from: Date().addingTimeInterval(-Double(days) * 86400)),
+             "source": "agy-usage", "error_category": "host_offline",
+             "windows": [["kind": "five_hour", "used_percent": 99]]]
+        }
+        return shared + others + googleHistory
     }
 
     static var analytics: Data {

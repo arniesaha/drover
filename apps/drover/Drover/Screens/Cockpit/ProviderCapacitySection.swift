@@ -173,6 +173,17 @@ struct ProviderAccountCard: View {
                     }
                 }
 
+                if !subscription.staleHosts.isEmpty {
+                    DisclosureGroup("Stale hosts · \(subscription.staleHosts.count)") {
+                        ForEach(subscription.staleHosts) { host in
+                            Label(host.title + " · stale", systemImage: "clock")
+                                .droverText(.subtitle)
+                                .accessibilityLabel(host.title + ", stale")
+                        }
+                    }
+                    .accessibilityIdentifier("stale-hosts-\(subscription.id)")
+                }
+
                 if isExpanded {
                     Text(subscription.freshnessText).droverText(.subtitle)
                     ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in
@@ -199,6 +210,7 @@ struct ProviderAccountCard: View {
                 }
             }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("provider-account-\(subscription.id)")
     }
 

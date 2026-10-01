@@ -3630,6 +3630,7 @@ def _provider_snapshot_json(
     return {
         **_detected_provider_json(detected),
         "account_label": snapshot.account_label,
+        "account_identity": snapshot.account_identity,
         "plan_label": plan_label,
         "status": snapshot.status,
         "snapshot_id": snapshot.snapshot_id,

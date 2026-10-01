@@ -843,6 +843,8 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
     /// Host ids that reported this subscription, sorted.
     public let hostIDs: [String]
     public let hosts: [ProviderHostPresentation]
+    public let staleHosts: [ProviderHostPresentation]
+    public let isHomeEligible: Bool
     /// "Mac Mini, NAS" — display titles when known, ids otherwise.
     public let hostsText: String
     /// The freshest reading across hosts; the card's numbers come from it.
@@ -863,6 +865,15 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
 }
 
 public enum ProviderSubscriptionGrouping {
+    /// Offline readings older than this remain in Accounts detail only.
+    public static let staleHostThreshold: TimeInterval = 72 * 60 * 60
+
+    public static func isCollapsedHost(_ account: ProviderAccount, now: Date) -> Bool {
+        account.errorCategory == "host_retired"
+            || (account.errorCategory == "host_offline"
+                && now.timeIntervalSince(account.observedAt) > staleHostThreshold)
+    }
+
     /// Groups per-host accounts into one entry per subscription.
     ///
     /// The representative is the most recently observed *healthy* member when
@@ -877,8 +888,13 @@ public enum ProviderSubscriptionGrouping {
         var order: [String] = []
         var buckets: [String: [ProviderAccount]] = [:]
 
+        let known = Dictionary(grouping: accounts, by: \.provider).mapValues {
+            Set($0.compactMap { identity(for: $0) })
+        }
         for account in accounts {
+            let candidates = known[account.provider] ?? []
             let key = identity(for: account)
+                ?? (candidates.count == 1 ? candidates.first! : "\(account.provider)|unknown")
             if buckets[key] == nil {
                 buckets[key] = []
                 order.append(key)
@@ -890,8 +906,12 @@ public enum ProviderSubscriptionGrouping {
             guard let members = buckets[key], let newest = members.max(by: { $0.observedAt < $1.observedAt })
             else { return nil }
 
-            let healthy = members.filter { $0.status == .ok }
-            let representative = healthy.max(by: { $0.observedAt < $1.observedAt }) ?? newest
+            let current = members.filter { !isCollapsedHost($0, now: now) }
+            let healthy = current.filter { $0.status == .ok }
+            let representative = healthy.max(by: { $0.observedAt < $1.observedAt })
+                ?? current.max(by: { $0.observedAt < $1.observedAt }) ?? newest
+            let label = members.filter { identity(for: $0) != nil && $0.accountLabel != "Unknown account" }
+                .max(by: { $0.observedAt < $1.observedAt })?.accountLabel ?? "Unknown account"
             let hostIDs = Array(Set(members.map(\.hostID))).sorted()
             let titles = hostIDs.map { hostTitles[$0] ?? $0 }
             let hosts = hostIDs.compactMap { hostID -> ProviderHostPresentation? in
@@ -905,15 +925,21 @@ public enum ProviderSubscriptionGrouping {
 
             return ProviderSubscriptionPresentation(
                 id: key,
-                title: "\(representative.provider.capitalized) · \(representative.accountLabel)",
+                title: "\(representative.provider.capitalized) · \(label)",
                 provider: representative.provider,
-                accountLabel: representative.accountLabel,
+                accountLabel: label,
                 // Any host that could read the plan speaks for the whole
                 // subscription; a host that could not should not blank it.
                 planLabel: representative.planLabel
                     ?? members.compactMap(\.planLabel).first,
                 hostIDs: hostIDs,
-                hosts: hosts,
+                hosts: hosts.filter { host in
+                    !members.filter { $0.hostID == host.id }.allSatisfy { isCollapsedHost($0, now: now) }
+                },
+                staleHosts: hosts.filter { host in
+                    members.filter { $0.hostID == host.id }.allSatisfy { isCollapsedHost($0, now: now) }
+                },
+                isHomeEligible: !current.isEmpty,
                 hostsText: ListFormatter.localizedString(byJoining: titles),
                 representative: representative,
                 windows: representative.windows,
@@ -933,16 +959,15 @@ public enum ProviderSubscriptionGrouping {
         }
     }
 
-    /// Provider and account only — the plan is an attribute of the
-    /// subscription, not part of its identity. Hosts disagree about it: the
-    /// same Anthropic account reports `max` from one machine and nothing at
-    /// all from another, depending on what that host's CLI could see. Keying
-    /// on it split one subscription back into the duplicate cards this exists
-    /// to remove.
-    private static func identity(for account: ProviderAccount) -> String {
-        [account.provider, account.accountLabel]
-            .map { $0.lowercased() }
-            .joined(separator: "|")
+    /// Explicit probe identity wins; old probes can supply normalized email.
+    /// Unknown readings join only the sole known identity for their provider;
+    /// ambiguity produces one Unknown account bucket, never guesses between users.
+    private static func identity(for account: ProviderAccount) -> String? {
+        let explicit = account.accountIdentity?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = account.accountLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let value = explicit.flatMap({ $0.isEmpty ? nil : $0.lowercased() })
+            ?? (label.contains("@") ? label : nil) else { return nil }
+        return "\(account.provider)|\(value)"
     }
 
     /// Names the failing hosts and what went wrong.
@@ -1043,8 +1068,9 @@ public struct ProviderCapacityPreview: Sendable, Equatable {
     public let hasWarnings: Bool
 
     public init(subscriptions: [ProviderSubscriptionPresentation], now: Date = Date()) {
-        accountCount = subscriptions.count
-        meters = subscriptions.map { account in
+        let visible = subscriptions.filter(\.isHomeEligible)
+        accountCount = visible.count
+        meters = visible.map { account in
             let expired = ProviderHeadline.leadingWindow(account.windows).map {
                 ProviderCapacityPresentation(account: account.representative, window: $0, now: now).isStale
             } ?? false

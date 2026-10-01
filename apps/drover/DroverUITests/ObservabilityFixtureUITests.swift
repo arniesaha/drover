@@ -91,6 +91,30 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testStudioFallbackAndOfflineGoogleHostsProduceOneAccount() {
+        let app = launch()
+        app.tabBars.buttons["Home"].tap()
+        let navigation = app.buttons["provider-capacity-navigation"]
+        XCTAssertTrue(navigation.waitForExistence(timeout: 8))
+        XCTAssertTrue(navigation.label.contains("11 accounts"))
+        navigation.tap()
+        let scroll = app.scrollViews["provider-accounts-scroll"]
+        let googleAccounts = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · arniesaha@gmail.com"))
+        let google = googleAccounts.firstMatch
+        for _ in 0..<6 where !google.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(google.isHittable)
+        XCTAssertEqual(googleAccounts.count, 1)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · Antigravity")).firstMatch.exists)
+        let stale = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Stale hosts")).firstMatch
+        XCTAssertTrue(stale.isHittable)
+        let nas = app.descendants(matching: .any).matching(NSPredicate(format: "label ==[c] %@", "NAS, stale")).firstMatch
+        XCTAssertFalse(nas.exists)
+        stale.tap()
+        XCTAssertTrue(nas.waitForExistence(timeout: 3))
+        screenshot("google-account-stale-hosts", app)
+    }
+
+    @MainActor
     private func launch(large: Bool = false, dark: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()

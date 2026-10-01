@@ -624,6 +624,7 @@ private func providerAccount(
     provider: String,
     label: String,
     plan: String? = nil,
+    identity: String? = nil,
     host: String,
     status: String = "ok",
     observedAt: String,
@@ -631,10 +632,11 @@ private func providerAccount(
     windows: String = "[]"
 ) throws -> ProviderAccount {
     let plan = plan.map { "\"plan_label\":\"\($0)\"," } ?? ""
+    let identityJSON = identity.map { "\"account_identity\":\"\($0)\"," } ?? ""
     let category = errorCategory.map { "\"error_category\":\"\($0)\"," } ?? ""
     let json = """
     {"snapshot_id":"\(snapshot)","dedup_key":"\(snapshot)-key","provider":"\(provider)",\
-    "account_label":"\(label)",\(plan)"host_id":"\(host)","status":"\(status)",\
+    "account_label":"\(label)",\(identityJSON)\(plan)"host_id":"\(host)","status":"\(status)",\
     "observed_at":"\(observedAt)",\(category)"source":"codex-app-server","windows":\(windows)}
     """
     return try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
@@ -649,7 +651,9 @@ private func providerAccount(
                         errorCategory: "host_offline"),
     ]
     let subscription = try #require(ProviderSubscriptionGrouping.group(
-        accounts, hostTitles: ["mini": "Mac Mini", "studio": "Studio"]
+        // Pinned clock: an offline reading collapses after 72h, so the
+        // wall clock would move "mini" out of `hosts` from 2026-10-02.
+        accounts, hostTitles: ["mini": "Mac Mini", "studio": "Studio"], now: accounts[0].observedAt
     ).first)
     #expect(subscription.status == .ok)
     #expect(subscription.hosts.map(\.id) == ["mini", "studio"])
@@ -699,7 +703,7 @@ private func providerAccount(
     let accounts = try [
         providerAccount(snapshot: "s1", provider: "openai", label: "me@example.com",
                         host: "mac-mini", observedAt: "2026-08-09T18:00:00Z"),
-        providerAccount(snapshot: "s2", provider: "openai", label: "Codex",
+        providerAccount(snapshot: "s2", provider: "openai", label: "work@example.com",
                         host: "work-laptop", status: "error",
                         observedAt: "2026-08-09T18:00:00Z", errorCategory: "unavailable"),
     ]
@@ -707,7 +711,7 @@ private func providerAccount(
     let groups = ProviderSubscriptionGrouping.group(accounts)
 
     #expect(groups.count == 2)
-    #expect(groups.first { $0.accountLabel == "Codex" }?.status == .error)
+    #expect(groups.first { $0.accountLabel == "work@example.com" }?.status == .error)
     #expect(groups.first { $0.accountLabel == "me@example.com" }?.status == .ok)
 }
 
@@ -1084,4 +1088,70 @@ private let fourAnthropicWindows = """
     #expect(preview.meters[0].remainingText == "19% left")
     #expect(preview.meters[0].isStale)
     #expect(preview.hasWarnings)
+}
+
+
+@Test func studioFallbackMergesWithFleetEmailWithoutAddingQuotas() throws {
+    let accounts = try [
+        providerAccount(snapshot: "studio", provider: "google", label: "Antigravity", host: "studio",
+                        observedAt: "2026-10-01T18:00:00Z", windows: "[{\"kind\":\"five_hour\",\"used_percent\":20}]"),
+        providerAccount(snapshot: "mini", provider: "google", label: "arniesaha@gmail.com", host: "mini", status: "stale",
+                        observedAt: "2026-09-29T18:00:00Z", errorCategory: "host_offline",
+                        windows: "[{\"kind\":\"five_hour\",\"used_percent\":95}]"),
+        providerAccount(snapshot: "nas", provider: "google", label: "arniesaha@gmail.com", host: "nas", status: "stale",
+                        observedAt: "2026-09-26T18:00:00Z", errorCategory: "host_offline"),
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts, now: accounts[0].observedAt)
+    #expect(groups.count == 1)
+    #expect(groups[0].accountLabel == "arniesaha@gmail.com")
+    #expect(groups[0].representative.snapshotID == "studio")
+    #expect(groups[0].hosts.map(\.id) == ["mini", "studio"])
+    #expect(groups[0].staleHosts.map(\.id) == ["nas"])
+    #expect(ProviderCapacityPreview(subscriptions: groups, now: accounts[0].observedAt).meters[0].remainingFraction == 0.8)
+}
+
+@Test func explicitIdentitySurvivesLabelChangesAndUnknownDoesNotGuessAmongAccounts() throws {
+    let accounts = try [
+        providerAccount(snapshot: "a", provider: "google", label: "Personal", identity: "user-1", host: "a", observedAt: "2026-10-01T18:00:00Z"),
+        providerAccount(snapshot: "b", provider: "google", label: "Renamed", identity: "user-1", host: "b", observedAt: "2026-10-01T18:00:00Z"),
+        providerAccount(snapshot: "c", provider: "google", label: "Other", identity: "user-2", host: "c", observedAt: "2026-10-01T18:00:00Z"),
+        providerAccount(snapshot: "d", provider: "google", label: "Antigravity", host: "d", observedAt: "2026-10-01T18:00:00Z"),
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts)
+    #expect(groups.count == 3)
+    #expect(groups.first { $0.id == "google|user-1" }?.hostIDs == ["a", "b"])
+    #expect(groups.first { $0.id == "google|unknown" }?.accountLabel == "Unknown account")
+}
+
+@Test func retiredAndLongOfflineHostsStayInAccountsButLeaveHome() throws {
+    let accounts = try [
+        providerAccount(snapshot: "fresh", provider: "openai", label: "fresh@example.com", host: "studio", observedAt: "2026-10-01T18:00:00Z", windows: "[{\"kind\":\"five_hour\",\"used_percent\":20}]"),
+        providerAccount(snapshot: "old", provider: "openai", label: "old@example.com", host: "nas", status: "stale", observedAt: "2026-09-26T18:00:00Z", errorCategory: "host_offline", windows: "[{\"kind\":\"five_hour\",\"used_percent\":99}]"),
+        providerAccount(snapshot: "retired", provider: "openai", label: "retired@example.com", host: "mini", observedAt: "2026-10-01T18:00:00Z", errorCategory: "host_retired", windows: "[{\"kind\":\"five_hour\",\"used_percent\":100}]"),
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts, now: accounts[0].observedAt)
+    #expect(groups.count == 3)
+    #expect(groups.filter { !$0.isHomeEligible }.allSatisfy { $0.hosts.isEmpty && $0.staleHosts.count == 1 })
+    let preview = ProviderCapacityPreview(subscriptions: groups, now: accounts[0].observedAt)
+    #expect(preview.accountCount == 1)
+    #expect(preview.meters.first?.accountLabel == "fresh@example.com")
+    #expect(!ProviderSubscriptionGrouping.isCollapsedHost(accounts[1], now: accounts[1].observedAt.addingTimeInterval(ProviderSubscriptionGrouping.staleHostThreshold)))
+    #expect(ProviderSubscriptionGrouping.isCollapsedHost(accounts[1], now: accounts[1].observedAt.addingTimeInterval(ProviderSubscriptionGrouping.staleHostThreshold + 1)))
+}
+
+
+@Test func legacyEmailIdentityIsTrimmedAndCaseInsensitive() throws {
+    let accounts = try [
+        providerAccount(snapshot: "a", provider: "google", label: " ArnieSaha@GMAIL.com ", host: "a", observedAt: "2026-10-01T18:00:00Z"),
+        providerAccount(snapshot: "b", provider: "google", label: "arniesaha@gmail.com", host: "b", observedAt: "2026-10-01T18:00:00Z"),
+    ]
+    let groups = ProviderSubscriptionGrouping.group(accounts)
+    #expect(groups.count == 1)
+    #expect(groups[0].id == "google|arniesaha@gmail.com")
+}
+
+@Test func nullIdentityAndLabelDecodeAsUnknownAccount() throws {
+    let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(#"{"snapshot_id":"a","dedup_key":"a","provider":"google","account_label":null,"account_identity":null,"host_id":"studio","status":"ok","observed_at":"2026-10-01T18:00:00Z","source":"agy-usage","windows":[]}"#.utf8))
+    #expect(account.accountIdentity == nil)
+    #expect(ProviderSubscriptionGrouping.group([account])[0].accountLabel == "Unknown account")
 }
