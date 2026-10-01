@@ -317,6 +317,37 @@ class AgyUsageProbe:
         except OSError:
             raise _ProbeFailure("unavailable", status="error") from None
 
+    def stored_account(self) -> tuple[str, str] | None:
+        """Local sign-in metadata shared with auth and model discovery.
+
+        The stored access/refresh credential indicates local sign-in; ID token
+        claims provide identity only, not proof that the server accepts it.
+        No network refresh, credential writes, or logging occurs here. Return
+        an opaque scope for credentials that have no usable identity claims.
+        """
+        try:
+            credential = json.loads(self._credential_blob())
+            token = credential.get("token")
+            if not isinstance(token, dict):
+                return None
+            secret = token.get("refresh_token") or token.get("access_token")
+            if not isinstance(secret, str) or not secret.strip():
+                return None
+            try:
+                metadata = _credential_account_metadata(credential)
+            except (ValueError, AttributeError, TypeError):
+                metadata = None
+            if metadata is not None:
+                return metadata
+            return (
+                "Unknown account",
+                "credential:" + hashlib.sha256(secret.encode()).hexdigest(),
+            )
+        except Exception:
+            # An unreadable credential must not leak its contents or suppress
+            # discovery through the older account layout.
+            return None
+
     def _account_metadata(self) -> tuple[str, str | None]:
         """Identity from the credential actually used for quota, then legacy state.
 
@@ -327,20 +358,9 @@ class AgyUsageProbe:
         """
         try:
             credential = json.loads(self._credential_blob())
-            encoded = credential.get("id_token")
-            if isinstance(encoded, str):
-                parts = encoded.split(".")
-                if len(parts) == 3:
-                    claims = json.loads(
-                        base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
-                    )
-                    email = claims.get("email")
-                    if isinstance(email, str) and "@" in email and email.strip():
-                        return email.strip(), email.strip().lower()
-                    subject = claims.get("sub")
-                    if isinstance(subject, str) and subject.strip():
-                        identity = hashlib.sha256(subject.strip().encode()).hexdigest()
-                        return "Unknown account", "google-sub:" + identity
+            metadata = _credential_account_metadata(credential)
+            if metadata is not None:
+                return metadata
         except Exception:  # Identity failure must not suppress quota reporting.
             pass
         try:
@@ -351,6 +371,24 @@ class AgyUsageProbe:
         except (OSError, ValueError, AttributeError):
             pass
         return "Unknown account", None
+
+
+def _credential_account_metadata(credential: Any) -> tuple[str, str] | None:
+    encoded = credential.get("id_token")
+    if isinstance(encoded, str):
+        parts = encoded.split(".")
+        if len(parts) == 3:
+            claims = json.loads(
+                base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+            )
+            email = claims.get("email")
+            if isinstance(email, str) and "@" in email and email.strip():
+                return email.strip(), email.strip().lower()
+            subject = claims.get("sub")
+            if isinstance(subject, str) and subject.strip():
+                identity = hashlib.sha256(subject.strip().encode()).hexdigest()
+                return "Unknown account", "google-sub:" + identity
+    return None
 
 
 def _unwrap_keyring(raw: str) -> str:

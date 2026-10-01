@@ -369,17 +369,23 @@ def _parse_agy_status(
 ) -> HarnessAuthStatus:
     """Read sign-in from agy's own state, not from ``agy --version``.
 
-    The probe command is ``--version``, which exits 0 whenever the binary is
-    installed -- signed in or not -- so its return code says nothing about
-    authentication. agy keeps its credentials in ``~/.gemini``: an account
-    address in ``google_accounts.json`` and the OAuth blob beside it. A
-    missing address is reported as ``unknown`` rather than
-    ``unauthenticated``, because agy may store identity somewhere this has
-    not seen.
+    ``--version`` establishes installation only. Current credentials come
+    from the same Keychain/file reader as the usage probe; older account and
+    OAuth layouts remain supported below.
     """
+    from drover.server.providers.agy import AgyUsageProbe
+
     root = home or Path.home()
     if returncode != 0:
         return HarnessAuthStatus("agy", "unavailable", detail=output or None)
+    account = AgyUsageProbe(state_dir=root / ".gemini").stored_account()
+    if account is not None:
+        return HarnessAuthStatus(
+            "agy",
+            "authenticated",
+            label=account[0] if account[0] != "Unknown account" else None,
+            detail="Antigravity CLI",
+        )
     account_label = None
     try:
         raw = json.loads((root / ".gemini/google_accounts.json").read_text())
