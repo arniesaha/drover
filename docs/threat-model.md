@@ -1,18 +1,24 @@
 # Security Threat Model
 
-This document describes the security architecture and threat model for Drover v0.3.
+This document describes the security architecture and threat model for the latest
+tagged Drover release (see [SECURITY.md](../SECURITY.md#supported-versions)).
 It complements the technical details in [Security](./security.md) and outlines the
 assumptions, trust boundaries, and threat mitigations that inform the design.
 
 ## Scope
 
-This threat model applies to the Drover v0.3 codebase and its standard deployment
-configurations:
+This threat model applies to the current Drover codebase and its standard
+deployment configurations:
 
 - `drover-server`: central fleet API and context store
-- `drover-harnessd`: per-host agent control daemon
-- iOS client application
-- DuckDB + Parquet local context store
+- `drover-harnessd`: per-host agent control daemon and its harness adapters
+  (Claude Code, Codex, and other supported agent CLIs)
+- iOS client application, built from source or distributed through the
+  TestFlight production lane
+- PostgreSQL control store for a fresh central installation, either an
+  operator-run server or a managed container bound to `127.0.0.1`
+- DuckDB + Parquet analytical context store and host-local spools; an existing
+  DuckDB control store keeps working until an explicit operator migration
 
 ## Trust Model
 
@@ -124,7 +130,8 @@ network hardening.
 
 **Mitigations**:
 - Context store data stored locally under `~/.drover/` by default
-- Tokens stored with restrictive permissions (mode `0600`)
+- Tokens and the PostgreSQL control store DSN (`~/.drover/server.env`) stored
+  with restrictive permissions (mode `0600`)
 - Credentials.json hashes tokens, never stores plaintext tokens
 - `raw_objects/` directory stores large payloads by URI
 - Operator responsible for backup and storage security
@@ -150,10 +157,12 @@ at the application layer; relies on OS-level encryption.
 - Server-side credential revocation available via `drover-server credentials revoke`
 - Pairing codes expire, preventing persistent unauthorized access
 - Local agent processes run in controlled environment
-- No per-host identity binding yet (credential grants full host access)
+- No host identity binding yet: a host credential can act as any registered
+  host ([#13](https://github.com/arniesaha/drover/issues/13))
 
-**Residual Risk**: A compromised credential provides full access to all registered
-hosts. No granular credential scoping or per-host identity verification.
+**Residual Risk**: A compromised credential, or the legacy shared token while it
+remains enabled, provides full access to all registered hosts. No granular
+credential scoping or per-host identity verification.
 
 ### 5. Supply Chain Attacks
 
@@ -166,21 +175,26 @@ hosts. No granular credential scoping or per-host identity verification.
 - Compromised Docker images or installation scripts
 
 **Mitigations**:
-- Source distribution only (no official PyPI package as of v0.3)
+- Source distribution only (no official PyPI package)
 - All code on GitHub repository, open source
-- Signed releases (recommended verification by operators)
+- Published release checksums; `install.sh --verify-release` checks them in a
+  disposable runtime before installation
 - Installer scripts are reviewed before release
 - `uv` dependency resolver for Python packages
 
 **Residual Risk**: Operator must trust the source repository and verification
 processes. No formal third-party security audit or continuous verification.
 
-## Known Limitations (v0.3)
+## Known Limitations
 
-These security features are intentionally not provided:
+These security features are not provided in the current release:
 
 1. **Multi-tenant isolation**: No support for multiple operators
-2. **Per-host credentials**: All devices can access all hosts with valid token
+2. **Host-bound credentials**: Host credentials are issued and revoked
+   individually but are not bound to a host identity, so one can act as any
+   registered host; every device credential, and the legacy shared token while
+   enabled, can access all hosts
+   ([#13](https://github.com/arniesaha/drover/issues/13))
 3. **RBAC/SCOPED permissions**: No fine-grained command-level authorization
 4. **SSO integration**: No enterprise identity provider support
 5. **Sandboxed execution**: Agent commands execute with full host privileges
@@ -212,9 +226,11 @@ If you suspect a security incident:
 ## Acknowledgments
 
 This threat model was written to guide Drover's security design. It reflects known
-limitations and intentional design decisions for v0.3. Updates will be made as new
-threats are identified and features are added.
+limitations and intentional design decisions for the current release. Updates will
+be made as new threats are identified and features are added.
 
 ## Version History
 
+- 0.3 (2026-10-01): Made version-neutral; added the PostgreSQL control store,
+  harness adapters, TestFlight production lane, and host-binding limitation
 - 0.2 (2026-08-13): Updated for the v0.3.0 release tag

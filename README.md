@@ -15,8 +15,8 @@ activity from others, including OpenClaw and Hermes, as context. A native iOS
 client lets you inspect sessions, answer prompts, send turns, hand work off,
 and attach to a terminal.
 
-Drover is self-hosted software for one trusted operator. The supported v0.3
-network boundary is localhost, a private LAN, or a private Tailscale network.
+Drover is self-hosted software for one trusted operator. The supported network
+boundary is localhost, a private LAN, or a private Tailscale network.
 It does not require a Drover cloud service.
 
 ## Screenshots
@@ -224,11 +224,13 @@ The model and its compatibility boundary are documented in
 ## Supported networking and security
 
 - Supported: localhost, a trusted private LAN, and a private Tailscale network.
-- Not supported for v0.3: Tailscale Funnel or any public-internet exposure.
+- Not supported: Tailscale Funnel or any public-internet exposure.
 - Authentication: individually issued device and host bearer credentials; the
   legacy shared token remains available for upgrades until explicitly disabled.
-- Not provided: multi-user isolation, RBAC, SSO, host-bound credential
-  enforcement, or a hosted control plane.
+- Host credentials are not yet bound to a host identity, so any host
+  credential can act as any host
+  ([#13](https://github.com/arniesaha/drover/issues/13)).
+- Not provided: multi-user isolation, RBAC, SSO, or a hosted control plane.
 
 Read [Security](docs/security.md) before exposing a listener beyond localhost,
 and [Multi-Host](docs/multi-host.md) before adding another machine.
@@ -266,10 +268,11 @@ device signing, and server configuration.
 
 ## Status and limitations
 
-Drover v0.3 is source-distributed software for technical users operating a
-trusted personal fleet. The Python server and native iOS client are functional.
-The iOS app is built from source or distributed to internal testers through
-TestFlight; it is not on the public App Store. Push notifications work when the
+Drover is source-distributed software for technical users operating a trusted
+personal fleet; the current release line is listed in the
+[changelog](CHANGELOG.md). The Python server and native iOS client are
+functional. The iOS app is built from source or distributed to testers through
+the TestFlight production lane; it is not on the public App Store. Push notifications work when the
 hub is configured with an APNs key (see the
 [iOS guide](apps/drover/README.md#push-notifications)); otherwise the app falls
 back to best-effort local notifications. Packaging, host-bound credential
