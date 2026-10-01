@@ -56,7 +56,7 @@ struct StreamTests {
         switch event {
         case let .message(message): texts.append(message.text)
         case let .history(messages, _): texts.append(contentsOf: messages.map(\.text))
-        case .connection, .connectFailed, .unauthorized: break
+        case .connection, .connectFailed, .busy, .unauthorized: break
         }
         if texts.count == 3 { break }
     }
@@ -92,7 +92,7 @@ struct StreamTests {
         case let .connection(up):
             if !up { sawDisconnect = true }
             else if sawDisconnect { sawReconnectUp = true }
-        case .connectFailed, .unauthorized: break
+        case .connectFailed, .busy, .unauthorized: break
         }
         if got.count == 2, sawReconnectUp { break }
     }
@@ -119,7 +119,7 @@ struct StreamTests {
         switch event {
         case let .message(message): texts.append(message.text)
         case let .history(messages, _): texts.append(contentsOf: messages.map(\.text))
-        case .connection, .connectFailed, .unauthorized: break
+        case .connection, .connectFailed, .busy, .unauthorized: break
         }
         if texts.count == 3 { break }
     }
@@ -152,7 +152,7 @@ struct StreamTests {
         case let .message(m): texts.append(m.text)
         case let .history(messages, _): texts.append(contentsOf: messages.map(\.text))
         case let .connection(up): connections.append(up)
-        case .connectFailed, .unauthorized: break
+        case .connectFailed, .busy, .unauthorized: break
         }
         if texts.count == 2, connections.contains(true) { break }
     }
@@ -279,7 +279,7 @@ struct StreamTests {
             batches.append(messages.map(\.seq))
         case let .message(message): live.append(message.seq)
         case .connection(false): catchUpFailed = true
-        case .connection(true), .connectFailed, .unauthorized: break
+        case .connection(true), .connectFailed, .busy, .unauthorized: break
         }
         if live == [6] || catchUpFailed { break }
     }
@@ -337,7 +337,7 @@ struct StreamTests {
         case let .history(messages, _): batches.append(messages.map(\.seq))
         case let .message(message): live.append(message.seq)
         case .connection(false): drops += 1
-        case .connection(true), .connectFailed, .unauthorized: break
+        case .connection(true), .connectFailed, .busy, .unauthorized: break
         }
         // One drop is the scripted failure; more means the stream is
         // restarting the cold window instead of resuming it.
@@ -394,7 +394,7 @@ struct StreamTests {
         switch event {
         case let .history(messages, _): batches.append(messages.map(\.seq))
         case .connection(false): drops += 1
-        case .message, .connection(true), .connectFailed, .unauthorized: break
+        case .message, .connection(true), .connectFailed, .busy, .unauthorized: break
         }
         if !batches.isEmpty || drops > 1 { break }
     }
@@ -439,7 +439,7 @@ struct StreamTests {
         case let .history(messages, _): batch = messages
         case let .message(message): live.append(message.seq)
         case .connection(false): drops += 1
-        case .connection(true), .connectFailed, .unauthorized: break
+        case .connection(true), .connectFailed, .busy, .unauthorized: break
         }
         // Wait for the live frame, not just the batch: the socket is attached
         // *after* the window is published, so leaving at `.history` would race
@@ -532,7 +532,7 @@ struct StreamTests {
         switch event {
         case let .history(messages, _) where !messages.isEmpty: batch = messages
         case .connection(false): drops += 1
-        case .history, .message, .connection(true), .connectFailed, .unauthorized: break
+        case .history, .message, .connection(true), .connectFailed, .busy, .unauthorized: break
         }
         if !batch.isEmpty || drops > MessageStream.gapRetryLimit + 2 { break }
     }
@@ -795,7 +795,7 @@ struct StreamTests {
         switch event {
         case let .message(message): delivered.append(message.seq)
         case .connection(false): break
-        case .history, .connection(true), .connectFailed, .unauthorized: continue
+        case .history, .connection(true), .connectFailed, .busy, .unauthorized: continue
         }
         break
     }

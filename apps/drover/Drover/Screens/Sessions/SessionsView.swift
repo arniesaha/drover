@@ -128,7 +128,10 @@ struct SessionsView: View {
             }
             .overlay {
                 if !store.hasLoadedOnce {
-                    if let error = store.lastError {
+                    if let deadline = store.busyUntil {
+                        Label(RetryPolicy.busyMessage(until: deadline), systemImage: "clock")
+                            .droverText(.subtitle)
+                    } else if let error = store.lastError {
                         if store.isTailscaleTransportFailure {
                             ContentUnavailableView {
                                 Label("Can't reach the hub over Tailscale", systemImage: "network.badge.shield.half.filled")

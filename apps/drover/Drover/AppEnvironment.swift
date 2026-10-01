@@ -275,7 +275,8 @@ final class AppEnvironment {
         client = DroverClient(
             config: newConfig,
             token: trimmedToken,
-            credentialBindingID: bindingID
+            credentialBindingID: bindingID,
+            retryGate: .shared
         )
         generation += 1
         await recoveryWriteGate.drain(retiredRecoveryGeneration)

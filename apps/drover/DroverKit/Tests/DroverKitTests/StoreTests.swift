@@ -290,7 +290,8 @@ private final class LockedCount: @unchecked Sendable {
 
 @Test @MainActor func continueSessionConflictReplacesAStaleTailscaleTransportPresentation() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
-    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let tsClient = DroverClient(config: tsConfig, token: "test-token",
+                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
@@ -642,7 +643,8 @@ private final class LockedCount: @unchecked Sendable {
 
 @Test @MainActor func refreshErrorOnTailscaleReflectsTailscaleContext() async throws {
     let tsConfig = ServerConfig(urlString: "http://100.64.0.1:7080")!
-    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let tsClient = DroverClient(config: tsConfig, token: "test-token",
+                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     #expect(store.isTailscaleAddress)
@@ -669,7 +671,8 @@ private final class LockedCount: @unchecked Sendable {
 
 @Test @MainActor func tailscaleNonTransportFailuresKeepTheirExactClassificationAndMessage() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
-    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let tsClient = DroverClient(config: tsConfig, token: "test-token",
+                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
@@ -687,13 +690,14 @@ private final class LockedCount: @unchecked Sendable {
     MockURLProtocol.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8)) }
     await store.refresh()
     #expect(store.lastRefreshFailure == .http)
-    #expect(store.lastError == "Hub is restarting")
+    #expect(store.lastError?.hasPrefix("Hub busy, retrying in ") == true)
     #expect(!store.isTailscaleTransportFailure)
 }
 
 @Test @MainActor func repeatedFirstLoadCancellationIsNotATailscaleTransportFailure() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
-    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let tsClient = DroverClient(config: tsConfig, token: "test-token",
+                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     MockURLProtocol.transportError = URLError(.cancelled)
@@ -707,7 +711,8 @@ private final class LockedCount: @unchecked Sendable {
 
 @Test @MainActor func ignoredCancellationsKeepTheDisplayedFailureClassificationInSync() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
-    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let tsClient = DroverClient(config: tsConfig, token: "test-token",
+                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     defer { MockURLProtocol.transportError = nil }
@@ -736,7 +741,8 @@ private final class LockedCount: @unchecked Sendable {
 
 @Test @MainActor func connectingDetailReportsTailscaleUnreachableHub() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
-    let tsClient = DroverClient(config: tsConfig, token: "test-token", session: MockURLProtocol.session())
+    let tsClient = DroverClient(config: tsConfig, token: "test-token",
+                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     MockURLProtocol.transportError = URLError(.cannotConnectToHost)

@@ -51,7 +51,17 @@ public struct URLSessionTerminalConnector: TerminalConnecting {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    if let response = task.response as? HTTPURLResponse,
+                       response.statusCode == 503 {
+                        let delay = RetryPolicy.delay(retryAfter: RetryPolicy.retryAfter(
+                            response.value(forHTTPHeaderField: "Retry-After")
+                        ))
+                        continuation.finish(throwing: DroverError.busy(
+                            until: Date().addingTimeInterval(delay)
+                        ))
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
             continuation.onTermination = { _ in
@@ -207,6 +217,7 @@ public actor TerminalStream {
 
     /// A retry asked for while no backoff was running, waiting to be spent.
     private var retryRequested = false
+    private var retryDeadline: Date?
 
     private func consumeRetryRequest() -> Bool {
         defer { retryRequested = false }
@@ -227,13 +238,20 @@ public actor TerminalStream {
                     // than resuming a doubling that was already 30s deep.
                     backoff = reconnectBaseDelay
                 } else {
-                    await backoffSleep(backoff)
+                    let components = backoff.components
+                    let seconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+                    await backoffSleep(.seconds(RetryPolicy.delay(backoff: seconds, minimum: min(1, max(0, seconds)))))
                     backoff = min(backoff * 2, .seconds(30))
                 }
                 if Task.isCancelled { break }
             }
             firstAttempt = false
 
+            if let retryDeadline {
+                do { try await RetryPolicy.wait(until: retryDeadline) }
+                catch { break }
+                self.retryDeadline = nil
+            }
             let connection = connector.connect(request)
             outgoing.setSend(connection.send)
             if let lastResize = outgoing.recallResize() {
@@ -271,6 +289,9 @@ public actor TerminalStream {
                 if !sawFrame {
                     continuation.yield(.connectFailed(DroverError.unreachableDescription))
                 }
+            } catch DroverError.busy(let deadline) {
+                retryDeadline = deadline
+                continuation.yield(.connectFailed(RetryPolicy.busyMessage(until: deadline)))
             } catch {
                 if Task.isCancelled { break }
                 // An attempt that never saw a frame never attached, so the

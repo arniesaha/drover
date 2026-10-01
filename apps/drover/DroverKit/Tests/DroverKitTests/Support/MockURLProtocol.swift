@@ -15,6 +15,7 @@ final class MockFlag: @unchecked Sendable {
 /// touch the network. Install a `handler` before each request and it decides
 /// the (status, body) pair returned for that request.
 final class MockURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var responseHeaders: [String: String]?
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
 
     /// A deliberately narrow request trace for recovery tests. It retains
@@ -79,7 +80,7 @@ final class MockURLProtocol: URLProtocol {
     private func deliver(_ answer: (Int, Data)) {
         let (status, body) = answer
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
-                                       httpVersion: nil, headerFields: nil)!
+                                       httpVersion: nil, headerFields: Self.responseHeaders)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)
         client?.urlProtocolDidFinishLoading(self)

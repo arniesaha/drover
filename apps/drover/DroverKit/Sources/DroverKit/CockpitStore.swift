@@ -150,12 +150,33 @@ public final class CockpitStore {
         await refresh(days: days)
     }
 
+    /// Busy reads retain the last good content and resume after the server's
+    /// deadline. A superseding filter/capability change prevents a stale retry.
+    private func retryRead<Value: Sendable>(
+        whileCurrent: () -> Bool,
+        onBusy: (String) -> Void,
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        while true {
+            try Task.checkCancellation()
+            guard whileCurrent() else { throw CancellationError() }
+            do { return try await operation() }
+            catch DroverError.busy(let deadline) {
+                onBusy(RetryPolicy.busyMessage(until: deadline))
+                try await RetryPolicy.wait(until: deadline)
+            }
+        }
+    }
+
     public func refresh(days: Int = 7) async {
         guard isCockpitAvailable else { return }
         refreshGeneration &+= 1
         let generation = refreshGeneration
         do {
-            let fresh = try await client.cockpitOverview(days: days)
+            let fresh = try await retryRead(
+                whileCurrent: { generation == self.refreshGeneration && self.isCockpitAvailable },
+                onBusy: { self.providerError = $0; self.activityError = $0 }
+            ) { try await self.client.cockpitOverview(days: days) }
             guard generation == refreshGeneration, isCockpitAvailable else { return }
             overview = fresh
 
@@ -403,7 +424,10 @@ public final class CockpitStore {
         analyticsRefreshNotice = nil
         analyticsProjectionNotice = nil
         do {
-            let fresh = try await client.analytics(filters: firstPage)
+            let fresh = try await retryRead(
+                whileCurrent: { generation == self.analyticsGeneration && self.isCockpitAvailable },
+                onBusy: { self.analyticsError = $0 }
+            ) { try await self.client.analytics(filters: firstPage) }
             guard generation == analyticsGeneration else { return }
             analytics = fresh
             if let data = fresh.activity.data {
@@ -442,7 +466,10 @@ public final class CockpitStore {
         filters.hostCursor = dimension == .hosts ? cursor : nil
         filters.modelCursor = dimension == .models ? cursor : nil
         do {
-            let page = try await client.analytics(filters: filters)
+            let page = try await retryRead(
+                whileCurrent: { generation == self.analyticsGeneration && self.isCockpitAvailable },
+                onBusy: { self.analyticsPageErrors[dimension] = $0 }
+            ) { try await self.client.analytics(filters: filters) }
             guard generation == analyticsGeneration, let data = page.activity.data else {
                 return
             }
@@ -538,8 +565,11 @@ public final class CockpitStore {
         insightsError = nil
         loadingInsightsGeneration = generation
         loadingInsightsPageGeneration = nil
-        let task = Task { [client] in
-            try await client.insights(filters: firstPageFilters)
+        let task = Task {
+            try await self.retryRead(
+                whileCurrent: { generation == self.insightsGeneration && self.isInsightsAvailable },
+                onBusy: { self.insightsError = $0 }
+            ) { try await self.client.insights(filters: firstPageFilters) }
         }
         insightsLoadTask = task
         defer {
@@ -578,7 +608,12 @@ public final class CockpitStore {
         var filters = insightFilters
         filters.cursor = cursor
         loadingInsightsPageGeneration = generation
-        let task = Task { [client] in try await client.insights(filters: filters) }
+        let task = Task {
+            try await self.retryRead(
+                whileCurrent: { generation == self.insightsGeneration && self.isInsightsAvailable },
+                onBusy: { self.insightsError = $0 }
+            ) { try await self.client.insights(filters: filters) }
+        }
         insightsPageTask = task
         defer {
             if loadingInsightsPageGeneration == generation {

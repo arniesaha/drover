@@ -39,7 +39,19 @@ public struct URLSessionWebSocketConnector: WebSocketConnecting {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    if let response = task.response as? HTTPURLResponse,
+                       response.statusCode == 503 {
+                        let delay = RetryPolicy.delay(retryAfter: RetryPolicy.retryAfter(
+                            response.value(forHTTPHeaderField: "Retry-After")
+                        ))
+                        continuation.finish(throwing: DroverError.busy(
+                            until: Date().addingTimeInterval(delay)
+                        ))
+                    } else if (task.response as? HTTPURLResponse)?.statusCode == 401 {
+                        continuation.finish(throwing: DroverError.unauthorized)
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
 
@@ -66,6 +78,7 @@ public enum StreamEvent: Sendable, Equatable {
     /// could not reach the hub went nowhere and the screen had a spinner and
     /// nothing else to show (#170).
     case connectFailed(String)
+    case busy(until: Date)
     /// Terminal: the token was rejected (401) by either the REST catch-up or
     /// the WebSocket handshake. Unlike a transient drop, this is never
     /// recoverable by retrying with the same token, so the pump stops
@@ -85,7 +98,7 @@ public struct OlderHistoryPage: Sendable, Equatable {
 /// Resumable message stream for a single harness session: replays REST
 /// history from the last-seen sequence number, then live WebSocket frames,
 /// deduped and delivered strictly in ascending `seq` order. On WebSocket
-/// failure it reconnects with doubling backoff (capped at 30s), always
+/// failure it reconnects with jittered backoff and a mandatory server cooldown, always
 /// catching up via REST from `lastSeq` first so no message is missed or
 /// re-delivered.
 public actor MessageStream {
@@ -221,11 +234,21 @@ public actor MessageStream {
     private func run(continuation: AsyncStream<StreamEvent>.Continuation) async {
         var backoff = reconnectBaseDelay
         var firstAttempt = true
+        var retryDeadline: Date?
 
         while !Task.isCancelled {
             if !firstAttempt {
                 continuation.yield(.connection(false))
-                try? await Task.sleep(for: backoff)
+                do {
+                    let components = backoff.components
+                    let seconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+                    let delay = RetryPolicy.delay(
+                        backoff: seconds, minimum: min(1, max(0, seconds))
+                    )
+                    let local = Date().addingTimeInterval(delay)
+                    try await RetryPolicy.wait(until: max(local, retryDeadline ?? .distantPast))
+                } catch { break }
+                retryDeadline = nil
                 backoff = min(backoff * 2, .seconds(30))
             }
             firstAttempt = false
@@ -243,6 +266,11 @@ public actor MessageStream {
             } catch DroverError.unauthorized {
                 if !Task.isCancelled { continuation.yield(.unauthorized) }
                 break
+            } catch DroverError.busy(let deadline) {
+                retryDeadline = deadline
+                await client.deferReads(until: deadline)
+                continuation.yield(.busy(until: deadline))
+                continue
             } catch {
                 if Task.isCancelled { break }
                 // Say why before backing off. The retry is unchanged; what is
@@ -282,6 +310,10 @@ public actor MessageStream {
                 // typed DroverError rather than a generic transport error.
                 if !Task.isCancelled { continuation.yield(.unauthorized) }
                 break
+            } catch DroverError.busy(let deadline) {
+                retryDeadline = deadline
+                await client.deferReads(until: deadline)
+                continuation.yield(.busy(until: deadline))
             } catch {
                 if Task.isCancelled { break }
                 // fall through to reconnect loop

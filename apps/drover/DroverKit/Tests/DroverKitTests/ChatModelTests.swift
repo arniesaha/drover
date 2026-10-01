@@ -225,6 +225,24 @@ struct ChatModelTests {
     #expect(requests.value == 2)
 }
 
+@Test @MainActor func recapPollWaitsForBusyHubWithoutSpendingAttempts() async throws {
+    let requests = RequestCounter()
+    MockURLProtocol.handler = { _ in
+        requests.bump()
+        return (200, sessionJSON(recap: "Recovered", source: 12))
+    }
+    let client = client()
+    await client.deferReads(until: Date().addingTimeInterval(0.2))
+    let model = recoveryChatModel(client: client, sessionID: "s1", harness: "codex",
+                          recap: "Old", recapSourceSeq: 8,
+                          recapPollInterval: .zero, recapPollAttempts: 1)
+    model.ingest(.message(turnComplete(seq: 12)))
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(requests.value == 0)
+    await eventually { model.recap == "Recovered" }
+    #expect(requests.value == 1)
+}
+
 @Test @MainActor func recapPollKeepsCurrentTextUntilTargetSourceArrives() async {
     let requests = RequestCounter()
     let target = DelayedSnapshotResponse(sessionJSON(recap: "Target", source: 12))

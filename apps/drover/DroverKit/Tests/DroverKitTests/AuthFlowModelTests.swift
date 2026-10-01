@@ -174,6 +174,26 @@ struct AuthFlowModelTests {
         #expect(model.errorMessage == nil)
     }
 
+    @Test @MainActor func busyPollingWaitsAndRecovers() async throws {
+        let state = PollTestState()
+        MockURLProtocol.handler = { _ in
+            state.incrementRequests()
+            return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"authenticated"}"#.utf8))
+        }
+        let client = client()
+        let deadline = Date().addingTimeInterval(0.2)
+        await client.deferReads(until: deadline)
+        let model = AuthFlowModel(client: client, hostID: "mac-mini", harness: "codex")
+        model.flow = try waitingFlow()
+        model.startPolling(every: 0.01)
+        try await waitUntil { model.errorMessage?.hasPrefix("Hub busy,") == true }
+        #expect(state.requestCount == 0)
+        try await waitUntil { model.flow?.state == .authenticated }
+        #expect(Date() >= deadline)
+        #expect(state.requestCount == 1)
+        #expect(model.errorMessage == nil)
+    }
+
     @Test @MainActor func failedCancellationResumesPolling() async throws {
         let state = PollTestState()
         MockURLProtocol.handler = { request in

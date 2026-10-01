@@ -15,6 +15,7 @@ public enum DroverError: Error, Equatable {
     case unavailable(String)             // 404 body "error" text
     case transport(String)               // URLError etc.
     case httpStatus(Int, String)         // Other HTTP statuses
+    case busy(until: Date)               // 503 read cooldown
     case decoding(String)
 
     /// Canonical detail string for a client-side cancellation, set by
@@ -65,6 +66,8 @@ extension DroverError: LocalizedError {
             return isCancellation ? "Request cancelled" : Self.unreachableDescription
         case .httpStatus(let code, let message):
             return message.isEmpty ? "Server error (\(code))" : message
+        case .busy(let deadline):
+            return RetryPolicy.busyMessage(until: deadline)
         case .decoding:
             return Self.malformedDescription
         }
@@ -131,17 +134,20 @@ public actor DroverClient {
     public nonisolated let credentialBindingID: UUID?
     private let token: String
     private let session: URLSession
+    private let retryGate: HubRetryGate
 
     public init(
         config: ServerConfig,
         token: String,
         credentialBindingID: UUID? = nil,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        retryGate: HubRetryGate = .shared
     ) {
         self.config = config
         self.credentialBindingID = credentialBindingID
         self.token = token
         self.session = session
+        self.retryGate = retryGate
     }
 
     // MARK: Pairing
@@ -577,6 +583,10 @@ public actor DroverClient {
         wsRequest(sessionID: sessionID, suffix: "terminal")
     }
 
+    public func deferReads(until deadline: Date) async {
+        await retryGate.deferReads(for: config.baseURL, until: deadline)
+    }
+
     // MARK: Private helpers
 
     private nonisolated func wsRequest(sessionID: String, suffix: String,
@@ -647,7 +657,15 @@ public actor DroverClient {
         let (data, http) = try await send(
             url: url, method: method, body: body, timeout: timeout
         )
-        return try validatedData(data, response: http)
+        if method == "GET", http.statusCode == 503 {
+            let deadline = await retryGate.record(
+                for: config.baseURL, header: http.value(forHTTPHeaderField: "Retry-After")
+            )
+            throw DroverError.busy(until: deadline)
+        }
+        let validated = try validatedData(data, response: http)
+        if method == "GET" { await retryGate.succeeded(for: config.baseURL) }
+        return validated
     }
 
     private func contentAnalysisStateRequest(
@@ -664,6 +682,12 @@ public actor DroverClient {
             guard http.statusCode == 503,
                   let decoded,
                   decoded.propagation == .failed else {
+                if method == "GET", http.statusCode == 503 {
+                    let deadline = await retryGate.record(
+                        for: config.baseURL, header: http.value(forHTTPHeaderField: "Retry-After")
+                    )
+                    throw DroverError.busy(until: deadline)
+                }
                 _ = try validatedData(data, response: http)
                 throw DroverError.httpStatus(http.statusCode, "unexpected status")
             }
@@ -684,6 +708,10 @@ public actor DroverClient {
     private func send(
         url: URL, method: String, body: Data?, timeout: TimeInterval?
     ) async throws -> (Data, HTTPURLResponse) {
+        try Task.checkCancellation()
+        if method == "GET", let deadline = await retryGate.deadline(for: config.baseURL) {
+            throw DroverError.busy(until: deadline)
+        }
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = method
         urlRequest.timeoutInterval = timeout ?? 15

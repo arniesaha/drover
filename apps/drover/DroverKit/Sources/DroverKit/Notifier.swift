@@ -90,14 +90,16 @@ public struct AttentionWatcher: Sendable {
             ?? !PushRegistration.isActive(in: seenStore)
     }
 
-    public func check(client: DroverClient) async {
+    @discardableResult
+    public func check(client: DroverClient) async -> Bool {
         let snapshot: HarnessSnapshot
         do {
             snapshot = try await client.snapshot()
         } catch {
-            return  // silence: never a false alert, never a lost seen-set
+            return false  // silence: never a false alert, never a lost seen-set
         }
         await evaluate(snapshot)
+        return true
     }
 
     /// Record what currently needs the user as already-seen, alerting about

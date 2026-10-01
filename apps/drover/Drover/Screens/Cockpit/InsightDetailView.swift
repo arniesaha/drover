@@ -7,6 +7,7 @@ struct InsightDetailView: View {
     let summary: InsightSummary
     @State private var detail: InsightDetail?
     @State private var loadError: String?
+    @State private var loadGeneration = 0
     @State private var showDismiss = false
     @State private var dismissalReason = ""
     @State private var actionMessage: String?
@@ -17,6 +18,9 @@ struct InsightDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                if let busy = loadError, busy.hasPrefix("Hub busy,") {
+                    Label(busy, systemImage: "clock").droverText(.subtitle)
+                }
                 if let detail {
                     let state = currentState ?? detail.finding.state
                     findingHeader(detail.finding, state: state, evidence: detail.evidence)
@@ -24,7 +28,7 @@ struct InsightDetailView: View {
                     actionSection(detail, state: state)
                     remediationSection(detail.finding)
                     evidenceSection(detail.evidence)
-                } else if let loadError {
+                } else if let loadError, !loadError.hasPrefix("Hub busy,") {
                     ContentUnavailableView(
                         "Insight unavailable", systemImage: "exclamationmark.triangle",
                         description: Text(loadError)
@@ -269,8 +273,22 @@ struct InsightDetailView: View {
     }
 
     private func load() async {
+        loadGeneration &+= 1
+        let generation = loadGeneration
         do {
-            let loadedDetail = try await client.insightDetail(findingID: summary.findingID)
+            let loadedDetail: InsightDetail
+            while true {
+                try Task.checkCancellation()
+                guard generation == loadGeneration else { return }
+                do {
+                    loadedDetail = try await client.insightDetail(findingID: summary.findingID)
+                    break
+                } catch DroverError.busy(let deadline) {
+                    loadError = RetryPolicy.busyMessage(until: deadline)
+                    try await RetryPolicy.wait(until: deadline)
+                }
+            }
+            guard generation == loadGeneration else { return }
             detail = loadedDetail
             currentState = loadedDetail.finding.state
             loadError = nil
@@ -280,7 +298,10 @@ struct InsightDetailView: View {
             if !checkState.isPending {
                 checkState = .ready
             }
+        } catch is CancellationError {
+            return
         } catch {
+            guard generation == loadGeneration else { return }
             loadError = (error as NSError).localizedDescription
         }
     }
