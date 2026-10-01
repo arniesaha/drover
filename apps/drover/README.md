@@ -98,6 +98,19 @@ app keeps its own local notifications (foreground watcher and background
 refresh) instead of assuming push will arrive. Local alerts are best effort and
 depend on iOS scheduling background refresh.
 
+The same refusal covers Apple rejecting delivery after a phone registered. If
+Apple rejects one phone's token (`BadDeviceToken`, `Unregistered`, ...), the
+hub clears that registration and keeps refusing that token. If Apple rejects
+the hub's key or topic for an APNs environment (for example
+`BadEnvironmentKeyInToken` from a sandbox-only key and a TestFlight build), the
+hub stops offering push for that environment until it restarts and logs one
+error naming the key. Throttling and network errors change nothing. The app
+re-sends its token each time it comes to the foreground, so it learns of a
+rejection there (or on its next launch) and resumes local notifications. The
+operator can see the hub's push state in `/readyz` (`push.state` is
+`disabled`, `ok` or `degraded`; authenticated callers also see which
+environment failed and why).
+
 ## Sign out
 
 **Settings → Sign Out** asks the hub to revoke this phone's own credential and

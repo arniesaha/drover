@@ -24,11 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- APNs rejections are no longer silent. Device-level rejections
+  (`BadDeviceToken`, `DeviceTokenNotForTopic`, `Unregistered`/410,
+  `ExpiredToken`) clear that phone's registration and the hub keeps refusing
+  the same token; key- or topic-level rejections (`BadEnvironmentKeyInToken`,
+  `InvalidProviderToken`, `ExpiredProviderToken`, `TopicDisallowed`, ...) mark
+  that APNs environment unavailable until the hub restarts, with one
+  rate-limited error naming the key and topic. Throttling, 5xx and network
+  errors keep registrations. `PUT /auth/device/apns` answers the existing
+  `503 hub push is unavailable` in both cases, `/readyz` reports a `push`
+  state, and the app re-sends its token when it comes to the foreground so it
+  resumes local notifications. PostgreSQL control stores apply migration 4
+  (#449).
+- The iOS launch sheet says when a host's release cannot complete paths
+  instead of staying silent. The hub keeps an unknown host, a host without the
+  `/fs` routes (404 with `reason: unsupported`) and a registry read failure
+  (500) apart; the status for an unsupported host stays 404 so older app
+  builds are unaffected (#232, #453).
 - A Codex or DeepSeek session parked between turns no longer blocks host
   updates forever with `not_quiescent`. Quiescence now asks whether a restart
   would cut work off instead of whether the session is open; a running turn, a
   pending approval, a live Claude Code process, or an open Agy session (which
-  cannot be recovered after a harnessd restart) still blocks (#236).
+  cannot be recovered after a harnessd restart) still blocks (#236, #452).
 - iOS honors `Retry-After` on hub `503`s across session polling, stream
   reconnects, cockpit and insight loads, auth polling and background refresh,
   with separate cooldowns for analytical and session reads, and shows
@@ -42,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run. It lists every live session (sessions waiting on the user first), then
   the newest 20 finished ones; `?archived=N` (up to 100) and
   `?archived_cursor=` from `next_archived_cursor` page through older history.
-  The hub's `/harness` fleet view, which iOS and web read, is unchanged (#224).
+  The hub's `/harness` fleet view, which iOS and web read, is unchanged (#224,
+  #451).
 
 - Keep metrics scrapes and small insight actions independent of cockpit admission,
   allow heavy requests a one-second admission wait, retry deferred day summaries
@@ -83,7 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version-neutral: only the latest tagged release is supported, PostgreSQL is
   the fresh central-install control store without automatic DuckDB migration,
   and the legacy shared token and unbound host credentials (#13) remain
-  explicit limitations. Documentation only (#415).
+  explicit limitations. Documentation only (#415, #450).
 
 ## [0.5.2] - 2026-09-26
 
