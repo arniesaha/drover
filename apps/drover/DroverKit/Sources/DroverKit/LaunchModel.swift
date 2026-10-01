@@ -30,6 +30,10 @@ public final class LaunchModel {
     /// True once a completion request failed outright (504/502/transport).
     /// Not set for a host that answered with an empty list.
     public private(set) var isCompletionHostUnreachable = false
+    /// True once the host answered that it has no completion routes — a
+    /// release older than path completion. Unlike unreachability this does
+    /// not pass on its own, so it gets its own words rather than silence (#232).
+    public private(set) var isCompletionUnsupported = false
     /// Bumped by every keystroke and host change. A response carrying an old
     /// value is stale by definition and is dropped: cancellation usually
     /// beats it, but a response already in flight when `cancel()` lands would
@@ -192,7 +196,13 @@ public final class LaunchModel {
     /// Nil while a request is merely in flight, and nil for a host that
     /// answered with no matches — an empty answer is an answer.
     public var cwdSuggestionsHint: String? {
-        isCompletionHostUnreachable ? "Can't reach the host — showing saved paths only" : nil
+        if isCompletionHostUnreachable {
+            return "Can't reach the host — showing saved paths only"
+        }
+        if isCompletionUnsupported {
+            return "This host doesn't support path completion yet — showing saved paths only"
+        }
+        return nil
     }
 
     /// False only for "shell" — every other harness runs in structured mode.
@@ -348,6 +358,7 @@ public final class LaunchModel {
         untaggedExistence = [:]
         liveCompletions = []
         isCompletionHostUnreachable = false
+        isCompletionUnsupported = false
         scheduleCompletion()
     }
 
@@ -367,6 +378,7 @@ public final class LaunchModel {
             completionTask = nil
             liveCompletions = []
             isCompletionHostUnreachable = false
+            isCompletionUnsupported = false
             return
         }
 
@@ -388,21 +400,33 @@ public final class LaunchModel {
             guard generation == completionGeneration, host == hostID else { return }
             liveCompletions = completion.entries.map(\.path)
             isCompletionHostUnreachable = false
+            isCompletionUnsupported = false
         } catch {
             guard generation == completionGeneration, host == hostID else { return }
             // A request the next keystroke tore down is not a failed one.
             if let droverError = error as? DroverError, droverError.isCancellation { return }
             liveCompletions = []
-            // A 404 means the host does not support path completion (older release),
-            // which is distinct from being unreachable (502, 504, transport failure).
-            // When unsupported, we keep the unreachable hint quiet and let saved paths show.
-            if case DroverError.unavailable = error {
-                isCompletionHostUnreachable = false
-            } else if case DroverError.httpStatus(let code, _) = error, code == 404 {
-                isCompletionHostUnreachable = false
-            } else {
-                isCompletionHostUnreachable = true
-            }
+            let unsupported = Self.isUnsupportedCompletionError(error)
+            isCompletionUnsupported = unsupported
+            isCompletionHostUnreachable = !unsupported
+        }
+    }
+
+    /// Whether a failed completion means "this host's release has no
+    /// completion routes" rather than "the host could not be asked".
+    ///
+    /// The hub answers 501 for that. A hub from before #232 passes the host's
+    /// own 404 through instead, which `validate()` maps to `.unavailable` like
+    /// every 404; the hub's own unknown-host 404 is told apart by its text,
+    /// and is a host the hub cannot route to, so it stays "can't reach".
+    static func isUnsupportedCompletionError(_ error: Error) -> Bool {
+        switch error {
+        case DroverError.httpStatus(501, _):
+            return true
+        case DroverError.unavailable(let text):
+            return !text.hasPrefix("unknown harness host")
+        default:
+            return false
         }
     }
 

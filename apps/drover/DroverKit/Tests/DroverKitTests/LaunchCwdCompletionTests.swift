@@ -271,20 +271,105 @@ private func testStore() -> HarnessModelCatalogStore {
     #expect(model.isCompletionHostUnreachable)
 }
 
-/// A host running an older release returns 404 for completion endpoints.
-/// This means completion is unsupported on that host version, not that
-/// the host is unreachable. The hint stays quiet and saved paths show.
-@Test @MainActor func anUnsupportedHostLeavesTheUnreachableHintUnset() async throws {
-    MockURLProtocol.handler = { _ in (404, Data(#"{"error": "not found"}"#.utf8)) }
+private let unsupportedHint =
+    "This host doesn't support path completion yet — showing saved paths only"
+
+/// A host on a release older than the completion routes never completes
+/// anything, on any keystroke. Silence reads as "no such directory", and
+/// "can't reach" would blame a host that answered — so it gets its own line
+/// (#232). The hub says 501.
+@Test @MainActor func anUnsupportedHostSaysSoInsteadOfStayingSilent() async throws {
+    MockURLProtocol.handler = { _ in
+        (501, Data(#"{"error": "host does not support path completion: work-laptop", "reason": "unsupported"}"#.utf8))
+    }
     let model = try model()
 
     model.cwd = "/home/arnab/d"
     await model.settleCompletion()
 
     #expect(model.liveCompletions.isEmpty)
+    #expect(model.isCompletionUnsupported)
     #expect(model.isCompletionHostUnreachable == false)
-    #expect(model.cwdSuggestionsHint == nil)
+    #expect(model.cwdSuggestionsHint == unsupportedHint)
     #expect(model.cwdSuggestions == ["/home/arnab/dev/drover"])
+}
+
+/// A hub from before #232 passes the host's own 404 straight through.
+@Test @MainActor func aLegacyHubsPassedThrough404IsAlsoUnsupported() async throws {
+    MockURLProtocol.handler = { _ in (404, Data(#"{"error": "not found"}"#.utf8)) }
+    let model = try model()
+
+    model.cwd = "/home/arnab/d"
+    await model.settleCompletion()
+
+    #expect(model.isCompletionUnsupported)
+    #expect(model.isCompletionHostUnreachable == false)
+    #expect(model.cwdSuggestionsHint == unsupportedHint)
+}
+
+/// The hub's own 404 means it has no route to that host at all. That is not
+/// a version gap, and the host is not reachable through this hub.
+@Test @MainActor func aHubThatDoesNotKnowTheHostIsUnreachableNotUnsupported() async throws {
+    MockURLProtocol.handler = { _ in
+        (404, Data(#"{"error": "unknown harness host: work-laptop"}"#.utf8))
+    }
+    let model = try model()
+
+    model.cwd = "/home/arnab/d"
+    await model.settleCompletion()
+
+    #expect(model.isCompletionUnsupported == false)
+    #expect(model.isCompletionHostUnreachable)
+    #expect(model.cwdSuggestionsHint == "Can't reach the host — showing saved paths only")
+}
+
+/// The hub's registry failing to read is transient and the hub's fault;
+/// it must not be mistaken for a permanent version gap.
+@Test @MainActor func aHubRegistryErrorIsNotUnsupported() async throws {
+    MockURLProtocol.handler = { _ in
+        (500, Data(#"{"error": "harness registry unavailable"}"#.utf8))
+    }
+    let model = try model()
+
+    model.cwd = "/home/arnab/d"
+    await model.settleCompletion()
+
+    #expect(model.isCompletionUnsupported == false)
+    #expect(model.isCompletionHostUnreachable)
+}
+
+/// Switching to a host that does support completion must not inherit the
+/// other host's "not supported", and neither must a later success.
+@Test @MainActor func theUnsupportedHintClearsOnHostChangeAndOnSuccess() async throws {
+    MockURLProtocol.handler = { _ in (501, Data(#"{"error": "unsupported"}"#.utf8)) }
+    let model = try model()
+    model.cwd = "/home/arnab/d"
+    await model.settleCompletion()
+    #expect(model.isCompletionUnsupported)
+
+    MockURLProtocol.handler = { _ in
+        (200, completionBody(parent: "/home/arnab", paths: ["/home/arnab/dev"]))
+    }
+    model.hostID = "nas"
+    #expect(model.isCompletionUnsupported == false)
+    #expect(model.cwdSuggestionsHint == nil)
+
+    model.hostID = "work-laptop"
+    await model.settleCompletion()
+    #expect(model.isCompletionUnsupported == false)
+    #expect(model.liveCompletions == ["/home/arnab/dev"])
+}
+
+/// Pins the exists-check side of an unsupported host: nothing it says can
+/// hide a favorite, whether the hub is new (501) or old (404).
+@Test(arguments: [404, 501])
+@MainActor func anUnsupportedExistsCheckKeepsShowingUntaggedSuggestions(status: Int) async throws {
+    let model = try model()
+    MockURLProtocol.handler = { _ in (status, Data(#"{"error": "not found"}"#.utf8)) }
+
+    await model.verifyCuratedSuggestions()
+
+    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover", "/Users/arnabmac/jenny"])
 }
 
 /// A host that answered "nothing here" is not unreachable — it answered.

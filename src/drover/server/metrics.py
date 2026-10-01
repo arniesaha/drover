@@ -1886,31 +1886,62 @@ class MetricsCollector:
         self, host_id: str, path_text: str
     ) -> tuple[int, str]:
         """Proxy one keystroke's worth of path completion to a host."""
-        host = self._harness_host(host_id)
-        if host is None:
-            return _json_response(404, {"error": f"unknown harness host: {host_id}"})
-        return self._harness_request(
-            host,
+        return self._proxy_harness_fs(
+            host_id,
             "/fs/complete?" + urlencode({"path": path_text}),
             method="GET",
             payload={},
-            timeout_s=FS_COMPLETE_TIMEOUT_S,
         )
 
     def proxy_harness_fs_exists(
         self, host_id: str, payload: Mapping[str, Any]
     ) -> tuple[int, str]:
         """Proxy a bounded "are these still directories?" batch to a host."""
-        host = self._harness_host(host_id)
+        return self._proxy_harness_fs(
+            host_id, "/fs/exists", method="POST", payload=payload
+        )
+
+    def _proxy_harness_fs(
+        self,
+        host_id: str,
+        path: str,
+        *,
+        method: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, str]:
+        """Route an ``/fs/*`` call so each failure keeps its own status (#232).
+
+        The client turns these statuses into different hints, so they must not
+        collapse into one 404. An unknown host stays 404. A registry that could
+        not be read is the hub's fault, and transient: 500, never 404 and never
+        503, which a phone treats as a cooldown for every read on the hub. A
+        host that answers 404 runs a release older than these routes -- harnessd
+        404s only unknown paths -- so that becomes 501, a permanent "not
+        supported", rather than passing through as "not found".
+        """
+        try:
+            host = self._harness_host(host_id, raise_errors=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to load harness host %s: %s", host_id, exc)
+            return _json_response(500, {"error": "harness registry unavailable"})
         if host is None:
             return _json_response(404, {"error": f"unknown harness host: {host_id}"})
-        return self._harness_request(
+        status, body = self._harness_request(
             host,
-            "/fs/exists",
-            method="POST",
+            path,
+            method=method,
             payload=payload,
             timeout_s=FS_COMPLETE_TIMEOUT_S,
         )
+        if status == 404:
+            return _json_response(
+                501,
+                {
+                    "error": f"host does not support path completion: {host_id}",
+                    "reason": "unsupported",
+                },
+            )
+        return status, body
 
     def proxy_harness_model_catalog(
         self, host_id: str, harness: str, *, refresh: bool = False
@@ -2359,11 +2390,13 @@ class MetricsCollector:
             return self.archive_resolver_factory()
         return self.archive_resolver
 
-    def _harness_host(self, host_id: str) -> Any | None:
+    def _harness_host(self, host_id: str, *, raise_errors: bool = False) -> Any | None:
         try:
             registry = HarnessRegistry(self.duckdb_path)
             return registry.get_host(host_id)
         except Exception as exc:  # noqa: BLE001
+            if raise_errors:
+                raise
             log.warning("failed to load harness host %s: %s", host_id, exc)
             return None
 
