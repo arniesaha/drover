@@ -5,9 +5,9 @@ machines. It connects directly to the `/harness` REST and WebSocket API exposed
 by `drover-server`.
 
 The app is distributed from source for day-to-day development. It is **not**
-on the public App Store or **public** TestFlight. Operators preparing the first
-**internal** TestFlight candidate should follow
-[Internal TestFlight runbook](docs/internal-testflight-runbook.md) and
+on the public App Store or **public** TestFlight. Operators preparing a production-lane
+TestFlight candidate should follow
+[TestFlight runbook](docs/internal-testflight-runbook.md) and
 [distribution configuration](docs/distribution.md); that path is separate from
 `scripts/deploy-ios.sh` development installs.
 
@@ -136,8 +136,8 @@ the required CI selection.
 
 ## Release-device evidence
 
-After an internal TestFlight upload, use the physical-device checklist in
-[Internal TestFlight runbook](docs/internal-testflight-runbook.md) together
+After a production-lane TestFlight upload, use the physical-device checklist in
+[TestFlight runbook](docs/internal-testflight-runbook.md) together
 with the targets below.
 
 Root records this evidence before release on the smallest supported physical

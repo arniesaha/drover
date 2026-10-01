@@ -5,6 +5,13 @@ All notable changes to Drover will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## TestFlight lane decision - 2026-09-30
+
+- Retired the internal staging lane and separate staging deployment. TestFlight
+  uses the production lane with unrestricted hub pairing (#390).
+- Added a read-only, bounded live-hub smoke before upload and physical-device
+  acceptance against the operator's live hub.
+
 ## [Unreleased]
 
 ### Fixed

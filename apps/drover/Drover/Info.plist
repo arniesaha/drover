@@ -22,10 +22,6 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>DROVER_TESTFLIGHT_STAGE_ONLY</key>
-	<string>$(DROVER_TESTFLIGHT_STAGE_ONLY)</string>
-	<key>DROVER_TESTFLIGHT_STAGING_URL</key>
-	<string>$(DROVER_TESTFLIGHT_STAGING_URL)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSAppTransportSecurity</key>
@@ -40,6 +36,13 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
 </plist>

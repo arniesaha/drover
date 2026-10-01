@@ -156,7 +156,7 @@ def test_healthz_preserves_liveness_contract_in_every_store_state(
         status, body, headers = request(port, "/healthz")
         assert status == 200
         assert body == b"ok\n"
-        # Existing backup preflight and TestFlight staging consumers use this.
+        # Existing backup preflight and TestFlight live-hub smoke consumers use this.
         assert body.strip() == b"ok"
         assert headers["X-Drover-Analytical"] == state
         if state != "ok":

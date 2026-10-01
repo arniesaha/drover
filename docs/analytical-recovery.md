@@ -25,7 +25,7 @@ connection for subsequent work. Runtime workers normally open a connection for
 each pass.
 
 `/healthz` remains a liveness endpoint: HTTP 200 with the exact body `ok\n`,
-regardless of analytical state. Backup preflight, staging, setup, and clients
+regardless of analytical state. Backup preflight, live-hub smoke, setup, and clients
 rely on this contract. The optional `X-Drover-Analytical` response header
 reports `ok`, `recovering`, or `failed-retrying` without querying the store.
 This header is observed, process-local health: it cannot discover a failure
