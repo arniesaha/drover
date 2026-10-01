@@ -710,8 +710,16 @@ def test_postgres_credentials_observe_cross_process_revocation(postgres_control_
     credential, token = issuer.issue(scope="device", label="PostgreSQL phone")
 
     assert verifier.find_active(token).id == credential.id
+    assert verifier.find_for_revocation(token).id == credential.id
+    issuer.set_apns_registration(credential.id, token="apns", environment="sandbox")
     assert issuer.revoke(credential.id) is True
     assert verifier.find_active(token) is None
+    revoked = verifier.find_for_revocation(token)
+    assert revoked.id == credential.id
+    assert not revoked.is_active
+    assert (revoked.apns_token, revoked.apns_environment) == (None, None)
+    assert verifier.revoke(credential.id) is False
+    assert verifier.find_for_revocation("unknown") is None
     assert issuer.server_id == verifier.server_id
 
 

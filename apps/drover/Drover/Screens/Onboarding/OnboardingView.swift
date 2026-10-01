@@ -31,6 +31,14 @@ struct OnboardingView: View {
         VStack(spacing: 0) {
             topNavigationHeader
 
+            if let warning = environment.signOutWarning {
+                Text(warning)
+                    .font(.subheadline)
+                    .foregroundStyle(DroverColor.warn)
+                    .padding()
+                    .accessibilityIdentifier("sign-out-revocation-warning")
+            }
+
             TabView(selection: $step) {
                 welcomeStep
                     .tag(OnboardingStep.welcome)

@@ -130,6 +130,15 @@ class CredentialStore:
             credential_id = self._by_verifier.get(verifier)
             return self._by_id.get(credential_id) if credential_id else None
 
+    def find_for_revocation(self, token: str) -> Credential | None:
+        """Resolve even a revoked verifier, only for idempotent self-revocation."""
+        verifier = verifier_from_token(token)
+        with self._lock:
+            return next(
+                (item for item in self._by_id.values() if item.verifier == verifier),
+                None,
+            )
+
     def get(self, credential_id: str) -> Credential | None:
         with self._lock:
             return self._by_id.get(credential_id)
@@ -358,6 +367,16 @@ class PostgresCredentialStore:
                 f"SELECT {_CREDENTIAL_COLUMNS} FROM control_credentials "
                 "WHERE verifier = ? AND revoked_at IS NULL",
                 [verifier],
+            ).fetchone()
+        return _credential_from_row(row) if row is not None else None
+
+    def find_for_revocation(self, token: str) -> Credential | None:
+        """Resolve even a revoked verifier, only for idempotent self-revocation."""
+        with self._connection() as con:
+            row = con.execute(
+                f"SELECT {_CREDENTIAL_COLUMNS} FROM control_credentials "
+                "WHERE verifier = ?",
+                [verifier_from_token(token)],
             ).fetchone()
         return _credential_from_row(row) if row is not None else None
 

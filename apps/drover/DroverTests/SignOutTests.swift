@@ -21,6 +21,7 @@ final class SignOutTests: XCTestCase {
     private func withEnvironment(
         configured: Bool = true,
         launchEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        credentialRevoker: @escaping @Sendable (DroverClient) async throws -> Void = { _ in },
         _ body: @MainActor (AppEnvironment, TokenStore, UserDefaults, ChatRecoveryStore, URL) async throws -> Void
     ) async throws {
         let suiteName = "drover.signout.\(UUID().uuidString)"
@@ -52,9 +53,66 @@ final class SignOutTests: XCTestCase {
             tokenStore: store,
             recoveryBindingStore: bindingStore,
             recoveryStore: recovery,
+            credentialRevoker: credentialRevoker,
             launchEnvironment: launchEnvironment
         )
         try await body(environment, store, defaults, recovery, root)
+    }
+
+    func testOnlineSignOutRevokesBeforeDeletingLocalCredential() async throws {
+        let probe = SignOutRevocationProbe()
+        try await withEnvironment(credentialRevoker: { client in
+            await probe.recordAndWait(client.config.baseURL)
+        }) { environment, store, defaults, _, _ in
+            try XCTSkipUnless(environment.client != nil, "Keychain unavailable")
+            PushRegistration.setActive(true)
+            let signingOut = Task { @MainActor in try await environment.signOut() }
+            await probe.waitUntilStarted()
+            XCTAssertNotNil(store.load(), "Keep the credential until the hub call finishes")
+            XCTAssertNil(environment.client)
+            XCTAssertFalse(PushRegistration.isActive())
+            await probe.release()
+            try await signingOut.value
+            let calls = await probe.calls
+            XCTAssertEqual(calls.count, 1)
+            XCTAssertNil(store.load())
+            XCTAssertNil(ServerConfig.load(defaults: defaults))
+            XCTAssertNil(environment.client)
+            XCTAssertNil(environment.signOutWarning)
+            XCTAssertFalse(PushRegistration.isActive())
+            try await environment.signOut()
+            let repeatedCalls = await probe.calls
+            XCTAssertEqual(repeatedCalls.count, 1)
+        }
+    }
+
+    func testOfflineSignOutErasesLocallyAndSurfacesRevocationFailure() async throws {
+        try await withEnvironment(credentialRevoker: { _ in
+            throw DroverError.transport("offline")
+        }) { environment, store, defaults, _, _ in
+            try XCTSkipUnless(environment.client != nil, "Keychain unavailable")
+            PushRegistration.setActive(true)
+            try await environment.signOut()
+            XCTAssertNil(store.load())
+            XCTAssertNil(ServerConfig.load(defaults: defaults))
+            XCTAssertNil(environment.client)
+            XCTAssertNotNil(environment.signOutWarning)
+            XCTAssertFalse(PushRegistration.isActive())
+            XCTAssertFalse(environment.hasPendingLocalCleanup)
+        }
+    }
+
+    func testUnauthorizedAfterRevocationStillCompletesSignOut() async throws {
+        try await withEnvironment(credentialRevoker: { _ in
+            throw DroverError.unauthorized
+        }) { environment, store, defaults, _, _ in
+            try XCTSkipUnless(environment.client != nil, "Keychain unavailable")
+            try await environment.signOut()
+            XCTAssertNil(store.load())
+            XCTAssertNil(ServerConfig.load(defaults: defaults))
+            XCTAssertNil(environment.client)
+            XCTAssertNil(environment.signOutWarning)
+        }
     }
 
     func testSignOutClearsTheToken() async throws {
@@ -221,6 +279,7 @@ final class SignOutTests: XCTestCase {
             tokenStore: tokenStore,
             recoveryBindingStore: bindingStore,
             recoveryStore: recoveryStore,
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         try XCTSkipUnless(environment.client?.credentialBindingID != nil, "Keychain unavailable")
@@ -262,6 +321,7 @@ final class SignOutTests: XCTestCase {
             tokenStore: tokenStore,
             recoveryBindingStore: bindingStore,
             recoveryStore: recovery,
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
@@ -286,6 +346,7 @@ final class SignOutTests: XCTestCase {
             tokenStore: tokenStore,
             recoveryBindingStore: bindingStore,
             recoveryStore: recovery,
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         await waitUntil { !FileManager.default.fileExists(atPath: root.path) }
@@ -317,6 +378,7 @@ final class SignOutTests: XCTestCase {
             tokenStore: tokenStore,
             recoveryBindingStore: bindingStore,
             recoveryStore: suspendedStore,
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         let bindingID = try XCTUnwrap(environment.client?.credentialBindingID)
@@ -341,6 +403,7 @@ final class SignOutTests: XCTestCase {
             tokenStore: tokenStore,
             recoveryBindingStore: bindingStore,
             recoveryStore: durableStore,
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         await waitUntil { !FileManager.default.fileExists(atPath: root.path) }
@@ -372,6 +435,7 @@ final class SignOutTests: XCTestCase {
             validator: { config, token in
                 await delayedValidator.validate(config: config, token: token)
             },
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         let raceCredential = "synthetic-race-value"
@@ -418,6 +482,7 @@ final class SignOutTests: XCTestCase {
             recoveryBindingStore: bindingStore,
             recoveryStore: recoveryStore,
             validator: { _, _ in nil },
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         let oldBinding = try XCTUnwrap(environment.client?.credentialBindingID)
@@ -469,6 +534,7 @@ final class SignOutTests: XCTestCase {
             recoveryBindingStore: bindingStore,
             recoveryStore: recovery,
             validator: { _, _ in nil },
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         let oldBinding = try XCTUnwrap(environment.client?.credentialBindingID)
@@ -529,6 +595,7 @@ final class SignOutTests: XCTestCase {
             tokenStore: tokenStore,
             recoveryBindingStore: bindingStore,
             recoveryStore: recoveryStore,
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         try XCTSkipUnless(environment.client?.credentialBindingID != nil, "Keychain unavailable")
@@ -599,6 +666,7 @@ final class SignOutTests: XCTestCase {
             recoveryBindingStore: bindingStore,
             recoveryStore: recoveryStore,
             validator: { _, _ in nil },
+            credentialRevoker: { _ in },
             launchEnvironment: [:]
         )
         try XCTSkipUnless(environment.client?.credentialBindingID != nil, "Keychain unavailable")
@@ -852,5 +920,28 @@ private actor FailOncePurgeRecoveryStore: ChatRecoveryPersisting {
 
     func eraseAllAfterCredentialDeletion() async throws {
         try await store.eraseAllAfterCredentialDeletion()
+    }
+}
+
+private actor SignOutRevocationProbe {
+    private(set) var calls: [URL] = []
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func recordAndWait(_ url: URL) async {
+        calls.append(url)
+        for waiter in startedWaiters { waiter.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        guard calls.isEmpty else { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }

@@ -10,6 +10,30 @@ extension MockNetworkTests {
 @Suite(.serialized)
 struct ClientTests {
 
+@Test func selfRevocationSendsOnlyBearerAndAcceptsNoContent() async throws {
+    MockURLProtocol.handler = { request in
+        #expect(request.httpMethod == "DELETE")
+        #expect(request.url?.path == "/auth/device/credential")
+        #expect(request.url?.query == nil)
+        #expect(request.httpBody == nil)
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        return (204, Data())
+    }
+    try await client().revokeDeviceCredential()
+}
+
+@Test func selfRevocationAcceptsAlreadyUnauthorized() async throws {
+    MockURLProtocol.handler = { _ in (401, Data()) }
+    try await client().revokeDeviceCredential()
+}
+
+@Test func selfRevocationSurfacesHubFailure() async {
+    MockURLProtocol.handler = { _ in (503, Data()) }
+    await #expect(throws: DroverError.httpStatus(503, "unexpected status 503")) {
+        try await client().revokeDeviceCredential()
+    }
+}
+
 @Test func snapshotSendsBearerAndDecodes() async throws {
     MockURLProtocol.handler = { request in
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")

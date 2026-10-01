@@ -321,9 +321,9 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "This phone forgets its token and returns to pairing. The "
-                + "credential stays valid on the server; revoke it there with "
-                + "drover-server credentials revoke."
+                "This phone revokes its hub credential, removes its push registration, "
+                + "and returns to pairing. If the hub cannot be reached, it signs "
+                + "out locally and shows a warning."
             )
         }
     }

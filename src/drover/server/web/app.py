@@ -1451,6 +1451,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def _do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/auth/device/credential":
+            self._revoke_own_device_credential()
+            return
         if path == "/auth/device/apns":
             self._clear_device_apns_registration()
             return
@@ -2180,12 +2183,52 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(200, "application/json", json.dumps(payload, sort_keys=True) + "\n")
 
     def _revoke_credential(self, credential_id: str) -> None:
+        caller = bearer_credential(self.auth, self.headers)
+        if caller is not None and caller.scope == "device":
+            self._send(
+                403, "application/json", '{"error": "use device self-revocation"}\n'
+            )
+            return
         if not self._pairing_ready():
             return
         if self.auth.credentials.revoke(credential_id):
             self._send(204, "application/json", "")
             return
         self._send(404, "application/json", '{"error": "unknown credential"}\n')
+
+    def _revoke_own_device_credential(self) -> None:
+        # This is the only route allowed to recognize a revoked verifier.
+        # No caller-supplied ID or APNs token is accepted or logged.
+        authorization = self.headers.get("Authorization", "") or ""
+        store = self.auth.credentials
+        credential = (
+            store.find_for_revocation(authorization.removeprefix("Bearer ").strip())
+            if store is not None and authorization.startswith("Bearer ")
+            else None
+        )
+        if credential is None:
+            # A valid shared token cannot be revoked as one device. Distinguish
+            # it from an already unusable bearer so clients surface failure.
+            if authorization.startswith("Bearer ") and token_matches(
+                self.auth, authorization.removeprefix("Bearer ").strip()
+            ):
+                self._send(
+                    403, "application/json", '{"error": "device credential required"}\n'
+                )
+                return
+            self._send(
+                401, "application/json", '{"error": "authentication required"}\n'
+            )
+            return
+        if credential.scope != "device":
+            self._send(
+                403, "application/json", '{"error": "device credential required"}\n'
+            )
+            return
+        # Store revocation atomically clears both APNs fields. A repeat is a
+        # successful no-op, including after a response was lost in transit.
+        store.revoke(credential.id)
+        self._send(204, "application/json", "")
 
     def _device_bearer_credential(self):
         credential = bearer_credential(self.auth, self.headers)
