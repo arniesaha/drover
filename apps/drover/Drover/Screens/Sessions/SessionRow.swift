@@ -168,6 +168,7 @@ struct SessionRow: View {
 /// last-known rather than current.
 struct StateDot: View {
     let attention: AttentionState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Overrides the state form entirely rather than tinting it. A stale card's
     /// `attention` is the field we cannot vouch for, so drawing it as a
     /// confident filled disc would be asserting the very thing in doubt.
@@ -189,6 +190,11 @@ struct StateDot: View {
                     Circle().fill(DroverColor.accent)
                 case .working:
                     Circle().strokeBorder(DroverColor.accentHi, lineWidth: 1.5)
+                        .phaseAnimator(reduceMotion ? [false] : [false, true]) { ring, faded in
+                            ring.opacity(faded ? 0.45 : 1)
+                        } animation: { _ in
+                            .easeInOut(duration: 1.2)
+                        }
                 case .done, .errored:
                     Circle().strokeBorder(DroverColor.line, lineWidth: 1)
                 }

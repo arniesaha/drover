@@ -105,6 +105,8 @@ struct DroverApp: App {
                     FixturePreparedRoot(scenario: testScenario, notifier: notifier)
                 case .insightDetail:
                     InsightDetailFixtureRoot(client: testScenario.transport.client)
+                case .observability:
+                    ObservabilityFixtureRoot(client: testScenario.transport.client)
                 }
             } else if ProcessInfo.processInfo.environment[
                 "DROVER_UI_TEST_CHAT_HEADER_FIXTURE"

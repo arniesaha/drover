@@ -513,6 +513,7 @@ public struct ProviderHeadline: Sendable, Equatable {
     public let windowTitle: String
     /// "26% used", "750 credits used", or "Usage unavailable".
     public let usedText: String
+    public let remainingText: String
     /// "74% remaining · Resets in 14h". Nil when there is no window.
     public let detailText: String?
     /// Used, 0...1. Nil when no fraction can be derived, which the bar draws
@@ -531,6 +532,7 @@ public struct ProviderHeadline: Sendable, Equatable {
         guard let window else {
             windowTitle = "Usage"
             usedText = "Usage unavailable"
+            remainingText = "Remaining unavailable"
             detailText = nil
             fraction = nil
             isCritical = false
@@ -542,6 +544,7 @@ public struct ProviderHeadline: Sendable, Equatable {
         let value = ProviderCapacityPresentation(account: account, window: window, now: now)
         windowTitle = ProviderWindowTitle.display(window.kind)
         usedText = value.usedText
+        remainingText = value.remainingText
         detailText = "\(value.remainingText) · \(value.resetText)"
 
         let used = Self.usedFraction(window)
@@ -808,6 +811,29 @@ private enum ProviderNumberFormatting {
 /// subscription on a third collapsed into one card that showed personal
 /// consumption against a work machine. Probes now report the account they are
 /// actually signed into, so this code can take the label at its word.
+/// A usage probe on one host, independent of the shared account's quota.
+/// Probe success does not assert that the host is currently online or authenticated.
+public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let status: ProviderAccountStatus
+    public let errorCategory: String?
+
+    public var symbol: String {
+        switch status {
+        case .ok: "checkmark.circle.fill"
+        case .stale: "clock.badge.exclamationmark"
+        case .error: "exclamationmark.triangle"
+        default: "questionmark.circle"
+        }
+    }
+
+    public var accessibilityLabel: String {
+        let reading = status == .ok ? "usage reported" : "usage \(status.rawValue.replacingOccurrences(of: "_", with: " "))"
+        return "\(title), \(reading)"
+    }
+}
+
 public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiable {
     public let id: String
     public let title: String
@@ -816,6 +842,7 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
     public let planLabel: String?
     /// Host ids that reported this subscription, sorted.
     public let hostIDs: [String]
+    public let hosts: [ProviderHostPresentation]
     /// "Mac Mini, NAS" — display titles when known, ids otherwise.
     public let hostsText: String
     /// The freshest reading across hosts; the card's numbers come from it.
@@ -867,6 +894,14 @@ public enum ProviderSubscriptionGrouping {
             let representative = healthy.max(by: { $0.observedAt < $1.observedAt }) ?? newest
             let hostIDs = Array(Set(members.map(\.hostID))).sorted()
             let titles = hostIDs.map { hostTitles[$0] ?? $0 }
+            let hosts = hostIDs.compactMap { hostID -> ProviderHostPresentation? in
+                guard let member = members.filter({ $0.hostID == hostID })
+                    .max(by: { $0.observedAt < $1.observedAt }) else { return nil }
+                return ProviderHostPresentation(
+                    id: hostID, title: hostTitles[hostID] ?? hostID,
+                    status: member.status, errorCategory: member.errorCategory
+                )
+            }
 
             return ProviderSubscriptionPresentation(
                 id: key,
@@ -878,6 +913,7 @@ public enum ProviderSubscriptionGrouping {
                 planLabel: representative.planLabel
                     ?? members.compactMap(\.planLabel).first,
                 hostIDs: hostIDs,
+                hosts: hosts,
                 hostsText: ListFormatter.localizedString(byJoining: titles),
                 representative: representative,
                 windows: representative.windows,
@@ -890,7 +926,9 @@ public enum ProviderSubscriptionGrouping {
                     observedAt: representative.observedAt, now: now
                 ),
                 status: representative.status,
-                reasonText: reason(members: members, hostTitles: hostTitles)
+                reasonText: reason(members: hostIDs.compactMap { hostID in
+                    members.filter { $0.hostID == hostID }.max(by: { $0.observedAt < $1.observedAt })
+                }, hostTitles: hostTitles)
             )
         }
     }

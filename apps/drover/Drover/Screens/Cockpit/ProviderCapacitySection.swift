@@ -18,6 +18,7 @@ struct ProviderCapacitySection: View {
     /// work, dead weight the rest of the time. Collapsed it keeps the one line
     /// that answers "what have I got left"; the cards are one tap away.
     @AppStorage("inbox.providerCapacityExpanded") private var isExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var subscriptions: [ProviderSubscriptionPresentation] {
         ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
@@ -37,7 +38,7 @@ struct ProviderCapacitySection: View {
                 disclosure: accounts.isEmpty
                     ? nil
                     : .init(isExpanded: isExpanded) {
-                        withAnimation(.snappy(duration: 0.2)) { isExpanded.toggle() }
+                        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { isExpanded.toggle() }
                     }
             )
 
@@ -55,168 +56,117 @@ struct ProviderCapacitySection: View {
 
             if !accounts.isEmpty {
                 if isExpanded {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 10) {
-                            ForEach(subscriptions) { subscription in
-                                // Every card in the strip is the same card. The row
-                                // sizes itself to the tallest and the rest grow to
-                                // match, which beats a hardcoded height: a
-                                // two-line account label or a Dynamic Type bump
-                                // moves the tallest card and everyone else follows.
-                                ProviderAccountCard(subscription: subscription, section: section)
-                                    .frame(width: 250)
-                            }
+                    VStack(spacing: 8) {
+                        ForEach(subscriptions) { subscription in
+                            ProviderAccountCard(subscription: subscription, section: section)
                         }
                     }
-                    .scrollClipDisabled()
                 } else {
                     collapsedSummary
                 }
             }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("provider-capacity-section")
     }
 
     private var collapsedSummary: some View {
         let summary = ProviderCapacitySummary(subscriptions: subscriptions)
-        return Text(summary.text)
-            .droverText(.subtitle, accented: summary.isCritical)
-            .lineLimit(1)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                withAnimation(.snappy(duration: 0.2)) { isExpanded = true }
-            }
+        return Button {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { isExpanded = true }
+        } label: {
+            Text(summary.text)
+                .droverText(.subtitle, accented: summary.isCritical)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+            .buttonStyle(.plain)
             .accessibilityIdentifier("provider-capacity-summary")
     }
 }
 
+/// One subscription, with host probe states and quota detail on demand.
 struct ProviderAccountCard: View {
     let subscription: ProviderSubscriptionPresentation
     let section: ProviderSectionPresentation
-
-    private var account: ProviderAccount { subscription.representative }
-
-    private var headline: ProviderHeadline { subscription.headline }
+    @State private var isExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         CockpitCard {
-            VStack(alignment: .leading, spacing: 10) {
-                identity
-                capacity
-                // Does two jobs, and the second is easy to miss: it pins the
-                // footer to the bottom edge, and it makes the card accept more
-                // height than its content needs. That second one is what
-                // squares the strip up — the row sizes to the tallest card and
-                // every other card's background grows to match. Delete it and
-                // the cards go ragged again, not just bottom-aligned.
-                Spacer(minLength: 0)
-                footer
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(subscription.accountLabel)
+                                .droverText(.body)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text([subscription.provider.capitalized, subscription.planLabel]
+                                .compactMap { $0 }.joined(separator: " · "))
+                                .droverText(.subtitle)
+                        }
+                        Spacer(minLength: 4)
+                        if subscription.isDegraded || section.warningText != nil {
+                            Image(systemName: "clock.badge.exclamationmark")
+                                .foregroundStyle(DroverColor.muted)
+                        }
+                        Image(systemName: "chevron.down")
+                            .font(.caption)
+                            .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                            .foregroundStyle(DroverColor.accentHi)
+                    }
+                    .frame(minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(subscription.title), \(section.accountStatusText(accountStatus: subscription.status))")
+                .accessibilityHint(isExpanded ? "Collapse quota details" : "Expand quota details")
+
+                FlowLayout(spacing: 6, lineSpacing: 6) {
+                    ForEach(subscription.hosts) { host in
+                        Label(host.title, systemImage: host.symbol)
+                            .droverText(.subtitle)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 8))
+                            .accessibilityLabel(host.accessibilityLabel)
+                    }
+                }
+
+                if isExpanded {
+                    Text(subscription.freshnessText).droverText(.subtitle)
+                    ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in
+                        ProviderWindowRow(account: subscription.representative, window: window)
+                    }
+                    if subscription.windows.isEmpty {
+                        Text(subscription.headline.usedText).droverText(.subtitle)
+                    }
+                    if let reason = subscription.reasonText {
+                        Label(reason, systemImage: "exclamationmark.triangle")
+                            .droverText(.subtitle)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    let headline = subscription.headline
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(headline.windowTitle).droverText(.subtitle)
+                        Spacer(minLength: 4)
+                        Text(headline.remainingText == "Remaining unavailable" ? headline.usedText : headline.remainingText)
+                            .droverText(.subtitle, accented: headline.isCritical)
+                            .monospacedDigit()
+                    }
+                    CapacityBar(fraction: headline.fraction.map { 1 - $0 }, isCritical: headline.isCritical)
+                }
             }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
         .accessibilityIdentifier("provider-account-\(subscription.id)")
     }
 
-    /// Who this subscription is and where it is signed in. The host used to sit
-    /// last in the faintest style, which is backwards — it is the field you
-    /// read when deciding where to send work.
-    private var identity: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(subscription.accountLabel)
-                    .droverText(.h2)
-                    // Reserved, not merely capped: without it a one-line
-                    // address makes a shorter card than a wrapped one, and
-                    // the strip goes ragged again.
-                    .lineLimit(2, reservesSpace: true)
-                Spacer(minLength: 0)
-                Text(statusTitle)
-                    .droverText(.marker)
-                    .lineLimit(1)
-            }
-            Text([subscription.provider.capitalized, subscription.planLabel]
-                .compactMap { $0 }.joined(separator: " · "))
-                .droverText(.subtitle)
-                .lineLimit(1)
-            // The hosts this one subscription covers. Reads at the same weight
-            // as the plan above it: it used to be the quietest thing on the
-            // card, which is backwards for the field you scan when deciding
-            // where to send work.
-            Text(subscription.hostsText)
-                .droverText(.subtitle)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-    }
-
-    /// One window — the one closest to exhaustion — and its bar. The rest of
-    /// the windows are on the analytics screen; rendering all of them here is
-    /// what made a four-window card stand four times taller than a card with
-    /// none.
-    private var capacity: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(headline.windowTitle)
-                    .droverText(.h3)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-                Text(headline.usedText)
-                    .droverText(.subtitle, accented: headline.isCritical)
-                    .lineLimit(1)
-            }
-            CapacityBar(fraction: headline.fraction, isCritical: headline.isCritical)
-            // A space rather than the empty string: an empty `Text` reserves a
-            // line a third of a point shorter than a laid-out one, which is
-            // enough to make the no-window card measurably shorter than its
-            // neighbours.
-            Text(headline.detailText ?? " ")
-                .droverText(.subtitle)
-                .lineLimit(1, reservesSpace: true)
-        }
-    }
-
-    /// When a probe failed on one host, which host and why. A single broken
-    /// probe belongs on its own card, not in a banner over the whole section.
-    private var footer: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if let reason = subscription.reasonText {
-                Label(reason, systemImage: "exclamationmark.triangle")
-                    .droverText(.subtitle, accented: true)
-                    .lineLimit(1)
-                    .accessibilityIdentifier("provider-account-reason")
-            }
-            Text(subscription.freshnessText)
-                .droverText(.subtitle)
-                .lineLimit(1)
-        }
-    }
-
-    private var statusTitle: String {
-        section.accountStatusText(accountStatus: subscription.status)
-    }
-
-    /// VoiceOver still hears every window. The card drops the other windows
-    /// for space; a screen reader has none of that pressure.
-    private var accessibilityLabel: String {
-        let windows = subscription.windows.map {
-            let value = ProviderCapacityPresentation(account: account, window: $0, now: .now)
-            return [
-                ProviderWindowTitle.display($0.kind),
-                value.usedText,
-                value.remainingText,
-                value.resetText,
-            ].joined(separator: ", ")
-        }.joined(separator: ". ")
-        return [
-            "\(subscription.provider), \(subscription.accountLabel), Provider reported, \(statusTitle)",
-            subscription.hostsText,
-            subscription.reasonText,
-            windows.isEmpty ? headline.usedText : windows,
-            subscription.freshnessText,
-        ].compactMap { $0 }.joined(separator: ". ")
-    }
 }
 
 struct CockpitSectionHeading: View {
@@ -258,7 +208,7 @@ struct CockpitSectionHeading: View {
                         // The chevron alone is well under the 44pt minimum, so
                         // the tap target is padded out rather than left at the
                         // glyph's size.
-                        .frame(width: 28, height: 28)
+                        .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)

@@ -49,6 +49,7 @@ struct DistributionSectionView: View {
                 trailing
             }
         }
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -90,7 +91,7 @@ struct DistributionRow: View {
                 CapacityBar(
                     fraction: row.tokensUnreported && row.shareFraction == 0
                         ? nil : row.shareFraction,
-                    height: 4
+                    height: 8
                 )
 
                 HStack(spacing: 6) {

@@ -25,8 +25,8 @@ struct InsightDetailView: View {
                     let state = currentState ?? detail.finding.state
                     findingHeader(detail.finding, state: state, evidence: detail.evidence)
                     impactSection(detail.finding)
-                    actionSection(detail, state: state)
                     remediationSection(detail.finding)
+                    actionSection(detail, state: state)
                     evidenceSection(detail.evidence)
                 } else if let loadError, !loadError.hasPrefix("Hub busy,") {
                     ContentUnavailableView(
@@ -58,7 +58,7 @@ struct InsightDetailView: View {
         return CockpitCard {
             VStack(alignment: .leading, spacing: 8) {
                 FlowLayout(spacing: 7, lineSpacing: 4) {
-                    Text(value.severityText).droverText(.marker)
+                    InsightSeverityBadge(severity: finding.severity)
                     Text(statusText)
                         .droverText(.subtitle)
                     Text(value.sourceText).droverText(.subtitle)
@@ -138,11 +138,14 @@ struct InsightDetailView: View {
     }
 
     private func remediationSection(_ finding: InsightFinding) -> some View {
-        detailSection("Guided remediation") {
+        detailSection("Recommended steps") {
             VStack(alignment: .leading, spacing: 9) {
                 ForEach(Array(finding.remediation.enumerated()), id: \.offset) { index, step in
                     HStack(alignment: .top, spacing: 9) {
-                        Text("\(index + 1)").droverText(.marker)
+                        Text("\(index + 1)")
+                            .droverText(.marker)
+                            .frame(minWidth: 28, minHeight: 28)
+                            .background(DroverColor.bg, in: Circle())
                         Text(step).droverText(.body).fixedSize(horizontal: false, vertical: true)
                     }
                 }

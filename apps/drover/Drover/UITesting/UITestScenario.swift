@@ -5,6 +5,7 @@ import DroverKit
 enum FixtureScenarioKind: String {
     case coreJourney = "core-journey"
     case insightDetail = "insight-detail"
+    case observability = "observability"
 }
 
 /// Isolated building blocks for environment-selected fixture scenarios.

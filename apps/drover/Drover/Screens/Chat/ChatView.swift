@@ -179,7 +179,13 @@ struct ChatView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            Composer(text: $model.composerText,
+            VStack(spacing: 0) {
+                if model.hasConnectedOnce, model.isConnected,
+                   model.pendingTurn == nil, model.pendingApproval == nil,
+                   model.activity.phase != .ready {
+                    SessionActivityView(activity: model.activity)
+                }
+                Composer(text: $model.composerText,
                      attachments: $model.pendingAttachments,
                      runPreferences: model.runPreferences,
                      harness: model.harnessPresentation.harness,
@@ -189,7 +195,8 @@ struct ChatView: View {
                      onAddAttachment: { attachment in
                          await model.addAttachmentIfRecoverable(attachment)
                      }) {
-                Task { await model.sendTurn() }
+                    Task { await model.sendTurn() }
+                }
             }
         }
         .background(DroverColor.bg)
@@ -473,12 +480,12 @@ struct ChatView: View {
             ThinkingBlock(
                 run: run,
                 estimatedTokens: estimatedTokens,
-                isStreaming: isNewest && (model.messages.last?.isThinking ?? false)
+                isStreaming: isNewest && model.activity.isActive && (model.messages.last?.isThinking ?? false)
             )
         case .statusRun(let run):
             SessionEventsRow(run: run)
         case .stepRun(let steps):
-            StepRunCard(steps: steps)
+            StepRunCard(steps: steps, activeToolIDs: model.activity.activeToolIDs)
         }
     }
 
