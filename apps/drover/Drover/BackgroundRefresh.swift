@@ -45,12 +45,7 @@ enum BackgroundRefresh {
         let watcher = AttentionWatcher(notifier: notifier)
         let work = Task {
             var success = false
-            // A stage-locked build must not dial a retained personal hub from
-            // the background either. This process may have been relaunched by
-            // the OS with no AppEnvironment, so it applies the policy itself.
-            if let built = ClientFactory.make(
-                endpointIsAllowed: TestFlightEndpointPolicy.fromBundle().accepts
-            ) {
+            if let built = ClientFactory.make() {
                 await watcher.check(client: built.client)
                 success = true
             }

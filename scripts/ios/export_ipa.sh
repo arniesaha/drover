@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Export an internal candidate; retain only the IPA and safe evidence.
+# Export a TestFlight candidate; retain only the IPA and safe evidence.
 set +x
 set -euo pipefail
 umask 077
@@ -23,7 +23,6 @@ from verify_archive import (
     ArtifactVerificationError,
     VERSION_PATTERN,
     inspect_signing,
-    normalize_staging_url,
     verify_app,
 )
 
@@ -66,14 +65,13 @@ def invoke(command, log, message):
     require(completed.returncode == 0, message)
 
 
-def verified(app, args, staging_url):
+def verified(app, args):
     try:
         return verify_app(
             app,
             expected_version=args.version,
             expected_build=args.build,
             sdk_floor="26.0",
-            expected_staging_url=staging_url,
             expected_unrestricted_hubs=args.unrestricted_hubs,
         )
     except ArtifactVerificationError as error:
@@ -159,24 +157,19 @@ def export_options(path, archive, identity, scratch):
 
 def main():
     parser = Parser(
-        description="Export and verify an internal TestFlight IPA. A missing export-options file is generated in its existing owner-only signing directory."
+        description="Export and verify a TestFlight IPA. A missing export-options file is generated in its existing owner-only signing directory."
     )
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--export-options", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--build", required=True)
-    policy = parser.add_mutually_exclusive_group(required=True)
-    policy.add_argument("--staging-url")
-    policy.add_argument("--unrestricted-hubs", action="store_true")
+    parser.add_argument("--unrestricted-hubs", action="store_true", required=True)
     args = parser.parse_args()
     require(
         VERSION_PATTERN.fullmatch(args.version)
         and VERSION_PATTERN.fullmatch(args.build),
         "version and build must be expanded numeric values",
-    )
-    staging_url = (
-        normalize_staging_url(args.staging_url) if args.staging_url is not None else None
     )
     require(args.output.is_absolute(), "output must be an absolute path")
     require(
@@ -199,7 +192,7 @@ def main():
         prefix="drover-ipa-", dir=args.export_options.parent
     ) as temporary:
         scratch = Path(temporary)
-        identity = verified(args.archive, args, staging_url)
+        identity = verified(args.archive, args)
         export_options(args.export_options, args.archive, identity, scratch)
         exported = scratch / "export"
         exported.mkdir()
@@ -234,7 +227,7 @@ def main():
             len(apps) == 1 and not apps[0].is_symlink(),
             "IPA must contain exactly one application",
         )
-        identity = verified(apps[0], args, staging_url)
+        identity = verified(apps[0], args)
         with ipas[0].open("rb") as artifact:
             digest = hashlib.file_digest(artifact, "sha256").hexdigest()
         record = {
@@ -242,11 +235,6 @@ def main():
             "build": identity.build,
             "bundle_identifier": identity.bundle_identifier,
             "ipa_sha256": digest,
-            "staging_url_sha256": (
-                hashlib.sha256(staging_url.encode()).hexdigest()
-                if staging_url is not None
-                else None
-            ),
         }
         args.output.mkdir(mode=0o700)
         shutil.copyfile(ipas[0], args.output / "Drover.ipa")

@@ -21,7 +21,7 @@ from test_ios_archive_verifier import (
 )
 
 SCRIPTS = Path(__file__).parents[1] / "scripts" / "ios"
-STAGE = "https://stage.example.test"
+HUB = "https://hub.example.test"
 ISSUER = "11111111-2222-3333-4444-555555555555"
 KEY_ID = "EXAMPLE123"
 
@@ -37,9 +37,7 @@ def chain(tmp_path: Path):
     logs = tmp_path / "scratch"
     logs.mkdir()
     info = valid_info() | {
-        "DROVER_TESTFLIGHT_STAGE_ONLY": "YES",
-        "DROVER_TESTFLIGHT_STAGING_URL": STAGE,
-        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": False},
+        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
     }
     app = write_bundle(tmp_path / "fixture", info=info)
     (app / "embedded.mobileprovision").write_bytes(b"synthetic profile fixture")
@@ -135,7 +133,7 @@ elif name != "xcodegen":
         "FIXTURE_ROOT": str(tmp_path),
         "DEVELOPER_DIR": str(developer),
         "TMPDIR": str(logs),
-        "LEAK_SENTINEL": STAGE + ISSUER + "RAW-UPLOAD-RESPONSE",
+        "LEAK_SENTINEL": HUB + ISSUER + "RAW-UPLOAD-RESPONSE",
     }
 
     def run(script: str, *args: str, **extra: str):
@@ -160,8 +158,7 @@ elif name != "xcodegen":
             "1.2.3",
             "--build",
             "42",
-            "--staging-url",
-            STAGE,
+            "--unrestricted-hubs",
             *args,
             **extra,
         )
@@ -185,74 +182,6 @@ elif name != "xcodegen":
     return tmp_path, run, export, upload, config
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        None,
-        "http://stage.example.test",
-        STAGE + "/path",
-        STAGE + "?query",
-        STAGE + "#fragment",
-        "https://user:pass@stage.example.test",
-        STAGE + "?",
-        STAGE + "#",
-        "https://stage.example.test\n",
-        "https://stage.example.test:invalid",
-    ],
-)
-def test_archive_rejects_unsafe_or_missing_staging_url(chain, url):
-    root, run, _, _, config = chain
-    args = [] if url is None else ["--staging-url", url]
-    result = run(
-        "archive.sh",
-        "--version",
-        "1.2.3",
-        "--build",
-        "42",
-        "--output",
-        root / "output",
-        "--signing-config",
-        config,
-        "--channel",
-        "testflight-internal",
-        *args,
-    )
-    assert result.returncode != 0
-    assert "staging URL" in result.stderr
-    assert not (root / "calls.jsonl").exists()
-
-
-def test_archive_stage_locks_build_and_hashes_normalized_url(chain):
-    root, run, _, _, config = chain
-    result = run(
-        "archive.sh",
-        "--version",
-        "1.2.3",
-        "--build",
-        "42",
-        "--output",
-        root / "output",
-        "--signing-config",
-        config,
-        "--channel",
-        "testflight-internal",
-        "--staging-url",
-        "https://STAGE.example.test:443/",
-    )
-    assert result.returncode == 0, result.stderr
-    calls = [
-        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
-    ]
-    invocation = next(call["args"] for call in calls if "archive" in call["args"])
-    assert "DROVER_TESTFLIGHT_STAGE_ONLY=YES" in invocation
-    assert f"DROVER_TESTFLIGHT_STAGING_URL={STAGE}" in invocation
-    assert "DROVER_ALLOW_ARBITRARY_LOADS=NO" in invocation
-    record = json.loads((root / "output" / "archive-record.json").read_text())
-    assert record["channel"] == "testflight-internal"
-    assert record["staging_url_sha256"] == hashlib.sha256(STAGE.encode()).hexdigest()
-    assert STAGE not in json.dumps(record) + result.stdout + result.stderr
-
-
 def test_archive_production_channel_enables_unrestricted_hubs(chain):
     root, run, _, _, config = chain
     archived_info_path = (
@@ -260,8 +189,6 @@ def test_archive_production_channel_enables_unrestricted_hubs(chain):
     )
     info = plistlib.loads(archived_info_path.read_bytes())
     info |= {
-        "DROVER_TESTFLIGHT_STAGE_ONLY": "NO",
-        "DROVER_TESTFLIGHT_STAGING_URL": "",
         "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
     }
     archived_info_path.write_bytes(plistlib.dumps(info))
@@ -285,35 +212,9 @@ def test_archive_production_channel_enables_unrestricted_hubs(chain):
         json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
     ]
     invocation = next(call["args"] for call in calls if "archive" in call["args"])
-    assert "DROVER_TESTFLIGHT_STAGE_ONLY=NO" in invocation
-    assert "DROVER_TESTFLIGHT_STAGING_URL=" in invocation
     assert "DROVER_ALLOW_ARBITRARY_LOADS=YES" in invocation
     record = json.loads((root / "output" / "archive-record.json").read_text())
     assert record["channel"] == "testflight-production"
-    assert record["staging_url_sha256"] is None
-
-
-def test_archive_production_channel_rejects_staging_url(chain):
-    root, run, _, _, config = chain
-    result = run(
-        "archive.sh",
-        "--version",
-        "1.2.3",
-        "--build",
-        "42",
-        "--output",
-        root / "output",
-        "--signing-config",
-        config,
-        "--channel",
-        "testflight-production",
-        "--staging-url",
-        STAGE,
-    )
-
-    assert result.returncode != 0
-    assert "staging URL" in result.stderr
-    assert not (root / "calls.jsonl").exists()
 
 
 def test_archive_consumes_complete_xcode_version_output(chain):
@@ -351,14 +252,14 @@ def test_export_rejects_existing_output(chain):
     assert not (root / "calls.jsonl").exists()
 
 
-@pytest.mark.parametrize("bad", ["stage", "signature"])
+@pytest.mark.parametrize("bad", ["ats", "signature"])
 def test_export_verifies_unpacked_signed_app(chain, bad):
     root, _, export, _, _ = chain
     extra = {}
-    if bad == "stage":
+    if bad == "ats":
         path = root / "fixture" / "Drover.app" / "Info.plist"
         info = plistlib.loads(path.read_bytes())
-        info["DROVER_TESTFLIGHT_STAGE_ONLY"] = "NO"
+        info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": False}
         path.write_bytes(plistlib.dumps(info))
     else:
         extra["CODESIGN_EXIT"] = "1"
@@ -382,7 +283,6 @@ def test_export_emits_only_sanitized_ipa_evidence(chain, generate):
         "build": "42",
         "bundle_identifier": "com.arnab.drover",
         "ipa_sha256": hashlib.sha256(b"synthetic IPA bytes").hexdigest(),
-        "staging_url_sha256": hashlib.sha256(STAGE.encode()).hexdigest(),
     }
     settings = plistlib.loads(options.read_bytes())
     assert settings["method"] == "app-store-connect"
@@ -392,7 +292,7 @@ def test_export_emits_only_sanitized_ipa_evidence(chain, generate):
     assert not (options.stat().st_mode & 0o077)
     assert list((root / "scratch").iterdir()) == []
     assert not list((root / "private").glob("drover-ipa-*"))
-    assert STAGE not in result.stdout + result.stderr
+    assert HUB not in result.stdout + result.stderr
 
 
 def test_export_verifies_unrestricted_production_ipa(chain):
@@ -403,8 +303,6 @@ def test_export_verifies_unrestricted_production_ipa(chain):
     ):
         info = plistlib.loads(info_path.read_bytes())
         info |= {
-            "DROVER_TESTFLIGHT_STAGE_ONLY": "NO",
-            "DROVER_TESTFLIGHT_STAGING_URL": "",
             "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
         }
         info_path.write_bytes(plistlib.dumps(info))
@@ -426,7 +324,7 @@ def test_export_verifies_unrestricted_production_ipa(chain):
 
     assert result.returncode == 0, result.stderr
     record = json.loads((root / "export/export-record.json").read_text())
-    assert record["staging_url_sha256"] is None
+    assert record["bundle_identifier"] == "com.arnab.drover"
 
 
 @pytest.mark.parametrize(
@@ -466,7 +364,7 @@ def test_export_rejects_nonprivate_options(chain, target):
     result = export()
     assert result.returncode != 0
     assert not (root / "calls.jsonl").exists()
-    assert STAGE not in result.stdout + result.stderr
+    assert HUB not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
@@ -597,7 +495,7 @@ def test_upload_uses_key_directory_and_writes_fixed_sanitized_receipt(chain):
         "upload_confirmed": True,
         "ipa_sha256": hashlib.sha256(b"synthetic IPA bytes").hexdigest(),
     }
-    for secret in ("SYNTHETIC-NOT-A-PRIVATE-KEY", ISSUER, STAGE, "RAW-UPLOAD-RESPONSE"):
+    for secret in ("SYNTHETIC-NOT-A-PRIVATE-KEY", ISSUER, HUB, "RAW-UPLOAD-RESPONSE"):
         assert secret not in record_text + result.stdout + result.stderr
     call = json.loads((root / "calls.jsonl").read_text().splitlines()[-1])
     assert call["keys"] == str(root / "private")
@@ -683,18 +581,15 @@ def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
     reason="requires macOS Xcode and XcodeGen for real plist processing",
 )
 @pytest.mark.parametrize(
-    "configuration,stage_only,staging_url,allow_loads,expected",
+    "configuration,allow_loads,expected",
     [
-        ("StoreRelease", "YES", STAGE, "NO", False),
-        ("StoreRelease", "NO", "", "YES", True),
-        ("Debug", "NO", "", "YES", True),
+        ("StoreRelease", "YES", True),
+        ("Debug", "YES", True),
     ],
 )
 def test_generated_project_processes_typed_ats_metadata(
     tmp_path: Path,
     configuration: str,
-    stage_only: str,
-    staging_url: str,
     allow_loads: str,
     expected: bool,
 ):
@@ -735,8 +630,6 @@ def test_generated_project_processes_typed_ats_metadata(
             "-derivedDataPath",
             str(tmp_path / "derived"),
             "CODE_SIGNING_ALLOWED=NO",
-            f"DROVER_TESTFLIGHT_STAGE_ONLY={stage_only}",
-            f"DROVER_TESTFLIGHT_STAGING_URL={staging_url}",
             f"DROVER_ALLOW_ARBITRARY_LOADS={allow_loads}",
             "build",
         ],
@@ -762,11 +655,5 @@ def test_generated_project_processes_typed_ats_metadata(
         "UIInterfaceOrientationLandscapeRight",
     }
     assert info["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is expected
-    assert info["DROVER_TESTFLIGHT_STAGE_ONLY"] == stage_only
-    assert info["DROVER_TESTFLIGHT_STAGING_URL"] == staging_url
     template = plistlib.loads((source / "Info.plist").read_bytes())
     assert template["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is True
-    assert template["DROVER_TESTFLIGHT_STAGE_ONLY"] == "$(DROVER_TESTFLIGHT_STAGE_ONLY)"
-    assert (
-        template["DROVER_TESTFLIGHT_STAGING_URL"] == "$(DROVER_TESTFLIGHT_STAGING_URL)"
-    )

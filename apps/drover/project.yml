@@ -50,8 +50,6 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: "0.1.0"
         SWIFT_VERSION: 6.0
-        DROVER_TESTFLIGHT_STAGE_ONLY: "NO"
-        DROVER_TESTFLIGHT_STAGING_URL: ""
         DROVER_ALLOW_ARBITRARY_LOADS: "YES"
       configs:
         # Development configurations keep the development APNs entitlement
@@ -78,8 +76,6 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        DROVER_TESTFLIGHT_STAGE_ONLY: "$(DROVER_TESTFLIGHT_STAGE_ONLY)"
-        DROVER_TESTFLIGHT_STAGING_URL: "$(DROVER_TESTFLIGHT_STAGING_URL)"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         # Required on physical devices to reach the central server over the
