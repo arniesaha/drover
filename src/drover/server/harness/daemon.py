@@ -57,6 +57,7 @@ from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.factory_observer import (
     FactoryObserverRequestError,
+    factory_observer_command,
     parse_factory_observer_launch,
 )
 from drover.server.harness.model_catalog import (
@@ -2361,6 +2362,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 return
         if command is not None:
             command = adapter.apply_preferences(list(command), model, thinking_effort)
+        if factory_launch is not None:
+            command = factory_observer_command(harness, list(command))
         label_source = command
         # A handoff already carries its own idempotency key: the session it
         # came from. The hub stops waiting for a create after
@@ -2402,20 +2405,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.BAD_REQUEST,
                 )
                 return
-        if adapter.capabilities.worktree and session_cwd is not None:
-            # These harnesses run full-auto with no approval channel, so the
+        if (
+            adapter.capabilities.worktree or factory_launch is not None
+        ) and session_cwd is not None:
+            # Factory always requires isolation, including approval-capable
+            # adapters. Full-auto harnesses also isolate Git repositories; the
             # worktree is the only thing standing between the session and the
             # user's checkout. A directory that cannot host one (no repo, no
-            # commits) returns None and running in place is correct. A failure
-            # raises, and must not be downgraded into that same fallback.
+            # commits) returns None; only non-Factory launches may run in place.
+            # A failure raises and must never be downgraded into that fallback.
             try:
                 session_worktree = create_session_worktree(
                     session_cwd, session_id, worktrees_dir
                 )
             except WorktreeIsolationUnavailable as exc:
                 log.warning(
-                    "refusing full-auto %s session: worktree isolation "
-                    "unavailable in %s: %s",
+                    "refusing %s session: worktree isolation unavailable in %s: %s",
                     harness,
                     session_cwd,
                     exc,
@@ -2424,7 +2429,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     {
                         "error": (
                             f"worktree isolation unavailable for {harness}: {exc}. "
-                            "Refusing to run a full-auto session in the requested "
+                            "Refusing to run the session in the requested "
                             "directory. Retry, or reduce accumulated worktrees."
                         )
                     },
@@ -2746,6 +2751,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             command = adapter.apply_preferences(
                 default_command, session.model, session.thinking_effort
             )
+            if session.handoff_mode == "factory_observer":
+                command = factory_observer_command(session.harness, command)
             try:
                 self.server.state.structured.start(
                     session_id,

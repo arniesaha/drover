@@ -37,7 +37,45 @@ Send this exact body shape to the existing route. `target_hostname` must equal t
 }
 ```
 
+`harness` and `model` are required. `thinking_effort` is optional (omission or
+`null`); when supplied it must be a non-empty string supported by the selected
+model's catalog. For Claude Code models advertising `reasoning: null`, use
+`"harness": "claude-code", "model": "opus"` and omit `thinking_effort`.
+Supplying an effort for such a model returns HTTP 400 with
+"The selected reasoning effort is not supported by this model."
+
 The bridge accepts no prompt, arbitrary command, or Factory mutation field. It forces Drover's existing `structured` launch mode, resolves the command from the selected harness adapter, and requires the existing isolated Git-worktree path to succeed. A non-Git working directory, disabled structured adapter, unavailable model selection, or worktree failure is rejected before a Factory observer session is started.
+
+Isolation is required even when the adapter does not advertise the worktree
+capability (including Claude Code). The host creates the same per-session Git
+worktree used for Codex; it never falls back to the requested checkout for a
+Factory launch. Non-Git directories or repositories without commits return 400;
+worktree creation failures return 503. The existing session row records the
+isolated cwd and requested repo owner/name/branch, while the projection records
+the actual worktree path/branch. A Git worktree isolates checkout changes, not
+all host filesystem access or credentials.
+
+### Claude Code unattended permissions
+
+Ordinary Claude structured sessions currently default to `bypassPermissions`.
+Factory launches explicitly replace that flag with `--permission-mode dontAsk`,
+including when a session is recovered after a daemon restart. The existing
+Drover session field `permission_mode: "auto"` is a generic launch-policy label;
+it does **not** select Claude's `auto` classifier mode or permission bypass.
+The bridge accepts no permission override or bypass option.
+
+[Claude Code documents `dontAsk`](https://code.claude.com/docs/en/permissions#permission-modes)
+as denying tool calls that would otherwise prompt, while allowing tools that
+need no approval or are already allowed by permission rules. Consequently an
+unattended Factory session does not park waiting for tool approval, but may be
+unable to complete edits or commands without preconfigured allow rules. Drover
+does not add allow rules or disable managed policies. This is deliberately a
+restricted unattended launch, not a guarantee that every delegated task can
+complete. The driver's existing `control_request` / `control_response` approval
+mapping is fixture-tested but has not been verified with a live approval capture
+(see `tests/fixtures/structured/FINDINGS.md`); this launch does not rely on it.
+Factory creation starts a session without a prompt; the existing turn endpoint
+is still needed to submit work.
 
 The Factory idempotency key is deterministically mapped to Drover's existing `client_session_id` uniqueness fence. Repeating the exact request returns the existing bounded session metadata rather than starting another host process or worktree.
 
