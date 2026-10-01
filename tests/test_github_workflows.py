@@ -17,6 +17,7 @@ def test_production_testflight_is_manual_unrestricted_and_credential_isolated() 
     assert set(workflow["on"]["workflow_dispatch"]["inputs"]) == {
         "version",
         "build",
+        "internal_group",
     }
     assert workflow["permissions"] == {"contents": "read"}
     assert set(workflow["jobs"]) == {"archive-upload"}
@@ -179,6 +180,9 @@ def test_production_apple_key_is_private_and_cleanup_survives_tool_failure(
     import subprocess
 
     material = b"synthetic private Apple key"
+    monkeypatch.setenv("CANDIDATE_VERSION", "0.1.0")
+    monkeypatch.setenv("CANDIDATE_BUILD", "3")
+    monkeypatch.setenv("TESTFLIGHT_INTERNAL_GROUP", "Drover Internal")
     monkeypatch.setenv("DROVER_APPSTORE_API_KEY_ID", "EXAMPLE123")
     monkeypatch.setenv(
         "DROVER_APPSTORE_API_ISSUER_ID", "00000000-0000-0000-0000-000000000000"
@@ -193,15 +197,22 @@ def test_production_apple_key_is_private_and_cleanup_survives_tool_failure(
         assert stat.S_IMODE(key.stat().st_mode) == 0o600
         assert stat.S_IMODE(key.parent.stat().st_mode) == 0o700
         assert material.decode() not in str(command)
+        assert command[command.index("--version") + 1] == "0.1.0"
+        assert command[command.index("--build") + 1] == "3"
+        assert command[command.index("--internal-group") + 1] == "Drover Internal"
+        assert "--info-plist" in command
         assert "DROVER_APPSTORE_API_PRIVATE_KEY_BASE64" not in kwargs["env"]
         raise subprocess.CalledProcessError(1, command, stderr="private diagnostic")
 
     monkeypatch.setattr(subprocess, "run", upload_failure)
     with pytest.raises(
-        SystemExit, match="^upload failed; private diagnostics discarded$"
+        SystemExit,
+        match="^upload or TestFlight distribution failed; see sanitized diagnostics and upload-record.json$",
     ):
         _run_production_python_step(
-            "Materialize Apple key and confirm upload", monkeypatch, tmp_path
+            "Upload, wait for Apple processing and assign internal group",
+            monkeypatch,
+            tmp_path,
         )
     _run_production_python_step("Remove temporary credentials", monkeypatch, tmp_path)
     assert not (tmp_path / "private_keys").exists()
