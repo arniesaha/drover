@@ -14,13 +14,20 @@ import json
 import pytest
 
 from drover.server.push.apns import (
+    DELIVERED,
+    DEVICE_REJECTED,
+    ENVIRONMENT_REJECTED,
+    REJECTED,
+    TRANSIENT,
     APNsConfig,
     APNsSender,
     AwaitingTransition,
     _AuthToken,
+    classify_response,
     configure,
     dispatch_awaiting_transition,
     push_available,
+    push_status,
     set_sender,
 )
 from drover.server.web.credentials import CredentialStore
@@ -260,6 +267,239 @@ def test_other_failures_leave_the_registration_intact(tmp_path, config):
 
     # A transient Apple outage is not evidence the phone is gone.
     assert store.get(credential.id).apns_token == "devicetoken123"
+
+
+# --- rejection classification ----------------------------------------------
+
+
+def _reason(reason):
+    return json.dumps({"reason": reason})
+
+
+@pytest.mark.parametrize(
+    "status, body, kind",
+    [
+        (200, "", DELIVERED),
+        (400, _reason("BadDeviceToken"), DEVICE_REJECTED),
+        (400, _reason("DeviceTokenNotForTopic"), DEVICE_REJECTED),
+        (410, _reason("Unregistered"), DEVICE_REJECTED),
+        (410, _reason("ExpiredToken"), DEVICE_REJECTED),
+        (410, "", DEVICE_REJECTED),
+        (403, _reason("BadEnvironmentKeyInToken"), ENVIRONMENT_REJECTED),
+        (403, _reason("InvalidProviderToken"), ENVIRONMENT_REJECTED),
+        (403, _reason("ExpiredProviderToken"), ENVIRONMENT_REJECTED),
+        (403, _reason("MissingProviderToken"), ENVIRONMENT_REJECTED),
+        (400, _reason("TopicDisallowed"), ENVIRONMENT_REJECTED),
+        (400, _reason("BadTopic"), ENVIRONMENT_REJECTED),
+        (429, _reason("TooManyRequests"), TRANSIENT),
+        (429, _reason("TooManyProviderTokenUpdates"), TRANSIENT),
+        (500, _reason("InternalServerError"), TRANSIENT),
+        (503, _reason("ServiceUnavailable"), TRANSIENT),
+        (503, "not json", TRANSIENT),
+        (413, _reason("PayloadTooLarge"), REJECTED),
+        (400, _reason("BadCollapseId"), REJECTED),
+        (403, "", REJECTED),
+    ],
+)
+def test_responses_are_classified_by_what_they_condemn(status, body, kind):
+    assert classify_response(status, body).kind == kind
+
+
+def test_classification_keeps_apples_reason():
+    outcome = classify_response(403, _reason("BadEnvironmentKeyInToken"))
+
+    assert (outcome.status, outcome.reason) == (403, "BadEnvironmentKeyInToken")
+
+
+@pytest.mark.parametrize(
+    "status, reason",
+    [
+        (400, "BadDeviceToken"),
+        (400, "DeviceTokenNotForTopic"),
+        (410, "Unregistered"),
+    ],
+)
+def test_device_rejection_clears_and_records_the_registration(
+    tmp_path, config, caplog, status, reason
+):
+    store, credential = _paired_device(tmp_path, environment="production")
+    client = FakeClient([FakeResponse(status, _reason(reason))])
+    sender = APNsSender(config, store, client=client)
+
+    sender._deliver(_transition())
+
+    stored = store.get(credential.id)
+    assert (stored.apns_token, stored.apns_environment) == (None, None)
+    assert stored.apns_failure_reason == reason
+    assert stored.apns_failed_at is not None
+    # The same token re-sent by the app is recognisably the rejected one...
+    assert stored.apns_registration_rejected("devicetoken123", "production")
+    # ...but not when it is reported for the environment that issued it.
+    assert not stored.apns_registration_rejected("devicetoken123", "sandbox")
+    # One dead phone says nothing about anyone else's.
+    assert sender.environment_available("production")
+    assert "devicetoken123" not in caplog.text
+    assert "devicetoken123" not in (tmp_path / "credentials.json").read_text()
+
+
+def test_device_rejection_does_not_condemn_a_token_registered_since(tmp_path, config):
+    store, credential = _paired_device(tmp_path)
+
+    class ReRegisteringClient(FakeClient):
+        def post(self, url, content=None, headers=None):
+            # The phone re-registered while this send was in flight.
+            store.set_apns_registration(
+                credential.id, token="fresh-token", environment="sandbox"
+            )
+            return FakeResponse(400, _reason("BadDeviceToken"))
+
+    APNsSender(config, store, client=ReRegisteringClient())._deliver(_transition())
+
+    stored = store.get(credential.id)
+    assert stored.apns_token == "fresh-token"
+    assert stored.apns_failure_reason is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["BadEnvironmentKeyInToken", "InvalidProviderToken", "ExpiredProviderToken"],
+)
+def test_environment_rejection_flips_availability_for_that_environment(
+    tmp_path, config, caplog, reason
+):
+    store, credential = _paired_device(tmp_path, environment="production")
+    sandbox_phone, _ = store.issue(scope="device", label="Dev phone")
+    store.set_apns_registration(
+        sandbox_phone.id, token="sandboxtoken", environment="sandbox"
+    )
+    client = FakeClient([FakeResponse(403, _reason(reason))])
+    sender = APNsSender(config, store, client=client)
+    try:
+        set_sender(sender)
+
+        sender._deliver(_transition())
+
+        assert not push_available("production")
+        assert push_available("sandbox")
+        assert push_available()
+        status = push_status()
+        assert status["state"] == "degraded"
+        assert status["environments"]["sandbox"] == {"available": True}
+        production = status["environments"]["production"]
+        assert production["available"] is False
+        assert (production["status"], production["reason"]) == (403, reason)
+        assert production["since"]
+        assert any(
+            record.levelname == "ERROR" and reason in record.message
+            for record in caplog.records
+        )
+        assert "devicetoken123" not in caplog.text
+    finally:
+        sender.close()
+        set_sender(None)
+
+
+def test_environment_rejection_stops_sends_and_logs_once(tmp_path, config, caplog):
+    store, _ = _paired_device(tmp_path, environment="production")
+    second, _ = store.issue(scope="device", label="iPad")
+    store.set_apns_registration(second.id, token="ipadtoken", environment="production")
+    dev, _ = store.issue(scope="device", label="Dev phone")
+    store.set_apns_registration(dev.id, token="sandboxtoken", environment="sandbox")
+    client = FakeClient([FakeResponse(403, _reason("BadEnvironmentKeyInToken"))])
+    sender = APNsSender(config, store, client=client)
+
+    sender._deliver(_transition())
+    sender._deliver(_transition(session_id="sess-2"))
+
+    production_posts = [
+        post
+        for post in client.posts
+        if post["url"].startswith("https://api.push.apple.com/")
+    ]
+    # The first production send condemned the environment; nothing after it
+    # paid for another send that could never land. Sandbox carried on.
+    assert len(production_posts) == 1
+    sandbox_posts = [post for post in client.posts if "sandbox" in post["url"]]
+    assert len(sandbox_posts) == 2
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+
+
+def test_environment_rejection_keeps_registrations_for_a_fixed_restart(
+    tmp_path, config
+):
+    store, credential = _paired_device(tmp_path, environment="production")
+    client = FakeClient([FakeResponse(403, _reason("InvalidProviderToken"))])
+
+    APNsSender(config, store, client=client)._deliver(_transition())
+
+    # The phone did nothing wrong; once the operator fixes the key and
+    # restarts, its registration must work without waiting for a re-pair.
+    stored = store.get(credential.id)
+    assert stored.apns_token == "devicetoken123"
+    assert stored.apns_failure_reason is None
+    assert APNsSender(config, store).environment_available("production")
+
+
+@pytest.mark.parametrize(
+    "status, body",
+    [
+        (429, _reason("TooManyRequests")),
+        (500, _reason("InternalServerError")),
+        (503, _reason("ServiceUnavailable")),
+    ],
+)
+def test_transient_failures_keep_registrations_and_availability(
+    tmp_path, config, status, body
+):
+    store, credential = _paired_device(tmp_path, environment="production")
+    client = FakeClient([FakeResponse(status, body)])
+    sender = APNsSender(config, store, client=client)
+
+    sender._deliver(_transition())
+
+    stored = store.get(credential.id)
+    assert stored.apns_token == "devicetoken123"
+    assert stored.apns_failure_reason is None
+    assert sender.environment_available("production")
+
+
+def test_timeouts_keep_registrations_and_availability(tmp_path, config):
+    import httpx
+
+    class TimingOutClient:
+        def post(self, *a, **k):
+            raise httpx.ReadTimeout("timed out")
+
+    store, credential = _paired_device(tmp_path)
+    sender = APNsSender(config, store, client=TimingOutClient())
+
+    sender._deliver(_transition())
+
+    assert store.get(credential.id).apns_token == "devicetoken123"
+    assert sender.environment_available("sandbox")
+
+
+def test_repeated_unclassified_rejections_are_rate_limited(tmp_path, config, caplog):
+    store, _ = _paired_device(tmp_path)
+    client = FakeClient(
+        [FakeResponse(413, _reason("PayloadTooLarge")) for _ in range(3)]
+    )
+    sender = APNsSender(config, store, client=client)
+
+    for index in range(3):
+        sender._deliver(_transition(session_id=f"sess-{index}"))
+
+    assert len(client.posts) == 3
+    warnings = [r for r in caplog.records if "PayloadTooLarge" in r.message]
+    assert len(warnings) == 1
+
+
+def test_push_status_reports_disabled_without_a_sender():
+    set_sender(None)
+
+    assert push_status() == {"state": "disabled"}
+    assert not push_available("production")
 
 
 def test_transport_failure_is_swallowed(tmp_path, config):

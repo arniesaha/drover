@@ -286,6 +286,26 @@ def _read_bounded_http_body(response: Any, *, max_response_bytes: int | None) ->
     return body.decode("utf-8")
 
 
+def _with_push_status(body: str, *, include_detail: bool) -> str:
+    """Add hub push state to a readiness body without touching its verdict.
+
+    Push is a degraded notification path, never a reason to fail readiness,
+    but an operator must be able to see that Apple is refusing the key
+    (#439's silent-loss shape) without reading server logs.
+    """
+    from drover.server.push import push_status
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    push = push_status()
+    payload["push"] = push if include_detail else {"state": push.get("state")}
+    return json.dumps(payload, sort_keys=True) + "\n"
+
+
 def _label_value(value: object) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
@@ -1166,6 +1186,7 @@ class MetricsCollector:
                 )
             probe = self._readiness
         status, body = probe.check().as_response(include_detail=include_detail)
+        body = _with_push_status(body, include_detail=include_detail)
         if self.analytics_worker_state is None:
             return status, body
         try:

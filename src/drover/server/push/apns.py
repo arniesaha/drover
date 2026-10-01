@@ -24,6 +24,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -40,6 +41,112 @@ _AWAITING_TITLES = {
     "approval": "approval required",
     "input": "your turn",
 }
+
+# --- rejection classification ------------------------------------------------
+#
+# A stored registration tells the iOS app to stop generating its own alerts, so
+# every rejection that means "this can never land" has to undo that promise,
+# not just log. The split is by what the rejection condemns:
+#
+# * the device: this one token is dead or belongs elsewhere. Clear it.
+# * the environment: our key/topic cannot reach this APNs host at all, so every
+#   device registered against it is in the same position. Stop offering push
+#   for that environment until the operator fixes the config and restarts.
+# * nothing: Apple is busy or the network blinked. Keep everything.
+#
+# Reasons are Apple's documented ``reason`` strings for the provider API.
+
+#: Permanent for this token in this environment.
+_DEVICE_REJECTIONS = frozenset(
+    {
+        "BadDeviceToken",
+        "DeviceTokenNotForTopic",
+        "Unregistered",
+        "ExpiredToken",
+    }
+)
+#: Permanent for every token in this environment: the provider key, its
+#: environment restriction, or the topic is wrong. ``BadEnvironmentKeyInToken``
+#: is the TestFlight-with-a-sandbox-only-key case; it is a property of the key,
+#: so no device in that environment can be reached either.
+_ENVIRONMENT_REJECTIONS = frozenset(
+    {
+        "BadEnvironmentKeyInToken",
+        "InvalidProviderToken",
+        "ExpiredProviderToken",
+        "MissingProviderToken",
+        "TopicDisallowed",
+        "BadTopic",
+        "BadCertificate",
+        "BadCertificateEnvironment",
+    }
+)
+
+DELIVERED = "delivered"
+DEVICE_REJECTED = "device"
+ENVIRONMENT_REJECTED = "environment"
+TRANSIENT = "transient"
+REJECTED = "rejected"
+
+#: How often an identical rejection may be logged. A broken environment stops
+#: being sent to after the first rejection, but a per-message problem (an
+#: oversized payload, say) would otherwise log on every transition.
+_LOG_INTERVAL_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    kind: str
+    status: int | None
+    reason: str = ""
+
+
+def _response_reason(text: str | None) -> str:
+    try:
+        body = json.loads(text or "")
+    except ValueError:
+        return ""
+    reason = body.get("reason") if isinstance(body, dict) else None
+    return reason if isinstance(reason, str) else ""
+
+
+def classify_response(status_code: int, text: str | None) -> DeliveryOutcome:
+    """Map an APNs provider response onto what it condemns."""
+    reason = _response_reason(text)
+    if status_code == 200:
+        return DeliveryOutcome(DELIVERED, status_code, reason)
+    if status_code == 429 or status_code >= 500:
+        return DeliveryOutcome(TRANSIENT, status_code, reason)
+    if reason in _ENVIRONMENT_REJECTIONS:
+        return DeliveryOutcome(ENVIRONMENT_REJECTED, status_code, reason)
+    if status_code == 410 or reason in _DEVICE_REJECTIONS:
+        return DeliveryOutcome(DEVICE_REJECTED, status_code, reason or "Unregistered")
+    return DeliveryOutcome(REJECTED, status_code, reason)
+
+
+@dataclass(frozen=True)
+class EnvironmentFailure:
+    status: int | None
+    reason: str
+    since: str
+
+
+class _RateLimitedLog:
+    """Lets one line per key through per interval."""
+
+    def __init__(self, interval: float = _LOG_INTERVAL_SECONDS):
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._last: dict[tuple, float] = {}
+
+    def allow(self, key: tuple, *, now: float | None = None) -> bool:
+        moment = time.monotonic() if now is None else now
+        with self._lock:
+            last = self._last.get(key)
+            if last is not None and moment - last < self._interval:
+                return False
+            self._last[key] = moment
+            return True
 
 
 @dataclass(frozen=True)
@@ -238,11 +345,76 @@ class APNsSender:
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="apns"
         )
+        self._environment_lock = threading.Lock()
+        self._environment_failures: dict[str, EnvironmentFailure] = {}
+        self._log_limit = _RateLimitedLog()
 
     @property
     def is_available(self) -> bool:
         """True when this sender can actually deliver APNs alerts."""
         return self._config.is_usable
+
+    def environment_available(self, environment: str) -> bool:
+        """False once Apple refused our key or topic for ``environment``.
+
+        Deliberately sticky until restart: nothing short of a config change
+        can fix these rejections, and re-offering push in between would let a
+        phone register, suppress its local alerts, and lose the next one.
+        """
+        if not self.is_available or environment not in _HOSTS:
+            return False
+        with self._environment_lock:
+            return environment not in self._environment_failures
+
+    def environment_failures(self) -> dict[str, EnvironmentFailure]:
+        with self._environment_lock:
+            return dict(self._environment_failures)
+
+    def status(self) -> dict:
+        """Operator-facing push state for readiness and diagnostics."""
+        if not self.is_available:
+            return {"state": "disabled"}
+        failures = self.environment_failures()
+        environments: dict[str, dict] = {}
+        for environment in _HOSTS:
+            failure = failures.get(environment)
+            if failure is None:
+                environments[environment] = {"available": True}
+            else:
+                environments[environment] = {
+                    "available": False,
+                    "status": failure.status,
+                    "reason": failure.reason,
+                    "since": failure.since,
+                }
+        return {
+            "state": "degraded" if failures else "ok",
+            "environments": environments,
+        }
+
+    def _mark_environment_unavailable(
+        self, environment: str, outcome: DeliveryOutcome
+    ) -> None:
+        with self._environment_lock:
+            if environment in self._environment_failures:
+                return
+            self._environment_failures[environment] = EnvironmentFailure(
+                status=outcome.status,
+                reason=outcome.reason,
+                since=datetime.now(timezone.utc).isoformat(),
+            )
+        if self._log_limit.allow(("environment", environment, outcome.reason)):
+            log.error(
+                "apns: %s push disabled until restart: Apple answered %s %s "
+                "for key %s / topic %s; devices registering for %s will be told "
+                "push is unavailable and keep local notifications",
+                environment,
+                outcome.status,
+                outcome.reason or "<no reason>",
+                self._config.key_id,
+                self._config.bundle_id,
+                environment,
+            )
 
     def _http(self):
         """Lazily build the HTTP/2 client; one connection, reused."""
@@ -270,6 +442,7 @@ class APNsSender:
                 and credential.is_active
                 and credential.apns_token
                 and credential.apns_environment in _HOSTS
+                and self.environment_available(credential.apns_environment)
             ):
                 yield credential
 
@@ -322,7 +495,9 @@ class APNsSender:
 
     def _send_one(self, credential, transition: AwaitingTransition, badge) -> None:
         host = _HOSTS.get(credential.apns_environment or "")
-        if host is None:
+        # Re-checked per send: an earlier device in this same batch may just
+        # have shown that the environment is unreachable.
+        if host is None or not self.environment_available(credential.apns_environment):
             return
         url = f"{host}/3/device/{credential.apns_token}"
         headers = {
@@ -340,29 +515,56 @@ class APNsSender:
                 url, content=self._payload(transition, badge), headers=headers
             )
         except Exception as exc:  # noqa: BLE001
+            # Timeouts and connection resets say nothing about the token.
             log.debug("apns: send failed for %s: %s", credential.id, exc)
             return
+        self._handle_outcome(
+            credential, classify_response(response.status_code, response.text)
+        )
 
-        if response.status_code == 200:
+    def _handle_outcome(self, credential, outcome: DeliveryOutcome) -> None:
+        environment = credential.apns_environment or ""
+        if outcome.kind == DELIVERED:
             return
-        if response.status_code == 410:
-            # Apple's "this token is dead" signal (app deleted, or the device
-            # re-registered). Drop it so the next pairing is the only source
-            # of truth and we stop paying for a send that can never land.
-            log.info("apns: token for %s unregistered, clearing", credential.id)
+        if outcome.kind == ENVIRONMENT_REJECTED:
+            # The registration itself is fine; our side cannot reach the
+            # environment. Leaving it in place means push resumes for this
+            # phone as soon as a fixed hub restarts, while the registration
+            # route refuses new promises in the meantime.
+            self._mark_environment_unavailable(environment, outcome)
+            return
+        if outcome.kind == DEVICE_REJECTED:
+            # Dead token (app deleted, re-registered, or reported the wrong
+            # environment). Clearing it alone is not enough: the app re-sends
+            # the same token on its next launch, so the rejection is recorded
+            # for the registration route to keep refusing it.
+            log.warning(
+                "apns: %s registration for %s rejected (%s %s); cleared so the "
+                "app falls back to local notifications",
+                environment,
+                credential.id,
+                outcome.status,
+                outcome.reason,
+            )
             try:
-                self._credentials.clear_apns_registration(
-                    credential.id, expected_token=credential.apns_token
+                self._credentials.mark_apns_registration_failed(
+                    credential.id,
+                    expected_token=credential.apns_token,
+                    reason=outcome.reason,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.debug("apns: could not clear registration: %s", exc)
             return
-        log.warning(
-            "apns: %s rejected for %s: %s",
-            response.status_code,
-            credential.id,
-            response.text[:200],
-        )
+        if self._log_limit.allow(
+            (outcome.kind, environment, outcome.status, outcome.reason)
+        ):
+            log.warning(
+                "apns: %s %s %s for %s; registration kept",
+                "transient" if outcome.kind == TRANSIENT else "rejected",
+                outcome.status,
+                outcome.reason or "<no reason>",
+                credential.id,
+            )
 
     def close(self) -> None:
         self._pool.shutdown(wait=False)
@@ -389,27 +591,48 @@ def set_sender(sender: APNsSender | None) -> None:
         _sender = sender
 
 
-def push_available() -> bool:
+def push_available(environment: str | None = None) -> bool:
     """Return whether hub push is currently able to deliver alerts.
 
     This is intentionally read-only so request handlers can fail closed before
     accepting a device token. A stored token means the iOS app suppresses local
     notifications, so registration is safe only when a usable sender has been
-    registered at startup.
+    registered at startup. With ``environment``, it is also false once Apple
+    has rejected the hub's key or topic for that APNs environment.
     """
     sender = _sender
     if sender is None:
         return False
     availability = getattr(sender, "is_available", None)
-    if availability is None:
+    try:
+        if availability is not None and not (
+            availability() if callable(availability) else availability
+        ):
+            return False
         # Test doubles and future sender types are registered only after their
         # own setup succeeds, so presence is the availability signal.
+        per_environment = getattr(sender, "environment_available", None)
+        if environment is not None and per_environment is not None:
+            return bool(per_environment(environment))
         return True
-    try:
-        return bool(availability() if callable(availability) else availability)
     except Exception as exc:  # noqa: BLE001
         log.debug("push availability check failed: %s", exc)
         return False
+
+
+def push_status() -> dict:
+    """Push state for ``/readyz``: disabled, ok, or degraded per environment."""
+    sender = _sender
+    if sender is None:
+        return {"state": "disabled"}
+    status = getattr(sender, "status", None)
+    if status is None:
+        return {"state": "ok"}
+    try:
+        return status()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("push status check failed: %s", exc)
+        return {"state": "unknown"}
 
 
 def configure(cfg, credentials) -> APNsSender | None:

@@ -228,6 +228,16 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        4,
+        (
+            # Apple's permanent rejection of a device registration, so the
+            # registration route can keep refusing the same dead token.
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS apns_failure_reason TEXT",
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS apns_failed_at TIMESTAMPTZ",
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS apns_failed_fingerprint TEXT",
+        ),
+    ),
 )
 
 

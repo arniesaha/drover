@@ -108,6 +108,149 @@ def test_registration_fails_closed_without_hub_push_and_does_not_store_token(ser
     assert (stored.apns_token, stored.apns_environment) == (None, None)
 
 
+def test_token_apple_rejected_is_refused_until_a_new_one_registers(server):
+    _, store, _ = server
+    device, device_token = store.issue(scope="device", label="Phone")
+    store.set_apns_registration(device.id, token="dead-apns", environment="production")
+    # What APNsSender records on a BadDeviceToken / Unregistered rejection.
+    assert store.mark_apns_registration_failed(
+        device.id, expected_token="dead-apns", reason="BadDeviceToken"
+    )
+
+    # The app re-sends the same token on its next launch or foreground: it
+    # must get #439's push-unavailable answer and keep local notifications.
+    status, body = request(
+        server,
+        "PUT",
+        "/auth/device/apns",
+        token=device_token,
+        json={"token": "dead-apns", "environment": "production"},
+    )
+    assert (status, body) == (503, b'{"error": "hub push is unavailable"}\n')
+    assert store.get(device.id).apns_token is None
+    # Asking again does not wear the rejection out.
+    assert (
+        request(
+            server,
+            "PUT",
+            "/auth/device/apns",
+            token=device_token,
+            json={"token": "dead-apns", "environment": "production"},
+        )[0]
+        == 503
+    )
+
+    # A reinstall mints a fresh token, which is a fresh promise.
+    assert request(
+        server,
+        "PUT",
+        "/auth/device/apns",
+        token=device_token,
+        json={"token": "fresh-apns", "environment": "production"},
+    ) == (204, b"")
+    stored = store.get(device.id)
+    assert (stored.apns_token, stored.apns_failure_reason) == ("fresh-apns", None)
+
+
+def test_registration_for_an_environment_apple_refused_returns_push_unavailable(
+    server,
+):
+    _, store, _ = server
+    device, device_token = store.issue(scope="device", label="TestFlight phone")
+    dev, dev_token = store.issue(scope="device", label="Dev phone")
+
+    class _SandboxOnlySender:
+        is_available = True
+
+        def environment_available(self, environment):
+            # A sandbox-restricted key: production said BadEnvironmentKeyInToken.
+            return environment == "sandbox"
+
+    set_sender(_SandboxOnlySender())
+
+    status, body = request(
+        server,
+        "PUT",
+        "/auth/device/apns",
+        token=device_token,
+        json={"token": "testflight-apns", "environment": "production"},
+    )
+    assert (status, body) == (503, b'{"error": "hub push is unavailable"}\n')
+    assert store.get(device.id).apns_token is None
+    assert request(
+        server,
+        "PUT",
+        "/auth/device/apns",
+        token=dev_token,
+        json={"token": "dev-apns", "environment": "sandbox"},
+    ) == (204, b"")
+    assert store.get(dev.id).apns_token == "dev-apns"
+
+
+def test_testflight_install_against_sandbox_only_key_falls_back(server, tmp_path):
+    """The 2026-09-30 TestFlight acceptance failure, end to end."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from drover.server.push import APNsConfig, APNsSender, AwaitingTransition
+
+    key_path = tmp_path / "AuthKey_SANDBOX.p8"
+    key_path.write_bytes(
+        ec.generate_private_key(ec.SECP256R1()).private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    class _Response:
+        status_code = 403
+        text = '{"reason":"BadEnvironmentKeyInToken"}'
+
+    class _Apple:
+        def post(self, url, content=None, headers=None):
+            return _Response()
+
+        def close(self):
+            pass
+
+    _, store, _ = server
+    device, device_token = store.issue(scope="device", label="TestFlight phone")
+    sender = APNsSender(
+        APNsConfig(
+            enabled=True,
+            key_path=key_path,
+            key_id="SANDBOXKEY",
+            team_id="TEAMID1234",
+            bundle_id="com.arnab.drover",
+        ),
+        store,
+        client=_Apple(),
+    )
+    set_sender(sender)
+    try:
+        registration = {"token": "testflight-apns", "environment": "production"}
+        # Before Apple has said anything, the hub honestly believes it can push.
+        assert request(
+            server, "PUT", "/auth/device/apns", token=device_token, json=registration
+        ) == (204, b"")
+
+        sender._deliver(
+            AwaitingTransition(
+                session_id="s", harness="codex", cwd="/p", awaiting="input"
+            )
+        )
+
+        status, body = request(
+            server, "PUT", "/auth/device/apns", token=device_token, json=registration
+        )
+        assert (status, body) == (503, b'{"error": "hub push is unavailable"}\n')
+        assert store.get(device.id).apns_token is None
+    finally:
+        sender.close()
+
+
 def test_device_bearer_deletes_its_apns_token_idempotently(server):
     _, store, _ = server
     device, device_token = store.issue(scope="device", label="Phone")

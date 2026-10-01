@@ -26,6 +26,14 @@ private func pushRegistrarSnapshotData(sessionID: String) -> Data {
     """.utf8)
 }
 
+private final class MockCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
 @MainActor
 private func waitForPushRegistrarCondition(
     timeoutNanoseconds: UInt64 = 1_000_000_000,
@@ -128,6 +136,91 @@ struct PushRegistrarTests {
         uploadAttempted.isRaised && PushRegistration.isActive(in: defaults)
     }
     #expect(registered)
+}
+
+@Test @MainActor func revalidationAfterHubRejectsTokenResumesLocalAlerts() async throws {
+    let defaults = UserDefaults.standard
+    let sessionID = "push-rejected-\(UUID().uuidString)"
+    defaults.removeObject(forKey: AttentionWatcher.seenKey)
+    defaults.removeObject(forKey: AttentionWatcher.readKey)
+    let registrar = PushRegistrar()
+    defer {
+        PushRegistration.setActive(false, in: defaults)
+        defaults.removeObject(forKey: AttentionWatcher.seenKey)
+        defaults.removeObject(forKey: AttentionWatcher.readKey)
+        registrar.updateClient(nil)
+        MockURLProtocol.handler = nil
+    }
+
+    // The hub accepts the first upload, then Apple rejects the token (or the
+    // hub's key) and every later upload gets #439's push-unavailable 503.
+    let hubRejected = MockFlag()
+    let uploads = MockCounter()
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "PUT", request.url?.path == "/auth/device/apns" {
+            uploads.increment()
+            if hubRejected.isRaised {
+                return (503, Data(#"{"error":"hub push is unavailable"}"#.utf8))
+            }
+            return (204, Data())
+        }
+        return (200, pushRegistrarSnapshotData(sessionID: sessionID))
+    }
+    let client = DroverClient(
+        config: ServerConfig(urlString: "http://drover.test")!,
+        token: pushRegistrarFixtureCredential,
+        session: MockURLProtocol.session()
+    )
+    registrar.updateClient(client)
+    registrar.accept(token: Data([0x09, 0x28, 0x03]))
+    let registered = await waitForPushRegistrarCondition {
+        PushRegistration.isActive(in: defaults)
+    }
+    #expect(registered)
+
+    // A repeated iOS callback alone does not re-upload once verified...
+    registrar.accept(token: Data([0x09, 0x28, 0x03]))
+    try await Task.sleep(nanoseconds: 50_000_000)
+    #expect(uploads.value == 1)
+
+    // ...but returning to the foreground asks the hub again.
+    hubRejected.raise()
+    registrar.revalidate()
+    let fellBack = await waitForPushRegistrarCondition {
+        uploads.value == 2 && !PushRegistration.isActive(in: defaults)
+    }
+    #expect(fellBack)
+
+    let spy = PushRegistrarSpyNotifier()
+    let snapshot = try HarnessSnapshot.decode(
+        from: pushRegistrarSnapshotData(sessionID: sessionID)
+    )
+    await AttentionWatcher(notifier: spy, seenStore: defaults).evaluate(snapshot)
+    #expect(await spy.notifiedIDs == [sessionID])
+}
+
+@Test @MainActor func revalidationThatSucceedsKeepsHubPushActive() async throws {
+    let registrar = PushRegistrar()
+    defer {
+        PushRegistration.setActive(false)
+        registrar.updateClient(nil)
+        MockURLProtocol.handler = nil
+    }
+    let uploads = MockCounter()
+    MockURLProtocol.handler = { request in
+        if request.httpMethod == "PUT" { uploads.increment() }
+        return (204, Data())
+    }
+    let client = DroverClient(config: ServerConfig(urlString: "http://drover.test")!,
+                              token: pushRegistrarFixtureCredential, session: MockURLProtocol.session())
+    registrar.updateClient(client)
+    registrar.accept(token: Data([0x04]))
+    #expect(await waitForPushRegistrarCondition { PushRegistration.isActive() })
+
+    registrar.revalidate()
+    #expect(await waitForPushRegistrarCondition { uploads.value == 2 })
+    try await Task.sleep(nanoseconds: 50_000_000)
+    #expect(PushRegistration.isActive())
 }
 
 @Test @MainActor func relaunchClearsPersistedSuccessBeforeATokenArrives() {
