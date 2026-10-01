@@ -709,6 +709,8 @@ class HarnessRegistry:
         host_id: str | None = None,
         status: str | None = None,
         archived_limit: int | None = None,
+        archived_mode: str | None = None,
+        archived_after: tuple[datetime, str] | None = None,
     ) -> list[HarnessSession]:
         """List sessions, optionally keeping only the newest archived ones.
 
@@ -719,6 +721,13 @@ class HarnessRegistry:
         worse failure than a long list, so the cap only ever applies to
         statuses known to be terminal, and anything unrecognised counts as
         live.
+
+        ``archived_mode`` and ``archived_after`` narrow only the archived rows,
+        so a page of history never costs a live session its place either.
+        ``archived_mode`` keeps archived rows of that mode (a caller that never
+        renders finished PTY rows should not spend its cap on them), and
+        ``archived_after`` is the ``(updated_at, session_id)`` of the last
+        archived row of the previous page, in this listing's own order.
         """
         filters = []
         params: list[Any] = []
@@ -728,6 +737,23 @@ class HarnessRegistry:
         if status is not None:
             filters.append("status = ?")
             params.append(status)
+        if archived_mode is not None or archived_after is not None:
+            scope: list[str] = []
+            scope_params: list[Any] = []
+            if archived_mode is not None:
+                scope.append("mode = ?")
+                scope_params.append(archived_mode)
+            if archived_after is not None:
+                # Same frame as the column: the cursor came out of it.
+                after_updated_at = _as_db_timestamp(archived_after[0])
+                scope.append("(updated_at < ? OR (updated_at = ? AND session_id > ?))")
+                scope_params += [after_updated_at, after_updated_at, archived_after[1]]
+            placeholders = ", ".join("?" for _ in ARCHIVED_SESSION_STATUSES)
+            filters.append(
+                f"(status IS NULL OR status NOT IN ({placeholders}) OR "
+                f"({' AND '.join(scope)}))"
+            )
+            params += [*ARCHIVED_SESSION_STATUSES, *scope_params]
         where = (" WHERE " + " AND ".join(filters)) if filters else ""
         order = " ORDER BY updated_at DESC, session_id"
 

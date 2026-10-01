@@ -69,7 +69,7 @@ from drover.server.harness.model_catalog import (
 )
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
-from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.registry import ARCHIVED_SESSION_STATUSES, HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.harness.structured.manager import StructuredSessionManager
@@ -1487,7 +1487,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._get_native_transcript(session_id, parsed.query)
             return
         if parsed.path == "/sessions":
-            self._list_sessions()
+            self._list_sessions(parsed.query)
             return
         if parsed.path.startswith("/sessions/"):
             session_id = parsed.path.removeprefix("/sessions/").strip("/")
@@ -2939,7 +2939,25 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             return None
         return _structured_session_row_json(registry_session)
 
-    def _list_sessions(self) -> None:
+    def _list_sessions(self, query: str = "") -> None:
+        """Every live session, then one bounded page of finished ones.
+
+        Unbounded, this returned every session the host had ever run (114 on
+        the mac-mini, 111 of them finished, ~41KB per call and growing). The
+        cap only ever applies to finished structured rows, which are the only
+        archived rows this listing renders: a live session, and so anything
+        the user is being asked about, is on every page. Older history is
+        reached with ``?archived_cursor=`` from ``next_archived_cursor``.
+        """
+        params = parse_qs(query)
+        archived_limit = _session_list_archived_limit(params)
+        try:
+            archived_after = _decode_archived_cursor(params)
+        except ValueError:
+            self._write_json(
+                {"error": "invalid archived_cursor"}, status=HTTPStatus.BAD_REQUEST
+            )
+            return
         self._reconcile_exited_sessions()
         pty_sessions = self.server.state.pty.list_sessions()
         pty_ids = {session.session_id for session in pty_sessions}
@@ -2951,13 +2969,24 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # live hub. A 114-session host spent ~45s in GET /sessions doing 115 of
         # them; this does 1.
         registry_rows: dict[str, Any] = {}
+        next_cursor: str | None = None
         try:
-            registry_rows = {
-                row.session_id: row
-                for row in self.server.state.registry.list_sessions(
-                    host_id=self.server.state.host_id
-                )
-            }
+            # One row past the page tells us whether another page exists.
+            rows = self.server.state.registry.list_sessions(
+                host_id=self.server.state.host_id,
+                archived_limit=archived_limit + 1,
+                archived_mode="structured",
+                archived_after=archived_after,
+            )
+            archived_rows = [row for row in rows if _is_archived_status(row.status)]
+            if len(archived_rows) > archived_limit:
+                overflow = archived_rows[archived_limit]
+                rows = [row for row in rows if row is not overflow]
+                if archived_limit > 0:
+                    next_cursor = _encode_archived_cursor(
+                        archived_rows[archived_limit - 1]
+                    )
+            registry_rows = {row.session_id: row for row in rows}
         except Exception:
             registry_rows = {}
         sessions = [
@@ -2969,11 +2998,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # otherwise finalized) after a restart has no manager entry anymore,
         # but its registry row -- now e.g. "errored" -- should still show up
         # here rather than silently disappearing from the listing.
-        structured_ids = set(self.server.state.structured.session_ids())
-        structured_ids.update(
+        # Registry order (newest first) for rows it returned, then any
+        # manager-only ids, so the archived tail stays in cursor order.
+        structured_ids = [
             session_id
             for session_id, row in registry_rows.items()
             if row.mode == "structured"
+        ]
+        structured_ids += sorted(
+            set(self.server.state.structured.session_ids()) - set(structured_ids)
         )
         for session_id in structured_ids:
             if session_id in pty_ids:
@@ -2989,10 +3022,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             structured_json = self._structured_session_json(session_id)
             if structured_json is not None:
                 sessions.append(structured_json)
+        # Whoever is waiting on the user first, then everything else live,
+        # then history. The sort is stable, so each group keeps its order.
+        sessions.sort(key=_session_listing_rank)
         self._write_json(
             {
                 "host_id": self.server.state.host_id,
                 "sessions": sessions,
+                "archived_limit": archived_limit,
+                "next_archived_cursor": next_cursor,
             }
         )
 
@@ -4239,6 +4277,72 @@ def _pty_session_json(session) -> dict[str, Any]:
         "pid": session.pid,
         "status": "running",
     }
+
+
+#: Finished sessions in one ``GET /sessions`` page when the caller names no
+#: number, and the most it may ask for. The same numbers as the hub's fleet
+#: render (``archived_session_limit`` / ``MAX_ARCHIVED_SESSION_LIMIT`` in
+#: server/metrics.py), so a host and the hub agree on what "recent" means.
+SESSION_LIST_DEFAULT_ARCHIVED = 20
+SESSION_LIST_MAX_ARCHIVED = 100
+
+
+def _session_list_archived_limit(params: Mapping[str, list[str]]) -> int:
+    """Read ``?archived=N``, clamped; anything unreadable is the default.
+
+    Clamped rather than rejected for the reason the hub's
+    ``_archived_limit_kwargs`` gives: a stray query string on a polled
+    listing should cost history, not the whole response.
+    """
+    raw = params.get("archived")
+    if not raw:
+        return SESSION_LIST_DEFAULT_ARCHIVED
+    try:
+        value = int(raw[0])
+    except (TypeError, ValueError):
+        return SESSION_LIST_DEFAULT_ARCHIVED
+    return max(0, min(value, SESSION_LIST_MAX_ARCHIVED))
+
+
+def _encode_archived_cursor(row: Any) -> str:
+    """Opaque cursor for the page after ``row``: its sort key, verbatim.
+
+    ``updated_at`` is serialized exactly as the column returned it (naive on
+    DuckDB, aware on PostgreSQL) so it compares in the column's own frame when
+    it comes back; normalizing it would shift the cursor by a UTC offset.
+    """
+    updated_at = row.updated_at
+    stamp = updated_at.isoformat() if isinstance(updated_at, datetime) else ""
+    raw = json.dumps([stamp, row.session_id], separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_archived_cursor(
+    params: Mapping[str, list[str]],
+) -> tuple[datetime, str] | None:
+    """Parse ``?archived_cursor=``; raise ``ValueError`` if it is not ours."""
+    raw = params.get("archived_cursor")
+    if not raw or not raw[0]:
+        return None
+    token = raw[0]
+    try:
+        decoded = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        stamp, session_id = json.loads(decoded.decode("utf-8"))
+        if not isinstance(stamp, str) or not isinstance(session_id, str):
+            raise ValueError("cursor fields must be strings")
+        return datetime.fromisoformat(stamp), session_id
+    except (binascii.Error, UnicodeDecodeError, TypeError) as exc:
+        raise ValueError("malformed archived cursor") from exc
+
+
+def _is_archived_status(status: Any) -> bool:
+    return status in ARCHIVED_SESSION_STATUSES
+
+
+def _session_listing_rank(session: Mapping[str, Any]) -> int:
+    if _is_archived_status(session.get("status")):
+        return 2
+    return 0 if session.get("awaiting") else 1
 
 
 def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
