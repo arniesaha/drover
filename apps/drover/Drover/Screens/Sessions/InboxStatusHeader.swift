@@ -1,18 +1,8 @@
 import DroverKit
 import SwiftUI
 
-/// The part of the inbox that does not scroll: the fleet line and the provider
-/// capacity strip, held above the session list.
-///
-/// Capacity used to be the third thing in the scroll, sitting *between* two
-/// groups of sessions. That cost it twice: it scrolled away the moment you
-/// reached for a session, and it broke the list in half on the way (#80).
-/// Pinned, it answers "what have I got left to spend" without being scrolled
-/// past, and the list below it is one continuous run.
-///
-/// It stays deliberately short — fleet line, host strip, one row of capacity
-/// cards — because every point it takes is a point the list does not get.
-/// `InboxStatusHeaderLayoutTests` holds that line.
+/// Pinned fleet status and a bounded Accounts preview. Provider details are
+/// pushed onto their own scrolling page so the inbox keeps room for sessions.
 struct InboxStatusHeader<Capacity: View>: View {
     let summary: FleetSummaryPresentation
     let hostGroups: [HostGroup]
@@ -36,6 +26,7 @@ struct InboxStatusHeader<Capacity: View>: View {
                 .fill(DroverColor.line)
                 .frame(height: 1)
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inbox-status-header")
     }
 }

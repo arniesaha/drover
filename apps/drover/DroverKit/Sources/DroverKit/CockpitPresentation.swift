@@ -1020,3 +1020,50 @@ public struct ProviderCapacitySummary: Sendable, Equatable {
         isCritical = tightest >= ProviderHeadline.criticalFraction
     }
 }
+
+/// Individual subscription meters for a horizontally scrolling Home preview.
+/// Hosts sharing an account contribute one meter, never a sum of their quota.
+public struct ProviderCapacityPreview: Sendable, Equatable {
+    public struct Meter: Sendable, Equatable, Identifiable {
+        public let id: String
+        public let accountLabel: String
+        public let provider: String
+        public let remainingFraction: Double?
+        public let isStale: Bool
+        public let hasWarnings: Bool
+
+        public var providerTitle: String { provider == "openai" ? "OpenAI" : provider.capitalized }
+        public var remainingText: String {
+            remainingFraction.map { "\(Int(($0 * 100).rounded()))% left" } ?? "Unknown"
+        }
+    }
+
+    public let accountCount: Int
+    public let meters: [Meter]
+    public let hasWarnings: Bool
+
+    public init(subscriptions: [ProviderSubscriptionPresentation], now: Date = Date()) {
+        accountCount = subscriptions.count
+        meters = subscriptions.map { account in
+            let expired = ProviderHeadline.leadingWindow(account.windows).map {
+                ProviderCapacityPresentation(account: account.representative, window: $0, now: now).isStale
+            } ?? false
+            let stale = account.isDegraded || expired
+            return Meter(
+                id: account.id,
+                accountLabel: account.accountLabel,
+                provider: account.provider,
+                remainingFraction: account.headline.fraction.map { max(0, min(1, 1 - $0)) },
+                isStale: stale,
+                hasWarnings: stale || account.headline.fraction == nil || account.hosts.contains { $0.status != .ok }
+            )
+        }.sorted {
+            let lhs = $0.remainingFraction ?? 2
+            let rhs = $1.remainingFraction ?? 2
+            if lhs != rhs { return lhs < rhs }
+            if $0.isStale != $1.isStale { return !$0.isStale }
+            return $0.id < $1.id
+        }
+        hasWarnings = meters.contains(where: \.hasWarnings)
+    }
+}

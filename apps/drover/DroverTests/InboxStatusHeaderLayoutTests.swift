@@ -14,6 +14,7 @@ import UIKit
 /// un-clamped account label or a stray section wired into the header would all
 /// compile, run, and quietly eat the list.
 @MainActor
+@Suite(.serialized)
 struct InboxStatusHeaderLayoutTests {
     /// iPhone 15/16 portrait width, and a screen tall enough that nothing here
     /// is being squeezed by the proposal.
@@ -62,7 +63,7 @@ struct InboxStatusHeaderLayoutTests {
                     status: .ok,
                     statusMessage: nil,
                     hostTitles: ["work-laptop": "work-laptop", "mac-mini": "Mac Mini", "nas": "NAS"],
-                    onOpenAnalytics: {}
+                    onOpenAccounts: {}
                 )
             }
         }
@@ -75,20 +76,16 @@ struct InboxStatusHeaderLayoutTests {
         ).height
     }
 
-    /// The budget. Chrome row and the "New Session" bar take their own bites of
-    /// an 852pt phone; the header has to leave the list the majority of what is
-    /// left, which means staying under about 40% of the screen. It measures
-    /// 322pt today — fleet line, host strip and one row of cards.
+    /// The fleet header plus preview must keep most of an 852pt phone
+    /// available for sessions, chrome and the New Session control.
     @Test func thePinnedHeaderLeavesTheListMostOfTheScreen() throws {
         let measured = try height(accounts: accounts([Self.anthropic, Self.openai]))
 
-        #expect(measured <= Self.phoneHeight * 0.4,
+        #expect(measured <= 210,
                 "pinned header is \(measured)pt of a \(Self.phoneHeight)pt screen")
     }
 
-    /// The strip scrolls sideways rather than wrapping, so the fifth
-    /// subscription costs the list nothing. This is the property that makes
-    /// pinning affordable at all.
+    /// More subscriptions must not increase the preview height.
     @Test func moreSubscriptionsDoNotMakeTheHeaderTaller() throws {
         let two = try height(accounts: accounts([Self.anthropic, Self.openai]))
         let many = try height(accounts: accounts(
@@ -108,34 +105,30 @@ struct InboxStatusHeaderLayoutTests {
         #expect(without <= 120, "bare header is \(without)pt")
     }
 
-    /// The collapse itself, measured rather than asserted.
-    ///
-    /// Collapsed is the default because the strip is charged to every frame the
-    /// inbox draws. This pins the saving so a future change to the summary line
-    /// cannot quietly grow it back into a second slab.
-    @Test func collapsingTheCapacityStripGivesTheListItsHeightBack() throws {
+    /// Old persisted disclosure state must never expand a pinned account list.
+    @Test func savedExpansionCannotTakeSpaceFromSessions() throws {
         let key = "inbox.providerCapacityExpanded"
         let previous = UserDefaults.standard.object(forKey: key)
         defer {
             if let previous { UserDefaults.standard.set(previous, forKey: key) }
             else { UserDefaults.standard.removeObject(forKey: key) }
         }
-
         UserDefaults.standard.set(true, forKey: key)
-        let expanded = try height(accounts: accounts([Self.anthropic, Self.openai]))
-
+        let measured = try height(accounts: accounts([Self.anthropic, Self.openai]))
+        #expect(measured <= 210, "pinned header took \(measured)pt from sessions")
         UserDefaults.standard.set(false, forKey: key)
-        let collapsed = try height(accounts: accounts([Self.anthropic, Self.openai]))
-
-        #expect(collapsed < expanded,
-                "collapsed \(collapsed)pt vs expanded \(expanded)pt")
-        // The cards are the bulk of the strip; collapsing has to give back most
-        // of it, not shave a few points off.
-        #expect(collapsed <= expanded * 0.6,
-                "collapse only saved \(expanded - collapsed)pt of \(expanded)pt")
-        // And the default the user actually gets is the small one.
-        UserDefaults.standard.removeObject(forKey: key)
-        let byDefault = try height(accounts: accounts([Self.anthropic, Self.openai]))
-        #expect(byDefault == collapsed, "default is not collapsed: \(byDefault)pt")
+        #expect(try height(accounts: accounts([Self.anthropic, Self.openai])) == measured)
     }
+    @Test func additionalProvidersDoNotAddRowsToThePinnedPreview() throws {
+        func readings(_ providers: [String]) throws -> [ProviderAccount] {
+            try providers.map { provider in
+                try accounts([Self.anthropic.replacingOccurrences(of: "anthropic", with: provider)])[0]
+            }
+        }
+        let three = try height(accounts: readings(["anthropic", "openai", "google"]))
+        let five = try height(accounts: readings(["anthropic", "openai", "google", "other", "local"]))
+        #expect(three == five)
+        #expect(five <= 210)
+    }
+
 }

@@ -14,8 +14,10 @@ final class FixtureReceiptState: @unchecked Sendable {
 
     private let lock = NSLock()
     private let defaults: UserDefaults
+    let kind: FixtureScenarioKind
 
-    init(runID: String) {
+    init(runID: String, kind: FixtureScenarioKind = .coreJourney) {
+        self.kind = kind
         let suiteName = "com.arnab.drover.ui-fixture.\(runID)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             preconditionFailure("Could not create isolated fixture defaults")
@@ -140,6 +142,8 @@ final class FixtureHubURLProtocol: URLProtocol {
             return .json(status: 400, ["error": "fixture refuses non-synthetic origin"])
         }
         switch (request.httpMethod, path) {
+        case ("GET", "/cockpit/overview") where state.kind == .observability:
+            return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.overview)
         case ("GET", "/analytics"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.analytics)
         case ("GET", "/insights"):
@@ -147,7 +151,8 @@ final class FixtureHubURLProtocol: URLProtocol {
         case ("GET", let path) where path == "/insights/\(FixtureScenarioData.insightFindingID)":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.insightDetailData())
         case ("GET", "/harness"):
-            return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
+            return FixtureHubResponse(status: 200, body: state.kind == .observability
+                ? ObservabilityFixtureData.homeSnapshot : FixtureScenarioData.snapshotData())
         case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/model-catalog":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.modelCatalogData())
         case ("POST", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/sessions":

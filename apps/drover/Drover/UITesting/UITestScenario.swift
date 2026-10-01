@@ -28,7 +28,7 @@ struct UITestScenarioTransport {
         let runID = runUUID.uuidString
         self.kind = kind
         self.runID = runID
-        let receiptState = FixtureReceiptState(runID: runID)
+        let receiptState = FixtureReceiptState(runID: runID, kind: kind)
         FixtureHubURLProtocol.install(receiptState: receiptState)
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.protocolClasses = [FixtureHubURLProtocol.self]

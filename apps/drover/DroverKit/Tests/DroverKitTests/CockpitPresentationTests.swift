@@ -1036,3 +1036,52 @@ private let fourAnthropicWindows = """
     #expect(summary.text == "1 account")
     #expect(!summary.isCritical)
 }
+
+@Test func accountPreviewKeepsIndividualQuotaWithoutDuplicatingSharedHosts() throws {
+    let accounts = try [
+        providerAccount(snapshot: "work", provider: "anthropic", label: "work@example.com", host: "laptop", status: "stale", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"seven_day","used_percent":81}]"#),
+        providerAccount(snapshot: "personal", provider: "anthropic", label: "personal@example.com", host: "studio", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"seven_day","used_percent":42}]"#),
+        providerAccount(snapshot: "shared", provider: "anthropic", label: "personal@example.com", host: "mini", status: "error", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"seven_day","used_percent":42}]"#),
+        providerAccount(snapshot: "codex", provider: "openai", label: "personal@example.com", host: "studio", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"primary","used_percent":28}]"#)
+    ]
+    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts))
+    #expect(preview.accountCount == 3)
+    try #require(preview.meters.count == 3)
+    #expect(preview.meters.map(\.provider) == ["anthropic", "anthropic", "openai"])
+    #expect(preview.meters[0].remainingText == "19% left")
+    #expect(preview.meters[0].isStale)
+    #expect(Set(preview.meters.map(\.id)).count == 3)
+    #expect(preview.meters[1].remainingText == "58% left")
+    #expect(preview.meters[2].remainingText == "72% left")
+    #expect(preview.hasWarnings)
+}
+
+@Test func accountPreviewKeepsEveryAccountAndUnknownQuotaUnknown() throws {
+    let accounts = try ["anthropic", "openai", "google", "other", "local"].map { provider in
+        try providerAccount(snapshot: provider, provider: provider, label: "me@example.com", host: "studio", observedAt: "2026-08-09T18:00:00Z")
+    }
+    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts))
+    #expect(preview.accountCount == 5)
+    #expect(preview.meters.count == 5)
+    #expect(preview.meters.allSatisfy { $0.remainingFraction == nil && $0.remainingText == "Unknown" })
+}
+
+@Test func providerPreviewDoesNotStaleFreshQuotaBecauseAnotherHostProbeFailed() throws {
+    let accounts = try [
+        providerAccount(snapshot: "fresh", provider: "openai", label: "me@example.com", host: "studio", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"primary","used_percent":28}]"#),
+        providerAccount(snapshot: "failed", provider: "openai", label: "me@example.com", host: "mini", status: "error", observedAt: "2026-08-09T18:00:00Z")
+    ]
+    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts))
+    #expect(preview.accountCount == 1)
+    #expect(preview.meters[0].remainingText == "72% left")
+    #expect(!preview.meters[0].isStale)
+    #expect(preview.hasWarnings)
+}
+
+@Test func providerPreviewMarksAPastResetAsStaleEvenWhenTheHostReportedOK() throws {
+    let account = try providerAccount(snapshot: "expired", provider: "anthropic", label: "me@example.com", host: "studio", observedAt: "2020-01-01T18:00:00Z", windows: #"[{"kind":"seven_day","used_percent":81,"resets_at":"2020-01-01T19:00:00Z"}]"#)
+    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group([account]))
+    #expect(preview.meters[0].remainingText == "19% left")
+    #expect(preview.meters[0].isStale)
+    #expect(preview.hasWarnings)
+}
