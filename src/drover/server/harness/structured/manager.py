@@ -80,11 +80,17 @@ class StructuredSessionManager:
         a session parked on user input blocked host updates forever. Those
         drivers report `has_turn_in_flight`; a driver that does not is a
         persistent process and stays busy for as long as it is alive.
+
+        A parked session is only safe to restart past when its adapter can
+        recover it afterwards (Codex, DeepSeek). One that cannot (Agy today)
+        would come back errored with its conversation lost, so it stays busy.
         """
         with self._entries_lock:
             entry = self._entries.get(session_id)
         if entry is None or not entry.driver.is_alive():
             return False
+        if not getattr(entry.adapter, "recover_after_restart", False):
+            return True
         has_turn_in_flight = getattr(entry.driver, "has_turn_in_flight", None)
         if not callable(has_turn_in_flight):
             return True

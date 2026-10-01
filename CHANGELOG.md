@@ -24,10 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A Codex, Agy or DeepSeek session parked between turns no longer blocks host
-  updates forever with `not_quiescent`. Quiescence now asks whether a turn is
-  in flight instead of whether the session is open; a running turn, a pending
-  approval or a live Claude Code process still blocks (#236).
+- A Codex or DeepSeek session parked between turns no longer blocks host
+  updates forever with `not_quiescent`. Quiescence now asks whether a restart
+  would cut work off instead of whether the session is open; a running turn, a
+  pending approval, a live Claude Code process, or an open Agy session (which
+  cannot be recovered after a harnessd restart) still blocks (#236).
 - iOS honors `Retry-After` on hub `503`s across session polling, stream
   reconnects, cockpit and insight loads, auth polling and background refresh,
   with separate cooldowns for analytical and session reads, and shows

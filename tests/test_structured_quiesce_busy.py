@@ -149,15 +149,12 @@ def _manager(tmp_path, adapter, session_id: str, release: Path):
     return manager
 
 
-@pytest.mark.parametrize("adapter_type", [AgyAdapter, CodexAdapter])
-def test_parked_session_lets_the_host_update_but_a_turn_does_not(
-    adapter_type, tmp_path
-):
+def test_parked_session_lets_the_host_update_but_a_turn_does_not(tmp_path):
     """The observed failure, end to end: open session at awaiting=input with
     no child process. It must be quiescent; the same session mid-turn must
     not be."""
     release = tmp_path / "release"
-    manager = _manager(tmp_path, adapter_type(), "sess-1", release)
+    manager = _manager(tmp_path, CodexAdapter(), "sess-1", release)
     try:
         assert manager.awaiting("sess-1") == "input"
         assert manager.is_alive("sess-1") is True
@@ -181,7 +178,7 @@ def test_a_dispatch_in_progress_is_busy_before_the_driver_knows(tmp_path):
     """send_turn holds the entry lock across dispatch; an update must not
     slip in between a turn being accepted and its process existing."""
     release = tmp_path / "release"
-    manager = _manager(tmp_path, AgyAdapter(), "sess-1", release)
+    manager = _manager(tmp_path, CodexAdapter(), "sess-1", release)
     try:
         entry = manager._require_entry("sess-1")
         held = threading.Event()
@@ -222,7 +219,7 @@ def test_a_persistent_driver_stays_busy_while_alive(tmp_path):
     """Claude Code keeps one process for the whole session. That process is
     real, so its liveness still blocks -- this fix is for per-turn drivers."""
     release = tmp_path / "release"
-    manager = _manager(tmp_path, AgyAdapter(), "sess-1", release)
+    manager = _manager(tmp_path, CodexAdapter(), "sess-1", release)
     try:
 
         class _Persistent:
@@ -237,7 +234,7 @@ def test_a_persistent_driver_stays_busy_while_alive(tmp_path):
 
 def test_a_driver_that_cannot_answer_blocks_the_update(tmp_path):
     release = tmp_path / "release"
-    manager = _manager(tmp_path, AgyAdapter(), "sess-1", release)
+    manager = _manager(tmp_path, CodexAdapter(), "sess-1", release)
     try:
         entry = manager._require_entry("sess-1")
 
@@ -257,3 +254,20 @@ def test_closed_and_unknown_sessions_are_not_busy(tmp_path):
     manager.close("sess-1")
     assert manager.is_busy("sess-1") is False
     assert manager.is_busy("never-existed") is False
+
+
+def test_a_parked_session_that_cannot_survive_a_restart_stays_busy(tmp_path):
+    """Agy cannot recover a session after harnessd restarts: the session
+    would come back errored and its conversation lost. Parked or not, it
+    holds the update back until its user closes it."""
+    release = tmp_path / "release"
+    manager = _manager(tmp_path, AgyAdapter(), "sess-1", release)
+    try:
+        assert AgyAdapter.recover_after_restart is False
+        assert manager.awaiting("sess-1") == "input"
+        assert manager._require_entry("sess-1").driver.has_turn_in_flight() is False
+        assert manager.is_busy("sess-1") is True
+        assert is_quiescent(_state(manager)) is False
+    finally:
+        release.touch()
+        manager.close("sess-1")
