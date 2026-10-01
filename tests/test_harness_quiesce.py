@@ -15,14 +15,18 @@ from drover.server.harness.updater import is_quiescent, quiesce_report
 
 
 class _Structured:
-    def __init__(self, alive_ids=(), dead_ids=()):
+    def __init__(self, alive_ids=(), dead_ids=(), parked_ids=()):
         self._alive = set(alive_ids)
-        self._all = list(alive_ids) + list(dead_ids)
+        self._all = list(alive_ids) + list(dead_ids) + list(parked_ids)
+        self._parked = set(parked_ids)
 
     def session_ids(self):
         return list(self._all)
 
     def is_alive(self, session_id):
+        return session_id in self._alive or session_id in self._parked
+
+    def is_busy(self, session_id):
         return session_id in self._alive
 
 
@@ -91,14 +95,42 @@ def test_a_broken_pty_manager_blocks_too():
     assert is_quiescent(state) is False
 
 
-def test_is_alive_raising_blocks():
+def test_is_busy_raising_blocks():
     """A per-session failure is still an unknown answer."""
 
     class _PartiallyBroken:
         def session_ids(self):
             return ["s1"]
 
-        def is_alive(self, session_id):
+        def is_busy(self, session_id):
             raise RuntimeError("driver gone")
 
     assert is_quiescent(_state(structured=_PartiallyBroken())) is False
+
+
+def test_a_session_parked_between_turns_does_not_block():
+    """Open but idle is not work (drover#236): a host with a session waiting
+    on its user must still be able to take an update."""
+    state = _state(structured=_Structured(parked_ids=["s1", "s2"]))
+    assert is_quiescent(state) is True
+    assert quiesce_report(state).structured_alive == 0
+
+
+def test_a_parked_session_does_not_hide_a_busy_one():
+    state = _state(structured=_Structured(alive_ids=["s1"], parked_ids=["s2"]))
+    assert quiesce_report(state).structured_alive == 1
+    assert is_quiescent(state) is False
+
+
+def test_a_manager_that_cannot_say_busy_blocks():
+    """Liveness alone is no longer enough to call a host idle. A manager that
+    only answers is_alive is an unknown answer, which means busy."""
+
+    class _LivenessOnly:
+        def session_ids(self):
+            return ["s1"]
+
+        def is_alive(self, session_id):
+            return False
+
+    assert is_quiescent(_state(structured=_LivenessOnly())) is False

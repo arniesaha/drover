@@ -182,6 +182,16 @@ class DeepSeekDriver:
     def is_alive(self) -> bool:
         return not self._closed
 
+    def has_turn_in_flight(self) -> bool:
+        """Whether a turn is still being driven or polled (drover#236).
+
+        The turn itself runs in the Web RPC service; what dies with harnessd
+        is the poll thread recording its events, so that is what counts.
+        """
+        with self._lock:
+            worker = self._turn_thread
+            return self._turn_active or (worker is not None and worker.is_alive())
+
     def send_turn(
         self,
         text: str,
