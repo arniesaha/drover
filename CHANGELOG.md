@@ -71,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `?archived_cursor=` from `next_archived_cursor` page through older history.
   The hub's `/harness` fleet view, which iOS and web read, is unchanged (#224,
   #451).
+- The watcher no longer fails a batch about once a day with `Conflict on tuple
+  deletion!` in `enqueue_summary_generation`. When a live session's next batch
+  arrived while the summarizer was committing the previous generation, both
+  rewrote the same `summarize_jobs` row in overlapping transactions; the batch
+  was left in place and parsed again. Every `summarize_jobs` write in the hub
+  now goes through one in-process writer, so the enqueue waits for that commit
+  and the next generation is queued behind it. Re-parsing a batch after a
+  failed enqueue adds no events and no second job (#308).
 
 - Keep metrics scrapes and small insight actions independent of cockpit admission,
   allow heavy requests a one-second admission wait, retry deferred day summaries

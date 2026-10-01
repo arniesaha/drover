@@ -16,6 +16,7 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.db import control_plane_path
+from drover.server.summarizer.jobs import source_version_for_session
 from drover.server.watcher import (
     IncomingWatcher,
     _Handler,
@@ -658,6 +659,162 @@ def test_handler_publishes_only_when_source_generation_is_created(
     handler._maybe_ingest(batch)
 
     assert published == []
+
+
+def _write_live_session_event(jsonl_path: Path, event_id: str, minute: int) -> None:
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "id": event_id,
+                "session_id": "sess-live",
+                "timestamp": f"2026-05-08T10:{minute:02d}:00Z",
+                "agent_id": "test-agent",
+                "event_type": "user_message",
+                "message": {"role": "user", "content": f"turn {event_id}"},
+            }
+        )
+        + "\n"
+    )
+
+
+def _summary_llm(prompt: str, **_kwargs) -> dict:
+    return {"summary_md": "summary", "next_steps_md": "next"}
+
+
+def test_enqueue_waits_for_a_worker_completing_the_same_session(
+    lh, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#308: two writers on one summarize_jobs row, made deterministic.
+
+    The summarizer worker finishes generation N inside one transaction whose
+    ``UPDATE ... RETURNING`` DuckDB executes as a delete plus insert. A live
+    session's next batch makes the watcher's enqueue upsert generation N+1 on
+    the same row, also a delete plus insert. Overlapping, the enqueue failed
+    with "Conflict on tuple deletion!" and the file was left to be re-parsed.
+    """
+    import drover.server.summarizer.worker as worker_module
+    from drover.server.summarizer.worker import SummarizerWorker
+
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini-claude"
+    host_dir.mkdir()
+    handler = _Handler(parquet_dir, db_path, max_lock_retries=0)
+    first = host_dir / "batch-1.jsonl"
+    _write_live_session_event(first, "live-1", 0)
+    handler._maybe_ingest(first)
+    assert (host_dir / ".processed" / "batch-1.jsonl").exists()
+
+    inside_completion = threading.Event()
+    release_completion = threading.Event()
+    real_enqueue_embed = worker_module._enqueue_embed_on_connection
+
+    def held_completion(con, session_id, source_version):
+        # Runs inside the worker's open completion transaction, after its
+        # UPDATE ... RETURNING has claimed the summarize_jobs row.
+        inside_completion.set()
+        assert release_completion.wait(10)
+        return real_enqueue_embed(con, session_id, source_version)
+
+    monkeypatch.setattr(worker_module, "_enqueue_embed_on_connection", held_completion)
+    worker = SummarizerWorker(duckdb_path=db_path, _llm_call=_summary_llm)
+    drained: list[int] = []
+    worker_thread = threading.Thread(target=lambda: drained.append(worker.drain_once()))
+    worker_thread.start()
+    assert inside_completion.wait(10), "worker never reached its completion"
+
+    second = host_dir / "batch-2.jsonl"
+    _write_live_session_event(second, "live-2", 1)
+    watcher_thread = threading.Thread(target=handler._maybe_ingest, args=(second,))
+    watcher_thread.start()
+    # Without a single writer the enqueue fails right here, while the worker
+    # is still inside its transaction; with one it waits for the commit.
+    watcher_thread.join(timeout=0.5)
+    release_completion.set()
+    worker_thread.join(10)
+    watcher_thread.join(10)
+    assert not worker_thread.is_alive() and not watcher_thread.is_alive()
+
+    assert "ingest failed" not in caplog.text
+    assert not second.exists(), "conflict left the batch to be re-parsed"
+    assert (host_dir / ".processed" / "batch-2.jsonl").exists()
+    assert drained == [1]
+    con = duckdb.connect(str(db_path))
+    try:
+        jobs = con.execute(
+            "SELECT status, source_version FROM summarize_jobs WHERE session_id = ?",
+            ["sess-live"],
+        ).fetchall()
+        summaries = con.execute(
+            "SELECT count(*) FROM session_summaries WHERE session_id = ?",
+            ["sess-live"],
+        ).fetchone()[0]
+        current = source_version_for_session(con, "sess-live")
+    finally:
+        con.close()
+    # Generation N's summary landed, and N+1 is queued behind it rather than
+    # being overwritten by N's completion.
+    assert summaries == 1
+    assert jobs == [("pending", current)]
+
+
+def test_reparse_after_a_failed_enqueue_is_idempotent(
+    lh, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file left in place after a post-ingest failure re-parses cleanly."""
+    import drover.server.watcher as watcher_module
+
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini-claude"
+    host_dir.mkdir()
+    batch = host_dir / "batch.jsonl"
+    _write_two_session_events(batch)
+    real_enqueue = watcher_module.enqueue_summary_generation
+    calls = {"count": 0}
+
+    def conflict_once(con, session_id, source_version):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            # One session enqueued, the next one fails: a partial enqueue.
+            raise duckdb.TransactionException(
+                "TransactionContext Error: Conflict on tuple deletion!"
+            )
+        return real_enqueue(con, session_id, source_version)
+
+    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", conflict_once)
+    handler = _Handler(parquet_dir, db_path, max_lock_retries=0)
+
+    handler._maybe_ingest(batch)
+    assert batch.exists(), "a failed enqueue must leave the file for re-parse"
+
+    handler._maybe_ingest(batch)
+    assert not batch.exists()
+    assert (host_dir / ".processed" / "batch.jsonl").exists()
+
+    # A redelivered copy of the same batch is a no-op as well.
+    again = host_dir / "batch-redelivered.jsonl"
+    _write_two_session_events(again)
+    handler._maybe_ingest(again)
+    assert (host_dir / ".processed" / "batch-redelivered.jsonl").exists()
+
+    con = duckdb.connect(str(db_path))
+    try:
+        events = con.execute("""SELECT id, count(*) FROM agent_events
+                WHERE session_id IN ('sess-w1', 'sess-w2')
+                GROUP BY id ORDER BY id""").fetchall()
+        jobs = con.execute(
+            """SELECT session_id, status, source_version FROM summarize_jobs
+                WHERE session_id IN ('sess-w1', 'sess-w2') ORDER BY session_id"""
+        ).fetchall()
+        versions = {
+            sid: source_version_for_session(con, sid) for sid in ("sess-w1", "sess-w2")
+        }
+    finally:
+        con.close()
+    assert events == [("watcher-s1-001", 1), ("watcher-s2-001", 1)]
+    assert jobs == [
+        ("sess-w1", "pending", versions["sess-w1"]),
+        ("sess-w2", "pending", versions["sess-w2"]),
+    ]
 
 
 def test_handler_leaves_file_in_place_when_duckdb_lock_retries_exhaust(

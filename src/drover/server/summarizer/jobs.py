@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 import duckdb
 
@@ -19,6 +21,44 @@ SUMMARY_MAX_ATTEMPTS = 5
 # re-enqueued until it succeeds again, so a permanently failing job can no
 # longer spend an unbounded number of backend invocations.
 SUMMARY_MAX_DEAD_LETTERS = 3
+
+# DuckDB runs an UPDATE ... RETURNING, and an upsert whose DO UPDATE fires, as
+# a delete plus an insert. Two of those on one summarize_jobs row in
+# overlapping transactions fail the second with "Conflict on tuple deletion!":
+# the watcher enqueueing a live session's next generation while the summarizer
+# worker was still committing the previous one did exactly that about once a
+# day, and the batch was left to be re-parsed (#308). Plain UPDATEs do not
+# conflict, which is worse rather than better: they overwrite each other. Only
+# one process can open the store read-write, so one lock in that process makes
+# every summarize_jobs transition a single writer. Hold it around the write
+# transaction only -- never around a model call, a scan or a stream publish.
+_SUMMARY_JOBS_WRITE_LOCK = threading.RLock()
+
+
+@contextmanager
+def summary_jobs_writer() -> Iterator[None]:
+    """Serialize one write transaction on ``summarize_jobs`` in this process."""
+    with _SUMMARY_JOBS_WRITE_LOCK:
+        yield
+
+
+@contextmanager
+def summary_jobs_transaction(con: duckdb.DuckDBPyConnection) -> Iterator[None]:
+    """Hold the writer for one explicit transaction on ``con``.
+
+    A failed transaction is rolled back before the writer is released: until
+    then its uncommitted rewrite still owns the row, and the next writer would
+    conflict with it exactly as before.
+    """
+    with _SUMMARY_JOBS_WRITE_LOCK:
+        try:
+            yield
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except duckdb.Error:
+                pass
+            raise
 
 
 def _duckdb_timestamp(value: datetime) -> datetime:
@@ -66,6 +106,13 @@ def enqueue_summary_generation(
     and ``dead_letter_streak`` carry across, and once the streak reaches
     ``SUMMARY_MAX_DEAD_LETTERS`` no further generation opens at all.
     """
+    with summary_jobs_writer():
+        return _open_summary_generation(con, session_id, source_version)
+
+
+def _open_summary_generation(
+    con: duckdb.DuckDBPyConnection, session_id: str, source_version: str
+) -> bool:
     try:
         con.execute("BEGIN TRANSACTION")
         legacy = con.execute(
@@ -152,12 +199,13 @@ def publish_summary_generation(
     if pending is None:
         return False
     stream.add({"session_id": session_id, "source_version": source_version})
-    con.execute(
-        """UPDATE summarize_jobs SET stream_publish_needed=FALSE
-             WHERE session_id=?
-               AND source_version IS NOT DISTINCT FROM ?""",
-        [session_id, source_version],
-    )
+    with summary_jobs_writer():
+        con.execute(
+            """UPDATE summarize_jobs SET stream_publish_needed=FALSE
+                 WHERE session_id=?
+                   AND source_version IS NOT DISTINCT FROM ?""",
+            [session_id, source_version],
+        )
     return True
 
 
@@ -193,7 +241,24 @@ def finish_summary_failure(
     """Spend one failure from the matching source generation's retry budget."""
     stored_now = _duckdb_timestamp(now)
     jitter_fraction = jitter(0, 0.2)
-    updated = con.execute(
+    with summary_jobs_writer():
+        updated = _spend_summary_failure(
+            con, session_id, source_version, error, stored_now, jitter_fraction
+        )
+    if updated is None:
+        return "stale"
+    return updated[0]
+
+
+def _spend_summary_failure(
+    con: duckdb.DuckDBPyConnection,
+    session_id: str,
+    source_version: str,
+    error: str,
+    stored_now: datetime,
+    jitter_fraction: float,
+) -> tuple | None:
+    return con.execute(
         """UPDATE summarize_jobs
               SET status = CASE
                     WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
@@ -232,6 +297,3 @@ def finish_summary_failure(
             source_version,
         ],
     ).fetchone()
-    if updated is None:
-        return "stale"
-    return updated[0]

@@ -53,6 +53,8 @@ from drover.server.summarizer.derive import compute_files_touched, compute_tools
 from drover.server.summarizer.jobs import (
     finish_summary_failure,
     flush_summary_publications,
+    summary_jobs_transaction,
+    summary_jobs_writer,
 )
 from drover.server.summarizer.prompt import build_summary_prompt
 
@@ -203,12 +205,13 @@ class SummarizerWorker:
         # fallback warnings are never emitted on idle poll ticks (fixes #55).
         con = _open_summarizer_db(self.duckdb_path)
         try:
-            con.execute(
-                """UPDATE summarize_jobs
-                      SET status='pending', next_run_at=NULL, updated_at=?
-                    WHERE status='retry_wait' AND next_run_at <= ?""",
-                [self._db_now(), self._db_now()],
-            )
+            with summary_jobs_writer():
+                con.execute(
+                    """UPDATE summarize_jobs
+                          SET status='pending', next_run_at=NULL, updated_at=?
+                        WHERE status='retry_wait' AND next_run_at <= ?""",
+                    [self._db_now(), self._db_now()],
+                )
             row = con.execute(
                 "SELECT 1 FROM summarize_jobs WHERE status='pending' LIMIT 1"
             ).fetchone()
@@ -362,12 +365,13 @@ class SummarizerWorker:
             con = _open_summarizer_db(self.duckdb_path)
             try:
                 now = self._db_now()
-                con.execute(
-                    """UPDATE summarize_jobs
-                          SET status='pending', next_run_at=NULL, updated_at=?
-                        WHERE status='retry_wait' AND next_run_at <= ?""",
-                    [now, now],
-                )
+                with summary_jobs_writer():
+                    con.execute(
+                        """UPDATE summarize_jobs
+                              SET status='pending', next_run_at=NULL, updated_at=?
+                            WHERE status='retry_wait' AND next_run_at <= ?""",
+                        [now, now],
+                    )
                 row = con.execute(
                     """SELECT session_id, source_version FROM summarize_jobs
                        WHERE status='pending'
@@ -377,12 +381,13 @@ class SummarizerWorker:
                     return None
                 candidate, source_version = row
                 # Conditional update: only claim if still pending
-                con.execute(
-                    """UPDATE summarize_jobs
-                       SET status='running', updated_at=?
-                       WHERE session_id=? AND status='pending'""",
-                    [now, candidate],
-                )
+                with summary_jobs_writer():
+                    con.execute(
+                        """UPDATE summarize_jobs
+                           SET status='running', updated_at=?
+                           WHERE session_id=? AND status='pending'""",
+                        [now, candidate],
+                    )
                 # If a sibling already claimed it, fetchone returns 0 affected rows.
                 # DuckDB doesn't expose rowcount on UPDATE directly; verify via re-read.
                 claimed = con.execute(
@@ -445,23 +450,25 @@ class SummarizerWorker:
                         if next_run_at is not None:
                             self._defer_delivery(delivery, next_run_at)
                         return None
-                    con.execute(
-                        """UPDATE summarize_jobs
-                              SET status='pending', next_run_at=NULL, updated_at=?
-                            WHERE session_id=? AND status='retry_wait'
-                              AND source_version IS NOT DISTINCT FROM ?""",
-                        [now, session_id, source_version],
-                    )
+                    with summary_jobs_writer():
+                        con.execute(
+                            """UPDATE summarize_jobs
+                                  SET status='pending', next_run_at=NULL, updated_at=?
+                                WHERE session_id=? AND status='retry_wait'
+                                  AND source_version IS NOT DISTINCT FROM ?""",
+                            [now, session_id, source_version],
+                        )
                     status = "pending"
                 if status != "pending":
                     return None
-                con.execute(
-                    """UPDATE summarize_jobs
-                       SET status='running', updated_at=?
-                       WHERE session_id=? AND status='pending'
-                         AND source_version IS NOT DISTINCT FROM ?""",
-                    [now, session_id, source_version],
-                )
+                with summary_jobs_writer():
+                    con.execute(
+                        """UPDATE summarize_jobs
+                           SET status='running', updated_at=?
+                           WHERE session_id=? AND status='pending'
+                             AND source_version IS NOT DISTINCT FROM ?""",
+                        [now, session_id, source_version],
+                    )
                 claimed = con.execute(
                     "SELECT status FROM summarize_jobs WHERE session_id=?",
                     [session_id],
@@ -716,91 +723,96 @@ class SummarizerWorker:
         self._before_success_effects()
 
         # Persist and create every durable success effect in one generation-fenced
-        # transaction (retry on optimistic-concurrency conflicts).
+        # transaction (retry on optimistic-concurrency conflicts). Its
+        # UPDATE ... RETURNING on summarize_jobs is a delete plus insert in
+        # DuckDB, so it holds the summarize_jobs writer: an enqueue of the next
+        # generation waits for this commit instead of failing on it (#308).
         for attempt in range(8):
             con = _open_summarizer_db(self.duckdb_path)
             try:
-                con.execute("BEGIN TRANSACTION")
-                current = con.execute(
-                    """SELECT 1 FROM summarize_jobs
-                         WHERE session_id=? AND status='running'
-                           AND source_version IS NOT DISTINCT FROM ?""",
-                    [session_id, source_version],
-                ).fetchone()
-                if current is None:
-                    con.execute("ROLLBACK")
-                    return None
-                con.execute(
-                    """INSERT OR REPLACE INTO session_summaries
-                       (session_id, task_id, agent_id, ended_at, summary_md,
-                        files_touched, tools_used, last_user_prompt, last_assistant,
-                        next_steps_md, open_questions, status, generator_model, generated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, now())""",
-                    [
-                        session_id,
-                        events[0].get("raw_data") and _safe_task_id(con, session_id),
-                        agent_id,
-                        events[-1].get("timestamp"),
-                        llm["summary_md"],
-                        files,
-                        tools,
-                        (llm.get("last_user_prompt") or last_user or "")[-500:],
-                        (llm.get("last_assistant") or last_assistant or "")[-500:],
-                        llm["next_steps_md"],
-                        llm.get("open_questions") or [],
-                        generator_model,
-                    ],
-                )
-                finalized = con.execute(
-                    """UPDATE summarize_jobs
-                          SET status='done', last_error=NULL, next_run_at=NULL,
-                              dead_letter_streak=0, updated_at=now()
-                        WHERE session_id=? AND status='running'
-                          AND source_version IS NOT DISTINCT FROM ?
-                        RETURNING session_id""",
-                    [session_id, source_version],
-                ).fetchone()
-                if finalized is None:
-                    con.execute("ROLLBACK")
-                    return None
-                project_row = con.execute(
-                    f"""WITH {_session_agent_events_ctes()}
-                       SELECT any_value(repo_owner), any_value(repo_name)
-                       FROM canonical_agent_events
-                       WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL""",
-                    [session_id],
-                ).fetchone()
-                project_key = (
-                    f"{project_row[0]}/{project_row[1]}"
-                    if project_row and project_row[0] and project_row[1]
-                    else None
-                )
-                brief_outcome = (
-                    _enqueue_brief_on_connection(
-                        con, project_key, session_id, source_version
+                with summary_jobs_transaction(con):
+                    con.execute("BEGIN TRANSACTION")
+                    current = con.execute(
+                        """SELECT 1 FROM summarize_jobs
+                             WHERE session_id=? AND status='running'
+                               AND source_version IS NOT DISTINCT FROM ?""",
+                        [session_id, source_version],
+                    ).fetchone()
+                    if current is None:
+                        con.execute("ROLLBACK")
+                        return None
+                    con.execute(
+                        """INSERT OR REPLACE INTO session_summaries
+                           (session_id, task_id, agent_id, ended_at, summary_md,
+                            files_touched, tools_used, last_user_prompt, last_assistant,
+                            next_steps_md, open_questions, status, generator_model, generated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, now())""",
+                        [
+                            session_id,
+                            events[0].get("raw_data")
+                            and _safe_task_id(con, session_id),
+                            agent_id,
+                            events[-1].get("timestamp"),
+                            llm["summary_md"],
+                            files,
+                            tools,
+                            (llm.get("last_user_prompt") or last_user or "")[-500:],
+                            (llm.get("last_assistant") or last_assistant or "")[-500:],
+                            llm["next_steps_md"],
+                            llm.get("open_questions") or [],
+                            generator_model,
+                        ],
                     )
-                    if project_key is not None
-                    else None
-                )
-                embed_outcome = _enqueue_embed_on_connection(
-                    con, session_id, source_version
-                )
-                if ledger_job_id is not None:
-                    Ledger(con).succeed_job(
-                        ledger_job_id,
-                        artifact=ArtifactSpec(
-                            artifact_kind="session_summary",
-                            subject_key=session_id,
-                            storage_uri=f"session_summaries/{session_id}",
-                            version_token=source_version,
-                        ),
+                    finalized = con.execute(
+                        """UPDATE summarize_jobs
+                              SET status='done', last_error=NULL, next_run_at=NULL,
+                                  dead_letter_streak=0, updated_at=now()
+                            WHERE session_id=? AND status='running'
+                              AND source_version IS NOT DISTINCT FROM ?
+                            RETURNING session_id""",
+                        [session_id, source_version],
+                    ).fetchone()
+                    if finalized is None:
+                        con.execute("ROLLBACK")
+                        return None
+                    project_row = con.execute(
+                        f"""WITH {_session_agent_events_ctes()}
+                           SELECT any_value(repo_owner), any_value(repo_name)
+                           FROM canonical_agent_events
+                           WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL""",
+                        [session_id],
+                    ).fetchone()
+                    project_key = (
+                        f"{project_row[0]}/{project_row[1]}"
+                        if project_row and project_row[0] and project_row[1]
+                        else None
                     )
-                con.execute("COMMIT")
-                return _SummaryCompletion(
-                    project_key=project_key,
-                    brief_outcome=brief_outcome,
-                    embed_outcome=embed_outcome,
-                )
+                    brief_outcome = (
+                        _enqueue_brief_on_connection(
+                            con, project_key, session_id, source_version
+                        )
+                        if project_key is not None
+                        else None
+                    )
+                    embed_outcome = _enqueue_embed_on_connection(
+                        con, session_id, source_version
+                    )
+                    if ledger_job_id is not None:
+                        Ledger(con).succeed_job(
+                            ledger_job_id,
+                            artifact=ArtifactSpec(
+                                artifact_kind="session_summary",
+                                subject_key=session_id,
+                                storage_uri=f"session_summaries/{session_id}",
+                                version_token=source_version,
+                            ),
+                        )
+                    con.execute("COMMIT")
+                    return _SummaryCompletion(
+                        project_key=project_key,
+                        brief_outcome=brief_outcome,
+                        embed_outcome=embed_outcome,
+                    )
             except duckdb.TransactionException:
                 try:
                     con.execute("ROLLBACK")

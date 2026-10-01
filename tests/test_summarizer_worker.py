@@ -16,6 +16,7 @@ from drover.server.jobs import JobStream
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
     publish_summary_generation,
+    summary_jobs_transaction,
 )
 from drover.server.summarizer.worker import SummarizerWorker, _session_agent_events_ctes
 
@@ -186,6 +187,36 @@ def test_successful_summary_clears_the_dead_letter_streak(tmp_path: Path) -> Non
         ).fetchone() == ("done", 0)
     finally:
         con.close()
+
+
+def test_failed_summary_jobs_transaction_releases_the_row_with_the_writer(
+    tmp_path: Path,
+) -> None:
+    """#308: an aborted rewrite must not outlive the writer that made it."""
+    _, duckdb_path = _seed(tmp_path)
+    worker_con = duckdb.connect(str(duckdb_path))
+    watcher_con = duckdb.connect(str(duckdb_path))
+    try:
+        assert enqueue_summary_generation(watcher_con, "sess-abort", "v1") is True
+        with pytest.raises(RuntimeError):
+            with summary_jobs_transaction(worker_con):
+                worker_con.execute("BEGIN TRANSACTION")
+                # UPDATE ... RETURNING is a delete plus insert in DuckDB.
+                worker_con.execute(
+                    """UPDATE summarize_jobs SET status='done'
+                        WHERE session_id='sess-abort' RETURNING session_id"""
+                ).fetchone()
+                raise RuntimeError("completion failed mid-transaction")
+        # worker_con is still open: only the rollback inside the writer frees
+        # the row for the next generation.
+        assert enqueue_summary_generation(watcher_con, "sess-abort", "v2") is True
+        assert watcher_con.execute(
+            "SELECT status, source_version FROM summarize_jobs "
+            "WHERE session_id='sess-abort'"
+        ).fetchone() == ("pending", "v2")
+    finally:
+        worker_con.close()
+        watcher_con.close()
 
 
 def test_worker_parks_failure_until_retry_time_when_no_api_key(tmp_path: Path) -> None:
