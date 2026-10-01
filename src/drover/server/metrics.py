@@ -25,6 +25,7 @@ from drover.server.db import (
     open_duckdb_connection,
     snapshot_scratch_root,
 )
+from drover.server.harness.capabilities import InvalidCapabilities
 from drover.server.harness.daemon import native_transcript_for_session
 from drover.server.harness.model_catalog import (
     MAX_CATALOG_WIRE_BYTES,
@@ -1488,6 +1489,9 @@ class MetricsCollector:
                 agent_version=agent_version,
                 update=update,
             )
+        except InvalidCapabilities as exc:
+            # Validation errors contain only static messages, never wire data.
+            return _json_response(400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)
             return _json_response(500, {"error": str(exc)})

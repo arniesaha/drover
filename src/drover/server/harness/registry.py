@@ -25,6 +25,7 @@ from drover.server.control_outbox import (
 )
 from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
+from drover.server.harness.capabilities import validate_capabilities
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.model_catalog import CatalogEnvelope
@@ -383,6 +384,7 @@ class HarnessRegistry:
         agent_version: str | None = None,
         update: dict[str, Any] | None = None,
     ) -> HarnessHost:
+        capabilities = validate_capabilities(capabilities, host_id)
         now = _now()
         with self._connect() as con:
             con.execute(

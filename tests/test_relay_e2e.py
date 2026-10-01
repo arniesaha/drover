@@ -422,3 +422,60 @@ def test_live_content_consent_and_revoke_round_trip_over_real_relay(relay_env):
         env.hub_collector.fetch_advisory_content_bundle(HOST_ID, ["AGENTS.md"])
     with pytest.raises(RuntimeError, match="disabled"):
         env.hub_collector.fetch_advisory_content_version(HOST_ID, ["AGENTS.md"])
+
+
+def test_capability_envelope_is_identical_over_direct_relay_and_central(relay_env):
+    from drover.server.harness.daemon import register_daemon_host_remote
+
+    env = relay_env
+    state = env.harnessd_state
+    direct = _get(env.harnessd_server.server_port, "/capabilities")
+    status, body = env.hub_collector.relay_manager.request(
+        HOST_ID, "GET", "/capabilities", {}, timeout_s=10
+    )
+    assert status == 200
+    assert json.loads(body) == direct
+    assert direct["harnesses"][0]["capabilities"]["schema_version"] == 1
+    state.central_url = f"http://127.0.0.1:{env.hub_port}"
+    state.host_token = TOKEN
+    for relay in (False, True):
+        state.relay = relay
+        response = register_daemon_host_remote(state)
+        assert response["host"]["connection_kind"] == ("relay" if relay else "direct")
+        assert response["host"]["capabilities"] == direct
+        for include_sessions in (False, True):
+            # Exercise both public listing projections, bypassing the pre-test
+            # render cache populated while waiting for the relay to attach.
+            snapshot = env.hub_collector.harness_snapshot(
+                include_sessions=include_sessions
+            )
+            assert snapshot["hosts"][0]["capabilities"] == direct
+
+
+def test_host_registration_rejects_duplicate_json_keys_and_identity_mismatch(relay_env):
+    env = relay_env
+    for path, raw in (
+        (
+            "/harness/hosts",
+            b'{"host_id":"laptop","capabilities":{"harnesses":[],"harnesses":["shell"]}}',
+        ),
+        ("/harness/hosts", b'{"host_id":"laptop","capabilities":{"host_id":"other"}}'),
+        ("/harness/hosts/laptop/heartbeat", b'{"host_id":"other"}'),
+        ("/harness/hosts/laptop/heartbeat", b'{"capabilities":{"host_id":"other"}}'),
+        (
+            "/harness/hosts",
+            b'{"host_id":"laptop","padding":"' + b"x" * (128 * 1024) + b'"}',
+        ),
+    ):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{env.hub_port}{path}",
+            data=raw,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "Content-Type": "application/json",
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=10)
+        assert error.value.code == 400

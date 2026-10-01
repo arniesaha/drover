@@ -1,0 +1,144 @@
+{
+  "hosts": [
+    {
+      "host_id": "test-host",
+      "display_name": "Test Host",
+      "kind": "linux",
+      "status": "online",
+      "capabilities": {
+        "host_id": "test-host",
+        "display_name": "Test Host",
+        "kind": "linux",
+        "harnesses": [
+          {
+            "name": "shell",
+            "enabled": true,
+            "description": "Interactive POSIX shell",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "shell",
+              "launch_modes": [
+                "pty"
+              ],
+              "approvals": false,
+              "interrupt": false,
+              "native_resume": false,
+              "model_catalog": false,
+              "usage": false,
+              "worktree": false,
+              "interactive_auth": false,
+              "attachments": []
+            }
+          },
+          {
+            "name": "claude-code",
+            "enabled": false,
+            "description": "Claude Code CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "claude-code",
+              "launch_modes": [
+                "structured"
+              ],
+              "approvals": true,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": false,
+              "interactive_auth": true,
+              "attachments": [
+                "image/gif",
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          },
+          {
+            "name": "codex",
+            "enabled": false,
+            "description": "Codex CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "codex",
+              "launch_modes": [
+                "structured"
+              ],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "interactive_auth": true,
+              "attachments": [
+                "image/gif",
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          },
+          {
+            "name": "agy",
+            "enabled": false,
+            "description": "Antigravity CLI (agy)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "agy",
+              "launch_modes": [
+                "structured"
+              ],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "interactive_auth": true,
+              "attachments": [
+                "image/gif",
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          },
+          {
+            "name": "deepseek-harness",
+            "enabled": false,
+            "description": "DeepSeek Harness (local Web RPC)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "deepseek-harness",
+              "launch_modes": [
+                "structured"
+              ],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "interactive_auth": false,
+              "attachments": [
+                "image/gif",
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "sessions": [],
+  "cwd_suggestions": []
+}

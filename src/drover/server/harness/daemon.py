@@ -41,6 +41,7 @@ from drover.config import (
 from drover.native_history_identity import native_source_fingerprint
 from drover.server.harness.adapters import (
     HarnessAdapterRegistry,
+    HarnessCapabilities,
     UnsupportedHarnessOperation,
 )
 from drover.server.harness.auth import (
@@ -53,6 +54,7 @@ from drover.server.harness.auth import (
     executable_path_prefix,
     resolve_executable,
 )
+from drover.server.harness.capabilities import capability_matrix, validate_capabilities
 from drover.server.harness.content_consent import DurableContentConsent
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.factory_observer import (
@@ -1365,12 +1367,32 @@ class HarnessDaemonState:
             return self.recovery_locks.setdefault(session_id, threading.Lock())
 
     def capabilities(self) -> dict[str, Any]:
-        return {
-            "host_id": self.host_id,
-            "display_name": self.display_name,
-            "kind": self.kind,
-            "harnesses": [preset.as_json() for preset in self.presets.values()],
-        }
+        harnesses = []
+        for preset in self.presets.values():
+            if preset.name == "shell":
+                # The daemon owns the generic terminal, outside the provider
+                # adapter registry. It makes no structured-operation claims.
+                capabilities = HarnessCapabilities(frozenset({"pty"}))
+            else:
+                try:
+                    capabilities = self.adapters.resolve(preset.name).capabilities
+                except KeyError:
+                    capabilities = HarnessCapabilities(frozenset())
+            row = preset.as_json()
+            # Commands may contain environment assignments, auth or prompt
+            # arguments. Keep the legacy field, never publish the invocation.
+            row["command"] = []
+            row["capabilities"] = capability_matrix(preset.name, capabilities)
+            harnesses.append(row)
+        return validate_capabilities(
+            {
+                "host_id": self.host_id,
+                "display_name": self.display_name,
+                "kind": self.kind,
+                "harnesses": harnesses,
+            },
+            self.host_id,
+        )
 
 
 class HarnessHTTPServer(ThreadingHTTPServer):
