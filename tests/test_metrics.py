@@ -5439,7 +5439,9 @@ def test_fs_proxies_report_an_unknown_host_rather_than_dialing(tmp_path):
 def test_fs_proxies_report_a_host_without_the_routes_as_unsupported(tmp_path):
     # #232: harnessd 404s only paths it does not route, so a host 404 here
     # means a release older than path completion. Passing it through made it
-    # indistinguishable from the hub's own unknown-host 404.
+    # indistinguishable from the hub's own unknown-host 404. The status stays
+    # 404 so shipped clients keep their old (quiet) behaviour instead of
+    # reporting the host as unreachable; the body and reason carry it.
     collector = _collector_for_proxy(tmp_path)
     collector._harness_request = (  # type: ignore[method-assign]
         lambda *args, **kwargs: (404, '{"error": "not found"}\n')
@@ -5450,8 +5452,10 @@ def test_fs_proxies_report_a_host_without_the_routes_as_unsupported(tmp_path):
         collector.proxy_harness_fs_complete("old-mini", "/Users/arn"),
         collector.proxy_harness_fs_exists("old-mini", {"paths": ["/a"]}),
     ):
-        assert status == 501, body
-        assert json.loads(body)["reason"] == "unsupported"
+        assert status == 404, body
+        payload = json.loads(body)
+        assert payload["reason"] == "unsupported"
+        assert not payload["error"].startswith("unknown harness host")
 
 
 def test_fs_proxies_report_a_failed_registry_read_as_a_hub_error(tmp_path):

@@ -1909,15 +1909,19 @@ class MetricsCollector:
         method: str,
         payload: Mapping[str, Any],
     ) -> tuple[int, str]:
-        """Route an ``/fs/*`` call so each failure keeps its own status (#232).
+        """Route an ``/fs/*`` call so each failure stays distinguishable (#232).
 
-        The client turns these statuses into different hints, so they must not
-        collapse into one 404. An unknown host stays 404. A registry that could
-        not be read is the hub's fault, and transient: 500, never 404 and never
-        503, which a phone treats as a cooldown for every read on the hub. A
-        host that answers 404 runs a release older than these routes -- harnessd
-        404s only unknown paths -- so that becomes 501, a permanent "not
-        supported", rather than passing through as "not found".
+        The client turns these failures into different hints, so they must not
+        collapse into one "not found". An unknown host is 404 "unknown harness
+        host". A registry that could not be read is the hub's fault, and
+        transient: 500, never 404 and never 503, which a phone treats as a
+        cooldown for every read on the hub. A host that answers 404 runs a
+        release older than these routes -- harnessd 404s only unknown paths --
+        so the hub answers with its own ``reason: unsupported`` body. That
+        status stays 404 on purpose: shipped app builds treat any 404 here as
+        "stay quiet" and anything else as "can't reach the host", so a new
+        status would make them blame a host that answered. Clients from #232
+        on tell it apart from the unknown-host 404 by its text.
         """
         try:
             host = self._harness_host(host_id, raise_errors=True)
@@ -1935,7 +1939,7 @@ class MetricsCollector:
         )
         if status == 404:
             return _json_response(
-                501,
+                404,
                 {
                     "error": f"host does not support path completion: {host_id}",
                     "reason": "unsupported",

@@ -415,10 +415,12 @@ public final class LaunchModel {
     /// Whether a failed completion means "this host's release has no
     /// completion routes" rather than "the host could not be asked".
     ///
-    /// The hub answers 501 for that. A hub from before #232 passes the host's
-    /// own 404 through instead, which `validate()` maps to `.unavailable` like
-    /// every 404; the hub's own unknown-host 404 is told apart by its text,
-    /// and is a host the hub cannot route to, so it stays "can't reach".
+    /// The hub answers 404 with a "host does not support path completion"
+    /// body (kept 404 so older app builds are not told the host is
+    /// unreachable); a hub from before #232 passes the host's own 404 through.
+    /// `validate()` maps both to `.unavailable` like every 404; the hub's own
+    /// unknown-host 404 is told apart by its text, and is a host the hub
+    /// cannot route to, so it stays "can't reach". 501 is accepted as well.
     static func isUnsupportedCompletionError(_ error: Error) -> Bool {
         switch error {
         case DroverError.httpStatus(501, _):

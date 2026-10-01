@@ -277,10 +277,10 @@ private let unsupportedHint =
 /// A host on a release older than the completion routes never completes
 /// anything, on any keystroke. Silence reads as "no such directory", and
 /// "can't reach" would blame a host that answered — so it gets its own line
-/// (#232). The hub says 501.
+/// (#232). The hub says 404 with an "unsupported" body.
 @Test @MainActor func anUnsupportedHostSaysSoInsteadOfStayingSilent() async throws {
     MockURLProtocol.handler = { _ in
-        (501, Data(#"{"error": "host does not support path completion: work-laptop", "reason": "unsupported"}"#.utf8))
+        (404, Data(#"{"error": "host does not support path completion: work-laptop", "reason": "unsupported"}"#.utf8))
     }
     let model = try model()
 
@@ -361,7 +361,7 @@ private let unsupportedHint =
 }
 
 /// Pins the exists-check side of an unsupported host: nothing it says can
-/// hide a favorite, whether the hub is new (501) or old (404).
+/// hide a favorite, whether the hub answers 404 (current and older hubs) or 501.
 @Test(arguments: [404, 501])
 @MainActor func anUnsupportedExistsCheckKeepsShowingUntaggedSuggestions(status: Int) async throws {
     let model = try model()
