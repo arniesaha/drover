@@ -619,14 +619,15 @@ def test_probe_ignores_disabled_buckets(tmp_path: Path):
     assert [w.kind for w in snapshot.windows] == ["seven_day"]
 
 
-def test_provider_probe_falls_back_to_a_generic_label(tmp_path: Path):
+def test_provider_probe_reports_unknown_identity_without_credentials(tmp_path: Path):
     snapshot = AgyUsageProbe(
         accounts_path=tmp_path / "missing.json",
         state_dir=tmp_path,
         keychain_reader=lambda: None,
     ).read()
 
-    assert snapshot.account_label == "Antigravity"
+    assert snapshot.account_label == "Unknown account"
+    assert snapshot.account_identity is None
     assert snapshot.status == "usage_unavailable"
 
 
@@ -638,10 +639,13 @@ def test_provider_probe_never_raises_on_a_broken_accounts_file(tmp_path: Path):
         accounts_path=accounts, state_dir=tmp_path, keychain_reader=lambda: None
     ).read()
 
-    assert snapshot.account_label == "Antigravity"
+    assert snapshot.account_label == "Unknown account"
+    assert snapshot.account_identity is None
 
 
-def test_provider_probe_falls_back_to_old_accounts_when_active_is_null(tmp_path: Path):
+def test_provider_probe_does_not_attribute_an_old_account_when_active_is_null(
+    tmp_path: Path,
+):
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text(json.dumps({"active": None, "old": ["someone@example.com"]}))
 
@@ -649,4 +653,79 @@ def test_provider_probe_falls_back_to_old_accounts_when_active_is_null(tmp_path:
         accounts_path=accounts, state_dir=tmp_path, keychain_reader=lambda: None
     ).read()
 
-    assert snapshot.account_label == "someone@example.com"
+    assert snapshot.account_label == "Unknown account"
+    assert snapshot.account_identity is None
+
+
+@pytest.mark.parametrize(
+    "fixture,email",
+    [
+        ("identity-present", "ArnieSaha@gmail.com"),
+        ("identity-missing", None),
+    ],
+)
+@pytest.mark.parametrize("store", ["file", "keychain"])
+def test_current_agy_credential_identity(tmp_path: Path, fixture: str, email, store):
+    credential = (
+        Path(__file__).parent / "fixtures" / "agy" / f"{fixture}.json"
+    ).read_text()
+    if store == "file":
+        token_file = tmp_path / "antigravity-cli" / "antigravity-oauth-token"
+        token_file.parent.mkdir()
+        token_file.write_text(credential)
+    snapshot = AgyUsageProbe(
+        state_dir=tmp_path,
+        keychain_reader=lambda: credential if store == "keychain" else None,
+        opener=_opener([]),
+    ).read()
+    assert snapshot.status == "ok"
+    assert snapshot.account_label == (email or "Unknown account")
+    assert snapshot.account_identity == (email.lower() if email else None)
+
+
+def test_current_credential_wins_over_old_accounts_file(tmp_path: Path):
+    (tmp_path / "google_accounts.json").write_text(
+        json.dumps({"active": "old@example.com"})
+    )
+    credential = (
+        Path(__file__).parent / "fixtures/agy/identity-present.json"
+    ).read_text()
+    snapshot = AgyUsageProbe(
+        state_dir=tmp_path, keychain_reader=lambda: credential, opener=_opener([])
+    ).read()
+    assert snapshot.account_identity == "arniesaha@gmail.com"
+
+
+def test_malformed_id_token_does_not_hide_quota(tmp_path: Path):
+    credential = json.loads(_cred())
+    credential["id_token"] = "header.!invalid!.signature"
+    snapshot = AgyUsageProbe(
+        state_dir=tmp_path,
+        keychain_reader=lambda: json.dumps(credential),
+        opener=_opener([]),
+    ).read()
+    assert snapshot.status == "ok"
+    assert snapshot.account_identity is None
+
+
+def test_id_token_subject_is_hashed_when_email_is_absent(tmp_path: Path):
+    import base64
+    import hashlib
+
+    credential = json.loads(_cred())
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"sub": "google-user-id"}).encode())
+        .decode()
+        .rstrip("=")
+    )
+    credential["id_token"] = f"header.{payload}.signature"
+    snapshot = AgyUsageProbe(
+        state_dir=tmp_path,
+        keychain_reader=lambda: json.dumps(credential),
+        opener=_opener([]),
+    ).read()
+    assert (
+        snapshot.account_identity
+        == "google-sub:" + hashlib.sha256(b"google-user-id").hexdigest()
+    )
+    assert snapshot.account_label == "Unknown account"

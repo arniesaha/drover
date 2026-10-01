@@ -57,6 +57,7 @@ class ProviderAccountSnapshot:
     error_category: str | None = None
     provider_observed_at: datetime | None = None
     freshness_age_seconds: float | None = None
+    account_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"ok", "usage_unavailable", "stale", "error"}:
@@ -65,6 +66,10 @@ class ProviderAccountSnapshot:
             raise ValueError("observed_at must be timezone-aware")
         _require_timezone_aware(self.observed_at, "observed_at")
         _require_timezone_aware(self.provider_observed_at, "provider_observed_at")
+        if self.account_identity is None and "@" in self.account_label:
+            object.__setattr__(
+                self, "account_identity", self.account_label.strip().lower()
+            )
         windows = tuple(self.windows)
         if not all(isinstance(window, ProviderUsageWindow) for window in windows):
             raise ValueError("windows must contain ProviderUsageWindow records")
@@ -79,6 +84,7 @@ def provider_snapshot_schema() -> pa.Schema:
             ("dedup_key", pa.string()),
             ("provider", pa.string()),
             ("account_label", pa.string()),
+            ("account_identity", pa.string()),
             ("plan_label", pa.string()),
             ("host_id", pa.string()),
             ("status", pa.string()),
@@ -110,6 +116,7 @@ def provider_snapshot_table(snapshot: ProviderAccountSnapshot) -> pa.Table:
             "dedup_key": snapshot.dedup_key,
             "provider": snapshot.provider,
             "account_label": snapshot.account_label,
+            "account_identity": snapshot.account_identity,
             "plan_label": snapshot.plan_label,
             "host_id": snapshot.host_id,
             "status": snapshot.status,

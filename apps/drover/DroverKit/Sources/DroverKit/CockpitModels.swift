@@ -133,6 +133,7 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
     public let dedupKey: String
     public let provider: String
     public let accountLabel: String
+    public let accountIdentity: String?
     public let planLabel: String?
     public let hostID: String
     public let status: ProviderAccountStatus
@@ -146,6 +147,7 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
         case dedupKey = "dedup_key"
         case provider
         case accountLabel = "account_label"
+        case accountIdentity = "account_identity"
         case planLabel = "plan_label"
         case hostID = "host_id"
         case status
@@ -160,7 +162,8 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
         snapshotID = try container.decodeRequiredIdentity(forKey: .snapshotID)
         dedupKey = try container.decodeRequiredIdentity(forKey: .dedupKey)
         provider = try container.decodeRequiredIdentity(forKey: .provider)
-        accountLabel = try container.decodeRequiredIdentity(forKey: .accountLabel)
+        accountLabel = (try? container.decodeRequiredIdentity(forKey: .accountLabel)) ?? "Unknown account"
+        accountIdentity = try? container.decodeRequiredIdentity(forKey: .accountIdentity)
         planLabel = try? container.decode(String.self, forKey: .planLabel)
         hostID = try container.decodeRequiredIdentity(forKey: .hostID)
         status = try container.decode(ProviderAccountStatus.self, forKey: .status)

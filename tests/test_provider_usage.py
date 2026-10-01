@@ -757,8 +757,11 @@ def test_expired_provider_reported_window_marks_account_stale(tmp_path, provider
     assert account.windows[0].resets_at == datetime(2026, 8, 8, 15, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize(
+    "host_status,category", [("offline", "host_offline"), ("retired", "host_retired")]
+)
 def test_offline_host_stales_immediately_and_recovery_clears_status(
-    tmp_path, provider_host
+    tmp_path, provider_host, host_status, category
 ):
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
@@ -803,7 +806,7 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
     )
 
     loop.run_once()
-    current[0] = _host("offline")
+    current[0] = _host(host_status)
     monotonic_clock[0] = 10
     loop.run_once()
     offline = service.latest_accounts()[0]
@@ -813,7 +816,7 @@ def test_offline_host_stales_immediately_and_recovery_clears_status(
     recovered = service.latest_accounts()[0]
 
     assert offline.status == "stale"
-    assert offline.error_category == "host_offline"
+    assert offline.error_category == category
     assert recovered.status == "ok"
     assert recovered.error_category is None
     assert refreshes == ["mac-mini", "mac-mini"]
@@ -1054,3 +1057,20 @@ def test_legacy_codex_source_is_normalized_to_canonical_contract(
     service.refresh_host(provider_host, fetch=lambda _: legacy_payload)
 
     assert service.latest_accounts()[0].source == "codex-app-server"
+
+
+def test_explicit_account_identity_round_trips_through_hub_storage(
+    provider_service, provider_host
+):
+    import copy
+
+    payload = copy.deepcopy(GOOD_PAYLOAD)
+    payload["accounts"][0]["account_identity"] = "google-sub:fixture-stable-id"
+    payload["accounts"][0]["account_label"] = "Friendly display name"
+    provider_service.refresh_host(provider_host, fetch=lambda host: payload)
+    accounts = provider_service.latest_accounts()
+    assert accounts[0].account_identity == "google-sub:fixture-stable-id"
+    section = CockpitService(
+        duckdb_path=None, provider_usage=provider_service
+    )._provider_capacity(AnalyticsFilters())
+    assert section["data"][0]["account_identity"] == "google-sub:fixture-stable-id"

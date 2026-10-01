@@ -5,7 +5,7 @@ ProviderAccountSnapshot.
 
 ``~/.gemini`` is agy's own state directory, not a Gemini CLI leftover: it
 holds ``antigravity-cli/`` beside ``oauth_creds.json`` and
-``google_accounts.json``, and a signed-in agy writes it directly (verified
+``google_accounts.json`` on older versions, and a signed-in agy writes it directly (verified
 on the Mac mini 2026-08-09, with no ``~/.agy``, ``~/.antigravity`` or
 ``~/.codeium`` present at all).
 
@@ -68,7 +68,6 @@ from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsage
 
 log = logging.getLogger(__name__)
 
-_ACCOUNT_LABEL = "Antigravity"
 _SOURCE = "agy-usage"
 
 _DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com"
@@ -153,13 +152,14 @@ class AgyUsageProbe:
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = self.now()
-        account_label = self._account_label()
+        account_label, account_identity = self._account_metadata()
         try:
             windows = self._fetch_windows()
         except _ProbeFailure as exc:
             return _snapshot(
                 host_id=host_id,
                 account_label=account_label,
+                account_identity=account_identity,
                 status=exc.status,
                 observed_at=observed_at,
                 windows=(),
@@ -171,6 +171,7 @@ class AgyUsageProbe:
             return _snapshot(
                 host_id=host_id,
                 account_label=account_label,
+                account_identity=account_identity,
                 status="usage_unavailable",
                 observed_at=observed_at,
                 windows=(),
@@ -180,6 +181,7 @@ class AgyUsageProbe:
         return _snapshot(
             host_id=host_id,
             account_label=account_label,
+            account_identity=account_identity,
             status="ok" if windows else "usage_unavailable",
             observed_at=observed_at,
             windows=windows,
@@ -315,28 +317,40 @@ class AgyUsageProbe:
         except OSError:
             raise _ProbeFailure("unavailable", status="error") from None
 
-    def _account_label(self) -> str:
-        """Name the account this host is signed into.
+    def _account_metadata(self) -> tuple[str, str | None]:
+        """Identity from the credential actually used for quota, then legacy state.
 
-        A generic label merges distinct accounts into one card and
-        misattributes one account's consumption to the other's machines
-        (drover#69), so the signed-in address is read per host. Falls back to
-        the generic name rather than failing -- no worse than having no
-        label at all.
+        agy 1.2.11 stores the signed-in email in the credential's ID token on
+        macOS too (Keychain or antigravity-cli/antigravity-oauth-token). Decode
+        claims only as local display metadata, never as authentication proof.
+        Old account history is not evidence of the currently signed-in user.
         """
         try:
+            credential = json.loads(self._credential_blob())
+            encoded = credential.get("id_token")
+            if isinstance(encoded, str):
+                parts = encoded.split(".")
+                if len(parts) == 3:
+                    claims = json.loads(
+                        base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+                    )
+                    email = claims.get("email")
+                    if isinstance(email, str) and "@" in email and email.strip():
+                        return email.strip(), email.strip().lower()
+                    subject = claims.get("sub")
+                    if isinstance(subject, str) and subject.strip():
+                        identity = hashlib.sha256(subject.strip().encode()).hexdigest()
+                        return "Unknown account", "google-sub:" + identity
+        except Exception:  # Identity failure must not suppress quota reporting.
+            pass
+        try:
             raw = json.loads(self.accounts_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return _ACCOUNT_LABEL
-        if not isinstance(raw, Mapping):
-            return _ACCOUNT_LABEL
-        active = raw.get("active")
-        if isinstance(active, str) and active.strip():
-            return active.strip()
-        old = raw.get("old")
-        if isinstance(old, list) and old and isinstance(old[0], str) and old[0].strip():
-            return old[0].strip()
-        return _ACCOUNT_LABEL
+            active = raw.get("active")
+            if isinstance(active, str) and "@" in active and active.strip():
+                return active.strip(), active.strip().lower()
+        except (OSError, ValueError, AttributeError):
+            pass
+        return "Unknown account", None
 
 
 def _unwrap_keyring(raw: str) -> str:
@@ -490,6 +504,7 @@ def _snapshot(
     *,
     host_id: str,
     account_label: str,
+    account_identity: str | None,
     status: str,
     observed_at: datetime,
     windows: tuple[ProviderUsageWindow, ...],
@@ -499,6 +514,7 @@ def _snapshot(
     fingerprint: dict[str, Any] = {
         "provider": "google",
         "account_label": account_label,
+        "account_identity": account_identity,
         "plan_label": plan_label,
         "host_id": host_id,
         "status": status,
@@ -524,6 +540,7 @@ def _snapshot(
         dedup_key=dedup_key,
         provider="google",
         account_label=account_label,
+        account_identity=account_identity,
         plan_label=plan_label,
         host_id=host_id,
         status=status,  # type: ignore[arg-type]

@@ -1,0 +1,8 @@
+{
+  "auth_method": "consumer",
+  "token": {
+    "access_token": "fixture-token",
+    "expiry": "2099-01-01T00:00:00Z"
+  },
+  "id_token": "eyJhbGciOiAibm9uZSJ9.eyJlbWFpbCI6ICJBcm5pZVNhaGFAZ21haWwuY29tIiwgInN1YiI6ICJmaXh0dXJlLWdvb2dsZS11c2VyIn0.fixture"
+}
