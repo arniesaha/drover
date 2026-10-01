@@ -80,6 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activity (current tool, elapsed time, completed steps) and stops tool
   animation on disconnect, approval or turn completion, respecting Reduce
   Motion (#447).
+- iOS Home keeps the pinned header to a compact, horizontally scrolling strip
+  of individual account meters (lowest remaining quota first; one meter per
+  account, never summed across hosts), so sessions are no longer pushed out of
+  view. Account identities, host reporting states, quota windows and
+  diagnostics move to a dedicated Accounts page with pull to refresh, and
+  Home's activity and project blocks become compact Analytics and Insights
+  links below the session list (#456).
 - TestFlight uses the production lane with unrestricted hub pairing; the
   internal staging lane and separate staging hub are retired. A read-only,
   bounded live-hub smoke runs before upload, and physical-device acceptance is
