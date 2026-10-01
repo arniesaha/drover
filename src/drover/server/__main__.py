@@ -156,7 +156,6 @@ from drover.server.mcp.server import build_mcp_server
 from drover.server.metrics import (
     MetricsCollector,
     sequence_health_report,
-    start_metrics_server,
 )
 from drover.server.native_usage_rollup import NativeUsageRollupWorker
 from drover.server.observatory import pipeline_observatory_snapshot
@@ -185,7 +184,10 @@ from drover.server.watcher import (
     ingest_incoming_file_once,
     sweep_processed,
 )
-from drover.server.web.app import analytics_boundary_dispatcher
+from drover.server.web.app import (
+    analytics_boundary_dispatcher,
+    start_resilient_metrics_server,
+)
 from drover.server.web.auth import load_auth
 from drover.server.web.pairing import PairingCodes
 from drover.server.web.qr import pairing_url, qr_lines
@@ -2831,7 +2833,9 @@ def _run_api_role(
         collector.update_planner = planner
         _start_update_checker(planner, cfg, stop)
     pairing = PairingCodes()
-    metrics_server = start_metrics_server(
+    # A bind address that is not there yet (a VPN that is down) is retried in
+    # the background rather than exiting into a launchd restart loop (#457).
+    metrics_server = start_resilient_metrics_server(
         host=metrics_host,
         port=cfg.metrics_http_port,
         collector=collector,
@@ -3360,7 +3364,10 @@ def run(
                     health_provider=lambda: _analytics_worker_health(outbox_exporter),
                 )
             else:
-                metrics_server = start_metrics_server(
+                # Retries a missing bind address and rebinds if it vanishes
+                # while serving, so a VPN going down no longer leaves the hub
+                # running with no listener until someone restarts it (#457).
+                metrics_server = start_resilient_metrics_server(
                     host=metrics_host,
                     port=cfg.metrics_http_port,
                     collector=metrics_collector,

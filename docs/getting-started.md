@@ -200,6 +200,37 @@ server is not running while it is serving normally.
 
 Review [Security](security.md) before changing bind addresses.
 
+### Hosts With More Than One Network (LAN + VPN)
+
+The installer writes the single address it detected, which on a machine with
+Tailscale or another overlay VPN is the VPN address. That address exists only
+while the VPN client is running. When it disappears the hub keeps running and
+logs `cockpit HTTP cannot bind ... retrying` (at startup) or `bind address ...
+is no longer assigned` (while serving), retries with backoff capped at 30
+seconds, and serves again by itself once the address returns. Nothing reaches
+it in the meantime, though, including loopback and the LAN. A local
+`curl http://<vpn-address>:7080/healthz` in that window times out rather than
+being refused, because the address no longer belongs to the machine and the
+request is routed off it.
+
+On a hub that should stay reachable when one network goes away, bind every
+interface and keep pointing the phone at the address you want it to use:
+
+```toml
+[server]
+metrics_host = "0.0.0.0"
+advertised_url = "100.64.0.10:7080"
+```
+
+Every route except `/healthz`, `/readyz`, login, and the single-use pairing
+and join-probe routes requires the API token or a paired device credential
+on every interface. A wildcard bind does expose those public routes and the
+login page on the LAN and any other network the machine joins, so add the
+host-firewall or Tailscale-policy restriction from the
+[Security](security.md#network-checklist) checklist, and avoid a wildcard bind
+on a laptop that joins untrusted networks. Keep a single address there and
+accept that the hub is unreachable while that network is down.
+
 OTLP and MCP remain loopback-only unless you also set `--otlp-host` or
 `--mcp-host` explicitly.
 
