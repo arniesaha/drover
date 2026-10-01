@@ -3,6 +3,8 @@ import SwiftUI
 
 struct AnalyticsView: View {
     let store: CockpitStore
+    @State private var dimension: AnalyticsDimension = .projects
+    @State private var filtersExpanded = false
     @State private var days = 7
     @State private var host: String?
     @State private var harness: String?
@@ -13,6 +15,7 @@ struct AnalyticsView: View {
     /// of them: comparing "ranked by sessions" in one section against "ranked
     /// by tokens" in the next is exactly the confusion this is meant to remove.
     @State private var rank: DistributionRank = .sessions
+    @ScaledMetric(relativeTo: .footnote) private var metricMinimum: CGFloat = 100
 
     var body: some View {
         ScrollView {
@@ -44,8 +47,8 @@ struct AnalyticsView: View {
                 }
 
                 if let snapshot = store.analytics {
-                    providerSection(snapshot)
                     observedSection(snapshot)
+                    providerSection(snapshot)
                 } else if store.isLoadingAnalytics {
                     ProgressView("Loading analytics…")
                         .frame(maxWidth: .infinity)
@@ -65,31 +68,49 @@ struct AnalyticsView: View {
     /// edge is one nobody knows exists, and at accessibility text sizes three
     /// chips can already exceed the screen width on their own.
     private var filterStrip: some View {
-        FlowLayout(spacing: 8, lineSpacing: 8) {
-            Menu("\(days) days") {
-                ForEach([1, 7, 14, 30, 90, 365], id: \.self) { value in
-                    Button("\(value) days") { days = value; Task { await reload() } }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Menu("\(days) days") {
+                    ForEach([1, 7, 14, 30, 90, 365], id: \.self) { value in
+                        Button("\(value) days") { days = value; Task { await reload() } }
+                    }
                 }
+                Spacer()
+                Button {
+                    filtersExpanded.toggle()
+                } label: {
+                    Label(activeFilterCount == 0 ? "Filters" : "Filters · \(activeFilterCount)",
+                          systemImage: "line.3.horizontal.decrease")
+                }
+                .accessibilityHint(filtersExpanded ? "Hide filters" : "Show filters")
             }
-            AnalyticsFilterMenu(title: "Host", selection: host, values: hostValues) {
-                host = $0; Task { await reload() }
-            }
-            AnalyticsFilterMenu(title: "Harness", selection: harness, values: harnessValues) {
-                harness = $0; Task { await reload() }
-            }
-            AnalyticsFilterMenu(title: "Provider", selection: provider, values: providerValues) {
-                provider = $0; Task { await reload() }
-            }
-            AnalyticsFilterMenu(title: "Model", selection: model, values: modelValues) {
-                model = $0; Task { await reload() }
-            }
-            AnalyticsFilterMenu(title: "Project", selection: project, values: projectValues) {
-                project = $0; Task { await reload() }
+            if filtersExpanded {
+                FlowLayout(spacing: 8, lineSpacing: 8) {
+                    AnalyticsFilterMenu(title: "Host", selection: host, values: hostValues) {
+                        host = $0; Task { await reload() }
+                    }
+                    AnalyticsFilterMenu(title: "Harness", selection: harness, values: harnessValues) {
+                        harness = $0; Task { await reload() }
+                    }
+                    AnalyticsFilterMenu(title: "Provider", selection: provider, values: providerValues) {
+                        provider = $0; Task { await reload() }
+                    }
+                    AnalyticsFilterMenu(title: "Model", selection: model, values: modelValues) {
+                        model = $0; Task { await reload() }
+                    }
+                    AnalyticsFilterMenu(title: "Project", selection: project, values: projectValues) {
+                        project = $0; Task { await reload() }
+                    }
+                }
             }
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
         .accessibilityIdentifier("analytics-filters")
+    }
+
+    private var activeFilterCount: Int {
+        [host, harness, provider, model, project].compactMap { $0 }.count
     }
 
     @ViewBuilder
@@ -123,36 +144,11 @@ struct AnalyticsView: View {
                     // account signed in on three machines was three identical
                     // rows with nothing to tell them apart.
                     ForEach(ProviderSubscriptionGrouping.group(accounts)) { subscription in
-                        CockpitCard {
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack(alignment: .firstTextBaseline) {
-                                    Text(subscription.title)
-                                        .droverText(.h2)
-                                    Spacer(minLength: 8)
-                                    Text(section.accountStatusText(accountStatus: subscription.status))
-                                        .droverText(.marker)
-                                }
-                                Text(subscription.hostsText)
-                                    .droverText(.subtitle)
-                                // Every window, with a bar each. The cockpit
-                                // card shows only the tightest one so the
-                                // strip can hold its shape; this is where the
-                                // rest are meant to be found.
-                                ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in
-                                    ProviderWindowRow(
-                                        account: subscription.representative, window: window
-                                    )
-                                }
-                                if let reason = subscription.reasonText {
-                                    Label(reason, systemImage: "exclamationmark.triangle")
-                                        .droverText(.subtitle, accented: true)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            }
-                        }
+                        ProviderAccountCard(subscription: subscription, section: section)
                     }
                 }
             }
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("analytics-provider-reported")
         }
     }
@@ -191,20 +187,19 @@ struct AnalyticsView: View {
                     .droverText(.subtitle)
                     .fixedSize(horizontal: false, vertical: true)
                 if let sourceText = sources.text {
-                    Text(sourceText)
-                        .droverText(.subtitle)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityLabel(sources.accessibilityText ?? sourceText)
+                    DisclosureGroup("Measurement sources") {
+                        Text(sourceText)
+                            .droverText(.subtitle)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel(sources.accessibilityText ?? sourceText)
+                    }
+                    .droverText(.subtitle)
                 }
                 CockpitCard {
-                    // A wider minimum than the old 88pt: at accessibility
-                    // sizes three columns crushed the longest metric label
-                    // into a stack of single words. Reflows two-up, then one.
-                    // (Deliberately not naming that label here — a Python
-                    // test greps these sources and counts its occurrences,
-                    // comments included.)
+                    // Three metrics fit at normal sizes; scaled minimums
+                    // reflow into fewer columns as accessibility text grows.
                     LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: 116), alignment: .leading)],
+                        columns: [GridItem(.adaptive(minimum: metricMinimum), alignment: .leading)],
                         alignment: .leading,
                         spacing: 12
                     ) {
@@ -225,38 +220,63 @@ struct AnalyticsView: View {
                     }
                 }
 
-                distributionSection(
-                    title: "Projects", singular: "project", glyph: "folder",
-                    dimension: .projects,
-                    entries: store.analyticsProjects.map {
-                        DistributionPresentationBuilder.Entry(
-                            key: $0.projectKey,
-                            sessionCount: $0.sessionCount,
-                            totalTokens: $0.totalTokens,
-                            metadata: $0.metadata,
-                            secondaryText: projectContributors($0)
-                        )
-                    },
-                    activity: activity
-                )
-                distributionSection(
-                    title: "Harnesses", singular: "harness", glyph: "cpu",
-                    dimension: .harnesses,
-                    entries: entries(store.analyticsHarnesses), activity: activity
-                )
-                distributionSection(
-                    title: "Hosts", singular: "host", glyph: "desktopcomputer",
-                    dimension: .hosts,
-                    entries: entries(store.analyticsHosts), activity: activity
-                )
-                distributionSection(
-                    title: "Models", singular: "model", glyph: "sparkles",
-                    dimension: .models,
-                    entries: entries(store.analyticsModels), activity: activity
-                )
+                FlowLayout(spacing: 6, lineSpacing: 6) {
+                    ForEach(AnalyticsDimension.allCases, id: \.self) { value in
+                        Button {
+                            dimension = value
+                        } label: {
+                            Text(dimensionTitle(value))
+                                .droverText(.nested, accented: dimension == value)
+                                .padding(.horizontal, 10)
+                                .frame(minHeight: 44)
+                                .background(dimension == value ? DroverColor.surface : DroverColor.bg,
+                                            in: Capsule())
+                                .overlay { Capsule().strokeBorder(DroverColor.line, lineWidth: 1) }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(dimension == value ? .isSelected : [])
+                        .accessibilityIdentifier("analytics-dimension-\(value.rawValue)")
+                    }
+                }
+                comparisonSection(activity)
+
             }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("analytics-drover-observed")
+    }
+
+    private func dimensionTitle(_ value: AnalyticsDimension) -> String {
+        switch value {
+        case .projects: "Projects"
+        case .harnesses: "Agents"
+        case .hosts: "Hosts"
+        case .models: "Models"
+        }
+    }
+
+    @ViewBuilder
+    private func comparisonSection(_ activity: ActivitySummary) -> some View {
+        switch dimension {
+        case .projects:
+            distributionSection(
+                title: "Projects", singular: "project", glyph: "folder", dimension: .projects,
+                entries: store.analyticsProjects.map {
+                    DistributionPresentationBuilder.Entry(
+                        key: $0.projectKey, sessionCount: $0.sessionCount,
+                        totalTokens: $0.totalTokens, metadata: $0.metadata,
+                        secondaryText: projectContributors($0))
+                }, activity: activity)
+        case .harnesses:
+            distributionSection(title: "Agents", singular: "agent", glyph: "cpu",
+                                dimension: .harnesses, entries: entries(store.analyticsHarnesses), activity: activity)
+        case .hosts:
+            distributionSection(title: "Hosts", singular: "host", glyph: "desktopcomputer",
+                                dimension: .hosts, entries: entries(store.analyticsHosts), activity: activity)
+        case .models:
+            distributionSection(title: "Models", singular: "model", glyph: "sparkles",
+                                dimension: .models, entries: entries(store.analyticsModels), activity: activity)
+        }
     }
 
     @ViewBuilder
@@ -377,7 +397,7 @@ struct AnalyticsView: View {
 /// closest to exhaustion so its cards can hold a common height; this screen is
 /// where the other windows have to be legible, so each gets the same treatment
 /// the headline gets on the card.
-private struct ProviderWindowRow: View {
+struct ProviderWindowRow: View {
     let account: ProviderAccount
     let window: ProviderWindow
 

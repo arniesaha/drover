@@ -9,18 +9,34 @@ import DroverKit
 /// it does not throw the detail away.
 struct StepRunCard: View {
     let steps: [ToolStep]
+    var activeToolIDs: Set<String> = []
+
+    private func isActive(_ step: ToolStep) -> Bool {
+        step.isRunning && activeToolIDs.contains(step.action.payload["tool_use_id"]?.stringValue ?? step.action.id)
+    }
 
     var body: some View {
         FoldRow(
             systemImage: "terminal",
-            summary: FoldSummary.steps(steps),
+            summary: summary,
             accessibilityIdentifier: "step-run",
-            isStreaming: steps.contains(where: \.isRunning)
+            isStreaming: steps.contains(where: isActive)
         ) {
             ForEach(steps) { step in
-                StepLine(step: step)
+                StepLine(step: step, isActive: isActive(step))
             }
         }
+    }
+
+    private var summary: String {
+        let completed = steps.filter { !$0.isRunning }.count
+        if steps.contains(where: isActive) {
+            return "\(completed)/\(steps.count) steps completed · working"
+        }
+        if steps.contains(where: \.isRunning) {
+            return "\(completed)/\(steps.count) steps completed · result unavailable"
+        }
+        return FoldSummary.steps(steps)
     }
 }
 
@@ -29,6 +45,7 @@ struct StepRunCard: View {
 /// the binary and its most distinguishing argument survive.
 private struct StepLine: View {
     let step: ToolStep
+    let isActive: Bool
     @State private var isExpanded = false
 
     var body: some View {
@@ -71,7 +88,7 @@ private struct StepLine: View {
     }
 
     private var mark: String {
-        if step.isRunning { return "·" }
+        if step.isRunning { return isActive ? "·" : "—" }
         return step.isFailed ? "✗" : "✓"
     }
 

@@ -16,6 +16,7 @@ struct FoldRow<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     @State private var isExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -25,7 +26,7 @@ struct FoldRow<Content: View>: View {
                 HStack(spacing: 7) {
                     Image(systemName: systemImage)
                         .font(.system(size: 11, weight: .medium))
-                        .symbolEffect(.pulse, isActive: isStreaming)
+                        .symbolEffect(.pulse, isActive: isStreaming && !reduceMotion)
                     Text(summary)
                         .lineLimit(1)
                         .truncationMode(.tail)

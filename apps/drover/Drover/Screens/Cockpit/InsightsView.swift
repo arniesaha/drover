@@ -4,6 +4,7 @@ import SwiftUI
 struct InsightsView: View {
     let client: DroverClient
     let store: CockpitStore
+    @State private var filtersExpanded = false
     @State private var state: InsightState?
     @State private var severity: InsightSeverity?
     @State private var confidence: InsightConfidence?
@@ -34,6 +35,7 @@ struct InsightsView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
                 } else {
+                    severityOverview
                     ForEach(store.insights, id: \.findingID) { insight in
                         NavigationLink {
                             InsightDetailView(client: client, store: store, summary: insight)
@@ -69,40 +71,81 @@ struct InsightsView: View {
     }
 
     private var filterStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
+            FlowLayout(spacing: 8, lineSpacing: 8) {
                 enumMenu("State", selection: state, values: InsightState.allFilterCases) {
                     state = $0; Task { await reload() }
                 }
                 enumMenu("Severity", selection: severity, values: InsightSeverity.allCases) {
                     severity = $0; Task { await reload() }
                 }
-                enumMenu("Confidence", selection: confidence, values: InsightConfidence.allCases) {
-                    confidence = $0; Task { await reload() }
+                Button {
+                    filtersExpanded.toggle()
+                } label: {
+                    Label(advancedFilterCount == 0 ? "More filters" : "More filters · \(advancedFilterCount)",
+                          systemImage: "line.3.horizontal.decrease")
                 }
-                enumMenu("Analyzer", selection: analyzerClass, values: InsightAnalyzerClass.allCases) {
-                    analyzerClass = $0; Task { await reload() }
-                }
-                TextField("Host", text: optionalBinding($host))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 120)
-                    .submitLabel(.search)
-                    .onSubmit { Task { await reload() } }
-                    .accessibilityLabel("Filter insights by host")
-                TextField("Harness", text: optionalBinding($harness))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 120)
-                    .submitLabel(.search)
-                    .onSubmit { Task { await reload() } }
-                    .accessibilityLabel("Filter insights by harness")
-                textMenu("Target", selection: targetType, values: availableTargets) {
-                    targetType = $0; Task { await reload() }
+            }
+            if filtersExpanded {
+                FlowLayout(spacing: 8, lineSpacing: 8) {
+                    enumMenu("Confidence", selection: confidence, values: InsightConfidence.allCases) {
+                        confidence = $0; Task { await reload() }
+                    }
+                    enumMenu("Analyzer", selection: analyzerClass, values: InsightAnalyzerClass.allCases) {
+                        analyzerClass = $0; Task { await reload() }
+                    }
+                    TextField("Host", text: optionalBinding($host))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                        .submitLabel(.search)
+                        .onSubmit { Task { await reload() } }
+                        .accessibilityLabel("Filter insights by host")
+                    TextField("Harness", text: optionalBinding($harness))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                        .submitLabel(.search)
+                        .onSubmit { Task { await reload() } }
+                        .accessibilityLabel("Filter insights by harness")
+                    textMenu("Target", selection: targetType, values: availableTargets) {
+                        targetType = $0; Task { await reload() }
+                    }
                 }
             }
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
         .accessibilityIdentifier("insights-filters")
+    }
+
+    private var advancedFilterCount: Int {
+        [confidence?.rawValue, analyzerClass?.rawValue, host, harness, targetType]
+            .compactMap { $0 }.count
+    }
+
+    private var severityOverview: some View {
+        CockpitCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(store.insights.count) loaded finding\(store.insights.count == 1 ? "" : "s")")
+                    .droverText(.h3)
+                FlowLayout(spacing: 8, lineSpacing: 8) {
+                    ForEach(InsightSeverity.allCases, id: \.rawValue) { value in
+                        let count = store.insights.filter { $0.severity == value }.count
+                        if count > 0 {
+                            HStack(spacing: 5) {
+                                Text("\(count)").droverText(.h2).monospacedDigit()
+                                InsightSeverityBadge(severity: value)
+                            }
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
+                }
+                Text(store.nextInsightsCursor != nil
+                     ? "Current filters · more findings available"
+                     : "Current filters")
+                    .droverText(.subtitle)
+            }
+        }
+        .accessibilityIdentifier("insights-severity-overview")
     }
 
     private func enumMenu<Value: RawRepresentable>(
@@ -156,24 +199,33 @@ private struct InsightFeedCard: View {
         let value = InsightPresentation(insight: insight)
         CockpitCard {
             VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 6) {
-                    Text(value.severityText).droverText(.marker)
-                    Text(value.sourceText).droverText(.subtitle)
-                    Text(value.confidenceText).droverText(.subtitle)
-                    Spacer(minLength: 6)
+                FlowLayout(spacing: 7, lineSpacing: 4) {
+                    InsightSeverityBadge(severity: insight.severity)
                     Text((state ?? insight.state).rawValue.capitalized).droverText(.subtitle)
                 }
-                Text(insight.title).droverText(.h2).fixedSize(horizontal: false, vertical: true)
-                Text("\(insight.targetType.replacingOccurrences(of: "_", with: " ")) · \(insight.targetID)")
-                    .droverText(.mono)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let uncertainty = value.uncertaintyText {
-                    Text(uncertainty).droverText(.subtitle)
+                HStack(alignment: .top, spacing: 8) {
+                    Text(insight.title)
+                        .droverText(.body)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(DroverColor.faint)
+                        .accessibilityHidden(true)
                 }
+                Label(insight.targetID, systemImage: "scope")
+                    .droverText(.mono)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                FlowLayout(spacing: 8, lineSpacing: 4) {
+                    Label(value.sourceText, systemImage: insight.analyzerClass == .model ? "sparkles" : "checkmark.shield")
+                    Text(value.confidenceText)
+                }
+                .droverText(.subtitle)
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(value.severityText), \(value.confidenceText), \(value.sourceText), \(insight.title), \(insight.targetID)")
+        .accessibilityLabel("\(value.severityText), \(value.confidenceText), \(value.sourceText), \(insight.title), \(insight.targetType), \(insight.targetID), \((state ?? insight.state).rawValue), \(value.uncertaintyText ?? "")")
         .accessibilityIdentifier("insight-\(insight.findingID)")
     }
 }

@@ -217,6 +217,7 @@ public final class ChatModel {
     @ObservationIgnored private var rowIDCache: (version: Int, id: String?)?
     @ObservationIgnored private var artifactsCache: (version: Int, artifacts: [SessionArtifact])?
     @ObservationIgnored private var gaugeCache: (version: Int, gauge: ContextGauge?)?
+    @ObservationIgnored private var activityCache: (version: Int, activity: SessionActivityPresentation)?
     @ObservationIgnored private(set) var historyPagesMerged = 0
     @ObservationIgnored private(set) var lastHistoryMergeDuration: Duration?
 
@@ -248,6 +249,24 @@ public final class ChatModel {
     /// rendered row use this rather than `latestRowID`.
     public var visualTailRowID: String? {
         items.last?.id
+    }
+
+    public var activity: SessionActivityPresentation {
+        let base: SessionActivityPresentation
+        if let activityCache, activityCache.version == messagesVersion {
+            base = activityCache.activity
+        } else {
+            base = SessionActivityPresentation(messages: messages)
+            activityCache = (messagesVersion, base)
+        }
+        guard isConnected else {
+            return base.overriding(phase: hasConnectedOnce ? .reconnecting : .connecting,
+                                   title: hasConnectedOnce ? "Reconnecting" : "Connecting")
+        }
+        if pendingApproval != nil { return base.overriding(phase: .approval, title: "Needs approval") }
+        if isSending { return base.overriding(phase: .sending, title: "Sending") }
+        if pendingTurn != nil { return base.overriding(phase: .delivery, title: "Awaiting delivery confirmation") }
+        return base
     }
 
     /// Prefer the current server summary for an open chat, but retain the

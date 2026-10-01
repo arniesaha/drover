@@ -167,6 +167,18 @@ struct DistributionLayoutTests {
 /// edge of a horizontal scroller, the later ones may as well not exist.
 @MainActor
 struct FlowLayoutTests {
+    @Test func oversizedHostLabelWrapsWithinItsOfferedLine() {
+        func height(width: CGFloat) -> CGFloat {
+            let view = FlowLayout {
+                Label("Work laptop with a very long descriptive host name in Vancouver", systemImage: "clock")
+                    .padding(8)
+            }
+            .dynamicTypeSize(.accessibility3)
+            let host = UIHostingController(rootView: view)
+            return host.sizeThatFits(in: CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        }
+        #expect(height(width: 200) > height(width: 600))
+    }
     private static func size(width: CGFloat, count: Int, typeSize: DynamicTypeSize = .large)
         -> CGSize {
         let view = FlowLayout(spacing: 8, lineSpacing: 8) {

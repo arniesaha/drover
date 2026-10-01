@@ -36,7 +36,7 @@ struct FlowLayout: Layout {
         for row in rows {
             var x = bounds.minX
             for index in row.indices {
-                let size = subviews[index].sizeThatFits(.unspecified)
+                let size = fittingSize(subviews[index], width: bounds.width)
                 subviews[index].place(
                     at: CGPoint(x: x, y: y + (row.height - size.height) / 2),
                     proposal: ProposedViewSize(size)
@@ -53,12 +53,20 @@ struct FlowLayout: Layout {
         var height: CGFloat = 0
     }
 
+    private func fittingSize(_ subview: LayoutSubview, width: CGFloat) -> CGSize {
+        let ideal = subview.sizeThatFits(.unspecified)
+        guard width.isFinite, ideal.width > width else { return ideal }
+        // Remeasure oversized labels with the same proposal used for placement,
+        // so their wrapped height is included in the line's height.
+        return subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
+    }
+
     private func arrange(subviews: Subviews, in width: CGFloat) -> [Row] {
         var rows: [Row] = []
         var current = Row()
 
         for index in subviews.indices {
-            let size = subviews[index].sizeThatFits(.unspecified)
+            let size = fittingSize(subviews[index], width: width)
             let needed = current.indices.isEmpty ? size.width : current.width + spacing + size.width
             // A single child wider than the line still gets its own line
             // rather than being dropped or clipped.

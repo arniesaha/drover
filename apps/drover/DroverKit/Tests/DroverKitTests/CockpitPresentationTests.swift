@@ -640,6 +640,37 @@ private func providerAccount(
     return try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
 }
 
+@Test func sharedQuotaRetainsIndependentHostProbeStates() throws {
+    let accounts = try [
+        providerAccount(snapshot: "fresh", provider: "openai", label: "me@example.com",
+                        host: "studio", observedAt: "2026-09-30T18:00:00Z"),
+        providerAccount(snapshot: "stale", provider: "openai", label: "me@example.com",
+                        host: "mini", status: "stale", observedAt: "2026-09-29T18:00:00Z",
+                        errorCategory: "host_offline"),
+    ]
+    let subscription = try #require(ProviderSubscriptionGrouping.group(
+        accounts, hostTitles: ["mini": "Mac Mini", "studio": "Studio"]
+    ).first)
+    #expect(subscription.status == .ok)
+    #expect(subscription.hosts.map(\.id) == ["mini", "studio"])
+    #expect(subscription.hosts.map(\.status) == [.stale, .ok])
+    #expect(subscription.hosts[0].accessibilityLabel.contains("Mac Mini"))
+    #expect(subscription.hosts[0].accessibilityLabel.contains("stale"))
+}
+
+@Test func repeatedHostUsesItsNewestProbeWithoutDuplicateIndicators() throws {
+    let accounts = try [
+        providerAccount(snapshot: "old", provider: "openai", label: "me@example.com",
+                        host: "studio", status: "stale", observedAt: "2026-09-29T18:00:00Z"),
+        providerAccount(snapshot: "new", provider: "openai", label: "me@example.com",
+                        host: "studio", observedAt: "2026-09-30T18:00:00Z"),
+    ]
+    let subscription = try #require(ProviderSubscriptionGrouping.group(accounts).first)
+    #expect(subscription.hosts.count == 1)
+    #expect(subscription.hosts.first?.status == .ok)
+    #expect(subscription.reasonText == nil)
+}
+
 /// The reported bug: one Codex subscription signed in on three machines
 /// rendered as three identical cards, with the host nowhere on them.
 @Test func oneSubscriptionOnManyHostsCollapsesToASingleEntry() throws {
