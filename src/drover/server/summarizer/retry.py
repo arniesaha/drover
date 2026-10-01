@@ -13,6 +13,7 @@ from typing import Any
 import duckdb
 
 from drover.server.db import open_duckdb_connection
+from drover.server.summarizer.jobs import summary_jobs_writer
 
 _AUTH_PATTERNS = (
     "401",
@@ -136,14 +137,15 @@ def retry_errored_jobs(
         if limit is not None:
             matched = matched[: max(0, int(limit))]
         if apply and matched:
-            con.executemany(
-                """UPDATE summarize_jobs
-                   SET status='pending', updated_at=now(),
-                       next_run_at=NULL, dead_lettered_at=NULL,
-                       dead_letter_streak=0
-                   WHERE session_id=? AND status IN ('errored', 'dead_lettered')""",
-                [(sid,) for sid, _ in matched],
-            )
+            with summary_jobs_writer():
+                con.executemany(
+                    """UPDATE summarize_jobs
+                       SET status='pending', updated_at=now(),
+                           next_run_at=NULL, dead_lettered_at=NULL,
+                           dead_letter_streak=0
+                       WHERE session_id=? AND status IN ('errored', 'dead_lettered')""",
+                    [(sid,) for sid, _ in matched],
+                )
             updated = [sid for sid, _ in matched]
         else:
             updated = []
