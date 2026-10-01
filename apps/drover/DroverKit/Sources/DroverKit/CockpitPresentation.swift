@@ -1021,17 +1021,18 @@ public struct ProviderCapacitySummary: Sendable, Equatable {
     }
 }
 
-/// Bounded Home preview. A provider's tightest reported quota is a routing
-/// signal, never a sum of independent subscriptions or a sign-in status.
+/// Individual subscription meters for a horizontally scrolling Home preview.
+/// Hosts sharing an account contribute one meter, never a sum of their quota.
 public struct ProviderCapacityPreview: Sendable, Equatable {
     public struct Meter: Sendable, Equatable, Identifiable {
-        public var id: String { provider }
+        public let id: String
+        public let accountLabel: String
         public let provider: String
         public let remainingFraction: Double?
         public let isStale: Bool
         public let hasWarnings: Bool
 
-        public var title: String { provider == "openai" ? "OpenAI" : provider.capitalized }
+        public var providerTitle: String { provider == "openai" ? "OpenAI" : provider.capitalized }
         public var remainingText: String {
             remainingFraction.map { "\(Int(($0 * 100).rounded()))% left" } ?? "Unknown"
         }
@@ -1039,42 +1040,30 @@ public struct ProviderCapacityPreview: Sendable, Equatable {
 
     public let accountCount: Int
     public let meters: [Meter]
-    public let additionalProviderCount: Int
     public let hasWarnings: Bool
 
     public init(subscriptions: [ProviderSubscriptionPresentation], now: Date = Date()) {
         accountCount = subscriptions.count
-        func readingIsStale(_ account: ProviderSubscriptionPresentation) -> Bool {
-            if account.isDegraded { return true }
-            guard let window = ProviderHeadline.leadingWindow(account.windows) else { return false }
-            return ProviderCapacityPresentation(account: account.representative, window: window, now: now).isStale
-        }
-        let groups = Dictionary(grouping: subscriptions, by: \.provider)
-        let all = groups.map { provider, accounts in
-            let limiting = accounts.filter { $0.headline.fraction != nil }.sorted {
-                let lhs = $0.headline.fraction ?? 0
-                let rhs = $1.headline.fraction ?? 0
-                if lhs != rhs { return lhs > rhs }
-                let leftStale = readingIsStale($0)
-                let rightStale = readingIsStale($1)
-                if leftStale != rightStale { return !leftStale }
-                return $0.id < $1.id
-            }.first
+        meters = subscriptions.map { account in
+            let expired = ProviderHeadline.leadingWindow(account.windows).map {
+                ProviderCapacityPresentation(account: account.representative, window: $0, now: now).isStale
+            } ?? false
+            let stale = account.isDegraded || expired
             return Meter(
-                provider: provider,
-                remainingFraction: limiting?.headline.fraction.map { max(0, min(1, 1 - $0)) },
-                isStale: limiting.map(readingIsStale) ?? false,
-                hasWarnings: accounts.contains {
-                    readingIsStale($0) || $0.headline.fraction == nil || $0.hosts.contains { $0.status != .ok }
-                }
+                id: account.id,
+                accountLabel: account.accountLabel,
+                provider: account.provider,
+                remainingFraction: account.headline.fraction.map { max(0, min(1, 1 - $0)) },
+                isStale: stale,
+                hasWarnings: stale || account.headline.fraction == nil || account.hosts.contains { $0.status != .ok }
             )
         }.sorted {
             let lhs = $0.remainingFraction ?? 2
             let rhs = $1.remainingFraction ?? 2
-            return lhs == rhs ? $0.provider < $1.provider : lhs < rhs
+            if lhs != rhs { return lhs < rhs }
+            if $0.isStale != $1.isStale { return !$0.isStale }
+            return $0.id < $1.id
         }
-        meters = Array(all.prefix(3))
-        additionalProviderCount = max(0, all.count - meters.count)
-        hasWarnings = all.contains(where: \.hasWarnings)
+        hasWarnings = meters.contains(where: \.hasWarnings)
     }
 }

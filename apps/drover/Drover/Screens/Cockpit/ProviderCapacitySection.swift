@@ -15,66 +15,89 @@ struct ProviderCapacitySection: View {
             subscriptions: ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
         )
         let degraded = status != .ok || statusMessage != nil
-        Button(action: onOpenAccounts) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text(typeSize.isAccessibilitySize ? "\(preview.accountCount) accounts" : "Accounts · \(preview.accountCount)").droverText(.body)
-                    if preview.hasWarnings || degraded {
-                        Image(systemName: "clock.badge.exclamationmark")
-                            .font(.caption)
-                            .foregroundStyle(DroverColor.muted)
-                            .accessibilityHidden(true)
-                    }
-                    Spacer(minLength: 4)
-                    if !typeSize.isAccessibilitySize, !preview.meters.isEmpty {
-                        Text("Lowest left").droverText(.subtitle).lineLimit(1)
-                    }
-                    if preview.additionalProviderCount > 0, !typeSize.isAccessibilitySize {
-                        Text("+\(preview.additionalProviderCount)").droverText(.subtitle)
-                    }
-                    Image(systemName: "chevron.right")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(typeSize.isAccessibilitySize ? "\(preview.accountCount) accounts" : "Accounts · \(preview.accountCount)").droverText(.body)
+                if preview.hasWarnings || degraded {
+                    Image(systemName: "clock.badge.exclamationmark")
                         .font(.caption)
                         .foregroundStyle(DroverColor.muted)
                         .accessibilityHidden(true)
                 }
-                if typeSize.isAccessibilitySize {
-                    // Detail remains a single navigation action at large type;
-                    // a three-column meter would crush labels or grow the header.
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(DroverColor.muted)
+                    .accessibilityHidden(true)
+            }
+            .accessibilityHidden(true)
+            .overlay {
+                // Enlarge the navigation target without growing the pinned pane.
+                Button(action: onOpenAccounts) {
+                    Color.clear.frame(height: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(accessibilityLabel(preview, degraded: degraded))
+                .accessibilityHint("Open all accounts, quota windows and host reporting details")
+                .accessibilityIdentifier("provider-capacity-navigation")
+            }
+
+            if typeSize.isAccessibilitySize {
+                Button(action: onOpenAccounts) {
                     Text(preview.meters.first.map { "Lowest \($0.remainingText)" } ?? "Capacity unavailable")
                         .droverText(.subtitle)
                         .fixedSize(horizontal: false, vertical: true)
-                } else if preview.meters.isEmpty {
-                    Text(degraded ? "Capacity unavailable · View details" : "No reported accounts")
-                        .droverText(.subtitle)
-                } else {
-                    HStack(alignment: .top, spacing: 10) {
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(preview.meters.first.map { meterLabel($0, degraded: degraded) } ?? "Capacity unavailable")
+                .accessibilityIdentifier("lowest-account-meter")
+            } else if preview.meters.isEmpty {
+                Text(degraded ? "Capacity unavailable · View details" : "No reported accounts")
+                    .droverText(.subtitle)
+            } else {
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 16) {
                         ForEach(preview.meters) { meter in
-                            meterView(meter, degraded: degraded)
+                            Button(action: onOpenAccounts) {
+                                meterView(meter, degraded: degraded)
+                                    .frame(minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(meterLabel(meter, degraded: degraded))
+                            .accessibilityHint("Open all account details")
+                            .accessibilityIdentifier("account-meter-\(meter.id)")
                         }
                     }
                 }
+                .scrollIndicators(.hidden)
+                .accessibilityIdentifier("account-meter-strip")
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-            .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
-            .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(DroverColor.line, lineWidth: 1) }
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel(preview, degraded: degraded))
-        .accessibilityHint("Open all accounts, quota windows and host reporting details")
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(DroverColor.line, lineWidth: 1) }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("provider-capacity-summary")
+    }
+
+    private func meterLabel(_ meter: ProviderCapacityPreview.Meter, degraded: Bool) -> String {
+        var label = "\(meter.accountLabel), \(meter.providerTitle), \(meter.remainingText)"
+        if meter.isStale || degraded { label += ", stale" }
+        return label
     }
 
     private func accessibilityLabel(_ preview: ProviderCapacityPreview, degraded: Bool) -> String {
         var parts = ["Accounts, \(preview.accountCount) accounts"]
-        for meter in preview.meters {
-            var reading = "\(meter.title), lowest reported \(meter.remainingText)"
-            if meter.isStale || degraded { reading += ", stale" }
-            parts.append(reading)
+        for meter in preview.meters.prefix(3) {
+            parts.append(meterLabel(meter, degraded: degraded))
         }
-        if preview.additionalProviderCount > 0 {
-            parts.append("\(preview.additionalProviderCount) additional providers")
+        if preview.accountCount > 3 {
+            parts.append("\(preview.accountCount - 3) additional accounts")
         }
         if preview.hasWarnings || degraded { parts.append("Some usage readings need refresh") }
         return parts.joined(separator: ". ")
@@ -83,16 +106,16 @@ struct ProviderCapacitySection: View {
     private func meterView(_ meter: ProviderCapacityPreview.Meter, degraded: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 3) {
-                Text(meter.title).droverText(.subtitle).lineLimit(1)
+                Text(meter.accountLabel).droverText(.subtitle).lineLimit(1).truncationMode(.middle)
                 if meter.isStale || degraded {
                     Image(systemName: "clock").font(.caption2).foregroundStyle(DroverColor.muted)
                 }
             }
-            Text(meter.remainingText).droverText(.subtitle).monospacedDigit()
+            Text("\(meter.providerTitle) · \(meter.remainingText)").droverText(.subtitle).monospacedDigit().lineLimit(1)
             CapacityBar(fraction: meter.remainingFraction, height: 4)
                 .opacity(meter.isStale || degraded ? 0.45 : 1)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: 180, alignment: .leading)
     }
 
 }

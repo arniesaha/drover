@@ -40,16 +40,26 @@ final class ObservabilityFixtureUITests: XCTestCase {
     func testHomePreviewOpensScrollingAccountsAndReturnsToSessions() {
         let app = launch(dark: true)
         app.tabBars.buttons["Home"].tap()
-        let preview = app.buttons["provider-capacity-summary"]
+        let preview = app.descendants(matching: .any)["provider-capacity-summary"]
         XCTAssertTrue(preview.waitForExistence(timeout: 8))
         XCTAssertLessThanOrEqual(preview.frame.height, 90)
-        XCTAssertTrue(preview.label.contains("2 additional providers"))
+        XCTAssertTrue(app.buttons["provider-capacity-navigation"].label.contains("8 additional accounts"))
+        XCTAssertGreaterThanOrEqual(app.buttons["provider-capacity-navigation"].frame.height, 44)
         let fleet = app.scrollViews["fleet-list"]
         XCTAssertTrue(fleet.exists)
         XCTAssertGreaterThan(fleet.frame.height, app.frame.height * 0.45)
         XCTAssertTrue(app.buttons["launch-button"].isHittable)
-        screenshot("home-compact-provider-preview", app)
-        preview.tap()
+        screenshot("home-compact-account-preview", app)
+        let strip = app.scrollViews["account-meter-strip"]
+        XCTAssertTrue(strip.exists)
+        let leadingAccount = strip.buttons.matching(NSPredicate(format: "label CONTAINS %@", "account-2@example.com")).firstMatch
+        XCTAssertTrue(leadingAccount.isHittable)
+        let initialX = leadingAccount.frame.minX
+        strip.swipeLeft()
+        XCTAssertLessThan(leadingAccount.frame.minX, initialX)
+        XCTAssertTrue(app.buttons["launch-button"].isHittable)
+        screenshot("home-account-preview-scrolled", app)
+        app.buttons["provider-capacity-navigation"].tap()
         let scroll = app.scrollViews["provider-accounts-scroll"]
         XCTAssertTrue(scroll.waitForExistence(timeout: 5))
         let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "alex@example.com")).firstMatch
@@ -70,9 +80,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
     func testHomePreviewKeepsSessionsReachableAtAccessibilitySize() {
         let app = launch(large: true)
         app.tabBars.buttons["Home"].tap()
-        let preview = app.buttons["provider-capacity-summary"]
+        let preview = app.descendants(matching: .any)["provider-capacity-summary"]
         XCTAssertTrue(preview.waitForExistence(timeout: 8))
-        XCTAssertTrue(app.staticTexts["Lowest 19% left"].exists)
+        XCTAssertTrue(app.buttons["lowest-account-meter"].label.contains("account-2@example.com, Anthropic, 19% left"))
         XCTAssertLessThanOrEqual(preview.frame.height, 145)
         XCTAssertGreaterThan(app.scrollViews["fleet-list"].frame.height, 180)
         XCTAssertTrue(app.buttons["launch-button"].isHittable)
