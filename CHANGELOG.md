@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- iOS cockpit: provider quota shows once per account as compact rows with
+  per-host probe indicators and expandable windows; Analytics leads with totals
+  and coverage and compares one dimension at a time; Insights adds a severity
+  overview, compact rows and folded advanced filters. Chat shows cached session
+  activity (current tool, elapsed time, completed steps) and stops tool
+  animation on disconnect, approval or turn completion, respecting Reduce
+  Motion (#447).
 - TestFlight uses the production lane with unrestricted hub pairing; the
   internal staging lane and separate staging hub are retired. A read-only,
   bounded live-hub smoke runs before upload, and physical-device acceptance is

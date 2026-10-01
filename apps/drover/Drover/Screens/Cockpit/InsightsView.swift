@@ -225,7 +225,11 @@ private struct InsightFeedCard: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(value.severityText), \(value.confidenceText), \(value.sourceText), \(insight.title), \(insight.targetType), \(insight.targetID), \((state ?? insight.state).rawValue), \(value.uncertaintyText ?? "")")
+        .accessibilityLabel([
+            value.severityText, value.confidenceText, value.sourceText, insight.title,
+            insight.targetType.replacingOccurrences(of: "_", with: " "), insight.targetID,
+            (state ?? insight.state).rawValue, value.uncertaintyText,
+        ].compactMap { $0 }.joined(separator: ", "))
         .accessibilityIdentifier("insight-\(insight.findingID)")
     }
 }
