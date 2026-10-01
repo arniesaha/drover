@@ -174,12 +174,17 @@ struct ProviderAccountCard: View {
                 }
 
                 if !subscription.staleHosts.isEmpty {
-                    DisclosureGroup("Stale hosts · \(subscription.staleHosts.count)") {
+                    DisclosureGroup {
                         ForEach(subscription.staleHosts) { host in
                             Label(host.title + " · stale", systemImage: "clock")
                                 .droverText(.subtitle)
                                 .accessibilityLabel(host.title + ", stale")
                         }
+                    } label: {
+                        // Several accounts can each have one; name the account
+                        // so VoiceOver (and UI tests) can tell them apart.
+                        Text("Stale hosts · \(subscription.staleHosts.count)")
+                            .accessibilityLabel("Stale hosts · \(subscription.staleHosts.count), \(subscription.accountLabel)")
                     }
                     .accessibilityIdentifier("stale-hosts-\(subscription.id)")
                 }

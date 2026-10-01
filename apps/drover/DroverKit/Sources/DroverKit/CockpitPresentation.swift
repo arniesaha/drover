@@ -865,12 +865,18 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
 }
 
 public enum ProviderSubscriptionGrouping {
-    /// Offline readings older than this remain in Accounts detail only.
+    /// Non-current readings older than this remain in Accounts detail only.
     public static let staleHostThreshold: TimeInterval = 72 * 60 * 60
 
+    /// Retired hosts collapse at once. Any other reading the hub no longer
+    /// calls current collapses once its last success is over 72h old, whatever
+    /// the last error was: a host whose probe failed (`unavailable`) just
+    /// before it went dark is as gone as one tagged `host_offline`. The hub
+    /// keeps `ok`/`usage_unavailable` only within its freshness window, so
+    /// those never age out here.
     public static func isCollapsedHost(_ account: ProviderAccount, now: Date) -> Bool {
         account.errorCategory == "host_retired"
-            || (account.errorCategory == "host_offline"
+            || (account.status != .ok && account.status != .usageUnavailable
                 && now.timeIntervalSince(account.observedAt) > staleHostThreshold)
     }
 

@@ -85,6 +85,19 @@ class HarnessHost:
         """
         if self.connection_kind == "relay":
             return False
+        return self.heartbeat_expired(stale_after_seconds, now=now)
+
+    def heartbeat_expired(
+        self, after_seconds: float, *, now: datetime | None = None
+    ) -> bool:
+        """True when the last heartbeat is older than ``after_seconds``.
+
+        Unlike :meth:`is_stale` this holds for relay hosts too. Their liveness
+        for routing is the relay socket, but they register through the same
+        HTTP heartbeat, so a ``last_seen_at`` days old means the host is dark
+        whichever way requests reach it. A host that never heartbeat is
+        unknown, not expired.
+        """
         if self.last_seen_at is None:
             return False
         if now is None:
@@ -98,7 +111,7 @@ class HarnessHost:
         elif self.last_seen_at.tzinfo is None and now.tzinfo is not None:
             now = now.astimezone().replace(tzinfo=None)
         age = (now - self.last_seen_at).total_seconds()
-        return age > stale_after_seconds
+        return age > after_seconds
 
 
 @dataclass(frozen=True)

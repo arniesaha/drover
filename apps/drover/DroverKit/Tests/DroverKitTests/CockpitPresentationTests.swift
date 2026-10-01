@@ -1048,7 +1048,10 @@ private let fourAnthropicWindows = """
         providerAccount(snapshot: "shared", provider: "anthropic", label: "personal@example.com", host: "mini", status: "error", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"seven_day","used_percent":42}]"#),
         providerAccount(snapshot: "codex", provider: "openai", label: "personal@example.com", host: "studio", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"primary","used_percent":28}]"#)
     ]
-    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts))
+    // Pinned clock: any non-current reading collapses once its last success is
+    // over 72h old, so the wall clock would drop the 2026-08-09 laptop reading.
+    let now = accounts[0].observedAt
+    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts, now: now), now: now)
     #expect(preview.accountCount == 3)
     try #require(preview.meters.count == 3)
     #expect(preview.meters.map(\.provider) == ["anthropic", "anthropic", "openai"])
@@ -1075,7 +1078,10 @@ private let fourAnthropicWindows = """
         providerAccount(snapshot: "fresh", provider: "openai", label: "me@example.com", host: "studio", observedAt: "2026-08-09T18:00:00Z", windows: #"[{"kind":"primary","used_percent":28}]"#),
         providerAccount(snapshot: "failed", provider: "openai", label: "me@example.com", host: "mini", status: "error", observedAt: "2026-08-09T18:00:00Z")
     ]
-    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts))
+    // Pinned clock: on the wall clock the failed probe is weeks old and
+    // collapses into Stale hosts, which would take the warning with it.
+    let now = accounts[0].observedAt
+    let preview = ProviderCapacityPreview(subscriptions: ProviderSubscriptionGrouping.group(accounts, now: now), now: now)
     #expect(preview.accountCount == 1)
     #expect(preview.meters[0].remainingText == "72% left")
     #expect(!preview.meters[0].isStale)
@@ -1139,6 +1145,45 @@ private let fourAnthropicWindows = """
     #expect(ProviderSubscriptionGrouping.isCollapsedHost(accounts[1], now: accounts[1].observedAt.addingTimeInterval(ProviderSubscriptionGrouping.staleHostThreshold + 1)))
 }
 
+/// The reference hub: work-laptop's probe failed (`unavailable`) on 2026-09-27,
+/// then the host went dark with its last success on 2026-09-25. It was never
+/// tagged `host_offline`, so its 6-day-old reading led Home's lowest meter.
+@Test func longDarkHostCollapsesWhateverItsLastProbeError() throws {
+    let accounts = try [
+        providerAccount(snapshot: "studio", provider: "anthropic", label: "me@example.com", host: "studio",
+                        observedAt: "2026-10-01T18:00:00Z", windows: #"[{"kind":"seven_day","used_percent":40}]"#),
+        providerAccount(snapshot: "work-laptop", provider: "anthropic", label: "work@example.com", host: "work-laptop",
+                        status: "stale", observedAt: "2026-09-25T18:00:00Z", errorCategory: "unavailable",
+                        windows: #"[{"kind":"seven_day","used_percent":97}]"#),
+    ]
+    let now = accounts[0].observedAt
+    let groups = ProviderSubscriptionGrouping.group(accounts, hostTitles: ["work-laptop": "work-laptop"], now: now)
+    #expect(groups.count == 2)
+    let work = try #require(groups.first { $0.accountLabel == "work@example.com" })
+    #expect(!work.isHomeEligible)
+    #expect(work.hosts.isEmpty)
+    #expect(work.staleHosts.map(\.id) == ["work-laptop"])
+
+    let preview = ProviderCapacityPreview(subscriptions: groups, now: now)
+    #expect(preview.accountCount == 1)
+    #expect(preview.meters.map(\.accountLabel) == ["me@example.com"])
+    #expect(preview.meters[0].remainingText == "60% left")
+
+    let laptop = accounts[1]
+    #expect(!ProviderSubscriptionGrouping.isCollapsedHost(laptop, now: laptop.observedAt.addingTimeInterval(ProviderSubscriptionGrouping.staleHostThreshold)))
+    #expect(ProviderSubscriptionGrouping.isCollapsedHost(laptop, now: laptop.observedAt.addingTimeInterval(ProviderSubscriptionGrouping.staleHostThreshold + 1)))
+}
+
+/// The hub only reports `ok`/`usage_unavailable` inside its freshness window,
+/// so the client never second-guesses them by age.
+@Test func currentStatusesNeverCollapseByAge() throws {
+    let accounts = try ["ok", "usage_unavailable"].map { status in
+        try providerAccount(snapshot: status, provider: "anthropic", label: "me@example.com", host: status,
+                            status: status, observedAt: "2026-08-09T18:00:00Z")
+    }
+    let now = accounts[0].observedAt.addingTimeInterval(30 * 86_400)
+    #expect(accounts.allSatisfy { !ProviderSubscriptionGrouping.isCollapsedHost($0, now: now) })
+}
 
 @Test func legacyEmailIdentityIsTrimmedAndCaseInsensitive() throws {
     let accounts = try [

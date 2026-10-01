@@ -112,6 +112,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `host_offline` readings older than 72 hours, fold into a collapsed
   **Stale hosts** list on the Accounts page and no longer count on Home; no
   data is deleted. Older app builds ignore the new field.
+- A host that has been dark for days no longer keeps a quota meter on Home just
+  because its last probe failed as `unavailable` instead of `host_offline`.
+  Relay hosts are exempt from the 45-second stale-heartbeat skip, so the hub
+  kept probing one that had gone dark and recorded each failure as
+  `unavailable`; it now tags any host whose last heartbeat is over 10 minutes
+  old as `host_offline`, whatever its connection kind. iOS also folds any
+  reading the hub no longer reports as current (anything but `ok` or
+  `usage_unavailable`) into **Stale hosts** once its last success is over 72
+  hours old, whatever the last error was, so older hubs are covered too. Quotas
+  are still never summed across hosts, and account identity grouping is
+  unchanged.
 
 ### Changed
 

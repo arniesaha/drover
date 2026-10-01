@@ -105,13 +105,45 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(google.isHittable)
         XCTAssertEqual(googleAccounts.count, 1)
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · Antigravity")).firstMatch.exists)
-        let stale = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Stale hosts")).firstMatch
+        // work@example.com has its own Stale hosts disclosure now, so match
+        // the one naming this account.
+        let stale = app.buttons.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "Stale hosts", "arniesaha@gmail.com")).firstMatch
         XCTAssertTrue(stale.isHittable)
         let nas = app.descendants(matching: .any).matching(NSPredicate(format: "label ==[c] %@", "NAS, stale")).firstMatch
         XCTAssertFalse(nas.exists)
         stale.tap()
         XCTAssertTrue(nas.waitForExistence(timeout: 3))
         screenshot("google-account-stale-hosts", app)
+    }
+
+    /// Reference hub: work-laptop's last probe failed as `unavailable` before
+    /// it went dark for 6 days. Its 3%-left reading stays off Home (count and
+    /// lowest meter unchanged) and sits under Stale hosts on Accounts.
+    @MainActor
+    func testLongDarkUnavailableHostStaysOffHome() {
+        let app = launch()
+        app.tabBars.buttons["Home"].tap()
+        let navigation = app.buttons["provider-capacity-navigation"]
+        XCTAssertTrue(navigation.waitForExistence(timeout: 8))
+        XCTAssertTrue(navigation.label.contains("11 accounts"))
+        // The strip leads with the lowest remaining meter; 3% would lead it.
+        let strip = app.scrollViews["account-meter-strip"]
+        XCTAssertTrue(strip.exists)
+        XCTAssertTrue(strip.buttons.firstMatch.label.contains("account-2@example.com, Anthropic, 19% left"))
+        XCTAssertFalse(strip.buttons.matching(NSPredicate(format: "label CONTAINS %@", "work@example.com")).firstMatch.exists)
+        navigation.tap()
+        let scroll = app.scrollViews["provider-accounts-scroll"]
+        let work = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Anthropic · work@example.com")).firstMatch
+        for _ in 0..<8 where !work.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(work.isHittable)
+        let stale = app.buttons.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "Stale hosts", "work@example.com")).firstMatch
+        for _ in 0..<3 where !stale.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(stale.isHittable)
+        let laptop = app.descendants(matching: .any).matching(NSPredicate(format: "label ==[c] %@", "work-laptop, stale")).firstMatch
+        XCTAssertFalse(laptop.exists)
+        stale.tap()
+        XCTAssertTrue(laptop.waitForExistence(timeout: 3))
+        screenshot("dark-unavailable-host-stale", app)
     }
 
     @MainActor

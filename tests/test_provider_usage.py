@@ -1,5 +1,6 @@
 """Contracts for normalized provider account usage."""
 
+import json
 import logging
 import subprocess
 import sys
@@ -915,6 +916,129 @@ def test_provider_refresh_loop_skips_stale_host(tmp_path):
     assert len(recovered) == 1
     assert recovered[0].status == "ok"
     assert recovered[0].error_category is None
+
+
+def _dark_relay_fixture():
+    path = (
+        Path(__file__).parent / "fixtures" / "providers" / "work-laptop-dark-relay.json"
+    )
+    return json.loads(path.read_text())
+
+
+def test_dark_relay_host_is_host_offline_not_its_last_probe_error(tmp_path):
+    """The reference hub's work-laptop: relay, probe failed, then went dark.
+
+    Relay hosts are exempt from the 45-second `is_stale` skip, so the loop kept
+    probing, every probe failed as `unavailable`, and the 6-day-old reading was
+    never tagged `host_offline` -- the one category Home collapsed by age.
+    """
+    fixture = _dark_relay_fixture()
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+    clock = [datetime.fromisoformat(fixture["last_success_at"])]
+    service = ProviderUsageService(
+        tmp_path / "drover.duckdb", tmp_path / "parquet", clock=lambda: clock[0]
+    )
+    heartbeat_age = [timedelta(0)]
+
+    class _Registry:
+        def list_hosts(self):
+            # last_seen_at is relative to the wall clock the loop reads.
+            return [
+                HarnessHost(
+                    **fixture["host"],
+                    last_seen_at=datetime.now(timezone.utc) - heartbeat_age[0],
+                )
+            ]
+
+    probes = []
+    responses = [fixture["payload"], RuntimeError("unavailable")]
+
+    def _fetch(host):
+        probes.append(host.host_id)
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monotonic_clock = [0.0]
+    loop = ProviderRefreshLoop(
+        provider_usage=service,
+        registry=_Registry(),
+        shutdown_event=threading.Event(),
+        interval_seconds=300,
+        clock=lambda: monotonic_clock[0],
+        fetch=_fetch,
+    )
+
+    loop.run_once()
+    clock[0] = datetime.fromisoformat(fixture["last_probe_failure_at"])
+    monotonic_clock[0] = 301.0
+    loop.run_once()
+    failed = service.latest_accounts()[0]
+    assert (failed.status, failed.error_category) == ("stale", "unavailable")
+
+    clock[0] = datetime.fromisoformat(fixture["now"])
+    heartbeat_age[0] = clock[0] - datetime.fromisoformat(fixture["last_heartbeat_at"])
+    monotonic_clock[0] = 602.0
+    loop.run_once()
+    account = service.latest_accounts()[0]
+
+    assert probes == ["work-laptop", "work-laptop"]  # no probe once dark
+    assert account.host_id == "work-laptop"
+    assert account.status == "stale"
+    assert account.error_category == "host_offline"
+    assert account.observed_at == datetime.fromisoformat(fixture["last_success_at"])
+
+
+def test_relay_host_inside_offline_window_is_still_probed(tmp_path):
+    """Relay hosts keep their #222 exemption from the 45-second stale skip."""
+    fixture = _dark_relay_fixture()
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+    service = ProviderUsageService(tmp_path / "drover.duckdb", tmp_path / "parquet")
+
+    class _Registry:
+        def list_hosts(self):
+            return [
+                HarnessHost(
+                    **fixture["host"],
+                    last_seen_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+                )
+            ]
+
+    probes = []
+    loop = ProviderRefreshLoop(
+        provider_usage=service,
+        registry=_Registry(),
+        shutdown_event=threading.Event(),
+        interval_seconds=300,
+        clock=lambda: 0.0,
+        fetch=lambda host: probes.append(host.host_id) or fixture["payload"],
+    )
+    loop.run_once()
+
+    assert probes == ["work-laptop"]
+
+
+def test_heartbeat_expired_ignores_connection_kind():
+    now = datetime(2026, 10, 1, 18, tzinfo=timezone.utc)
+
+    def _host(kind, last_seen):
+        return HarnessHost(
+            host_id="work-laptop",
+            display_name="work-laptop",
+            kind="macos",
+            status="online",
+            connection_kind=kind,
+            last_seen_at=last_seen,
+        )
+
+    for kind in ("direct", "relay"):
+        assert _host(kind, now - timedelta(seconds=601)).heartbeat_expired(600, now=now)
+        assert not _host(kind, now - timedelta(seconds=600)).heartbeat_expired(
+            600, now=now
+        )
+        # Never heartbeat is unknown, not expired.
+        assert not _host(kind, None).heartbeat_expired(600, now=now)
 
 
 def test_harness_host_is_stale_behavior():
