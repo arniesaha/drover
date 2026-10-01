@@ -5365,7 +5365,7 @@ def test_a_refused_connection_is_still_reported_as_unreachable(tmp_path, monkeyp
     assert status == 502, "nothing was started, so the old meaning still holds"
 
 
-def _stub_direct_host(host_id: str):
+def _stub_direct_host(host_id: str, **_kwargs):
     return type(
         "H",
         (),
@@ -5434,6 +5434,65 @@ def test_fs_proxies_report_an_unknown_host_rather_than_dialing(tmp_path):
     assert status == 404, body
     status, body = collector.proxy_harness_fs_exists("ghost", {"paths": []})
     assert status == 404, body
+
+
+def test_fs_proxies_report_a_host_without_the_routes_as_unsupported(tmp_path):
+    # #232: harnessd 404s only paths it does not route, so a host 404 here
+    # means a release older than path completion. Passing it through made it
+    # indistinguishable from the hub's own unknown-host 404. The status stays
+    # 404 so shipped clients keep their old (quiet) behaviour instead of
+    # reporting the host as unreachable; the body and reason carry it.
+    collector = _collector_for_proxy(tmp_path)
+    collector._harness_request = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (404, '{"error": "not found"}\n')
+    )
+    collector._harness_host = _stub_direct_host  # type: ignore[method-assign]
+
+    for status, body in (
+        collector.proxy_harness_fs_complete("old-mini", "/Users/arn"),
+        collector.proxy_harness_fs_exists("old-mini", {"paths": ["/a"]}),
+    ):
+        assert status == 404, body
+        payload = json.loads(body)
+        assert payload["reason"] == "unsupported"
+        assert not payload["error"].startswith("unknown harness host")
+
+
+def test_fs_proxies_report_a_failed_registry_read_as_a_hub_error(tmp_path):
+    # #232: a registry read failing under lock contention used to come back as
+    # "unknown harness host". It is transient and the hub's own, so it must be
+    # neither 404 nor 503 (which the phone applies as a hub-wide read cooldown).
+    collector = _collector_for_proxy(tmp_path)
+    dialed: list = []
+    collector._harness_request = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: dialed.append(args) or (200, "{}")
+    )
+
+    def _registry_locked(host_id, *, raise_errors=False):
+        if raise_errors:
+            raise RuntimeError("Could not set lock on file")
+        return None
+
+    collector._harness_host = _registry_locked  # type: ignore[method-assign]
+
+    status, body = collector.proxy_harness_fs_complete("mini", "/")
+    assert status == 500, body
+    status, body = collector.proxy_harness_fs_exists("mini", {"paths": []})
+    assert status == 500, body
+    assert dialed == []
+
+
+def test_harness_host_raises_registry_errors_only_when_asked(tmp_path, monkeypatch):
+    collector = _collector_for_proxy(tmp_path)
+
+    def _locked(self, host_id):
+        raise RuntimeError("Could not set lock on file")
+
+    monkeypatch.setattr(metrics.HarnessRegistry, "get_host", _locked)
+
+    assert collector._harness_host("mini") is None
+    with pytest.raises(RuntimeError):
+        collector._harness_host("mini", raise_errors=True)
 
 
 def test_a_slow_host_fails_completion_fast_instead_of_hanging_the_field(
