@@ -523,3 +523,24 @@ def test_query_finally_close_does_not_wait_for_recovery(tmp_path):
     finally:
         release.set()
         _wait_recovery(path)
+
+
+@pytest.mark.parametrize("failed_role", ["worker", "snapshot"])
+def test_recovery_leaves_other_analytical_instance_usable(tmp_path, failed_role):
+    live_path, copy_path = tmp_path / "live", tmp_path / "copy"
+    live = open_duckdb_connection(live_path)
+    copy = open_duckdb_connection(copy_path, role="snapshot")
+    failed, unaffected = (live, copy) if failed_role == "worker" else (copy, live)
+    path = live_path if failed_role == "worker" else copy_path
+    try:
+        db_module._invalidate_analytical_store(
+            path, failed._generation, duckdb.FatalException(_MESSAGE), failed
+        )
+        assert unaffected.execute("SELECT 42").fetchone() == (42,)
+        _wait_recovery(path)
+        assert unaffected.execute("SELECT 43").fetchone() == (43,)
+        with pytest.raises(AnalyticalStoreUnavailable):
+            failed.execute("SELECT 1")
+    finally:
+        live.close()
+        copy.close()

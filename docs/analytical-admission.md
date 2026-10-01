@@ -39,17 +39,18 @@ All values below are positive integers, read from the environment:
 | `DROVER_ANALYTICAL_HTTP_CONCURRENCY` | `1` | Concurrent heavy analytical requests per listener/dispatcher |
 | `DROVER_FLEET_HTTP_CONCURRENCY` | `4` | Concurrent fleet listing requests per listener |
 
-Existing `DROVER_DUCKDB_<ROLE>_THREADS` settings choose a role's thread count
-within the ceiling. Raising the ceiling alone does not raise the one-thread role
-defaults. Snapshot readers on private copies retain their existing separately
-configurable `DROVER_DUCKDB_SNAPSHOT_THREADS` budget; the control-plane instance
-retains `DROVER_DUCKDB_CONTROL_PLANE_THREADS`.
+`DROVER_DUCKDB_ANALYTICAL_THREADS` chooses the shared analytical thread count
+within the ceiling. Raising the ceiling alone does not raise its one-thread
+default. Legacy `WORKER`, `SUMMARIZER`, and `DIAGNOSTIC` settings are aliases for
+that same count and must agree. Snapshot readers on private copies retain
+`DROVER_DUCKDB_SNAPSHOT_THREADS`; the control-plane instance retains
+`DROVER_DUCKDB_CONTROL_PLANE_THREADS`.
 
-DuckDB `threads` and `memory_limit` remain **instance-wide**. These are not
-per-query or per-worker allocations. Role opens may still lower parallelism for
-other connections; none of the live analytical roles can raise it above the
-shared ceiling. Memory settings are unchanged. This change does not implement
-#364's instance split.
+DuckDB `threads` and `memory_limit` are **instance-wide**, not per-query or
+per-worker allocations. See [analytical memory](analytical-memory.md) for #364's
+shared-budget validation, RSS diagnostics, resource cleanup, and the remaining
+foreground-instance split design. Admission still bounds CPU contention across
+instances and processes.
 
 ## Background work
 

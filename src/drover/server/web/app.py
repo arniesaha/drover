@@ -858,6 +858,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 extra_headers={"Retry-After": "2"},
             )
         finally:
+            if heavy and self.analytics_boundary is None:
+                from drover.server.memory import release_idle_arrow_memory
+
+                release_idle_arrow_memory()
             if slots is not None:
                 slots.release()
 
@@ -2623,6 +2627,10 @@ def analytics_boundary_dispatcher(
                 503, "application/json", '{"error":"analytical_store_unavailable"}\n'
             )
         finally:
+            if lane == "heavy":
+                from drover.server.memory import release_idle_arrow_memory
+
+                release_idle_arrow_memory()
             slots.release()
 
     def dispatch_available(

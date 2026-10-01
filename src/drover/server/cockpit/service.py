@@ -394,6 +394,7 @@ class CockpitService:
                         con.close()
                     except Exception:  # noqa: BLE001 - closing is best effort
                         pass
+                outcome.pop("connection", None)
                 # Released here, not when the caller gives up at its budget:
                 # an abandoned query keeps running and keeps consuming the
                 # instance, so it is still foreground as far as the gate is
@@ -488,6 +489,11 @@ class CockpitService:
                 raise TimeoutError(
                     f"activity query exceeded {ACTIVITY_BUDGET_SECONDS:g}s budget"
                 ) from exc
+        if (
+            os.environ.get("DROVER_DUCKDB_MEMORY_DIAGNOSTICS") == "1"
+            and completed.stderr
+        ):
+            log.info("activity reader diagnostics: %s", completed.stderr.strip())
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
