@@ -4376,6 +4376,45 @@ def test_sync_created_harness_session_preserves_mode(tmp_path):
     assert session.mode == "structured"
 
 
+@pytest.mark.parametrize("extra", [{}, {"factory_observer": None}])
+def test_sync_created_app_session_preserves_project_and_cwd(tmp_path, extra):
+    collector = _make_collector(tmp_path)
+    request = {
+        "harness": "codex",
+        "mode": "structured",
+        "repo_owner": "arniesaha",
+        "repo_name": "drover",
+        "branch": "main",
+        "cwd": "/work/drover",
+        **extra,
+    }
+    collector._sync_created_harness_session(
+        "mac-mini", request, json.dumps({"session_id": "app-launch"})
+    )
+    [session] = collector.harness_snapshot()["sessions"]
+    for key in ("mode", "repo_owner", "repo_name", "branch", "cwd"):
+        assert session[key] == request[key]
+
+
+def test_sync_created_factory_session_survives_hub_parser_mismatch(tmp_path):
+    # The host already started the session; a hub-side parse disagreement
+    # (mixed versions) must not drop the row or fail the proxied create.
+    collector = _make_collector(tmp_path)
+    collector._sync_created_harness_session(
+        "studio",
+        {"harness": "codex", "mode": "structured", "factory_observer": "malformed"},
+        json.dumps(
+            {
+                "session_id": "factory-mismatch",
+                "factory_observer": {"worktree": {"path": "/worktrees/fm"}},
+            }
+        ),
+    )
+    [session] = collector.harness_snapshot()["sessions"]
+    assert session["session_id"] == "factory-mismatch"
+    assert session["cwd"] == "/worktrees/fm"
+
+
 def test_sync_created_harness_session_preserves_permission_mode(tmp_path):
     collector = _make_collector(tmp_path)
     collector._sync_created_harness_session(

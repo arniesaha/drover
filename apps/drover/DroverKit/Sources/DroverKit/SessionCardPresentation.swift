@@ -88,7 +88,7 @@ public struct SessionCardPresentation: Sendable, Equatable {
     ) {
         harness = HarnessPresentation(session.harness)
         species = session.isStructured ? .conversation : .terminal
-        projectName = Self.projectName(for: session.cwd)
+        projectName = Self.nonEmpty(session.repoName) ?? Self.projectName(for: session.cwd)
         isStale = freshness.isStale
         staleNote = freshness.staleNote
         frozenActivityText = freshness.frozenActivityText(for: session.activityDate)

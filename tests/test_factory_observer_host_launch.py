@@ -17,6 +17,7 @@ from drover.server.harness.daemon import (
 from drover.server.harness.model_catalog import CatalogEnvelope, ModelOption
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.metrics import MetricsCollector, start_metrics_server
 
 
 class _Catalog:
@@ -78,9 +79,9 @@ def _init_repo(path):
     )
 
 
-def _post(base, payload):
+def _post(base, payload, path="/sessions"):
     request = urllib.request.Request(
-        f"{base}/sessions",
+        f"{base}{path}",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -92,6 +93,22 @@ def test_factory_observer_launches_host_local_isolated_worktree_and_retries_once
     tmp_path,
 ):
     server, state, base = _server(tmp_path)
+    hub_path = tmp_path / "hub.duckdb"
+    bootstrap(parquet_dir=tmp_path / "hub-parquet", duckdb_path=hub_path)
+    collector = MetricsCollector(
+        duckdb_path=hub_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+    hub_registry = HarnessRegistry(hub_path)
+    hub_registry.register_host(
+        host_id="studio", display_name="Studio", kind="macos", local_url=base
+    )
+    hub_registry.create_session(
+        session_id="legacy-null-cwd", host_id="studio", harness="codex", command="codex"
+    )
+    hub_server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
+    hub_base = f"http://127.0.0.1:{hub_server.server_address[1]}"
     repo = tmp_path / "drover"
     _init_repo(repo)
     payload = {
@@ -113,8 +130,10 @@ def test_factory_observer_launches_host_local_isolated_worktree_and_retries_once
         "thinking_effort": "medium",
     }
     try:
-        created_status, created = _post(base, payload)
-        retry_status, retry = _post(base, payload)
+        created_status, created = _post(
+            hub_base, payload, "/harness/hosts/studio/sessions"
+        )
+        retry_status, retry = _post(hub_base, payload, "/harness/hosts/studio/sessions")
 
         assert created_status == 201
         assert retry_status == 200
@@ -137,7 +156,23 @@ def test_factory_observer_launches_host_local_isolated_worktree_and_retries_once
         assert session is not None
         assert session.cwd == str(tmp_path / "worktrees" / created["session_id"])
         assert session.handoff_mode == "factory_observer"
+        with urllib.request.urlopen(
+            f"{hub_base}/harness/sessions", timeout=5
+        ) as response:
+            listing = json.loads(response.read())
+        sessions = {item["session_id"]: item for item in listing["sessions"]}
+        listed = sessions[created["session_id"]]
+        assert listed["cwd"] == session.cwd
+        assert listed["cwd"] != str(repo)
+        assert listed["repo_owner"] == "arniesaha"
+        assert listed["repo_name"] == "drover"
+        assert listed["branch"] == "factory/run_FACTORY001"
+        assert listed["mode"] == "structured"
+        assert listed["factory_observer"]["run_id"] == "run_FACTORY001"
+        assert sessions["legacy-null-cwd"]["cwd"] is None
     finally:
+        hub_server.shutdown()
+        hub_server.server_close()
         state.pty.close_all()
         server.shutdown()
         server.server_close()

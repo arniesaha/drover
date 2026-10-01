@@ -375,6 +375,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     public var status: String
     public var awaiting: String?
     public var cwd: String?
+    public var repoName: String?
     public var lastActivity: Date?
     public var preview: String?
     public var recap: String?
@@ -401,7 +402,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         updatedAt: Date? = nil,
         endedAt: Date? = nil,
         model: String? = nil,
-        thinkingEffort: String? = nil
+        thinkingEffort: String? = nil,
+        repoName: String? = nil
     ) {
         self.id = id
         self.hostID = hostID
@@ -410,6 +412,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         self.status = status
         self.awaiting = awaiting
         self.cwd = cwd
+        self.repoName = repoName
         self.lastActivity = lastActivity
         self.preview = preview
         self.recap = recap
@@ -429,6 +432,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         case status
         case awaiting
         case cwd
+        case repoName = "repo_name"
         case lastActivity = "last_activity"
         case preview
         case recap
@@ -449,6 +453,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         status = (try? container.decode(String.self, forKey: .status)) ?? ""
         awaiting = try? container.decode(String.self, forKey: .awaiting)
         cwd = try? container.decode(String.self, forKey: .cwd)
+        repoName = try? container.decode(String.self, forKey: .repoName)
         let rawDate = try? container.decode(String.self, forKey: .lastActivity)
         lastActivity = WireDate.parse(rawDate)
         preview = try? container.decode(String.self, forKey: .preview)
