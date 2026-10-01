@@ -1,88 +1,100 @@
 import DroverKit
 import SwiftUI
 
+/// A bounded preview in the pinned inbox header. All detail lives on Accounts.
 struct ProviderCapacitySection: View {
     let accounts: [ProviderAccount]
     let status: DataStatus
     let statusMessage: String?
-    /// Host id → display title, so a merged card can name the machines it
-    /// covers. Falls back to the raw id when the fleet snapshot is unavailable.
     var hostTitles: [String: String] = [:]
-    let onOpenAnalytics: () -> Void
-
-    /// Collapsed by default, and remembered across launches.
-    ///
-    /// The strip is pinned above the inbox (#80), so its height is taken from
-    /// the session list on every screen, forever. Expanded it ran to roughly a
-    /// quarter of the viewport — worth it while you are deciding where to send
-    /// work, dead weight the rest of the time. Collapsed it keeps the one line
-    /// that answers "what have I got left"; the cards are one tap away.
-    @AppStorage("inbox.providerCapacityExpanded") private var isExpanded = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var subscriptions: [ProviderSubscriptionPresentation] {
-        ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
-    }
+    let onOpenAccounts: () -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
-        let section = ProviderSectionPresentation(
-            status: status,
-            message: statusMessage,
-            hasRetainedValues: !accounts.isEmpty
+        let preview = ProviderCapacityPreview(
+            subscriptions: ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
         )
-        VStack(alignment: .leading, spacing: 10) {
-            CockpitSectionHeading(
-                title: "Provider capacity",
-                source: "Provider reported",
-                action: accounts.isEmpty ? nil : onOpenAnalytics,
-                disclosure: accounts.isEmpty
-                    ? nil
-                    : .init(isExpanded: isExpanded) {
-                        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { isExpanded.toggle() }
+        let degraded = status != .ok || statusMessage != nil
+        Button(action: onOpenAccounts) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(typeSize.isAccessibilitySize ? "\(preview.accountCount) accounts" : "Accounts · \(preview.accountCount)").droverText(.body)
+                    if preview.hasWarnings || degraded {
+                        Image(systemName: "clock.badge.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(DroverColor.muted)
+                            .accessibilityHidden(true)
                     }
-            )
-
-            // A failed probe is not something to hide behind a chevron: it
-            // explains numbers that are missing or stale, so it shows in both
-            // states.
-            if let warning = section.warningText {
-                CockpitCard {
-                    Label(warning, systemImage: "gauge.with.dots.needle.33percent")
-                        .droverText(.nested)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if !typeSize.isAccessibilitySize, !preview.meters.isEmpty {
+                        Text("Lowest left").droverText(.subtitle).lineLimit(1)
+                    }
+                    if preview.additionalProviderCount > 0, !typeSize.isAccessibilitySize {
+                        Text("+\(preview.additionalProviderCount)").droverText(.subtitle)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(DroverColor.muted)
+                        .accessibilityHidden(true)
                 }
-                .accessibilityIdentifier("provider-capacity-warning")
-            }
-
-            if !accounts.isEmpty {
-                if isExpanded {
-                    VStack(spacing: 8) {
-                        ForEach(subscriptions) { subscription in
-                            ProviderAccountCard(subscription: subscription, section: section)
+                if typeSize.isAccessibilitySize {
+                    // Detail remains a single navigation action at large type;
+                    // a three-column meter would crush labels or grow the header.
+                    Text(preview.meters.first.map { "Lowest \($0.remainingText)" } ?? "Capacity unavailable")
+                        .droverText(.subtitle)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if preview.meters.isEmpty {
+                    Text(degraded ? "Capacity unavailable · View details" : "No reported accounts")
+                        .droverText(.subtitle)
+                } else {
+                    HStack(alignment: .top, spacing: 10) {
+                        ForEach(preview.meters) { meter in
+                            meterView(meter, degraded: degraded)
                         }
                     }
-                } else {
-                    collapsedSummary
                 }
             }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
+            .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(DroverColor.line, lineWidth: 1) }
+            .contentShape(Rectangle())
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("provider-capacity-section")
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel(preview, degraded: degraded))
+        .accessibilityHint("Open all accounts, quota windows and host reporting details")
+        .accessibilityIdentifier("provider-capacity-summary")
     }
 
-    private var collapsedSummary: some View {
-        let summary = ProviderCapacitySummary(subscriptions: subscriptions)
-        return Button {
-            withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { isExpanded = true }
-        } label: {
-            Text(summary.text)
-                .droverText(.subtitle, accented: summary.isCritical)
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .contentShape(Rectangle())
+    private func accessibilityLabel(_ preview: ProviderCapacityPreview, degraded: Bool) -> String {
+        var parts = ["Accounts, \(preview.accountCount) accounts"]
+        for meter in preview.meters {
+            var reading = "\(meter.title), lowest reported \(meter.remainingText)"
+            if meter.isStale || degraded { reading += ", stale" }
+            parts.append(reading)
         }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("provider-capacity-summary")
+        if preview.additionalProviderCount > 0 {
+            parts.append("\(preview.additionalProviderCount) additional providers")
+        }
+        if preview.hasWarnings || degraded { parts.append("Some usage readings need refresh") }
+        return parts.joined(separator: ". ")
     }
+
+    private func meterView(_ meter: ProviderCapacityPreview.Meter, degraded: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 3) {
+                Text(meter.title).droverText(.subtitle).lineLimit(1)
+                if meter.isStale || degraded {
+                    Image(systemName: "clock").font(.caption2).foregroundStyle(DroverColor.muted)
+                }
+            }
+            Text(meter.remainingText).droverText(.subtitle).monospacedDigit()
+            CapacityBar(fraction: meter.remainingFraction, height: 4)
+                .opacity(meter.isStale || degraded ? 0.45 : 1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
 }
 
 /// One subscription, with host probe states and quota detail on demand.
@@ -170,18 +182,9 @@ struct ProviderAccountCard: View {
 }
 
 struct CockpitSectionHeading: View {
-    /// An optional expand/collapse affordance. Optional because every other
-    /// cockpit section using this heading has nothing to collapse — passing
-    /// nil keeps their headings byte-identical to before.
-    struct Disclosure {
-        let isExpanded: Bool
-        let toggle: () -> Void
-    }
-
     let title: String
     let source: String?
     let action: (() -> Void)?
-    var disclosure: Disclosure? = nil
 
     var body: some View {
         // Wraps rather than sharing one line. Three items squeezed side by
@@ -198,24 +201,6 @@ struct CockpitSectionHeading: View {
                     .font(.system(.caption, design: .default, weight: .medium))
                     .foregroundStyle(DroverColor.accentHi)
                     .buttonStyle(.plain)
-            }
-            if let disclosure {
-                Button(action: disclosure.toggle) {
-                    Image(systemName: "chevron.down")
-                        .font(.system(.caption, design: .default, weight: .semibold))
-                        .rotationEffect(.degrees(disclosure.isExpanded ? 180 : 0))
-                        .foregroundStyle(DroverColor.accentHi)
-                        // The chevron alone is well under the 44pt minimum, so
-                        // the tap target is padded out rather than left at the
-                        // glyph's size.
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(disclosure.isExpanded
-                    ? "Collapse provider capacity"
-                    : "Expand provider capacity")
-                .accessibilityIdentifier("provider-capacity-disclosure")
             }
         }
     }

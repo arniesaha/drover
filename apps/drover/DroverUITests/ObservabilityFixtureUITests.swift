@@ -37,7 +37,51 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    private func launch(large: Bool = false) -> XCUIApplication {
+    func testHomePreviewOpensScrollingAccountsAndReturnsToSessions() {
+        let app = launch(dark: true)
+        app.tabBars.buttons["Home"].tap()
+        let preview = app.buttons["provider-capacity-summary"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 8))
+        XCTAssertLessThanOrEqual(preview.frame.height, 90)
+        XCTAssertTrue(preview.label.contains("2 additional providers"))
+        let fleet = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleet.exists)
+        XCTAssertGreaterThan(fleet.frame.height, app.frame.height * 0.45)
+        XCTAssertTrue(app.buttons["launch-button"].isHittable)
+        screenshot("home-compact-provider-preview", app)
+        preview.tap()
+        let scroll = app.scrollViews["provider-accounts-scroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 5))
+        let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "alex@example.com")).firstMatch
+        XCTAssertTrue(account.isHittable)
+        account.tap()
+        XCTAssertTrue(app.staticTexts["Five hour"].exists)
+        screenshot("accounts-dedicated-page", app)
+        let openAI = app.staticTexts["provider-heading-openai"]
+        for _ in 0..<6 where !openAI.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(openAI.isHittable)
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(preview.waitForExistence(timeout: 5))
+        XCTAssertLessThanOrEqual(preview.frame.height, 90)
+        XCTAssertTrue(app.buttons["launch-button"].isHittable)
+    }
+
+    @MainActor
+    func testHomePreviewKeepsSessionsReachableAtAccessibilitySize() {
+        let app = launch(large: true)
+        app.tabBars.buttons["Home"].tap()
+        let preview = app.buttons["provider-capacity-summary"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts["Lowest 19% left"].exists)
+        XCTAssertLessThanOrEqual(preview.frame.height, 145)
+        XCTAssertGreaterThan(app.scrollViews["fleet-list"].frame.height, 180)
+        XCTAssertTrue(app.buttons["launch-button"].isHittable)
+        XCTAssertLessThanOrEqual(preview.frame.maxX, app.frame.maxX)
+        screenshot("home-preview-accessibility", app)
+    }
+
+    @MainActor
+    private func launch(large: Bool = false, dark: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "observability"
@@ -45,6 +89,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
         }
+        if dark { app.launchArguments += ["-drover.appearance", "dark"] }
         app.launch()
         return app
     }

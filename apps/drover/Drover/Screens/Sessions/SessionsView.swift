@@ -39,6 +39,7 @@ struct SessionsView: View {
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
     @State private var showAnalytics = false
+    @State private var showAccounts = false
     @State private var showInsights = false
 
     init(
@@ -270,6 +271,18 @@ struct SessionsView: View {
         .navigationDestination(isPresented: $showAnalytics) {
             AnalyticsView(store: cockpitStore)
         }
+        .navigationDestination(isPresented: $showAccounts) {
+            ProviderAccountsView(
+                accounts: cockpitStore.providerAccounts,
+                status: providerSectionStatus,
+                statusMessage: cockpitStore.providerError,
+                hostTitles: hostTitles,
+                onRefresh: {
+                    await store.refresh()
+                    if let snapshot = store.snapshot { await cockpitStore.refresh(for: snapshot) }
+                }
+            )
+        }
         .navigationDestination(isPresented: $showInsights) {
             InsightsView(client: client, store: cockpitStore)
         }
@@ -329,7 +342,7 @@ struct SessionsView: View {
                 status: providerSectionStatus,
                 statusMessage: cockpitStore.providerError,
                 hostTitles: hostTitles,
-                onOpenAnalytics: { showAnalytics = true }
+                onOpenAccounts: { showAccounts = true }
             )
         }
     }
@@ -338,21 +351,22 @@ struct SessionsView: View {
     /// list, where it can no longer split it.
     @ViewBuilder
     private var analyticsSections: some View {
-        if let activity = cockpitStore.activity {
-            ActivitySummarySection(
-                activity: activity,
-                statusMessage: cockpitStore.activityError,
-                onOpenAnalytics: { showAnalytics = true }
-            )
+        Button { showAnalytics = true } label: {
+            CockpitCard {
+                HStack(spacing: 12) {
+                    Image(systemName: "chart.bar").foregroundStyle(DroverColor.accentHi)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Analytics").droverText(.h2)
+                        Text("Projects, agents, hosts and models").droverText(.subtitle)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(DroverColor.faint)
+                }
+                .frame(minHeight: 44, alignment: .leading)
+            }
         }
-
-        if !cockpitStore.popularProjects.isEmpty {
-            PopularProjectsSection(
-                projects: cockpitStore.popularProjects,
-                tokenCoveragePercent: cockpitStore.activity?.coverage.tokenPercent,
-                onOpenAnalytics: { showAnalytics = true }
-            )
-        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("analytics-summary")
 
         if cockpitStore.isInsightsAvailable {
             InsightsSummaryRow(counts: cockpitStore.insightCounts) {

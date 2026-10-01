@@ -6,6 +6,7 @@ import SwiftUI
 struct ObservabilityFixtureRoot: View {
     let client: DroverClient
     @State private var store: CockpitStore
+    @State private var appearance = AppearanceStore()
 
     init(client: DroverClient) {
         self.client = client
@@ -22,27 +23,40 @@ struct ObservabilityFixtureRoot: View {
             NavigationStack { InsightsView(client: client, store: store) }
                 .tabItem { Label("Insights", systemImage: "lightbulb") }
             NavigationStack {
-                ScrollView {
-                    VStack(spacing: 8) {
-                        ForEach(ProviderSubscriptionGrouping.group(ObservabilityFixtureData.accounts,
-                            hostTitles: ["studio": "Mac Studio", "mini": "Mac Mini", "laptop": "Work laptop with a long descriptive host name"])) { subscription in
-                            ProviderAccountCard(subscription: subscription,
-                                                section: ProviderSectionPresentation(status: .ok))
-                        }
-                    }
-                    .padding(14)
-                }
-                .background(DroverColor.bg)
-                .navigationTitle("Accounts")
-                .navigationBarTitleDisplayMode(.inline)
+                ProviderAccountsView(accounts: ObservabilityFixtureData.accounts, status: .ok,
+                    statusMessage: nil, hostTitles: ObservabilityFixtureData.hostTitles)
             }
             .tabItem { Label("Accounts", systemImage: "person.crop.circle") }
+            NavigationStack {
+                SessionsView(client: client, notifier: FixtureNotifier(), recoveryStore: nil,
+                    recoveryWriteGate: ChatRecoveryWriteGate(), recoveryGeneration: 0)
+            }
+            .tabItem { Label("Home", systemImage: "rectangle.stack") }
+
         }
+        .environment(appearance)
+        .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()
     }
 }
 
 enum ObservabilityFixtureData {
+    static let hostTitles = ["studio": "Mac Studio", "mini": "Mac Mini",
+        "laptop": "Work laptop with a long descriptive host name"]
+
+    static var homeSnapshot: Data {
+        var value = try! JSONSerialization.jsonObject(with: FixtureScenarioData.snapshotData()) as! [String: Any]
+        value["cockpit_api_version"] = 1
+        value["cockpit_sections"] = ["provider_capacity", "activity", "insights"]
+        return encode(value)
+    }
+
+    static var overview: Data {
+        var value = try! JSONSerialization.jsonObject(with: analytics) as! [String: Any]
+        value["insight_counts"] = ["critical": 0, "high": 1, "medium": 0, "low": 0]
+        return encode(value)
+    }
+
     private static let reported = "2026-09-30T18:00:00Z"
 
     static var accounts: [ProviderAccount] {
@@ -50,7 +64,7 @@ enum ObservabilityFixtureData {
     }
 
     private static var accountValues: [[String: Any]] {
-        [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
+        let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
             ["snapshot_id": host, "dedup_key": host, "provider": "anthropic",
              "account_label": "alex@example.com", "plan_label": "Max",
              "host_id": host, "status": status, "observed_at": reported,
@@ -58,6 +72,15 @@ enum ObservabilityFixtureData {
              "windows": [["kind": "seven_day", "used_percent": used],
                          ["kind": "five_hour", "used_percent": 18]]]
         }
+        let others: [[String: Any]] = (0..<10).map { index in
+            let provider = index == 0 ? "openai" : index == 1 ? "google" : index == 8 ? "other" : index == 9 ? "local" : "anthropic"
+            return ["snapshot_id": "other-\(index)", "dedup_key": "other-\(index)",
+                "provider": provider, "account_label": "account-\(index)@example.com", "plan_label": "Personal",
+                "host_id": "studio", "status": index == 2 ? "stale" : "ok", "observed_at": reported,
+                "source": "fixture-usage", "windows": [["kind": "seven_day", "used_percent": index == 2 ? 81 : index == 0 ? 28 : 0],
+                    ["kind": "five_hour", "used_percent": 0]]]
+        }
+        return shared + others
     }
 
     static var analytics: Data {
