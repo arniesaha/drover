@@ -3175,6 +3175,72 @@ def test_harnessd_recovers_claude_with_native_resume_command(monkeypatch, tmp_pa
         server.server_close()
 
 
+def test_harnessd_recovers_agy_onto_its_conversation(monkeypatch, tmp_path):
+    """drover#236: an Agy session lost to a restart resumes its conversation
+    instead of telling the user to start over."""
+    monkeypatch.setattr(
+        harness_daemon.BUILTIN_ADAPTERS.resolve("agy"),
+        "default_command",
+        lambda: ["/opt/homebrew/bin/agy"],
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path, harness="agy")
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={"native_session_id": "provider-session-1"},
+        )
+
+        assert status == 200
+        assert payload["recovered"] is True
+        driver = state.structured._require_entry(session_id).driver
+        argv = driver._argv_for("next")
+        assert argv.count("--conversation") == 1
+        assert argv[argv.index("--conversation") + 1] == "provider-session-1"
+        assert argv[argv.index("--add-dir") + 1] == str(tmp_path / session_id)
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_refuses_turns_while_draining_for_an_update(monkeypatch, tmp_path):
+    """drover#236: between the updater's final check and the restart, a turn
+    is refused with a retryable 409 and leaves nothing behind."""
+    monkeypatch.setattr(
+        harness_daemon.BUILTIN_ADAPTERS.resolve("agy"),
+        "default_command",
+        lambda: ["/opt/homebrew/bin/agy"],
+    )
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path, harness="agy")
+    try:
+        _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={"native_session_id": "provider-session-1"},
+        )
+        events_before = len(state.registry.list_events(session_id))
+        state.structured.begin_drain(60)
+
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/turns",
+                payload={"text": "too late"},
+            )
+
+        assert raised.value.code == 409
+        error = json.loads(raised.value.read().decode("utf-8"))["error"]
+        assert "restarting for an update" in error
+        assert len(state.registry.list_events(session_id)) == events_before
+    finally:
+        state.structured.end_drain()
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_harnessd_concurrent_recovery_creates_one_driver(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     session_id = _seed_restart_lost_structured_session(state, tmp_path)
@@ -3267,7 +3333,7 @@ def test_harnessd_terminate_waits_for_recovery_and_wins(tmp_path):
 @pytest.mark.parametrize(
     ("harness", "native_session_id", "cwd_exists"),
     [
-        ("agy", "provider-session-1", True),
+        ("not-a-harness", "provider-session-1", True),
         ("codex", "", True),
         ("codex", "provider-session-1", False),
     ],

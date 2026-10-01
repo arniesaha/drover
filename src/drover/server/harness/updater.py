@@ -33,6 +33,12 @@ log = logging.getLogger("drover.harnessd.update")
 # watchdog decides it cannot, and undoes the flip.
 REGISTRATION_DEADLINE_SECONDS = 90.0
 
+# How long new turns are refused once an activation has committed to a
+# restart. Long enough to cover an in-place install and the service manager
+# restarting us; bounded so a restart that never comes does not leave every
+# session refusing turns until someone notices.
+RESTART_DRAIN_SECONDS = 300.0
+
 
 @dataclass(frozen=True)
 class QuiesceReport:
@@ -58,6 +64,31 @@ def quiesce_report(state) -> QuiesceReport:
             alive += 1
     terminals = len(state.pty.list_sessions())
     return QuiesceReport(structured_alive=alive, terminals=terminals)
+
+
+def drain_for_restart(state) -> bool:
+    """Stop accepting turns, then check that nothing is running.
+
+    Checking first and restarting later left a window: a turn sent after the
+    check but before the restart was cut off mid-flight (drover#236). The gate
+    goes up before the check, so a turn either got in first -- and the check
+    sees it -- or is refused with a retryable error. On a busy host the gate
+    comes straight back down.
+    """
+    structured = state.structured
+    begin = getattr(structured, "begin_drain", None)
+    if callable(begin):
+        begin(RESTART_DRAIN_SECONDS)
+    if is_quiescent(state):
+        return True
+    end_drain(state)
+    return False
+
+
+def end_drain(state) -> None:
+    end = getattr(state.structured, "end_drain", None)
+    if callable(end):
+        end()
 
 
 def is_quiescent(state) -> bool:
@@ -413,7 +444,7 @@ class HostUpdater:
             log.warning("%s failed its smoke test; refusing to activate", target)
             self._record_refusal(target, "smoke_test")
             return False
-        if not is_quiescent(self._state):
+        if not drain_for_restart(self._state):
             self._record_refusal(target, "not_quiescent")
             return False
 
@@ -435,6 +466,7 @@ class HostUpdater:
                     self._in_place_venv,
                     previous or "unknown",
                 )
+                end_drain(self._state)
                 self._record_refusal(target, "install_failed")
                 return False
 

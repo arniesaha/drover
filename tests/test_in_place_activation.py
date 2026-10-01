@@ -31,6 +31,7 @@ from drover.config import (
     default_config,
     load_config,
 )
+from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.updater import (
     HostUpdater,
     resolve_activation,
@@ -119,6 +120,7 @@ def _updater(
     idle=True,
     restarts=None,
     sibling_restarter=None,
+    state=None,
 ):
     layout = RuntimeLayout(tmp_path / "home")
     _installed(layout, "0.1.3")
@@ -134,7 +136,7 @@ def _updater(
     if sibling_restarter is not None:
         kwargs["sibling_restarter"] = sibling_restarter
     return layout, HostUpdater(
-        _state(idle=idle),
+        state if state is not None else _state(idle=idle),
         layout,
         cfg,
         installer=install,
@@ -293,6 +295,55 @@ def test_a_failed_in_place_install_leaves_the_host_where_it_was(tmp_path):
     assert status["update_blocked"] is True
     assert status["reason"] == "install_failed"
     assert status["blocked_version"] == "0.1.4"
+
+
+def _manager_state():
+    return SimpleNamespace(
+        structured=StructuredSessionManager(),
+        pty=SimpleNamespace(list_sessions=lambda: []),
+    )
+
+
+def test_turns_are_refused_from_the_final_check_through_the_restart(tmp_path):
+    """drover#236: the gate goes up before the quiescence check and is still
+    up when the restart is requested, so no turn can start in between."""
+    venv = _venv(tmp_path)
+    state = _manager_state()
+    draining_at = {}
+    layout, updater = _updater(
+        tmp_path,
+        cfg=_in_place_cfg(venv),
+        in_place_installer=lambda *args: draining_at.setdefault(
+            "install", state.structured.is_draining()
+        )
+        or True,
+        restarts=lambda: draining_at.setdefault(
+            "restart", state.structured.is_draining()
+        ),
+        state=state,
+    )
+    updater.observe(_beat("0.1.4"))
+
+    assert updater.maybe_activate() is True
+    assert draining_at == {"install": True, "restart": True}
+
+
+def test_a_failed_in_place_install_takes_turns_again(tmp_path):
+    """The host stays on its version and keeps working: no restart is coming,
+    so the gate must not outlive the refusal."""
+    venv = _venv(tmp_path)
+    state = _manager_state()
+    layout, updater = _updater(
+        tmp_path,
+        cfg=_in_place_cfg(venv),
+        in_place_installer=lambda *args: False,
+        state=state,
+    )
+    updater.observe(_beat("0.1.4"))
+
+    assert updater.maybe_activate() is False
+    assert updater.status()["reason"] == "install_failed"
+    assert state.structured.is_draining() is False
 
 
 def test_in_place_activation_without_a_cached_artifact_refuses(tmp_path):

@@ -231,6 +231,12 @@ class AgyAdapter(_WorktreeAdapter, _StructuredAdapter):
     )
     catalog_type = AgyCatalogAdapter
     catalog_suffix: tuple[str, ...] = ()
+    # agy is a per-turn process: every turn after the first is already a fresh
+    # `agy --conversation <id>` with nothing carried over but agy's own on-disk
+    # conversation store. A harnessd restart between turns is the same gap, so
+    # the recovered driver resumes exactly as the next turn would have
+    # (drover#236).
+    recover_after_restart = True
 
     def default_command(self) -> list[str]:
         return agy.default_command()

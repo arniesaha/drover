@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would cut work off instead of whether the session is open; a running turn, a
   pending approval, a live Claude Code process, or an open Agy session (which
   cannot be recovered after a harnessd restart) still blocks (#236, #452).
+- An Agy session parked between turns no longer blocks host updates either:
+  after a harnessd restart it resumes its conversation with
+  `agy --conversation <id>` (the same invocation every later turn already
+  uses) instead of reporting that it cannot be resumed. A session that never
+  completed a turn has no conversation to resume and asks for a new session.
+  Activation also closes the turn-vs-restart race: harnessd stops accepting
+  turns before its final quiescence check and answers `409 host is restarting
+  for an update` until it restarts, lifting the gate after five minutes if the
+  restart never comes (#236).
 - iOS honors `Retry-After` on hub `503`s across session polling, stream
   reconnects, cockpit and insight loads, auth polling and background refresh,
   with separate cooldowns for analytical and session reads, and shows

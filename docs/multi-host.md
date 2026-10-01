@@ -203,12 +203,19 @@ sends, so no new channel and no inbound access to a host is involved.
 A host that is behind installs the new version beside its current one and then
 waits. It activates only when it has no live work: no structured turn in
 flight, and no attached terminal. If it cannot tell, it treats itself as busy.
-A Codex or DeepSeek session waiting for its user between turns is not work and
-does not hold the update back, because it resumes after the restart; a turn in
-progress, a pending approval, a Claude Code session's still-running process, or
-an open Agy session (which cannot be resumed after a restart yet) does.
+A Codex, DeepSeek or Agy session waiting for its user between turns is not work
+and does not hold the update back, because it resumes after the restart; a turn
+in progress, a pending approval, or a Claude Code session's still-running
+process does. An Agy session that has not finished its first turn has no
+conversation yet, so after a restart its next turn asks for a new session.
 An update deferred costs hours; an update that interrupts a turn costs work
 nobody gets back.
+
+Once a host decides to activate, it stops accepting turns *before* its final
+check, so a turn cannot start between "idle" and the restart. A turn sent in
+that window gets `409 host is restarting for an update` and can be sent again
+a minute later. If the restart never happens, the host takes turns again after
+five minutes.
 
 Activation is a symlink flip plus a restart. Nothing is ever upgraded in place,
 which is what makes going back cheap.
