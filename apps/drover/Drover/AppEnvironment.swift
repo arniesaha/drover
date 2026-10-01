@@ -62,6 +62,8 @@ final class AppEnvironment {
     /// admitted to the recovery actor before it erases their namespace.
     private let recoveryWriteGate = ChatRecoveryWriteGate()
     private let validator: @Sendable (ServerConfig, String) async -> String?
+    private let credentialRevoker: @Sendable (DroverClient) async throws -> Void
+    private(set) var signOutWarning: String?
     private var operationEpoch = 0
     private var pendingCleanupBindingIDs = Set<UUID>()
     private var isPerformingRecoveryRootCleanup = false
@@ -75,6 +77,7 @@ final class AppEnvironment {
         self.tokenStore = tokenStore
         self.recoveryBindingStore = RecoveryBindingStore(service: tokenStore.service)
         self.recoveryStore = recoveryStore
+        self.credentialRevoker = { try await $0.revokeDeviceCredential() }
         self.validator = { _, _ in "Connection changes are disabled in this synthetic fixture." }
         self.client = fixtureClient
         self.config = fixtureClient?.config
@@ -89,6 +92,9 @@ final class AppEnvironment {
         validator: @escaping @Sendable (ServerConfig, String) async -> String? = { config, token in
             await ClientFactory.validate(config: config, token: token)
         },
+        credentialRevoker: @escaping @Sendable (DroverClient) async throws -> Void = {
+            try await $0.revokeDeviceCredential()
+        },
         launchEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.defaults = defaults
@@ -98,6 +104,7 @@ final class AppEnvironment {
         self.recoveryBindingStore = resolvedBindingStore
         self.recoveryStore = recoveryStore ?? Self.defaultRecoveryStore()
         self.validator = validator
+        self.credentialRevoker = credentialRevoker
         if UITestOverrides.shouldResetAuthentication(environment: launchEnvironment) {
             try? tokenStore.delete()
             try? resolvedBindingStore.clear()
@@ -303,28 +310,32 @@ final class AppEnvironment {
 
     /// Forget this device's credential and return the app to onboarding.
     ///
-    /// Local only, deliberately. The usual reason to sign out is to re-pair
-    /// this same phone, and revoking server-side would also cut off anything
-    /// else still holding that token. Revocation belongs on the hub, where it
-    /// can name which credential is going away:
-    ///
-    ///     drover-server credentials list
-    ///     drover-server credentials revoke <id>
-    ///
-    /// Everything a fresh install lacks is cleared, so the next pairing
-    /// cannot inherit half the old configuration.
+    /// Disconnect foreground work, revoke on the hub, then erase local state.
+    /// Hub failure never retains a credential or schedules a retry.
     func signOut() async throws {
         operationEpoch &+= 1
         isPerformingRecoveryRootCleanup = true
         defer { isPerformingRecoveryRootCleanup = false }
         let retiredRecoveryGeneration = recoveryWriteGate.invalidate()
         let previousConfig = config
+        let previousClient = client
+        signOutWarning = nil
         // Drop the app's foreground connection before its first suspension so
         // no visible UI or new background work can use this credential.
         client = nil
         PushRegistrar.shared.updateClient(nil)
         config = nil
         generation += 1
+
+        if let previousClient {
+            do {
+                try await credentialRevoker(previousClient)
+            } catch DroverError.unauthorized {
+                // The hub has already rejected this credential.
+            } catch {
+                signOutWarning = "Signed out locally, but the hub credential could not be revoked. Ask the hub operator to revoke this device; hub push may remain registered."
+            }
+        }
 
         do {
             try tokenStore.delete()

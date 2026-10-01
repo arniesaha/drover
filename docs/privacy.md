@@ -89,9 +89,11 @@ operator-created backups.
 To remove the phone's local connection, use **Sign Out** in the app. It removes
 the phone's credential, saved server address, and local chat-recovery store
 after credential deletion. If iOS protected storage is unavailable, the app
-reports that cleanup is incomplete so you can retry. Signing out does not
-revoke the corresponding server credential. From the hub, list and revoke the
-device credential with `drover-server credentials list` and
+reports that cleanup is incomplete so you can retry. Sign Out first asks the
+hub to revoke this device's credential and clear its APNs registration. If the
+hub cannot be reached, the app signs out locally, reports the revocation
+failure, and retains no credential or queued retry. In that case, the hub
+operator can list and revoke the device credential with `drover-server credentials list` and
 `drover-server credentials revoke <credential-id>`.
 
 Because the hub is self-hosted, there is no Drover-hosted account or central

@@ -234,3 +234,97 @@ def test_device_bearer_cannot_mutate_another_device_registration(server):
     ) == (204, b"")
     assert store.get(first.id).apns_token == "phone-token"
     assert store.get(second.id).apns_token == "tablet-token"
+
+
+def test_self_revocation_is_idempotent_and_clears_only_callers_push(server, caplog):
+    _, store, _ = server
+    device, token = store.issue(scope="device", label="Phone")
+    other, _ = store.issue(scope="device", label="Tablet")
+    store.set_apns_registration(device.id, token="secret-apns", environment="sandbox")
+    store.set_apns_registration(other.id, token="other-apns", environment="production")
+    caplog.set_level("DEBUG")
+
+    # Target selectors have no authority: only the bearer identifies the device.
+    assert request(
+        server,
+        "DELETE",
+        f"/auth/device/credential?credential_id={other.id}",
+        token=token,
+        json={"credential_id": other.id},
+    ) == (204, b"")
+    revoked = store.get(device.id)
+    assert not revoked.is_active
+    assert (revoked.apns_token, revoked.apns_environment) == (None, None)
+    assert store.find_active(token) is None
+    assert request(server, "DELETE", "/auth/device/credential", token=token) == (
+        204,
+        b"",
+    )
+    assert store.get(device.id).revoked_at == revoked.revoked_at
+    assert store.get(other.id).is_active
+    assert store.get(other.id).apns_token == "other-apns"
+    assert request(server, "DELETE", "/auth/device/apns", token=token)[0] == 401
+    assert (
+        request(
+            server,
+            "PUT",
+            "/auth/device/apns",
+            token=token,
+            json={"token": "new-apns", "environment": "sandbox"},
+        )[0]
+        == 401
+    )
+    assert token not in caplog.text
+    assert "secret-apns" not in caplog.text
+
+
+def test_self_revocation_requires_device_bearer_even_without_push(server):
+    _, store, auth = server
+    device, _ = store.issue(scope="device", label="Phone")
+    _, host_token = store.issue(scope="host", label="Mac")
+    _, preflight_token = store.issue(scope="preflight", label="Probe")
+    set_sender(None)
+    for token in (None, "unknown"):
+        assert (
+            request(server, "DELETE", "/auth/device/credential", token=token)[0] == 401
+        )
+    assert (
+        request(
+            server,
+            "DELETE",
+            "/auth/device/credential",
+            cookie=f"{auth.cookie_name}={mint_session(auth)}",
+        )[0]
+        == 401
+    )
+    for token in (host_token, preflight_token, "cluster-token"):
+        assert (
+            request(server, "DELETE", "/auth/device/credential", token=token)[0] == 403
+        )
+    assert store.get(device.id).is_active
+
+
+def test_device_cannot_revoke_another_via_credential_id_route(server):
+    _, store, _ = server
+    _, token = store.issue(scope="device", label="Phone")
+    other, _ = store.issue(scope="device", label="Tablet")
+    assert (
+        request(server, "DELETE", f"/auth/credentials/{other.id}", token=token)[0]
+        == 403
+    )
+    assert store.get(other.id).is_active
+
+
+def test_revocation_without_push_survives_store_restart(server):
+    _, store, _ = server
+    device, token = store.issue(scope="device", label="Phone")
+    store.set_apns_registration(device.id, token="apns", environment="sandbox")
+    set_sender(None)
+    assert request(server, "DELETE", "/auth/device/credential", token=token) == (
+        204,
+        b"",
+    )
+    reopened = CredentialStore(store._path)
+    assert reopened.find_active(token) is None
+    assert reopened.find_for_revocation(token).id == device.id
+    assert reopened.get(device.id).apns_token is None

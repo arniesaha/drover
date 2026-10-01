@@ -552,6 +552,17 @@ public actor DroverClient {
         _ = try await request(path: "/auth/device/apns", method: "DELETE", body: nil)
     }
 
+    /// Revoke only this device's credential and clear its hub APNs registration.
+    /// No retry or durable work is scheduled. A 401 means the credential is
+    /// already unusable (for example, revocation succeeded before a lost reply).
+    public func revokeDeviceCredential() async throws {
+        do {
+            _ = try await request(path: "/auth/device/credential", method: "DELETE", body: nil)
+        } catch DroverError.unauthorized {
+            return
+        }
+    }
+
     /// Deliberately bypasses the shared `request()` helper: its contract is
     /// different from the authed endpoints — it answers "is the server
     /// reachable?" as a Bool, sends no Authorization header, and collapses

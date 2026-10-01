@@ -70,11 +70,12 @@ not suitable for your work.
 ## Removing a phone connection
 
 Use **Sign Out** in the app to remove the local credential, saved server
-address, and local chat-recovery data. It does not unregister the phone's
-notification token or revoke the corresponding server credential. Disable
-Drover notifications in iOS to stop alerts from being displayed, or have the
-hub operator revoke the credential to clear its APNs registration and stop
-hub-sent alerts:
+address, and local chat-recovery data. Sign Out also asks the hub to revoke
+this device's credential and clear its APNs registration. If the hub cannot
+be reached, local sign-out still completes and the app shows a warning; it
+retains no credential or queued retry. In that case, disable Drover
+notifications in iOS to stop alerts from being displayed, and have the hub
+operator revoke the credential to stop hub-sent alerts:
 
 ```sh
 drover-server credentials list
