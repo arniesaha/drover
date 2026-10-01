@@ -67,6 +67,10 @@ final class AppEnvironment {
     private var operationEpoch = 0
     private var pendingCleanupBindingIDs = Set<UUID>()
     private var isPerformingRecoveryRootCleanup = false
+    /// The launch-time sweep or erase retry started by `init`. It runs on the
+    /// recovery actor concurrently with whatever the caller does next, so
+    /// tests that inspect the recovery directory await it first.
+    @ObservationIgnored private(set) var startupRecoveryTask: Task<Void, Never>?
 
 #if DEBUG
     /// A separate initializer deliberately bypasses all normal startup reads,
@@ -155,7 +159,7 @@ final class AppEnvironment {
             // launch retry may therefore erase a corrupt authorization index
             // without weakening normal load/sweep fail-closed behavior.
             if let recoveryStore = self.recoveryStore {
-                Task { @MainActor [weak self] in
+                startupRecoveryTask = Task { @MainActor [weak self] in
                     do {
                         try await recoveryStore.eraseAllAfterCredentialDeletion()
                         guard let self else { return }
@@ -169,7 +173,7 @@ final class AppEnvironment {
                 }
             }
         } else if shouldSweepRecovery, let recoveryStore = self.recoveryStore {
-            Task {
+            startupRecoveryTask = Task {
                 try? await recoveryStore.sweep(keeping: bindings)
             }
         }

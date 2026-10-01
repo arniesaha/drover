@@ -16,6 +16,16 @@ from drover.hook.__main__ import main as hook_main
 from drover.schema import bootstrap
 from drover.server.mcp.server import build_mcp_server
 
+# The offline tests assert on *which* sentinel the hook prints, and the hook
+# picks "timeout" whenever its budget expires before the connect is attempted.
+# A refused port answers in milliseconds, but the client is built (httpx
+# client, SSL context) inside the budget first, so a sub-second budget made
+# these a race against any process pause there: a full-suite stall past 0.5 s
+# (#321, and the spawn spikes measured in #358) printed the timeout sentinel.
+# A budget the refusal cannot lose to keeps the outcome deterministic; it is
+# not waited on, because the refusal ends the call long before it.
+_OFFLINE_BUDGET_S = "30"
+
 
 def _free_port() -> int:
     with socket.socket() as s:
@@ -148,7 +158,7 @@ def test_session_start_offline_exits_zero_with_stderr(git_repo: Path) -> None:
             "--mcp-url",
             "http://127.0.0.1:1/dead",
             "--timeout",
-            "0.5",
+            _OFFLINE_BUDGET_S,
             "--agent-id",
             "x",
         ],
@@ -239,7 +249,7 @@ def test_session_end_offline_exits_zero(tmp_path: Path) -> None:
             "--mcp-url",
             "http://127.0.0.1:1/dead",
             "--timeout",
-            "0.5",
+            _OFFLINE_BUDGET_S,
         ],
     )
     assert res.exit_code == 0, res.output

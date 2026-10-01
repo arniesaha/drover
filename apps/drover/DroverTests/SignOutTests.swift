@@ -56,6 +56,10 @@ final class SignOutTests: XCTestCase {
             credentialRevoker: credentialRevoker,
             launchEnvironment: launchEnvironment
         )
+        // The launch sweep shares the recovery directory with the body. Left
+        // running, it can be mid index write (an unprotected `.tmp` present)
+        // when a test lists the directory.
+        await environment.startupRecoveryTask?.value
         try await body(environment, store, defaults, recovery, root)
     }
 

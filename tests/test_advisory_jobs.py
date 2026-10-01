@@ -457,27 +457,34 @@ def test_check_status_uses_a_writer_compatible_ledger_connection(
 def test_check_status_times_out_once_and_refuses_parallel_reads(
     db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The read cannot finish until `release`, so "unavailable" from the first
+    # call can only come from the budget expiring -- proven by the read still
+    # being blocked when the call returns, not by a wall-clock bound that a
+    # full-suite pause breaks (#321). Nothing here waits out the long values.
     monkeypatch.setattr(advisory_service_module, "CHECK_STATUS_BUDGET_SECONDS", 0.05)
     service = InsightsService(db_path)
     entered = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
 
     def slow_read(_finding_id: str, _job_id: str, **_kwargs):
         entered.set()
-        assert release.wait(1)
-        return {"status": "queued"}
+        try:
+            assert release.wait(30)
+            return {"status": "queued"}
+        finally:
+            finished.set()
 
     monkeypatch.setattr(service, "_read_check_status", slow_read, raising=False)
-    started = time.monotonic()
     try:
         first = service.check_status("a" * 32, "job-1")
-        elapsed = time.monotonic() - started
+        read_finished_before_return = finished.is_set()
         second = service.check_status("a" * 32, "job-2")
+        assert entered.wait(30)
     finally:
         release.set()
 
-    assert entered.is_set()
-    assert elapsed < 0.2
+    assert not read_finished_before_return
     assert first["status"] == "unavailable"
     assert second["status"] == "unavailable"
 
