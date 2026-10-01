@@ -84,11 +84,16 @@ No listing contract changed. `/harness` already returns active sessions plus
 and the harness daemon's `/sessions` listing remain unbounded. Complete
 pagination/filter semantics remain #224 work.
 
-The iOS `DroverClient.validate` discards response headers when converting 503
-into `DroverError.httpStatus`; `SessionStore.pollDelay` uses its ordinary cadence
-for failures and a bounded faster cadence for cancellations. It does not honor
-`Retry-After`. The web fleet page's `load()` also ignores the header (and lacks a
-status check), but has no automatic retry loop. Client changes are deferred.
+The iOS client honors `Retry-After` (#442): a GET `503` becomes
+`DroverError.busy(until:)`, and DroverKit's shared `RetryPolicy` / `HubRetryGate`
+treat the server delay as a floor (local backoff 1-300 s, positive jitter up to
+20 % / 30 s). The cooldown is persisted across relaunches and shared by
+foreground and background clients, with separate lanes for analytical routes
+(`/cockpit`, `/analytics`, `/insights`, `/metrics`, `/observability`) and
+fleet/session/control routes, mirroring the hub's admission lanes. Session
+polling, stream reconnects, cockpit/insight loads and background refresh all
+wait it out. The web fleet page's `load()` still ignores the header (and lacks
+a status check), but has no automatic retry loop.
 
 Regression tests use events to hold an analytical request in flight, verify
 both fleet routes respond in under one second, exercise actual rollup deferrals,

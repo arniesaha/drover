@@ -24,6 +24,19 @@ Apple internal tester distribution is separate from the retired hub restriction.
   its Key ID, Issuer ID, and `.p8` private key as GitHub Environment secrets
   (names below). Do not commit the `.p8`.
 
+### Push notifications on the live hub
+
+TestFlight and App Store builds carry the production `aps-environment`, so
+their device tokens are registered with the hub as `production` and the hub
+delivers them through Apple's production APNs endpoint. The hub's APNs auth key
+(`[apns]` in the hub's `config.toml`) must therefore be enabled for
+**Sandbox & Production** in the Apple Developer portal. A sandbox-only key
+still delivers to development builds but Apple rejects every production send
+with `403 BadEnvironmentKeyInToken`, so TestFlight notifications are silently
+lost. See [Push notifications](../README.md#push-notifications) for the hub
+configuration and the app's local-notification fallback. The APNs auth key is
+not one of the App Store Connect API secrets below.
+
 ### Signing material (for Environment `ios-testflight-upload`)
 
 You need a reviewed **Apple Distribution** identity and an App Store Connect
@@ -193,9 +206,17 @@ content out of public release notes.
 - [ ] Verify light/dark appearance and largest Dynamic Type.
 - [ ] Check VoiceOver primary navigation and Reduce Motion.
 - [ ] Check keyboard/paste, camera pairing or hand-entry fallback.
-- [ ] Check background/foreground resume and notification tap if APNs is configured.
+- [ ] Check background/foreground resume. If the hub has APNs configured, leave
+      the app in the background, make a session ask for input, and confirm the
+      push arrives and its tap opens that session; otherwise confirm the local
+      notification fallback.
+- [ ] Stream a full turn from the phone and reconnect after backgrounding or a
+      network change; answer an approval or question from the phone.
 - [ ] Check long-code or diff rendering.
-- [ ] Sign out and re-pair; verify the intended connection is restored.
+- [ ] Sign out: confirm no revocation warning is shown and that
+      `drover-server credentials list` on the hub reports this device's
+      credential as `revoked`; then re-pair and verify the intended connection
+      is restored.
 
 | Physical-device observation | Target |
 | --- | --- |

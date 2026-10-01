@@ -73,6 +73,52 @@ Drover v0.1 is intended for trusted private networks. Do not expose the server
 directly to the public internet. See [Security](../../docs/security.md) and
 [Multi-host setup](../../docs/multi-host.md).
 
+## Push notifications
+
+When a session starts waiting for you, the hub can send an APNs alert. Push is
+off until the operator configures the hub's `config.toml`:
+
+```toml
+[apns]
+enabled = true
+key_path = "/path/to/AuthKey_KEYID.p8"   # APNs auth key from the Apple Developer portal
+key_id = "KEYID"
+team_id = "TEAMID"
+bundle_id = "com.arnab.drover"
+```
+
+Development builds register `sandbox` device tokens; TestFlight and App Store
+builds register `production` tokens. Create the APNs key with **Sandbox &
+Production** enabled: a sandbox-only key works for development installs, but
+Apple rejects production sends with `BadEnvironmentKeyInToken`, so TestFlight
+alerts never arrive. Restart `drover-server` after changing `[apns]`.
+
+If the hub has no usable APNs sender, it refuses the device registration and the
+app keeps its own local notifications (foreground watcher and background
+refresh) instead of assuming push will arrive. Local alerts are best effort and
+depend on iOS scheduling background refresh.
+
+## Sign out
+
+**Settings → Sign Out** asks the hub to revoke this phone's own credential and
+clear its push registration (`DELETE /auth/device/credential`; a device can
+only revoke itself), then erases the local token, server address and chat
+recovery data. If the hub cannot be reached, or is too old to support the
+call, the phone still signs out locally, keeps no credential or queued retry,
+and shows a warning; the operator can then revoke it with
+`drover-server credentials list` and `drover-server credentials revoke <id>`.
+
+## When the hub is busy
+
+The hub answers `503` with `Retry-After` while it sheds analytical or fleet
+load, or while its analytical store recovers. The app never retries sooner than
+that delay: session polling, stream reconnects, cockpit and insight loads and
+background refresh wait it out (plus a little jitter) and show
+"Hub busy, retrying in Ns" instead of an error. Analytical reads (cockpit,
+analytics, insights) and session/fleet reads keep separate cooldowns, so a
+busy cockpit does not stall the session list or chat. Push registration is not
+retried on `503`; the app falls back to local notifications.
+
 ## Test
 
 Run these commands from the repository root. Generate the project before
@@ -144,7 +190,8 @@ Root records this evidence before release on the smallest supported physical
 iPhone. Record the reference iPhone model and OS, app build, local network,
 and data fixture. Exercise light and dark appearance, the largest Dynamic
 Type size, VoiceOver, Reduce Motion, keyboard and paste, camera pairing,
-background and foreground, a development-account notification tap, and a
+background and foreground, a notification tap on the build's APNs
+environment (production for TestFlight), and a
 long-code or diff session.
 
 Measure cached-screen, latest-page, and send-acknowledgement behavior on that

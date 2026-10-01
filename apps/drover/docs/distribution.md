@@ -77,6 +77,11 @@ justification required for this broad exception.
 selects `Drover/Drover-AppStore.entitlements`, which changes only APNs to
 `production`. `DroverAppStore` uses `StoreRelease` for its archive action.
 
+Distribution builds therefore register `production` APNs device tokens with
+the hub. The hub's APNs auth key must be enabled for **Sandbox & Production**;
+a sandbox-only key makes every production send fail with
+`BadEnvironmentKeyInToken` (see [Push notifications](../README.md#push-notifications)).
+
 `CFBundleShortVersionString` and `CFBundleVersion` come from
 `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in both the XcodeGen source
 and the checked-in `Info.plist`. The defaults (`0.1.0` and `1`) are for
