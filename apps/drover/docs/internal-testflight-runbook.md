@@ -19,7 +19,8 @@ Apple internal tester distribution is separate from the retired hub restriction.
   `com.arnab.drover`.
 - An App Store Connect **app record** for that bundle ID (create if missing).
 - Paid agreements and banking/tax state current enough that ASC accepts uploads.
-- An App Store Connect API key with permission to upload builds. You will store
+- An App Store Connect API key with permission to upload builds, update export
+  compliance and manage internal beta groups/build assignments. You will store
   its Key ID, Issuer ID, and `.p8` private key as GitHub Environment secrets
   (names below). Do not commit the `.p8`.
 
@@ -68,6 +69,12 @@ shell placeholders `DROVER_ASC_KEY_ID`, `DROVER_ASC_ISSUER`, and
 are **not** GitHub secret names. CI materializes
 `AuthKey_<DROVER_APPSTORE_API_KEY_ID>.p8` under `$RUNNER_TEMP/private_keys`
 from the three `DROVER_APPSTORE_API_*` secrets above.
+
+Create an **internal** beta group for this app in App Store Connect and add the
+intended ASC-user testers. The dispatch `internal_group` input takes precedence
+over repository variable `DROVER_TESTFLIGHT_INTERNAL_GROUP`; when both are empty,
+the default is `Drover Internal`. The lane fails if that exact internal group
+is missing or ambiguous; it never creates groups or adds testers.
 
 ## Protect the upload environment
 
@@ -136,17 +143,39 @@ Approve the `ios-testflight-upload` deployment when prompted.
 The workflow selects Xcode 26.6 on `macos-26`, runs DroverKit tests, app unit
 tests and deterministic/accessibility UI slices, sets up temporary signing,
 archives with `--channel testflight-production`, exports with
-`--unrestricted-hubs`, confirms upload and cleans temporary credentials in
+`--unrestricted-hubs`, confirms upload, waits for processing and internal group
+assignment, and cleans temporary credentials in
 `always()`. It retains only sanitized `testflight-production-candidate-metadata`.
 
 After upload:
 
 1. Confirm `upload-record.json` reports `upload_confirmed` and the expected IPA
    digest; archive/export records must match the approved version/build/SHA.
-2. Wait for Apple processing in App Store Connect and verify version/build.
-3. Assign the build to the intended internal ASC-user testing group and confirm
-   it is installable. The workflow does not assign testers or wait for processing.
-4. Complete the physical-device checklist below. A green upload is not acceptance.
+2. The lane polls ASC `buildUploads` and `builds` for the exact app/version/build
+   on iOS, every 30 seconds with one 45-minute deadline (including retries for
+   rate limits/transient failures). `FAILED`/`INVALID` stops the lane immediately.
+3. If the archived app's Info.plist declares the boolean
+   `ITSAppUsesNonExemptEncryption=NO`, the lane sets `usesNonExemptEncryption=false`
+   and waits for it to propagate. Otherwise missing compliance fails with a
+   request to resolve it in ASC; the lane never guesses an encryption answer.
+4. The lane adds the processed build to the selected internal group and verifies
+   the assignment through ASC before succeeding. The receipt must also report
+   `processing_state: VALID` and `internal_group_assigned: true`, with build/group
+   IDs. Confirm that the tester can install it.
+5. Complete the physical-device checklist below. A green upload is not acceptance.
+
+A post-upload failure preserves `upload_confirmed: true` and a sanitized
+`distribution_failure` in the receipt. **Do not re-upload the same candidate**
+when processing times out or group assignment fails: inspect ASC, resolve group,
+permission or compliance issues, and finish distribution there. Upload success
+alone is no longer a green production lane. Physical installation and live-hub
+acceptance remain manual. Key material and API response bodies are never logged;
+the existing `always()` credential cleanup still runs on failures.
+
+API references: Apple’s [build upload lookup](https://developer.apple.com/documentation/appstoreconnectapi/get-v1-apps-_id_-builduploads),
+[build lookup](https://developer.apple.com/documentation/appstoreconnectapi/get-v1-builds),
+[export compliance update](https://developer.apple.com/documentation/appstoreconnectapi/patch-v1-builds-_id_),
+and [beta group build assignment](https://developer.apple.com/documentation/appstoreconnectapi/post-v1-betagroups-_id_-relationships-builds).
 
 ## Physical-device acceptance on the live hub
 

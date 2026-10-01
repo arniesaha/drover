@@ -11,6 +11,10 @@ on:
         description: Approved CFBundleVersion
         required: true
         type: string
+      internal_group:
+        description: Internal TestFlight group (blank uses repository variable or Drover Internal)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -24,11 +28,12 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment: ios-testflight-upload
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 135
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       CANDIDATE_VERSION: ${{ inputs.version }}
       CANDIDATE_BUILD: ${{ inputs.build }}
+      TESTFLIGHT_INTERNAL_GROUP: ${{ inputs.internal_group || vars.DROVER_TESTFLIGHT_INTERNAL_GROUP || 'Drover Internal' }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -135,7 +140,9 @@ jobs:
           --export-options "$RUNNER_TEMP/drover-distribution-signing/ExportOptions.plist" \
           --version "$CANDIDATE_VERSION" --build "$CANDIDATE_BUILD" \
           --unrestricted-hubs
-    - name: Materialize Apple key and confirm upload
+    - name: Install ASC signing dependency
+      run: python3 -m pip install 'cryptography>=42,<47'
+    - name: Upload, wait for Apple processing and assign internal group
       env:
         DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
         DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
@@ -162,7 +169,12 @@ jobs:
                 "scripts/ios/upload_testflight.sh", "--ipa", str(root / "drover-ios-export/Drover.ipa"),
                 "--api-key-id", key_id, "--api-issuer", os.environ["DROVER_APPSTORE_API_ISSUER_ID"],
                 "--private-keys-dir", str(directory), "--record", str(root / "upload-record.json"),
+                "--version", os.environ["CANDIDATE_VERSION"], "--build", os.environ["CANDIDATE_BUILD"],
+                "--info-plist", str(root / "drover-ios-candidate/Drover.xcarchive/Products/Applications/Drover.app/Info.plist"),
+                "--internal-group", os.environ["TESTFLIGHT_INTERNAL_GROUP"],
             ], env=environment, check=True)
+        except subprocess.CalledProcessError:
+            raise SystemExit("upload or TestFlight distribution failed; see sanitized diagnostics and upload-record.json")
         except Exception:
             raise SystemExit("upload failed; private diagnostics discarded")
         PY

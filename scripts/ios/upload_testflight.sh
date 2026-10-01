@@ -3,11 +3,12 @@
 set +x
 set -euo pipefail
 umask 077
-exec python3 - "$@" <<'PY'
+exec python3 - "$(cd "$(dirname "$0")" && pwd)" "$@" <<'PY'
 import argparse
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import stat
@@ -15,9 +16,8 @@ import subprocess
 import sys
 import tempfile
 
-
-class Rejected(ValueError):
-    pass
+sys.path.insert(0, sys.argv.pop(1))
+from testflight_api import Client, Rejected, distribute
 
 
 class Parser(argparse.ArgumentParser):
@@ -110,6 +110,10 @@ def main():
     parser.add_argument("--api-issuer", required=True)
     parser.add_argument("--private-keys-dir", type=Path, required=True)
     parser.add_argument("--record", type=Path, required=True)
+    parser.add_argument("--version")
+    parser.add_argument("--build")
+    parser.add_argument("--info-plist", type=Path)
+    parser.add_argument("--internal-group")
     args = parser.parse_args()
     require(
         re.fullmatch(r"[A-Z0-9]{8,20}", args.api_key_id), "invalid API key identifier"
@@ -139,6 +143,27 @@ def main():
     key = args.private_keys_dir / f"AuthKey_{args.api_key_id}.p8"
     check_private(key)
     require(key.stat().st_size > 0, "private key material is unavailable")
+    client = info = None
+    if args.internal_group is not None:
+        require(
+            args.version
+            and args.build
+            and args.info_plist
+            and args.internal_group.strip(),
+            "distribution requires version, build, Info.plist and internal group",
+        )
+        info = plistlib.loads(args.info_plist.read_bytes())
+        require(
+            info.get("CFBundleShortVersionString") == args.version
+            and str(info.get("CFBundleVersion")) == args.build,
+            "candidate version/build does not match Info.plist",
+        )
+        client = Client(key, args.api_key_id, args.api_issuer)
+    else:
+        require(
+            not (args.version or args.build or args.info_plist),
+            "distribution requires an internal group",
+        )
     with args.ipa.open("rb") as artifact:
         digest = hashlib.file_digest(artifact, "sha256").hexdigest()
     environment = os.environ | {"API_PRIVATE_KEYS_DIR": str(args.private_keys_dir)}
@@ -183,16 +208,20 @@ def main():
         # Apple: no receipt is written, and the operator's natural retry
         # becomes a second build. Match the invariant part, and keep the
         # product-errors check as the real gate.
-        message = response.get("success-message") if isinstance(response, dict) else None
+        message = (
+            response.get("success-message") if isinstance(response, dict) else None
+        )
         confirmed = isinstance(message, str) and re.match(
             r"^No errors uploading\b", message.strip()
         )
-        product_errors = response.get("product-errors") if isinstance(response, dict) else None
+        product_errors = (
+            response.get("product-errors") if isinstance(response, dict) else None
+        )
         if result.returncode != 0 or not confirmed or product_errors:
             codes = set(diagnostic_codes(response))
             codes.update(
                 stderr_diagnostic_codes(
-                    errors_path.read_text(errors="ignore")[:1024 * 1024]
+                    errors_path.read_text(errors="ignore")[: 1024 * 1024]
                 )
             )
             write_receipt(
@@ -212,9 +241,27 @@ def main():
         )
     receipt = {"upload_confirmed": True, "ipa_sha256": digest}
     write_receipt(args.record, receipt)
-    print(
-        "upload confirmed; Apple processing and physical-device acceptance remain pending"
-    )
+    if client is not None:
+        print(
+            "upload confirmed; waiting for Apple processing and internal group assignment",
+            flush=True,
+        )
+        try:
+            receipt.update(
+                distribute(client, info, args.version, args.build, args.internal_group)
+            )
+        except Rejected as error:
+            receipt["distribution_failure"] = str(error)
+            args.record.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+            raise
+        args.record.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        print(
+            "Apple processing complete; internal group assignment confirmed; physical-device acceptance remains pending"
+        )
+    else:
+        print(
+            "upload confirmed; Apple processing and physical-device acceptance remain pending"
+        )
 
 
 try:

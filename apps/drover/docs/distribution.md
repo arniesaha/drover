@@ -249,9 +249,17 @@ recognized positive upload confirmation without product errors produce a
 receipt. The receipt contains only `upload_confirmed` and `ipa_sha256`.
 
 The upload wrapper uses `xcrun altool --upload-app -f` with JSON output and
-returns after upload confirmation. It does not wait for Apple processing.
+returns after upload confirmation when called with the upload-only arguments
+above. The production workflow also passes `--version`, `--build`, `--info-plist`
+(the archived app plist) and `--internal-group` to wait up to 45 minutes for ASC
+processing, apply a declared non-exempt-encryption answer of NO, and confirm
+internal group assignment. This mode requires Python `cryptography>=42,<47`
+and app/group management permissions for the same API key. Its receipt adds
+processing state, assignment status and build/group IDs on success, or a sanitized
+`distribution_failure` after an acknowledged upload. See the
+[TestFlight runbook](internal-testflight-runbook.md) for configuration and recovery.
 Upload confirmation, Apple processing, tester availability, and physical-device
-acceptance are separate checks; this receipt asserts only the first. The caller
+acceptance are separate checks; the upload-only receipt asserts only the first. The caller
 owns removal of the supplied temporary key directory and signing workspace.
 Never publish IPA/archive files, hub URLs, keys, issuer IDs, generated
 signing options, or raw tool output as workflow artifacts. Disable shell tracing
