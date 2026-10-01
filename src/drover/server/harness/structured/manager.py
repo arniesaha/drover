@@ -30,6 +30,7 @@ from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.harness.structured.driver import StructuredMessage
 
 _MAX_ACCEPTED_CLIENT_TURNS = 128
+_DRAINING_ERROR = "host is restarting for an update; send the turn again in a minute"
 
 
 class _Entry:
@@ -62,6 +63,32 @@ class StructuredSessionManager:
         self.adapters = adapters if adapters is not None else BUILTIN_ADAPTERS
         self._entries: dict[str, _Entry] = {}
         self._entries_lock = threading.Lock()
+        # Monotonic deadline until which new turns are refused, or None. Set by
+        # the updater *before* its last quiescence check, so a turn cannot be
+        # dispatched between "idle" and the restart (drover#236). A deadline
+        # rather than a flag: if the restart never happens, turns resume on
+        # their own instead of being refused for the life of the process.
+        self._drain_until: float | None = None
+
+    def begin_drain(self, seconds: float) -> None:
+        """Refuse new turns for `seconds` while the host restarts for an update.
+
+        Turns are checked under each entry's dispatch lock, and `is_busy`
+        reports a held dispatch lock as busy. So once this returns, a
+        quiescence check either sees any turn that got in first, or that turn
+        is refused: nothing lands in between.
+        """
+        with self._entries_lock:
+            self._drain_until = time.monotonic() + seconds
+
+    def end_drain(self) -> None:
+        with self._entries_lock:
+            self._drain_until = None
+
+    def is_draining(self) -> bool:
+        with self._entries_lock:
+            until = self._drain_until
+        return until is not None and time.monotonic() < until
 
     def has(self, session_id: str) -> bool:
         with self._entries_lock:
@@ -82,8 +109,8 @@ class StructuredSessionManager:
         persistent process and stays busy for as long as it is alive.
 
         A parked session is only safe to restart past when its adapter can
-        recover it afterwards (Codex, DeepSeek). One that cannot (Agy today)
-        would come back errored with its conversation lost, so it stays busy.
+        recover it afterwards (Codex, DeepSeek, Agy). One that cannot would
+        come back errored with its conversation lost, so it stays busy.
         """
         with self._entries_lock:
             entry = self._entries.get(session_id)
@@ -362,6 +389,9 @@ class StructuredSessionManager:
             accepted = self._accepted_turn_id(entry, client_turn_id)
             if accepted is not None:
                 return accepted, True
+            # Refuse before preparing, so a refused turn leaves no files.
+            if self.is_draining():
+                raise RuntimeError(_DRAINING_ERROR)
             text, images = prepare()
             return (
                 self._send_turn_locked(
@@ -407,6 +437,8 @@ class StructuredSessionManager:
     ) -> str:
         if entry.awaiting == "approval":
             raise PermissionError("approval pending; answer it first")
+        if self.is_draining():
+            raise RuntimeError(_DRAINING_ERROR)
         guard_persistent_turn = bool(
             getattr(entry.adapter, "persistent_turn_guard", False)
         )

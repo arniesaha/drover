@@ -16,7 +16,7 @@ def test_every_builtin_resolves_with_its_existing_policy():
     expected = {
         "claude-code": (False, True, True, True),
         "codex": (True, False, True, True),
-        "agy": (True, False, True, False),
+        "agy": (True, False, True, True),
         "deepseek-harness": (True, False, False, True),
     }
     assert set(BUILTIN_ADAPTERS.ids()) == set(expected)
