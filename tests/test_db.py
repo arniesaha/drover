@@ -17,6 +17,17 @@ from drover.server.db import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ambient_duckdb_overrides_cleared(monkeypatch):
+    """These tests pin role defaults and their own overrides. A developer
+    shell that exports the production DROVER_DUCKDB_* tuning would otherwise
+    leak into every one of them (and trip the instance-wide conflict check).
+    """
+    for name in list(os.environ):
+        if name.startswith(("DROVER_DUCKDB_", "DROVER_ANALYTICAL_")):
+            monkeypatch.delenv(name)
+
+
 def test_snapshot_thread_default_scales_with_cores_but_always_leaves_one():
     """The snapshot role gets parallelism, never the whole machine.
 
