@@ -2367,12 +2367,24 @@ class MetricsCollector:
             return
         if request_payload.get("factory_observer") is not None:
             from drover.server.harness.factory_observer import (
+                FactoryObserverRequestError,
                 parse_factory_observer_launch,
             )
 
-            _, request_payload = parse_factory_observer_launch(
-                request_payload, host_id=host_id
-            )
+            # The host already accepted and started this session. A hub whose
+            # parser disagrees (mixed versions) must still record the row the
+            # host created, rather than fail the proxied create after the fact.
+            try:
+                _, request_payload = parse_factory_observer_launch(
+                    request_payload, host_id=host_id
+                )
+            except FactoryObserverRequestError as exc:
+                log.warning(
+                    "factory observer metadata for %s not normalized: %s",
+                    session_id,
+                    exc,
+                )
+                request_payload = dict(request_payload)
             # The request names the source checkout. Persist the isolated
             # directory created by the host, including on idempotent retries.
             observer = payload.get("factory_observer")
