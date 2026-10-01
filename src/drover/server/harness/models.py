@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from drover.server.harness.capabilities import stored_capabilities
+
 #: How long a direct host may go without a heartbeat before it counts as stale.
 #:
 #: One definition, two readers: the provider refresh loop uses it to skip
@@ -55,7 +57,9 @@ class HarnessHost:
             local_url=row.get("local_url"),
             tailscale_url=row.get("tailscale_url"),
             connection_kind=row.get("connection_kind") or "direct",
-            capabilities=_loads_object(row.get("capabilities_json")),
+            capabilities=stored_capabilities(
+                row.get("capabilities_json"), row["host_id"]
+            ),
             agent_version=row.get("agent_version"),
             update=_loads_object(row.get("update_json")) or None,
             last_seen_at=row.get("last_seen_at"),

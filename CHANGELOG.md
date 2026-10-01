@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Host and central harness listings publish bounded capability schema v1 from
+  the adapter registry, with fail-closed mixed-version handling. Legacy fields
+  remain available; command arrays are cleared to keep launch arguments private
+  (#418).
+
 - Claude Code, Codex, agy, and DeepSeek structured sessions now resolve driver
   construction, default commands, worktree policy, authentication, and model
   catalogs through the validated harness adapter registry. No intentional

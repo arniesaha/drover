@@ -113,38 +113,108 @@ provider could support it in theory.
 ## Public host capability envelope
 
 Existing harness rows retain `name`, `enabled`, `description`, and `command`
-for compatibility. A versioned nested capability object becomes the source of
-truth for new clients:
+for compatibility. `/capabilities` on harnessd and the `capabilities` object
+inside central `/harness` and `/harness/hosts` host rows carry the same envelope,
+regardless of direct or relay transport. The nested matrix is schema v1:
 
 ```json
 {
-  "name": "codex",
-  "enabled": true,
-  "description": "Codex CLI",
-  "capabilities": {
-    "schema_version": 1,
-    "launch_modes": ["structured"],
-    "approvals": false,
-    "interrupt": true,
-    "native_resume": true,
-    "model_catalog": true,
-    "usage": true,
-    "worktree": true,
-    "attachments": true,
-    "interactive_auth": true
-  }
+  "host_id": "mac-mini",
+  "display_name": "Mac Mini",
+  "kind": "macos",
+  "harnesses": [
+    {
+      "name": "codex",
+      "enabled": true,
+      "description": "Codex CLI",
+      "command": [],
+      "capabilities": {
+        "schema_version": 1,
+        "harness_id": "codex",
+        "launch_modes": ["structured"],
+        "approvals": false,
+        "interrupt": true,
+        "native_resume": true,
+        "model_catalog": true,
+        "usage": false,
+        "worktree": true,
+        "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+        "interactive_auth": true
+      }
+    }
+  ]
 }
 ```
 
-Rules:
+`attachments` is an array of accepted MIME types, not a boolean. `usage` follows
+the executable adapter contract; a separate provider usage probe does not imply
+adapter session-usage support. Fields describe adapter support, not current auth
+state. `enabled` remains the host's availability gate. Shell advertises only
+`pty` through the daemon's generic terminal implementation; provider declarations
+come from the existing validated adapter registry. Publication invokes no auth,
+health, model-discovery, or command-construction hooks.
 
-- The schema is additive within one version.
-- Unknown fields are ignored by clients.
-- Missing capability data invokes a bounded legacy compatibility path during
-  rollout; it does not imply every capability.
-- New servers emit the matrix for every offered harness.
-- A harness with no launch mode is not a launch target.
-- Observe-only sources are not represented as disabled launch adapters.
+### Mixed-version rules
+
+- New hosts emit v1 for every preset. A preset with no registered drive adapter
+  has no launch modes and is disabled. Observe-only Sources do not become presets.
+- Launch requires `enabled == true`, a supported schema version, and an explicitly
+  advertised launch mode. An empty launch-mode list forces `enabled: false`, so
+  old clients also hide that row.
+- **Legacy fallback is metadata only.** An old host's missing envelope or missing
+  per-harness matrix advertises no operations to a matrix-aware client. Do not
+  synthesize a matrix, select a mode by harness name, or infer approvals, resume,
+  attachments, auth, or any other capability. Clients may show host/harness status
+  and an upgrade explanation. Existing sessions remain listable.
+- Central preserves legacy `enabled` values and absent matrices for the existing
+  clients during this compatibility window. Old string-only harness lists remain
+  metadata; they contain neither an enabled flag nor a mode. Matrix-less legacy
+  names may contain spaces (for example `codex beta`); they are not registry IDs. Existing clients
+  that ignore unknown fields keep their current behavior; this slice does not
+  migrate their control logic (#419/#420).
+- Optional v1 booleans missing on input default to `false`; missing attachments
+  default to `[]`. `schema_version` and `launch_modes` are required on a matrix.
+  A present `null` or malformed matrix is invalid, never a legacy fallback.
+- Unknown fields are ignored and removed before persistence/proxying. Unsupported
+  positive integer schema versions are retained as version/identity metadata
+  with empty launch modes and `enabled: false`; they never invoke legacy fallback.
+- `command` is retained as an empty array on new hosts. Central also clears any
+  legacy command array before persistence or publication: launch commands,
+  environment assignments, prompts, credentials, and native auth payloads are
+  host-local. The current web/iOS pickers do not need command contents.
+
+### Validation and bounds
+
+The shared wire validator runs before host registration persistence, and again
+when loading previously stored declarations. It projects only public fields.
+
+| Limit | Value |
+| --- | --- |
+| HTTP registration/heartbeat body | 128 KiB, rejected before reading |
+| Host capability envelope | 64 KiB of JSON, including unknown fields |
+| Harness rows per envelope | 32 |
+| Nested matrix | 4 KiB of JSON, including unknown fields |
+| Launch modes | At most two unique values: `structured`, `pty` |
+| Attachment types | At most 16 unique MIME types, 127 characters each |
+| Versioned harness ID | At most 64 characters; lowercase letters/digits with hyphen separators |
+| Matrix-less legacy harness name | Nonempty text, at most 256 characters |
+| Host ID / display name / kind | 256 / 256 / 64 characters |
+| Description | 1,024 characters |
+| Legacy command input | At most 64 strings, 4,096 characters each; discarded |
+
+JSON size checks use Python's ASCII-escaped JSON encoding (including default
+separator whitespace), stopping at the limit. Publication does not probe hosts,
+perform analytical reads, or bypass the existing fleet render cache (#331/#224).
+
+Duplicate JSON keys, harness IDs, modes, and MIME types are rejected. A supplied
+nested `host_id` must match the registration host; a matrix's `harness_id`, when
+supplied, must match its row's `name` (omission uses the row identity). Heartbeat
+URL and body identities must agree. Booleans are strict JSON booleans, not strings
+or integers. Invalid incoming declarations return HTTP 400 without changing the
+last accepted registration. Corrupt or invalid pre-upgrade stored envelopes
+publish `{}` so one host cannot break fleet listings. Error messages never echo
+rejected values or secret-bearing payloads. These checks do not grant new trust:
+registration still uses the existing authenticated host boundary.
 
 ## Registry
 

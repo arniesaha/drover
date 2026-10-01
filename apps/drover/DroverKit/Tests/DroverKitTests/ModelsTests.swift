@@ -478,3 +478,14 @@ func hostPresenceDerivation(status: String, expected: HostPresence) {
     let flow = try JSONDecoder().decode(HarnessAuthFlow.self, from: data)
     #expect(!flow.supportsInput)
 }
+
+@Test func backendCapabilityV1FixturePreservesLegacyDecoding() throws {
+    let fixtureURL = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent("Fixtures/harness-capabilities-v1.json")
+    let snapshot = try HarnessSnapshot.decode(from: Data(contentsOf: fixtureURL))
+    #expect(snapshot.hosts.count == 1)
+    #expect(snapshot.hosts[0].displayName == "Test Host")
+    #expect(snapshot.hosts[0].harnesses == ["shell"])
+    #expect(snapshot.sessions.isEmpty)
+}

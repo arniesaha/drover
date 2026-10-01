@@ -40,6 +40,7 @@ from drover.server.db import (
     analytical_store_health,
     require_analytical_store,
 )
+from drover.server.harness.capabilities import unique_capability_keys
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_protocol import (
@@ -1278,7 +1279,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._ingest_harness_events()
             return
         if path == "/harness/hosts":
-            body = self._read_json()
+            body = self._read_json(capability_registration=True)
             if body is None:
                 self._send(
                     400,
@@ -1298,12 +1299,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if not host_id:
                 self._send(400, "application/json", '{"error": "missing host_id"}\n')
                 return
-            body = self._read_json()
+            body = self._read_json(capability_registration=True)
             if body is None:
                 self._send(
                     400,
                     "application/json",
                     '{"error": "request body must be valid JSON"}\n',
+                )
+                return
+            if "host_id" in body and body["host_id"] != host_id:
+                self._send(
+                    400, "application/json", '{"error": "host identity mismatch"}\n'
                 )
                 return
             body["host_id"] = host_id
@@ -2292,12 +2298,28 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self.auth.credentials.clear_apns_registration(credential.id)
         self._send(204, "application/json", "")
 
-    def _read_json(self) -> dict[str, Any] | None:
-        length = int(self.headers.get("Content-Length") or "0")
+    def _read_json(
+        self, *, capability_registration: bool = False
+    ) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self.close_connection = True
+            return None
+        # Registration has a small, bounded envelope. Reject before reading
+        # oversized input; leave unrelated APIs' existing body limits alone.
+        if length < 0 or (capability_registration and length > 128 * 1024):
+            self.close_connection = True
+            return None
         raw = self.rfile.read(length) if length else b"{}"
         try:
-            value = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=(
+                    unique_capability_keys if capability_registration else None
+                ),
+            )
+        except (ValueError, RecursionError):
             return None
         return value if isinstance(value, dict) else None
 
