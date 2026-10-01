@@ -162,31 +162,21 @@ struct ProviderAccountCard: View {
                 .accessibilityLabel("\(subscription.title), \(section.accountStatusText(accountStatus: subscription.status))")
                 .accessibilityHint(isExpanded ? "Collapse quota details" : "Expand quota details")
 
+                // Every host, live and stale, as icon + name. The icon carries
+                // the state; status, last report and error are in the label.
                 FlowLayout(spacing: 6, lineSpacing: 6) {
                     ForEach(subscription.hosts) { host in
                         Label(host.title, systemImage: host.symbol)
                             .droverText(.subtitle)
+                            .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 4)
                             .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 8))
+                            // One VoiceOver stop per chip, not icon and name.
+                            .accessibilityElement(children: .combine)
                             .accessibilityLabel(host.accessibilityLabel)
+                            .accessibilityIdentifier("provider-host-\(subscription.id)-\(host.id)")
                     }
-                }
-
-                if !subscription.staleHosts.isEmpty {
-                    DisclosureGroup {
-                        ForEach(subscription.staleHosts) { host in
-                            Label(host.title + " · stale", systemImage: "clock")
-                                .droverText(.subtitle)
-                                .accessibilityLabel(host.title + ", stale")
-                        }
-                    } label: {
-                        // Several accounts can each have one; name the account
-                        // so VoiceOver (and UI tests) can tell them apart.
-                        Text("Stale hosts · \(subscription.staleHosts.count)")
-                            .accessibilityLabel("Stale hosts · \(subscription.staleHosts.count), \(subscription.accountLabel)")
-                    }
-                    .accessibilityIdentifier("stale-hosts-\(subscription.id)")
                 }
 
                 if isExpanded {
@@ -196,11 +186,6 @@ struct ProviderAccountCard: View {
                     }
                     if subscription.windows.isEmpty {
                         Text(subscription.headline.usedText).droverText(.subtitle)
-                    }
-                    if let reason = subscription.reasonText {
-                        Label(reason, systemImage: "exclamationmark.triangle")
-                            .droverText(.subtitle)
-                            .fixedSize(horizontal: false, vertical: true)
                     }
                 } else {
                     let headline = subscription.headline

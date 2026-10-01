@@ -67,8 +67,8 @@ enum ObservabilityFixtureData {
         let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
             ["snapshot_id": host, "dedup_key": host, "provider": "anthropic",
              "account_label": "alex@example.com", "plan_label": "Max",
-             // Offline readings older than 72h collapse into "Stale hosts", so
-             // a fixed date would hide these chips from the journeys over time.
+             // Non-ok readings older than 72h become stale hosts (and leave
+             // Home), so a fixed date would change these journeys over time.
              "host_id": host, "status": status,
              "observed_at": status == "ok" ? reported
                  : ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86400)),

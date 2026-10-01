@@ -36,8 +36,10 @@ Quotas are never added across hosts (#456).
 `ProviderSubscriptionGrouping.staleHostThreshold` is 72 hours. Any reading
 the hub no longer reports as current (status other than `ok` or
 `usage_unavailable`) whose last successful observation is older than that
-threshold moves to a collapsed **Stale hosts** disclosure on Accounts,
-whatever its `error_category`. (Originally only `host_offline` collapsed; see
+threshold becomes a stale host, whatever its `error_category`. Accounts
+cards show it as a clock-icon chip beside the live hosts (originally a
+collapsed **Stale hosts** disclosure; replaced after TestFlight build 6), and
+its VoiceOver label gives state, last report time and error. (Originally only `host_offline` collapsed; see
 "Dark hosts whose last probe failed" below.)
 `host_retired` moves there immediately; the hub refresh loop emits this category
 when the registry host status is `retired`. Exactly 72 hours remains visible.
@@ -79,7 +81,7 @@ Fixtures: `tests/fixtures/providers/work-laptop-dark-relay.json` (hub), the
 - `src/drover/server/cockpit/service.py`: retired-host connector overlay.
 - `apps/drover/DroverKit/Sources/DroverKit/CockpitModels.swift`: wire identity and unknown-label decoding.
 - `apps/drover/DroverKit/Sources/DroverKit/CockpitPresentation.swift`: account grouping, stale host classification and Home eligibility.
-- `apps/drover/Drover/Screens/Cockpit/ProviderCapacitySection.swift`: collapsed stale-host disclosure.
+- `apps/drover/Drover/Screens/Cockpit/ProviderCapacitySection.swift`: one host chip row per card, stale hosts included.
 - `apps/drover/Drover/UITesting/ObservabilityFixtureRoot.swift`: Studio fallback, Mini/NAS email fixture.
 - `apps/drover/DroverUITests/ObservabilityFixtureUITests.swift`: regression journey alongside #447/#456 journeys.
 - `apps/drover/DroverKit/Tests/DroverKitTests/CockpitPresentationTests.swift`: grouping, ambiguity, normalization, missing identity, threshold and retirement tests.

@@ -117,9 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Relay hosts are exempt from the 45-second stale-heartbeat skip, so the hub
   kept probing one that had gone dark and recorded each failure as
   `unavailable`; it now tags any host whose last heartbeat is over 10 minutes
-  old as `host_offline`, whatever its connection kind. iOS also folds any
+  old as `host_offline`, whatever its connection kind. iOS also treats any
   reading the hub no longer reports as current (anything but `ok` or
-  `usage_unavailable`) into **Stale hosts** once its last success is over 72
+  `usage_unavailable`) as a stale host once its last success is over 72
   hours old, whatever the last error was, so older hubs are covered too. Quotas
   are still never summed across hosts, and account identity grouping is
   unchanged.
@@ -140,6 +140,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostics move to a dedicated Accounts page with pull to refresh, and
   Home's activity and project blocks become compact Analytics and Insights
   links below the session list (#456).
+- iOS Accounts cards list every host for an account in one chip row: live
+  hosts with their usual icon, stale or retired hosts with the clock icon and
+  their name. The collapsed **Stale hosts · N** disclosure and the
+  "Not reporting on …"/"Couldn't reach …" footer are gone; each chip's
+  VoiceOver label carries its state, last report time and error (for example
+  "NAS, stale, last reported 5 days ago, couldn't reach host"). Stale hosts
+  still never count on Home.
 - TestFlight uses the production lane with unrestricted hub pairing; the
   internal staging lane and separate staging hub are retired. A read-only,
   bounded live-hub smoke runs before upload, and physical-device acceptance is

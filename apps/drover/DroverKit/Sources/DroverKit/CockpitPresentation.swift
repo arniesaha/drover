@@ -818,19 +818,67 @@ public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
     public let title: String
     public let status: ProviderAccountStatus
     public let errorCategory: String?
+    /// Collapsed by `ProviderSubscriptionGrouping.isCollapsedHost`: retired, or
+    /// not current for over 72h. Shown as a chip, never used for Home quota.
+    public let isStale: Bool
+    /// When this host last reported successfully.
+    public let observedAt: Date
+    /// "NAS, stale, last reported 5 days ago, couldn't reach host". The chip
+    /// shows only icon and name, so the per-host detail lives here.
+    public let accessibilityLabel: String
+
+    public init(
+        id: String, title: String, status: ProviderAccountStatus, errorCategory: String?,
+        isStale: Bool, observedAt: Date, now: Date
+    ) {
+        self.id = id
+        self.title = title
+        self.status = status
+        self.errorCategory = errorCategory
+        self.isStale = isStale
+        self.observedAt = observedAt
+        let state = isStale ? (errorCategory == "host_retired" ? "retired" : "stale")
+            : status == .ok ? "usage reported"
+            : status.rawValue.replacingOccurrences(of: "_", with: " ")
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        formatter.dateTimeStyle = .named
+        let reported = "last reported \(formatter.localizedString(for: min(observedAt, now), relativeTo: now))"
+        let detail = status == .ok && !isStale ? nil : errorCategory.flatMap(Self.explain)
+        accessibilityLabel = ([title, state, reported] + [detail].compactMap { $0 })
+            .joined(separator: ", ")
+    }
 
     public var symbol: String {
+        if isStale { return "clock.badge.exclamationmark" }
         switch status {
-        case .ok: "checkmark.circle.fill"
-        case .stale: "clock.badge.exclamationmark"
-        case .error: "exclamationmark.triangle"
-        default: "questionmark.circle"
+        case .ok: return "checkmark.circle.fill"
+        case .stale: return "clock.badge.exclamationmark"
+        case .error: return "exclamationmark.triangle"
+        default: return "questionmark.circle"
         }
     }
 
-    public var accessibilityLabel: String {
-        let reading = status == .ok ? "usage reported" : "usage \(status.rawValue.replacingOccurrences(of: "_", with: " "))"
-        return "\(title), \(reading)"
+    /// What went wrong on this host, in prose.
+    ///
+    /// These categories describe the *central server's* attempt to collect
+    /// usage from a host, not the state of that host's CLI: `unavailable` is
+    /// set when the fetch of `/providers/usage` failed, which is what a
+    /// restarting daemon looks like from here. Saying "provider CLI
+    /// unavailable" read as "the tool is not installed" and sent a reader to
+    /// reinstall CLIs that were on PATH the whole time.
+    static func explain(_ category: String) -> String? {
+        switch category {
+        case "unavailable", "host_offline": return "couldn't reach host"
+        // Not a reachability or sign-in problem: the daemon resolved no path to
+        // the CLI, so the probe never ran.
+        case "cli_not_found": return "CLI not found"
+        case "timeout": return "timed out"
+        case "process_error": return "usage probe failed"
+        case "empty_inventory": return "no accounts detected"
+        case "freshness_expired", "provider_window_expired": return "reading expired"
+        default: return nil
+        }
     }
 }
 
@@ -842,8 +890,9 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
     public let planLabel: String?
     /// Host ids that reported this subscription, sorted.
     public let hostIDs: [String]
+    /// Every host for the account, live and stale, sorted by id. Stale hosts
+    /// (`isStale`) are listed but never supply quota.
     public let hosts: [ProviderHostPresentation]
-    public let staleHosts: [ProviderHostPresentation]
     public let isHomeEligible: Bool
     /// "Mac Mini, NAS" — display titles when known, ids otherwise.
     public let hostsText: String
@@ -856,10 +905,6 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
     /// because a subscription with no windows must still say when it was read.
     public let freshnessText: String
     public let status: ProviderAccountStatus
-    /// Why this subscription is degraded, naming the host it failed on, so a
-    /// single broken probe reads as one card's problem rather than a banner
-    /// over the whole section.
-    public let reasonText: String?
 
     public var isDegraded: Bool { status != .ok }
 }
@@ -925,7 +970,9 @@ public enum ProviderSubscriptionGrouping {
                     .max(by: { $0.observedAt < $1.observedAt }) else { return nil }
                 return ProviderHostPresentation(
                     id: hostID, title: hostTitles[hostID] ?? hostID,
-                    status: member.status, errorCategory: member.errorCategory
+                    status: member.status, errorCategory: member.errorCategory,
+                    isStale: members.filter { $0.hostID == hostID }.allSatisfy { isCollapsedHost($0, now: now) },
+                    observedAt: member.observedAt, now: now
                 )
             }
 
@@ -939,12 +986,7 @@ public enum ProviderSubscriptionGrouping {
                 planLabel: representative.planLabel
                     ?? members.compactMap(\.planLabel).first,
                 hostIDs: hostIDs,
-                hosts: hosts.filter { host in
-                    !members.filter { $0.hostID == host.id }.allSatisfy { isCollapsedHost($0, now: now) }
-                },
-                staleHosts: hosts.filter { host in
-                    members.filter { $0.hostID == host.id }.allSatisfy { isCollapsedHost($0, now: now) }
-                },
+                hosts: hosts,
                 isHomeEligible: !current.isEmpty,
                 hostsText: ListFormatter.localizedString(byJoining: titles),
                 representative: representative,
@@ -957,10 +999,7 @@ public enum ProviderSubscriptionGrouping {
                 freshnessText: ProviderCapacityPresentation.freshness(
                     observedAt: representative.observedAt, now: now
                 ),
-                status: representative.status,
-                reasonText: reason(members: hostIDs.compactMap { hostID in
-                    members.filter { $0.hostID == hostID }.max(by: { $0.observedAt < $1.observedAt })
-                }, hostTitles: hostTitles)
+                status: representative.status
             )
         }
     }
@@ -974,43 +1013,6 @@ public enum ProviderSubscriptionGrouping {
         guard let value = explicit.flatMap({ $0.isEmpty ? nil : $0.lowercased() })
             ?? (label.contains("@") ? label : nil) else { return nil }
         return "\(account.provider)|\(value)"
-    }
-
-    /// Names the failing hosts and what went wrong.
-    ///
-    /// These categories describe the *central server's* attempt to collect
-    /// usage from a host, not the state of that host's CLI: `unavailable` is
-    /// set when the fetch of `/providers/usage` failed, which is what a
-    /// restarting daemon looks like from here. Saying "provider CLI
-    /// unavailable" read as "the tool is not installed" and sent a reader to
-    /// reinstall CLIs that were on PATH the whole time.
-    private static func reason(
-        members: [ProviderAccount],
-        hostTitles: [String: String]
-    ) -> String? {
-        let failing = members.filter { $0.status == .error || $0.status == .stale }
-        guard !failing.isEmpty else { return nil }
-
-        let hosts = ListFormatter.localizedString(
-            byJoining: failing.map { hostTitles[$0.hostID] ?? $0.hostID }.sorted()
-        )
-        let categories = Set(failing.compactMap { $0.errorCategory })
-        let detail = categories.count == 1 ? categories.first.map(explain) ?? nil : nil
-        return detail.map { "\($0) \(hosts)" } ?? "Not reporting on \(hosts)"
-    }
-
-    private static func explain(_ category: String) -> String? {
-        switch category {
-        case "unavailable", "host_offline": return "Couldn't reach"
-        // Not a reachability or sign-in problem: the daemon resolved no path to
-        // the CLI, so the probe never ran.
-        case "cli_not_found": return "CLI not found on"
-        case "timeout": return "Timed out reaching"
-        case "process_error": return "Usage probe failed on"
-        case "empty_inventory": return "No accounts detected on"
-        case "freshness_expired", "provider_window_expired": return "Reading expired on"
-        default: return nil
-        }
     }
 }
 
@@ -1087,7 +1089,7 @@ public struct ProviderCapacityPreview: Sendable, Equatable {
                 provider: account.provider,
                 remainingFraction: account.headline.fraction.map { max(0, min(1, 1 - $0)) },
                 isStale: stale,
-                hasWarnings: stale || account.headline.fraction == nil || account.hosts.contains { $0.status != .ok }
+                hasWarnings: stale || account.headline.fraction == nil || account.hosts.contains { !$0.isStale && $0.status != .ok }
             )
         }.sorted {
             let lhs = $0.remainingFraction ?? 2
