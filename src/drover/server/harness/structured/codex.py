@@ -194,6 +194,18 @@ class CodexDriver:
     def is_alive(self) -> bool:
         return not self._closed
 
+    def has_turn_in_flight(self) -> bool:
+        """Whether any part of a turn is still running (drover#236).
+
+        `is_alive` only means nobody has closed the session: between turns a
+        per-turn driver owns no process at all. The worker thread is checked
+        as well as the flag because it clears the flag before emitting the
+        turn's final error/exit events, and those must land before a restart.
+        """
+        with self._turn_lock:
+            worker = self._turn_thread
+            return self._turn_active or (worker is not None and worker.is_alive())
+
     def interrupt(self) -> None:
         with self._turn_lock:
             process = self._turn_process

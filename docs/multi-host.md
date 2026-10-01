@@ -197,8 +197,12 @@ timer and publishes a target on the heartbeat every `drover-harnessd` already
 sends, so no new channel and no inbound access to a host is involved.
 
 A host that is behind installs the new version beside its current one and then
-waits. It activates only when it has no live work: no running structured
-session, and no attached terminal. If it cannot tell, it treats itself as busy.
+waits. It activates only when it has no live work: no structured turn in
+flight, and no attached terminal. If it cannot tell, it treats itself as busy.
+A Codex or DeepSeek session waiting for its user between turns is not work and
+does not hold the update back, because it resumes after the restart; a turn in
+progress, a pending approval, a Claude Code session's still-running process, or
+an open Agy session (which cannot be resumed after a restart yet) does.
 An update deferred costs hours; an update that interrupts a turn costs work
 nobody gets back.
 

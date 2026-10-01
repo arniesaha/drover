@@ -45,10 +45,16 @@ class QuiesceReport:
 
 
 def quiesce_report(state) -> QuiesceReport:
-    """Count live work. Raises if either manager cannot answer."""
+    """Count live work. Raises if either manager cannot answer.
+
+    A structured session counts when it is busy, not merely open: a per-turn
+    session parked on user input has no process to interrupt, and counting it
+    kept hosts off new versions for as long as any session stayed open
+    (drover#236). A turn in flight still counts.
+    """
     alive = 0
     for session_id in state.structured.session_ids():
-        if state.structured.is_alive(session_id):
+        if state.structured.is_busy(session_id):
             alive += 1
     terminals = len(state.pty.list_sessions())
     return QuiesceReport(structured_alive=alive, terminals=terminals)

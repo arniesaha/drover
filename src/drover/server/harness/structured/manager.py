@@ -72,6 +72,40 @@ class StructuredSessionManager:
             entry = self._entries.get(session_id)
         return bool(entry and entry.driver.is_alive())
 
+    def is_busy(self, session_id: str) -> bool:
+        """Whether restarting harnessd now would cut work off (drover#236).
+
+        Liveness is the wrong question for per-turn drivers (Codex, Agy,
+        DeepSeek): they stay "alive" between turns while owning no process, so
+        a session parked on user input blocked host updates forever. Those
+        drivers report `has_turn_in_flight`; a driver that does not is a
+        persistent process and stays busy for as long as it is alive.
+
+        A parked session is only safe to restart past when its adapter can
+        recover it afterwards (Codex, DeepSeek). One that cannot (Agy today)
+        would come back errored with its conversation lost, so it stays busy.
+        """
+        with self._entries_lock:
+            entry = self._entries.get(session_id)
+        if entry is None or not entry.driver.is_alive():
+            return False
+        if not getattr(entry.adapter, "recover_after_restart", False):
+            return True
+        has_turn_in_flight = getattr(entry.driver, "has_turn_in_flight", None)
+        if not callable(has_turn_in_flight):
+            return True
+        # A send_turn/answer_permission dispatch or an event write holds
+        # entry.lock; any of those in progress is work, even before the
+        # driver has registered a turn.
+        if not entry.lock.acquire(blocking=False):
+            return True
+        try:
+            if entry.awaiting == "approval":
+                return True
+            return bool(has_turn_in_flight())
+        finally:
+            entry.lock.release()
+
     def harness_for(self, session_id: str) -> str | None:
         with self._entries_lock:
             entry = self._entries.get(session_id)
