@@ -404,7 +404,7 @@ def test_postgres_bootstrap_serializes_concurrent_starters(tmp_path: Path):
             rows = con.execute(
                 f'SELECT version FROM "{schema}".control_schema_migrations'
             ).fetchall()
-        assert rows == [(1,), (2,), (3,)]
+        assert rows == [(1,), (2,), (3,), (4,)]
     finally:
         for store in starters:
             store.close()
@@ -698,6 +698,30 @@ def test_postgres_snapshot_bridges_only_analytical_control_facts(
             ).fetchall() == [("pg-snapshot-session",)]
             with pytest.raises(duckdb.CatalogException):
                 analytical.execute("SELECT * FROM harness_events")
+
+
+def test_postgres_credentials_record_apns_rejection(postgres_control_store):
+    control_path, _ = postgres_control_store
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    store = PostgresCredentialStore(control_path)
+    credential, _ = store.issue(scope="device", label="PostgreSQL phone")
+    store.set_apns_registration(credential.id, token="dead", environment="production")
+
+    assert not store.mark_apns_registration_failed(
+        credential.id, expected_token="other", reason="BadDeviceToken"
+    )
+    assert store.mark_apns_registration_failed(
+        credential.id, expected_token="dead", reason="BadDeviceToken"
+    )
+    stored = store.get(credential.id)
+    assert (stored.apns_token, stored.apns_environment) == (None, None)
+    assert stored.apns_failure_reason == "BadDeviceToken"
+    assert stored.apns_failed_at is not None
+    assert stored.apns_registration_rejected("dead", "production")
+
+    store.set_apns_registration(credential.id, token="fresh", environment="production")
+    assert store.get(credential.id).apns_failed_fingerprint is None
 
 
 def test_postgres_credentials_observe_cross_process_revocation(postgres_control_store):

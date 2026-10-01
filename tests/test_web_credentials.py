@@ -223,6 +223,39 @@ def test_clear_apns_registration_compares_expected_token(tmp_path):
     assert store.get(credential.id).apns_token is None
 
 
+def test_apns_rejection_is_recorded_without_the_token_and_survives_restart(tmp_path):
+    store = _store(tmp_path)
+    credential, _ = store.issue(scope="device", label="Phone")
+    store.set_apns_registration(
+        credential.id, token="dead-token", environment="sandbox"
+    )
+
+    assert not store.mark_apns_registration_failed(
+        credential.id, expected_token="other-token", reason="BadDeviceToken"
+    )
+    assert store.mark_apns_registration_failed(
+        credential.id, expected_token="dead-token", reason="BadDeviceToken"
+    )
+
+    loaded = CredentialStore(tmp_path / CREDENTIALS_FILENAME).get(credential.id)
+    assert (loaded.apns_token, loaded.apns_environment) == (None, None)
+    assert loaded.apns_failure_reason == "BadDeviceToken"
+    assert loaded.apns_failed_at is not None
+    assert loaded.apns_registration_rejected("dead-token", "sandbox")
+    assert not loaded.apns_registration_rejected("dead-token", "production")
+    assert "dead-token" not in (tmp_path / CREDENTIALS_FILENAME).read_text()
+    assert set(loaded.as_public_json()) == PUBLIC_CREDENTIAL_KEYS
+
+    assert store.set_apns_registration(
+        credential.id, token="new-token", environment="sandbox"
+    )
+    renewed = store.get(credential.id)
+    assert (renewed.apns_failure_reason, renewed.apns_failed_fingerprint) == (
+        None,
+        None,
+    )
+
+
 def test_revoke_destroys_apns_capability(tmp_path):
     store = _store(tmp_path)
     credential, _ = store.issue(scope="device", label="Phone")

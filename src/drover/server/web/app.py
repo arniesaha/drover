@@ -2278,7 +2278,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 400, "application/json", '{"error": "invalid APNs registration"}\n'
             )
             return
-        if not push_available():
+        # Same 503 for "push is off", "Apple refused our key for this
+        # environment", and "Apple refused this very token": each one means
+        # the app must keep its local notifications (#439's contract).
+        if not push_available(environment) or credential.apns_registration_rejected(
+            token, environment
+        ):
             self.auth.credentials.clear_apns_registration(credential.id)
             self._send(
                 503,

@@ -39,6 +39,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def apns_registration_fingerprint(token: str, environment: str) -> str:
+    """Identify a rejected (token, environment) pair without keeping the token.
+
+    A token Apple refused is re-sent by the app on every cold launch, so the
+    hub has to recognise it to keep answering "push unavailable". The pair
+    matters, not the token alone: the same token is valid in the other
+    environment when the app simply reported the wrong one.
+    """
+    digest = hashlib.sha256(
+        b"drover-apns-v1\0"
+        + environment.encode("utf-8")
+        + b"\0"
+        + token.encode("utf-8")
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
 @dataclass(frozen=True)
 class Credential:
     id: str
@@ -51,10 +68,23 @@ class Credential:
     revoked_at: str | None = None
     apns_token: str | None = None
     apns_environment: str | None = None
+    #: Set when Apple permanently rejected this device's registration. The
+    #: fingerprint (never the token) lets the registration route refuse the
+    #: same dead token when the app re-sends it.
+    apns_failure_reason: str | None = None
+    apns_failed_at: str | None = None
+    apns_failed_fingerprint: str | None = None
 
     @property
     def is_active(self) -> bool:
         return self.revoked_at is None
+
+    def apns_registration_rejected(self, token: str, environment: str) -> bool:
+        return (
+            self.apns_failed_fingerprint is not None
+            and self.apns_failed_fingerprint
+            == apns_registration_fingerprint(token, environment)
+        )
 
     def as_json(self) -> dict:
         return {
@@ -68,6 +98,9 @@ class Credential:
             "revoked_at": self.revoked_at,
             "apns_token": self.apns_token,
             "apns_environment": self.apns_environment,
+            "apns_failure_reason": self.apns_failure_reason,
+            "apns_failed_at": self.apns_failed_at,
+            "apns_failed_fingerprint": self.apns_failed_fingerprint,
         }
 
     def as_public_json(self) -> dict:
@@ -160,6 +193,9 @@ class CredentialStore:
                 credential,
                 apns_token=token,
                 apns_environment=environment,
+                apns_failure_reason=None,
+                apns_failed_at=None,
+                apns_failed_fingerprint=None,
             )
             self._write()
             return True
@@ -182,6 +218,35 @@ class CredentialStore:
                 credential,
                 apns_token=None,
                 apns_environment=None,
+            )
+            self._write()
+            return True
+
+    def mark_apns_registration_failed(
+        self, credential_id: str, *, expected_token: str, reason: str
+    ) -> bool:
+        """Clear a registration Apple permanently refused, remembering why.
+
+        ``expected_token`` guards against a send that raced a re-registration:
+        a fresh token must not be condemned by its predecessor's rejection.
+        """
+        with self._lock:
+            credential = self._by_id.get(credential_id)
+            if (
+                credential is None
+                or credential.apns_token is None
+                or credential.apns_token != expected_token
+            ):
+                return False
+            self._by_id[credential_id] = replace(
+                credential,
+                apns_token=None,
+                apns_environment=None,
+                apns_failure_reason=reason,
+                apns_failed_at=_now_iso(),
+                apns_failed_fingerprint=apns_registration_fingerprint(
+                    expected_token, credential.apns_environment or ""
+                ),
             )
             self._write()
             return True
@@ -250,6 +315,9 @@ class CredentialStore:
                     revoked_at=item.get("revoked_at"),
                     apns_token=item.get("apns_token"),
                     apns_environment=item.get("apns_environment"),
+                    apns_failure_reason=item.get("apns_failure_reason"),
+                    apns_failed_at=item.get("apns_failed_at"),
+                    apns_failed_fingerprint=item.get("apns_failed_fingerprint"),
                 )
             except KeyError:
                 continue
@@ -279,7 +347,8 @@ class CredentialStore:
 
 _CREDENTIAL_COLUMNS = """
 credential_id, scope, label, verifier, created_at, host_id, last_used_at,
-revoked_at, apns_token, apns_environment
+revoked_at, apns_token, apns_environment, apns_failure_reason, apns_failed_at,
+apns_failed_fingerprint
 """
 
 
@@ -304,6 +373,9 @@ def _credential_from_row(row: tuple[object, ...]) -> Credential:
         revoked_at=timestamp(row[7]),
         apns_token=str(row[8]) if row[8] is not None else None,
         apns_environment=str(row[9]) if row[9] is not None else None,
+        apns_failure_reason=str(row[10]) if row[10] is not None else None,
+        apns_failed_at=timestamp(row[11]),
+        apns_failed_fingerprint=str(row[12]) if row[12] is not None else None,
     )
 
 
@@ -397,7 +469,9 @@ class PostgresCredentialStore:
         with self._connection() as con:
             row = con.execute(
                 """UPDATE control_credentials
-                   SET apns_token = ?, apns_environment = ?
+                   SET apns_token = ?, apns_environment = ?,
+                       apns_failure_reason = NULL, apns_failed_at = NULL,
+                       apns_failed_fingerprint = NULL
                    WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device'
                    RETURNING credential_id""",
                 [token, environment, credential_id],
@@ -418,6 +492,36 @@ class PostgresCredentialStore:
         sql += " RETURNING credential_id"
         with self._connection() as con:
             row = con.execute(sql, params).fetchone()
+        return row is not None
+
+    def mark_apns_registration_failed(
+        self, credential_id: str, *, expected_token: str, reason: str
+    ) -> bool:
+        with self._connection() as con:
+            current = con.execute(
+                "SELECT apns_environment FROM control_credentials "
+                "WHERE credential_id = ? AND apns_token = ?",
+                [credential_id, expected_token],
+            ).fetchone()
+            if current is None:
+                return False
+            row = con.execute(
+                """UPDATE control_credentials
+                   SET apns_token = NULL, apns_environment = NULL,
+                       apns_failure_reason = ?, apns_failed_at = ?,
+                       apns_failed_fingerprint = ?
+                   WHERE credential_id = ? AND apns_token = ?
+                   RETURNING credential_id""",
+                [
+                    reason,
+                    _now_iso(),
+                    apns_registration_fingerprint(
+                        expected_token, str(current[0] or "")
+                    ),
+                    credential_id,
+                    expected_token,
+                ],
+            ).fetchone()
         return row is not None
 
     def touch(self, credential_id: str, *, now: float | None = None) -> None:

@@ -125,6 +125,9 @@ struct DroverApp: App {
 #endif
             if phase == .background {
                 BackgroundRefresh.schedule()
+            } else if phase == .active {
+                // Learn about a hub-side APNs rejection since the last upload.
+                PushRegistrar.shared.revalidate()
             }
         }
     }

@@ -56,6 +56,18 @@ final class PushRegistrar {
         uploadIfReady()
     }
 
+    /// Re-send the current token so the hub can withdraw a promise it can no
+    /// longer keep. Apple can reject a token (or the hub's key) after the
+    /// upload succeeded, and the hub then answers the next upload with the
+    /// same 503 as "push unavailable". Without this, a long-running process
+    /// would stay suppressed until its next cold launch. The current state
+    /// stands until the hub answers, so a revalidation never opens a window
+    /// of duplicate alerts.
+    func revalidate() {
+        uploadedToken = nil
+        uploadIfReady()
+    }
+
     /// Drop the registration server-side. Used on sign-out, so a signed-out
     /// phone stops lighting up for a fleet it no longer belongs to.
     func unregister() async {
