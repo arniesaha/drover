@@ -4,6 +4,42 @@ import Testing
 
 // MARK: - Conversation cards
 
+@Test func conversationCardPrefersExplicitRepoOverIsolatedDirectory() throws {
+    let wire = Data("""
+        {"session_id":"delegated","harness":"codex","mode":"structured",
+         "status":"running","cwd":"/worktrees/harness-123","repo_name":"drover"}
+        """.utf8)
+    let session = try JSONDecoder().decode(SessionSummary.self, from: wire)
+    let card = SessionCardPresentation(session: session, hostTitle: "Studio")
+
+    #expect(session.cwd == "/worktrees/harness-123")
+    #expect(card.projectName == "drover")
+    #expect(card.kicker == "drover")
+}
+
+@Test func conversationCardHandlesLegacyNullProjectMetadata() throws {
+    for repo in ["null", "\"\"", "\"  \"", "\"drover\""] {
+        let wire = Data("""
+            {"session_id":"legacy","harness":"codex","mode":"structured",
+             "status":"running","cwd":null,"repo_name":\(repo)}
+            """.utf8)
+        let session = try JSONDecoder().decode(SessionSummary.self, from: wire)
+        let card = SessionCardPresentation(session: session, hostTitle: "Studio")
+
+        #expect(card.kicker == (repo == "\"drover\"" ? "drover" : nil))
+        #expect(card.title == "Running")
+    }
+}
+
+@Test func conversationCardFallsBackToCwdWhenRepoIsBlank() {
+    let session = SessionSummary(
+        id: "app", hostID: "h", harness: "codex", mode: "structured",
+        status: "running", awaiting: nil, cwd: "/src/drover", lastActivity: nil,
+        repoName: "  "
+    )
+    #expect(SessionCardPresentation(session: session, hostTitle: "Studio").kicker == "drover")
+}
+
 @Test func conversationCardMakesThePreviewTheLoudThing() {
     let session = SessionSummary(
         id: "s1",

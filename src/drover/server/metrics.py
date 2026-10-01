@@ -2365,6 +2365,23 @@ class MetricsCollector:
         session_id = str(payload.get("session_id") or "").strip()
         if not session_id:
             return
+        if request_payload.get("factory_observer") is not None:
+            from drover.server.harness.factory_observer import (
+                parse_factory_observer_launch,
+            )
+
+            _, request_payload = parse_factory_observer_launch(
+                request_payload, host_id=host_id
+            )
+            # The request names the source checkout. Persist the isolated
+            # directory created by the host, including on idempotent retries.
+            observer = payload.get("factory_observer")
+            worktree = observer.get("worktree") if isinstance(observer, dict) else None
+            request_payload["cwd"] = (
+                _optional_str(worktree.get("path"))
+                if isinstance(worktree, dict)
+                else None
+            )
         harness = str(
             payload.get("harness") or request_payload.get("harness") or "shell"
         )
