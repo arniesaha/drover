@@ -749,7 +749,8 @@ class SummarizerWorker:
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, now())""",
                         [
                             session_id,
-                            events[0].get("raw_data") and _safe_task_id(con, session_id),
+                            events[0].get("raw_data")
+                            and _safe_task_id(con, session_id),
                             agent_id,
                             events[-1].get("timestamp"),
                             llm["summary_md"],

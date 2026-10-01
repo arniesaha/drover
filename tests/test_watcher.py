@@ -715,9 +715,7 @@ def test_enqueue_waits_for_a_worker_completing_the_same_session(
         assert release_completion.wait(10)
         return real_enqueue_embed(con, session_id, source_version)
 
-    monkeypatch.setattr(
-        worker_module, "_enqueue_embed_on_connection", held_completion
-    )
+    monkeypatch.setattr(worker_module, "_enqueue_embed_on_connection", held_completion)
     worker = SummarizerWorker(duckdb_path=db_path, _llm_call=_summary_llm)
     drained: list[int] = []
     worker_thread = threading.Thread(target=lambda: drained.append(worker.drain_once()))
@@ -782,9 +780,7 @@ def test_reparse_after_a_failed_enqueue_is_idempotent(
             )
         return real_enqueue(con, session_id, source_version)
 
-    monkeypatch.setattr(
-        watcher_module, "enqueue_summary_generation", conflict_once
-    )
+    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", conflict_once)
     handler = _Handler(parquet_dir, db_path, max_lock_retries=0)
 
     handler._maybe_ingest(batch)
@@ -802,18 +798,15 @@ def test_reparse_after_a_failed_enqueue_is_idempotent(
 
     con = duckdb.connect(str(db_path))
     try:
-        events = con.execute(
-            """SELECT id, count(*) FROM agent_events
+        events = con.execute("""SELECT id, count(*) FROM agent_events
                 WHERE session_id IN ('sess-w1', 'sess-w2')
-                GROUP BY id ORDER BY id"""
-        ).fetchall()
+                GROUP BY id ORDER BY id""").fetchall()
         jobs = con.execute(
             """SELECT session_id, status, source_version FROM summarize_jobs
                 WHERE session_id IN ('sess-w1', 'sess-w2') ORDER BY session_id"""
         ).fetchall()
         versions = {
-            sid: source_version_for_session(con, sid)
-            for sid in ("sess-w1", "sess-w2")
+            sid: source_version_for_session(con, sid) for sid in ("sess-w1", "sess-w2")
         }
     finally:
         con.close()
