@@ -67,8 +67,8 @@ enum ObservabilityFixtureData {
         let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
             ["snapshot_id": host, "dedup_key": host, "provider": "anthropic",
              "account_label": "alex@example.com", "plan_label": "Max",
-             // Offline readings older than 72h collapse into "Stale hosts", so
-             // a fixed date would hide these chips from the journeys over time.
+             // Non-ok readings older than 72h become stale hosts (and leave
+             // Home), so a fixed date would change these journeys over time.
              "host_id": host, "status": status,
              "observed_at": status == "ok" ? reported
                  : ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86400)),
@@ -80,7 +80,10 @@ enum ObservabilityFixtureData {
             let provider = index == 0 ? "openai" : index == 1 ? "google" : index == 8 ? "other" : index == 9 ? "local" : "anthropic"
             return ["snapshot_id": "other-\(index)", "dedup_key": "other-\(index)",
                 "provider": provider, "account_label": index == 1 ? "Antigravity" : "account-\(index)@example.com", "plan_label": index == 1 ? NSNull() : "Personal",
-                "host_id": "studio", "status": index == 2 ? "stale" : "ok", "observed_at": reported,
+                // Any non-ok reading collapses after 72h, so the stale one is
+                // relative to launch like the offline hosts above.
+                "host_id": "studio", "status": index == 2 ? "stale" : "ok",
+                "observed_at": index == 2 ? ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86400)) : reported,
                 "source": index == 1 ? "agy-usage" : "fixture-usage", "windows": [["kind": "seven_day", "used_percent": index == 2 ? 81 : index == 0 ? 28 : 0],
                     ["kind": "five_hour", "used_percent": 0]]]
         }
@@ -92,7 +95,16 @@ enum ObservabilityFixtureData {
              "source": "agy-usage", "error_category": "host_offline",
              "windows": [["kind": "five_hour", "used_percent": 99]]]
         }
-        return shared + others + googleHistory
+        // Reference hub: work-laptop's probe failed before it went dark, so its
+        // 6-day-old reading is `unavailable`, not `host_offline`. It must stay
+        // off Home, where 3% left would otherwise be the lowest meter.
+        let darkHost: [String: Any] = ["snapshot_id": "work-laptop", "dedup_key": "work-laptop",
+            "provider": "anthropic", "account_label": "work@example.com", "plan_label": "Team",
+            "host_id": "work-laptop", "status": "stale",
+            "observed_at": ISO8601DateFormatter().string(from: Date().addingTimeInterval(-6 * 86400)),
+            "source": "fixture-usage", "error_category": "unavailable",
+            "windows": [["kind": "seven_day", "used_percent": 97]]]
+        return shared + others + googleHistory + [darkHost]
     }
 
     static var analytics: Data {

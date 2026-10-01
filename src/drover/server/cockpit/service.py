@@ -46,6 +46,12 @@ COCKPIT_SECTIONS = (
     "insights",
 )
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
+# Two refresh intervals of heartbeat silence (forty missed 15-second beats)
+# marks a host offline for provider capacity whatever its connection kind.
+# Relay hosts are exempt from the 45-second `is_stale` skip, so without this a
+# relay host that went dark kept failing probes as `unavailable` forever and
+# its days-old quota never read as host-offline.
+PROVIDER_HOST_OFFLINE_AFTER_SECONDS = 2 * PROVIDER_REFRESH_INTERVAL_SECONDS
 # The bounded query is usually about four seconds against the production
 # lakehouse, but a cold concurrent read has exceeded eight seconds and older
 # live measurements put the complete cold overview at 12.4 seconds. Cockpit
@@ -582,7 +588,11 @@ class ProviderRefreshLoop:
             # The registry always yields HarnessHost, so call it directly: a
             # getattr probe defaulting to "not stale" would let a rename
             # silently turn the whole skip off with every test still green.
-            if status != "online" or host.is_stale():
+            if (
+                status != "online"
+                or host.is_stale()
+                or host.heartbeat_expired(PROVIDER_HOST_OFFLINE_AFTER_SECONDS)
+            ):
                 try:
                     self.provider_usage.mark_host_unavailable(
                         host_id,

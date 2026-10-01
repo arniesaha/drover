@@ -33,14 +33,44 @@ freshest eligible host, then the freshest historical host if all are collapsed.
 The display label can come from another member carrying a known identity.
 Quotas are never added across hosts (#456).
 
-`ProviderSubscriptionGrouping.staleHostThreshold` is 72 hours. A
-`host_offline` reading whose last successful observation is older than that
-threshold moves to a collapsed **Stale hosts** disclosure on Accounts.
+`ProviderSubscriptionGrouping.staleHostThreshold` is 72 hours. Any reading
+the hub no longer reports as current (status other than `ok` or
+`usage_unavailable`) whose last successful observation is older than that
+threshold becomes a stale host, whatever its `error_category`. Accounts
+cards show it as a clock-icon chip beside the live hosts (originally a
+collapsed **Stale hosts** disclosure; replaced after TestFlight build 6), and
+its VoiceOver label gives state, last report time and error. (Originally only `host_offline` collapsed; see
+"Dark hosts whose last probe failed" below.)
 `host_retired` moves there immediately; the hub refresh loop emits this category
 when the registry host status is `retired`. Exactly 72 hours remains visible.
 Collapsed hosts cannot supply Home quotas. Accounts with no eligible hosts
 remain on Accounts and are excluded from Home's account count, meter strip,
 and lowest-remaining calculation. All snapshots and history are retained.
+
+## Dark hosts whose last probe failed
+
+On the reference hub, relay host `work-laptop` last succeeded on 2026-09-25,
+its probe failed as `unavailable` on 2026-09-27, and its heartbeat stopped.
+`HarnessHost.is_stale()` is false for relay hosts (#222 keeps probing them over
+the relay socket), so the refresh loop kept probing, every failure was recorded
+as `unavailable`, and the reading never became `host_offline`. Its 6-day-old
+Anthropic quota stayed on Home's lowest-remaining meter.
+
+Two rules now hold:
+
+- Hub: `ProviderRefreshLoop` marks a host `host_offline`, without probing, when
+  its last heartbeat is older than `PROVIDER_HOST_OFFLINE_AFTER_SECONDS` (600 s,
+  two refresh intervals) via `HarnessHost.heartbeat_expired()`, whatever its
+  connection kind. Relay hosts register through the same 15-second HTTP
+  heartbeat, so `last_seen_at` is meaningful for them. A host that never
+  heartbeat is unknown, not expired. The 45-second direct-host skip is unchanged.
+- Client: the 72-hour collapse applies to any non-current reading, not only
+  `host_offline`, so a hub without the rule above, or a host removed from the
+  registry, cannot put a days-old quota on Home either.
+
+Fixtures: `tests/fixtures/providers/work-laptop-dark-relay.json` (hub), the
+`longDarkHostCollapsesWhateverItsLastProbeError` DroverKit test, and the
+`work-laptop` reading in the observability UI fixture.
 
 ## Implementation files
 
@@ -51,7 +81,7 @@ and lowest-remaining calculation. All snapshots and history are retained.
 - `src/drover/server/cockpit/service.py`: retired-host connector overlay.
 - `apps/drover/DroverKit/Sources/DroverKit/CockpitModels.swift`: wire identity and unknown-label decoding.
 - `apps/drover/DroverKit/Sources/DroverKit/CockpitPresentation.swift`: account grouping, stale host classification and Home eligibility.
-- `apps/drover/Drover/Screens/Cockpit/ProviderCapacitySection.swift`: collapsed stale-host disclosure.
+- `apps/drover/Drover/Screens/Cockpit/ProviderCapacitySection.swift`: one host chip row per card, stale hosts included.
 - `apps/drover/Drover/UITesting/ObservabilityFixtureRoot.swift`: Studio fallback, Mini/NAS email fixture.
 - `apps/drover/DroverUITests/ObservabilityFixtureUITests.swift`: regression journey alongside #447/#456 journeys.
 - `apps/drover/DroverKit/Tests/DroverKitTests/CockpitPresentationTests.swift`: grouping, ambiguity, normalization, missing identity, threshold and retirement tests.

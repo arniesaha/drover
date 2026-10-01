@@ -1,0 +1,44 @@
+{
+  "description": "Reference hub, 2026-10-01: relay host work-laptop's last good Anthropic reading was 2026-09-25, its probe then failed as 'unavailable' on 2026-09-27, and its heartbeat stopped. Synthetic account; no credentials.",
+  "host": {
+    "host_id": "work-laptop",
+    "display_name": "work-laptop",
+    "kind": "macos",
+    "status": "online",
+    "connection_kind": "relay"
+  },
+  "last_success_at": "2026-09-25T18:00:00+00:00",
+  "last_probe_failure_at": "2026-09-27T18:00:00+00:00",
+  "last_heartbeat_at": "2026-09-27T18:00:00+00:00",
+  "now": "2026-10-01T18:00:00+00:00",
+  "payload": {
+    "accounts": [
+      {
+        "snapshot_id": "work-laptop-anthropic-0925",
+        "dedup_key": "work-laptop-anthropic-0925",
+        "provider": "anthropic",
+        "account_label": "work@example.com",
+        "account_identity": "work@example.com",
+        "plan_label": "team",
+        "host_id": "work-laptop",
+        "status": "ok",
+        "observed_at": "2026-09-25T18:00:00+00:00",
+        "source": "claude-oauth-usage",
+        "error_category": null,
+        "windows": [
+          {
+            "kind": "seven_day",
+            "used_percent": 97.0,
+            "limit_value": null,
+            "remaining_value": null,
+            "unit": null,
+            "window_minutes": 10080,
+            "starts_at": null,
+            "resets_at": "2026-10-02T18:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "observed_at": "2026-09-25T18:00:00+00:00"
+  }
+}

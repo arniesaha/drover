@@ -23,6 +23,11 @@ final class ObservabilityFixtureUITests: XCTestCase {
         screenshot("accounts-compact", app)
         account.tap()
         XCTAssertTrue(app.staticTexts["Five hour"].exists)
+        // Mac Mini and the work laptop are failing; their chips say so, and
+        // the expanded card no longer repeats it as a footer line.
+        for footer in ["Couldn't reach", "Not reporting on"] {
+            XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", footer)).firstMatch.exists)
+        }
     }
 
     @MainActor
@@ -105,13 +110,43 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(google.isHittable)
         XCTAssertEqual(googleAccounts.count, 1)
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · Antigravity")).firstMatch.exists)
-        let stale = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Stale hosts")).firstMatch
-        XCTAssertTrue(stale.isHittable)
-        let nas = app.descendants(matching: .any).matching(NSPredicate(format: "label ==[c] %@", "NAS, stale")).firstMatch
-        XCTAssertFalse(nas.exists)
-        stale.tap()
-        XCTAssertTrue(nas.waitForExistence(timeout: 3))
+        // The stale NAS is a chip in the account's host row, with no
+        // separate "Stale hosts" list and no "Not reporting on" footer.
+        let nas = app.descendants(matching: .any)["provider-host-google|arniesaha@gmail.com-nas"]
+        XCTAssertTrue(nas.exists)
+        // Host titles can fall back to lower-case ids on this path.
+        XCTAssertTrue(nas.label.lowercased().hasPrefix("nas, stale, last reported 5 days ago"), nas.label)
+        let mini = app.descendants(matching: .any)["provider-host-google|arniesaha@gmail.com-mini"]
+        XCTAssertTrue(mini.exists)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Stale hosts")).firstMatch.exists)
+        XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", "Not reporting on")).firstMatch.exists)
         screenshot("google-account-stale-hosts", app)
+    }
+
+    /// Reference hub: work-laptop's last probe failed as `unavailable` before
+    /// it went dark for 6 days. Its 3%-left reading stays off Home (count and
+    /// lowest meter unchanged) and shows as a stale chip on its Accounts card.
+    @MainActor
+    func testLongDarkUnavailableHostStaysOffHome() {
+        let app = launch()
+        app.tabBars.buttons["Home"].tap()
+        let navigation = app.buttons["provider-capacity-navigation"]
+        XCTAssertTrue(navigation.waitForExistence(timeout: 8))
+        XCTAssertTrue(navigation.label.contains("11 accounts"))
+        // The strip leads with the lowest remaining meter; 3% would lead it.
+        let strip = app.scrollViews["account-meter-strip"]
+        XCTAssertTrue(strip.exists)
+        XCTAssertTrue(strip.buttons.firstMatch.label.contains("account-2@example.com, Anthropic, 19% left"))
+        XCTAssertFalse(strip.buttons.matching(NSPredicate(format: "label CONTAINS %@", "work@example.com")).firstMatch.exists)
+        navigation.tap()
+        let scroll = app.scrollViews["provider-accounts-scroll"]
+        let work = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Anthropic · work@example.com")).firstMatch
+        for _ in 0..<8 where !work.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(work.isHittable)
+        let laptop = app.descendants(matching: .any)["provider-host-anthropic|work@example.com-work-laptop"]
+        XCTAssertTrue(laptop.exists)
+        XCTAssertEqual(laptop.label, "work-laptop, stale, last reported 6 days ago, couldn't reach host")
+        screenshot("dark-unavailable-host-stale", app)
     }
 
     @MainActor
