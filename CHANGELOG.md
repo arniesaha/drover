@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogs through the validated harness adapter registry. No intentional
   lifecycle or client behavior changes.
 
+- Public README, security policy, security guide, and threat model are
+  version-neutral: only the latest tagged release is supported, PostgreSQL is
+  the fresh central-install control store without automatic DuckDB migration,
+  and the legacy shared token and unbound host credentials (#13) remain
+  explicit limitations. Documentation only (#415).
+
 ## [0.5.2] - 2026-09-26
 
 ### Fixed

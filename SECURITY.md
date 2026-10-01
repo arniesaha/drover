@@ -32,16 +32,19 @@ When reporting a vulnerability, please provide:
 
 ## Supported Versions
 
-We recommend running the latest version of Drover for security updates.
+Security fixes land on `main` and ship in the next tagged release. Only the
+latest tagged release is supported; earlier releases, including earlier minor
+lines, do not receive backported fixes.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| v0.2.x  | :white_check_mark: |
-| v0.1.x  | :x:                |
-| < 0.1.0 | :x:                |
+| Version                                    | Supported          |
+| ------------------------------------------ | ------------------ |
+| Latest tagged release (see `CHANGELOG.md`) | :white_check_mark: |
+| Any earlier release                        | :x:                |
 
-**Note**: Drover is in active development. Always run the latest release for best
-security posture.
+**Note**: Drover is in active development. Upgrade to the latest release for the
+best security posture. Upgrading does not migrate an existing DuckDB control
+store to PostgreSQL; that remains an explicit operator step described in
+[PostgreSQL control store](./docs/postgresql-control-store.md).
 
 ## Best Practices
 
@@ -92,7 +95,12 @@ security posture.
 - When authentication is enabled, bearer tokens or session cookies protect all
   routes except `/healthz`, `/readyz`, `/auth/login`, `/auth/pair`, and
   `/harness/probe`
-- Per-device and per-host credentials (not shared)
+- Per-device and per-host credentials, individually revocable
+- Host credentials are not yet bound to a host identity: any host credential
+  can act as any registered host
+  ([#13](https://github.com/arniesaha/drover/issues/13))
+- The legacy shared token is accepted by default for upgrade compatibility
+  until `[auth] legacy_token_enabled = false`
 - Credential hashing: `sha256("drover-cred-v1\0" + token)`
 - Pairing codes with time limits (10 min device, 15 min host)
 - Rate limiting on pairing endpoint
@@ -103,13 +111,17 @@ security posture.
 - Built-in central and harness listeners do not configure TLS or mTLS
 - Keep listeners on localhost or a trusted private network; terminate TLS in
   an external proxy only when you operate and secure that proxy
-- Private network boundary enforcement (no public exposure)
+- Supported boundary: localhost, a trusted private LAN, or a private Tailscale
+  network; Tailscale Funnel and other public-internet exposure are unsupported
 
 ### Data Security
 
 - Credentials.json stores hashed tokens, never plaintext
-- Sensitive data stored locally (`~/.drover/`)
-- No external cloud storage or transmission
+- Sensitive data stored locally (`~/.drover/`); a PostgreSQL control store
+  DSN is kept in `~/.drover/server.env` with mode `0600`
+- No external cloud storage or transmission unless the operator configures it,
+  for example APNs push notifications, an external model or embedding
+  provider, or a manual archive backup to R2
 - Redaction policy support for summaries and context data
 
 ## Incident Response
@@ -152,8 +164,10 @@ We maintain a responsible disclosure program for security vulnerabilities:
 
 ## Compliance
 
-Drover v0.2 is designed for trusted personal use. It does not provide:
+Drover is designed for trusted personal use by a single operator. It does not
+provide:
 - Multi-tenant isolation
+- Host-identity-bound credentials
 - SOC 2 or ISO 27001 compliance
 - Enterprise audit logging
 - Formal penetration testing certification
@@ -168,4 +182,4 @@ and issue reporting through the proper channels.
 
 ---
 
-_Last updated: 2026-08-13_
+_Last updated: 2026-10-01_

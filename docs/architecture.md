@@ -103,7 +103,7 @@ cold archived payload reads.
 
 All central listeners bind to localhost by default. Ports and bind addresses
 are configurable for deliberate private-LAN or private-Tailscale deployments.
-Public-internet exposure is not supported for v0.3.
+Public-internet exposure is not supported.
 
 ## Failure And Recovery
 
@@ -150,5 +150,5 @@ emit Drover naming. Compatibility storage is not a second public product name.
 
 All components belong to one trusted operator. Device and host credentials
 protect the central API, while the legacy shared bearer token remains enabled
-by default for upgrades. Drover v0.3 does not provide host-bound credential
+by default for upgrades. Drover does not yet provide host-bound credential
 enforcement, RBAC, SSO, or multi-tenant isolation. See [Security](security.md).

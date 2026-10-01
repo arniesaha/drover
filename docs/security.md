@@ -1,7 +1,9 @@
 # Security
 
-Drover v0.3 is designed for one trusted operator on machines and networks they
-control. It is not a multi-tenant service.
+Drover is designed for one trusted operator on machines and networks they
+control. It is not a multi-tenant service. This document describes the latest
+tagged release; see [SECURITY.md](../SECURITY.md#supported-versions) for the
+support policy.
 
 ## Supported Boundary
 
@@ -11,8 +13,10 @@ control. It is not a multi-tenant service.
 
 Tailscale Funnel and other public-internet exposure are not supported. The
 relay protocol forwards requests that create and control agent sessions and
-carries bidirectional terminal streams. Drover v0.3 does not bind individual
-hosts to individual credentials.
+carries bidirectional terminal streams. Drover does not yet bind a host
+credential to the host identity it was issued for
+([#13](https://github.com/arniesaha/drover/issues/13)), so public relay
+ingress stays unsupported.
 
 ## Authentication
 
@@ -70,13 +74,14 @@ Drover does not currently provide:
 
 - Multiple users or tenant isolation
 - RBAC, SSO, or scoped API permissions
-- Per-host tokens or cryptographic host identity binding
+- Host-identity-bound credentials or cryptographic host identity: a host
+  credential is individually revocable but can act as any registered host
 - A sandbox around commands launched by an agent harness
 - A hosted backup, recovery, or availability service
 
-Every registered host and every client holding the shared token belongs to the
-same trust domain. Run agent CLIs with the operating-system account and file
-permissions you intend them to have.
+Every registered host, every paired device, and every client holding the
+shared token belongs to the same trust domain. Run agent CLIs with the
+operating-system account and file permissions you intend them to have.
 
 ## GitHub Actions Runner
 
@@ -87,10 +92,19 @@ operator credentials. See the [GitHub Actions runner model](github-actions-runne
 
 ## Data Handling
 
+A fresh central installation keeps fleet serving state in a PostgreSQL control
+store; the installer stores its DSN in `~/.drover/server.env` with mode `0600`
+and never in TOML or service arguments. A managed control store binds only to
+`127.0.0.1`. Upgrading does not migrate an existing DuckDB control store
+automatically; that cutover is an explicit offline operator step described in
+[PostgreSQL control store](postgresql-control-store.md). The analytical lake
+and each host's local spool remain DuckDB and Parquet.
+
 The context store may contain prompts, responses, repository paths, diffs,
 tool calls, and telemetry. It remains on the configured local storage unless
-you explicitly ship events between your own machines or configure an external
-model/embedding provider.
+you explicitly ship events between your own machines, configure an external
+model/embedding provider, enable APNs push notifications (relayed by Apple), or
+run a manual archive backup to R2.
 
 Before sharing logs, database extracts, screenshots, or issue reports, remove
 credentials, private hostnames, personal paths, repository secrets, and user
