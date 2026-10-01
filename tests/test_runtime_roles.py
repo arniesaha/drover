@@ -809,7 +809,9 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
         lambda _cfg: SimpleNamespace(enabled=False, api_token=""),
     )
     monkeypatch.setattr(server_main, "_configure_push", lambda *_args: None)
-    monkeypatch.setattr(server_main, "start_metrics_server", lambda **_kwargs: Server())
+    monkeypatch.setattr(
+        server_main, "start_resilient_metrics_server", lambda **_kwargs: Server()
+    )
     monkeypatch.setattr(server_main.threading, "Event", Stop)
     monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(

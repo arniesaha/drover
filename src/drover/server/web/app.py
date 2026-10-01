@@ -73,6 +73,7 @@ from drover.server.web.auth import (
     session_cookie_value,
     token_matches,
 )
+from drover.server.web.listener import DroverHTTPServer, ResilientListener
 from drover.server.web.pairing import PairingCodes, ThrottledSource, UnknownCode
 from drover.server.web.ui import load_page
 
@@ -2618,21 +2619,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
 
 
-def start_metrics_server(
+def _metrics_handler(
     *,
-    host: str,
-    port: int,
     collector: "MetricsCollector",
-    auth: AuthSettings | None = None,
-    pairing: PairingCodes | None = None,
-    analytics_boundary: AnalyticsBoundaryClient | None = None,
-    host_data_bridge_token: str = "",
-) -> ThreadingHTTPServer:
-    """Start the Drover metrics HTTP server in a daemon thread."""
+    auth: AuthSettings | None,
+    pairing: PairingCodes | None,
+    analytics_boundary: AnalyticsBoundaryClient | None,
+    host_data_bridge_token: str,
+) -> type[_MetricsHandler]:
+    """Build the handler class once; every (re)bound listener shares it."""
     from drover.server.relay_manager import RelayManager
 
     collector.relay_manager = RelayManager()
-    handler = type(
+    return type(
         "DroverMetricsHandler",
         (_MetricsHandler,),
         {
@@ -2649,12 +2648,64 @@ def start_metrics_server(
             "fleet_slots": _request_slots("DROVER_FLEET_HTTP_CONCURRENCY", 4),
         },
     )
-    server = ThreadingHTTPServer((host, port), handler)
+
+
+def start_metrics_server(
+    *,
+    host: str,
+    port: int,
+    collector: "MetricsCollector",
+    auth: AuthSettings | None = None,
+    pairing: PairingCodes | None = None,
+    analytics_boundary: AnalyticsBoundaryClient | None = None,
+    host_data_bridge_token: str = "",
+) -> ThreadingHTTPServer:
+    """Start the Drover metrics HTTP server in a daemon thread."""
+    handler = _metrics_handler(
+        collector=collector,
+        auth=auth,
+        pairing=pairing,
+        analytics_boundary=analytics_boundary,
+        host_data_bridge_token=host_data_bridge_token,
+    )
+    server = DroverHTTPServer((host, port), handler)
     thread = threading.Thread(
         target=server.serve_forever, name="drover-metrics", daemon=True
     )
     thread.start()
     return server
+
+
+def start_resilient_metrics_server(
+    *,
+    host: str,
+    port: int,
+    collector: "MetricsCollector",
+    auth: AuthSettings | None = None,
+    pairing: PairingCodes | None = None,
+    analytics_boundary: AnalyticsBoundaryClient | None = None,
+    host_data_bridge_token: str = "",
+) -> ResilientListener:
+    """Start the hub's public listener so a missing bind address is survivable.
+
+    Unlike ``start_metrics_server`` this does not raise when ``host`` is not
+    assigned to the machine yet (a VPN that is down): it logs, retries with
+    capped backoff, and rebinds if the address later disappears and returns
+    (#457). Configuration errors still raise immediately.
+    """
+    handler = _metrics_handler(
+        collector=collector,
+        auth=auth,
+        pairing=pairing,
+        analytics_boundary=analytics_boundary,
+        host_data_bridge_token=host_data_bridge_token,
+    )
+    return ResilientListener(
+        host=host,
+        port=port,
+        factory=lambda: DroverHTTPServer((host, port), handler),
+        name="cockpit",
+    ).start()
 
 
 def analytics_boundary_dispatcher(

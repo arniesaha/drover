@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The hub survives its bind address disappearing, for example a VPN client
+  stopping. A missing `[server].metrics_host` at startup no longer exits into
+  a launchd/systemd restart loop (API role) or leaves the all-in-one hub
+  running with no listener. The hub stays up, logs, retries with backoff
+  capped at 30 seconds, and serves as soon as the address appears. A specific
+  address that vanishes while serving has its listener closed and rebound when
+  it returns, and binding no longer does a reverse DNS lookup that could stall
+  while the VPN's resolver is gone. The docs now recommend
+  `metrics_host = "0.0.0.0"` with the existing auth and a firewall for hubs
+  with both LAN and VPN addresses (#457).
 - APNs rejections are no longer silent. Device-level rejections
   (`BadDeviceToken`, `DeviceTokenNotForTopic`, `Unregistered`/410,
   `ExpiredToken`) clear that phone's registration and the hub keeps refusing

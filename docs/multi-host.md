@@ -35,6 +35,10 @@ uv run drover-server run --metrics-host 0.0.0.0
 Only add `--mcp-host` or `--otlp-host` when remote agents or collectors need
 those listeners too.
 
+A hub with both a LAN and a VPN address should bind the wildcard, not the VPN
+address alone, so it stays reachable when the VPN stops. See
+[Hosts With More Than One Network](getting-started.md#hosts-with-more-than-one-network-lan--vpn).
+
 ## Adding A Machine
 
 On the machine that already runs the hub:
