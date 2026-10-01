@@ -33,6 +33,7 @@ struct TerminalScreen: View {
     /// rather than an automatic pop so the user can still read whatever last
     /// output is on screen.
     @State private var sessionEnded = false
+    @State private var busyMessage: String?
     /// True while the terminal socket is down and the stream is retrying.
     /// Suppressed during the initial connect (nothing to *re*-connect to
     /// yet) by only flipping on after the first successful connection —
@@ -73,12 +74,19 @@ struct TerminalScreen: View {
                 onSessionEnded: { sessionEnded = true },
                 onConnectionChanged: { up in
                     if up {
+                        busyMessage = nil
                         hasConnectedOnce = true
                         coldOpen.reset()
                     }
                     isReconnecting = !up
                 },
                 onConnectFailed: { reason in
+                    if reason.hasPrefix("Hub busy,") {
+                        busyMessage = reason
+                        coldOpen.reset()
+                        return
+                    }
+                    busyMessage = nil
                     guard !hasConnectedOnce else { return }
                     coldOpen.noteFailure(reason)
                 }
@@ -97,6 +105,11 @@ struct TerminalScreen: View {
         .overlay {
             if sessionEnded {
                 SessionEndedOverlay { dismiss() }
+            } else if let busyMessage {
+                Label(busyMessage, systemImage: "clock")
+                    .droverText(.subtitle)
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             } else if !hasConnectedOnce, let detail = coldOpen.detail {
                 // Retry wakes the stream's backoff rather than rebuilding the
                 // socket: `TerminalStream` is already reattaching on a

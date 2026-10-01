@@ -123,12 +123,21 @@ public final class AuthFlowModel {
                     self.errorMessage = nil
                     transientFailureCount = 0
                     if fresh.isTerminal { return }
+                } catch DroverError.busy(let deadline) {
+                    guard !Task.isCancelled, let self, self.pollGeneration == generation else { return }
+                    self.errorMessage = RetryPolicy.busyMessage(until: deadline)
+                    do { try await RetryPolicy.wait(until: deadline) }
+                    catch { return }
+                    continue
                 } catch {
                     guard !Task.isCancelled, let self, self.pollGeneration == generation else { return }
                     self.errorMessage = Self.errorMessage(for: error)
                     guard Self.isRetryablePollingError(error) else { return }
                     let multiplier = pow(2.0, Double(min(transientFailureCount, 10)))
-                    let delay = min(max(seconds, 0.01) * multiplier, 10)
+                    let delay = RetryPolicy.delay(
+                        backoff: min(max(seconds, 0.01) * multiplier, 10),
+                        minimum: min(1, max(seconds, 0.01))
+                    )
                     transientFailureCount += 1
                     try? await Task.sleep(for: .seconds(delay))
                     continue

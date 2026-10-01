@@ -19,7 +19,10 @@ public enum ClientFactory {
         -> (client: DroverClient, config: ServerConfig)? {
         if let override = ServerConfig.debugOverride() {
             guard endpointIsAllowed(override.config.baseURL) else { return nil }
-            return (DroverClient(config: override.config, token: override.token), override.config)
+            return (
+                DroverClient(config: override.config, token: override.token, retryGate: .shared),
+                override.config
+            )
         }
         guard let config = ServerConfig.load(defaults: defaults),
               endpointIsAllowed(config.baseURL),
@@ -31,7 +34,8 @@ public enum ClientFactory {
             DroverClient(
                 config: config,
                 token: token,
-                credentialBindingID: credentialBindingID
+                credentialBindingID: credentialBindingID,
+                retryGate: .shared
             ),
             config
         )

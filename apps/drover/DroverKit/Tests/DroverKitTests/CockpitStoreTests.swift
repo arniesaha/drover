@@ -4,6 +4,100 @@ import Testing
 
 @Suite(.serialized)
 struct CockpitStoreTests {
+    @Test @MainActor func busyOverviewWaitsBeforeRetryingAndRetainsContent() async throws {
+        let client = CockpitClientStub(overviews: [
+            try decodeOverview(providerStatus: "ok", activitySessions: 10),
+            try decodeOverview(providerStatus: "ok", activitySessions: 20),
+        ])
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.refresh()
+        let deadline = Date().addingTimeInterval(0.2)
+        await client.setError(.busy(until: deadline))
+        let load = Task { await store.refresh() }
+        try await Task.sleep(for: .milliseconds(40))
+        #expect(store.providerError?.hasPrefix("Hub busy,") == true)
+        #expect(store.activity?.totals.sessionCount == 10)
+        #expect(await client.overviewRequestCount == 2)
+        await client.setError(nil)
+        await load.value
+        #expect(Date() >= deadline)
+        #expect(await client.overviewRequestCount == 3)
+        #expect(store.providerError == nil)
+    }
+
+    @Test @MainActor func busyAnalyticsWaitsAndResumes() async throws {
+        let deadline = Date().addingTimeInterval(0.2)
+        let client = CockpitClientStub(
+            analyticsPages: [try decodeAnalytics()], analyticsErrors: [DroverError.busy(until: deadline)]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        let load = Task { await store.loadAnalytics() }
+        try await Task.sleep(for: .milliseconds(40))
+        #expect(store.analyticsError?.hasPrefix("Hub busy,") == true)
+        #expect(await client.analyticsRequestCount == 1)
+        await load.value
+        #expect(Date() >= deadline)
+        #expect(await client.analyticsRequestCount == 2)
+        #expect(store.analyticsError == nil)
+    }
+
+    @Test @MainActor func busyInsightsWaitsAndCancelledLoadDoesNotRetry() async throws {
+        let deadline = Date().addingTimeInterval(0.2)
+        let client = CockpitClientStub(insightsError: DroverError.busy(until: deadline))
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        let load = Task { await store.loadInsights() }
+        try await Task.sleep(for: .milliseconds(40))
+        #expect(store.insightsError?.hasPrefix("Hub busy,") == true)
+        #expect(await client.insightsRequestCount == 1)
+        await client.setInsightsError(nil)
+        load.cancel()
+        await load.value
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await client.insightsRequestCount == 1)
+    }
+
+    @Test @MainActor func busyPaginationWaitsAndKeepsCursor() async throws {
+        let client = CockpitClientStub(
+            analyticsPages: [
+                try decodeAnalyticsPage(projects: ["one"], hosts: [],
+                                        projectCursor: "next", hostCursor: nil),
+                try decodeAnalyticsPage(projects: ["two"], hosts: [],
+                                        projectCursor: nil, hostCursor: nil),
+            ],
+            insightPages: [
+                try decodeInsightPage(ids: ["one"], nextCursor: "next"),
+                try decodeInsightPage(ids: ["two"], nextCursor: nil),
+            ]
+        )
+        let store = CockpitStore(client: client)
+        store.updateCapability(from: try capableSnapshot())
+        await store.loadAnalytics()
+        await store.loadInsights()
+        let deadline = Date().addingTimeInterval(0.2)
+        await client.setAnalyticsErrors([DroverError.busy(until: deadline)])
+        await client.setInsightsError(DroverError.busy(until: deadline))
+        let analyticsLoad = Task { await store.loadMoreAnalytics(.projects) }
+        let insightsLoad = Task { await store.loadMoreInsights() }
+        try await Task.sleep(for: .milliseconds(40))
+        #expect(store.nextAnalyticsCursor(for: .projects) == "next")
+        #expect(store.nextInsightsCursor == "next")
+        #expect(store.analyticsPaginationError(for: .projects)?.hasPrefix("Hub busy,") == true)
+        #expect(store.insightsError?.hasPrefix("Hub busy,") == true)
+        #expect(await client.analyticsRequestCount == 2)
+        #expect(await client.insightsRequestCount == 2)
+        await client.setInsightsError(nil)
+        await analyticsLoad.value
+        await insightsLoad.value
+        #expect(Date() >= deadline)
+        #expect(await client.analyticsRequestCount == 3)
+        #expect(await client.insightsRequestCount == 3)
+        #expect(store.nextAnalyticsCursor(for: .projects) == nil)
+        #expect(store.nextInsightsCursor == nil)
+    }
+
     @Test @MainActor func insightsAvailabilityFollowsAdvertisedCapability() throws {
         let store = CockpitStore(client: CockpitClientStub())
 
@@ -960,6 +1054,8 @@ private actor CockpitClientStub: CockpitClient {
     }
 
     func setError(_ error: DroverError?) { refreshError = error }
+
+    func setAnalyticsErrors(_ errors: [any Error & Sendable]) { analyticsErrors = errors }
 
     func setInsightsError(_ error: (any Error & Sendable)?) { insightsError = error }
 

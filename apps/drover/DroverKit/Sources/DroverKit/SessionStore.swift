@@ -278,12 +278,15 @@ public final class SessionStore {
         inFlightRefresh = nil
     }
 
+    public private(set) var busyUntil: Date?
+
     private func performRefresh() async {
         guard let client else { return }
         refreshAttempts += 1
         do {
             let fresh = try await client.snapshot()
             snapshot = fresh
+            busyUntil = nil
             lastError = nil
             lastRefreshFailure = nil
             isReachable = true
@@ -307,6 +310,8 @@ public final class SessionStore {
                 noteCancelledFirstLoad()
                 return
             }
+            busyUntil = nil
+            if case DroverError.busy(let deadline) = error { busyUntil = deadline }
             cancelledFirstLoads = 0
             fastRetryStartedAt = nil
             isReachable = false
@@ -423,6 +428,7 @@ public final class SessionStore {
     /// cancellation window (#95) is the last thing that should be polled four
     /// times a second forever.
     private func pollDelay(base seconds: Double) -> Double {
+        if let busyUntil { return max(seconds, busyUntil.timeIntervalSinceNow) }
         guard !hasLoadedOnce, cancelledFirstLoads > 0, lastError == nil else { return seconds }
         // Bounded by the clock, not just by a run of cancellations. The counter
         // resets on any honest failure, so a hub that alternates between timing
@@ -517,7 +523,7 @@ public final class SessionStore {
                 return .authentication
             case .decoding:
                 return .decoding
-            case .httpStatus:
+            case .httpStatus, .busy:
                 return .http
             case .conflict, .badRequest, .unavailable:
                 return .other

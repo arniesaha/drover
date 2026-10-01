@@ -56,7 +56,7 @@ struct SessionLoadPerformanceTests {
                 coldBatches.append(messages.map(\.seq))
             case .connection(true):
                 break eventLoop
-            case .message, .connection(false), .connectFailed, .unauthorized:
+            case .message, .connection(false), .connectFailed, .busy, .unauthorized:
                 break
             }
         }

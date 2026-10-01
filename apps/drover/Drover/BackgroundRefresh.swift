@@ -27,9 +27,19 @@ enum BackgroundRefresh {
     /// Safe to call repeatedly — a new submit replaces any pending request
     /// for the same identifier.
     static func schedule() {
-        let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
-        try? BGTaskScheduler.shared.submit(request)
+        Task {
+            let config = ClientFactory.make()?.config
+            let deadline: Date?
+            if let config { deadline = await HubRetryGate.shared.deadline(for: config.baseURL) }
+            else { deadline = nil }
+            let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
+            request.earliestBeginDate = nextRefreshDate(retryDeadline: deadline)
+            try? BGTaskScheduler.shared.submit(request)
+        }
+    }
+
+    static func nextRefreshDate(now: Date = Date(), retryDeadline: Date?) -> Date {
+        max(now.addingTimeInterval(15 * 60), retryDeadline ?? .distantPast)
     }
 
     private static func handle(_ task: BGAppRefreshTask, notifier: Notifying) {
@@ -46,8 +56,8 @@ enum BackgroundRefresh {
         let work = Task {
             var success = false
             if let built = ClientFactory.make() {
-                await watcher.check(client: built.client)
-                success = true
+                success = await watcher.check(client: built.client)
+                schedule()
             }
             box.value.setTaskCompleted(success: success)
         }

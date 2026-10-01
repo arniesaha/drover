@@ -199,7 +199,8 @@ func client() -> DroverClient {
     DroverClient(config: ServerConfig(urlString: "http://test.local:7080")!,
                 token: "test-token",
                 credentialBindingID: testRecoveryBindingID,
-                session: MockURLProtocol.session())
+                session: MockURLProtocol.session(),
+                retryGate: HubRetryGate())
 }
 
 @MainActor

@@ -17,7 +17,7 @@ struct InsightsView: View {
             LazyVStack(alignment: .leading, spacing: 10) {
                 filterStrip
                 if let error = store.insightsError {
-                    Label(error, systemImage: "exclamationmark.circle")
+                    Label(error, systemImage: error.hasPrefix("Hub busy,") ? "clock" : "exclamationmark.circle")
                         .droverText(.nested)
                         .foregroundStyle(DroverColor.accentHi)
                 }

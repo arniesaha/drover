@@ -58,8 +58,8 @@ private final class BundleWithoutProfile: Bundle, @unchecked Sendable {
 /// Serves a file whose bytes wrap an XML plist in noise, the way a real
 /// `embedded.mobileprovision` wraps one in a CMS signature.
 private final class BundleWithProfile: Bundle, @unchecked Sendable {
-    nonisolated(unsafe) static var apsEnvironment = "development"
-    nonisolated(unsafe) static var written: URL?
+    var apsEnvironment = "development"
+    var written: URL?
 
     override func url(forResource name: String?, withExtension ext: String?) -> URL? {
         let plist = """
@@ -71,7 +71,7 @@ private final class BundleWithProfile: Bundle, @unchecked Sendable {
               <key>Name</key><string>Drover Development</string>
               <key>Entitlements</key>
               <dict>
-                <key>aps-environment</key><string>\(Self.apsEnvironment)</string>
+                <key>aps-environment</key><string>\(apsEnvironment)</string>
               </dict>
             </dict>
             </plist>
@@ -83,33 +83,36 @@ private final class BundleWithProfile: Bundle, @unchecked Sendable {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("embedded-\(UUID().uuidString).mobileprovision")
         try? data.write(to: url)
-        Self.written = url
+        written = url
         return url
     }
 }
 
 @Test func developmentProfileMeansSandbox() {
-    BundleWithProfile.apsEnvironment = "development"
-    defer { BundleWithProfile.written.map { try? FileManager.default.removeItem(at: $0) } }
+    let bundle = BundleWithProfile()
+    bundle.apsEnvironment = "development"
+    defer { bundle.written.map { try? FileManager.default.removeItem(at: $0) } }
 
     // A development profile issues sandbox tokens even from a Release build,
     // which is exactly the case `#if DEBUG` would get wrong.
-    #expect(APNsEnvironment.current(bundle: BundleWithProfile()) == .sandbox)
+    #expect(APNsEnvironment.current(bundle: bundle) == .sandbox)
 }
 
 @Test func productionProfileMeansProduction() {
-    BundleWithProfile.apsEnvironment = "production"
-    defer { BundleWithProfile.written.map { try? FileManager.default.removeItem(at: $0) } }
+    let bundle = BundleWithProfile()
+    bundle.apsEnvironment = "production"
+    defer { bundle.written.map { try? FileManager.default.removeItem(at: $0) } }
 
-    #expect(APNsEnvironment.current(bundle: BundleWithProfile()) == .production)
+    #expect(APNsEnvironment.current(bundle: bundle) == .production)
 }
 
 @Test func entitlementIsParsedOutOfTheSignedEnvelope() {
-    BundleWithProfile.apsEnvironment = "development"
-    defer { BundleWithProfile.written.map { try? FileManager.default.removeItem(at: $0) } }
+    let bundle = BundleWithProfile()
+    bundle.apsEnvironment = "development"
+    defer { bundle.written.map { try? FileManager.default.removeItem(at: $0) } }
 
     // The plist has to be found between binary CMS bytes on both sides.
     #expect(
-        APNsEnvironment.apsEnvironmentEntitlement(in: BundleWithProfile()) == "development"
+        APNsEnvironment.apsEnvironmentEntitlement(in: bundle) == "development"
     )
 }

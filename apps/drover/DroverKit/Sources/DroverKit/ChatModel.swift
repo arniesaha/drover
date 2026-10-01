@@ -565,6 +565,7 @@ public final class ChatModel {
             isConnected = connected
             if connected {
                 hasConnectedOnce = true
+                if hint?.hasPrefix("Hub busy,") == true { hint = nil }
                 coldOpen.reset()
             }
         case .connectFailed(let reason):
@@ -573,6 +574,9 @@ public final class ChatModel {
             // state would hide history the user can still read.
             guard !hasConnectedOnce else { break }
             coldOpen.noteFailure(reason)
+        case .busy(let deadline):
+            coldOpen.reset()
+            hint = RetryPolicy.busyMessage(until: deadline)
         case .unauthorized:
             // Terminal: MessageStream has already stopped reconnecting (see
             // its doc comment on `.unauthorized`). Surface a hint instead of
@@ -1122,7 +1126,7 @@ public final class ChatModel {
             return true
         case .httpStatus(let status, _):
             return status >= 500
-        case .unauthorized, .conflict, .badRequest, .unavailable:
+        case .unauthorized, .conflict, .badRequest, .unavailable, .busy:
             return false
         }
     }
@@ -1492,10 +1496,18 @@ public final class ChatModel {
     private nonisolated static func fetchSessionMetadata(
         client: DroverClient, sessionID: String
     ) async -> (snapshot: HarnessSnapshot, session: SessionSummary)? {
-        guard let snapshot = try? await client.snapshot(),
-              let session = snapshot.sessions.first(where: { $0.id == sessionID })
-        else { return nil }
-        return (snapshot, session)
+        while !Task.isCancelled {
+            do {
+                let snapshot = try await client.snapshot()
+                guard let session = snapshot.sessions.first(where: { $0.id == sessionID })
+                else { return nil }
+                return (snapshot, session)
+            } catch DroverError.busy(let deadline) {
+                do { try await RetryPolicy.wait(until: deadline) }
+                catch { return nil }
+            } catch { return nil }
+        }
+        return nil
     }
 
     private func applySessionMetadata(_ snapshot: HarnessSnapshot, session: SessionSummary) {
