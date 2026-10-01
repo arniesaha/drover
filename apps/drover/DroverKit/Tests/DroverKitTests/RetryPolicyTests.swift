@@ -79,31 +79,69 @@ struct RetryCallSiteTests {
         let background = DroverClient(config: config, token: "two", session: MockURLProtocol.session(), retryGate: gate)
         do { _ = try await first.snapshot(); Issue.record("Expected busy") }
         catch DroverError.busy(let deadline) { #expect(deadline.timeIntervalSinceNow >= 119) }
-        let reads: [() async throws -> Void] = [
+        let controlReads: [() async throws -> Void] = [
             { _ = try await first.snapshot() },
             { _ = try await first.messagePage(sessionID: "s1", request: .newest(limit: 50)) },
+            { _ = try await first.authFlow(hostID: "h1", harness: "codex", flowID: "f1") },
+        ]
+        for read in controlReads {
+            do { try await read(); Issue.record("Cooldown bypassed") }
+            catch DroverError.busy { }
+        }
+        #expect(requests == 1)
+        // The analytical lane is admitted separately by the hub: one probe,
+        // then its own cooldown covers every analytical read.
+        let analyticalReads: [() async throws -> Void] = [
             { _ = try await first.cockpitOverview() },
             { _ = try await first.analytics() },
             { _ = try await first.insights() },
             { _ = try await first.insightDetail(findingID: "f1") },
-            { _ = try await first.authFlow(hostID: "h1", harness: "codex", flowID: "f1") },
         ]
-        for read in reads {
+        for read in analyticalReads {
             do { try await read(); Issue.record("Cooldown bypassed") }
             catch DroverError.busy { }
         }
+        #expect(requests == 2)
         let store = SessionStore(client: first)
         await store.refresh()
         #expect(store.busyUntil != nil)
         #expect(store.lastError?.hasPrefix("Hub busy, retrying in ") == true)
         let watcher = AttentionWatcher(notifier: RetryNotifier())
         #expect(await watcher.check(client: background) == false)
-        #expect(requests == 1)
+        #expect(requests == 2)
         // Push registration stays a single PUT and preserves #439's status.
         await #expect(throws: DroverError.httpStatus(503, "unexpected status 503")) {
             try await first.registerAPNsToken(Data([1]))
         }
-        #expect(requests == 2)
+        #expect(requests == 3)
+    }
+
+    @Test func analyticalCooldownDoesNotStallSessionReads() async throws {
+        nonisolated(unsafe) var paths: [String] = []
+        MockURLProtocol.responseHeaders = ["Retry-After": "120"]
+        defer { MockURLProtocol.responseHeaders = nil }
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            paths.append(path)
+            if path.hasPrefix("/cockpit") { return (503, Data()) }
+            return (200, Data(#"{"hosts":[],"sessions":[]}"#.utf8))
+        }
+        let gate = HubRetryGate()
+        let config = ServerConfig(urlString: "http://retry.test")!
+        let client = DroverClient(
+            config: config, token: "t", session: MockURLProtocol.session(), retryGate: gate
+        )
+        do { _ = try await client.cockpitOverview(); Issue.record("Expected busy") }
+        catch DroverError.busy { }
+        // The analytical store recovering must not hide the fleet (#363).
+        _ = try await client.snapshot()
+        _ = try await client.snapshot()
+        #expect(await gate.deadline(for: config.baseURL) == nil)
+        do { _ = try await client.insights(); Issue.record("Analytical cooldown bypassed") }
+        catch DroverError.busy { }
+        #expect(paths.filter { $0.hasPrefix("/cockpit") }.count == 1)
+        #expect(paths.filter { $0 == "/harness" }.count == 2)
+        #expect(paths.count == 3)
     }
 
     @Test func socketBusyCooldownSurvivesManualSessionRestart() async throws {

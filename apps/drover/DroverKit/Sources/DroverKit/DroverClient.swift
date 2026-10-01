@@ -659,12 +659,12 @@ public actor DroverClient {
         )
         if method == "GET", http.statusCode == 503 {
             let deadline = await retryGate.record(
-                for: config.baseURL, header: http.value(forHTTPHeaderField: "Retry-After")
+                for: retryLane(for: url), header: http.value(forHTTPHeaderField: "Retry-After")
             )
             throw DroverError.busy(until: deadline)
         }
         let validated = try validatedData(data, response: http)
-        if method == "GET" { await retryGate.succeeded(for: config.baseURL) }
+        if method == "GET" { await retryGate.succeeded(for: retryLane(for: url)) }
         return validated
     }
 
@@ -684,7 +684,8 @@ public actor DroverClient {
                   decoded.propagation == .failed else {
                 if method == "GET", http.statusCode == 503 {
                     let deadline = await retryGate.record(
-                        for: config.baseURL, header: http.value(forHTTPHeaderField: "Retry-After")
+                        for: retryLane(for: url.absoluteURL),
+                        header: http.value(forHTTPHeaderField: "Retry-After")
                     )
                     throw DroverError.busy(until: deadline)
                 }
@@ -705,11 +706,32 @@ public actor DroverClient {
         return ContentAnalysisConsentResult(status: status, outcome: outcome)
     }
 
+    /// The hub admits analytical reads (cockpit, analytics, insights) through
+    /// a bounded lane separate from fleet, session and auth reads (#331,
+    /// #363). Each lane keeps its own cooldown so a busy or recovering
+    /// analytical store cannot stall the session list or chat catch-up.
+    /// Control-lane cooldowns stay keyed by the hub base URL, which is what
+    /// background refresh and message streams consult.
+    private nonisolated func retryLane(for url: URL) -> URL {
+        Self.retryLane(for: url, baseURL: config.baseURL)
+    }
+
+    static func retryLane(for url: URL, baseURL: URL) -> URL {
+        var path = url.path
+        let basePath = baseURL.path
+        if basePath.count > 1, path.hasPrefix(basePath) {
+            path.removeFirst(basePath.count)
+        }
+        let analytical = ["/cockpit", "/analytics", "/insights", "/metrics", "/observability"]
+            .contains { path == $0 || path.hasPrefix($0 + "/") }
+        return analytical ? baseURL.appendingPathComponent("analytics-lane") : baseURL
+    }
+
     private func send(
         url: URL, method: String, body: Data?, timeout: TimeInterval?
     ) async throws -> (Data, HTTPURLResponse) {
         try Task.checkCancellation()
-        if method == "GET", let deadline = await retryGate.deadline(for: config.baseURL) {
+        if method == "GET", let deadline = await retryGate.deadline(for: retryLane(for: url)) {
             throw DroverError.busy(until: deadline)
         }
         var urlRequest = URLRequest(url: url)
