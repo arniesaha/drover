@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import shlex
 import sys
@@ -318,6 +319,7 @@ def _agy_adapter(monkeypatch, tmp_path):
     ``~/.gemini``, and reading the real one would make these assertions
     depend on whether this machine happens to be signed into agy.
     """
+    monkeypatch.setattr("drover.server.providers.agy._read_keychain", lambda: None)
     agy = tmp_path / "agy"
     agy.write_text("#!/bin/sh\nexit 0\n")
     agy.chmod(0o755)
@@ -1179,3 +1181,29 @@ def test_a_flow_that_never_completes_is_still_expired_at_its_timeout():
         )
 
     manager.close_all()
+
+
+@pytest.mark.parametrize("store", ["file", "keychain"])
+def test_agy_auth_status_with_current_credential(monkeypatch, tmp_path, store):
+    adapter, _, home = _agy_adapter(monkeypatch, tmp_path)
+    credential = (
+        Path(__file__).parent / "fixtures/agy/identity-present.json"
+    ).read_text()
+    if store == "file":
+        token_file = home / ".gemini/antigravity-cli/antigravity-oauth-token"
+        token_file.parent.mkdir()
+        token_file.write_text(credential)
+    else:
+        monkeypatch.setattr(
+            "drover.server.providers.agy._read_keychain", lambda: credential
+        )
+    status = adapter.status()
+    assert status.state == "authenticated"
+    assert (
+        status.label
+        == json.loads(
+            base64.urlsafe_b64decode(
+                json.loads(credential)["id_token"].split(".")[1] + "=="
+            )
+        )["email"]
+    )

@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .models import MAX_MODELS, DiscoveredCatalog, ModelOption
 from .service import CatalogDiscoveryError
@@ -26,6 +26,7 @@ class AgyCatalogAdapter:
         command: Sequence[str],
         accounts_path: Path | None = None,
         timeout_s: float = 5.0,
+        keychain_reader: Callable[[], str | None] | None = None,
     ):
         self.command = tuple(command)
         self.accounts_path = (
@@ -34,6 +35,15 @@ class AgyCatalogAdapter:
             else Path.home() / ".gemini" / "google_accounts.json"
         )
         self.timeout_s = timeout_s
+        # Keep the harness entrypoint free of provider/storage imports until
+        # an enabled catalog is actually constructed.
+        from drover.server.providers.agy import AgyUsageProbe
+
+        self.account_probe = AgyUsageProbe(
+            accounts_path=self.accounts_path,
+            state_dir=self.accounts_path.parent,
+            keychain_reader=keychain_reader,
+        )
 
     def cache_identity(self) -> str:
         executable = _executable_path(self.command)
@@ -41,6 +51,17 @@ class AgyCatalogAdapter:
         parts.extend(_stat_metadata(executable))
         parts.extend(
             ("accounts", str(self.accounts_path), *_stat_metadata(self.accounts_path))
+        )
+        # Keychain has no file stat. Hash the account scope so switching or
+        # signing out invalidates the cache without exposing identity/secrets.
+        account = self.account_probe.stored_account()
+        parts.extend(("credential-account", account[1] if account else "missing"))
+        parts.extend(
+            _stat_metadata(
+                self.accounts_path.parent
+                / "antigravity-cli"
+                / "antigravity-oauth-token"
+            )
         )
         return _fingerprint(parts)
 
@@ -112,6 +133,9 @@ class AgyCatalogAdapter:
         return version
 
     def _account_label(self) -> str:
+        account = self.account_probe.stored_account()
+        if account is not None:
+            return account[1]
         try:
             value = json.loads(self.accounts_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
