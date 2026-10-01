@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Agy model catalog works with agy 1.2.11, which no longer writes
+  `google_accounts.json`. Sign-in and the catalog's account scope now come
+  from the same Keychain/file credential reader the usage probe uses (identity
+  from the credential's `id_token`, legacy account file as a fallback), and
+  models come from native `agy models` instead of the host reporting
+  `not_authenticated` with a stale catalog. Switching or signing out of the
+  account invalidates the cached catalog; no tokens or addresses are logged.
 - The hub survives its bind address disappearing, for example a VPN client
   stopping. A missing `[server].metrics_host` at startup no longer exits into
   a launchd/systemd restart loop (API role) or leaves the all-in-one hub
