@@ -343,6 +343,7 @@ final class AppEnvironment {
         // Drop the app's foreground connection before its first suspension so
         // no visible UI or new background work can use this credential.
         client = nil
+        PushRegistrar.shared.updateClient(nil)
         config = nil
         generation += 1
 

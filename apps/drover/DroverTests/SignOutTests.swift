@@ -75,8 +75,10 @@ final class SignOutTests: XCTestCase {
         try await withEnvironment { environment, _, _, _, _ in
             try XCTSkipUnless(environment.client != nil, "Keychain unavailable")
 
+            PushRegistration.setActive(true)
             try await environment.signOut()
 
+            XCTAssertFalse(PushRegistration.isActive())
             XCTAssertNil(
                 environment.client, "a live client would keep the inbox showing"
             )
