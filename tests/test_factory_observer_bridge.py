@@ -8,6 +8,7 @@ import pytest
 
 from drover.server.harness.factory_observer import (
     FactoryObserverRequestError,
+    factory_observer_command,
     factory_observer_projection,
     parse_factory_observer_launch,
 )
@@ -92,3 +93,34 @@ def test_factory_observer_projection_is_derived_not_a_factory_ledger():
         "status": "running",
         "authority": "taskflow",
     }
+
+
+@pytest.mark.parametrize("effort", [None, " high "])
+def test_factory_effort_is_optional(effort):
+    payload = _payload()
+    payload.pop("thinking_effort")
+    if effort is not None:
+        payload["thinking_effort"] = effort
+    _, normalized = parse_factory_observer_launch(payload, host_id="studio")
+    assert normalized["thinking_effort"] == (effort.strip() if effort else None)
+
+
+@pytest.mark.parametrize("effort", ["", "  ", 3, False, []])
+def test_factory_rejects_malformed_effort(effort):
+    payload = _payload()
+    payload["thinking_effort"] = effort
+    with pytest.raises(FactoryObserverRequestError, match="thinking_effort"):
+        parse_factory_observer_launch(payload, host_id="studio")
+
+
+def test_factory_permission_policy_applies_to_launch_and_recovery_commands():
+    command = [
+        "claude",
+        "--permission-mode=bypassPermissions",
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+    ]
+    safe = factory_observer_command("claude-code", command)
+    assert safe == ["claude", "--permission-mode", "dontAsk"]
+    assert factory_observer_command("claude-code", safe) == safe
+    assert factory_observer_command("codex", command) == command

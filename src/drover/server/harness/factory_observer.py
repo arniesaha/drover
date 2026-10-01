@@ -149,12 +149,14 @@ def parse_factory_observer_launch(
     harness = body.get("harness")
     model = body.get("model")
     thinking_effort = body.get("thinking_effort")
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (harness, model, thinking_effort)
+    if not all(isinstance(value, str) and value.strip() for value in (harness, model)):
+        raise FactoryObserverRequestError("factory harness and model are required")
+
+    if thinking_effort is not None and (
+        not isinstance(thinking_effort, str) or not thinking_effort.strip()
     ):
         raise FactoryObserverRequestError(
-            "factory harness, model, and thinking_effort are required"
+            "factory thinking_effort must be a non-empty string when provided"
         )
 
     launch = FactoryObserverLaunch(
@@ -171,7 +173,9 @@ def parse_factory_observer_launch(
         "mode": "structured",
         "harness": harness.strip(),
         "model": model.strip(),
-        "thinking_effort": thinking_effort.strip(),
+        "thinking_effort": (
+            thinking_effort.strip() if thinking_effort is not None else None
+        ),
         "repo_owner": launch.repo_owner,
         "repo_name": launch.repo_name,
         "branch": launch.branch,
@@ -204,3 +208,26 @@ def factory_observer_projection(session: Any) -> dict[str, Any] | None:
         "status": getattr(session, "status", "unknown"),
         "authority": "taskflow",
     }
+
+
+def factory_observer_command(harness: str, command: list[str]) -> list[str]:
+    """Keep unattended Claude launches from inheriting structured-mode bypass.
+
+    dontAsk runs permitted tools and denies tools requiring approval rather
+    than waiting for an operator. Apply the same policy during recovery.
+    """
+    if harness != "claude-code":
+        return list(command)
+    result: list[str] = []
+    args = iter(command)
+    for arg in args:
+        if arg == "--permission-mode":
+            next(args, None)
+        elif arg.startswith("--permission-mode=") or arg in {
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+        }:
+            continue
+        else:
+            result.append(arg)
+    return [*result, "--permission-mode", "dontAsk"]
