@@ -651,7 +651,9 @@ private func providerAccount(
                         errorCategory: "host_offline"),
     ]
     let subscription = try #require(ProviderSubscriptionGrouping.group(
-        accounts, hostTitles: ["mini": "Mac Mini", "studio": "Studio"]
+        // Pinned clock: an offline reading collapses after 72h, so the
+        // wall clock would move "mini" out of `hosts` from 2026-10-02.
+        accounts, hostTitles: ["mini": "Mac Mini", "studio": "Studio"], now: accounts[0].observedAt
     ).first)
     #expect(subscription.status == .ok)
     #expect(subscription.hosts.map(\.id) == ["mini", "studio"])

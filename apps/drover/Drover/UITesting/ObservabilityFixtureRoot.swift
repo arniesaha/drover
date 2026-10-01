@@ -67,7 +67,11 @@ enum ObservabilityFixtureData {
         let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
             ["snapshot_id": host, "dedup_key": host, "provider": "anthropic",
              "account_label": "alex@example.com", "plan_label": "Max",
-             "host_id": host, "status": status, "observed_at": reported,
+             // Offline readings older than 72h collapse into "Stale hosts", so
+             // a fixed date would hide these chips from the journeys over time.
+             "host_id": host, "status": status,
+             "observed_at": status == "ok" ? reported
+                 : ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86400)),
              "source": "fixture-usage", "error_category": status == "ok" ? NSNull() : "host_offline",
              "windows": [["kind": "seven_day", "used_percent": used],
                          ["kind": "five_hour", "used_percent": 18]]]

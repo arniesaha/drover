@@ -71,6 +71,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   throughout foreground builds, and return retry hints for saturated analytical
   and fleet listings without queueing control requests behind analytics (#331).
 
+- One Google account no longer shows as two provider cards. agy 1.2.11 keeps
+  the signed-in email only in its credential's ID token (`google_accounts.json`
+  is gone), so the Studio reported the generic label `Antigravity` while older
+  hosts reported the email. The agy probe now reads the email (or a hashed
+  Google subject) from the credential it already uses for quota and reports
+  `Unknown account` with a null identity when it cannot; it no longer treats
+  the account file's `old` history as the signed-in user. Provider readings
+  carry an optional `account_identity` (older readings derive it from an email
+  label), and iOS groups accounts by provider plus identity: an unknown reading
+  joins the provider's only known account and never guesses between several.
+  Quotas are still never summed across hosts. Readings from retired hosts, and
+  `host_offline` readings older than 72 hours, fold into a collapsed
+  **Stale hosts** list on the Accounts page and no longer count on Home; no
+  data is deleted. Older app builds ignore the new field.
+
 ### Changed
 
 - iOS cockpit: provider quota shows once per account as compact rows with
