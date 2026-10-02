@@ -75,7 +75,7 @@ postgres = [
 ]
 
 [tool.setuptools.package-data]
-drover = ["prompts/*.md", "server/web/static/*.html"]
+drover = ["prompts/*.md", "server/web/static/*.html", "server/web/static/*.js"]
 
 [tool.pytest.ini_options]
 # `scripts` is here for the Loop Engine Phase 0 driver, which decision D4 puts

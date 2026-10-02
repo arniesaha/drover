@@ -1,0 +1,228 @@
+{
+  "hosts": [
+    {
+      "host_id": "mac-mini",
+      "display_name": "Mac Mini",
+      "kind": "macos",
+      "status": "online",
+      "local_url": "http://127.0.0.1:7081",
+      "capabilities": {
+        "host_id": "mac-mini",
+        "display_name": "Mac Mini",
+        "kind": "macos",
+        "harnesses": [
+          {
+            "name": "shell",
+            "enabled": true,
+            "description": "Login shell",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "shell",
+              "launch_modes": ["pty"],
+              "approvals": false,
+              "interrupt": false,
+              "native_resume": false,
+              "model_catalog": false,
+              "usage": false,
+              "worktree": false,
+              "attachments": [],
+              "interactive_auth": false
+            }
+          },
+          {
+            "name": "claude-code",
+            "enabled": true,
+            "description": "Claude Code CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "claude-code",
+              "launch_modes": ["structured"],
+              "approvals": true,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": false,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "interactive_auth": true
+            }
+          },
+          {
+            "name": "codex",
+            "enabled": true,
+            "description": "Codex CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "codex",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "interactive_auth": true
+            }
+          },
+          {
+            "name": "agy",
+            "enabled": true,
+            "description": "Antigravity CLI (agy)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "agy",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "interactive_auth": true
+            }
+          },
+          {
+            "name": "deepseek-harness",
+            "enabled": true,
+            "description": "DeepSeek Harness (local Web RPC)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "deepseek-harness",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "interactive_auth": false
+            }
+          }
+        ]
+      }
+    },
+    {
+      "host_id": "fixture-box",
+      "display_name": "Fixture Box",
+      "kind": "linux",
+      "status": "online",
+      "local_url": "http://127.0.0.1:7082",
+      "capabilities": {
+        "host_id": "fixture-box",
+        "harnesses": [
+          {
+            "name": "fixture-echo",
+            "enabled": true,
+            "description": "Fixture adapter with an unusual capability mix",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "fixture-echo",
+              "launch_modes": ["pty", "structured", "telepathy"],
+              "approvals": true,
+              "interrupt": false,
+              "native_resume": false,
+              "model_catalog": false,
+              "usage": true,
+              "worktree": false,
+              "attachments": ["application/pdf", "text/*", "NOT A MIME"],
+              "interactive_auth": "yes",
+              "teleport": true
+            }
+          },
+          {
+            "name": "fixture-tty",
+            "enabled": true,
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "fixture-tty",
+              "launch_modes": ["pty"],
+              "interrupt": true,
+              "worktree": true
+            }
+          },
+          {
+            "name": "fixture-off",
+            "enabled": false,
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "fixture-off",
+              "launch_modes": ["structured"],
+              "approvals": true
+            }
+          },
+          {
+            "name": "fixture-modeless",
+            "enabled": true,
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "fixture-modeless",
+              "launch_modes": [],
+              "interrupt": true
+            }
+          },
+          {
+            "name": "fixture-future",
+            "enabled": true,
+            "command": [],
+            "capabilities": {
+              "schema_version": 2,
+              "harness_id": "fixture-future",
+              "launch_modes": ["structured"],
+              "approvals": true
+            }
+          },
+          {
+            "name": "fixture-null",
+            "enabled": true,
+            "command": [],
+            "capabilities": null
+          },
+          {
+            "name": "fixture-mismatch",
+            "enabled": true,
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "someone-else",
+              "launch_modes": ["pty"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "host_id": "old-nas",
+      "display_name": "Old NAS",
+      "kind": "linux",
+      "status": "online",
+      "local_url": "http://127.0.0.1:7083",
+      "capabilities": {
+        "harnesses": [
+          "shell",
+          {"name": "claude-code", "enabled": true, "command": []},
+          {"name": "codex beta", "enabled": true, "description": "pre-registry name"}
+        ]
+      }
+    },
+    {
+      "host_id": "bare-host",
+      "display_name": "Bare Host",
+      "kind": "linux",
+      "status": "online",
+      "local_url": "http://127.0.0.1:7084",
+      "capabilities": {}
+    }
+  ]
+}

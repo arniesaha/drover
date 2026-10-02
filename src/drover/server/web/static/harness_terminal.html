@@ -42,7 +42,7 @@
       gap: 10px;
       padding: 10px;
     }
-    button, a.button {
+    button, a.button, label.button {
       border: 1px solid var(--line);
       background: var(--panel-2);
       color: var(--text);
@@ -52,7 +52,8 @@
       text-decoration: none;
       cursor: pointer;
     }
-    button:hover, a.button:hover { border-color: var(--accent); }
+    button:hover, a.button:hover, label.button:hover { border-color: var(--accent); }
+    body.structured-session [data-terminal-only] { display: none !important; }
     .toolbar, .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .muted { color: var(--muted); }
     select {
@@ -251,9 +252,10 @@
     </div>
     <div class="toolbar">
       <a class="button" href="/ui/harness">Sessions</a>
-      <button id="connect" type="button">Connect</button>
-      <button id="interrupt" type="button">Ctrl-C</button>
-      <button id="detach" type="button">Detach</button>
+      <button id="connect" type="button" data-terminal-only>Connect</button>
+      <button id="interrupt" type="button" data-terminal-only>Ctrl-C</button>
+      <button id="interrupt-turn" type="button" class="hidden">Interrupt</button>
+      <button id="detach" type="button" data-terminal-only>Detach</button>
       <button id="terminate" type="button">Kill</button>
     </div>
   </header>
@@ -262,8 +264,9 @@
     <section id="handoff-summary" class="handoff-summary hidden" aria-label="Handoff context"></section>
     <section class="panel view-tabs" aria-label="Session view">
       <button id="show-events" type="button" aria-pressed="true">Transcript</button>
-      <button id="show-terminal" type="button" aria-pressed="false">Raw terminal</button>
+      <button id="show-terminal" type="button" aria-pressed="false" data-terminal-only>Raw terminal</button>
     </section>
+    <section class="panel hidden" id="approval" aria-live="assertive"></section>
     <section class="panel" id="continue">
       <strong>Continue this session</strong>
       <div class="continue-grid" style="margin-top:10px">
@@ -297,11 +300,16 @@
       <textarea id="input" placeholder="Type input, then Send. Use newline for commands."></textarea>
       <div class="toolbar" style="margin-top:8px">
         <button id="send" type="button">Send</button>
-        <button id="newline" type="button">Send newline</button>
+        <button id="newline" type="button" data-terminal-only>Send newline</button>
         <button id="paste" type="button">Paste</button>
+        <label class="button hidden" id="attach-label">Attach
+          <input id="attach" type="file" multiple class="hidden">
+        </label>
+        <span class="muted" id="attach-status"></span>
       </div>
+      <div class="muted" id="session-control-status" style="margin-top:6px"></div>
     </section>
-    <section class="panel shortcut-grid" aria-label="Terminal shortcuts">
+    <section class="panel shortcut-grid" aria-label="Terminal shortcuts" data-terminal-only>
       <button type="button" data-shortcut="ctrl-c">Ctrl-C</button>
       <button type="button" data-shortcut="ctrl-d">Ctrl-D</button>
       <button type="button" data-shortcut="tab">Tab</button>
@@ -314,6 +322,9 @@
   </main>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script>
+    /*@include harness_capabilities.js*/
+  </script>
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -388,6 +399,10 @@
     let reconnectTimer = null;
     let reconnectAttempts = 0;
     let manualDetach = false;
+    let structuredPollTimer = null;
+    let pendingAttachments = [];
+    const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+    const MAX_ATTACHMENTS = 4;
 
     function terminalSize() {
       return {rows: term?.rows || 32, cols: term?.cols || 100};
@@ -683,8 +698,201 @@
       return `${protocol}//${location.host}/harness/sessions/${encodeURIComponent(id)}/terminal`;
     }
 
-    function enabledHarnesses(host) {
-      return (((host.capabilities || {}).harnesses) || []).filter((item) => item.enabled);
+    function hostById(id) {
+      return (harnessState.hosts || []).find((item) => item.host_id === id) || null;
+    }
+
+    // Recomputed from the latest envelope on every render and every action,
+    // so a control rendered earlier cannot outlive the capability behind it.
+    function currentSessionControls() {
+      const session = sessionData?.session;
+      if (!session) return null;
+      return DroverCapabilities.sessionControls(
+        hostById(session.host_id) || sessionData?.host,
+        session,
+      );
+    }
+
+    function isStructuredSession() {
+      return sessionData?.session?.mode === "structured";
+    }
+
+    function applySessionControls() {
+      const controls = currentSessionControls();
+      const structured = isStructuredSession();
+      document.body.classList.toggle("structured-session", structured);
+      if (structured) setView("events");
+      const live = ["created", "starting", "running"].includes(sessionData?.session?.status);
+      const turns = Boolean(controls?.turns && live);
+      $("interrupt-turn").classList.toggle("hidden", !(controls?.interrupt && live));
+      $("attach-label").classList.toggle("hidden", !(turns && controls.attachments.length));
+      $("attach").accept = turns ? controls.attachments.join(",") : "";
+      if (!turns || !controls.attachments.length) clearAttachments();
+      if (structured) {
+        $("send").disabled = !turns;
+        $("input").disabled = !turns;
+        $("input").placeholder = turns
+          ? "Message the agent, then Send (Ctrl/Cmd-Enter)."
+          : "This session cannot take new turns from the web.";
+        $("session-control-status").textContent = !live
+          ? "Session is no longer running."
+          : (controls?.reason || "");
+      } else {
+        $("send").disabled = false;
+        $("input").disabled = false;
+        $("session-control-status").textContent = "";
+      }
+      renderApproval();
+    }
+
+    function renderApproval() {
+      const controls = currentSessionControls();
+      const pending = controls?.approvals ? DroverCapabilities.pendingApproval(normalizedEvents) : null;
+      if (!pending) {
+        $("approval").classList.add("hidden");
+        $("approval").innerHTML = "";
+        return;
+      }
+      $("approval").innerHTML = `
+        <strong>Approval needed${pending.tool ? `: ${esc(pending.tool)}` : ""}</strong>
+        ${pending.text ? `<p class="muted">${esc(pending.text)}</p>` : ""}
+        <div class="toolbar" style="margin-top:8px">
+          <button type="button" data-decision="allow" data-request="${esc(pending.request_id)}">Approve</button>
+          <button type="button" data-decision="deny" data-request="${esc(pending.request_id)}">Deny</button>
+        </div>`;
+      $("approval").classList.remove("hidden");
+    }
+
+    async function postSessionAction(action, body) {
+      const res = await fetch(`/harness/sessions/${encodeURIComponent(sessionId)}/${action}`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {}),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.error || `${action} failed: ${res.status}`);
+      return payload;
+    }
+
+    function guardSessionAction(action) {
+      const session = sessionData?.session;
+      return DroverCapabilities.requireSessionAction(
+        hostById(session?.host_id) || sessionData?.host,
+        session,
+        action,
+      );
+    }
+
+    async function answerApproval(requestId, decision) {
+      try {
+        guardSessionAction("approve");
+        // The request must still be the pending one in the latest events.
+        const pending = DroverCapabilities.pendingApproval(normalizedEvents);
+        if (!pending || pending.request_id !== requestId) throw new Error("this approval is no longer pending");
+        await postSessionAction("permission", {request_id: requestId, decision});
+        $("session-control-status").textContent = decision === "allow" ? "Approved." : "Denied.";
+        await refreshStructured();
+      } catch (err) {
+        $("session-control-status").textContent = `Approval failed: ${err.message || err}`;
+      }
+    }
+
+    async function interruptTurn() {
+      try {
+        guardSessionAction("interrupt");
+        await postSessionAction("interrupt");
+        $("session-control-status").textContent = "Interrupt sent.";
+      } catch (err) {
+        $("session-control-status").textContent = `Interrupt failed: ${err.message || err}`;
+      }
+    }
+
+    function clearAttachments() {
+      pendingAttachments = [];
+      $("attach").value = "";
+      $("attach-status").textContent = "";
+    }
+
+    function readAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || "").replace(/^data:[^,]*,/, ""));
+        reader.onerror = () => reject(reader.error || new Error("could not read file"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function chooseAttachments() {
+      const controls = currentSessionControls();
+      const files = Array.from($("attach").files || []);
+      pendingAttachments = [];
+      const rejected = [];
+      for (const file of files.slice(0, MAX_ATTACHMENTS)) {
+        if (!DroverCapabilities.acceptsAttachment(controls?.harness, file.type) || file.size > MAX_ATTACHMENT_BYTES) {
+          rejected.push(file.name);
+          continue;
+        }
+        pendingAttachments.push({media_type: file.type, data_base64: await readAsBase64(file)});
+      }
+      const notes = [];
+      if (pendingAttachments.length) notes.push(`${pendingAttachments.length} attached`);
+      if (rejected.length) notes.push(`not supported: ${rejected.join(", ")}`);
+      if (files.length > MAX_ATTACHMENTS) notes.push(`only the first ${MAX_ATTACHMENTS} are sent`);
+      $("attach-status").textContent = notes.join(" · ");
+    }
+
+    async function submitTurn() {
+      const text = $("input").value.trim();
+      let controls;
+      try {
+        controls = guardSessionAction("turns");
+      } catch (err) {
+        $("session-control-status").textContent = `Cannot send: ${err.message || err}`;
+        return;
+      }
+      // Attachments are re-checked against what the harness advertises now.
+      const images = pendingAttachments.filter((item) =>
+        DroverCapabilities.acceptsAttachment(controls.harness, item.media_type)
+      );
+      if (!text && !images.length) return;
+      const body = {text};
+      if (images.length) body.images = images;
+      if (window.crypto?.randomUUID) body.client_turn_id = window.crypto.randomUUID();
+      $("send").disabled = true;
+      try {
+        await postSessionAction("turns", body);
+        $("input").value = "";
+        clearAttachments();
+        $("session-control-status").textContent = "Sent.";
+        await refreshStructured();
+      } catch (err) {
+        $("session-control-status").textContent = `Send failed: ${err.message || err}`;
+      } finally {
+        applySessionControls();
+      }
+    }
+
+    async function refreshStructured() {
+      const res = await fetch(`/harness/sessions/${encodeURIComponent(sessionId)}`, {cache: "no-store"});
+      const data = await res.json();
+      if (!res.ok || data.error) return;
+      sessionData = data;
+      nativeTranscript = data.native_transcript || nativeTranscript;
+      normalizedEvents = data.events || [];
+      renderEvents();
+      applySessionControls();
+    }
+
+    function scheduleStructuredRefresh() {
+      if (structuredPollTimer || !isStructuredSession()) return;
+      if (!["created", "starting", "running"].includes(sessionData?.session?.status)) return;
+      structuredPollTimer = setTimeout(async () => {
+        structuredPollTimer = null;
+        if (!document.hidden) {
+          try { await refreshStructured(); } catch (err) {}
+        }
+        scheduleStructuredRefresh();
+      }, 3000);
     }
 
     function renderContinueControls() {
@@ -699,18 +907,25 @@
     async function updateContinueHarnessOptions() {
       const hosts = harnessState.hosts || [];
       const host = hosts.find((item) => item.host_id === $("continue-host").value) || hosts[0];
-      const harnesses = enabledHarnesses(host || {});
-      $("continue-harness").innerHTML = harnesses.map((item) => (
+      const targets = DroverCapabilities.launchTargets(host);
+      $("continue-harness").innerHTML = targets.map((item) => (
         `<option value="${esc(item.name)}">${esc(item.name)}</option>`
       )).join("");
-      if (sessionData?.session?.harness && harnesses.some((item) => item.name === sessionData.session.harness)) {
+      if (sessionData?.session?.harness && targets.some((item) => item.name === sessionData.session.harness)) {
         $("continue-harness").value = sessionData.session.harness;
       }
-      $("continue-session").disabled = !host || !harnesses.length;
-      $("continue-status").textContent = host && harnesses.length
-        ? "Loading native resume candidates..."
-        : "No enabled harnesses are available on this host.";
+      $("continue-session").disabled = !host || !targets.length;
+      $("continue-status").textContent = host && targets.length
+        ? ""
+        : (DroverCapabilities.hostSummary(host).partlyLegacy
+          ? "This host needs a Drover upgrade before the web can continue sessions on it."
+          : "No launchable harness is advertised on this host.");
       await loadNativeCandidates();
+    }
+
+    function continueTarget() {
+      const host = hostById($("continue-host").value);
+      return DroverCapabilities.harnessControls(host, $("continue-harness").value);
     }
 
     async function loadNativeCandidates() {
@@ -719,6 +934,13 @@
       nativeCandidates = [];
       $("continue-native").innerHTML = '<option value="">Drover handoff only</option>';
       if (!hostId || !harness) return;
+      const target = continueTarget();
+      $("continue-native").disabled = !target.nativeResume;
+      if (!target.nativeResume) {
+        $("continue-status").textContent = `${harness} does not advertise native resume; Drover handoff will be used.`;
+        return;
+      }
+      $("continue-status").textContent = "Loading native resume candidates...";
       const cwd = sessionData?.session?.cwd || "";
       const query = new URLSearchParams({harness, limit: "12"});
       if (cwd) query.set("cwd", cwd);
@@ -726,6 +948,8 @@
         const res = await fetch(`/harness/hosts/${encodeURIComponent(hostId)}/native-sessions?${query}`, {cache: "no-store"});
         const payload = await res.json();
         if (!res.ok) throw new Error(payload.error || `native sessions failed: ${res.status}`);
+        // A slower response for a target the user has since changed is dropped.
+        if ($("continue-host").value !== hostId || $("continue-harness").value !== harness) return;
         nativeCandidates = payload.sessions || [];
         $("continue-native").innerHTML = [
           '<option value="">Drover handoff only</option>',
@@ -743,7 +967,7 @@
 
     function selectedNativeResume() {
       const value = $("continue-native").value;
-      if (value === "") return null;
+      if (value === "" || !continueTarget().nativeResume) return null;
       const candidate = nativeCandidates[Number(value)];
       return candidate?.native_resume || null;
     }
@@ -762,7 +986,10 @@
       const session = data.session || {};
       const host = data.host || {};
       const url = endpoint(host) || hostUrlParam;
-      const attachable = ["created", "starting", "running"].includes(session.status);
+      // Structured sessions have no terminal to attach; they are driven
+      // through the capability-gated turn/approval/interrupt controls.
+      const structured = session.mode === "structured";
+      const attachable = !structured && ["created", "starting", "running"].includes(session.status);
       hostHttpUrl = url || "";
       attachUrl = url && attachable ? toWsUrl(url, session.session_id) : "";
       $("statusline").textContent = `${session.harness || "session"} on ${host.display_name || session.host_id || "host"}`;
@@ -772,11 +999,16 @@
         ["Host", `${host.display_name || host.host_id || ""} (${host.kind || "host"})`],
         ["Handoff", session.handoff_mode || "original"],
         ["Source", session.source_session_id || "none"],
-        ["Attach", attachUrl || (attachable ? "No host URL registered" : "Session is no longer running")],
+        structured
+          ? ["Mode", "structured"]
+          : ["Attach", attachUrl || (attachable ? "No host URL registered" : "Session is no longer running")],
       ].map(([label, value]) => `<div class="panel"><div class="muted">${esc(label)}</div><code>${esc(value)}</code></div>`).join("");
       renderContinueControls();
       renderHandoffSummary();
       renderEvents();
+      applySessionControls();
+      scheduleStructuredRefresh();
+      if (structured) return;
       // Scrollback comes from terminal.output events, not a separate chunk
       // table: the two carried byte-identical text, and the chunk table is
       // gone. `payload` is a decoded object here, same as displayEvent reads.
@@ -789,6 +1021,12 @@
       const targetHost = $("continue-host").value;
       const targetHarness = $("continue-harness").value;
       if (!targetHost || !targetHarness) return;
+      try {
+        DroverCapabilities.requireLaunch(hostById(targetHost), targetHarness);
+      } catch (err) {
+        $("continue-status").textContent = `Cannot continue in ${targetHarness}: ${err.message || err}`;
+        return;
+      }
       $("continue-status").textContent = `Continuing in ${targetHarness} on ${targetHost}...`;
       try {
         const nativeResume = selectedNativeResume();
@@ -814,6 +1052,7 @@
     }
 
     function connect() {
+      if (isStructuredSession()) return;
       if (!attachUrl) {
         append("No active terminal is available for this session.", "bad");
         return;
@@ -884,7 +1123,8 @@
     }
 
     function submitSuffix() {
-      return sessionData?.session?.harness === "codex" ? "\n" : "\r";
+      // A PTY is a terminal: Enter is a carriage return for every harness.
+      return "\r";
     }
 
     async function terminateSession() {
@@ -928,13 +1168,25 @@
     $("continue-host").addEventListener("change", updateContinueHarnessOptions);
     $("continue-harness").addEventListener("change", loadNativeCandidates);
     $("continue-session").addEventListener("click", continueSession);
-    $("interrupt").addEventListener("click", () => send({type: "interrupt"}));
+    $("interrupt").addEventListener("click", () => {
+      if (!isStructuredSession()) send({type: "interrupt"});
+    });
+    $("interrupt-turn").addEventListener("click", interruptTurn);
+    $("approval").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-decision]");
+      if (button) answerApproval(button.dataset.request || "", button.dataset.decision || "");
+    });
+    $("attach").addEventListener("change", chooseAttachments);
     $("detach").addEventListener("click", () => {
       manualDetach = true;
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type: "detach"}));
     });
     $("terminate").addEventListener("click", terminateSession);
     $("send").addEventListener("click", () => {
+      if (isStructuredSession()) {
+        submitTurn();
+        return;
+      }
       let data = $("input").value;
       const suffix = submitSuffix();
       data = data.replace(/\r?\n/g, "\r");
@@ -942,7 +1194,9 @@
       send({type: "input", data});
       $("input").value = "";
     });
-    $("newline").addEventListener("click", () => send({type: "input", data: "\r"}));
+    $("newline").addEventListener("click", () => {
+      if (!isStructuredSession()) send({type: "input", data: "\r"});
+    });
     $("paste").addEventListener("click", async () => {
       try {
         const text = await navigator.clipboard.readText();
@@ -959,7 +1213,7 @@
     });
     document.querySelector(".shortcut-grid").addEventListener("click", (event) => {
       const button = event.target.closest("button[data-shortcut]");
-      if (button) send({type: "input", data: shortcuts[button.dataset.shortcut] || ""});
+      if (button && !isStructuredSession()) send({type: "input", data: shortcuts[button.dataset.shortcut] || ""});
     });
 
     load().catch((err) => {

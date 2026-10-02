@@ -252,6 +252,60 @@ Web and iOS consume the same host capability envelope.
 These are deterministic rendering rules. No model decides which controls are
 visible.
 
+### Web console (#419)
+
+The web console derives every control from
+`src/drover/server/web/static/harness_capabilities.js`, which `ui.py` inlines into
+`harness.html` and `harness_terminal.html`. The pages and the module contain no
+harness names; a test fails if one appears in their scripts. Decisions for the
+questions #418 left to clients:
+
+- **Fail closed.** Only a row with a schema v1 matrix, `enabled: true` and a launch
+  mode this client drives can be launched or chosen as a Continue target. Flags
+  must be JSON `true`; unknown fields, unknown modes and malformed MIME types are
+  ignored. A null, malformed or identity-mismatched matrix, or any other
+  `schema_version`, offers nothing. A harness the host does not list (for
+  example observe-only OpenClaw) has no controls.
+- **Preferred mode.** The web drives both modes. If a harness advertises both,
+  it picks `structured`, because approvals, interrupt, attachments and the model
+  catalog are structured adapter operations, while a PTY session only exposes
+  raw terminal I/O. The one-click workspace start uses the first
+  structured-capable target in the host's advertised order, falling back to a
+  PTY-only target. The launch body always sends the chosen `mode`.
+- **Session controls.** A structured session (`session.mode == "structured"`)
+  gets a turn composer. Interrupt, Approve/Deny and attachments appear only if
+  its harness still advertises `structured` and the matching capability on that
+  host. The attachment picker accepts only the advertised MIME types. A PTY
+  session, including one from before the matrix, keeps terminal attach, Ctrl-C,
+  keys and Kill: these are part of the `pty` mode, not of the `interrupt`
+  capability. Model and effort pickers appear only for a structured launch with
+  `model_catalog`. They send only an effort the selected model lists. Native
+  resume candidates are fetched only for a Continue target with
+  `native_resume`. Worktree isolation is explained only when `worktree` is true.
+- **No stale controls.** Launch, Continue, turn, approval and interrupt handlers
+  re-resolve capabilities from the latest envelope when they run. They do not
+  trust a hidden or previously rendered control. An approval is answered only if
+  its `request_id` is still the newest unanswered `approval_prompt`.
+- **Upgrade guidance.** A host whose rows have no matrix shows its harnesses as
+  disabled pills, with "Upgrade Drover on this host to launch from the web. Its
+  existing sessions stay listed." A newer schema version asks the user to
+  upgrade the Drover hub. Neither case triggers a name-based fallback.
+- **Legacy window.** The web needs no legacy compatibility code: legacy rows are
+  rendered as metadata only. The upgrade explanation is removed once central
+  stops publishing matrix-less rows. That is the end of the compatibility window
+  in the rollout above, after #420 ships.
+- **Not offered on the web.** The web has no interactive sign-in or usage
+  surface. The module exposes `interactiveAuth` and `usage` for a future one, but
+  nothing is rendered.
+
+Behavior change: until now the web started provider CLIs (Claude Code, Codex,
+agy) as raw PTY terminals, even though their adapters advertise only
+`structured`. Now they start as structured sessions, driven from the session
+page. `shell` remains a PTY terminal. The PTY Send button now ends input with
+`\r` for every harness. The Codex-only `\n` special case is gone, so an
+already-running Codex PTY session from before this change gets a terminal
+Enter.
+
 ## Compatibility and rollout
 
 1. Add capability types, adapter Protocol, registry validation, and contract

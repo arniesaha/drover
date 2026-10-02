@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   include `sources: ["hub"]` while retaining their response envelope.
 - DuckLake and R2 catalog+files generation backups plus a Postgres dump are
   planned for Phase 4 (#481); `docs/backup.md` records the unimplemented design.
+- Web console launch and session controls come from the advertised harness
+  capability matrix, not harness names (#419). Launch offers only an enabled
+  schema v1 harness with a launch mode the web can drive, and sends that mode
+  (`structured` is preferred when both are advertised). Provider CLIs now start
+  as structured sessions with a web turn composer instead of raw PTY terminals.
+  Interrupt, Approve/Deny, attachments (advertised MIME types only), model and
+  effort pickers, native resume and the worktree note appear only when
+  advertised, and every action re-checks the latest envelope. Hosts without a
+  matrix are listed with an upgrade note and cannot launch.
 
 ### Added
 

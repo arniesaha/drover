@@ -173,6 +173,7 @@
       overflow-wrap: anywhere;
     }
     .empty { color: var(--muted); padding: 18px 0; }
+    .hidden { display: none; }
     @media (max-width: 760px) {
       header { position: static; align-items: flex-start; flex-direction: column; }
       main { padding: 14px; }
@@ -217,6 +218,17 @@
           </label>
           <button id="launch" type="button">Launch</button>
         </div>
+        <div class="launch hidden" id="launch-model-row">
+          <label>
+            <div class="muted">Model</div>
+            <select id="launch-model" aria-label="Model"></select>
+          </label>
+          <label id="launch-effort-field">
+            <div class="muted">Reasoning effort</div>
+            <select id="launch-effort" aria-label="Reasoning effort"></select>
+          </label>
+        </div>
+        <div class="muted" id="launch-detail" style="margin-top:8px"></div>
         <div class="muted" id="advanced-status" style="margin-top:8px">Select a registered host to launch a session.</div>
       </details>
     </section>
@@ -231,19 +243,20 @@
     </section>
   </main>
   <script>
+    /*@include harness_capabilities.js*/
+  </script>
+  <script>
     const $ = (id) => document.getElementById(id);
     let harnessState = {hosts: [], sessions: [], cwd_suggestions: []};
+    let modelCatalog = null;
+    let modelCatalogKey = "";
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
     }[c]));
-    const HARNESS_PREFERENCE = ["claude-code", "codex", "agy", "openclaw", "shell"];
+    const MODE_LABEL = {structured: "structured", pty: "terminal"};
 
     function endpoint(host) {
       return host && (host.tailscale_url || host.local_url) || "";
-    }
-
-    function enabledHarnesses(host) {
-      return (((host?.capabilities || {}).harnesses) || []).filter((cap) => cap.enabled);
     }
 
     function hostById(id) {
@@ -253,12 +266,6 @@
     function selectedHost() {
       const id = $("launch-host").value;
       return hostById(id);
-    }
-
-    function preferredHarness(host) {
-      const enabled = enabledHarnesses(host).map((cap) => cap.name);
-      const pick = HARNESS_PREFERENCE.find((name) => enabled.includes(name));
-      return pick || enabled[0] || "shell";
     }
 
     function inferHostForPath(path) {
@@ -286,8 +293,17 @@
       if (!host) return "No connected machine for this path";
       if (host.status !== "online") return `${host.display_name || host.host_id} is offline`;
       if (!endpoint(host)) return "No reachable URL for this machine";
-      if (!enabledHarnesses(host).length) return "No harness enabled on this machine";
+      if (!DroverCapabilities.launchTargets(host).length) {
+        const summary = DroverCapabilities.hostSummary(host);
+        if (summary.legacy) return "This machine needs a Drover upgrade to launch from the web";
+        if (summary.unsupported) return "This machine advertises a newer capability schema; upgrade the Drover hub";
+        return "No launchable harness advertised on this machine";
+      }
       return "";
+    }
+
+    function targetLabel(target) {
+      return `${target.name} · ${MODE_LABEL[target.mode] || target.mode}`;
     }
 
     function buildWorkspaces() {
@@ -321,7 +337,7 @@ ${s.path}`;
         const host = item.host;
         const reason = launchableReason(host);
         const ready = !reason;
-        const harness = ready ? preferredHarness(host) : "";
+        const target = ready ? DroverCapabilities.preferredLaunchTarget(host) : null;
         const fav = item.source === "favorite";
         const where = host ? (host.display_name || host.host_id) : "unknown machine";
         return `<button class="workspace panel" type="button"
@@ -332,7 +348,7 @@ ${s.path}`;
           <div class="meta">
             <span class="pill ${fav ? "fav" : ""}">${fav ? "★ Favorite" : "Recent"}</span>
             <span class="pill">${esc(where)}</span>
-            ${ready ? `<span class="pill">via ${esc(harness)}</span>` : ""}
+            ${target ? `<span class="pill">via ${esc(targetLabel(target))}</span>` : ""}
           </div>
           <div class="cta">${ready ? `Start session on ${esc(where)} →` : esc(reason)}</div>
         </button>`;
@@ -349,7 +365,9 @@ ${s.path}`;
       const item = items[index];
       if (!item || !item.ready) return;
       const host = hostById(item.host_id);
-      doLaunch(host, preferredHarness(host), item.path, $("launch-status"));
+      const target = DroverCapabilities.preferredLaunchTarget(host);
+      if (!target) return;
+      doLaunch(host, target.name, item.path, $("launch-status"));
     }
 
     function renderLaunchForm(hosts) {
@@ -361,21 +379,94 @@ ${s.path}`;
 
     function updateHarnessOptions() {
       const host = selectedHost();
-      const harnesses = enabledHarnesses(host);
+      const targets = DroverCapabilities.launchTargets(host);
+      const previous = $("launch-harness").value;
       const suggestions = (harnessState.cwd_suggestions || []).filter(
         (item) => !item.host_id || item.host_id === (host ? host.host_id : "")
       ).slice(0, 10);
-      $("launch-harness").innerHTML = harnesses.map((cap) =>
-        `<option value="${esc(cap.name)}">${esc(cap.name)}</option>`
+      $("launch-harness").innerHTML = targets.map((target) =>
+        `<option value="${esc(target.name)}">${esc(targetLabel(target))}</option>`
       ).join("");
+      if (targets.some((target) => target.name === previous)) $("launch-harness").value = previous;
       $("cwd-suggestions").innerHTML = suggestions.map((item) =>
         `<option value="${esc(item.path)}" label="${esc(item.source || "")}"></option>`
       ).join("");
-      $("launch").disabled = !host || !endpoint(host) || harnesses.length === 0;
+      $("launch").disabled = !host || !endpoint(host) || targets.length === 0;
       const reason = launchableReason(host);
       $("advanced-status").textContent = reason
         ? reason
         : `Ready to launch on ${host.display_name || host.host_id}.`;
+      updateLaunchDetails();
+    }
+
+    function selectedTarget() {
+      const host = selectedHost();
+      const controls = DroverCapabilities.harnessControls(host, $("launch-harness").value);
+      return controls.launchable ? {host, controls} : null;
+    }
+
+    function updateLaunchDetails() {
+      const selected = selectedTarget();
+      const controls = selected?.controls;
+      const notes = [];
+      if (controls) {
+        notes.push(controls.mode === "structured"
+          ? "Structured session: Drover drives the CLI and shows its transcript."
+          : "Terminal session: raw CLI in a browser terminal.");
+        if (controls.worktree) notes.push("Runs in an isolated Drover git worktree when the folder is a git repository.");
+      }
+      $("launch-detail").textContent = notes.join(" ");
+      const wantsModels = Boolean(controls && controls.mode === "structured" && controls.modelCatalog);
+      $("launch-model-row").classList.toggle("hidden", !wantsModels);
+      if (!wantsModels) {
+        // Clear, not just hide: a hidden picker must never leak a stale value.
+        modelCatalog = null;
+        modelCatalogKey = "";
+        $("launch-model").innerHTML = "";
+        $("launch-effort").innerHTML = "";
+        return;
+      }
+      loadModelCatalog(selected.host, controls);
+    }
+
+    async function loadModelCatalog(host, controls) {
+      const key = `${host.host_id}\n${controls.name}`;
+      if (key === modelCatalogKey) return;
+      modelCatalogKey = key;
+      modelCatalog = null;
+      $("launch-model").innerHTML = '<option value="">Default model</option>';
+      $("launch-effort").innerHTML = "";
+      try {
+        const query = new URLSearchParams({harness: controls.name});
+        const res = await fetch(`/harness/hosts/${encodeURIComponent(host.host_id)}/model-catalog?${query}`, {cache: "no-store"});
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `model catalog failed: ${res.status}`);
+        if (modelCatalogKey !== key) return;
+        modelCatalog = payload;
+        $("launch-model").innerHTML = [
+          '<option value="">Default model</option>',
+          ...(payload.models || []).map((model) =>
+            `<option value="${esc(model.id)}">${esc(model.display_name || model.id)}</option>`
+          ),
+        ].join("");
+      } catch (err) {
+        if (modelCatalogKey === key) $("launch-detail").textContent += ` Model list unavailable (${err}); the default model will be used.`;
+      }
+      updateEffortOptions();
+    }
+
+    function selectedModel() {
+      const id = $("launch-model").value;
+      return (modelCatalog?.models || []).find((model) => model.id === id) || null;
+    }
+
+    function updateEffortOptions() {
+      const supported = selectedModel()?.reasoning?.supported || [];
+      $("launch-effort").innerHTML = [
+        '<option value="">Default effort</option>',
+        ...supported.map((effort) => `<option value="${esc(effort)}">${esc(effort)}</option>`),
+      ].join("");
+      $("launch-effort-field").classList.toggle("hidden", !supported.length);
     }
 
     function focusNextLaunchField(event) {
@@ -395,27 +486,38 @@ ${s.path}`;
 
     function launchFromForm() {
       const host = selectedHost();
-      if (!host) return;
-      const harness = $("launch-harness").value || "shell";
+      const harness = $("launch-harness").value;
+      if (!host || !harness) return;
       const cwd = $("launch-cwd").value.trim();
-      doLaunch(host, harness, cwd, $("advanced-status"));
+      const model = selectedModel();
+      const effort = $("launch-effort").value;
+      doLaunch(host, harness, cwd, $("advanced-status"), {
+        model: model ? model.id : "",
+        // Only an effort the selected model advertises is ever sent.
+        thinkingEffort: model && (model.reasoning?.supported || []).includes(effort) ? effort : "",
+      });
     }
 
-    async function doLaunch(host, harness, cwd, statusEl) {
+    async function doLaunch(host, harness, cwd, statusEl, preferences = {}) {
       if (!host) return;
       const where = host.display_name || host.host_id;
       const what = repoName(cwd) || "session";
+      let body;
+      try {
+        // Re-resolve from the current envelope: a stale option or card never
+        // launches a harness or mode the host no longer advertises.
+        const controls = DroverCapabilities.requireLaunch(hostById(host.host_id), harness);
+        body = DroverCapabilities.launchBody(controls, {cwd, rows: 32, cols: 100, ...preferences});
+      } catch (err) {
+        statusEl.textContent = `Cannot start ${harness} on ${where}: ${err.message || err}`;
+        return;
+      }
       statusEl.textContent = `Starting ${harness} in ${what} on ${where}...`;
       try {
         const res = await fetch(`/harness/hosts/${encodeURIComponent(host.host_id)}/sessions`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({
-            harness,
-            cwd: cwd || undefined,
-            rows: 32,
-            cols: 100,
-          }),
+          body: JSON.stringify(body),
         });
         const contentType = res.headers.get("content-type") || "";
         if (res.redirected || !contentType.includes("application/json")) {
@@ -437,9 +539,9 @@ ${s.path}`;
         return;
       }
       $("hosts").innerHTML = hosts.map((host) => {
-        const caps = (((host.capabilities || {}).harnesses) || []);
-        const enabled = caps.filter((cap) => cap.enabled).map((cap) => cap.name);
-        const declared = caps.filter((cap) => !cap.enabled).map((cap) => cap.name);
+        const summary = DroverCapabilities.hostSummary(host);
+        const ready = summary.controls.filter((item) => item.launchable);
+        const unavailable = summary.controls.filter((item) => !item.launchable);
         const url = endpoint(host);
         return `<article class="panel">
           <div class="host-title">
@@ -450,9 +552,11 @@ ${s.path}`;
             <span class="${host.status === "online" ? "online" : "offline"}">${esc(host.status)}</span>
           </div>
           <div class="row" style="margin-top:12px">
-            ${enabled.map((name) => `<span class="pill">${esc(name)}</span>`).join("")}
-            ${declared.map((name) => `<span class="pill disabled">${esc(name)}</span>`).join("")}
+            ${ready.map((item) => `<span class="pill">${esc(targetLabel(item))}</span>`).join("")}
+            ${unavailable.map((item) => `<span class="pill disabled" title="${esc(item.reason)}">${esc(item.name)}</span>`).join("")}
           </div>
+          ${summary.partlyLegacy ? `<div class="reason">Upgrade Drover on this host to launch from the web. Its existing sessions stay listed.</div>` : ""}
+          ${summary.unsupported ? `<div class="reason">This host advertises a capability schema newer than v${DroverCapabilities.SCHEMA_VERSION}; upgrade the Drover hub to use it.</div>` : ""}
           <div style="margin-top:12px">${url ? `<code>${esc(url)}</code>` : '<span class="muted">No URL registered</span>'}</div>
         </article>`;
       }).join("");
@@ -623,6 +727,8 @@ ${s.path}`;
 
     $("refresh").addEventListener("click", load);
     $("launch-host").addEventListener("change", updateHarnessOptions);
+    $("launch-harness").addEventListener("change", updateLaunchDetails);
+    $("launch-model").addEventListener("change", updateEffortOptions);
     $("launch").addEventListener("click", launchFromForm);
     ["launch-host", "launch-harness", "launch-cwd"].forEach((id) => {
       $(id).addEventListener("keydown", focusNextLaunchField);
