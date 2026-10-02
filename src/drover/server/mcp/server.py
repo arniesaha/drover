@@ -44,18 +44,25 @@ def build_mcp_server(
     )
 
     @mcp.tool()
+    def drover_memory_acceptance(harness_ids: list[str]) -> dict:
+        """Read-only memory evidence report for up to 25 harness IDs."""
+        return t.drover_memory_acceptance(duckdb_path=db, harness_ids=harness_ids)
+
+    @mcp.tool()
     def drover_handoff(
         repo_owner: Optional[str] = None,
         repo_name: Optional[str] = None,
         branch: Optional[str] = None,
         task_id: Optional[str] = None,
         max_summaries: int = 3,
+        session_id: Optional[str] = None,
     ) -> dict:
         """Return recent session summaries and currently-active sessions for a
-        task, identified by either ``task_id`` or ``(repo_owner, repo_name, branch)``.
+        task, identified by ``task_id``, repo, or a harness/native ``session_id``.
         """
         return t.drover_handoff(
             duckdb_path=db,
+            session_id=session_id,
             repo_owner=repo_owner,
             repo_name=repo_name,
             branch=branch,
@@ -80,7 +87,7 @@ def build_mcp_server(
         )
 
     @mcp.tool()
-    def drover_session_summary(session_id: str) -> Optional[dict]:
+    def drover_session_summary(session_id: str) -> dict:
         """Return the session_summaries row for one session, or null if no summary exists."""
         return t.drover_session_summary(duckdb_path=db, session_id=session_id)
 
@@ -97,15 +104,18 @@ def build_mcp_server(
         since: Optional[str] = None,
         limit: int = 50,
         default_since_days: int = 30,
+        session_id: Optional[str] = None,
     ) -> dict:
         """Case-insensitive content search across agent_events.
 
+        ``session_id`` scopes either a harness or native session identity.
         ``repo`` matches the literal ``<owner>/<name>`` (e.g. ``arniesaha/drover``).
         ``since`` is an ISO-8601 timestamp lower bound. Unscoped searches default
         to the last ``default_since_days`` days to keep live MCP recall bounded.
         """
         return t.drover_search(
             duckdb_path=db,
+            session_id=session_id,
             query=query,
             task_id=task_id,
             repo=repo,
@@ -136,10 +146,15 @@ def build_mcp_server(
         )
 
     @mcp.tool()
-    def drover_files_touched(task_id: str, since: Optional[str] = None) -> dict:
-        """Return distinct file paths edited under ``task_id``, derived from
-        tool_use_blocks (Edit/Write inputs)."""
-        return t.drover_files_touched(duckdb_path=db, task_id=task_id, since=since)
+    def drover_files_touched(
+        task_id: Optional[str] = None,
+        since: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict:
+        """Return file paths from normalized tool inputs for a task or harness/native ``session_id``."""
+        return t.drover_files_touched(
+            duckdb_path=db, task_id=task_id, since=since, session_id=session_id
+        )
 
     @mcp.tool()
     def drover_session_close(session_id: str) -> dict:
@@ -252,6 +267,7 @@ def build_mcp_server(
         limit: int = 5,
         repo_owner: Optional[str] = None,
         repo_name: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> dict:
         """Semantic recall: return session summaries ranked by cosine similarity
         to ``query_embedding``. Caller supplies the embedding (encode the query
@@ -260,6 +276,7 @@ def build_mcp_server(
         to one project."""
         return t.drover_recall(
             duckdb_path=db,
+            session_id=session_id,
             query_embedding=query_embedding,
             limit=limit,
             repo_owner=repo_owner,
@@ -268,10 +285,15 @@ def build_mcp_server(
         )
 
     @mcp.tool()
-    def drover_task_status(task_id: str) -> Optional[dict]:
+    def drover_task_status(
+        task_id: Optional[str] = None, session_id: Optional[str] = None
+    ) -> dict:
         """Aggregate stats for a task: session count, agent count, last activity,
-        and latest summary. Returns null if the task is unknown."""
-        return t.drover_task_status(duckdb_path=db, task_id=task_id)
+        and latest summary. Accepts a harness/native ``session_id``; missing data has an explicit status.
+        """
+        return t.drover_task_status(
+            duckdb_path=db, task_id=task_id, session_id=session_id
+        )
 
     @mcp.tool()
     def drover_project_activity(

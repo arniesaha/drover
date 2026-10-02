@@ -12,6 +12,7 @@ from typing import Callable, Iterator, Literal
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.summarizer.derive import SUBSTANTIVE_SQL
 
 SUMMARY_MAX_ATTEMPTS = 5
 # Attempts are scoped to one source generation, and a live session mints a new
@@ -77,7 +78,7 @@ def source_version_for_session(con: duckdb.DuckDBPyConnection, session_id: str) 
              SELECT count(*),
                     max(TRY_CAST(timestamp AS TIMESTAMPTZ)),
                     max(dedup_key)
-             FROM canonical_agent_events""",
+             FROM canonical_agent_events WHERE {SUBSTANTIVE_SQL}""",
         [session_id],
     ).fetchone()
     event_count, max_timestamp, max_dedup_key = row or (0, None, None)

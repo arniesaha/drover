@@ -679,11 +679,17 @@ def _agent_events_view(parquet_dir: Path) -> str:
     return f"""
 CREATE OR REPLACE VIEW agent_events AS
 WITH raw_agent_events AS (
-  SELECT * FROM read_parquet(
+  SELECT *, 'native' AS source FROM read_parquet(
     '{parquet_dir}/agent_events/**/*.parquet',
     hive_partitioning=true,
     union_by_name=true
+  ) native
+  WHERE NOT EXISTS (
+    SELECT 1 FROM memory_session_identity m
+    WHERE native.session_id IN (m.harness_session_id, m.native_session_id)
   )
+  UNION ALL BY NAME
+  SELECT * FROM control_memory_events
 ),
 normalized_agent_events AS (
   SELECT *,
@@ -965,7 +971,7 @@ WITH raw_spans AS (
 )
 {span_attr_select}
 
-CREATE OR REPLACE MACRO agent_events_for_date(partition_date) AS TABLE
+CREATE OR REPLACE MACRO raw_agent_events_for_date(partition_date) AS TABLE
 SELECT *
 FROM read_parquet(
   [
@@ -976,6 +982,15 @@ FROM read_parquet(
   union_by_name=true
 )
 WHERE date <> '_seed';
+
+CREATE OR REPLACE MACRO agent_events_for_date(partition_date) AS TABLE
+SELECT *, 'native' AS source FROM raw_agent_events_for_date(partition_date) native
+WHERE NOT EXISTS (
+  SELECT 1 FROM memory_session_identity m
+  WHERE native.session_id IN (m.harness_session_id, m.native_session_id)
+)
+UNION ALL BY NAME
+SELECT * FROM control_memory_events WHERE date = partition_date;
 
 CREATE OR REPLACE MACRO spans_enriched_for_date(partition_date) AS TABLE
 WITH date_agent_events AS (
@@ -2325,11 +2340,22 @@ def bootstrap(
 
     con = open_duckdb_connection(duckdb_path)
     try:
+        from drover.server.memory_identity import ensure_memory_schema
+
+        ensure_memory_schema(con)
         con.execute(_TASKS_DDL)
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
         con.execute(_AGENT_EVENT_PARTITION_ACTIVITY_DDL)
         con.execute(_AGENT_EVENT_DAY_SUMMARY_DDL)
         con.execute(_SESSION_SUMMARIES_DDL)
+        con.execute("""CREATE OR REPLACE VIEW canonical_session_summaries AS
+            SELECT ss.* FROM session_summaries ss
+            WHERE NOT EXISTS (
+              SELECT 1 FROM memory_session_identity m
+              JOIN session_summaries canonical ON canonical.session_id=m.harness_session_id
+              WHERE ss.session_id=m.native_session_id
+                AND ss.session_id<>m.harness_session_id
+            )""")
         con.execute(_SUMMARIZE_JOBS_DDL)
         _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
         con.execute(_PROJECT_BRIEFS_DDL)

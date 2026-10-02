@@ -337,11 +337,27 @@ class SummarizerWorker:
             return 1
 
         if completion is None:
+            con = _open_summarizer_db(self.duckdb_path)
+            try:
+                row = con.execute(
+                    "SELECT status FROM summarize_jobs WHERE session_id=?", [session_id]
+                ).fetchone()
+                insufficient = bool(row and row[0] == "insufficient_input")
+            finally:
+                con.close()
             ledger_shadow.fail_and_dead_letter(
                 self.duckdb_path,
                 ledger_job_id,
-                error_message="source generation superseded",
-                error_category="summarizer_stale_generation",
+                error_message=(
+                    "no substantive turns"
+                    if insufficient
+                    else "source generation superseded"
+                ),
+                error_category=(
+                    "insufficient_input"
+                    if insufficient
+                    else "summarizer_stale_generation"
+                ),
             )
             if delivery is not None:
                 self.job_stream.ack(delivery.id)
@@ -680,33 +696,52 @@ class SummarizerWorker:
     ) -> Optional[_SummaryCompletion]:
         con = _open_summarizer_db(self.duckdb_path)
         try:
+            from drover.server.summarizer.derive import select_substantive_window
+
+            events = select_substantive_window(
+                con, _session_agent_events_ctes(), session_id
+            )
+            if not events:
+                with summary_jobs_writer():
+                    con.execute(
+                        """UPDATE summarize_jobs SET status='insufficient_input',
+                        last_error='no substantive turns', updated_at=now()
+                        WHERE session_id=? AND status='running'
+                        AND source_version IS NOT DISTINCT FROM ?""",
+                        [session_id, source_version],
+                    )
+                return None
+            # Derive artifacts from the whole normalized tool stream, not the
+            # bounded text prompt (edits often precede the final 30 turns).
             cur = con.execute(
                 f"""WITH {_session_agent_events_ctes()}
-                   SELECT id, timestamp, agent_id, event_type, role, content, raw_data
-                   FROM canonical_agent_events
-                   ORDER BY timestamp DESC LIMIT 30""",
+                SELECT event_type, raw_data FROM canonical_agent_events
+                WHERE raw_data IS NOT NULL""",
                 [session_id],
             )
-            cols = [d[0] for d in cur.description]
-            events_desc = [dict(zip(cols, r)) for r in cur.fetchall()]
+            tool_events = [
+                dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()
+            ]
         finally:
             con.close()
 
-        if not events_desc:
-            raise RuntimeError(f"no events for session {session_id}")
-
-        # Reverse to chronological order for the prompt
-        events = list(reversed(events_desc))
         agent_id = events[-1].get("agent_id") or "unknown"
-
-        files = compute_files_touched(events)
-        tools = compute_tools_used(events)
+        files = compute_files_touched(tool_events)
+        tools = compute_tools_used(tool_events)
 
         last_user = next(
             (e["content"] for e in reversed(events) if e.get("role") == "user"), ""
         )
         last_assistant = next(
-            (e["content"] for e in reversed(events) if e.get("role") == "assistant"), ""
+            (
+                e["content"]
+                for e in reversed(events)
+                if e.get("role") == "assistant"
+                and e.get("event_type")
+                not in ("tool_call", "tool_action", "tool_result")
+                and e.get("content")
+            ),
+            "",
         )
 
         prompt = build_summary_prompt(
@@ -737,6 +772,14 @@ class SummarizerWorker:
             except NoApiKeyError:
                 raise RuntimeError("ANTHROPIC_API_KEY not configured (no_api_key)")
             generator_model = self.model
+
+        # Preserve exact final commit/issue evidence even if the model omits it.
+        from drover.server.summarizer.derive import final_references
+
+        refs = final_references(last_assistant)
+        missing_refs = [ref for ref in refs if ref not in llm["summary_md"]]
+        if missing_refs:
+            llm["summary_md"] += "\n\nFinal references: " + ", ".join(missing_refs)
 
         # The test seam is deliberately before the single completion transaction:
         # any superseding generation either wins first and makes this stale, or is
@@ -778,7 +821,7 @@ class SummarizerWorker:
                             files,
                             tools,
                             (llm.get("last_user_prompt") or last_user or "")[-500:],
-                            (llm.get("last_assistant") or last_assistant or "")[-500:],
+                            last_assistant or "",
                             llm["next_steps_md"],
                             llm.get("open_questions") or [],
                             generator_model,

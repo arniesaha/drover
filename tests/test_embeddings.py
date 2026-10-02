@@ -162,10 +162,10 @@ def test_embedding_backend_config_prefers_mac_local_ollama_before_gpu() -> None:
     assert isinstance(embedder, OllamaEmbedder)
     assert embedder.ollama_url == "http://127.0.0.1:11435"
     assert embedder.wake_on_first_call is True
-    assert embedder.launchd_label == "com.drover.mac-ollama-embeddings"
+    assert embedder.launchd_label is None
 
 
-def test_mac_local_embedder_kickstarts_launchd_before_request() -> None:
+def test_mac_local_embedder_probes_before_launchd() -> None:
     with (
         patch("drover.server.embeddings.client.subprocess.run") as mock_run,
         patch(
@@ -183,11 +183,7 @@ def test_mac_local_embedder_kickstarts_launchd_before_request() -> None:
         )
         e.embed("x")
 
-    assert mock_run.call_args.args[0][:3] == [
-        "/bin/launchctl",
-        "kickstart",
-        f"gui/{__import__('os').getuid()}/com.drover.mac-ollama-embeddings",
-    ]
+    mock_run.assert_not_called()
     mock_get.assert_called_once_with("http://127.0.0.1:11435/api/tags", timeout=3.0)
     assert mock_post.call_args.args[0] == "http://127.0.0.1:11435/api/embed"
 

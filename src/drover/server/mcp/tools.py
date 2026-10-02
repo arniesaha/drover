@@ -73,6 +73,49 @@ def _parse_datetime(value: Any) -> datetime | None:
     return None
 
 
+def _resolve(duckdb_path: Path, session_id: str) -> dict:
+    from drover.server.memory_identity import resolve_session
+
+    try:
+        con = _connect(duckdb_path)
+        try:
+            return resolve_session(con, session_id)
+        finally:
+            con.close()
+    except (duckdb.Error, OSError):
+        return {"status": "unavailable", "session_id": session_id}
+
+
+def _missing(resolution: dict) -> dict:
+    return {**resolution, "status": "unavailable"}
+
+
+def drover_memory_acceptance(*, duckdb_path: Path, harness_ids: list[str]) -> dict:
+    """Read-only evidence report for up to 25 explicitly selected sessions."""
+    from drover.server.memory_audit import audit_session
+
+    if len(harness_ids) > 25:
+        raise ValueError("at most 25 harness IDs per audit read")
+    try:
+        con = _connect(duckdb_path)
+        try:
+            reports = []
+            for sid in harness_ids:
+                try:
+                    reports.append(audit_session(con, sid))
+                except duckdb.Error:
+                    reports.append({"harness_id": sid, "status": "unavailable"})
+            return {"sessions": reports}
+        finally:
+            con.close()
+    except (duckdb.Error, OSError):
+        return {
+            "sessions": [
+                {"harness_id": sid, "status": "unavailable"} for sid in harness_ids
+            ]
+        }
+
+
 # --- drover_handoff -----------------------------------------------------------
 
 
@@ -84,6 +127,7 @@ def drover_handoff(
     branch: Optional[str] = None,
     task_id: Optional[str] = None,
     max_summaries: int = 3,
+    session_id: Optional[str] = None,
 ) -> dict:
     """Return recent session summaries + active sessions for a task or repo.
 
@@ -98,6 +142,21 @@ def drover_handoff(
     folds the branch into the hash, so the cross-branch view was previously
     invisible to callers who only knew the repo (#53).
     """
+    if session_id:
+        summary = drover_session_summary(duckdb_path=duckdb_path, session_id=session_id)
+        if summary.get("status") in {
+            "unknown",
+            "unmapped",
+            "unavailable",
+            "insufficient_input",
+        }:
+            return summary
+        return {
+            "status": "ok",
+            "session_id": summary["session_id"],
+            "summaries": [summary],
+            "active_sessions": [],
+        }
     by_repo = repo_owner is not None and repo_name is not None and task_id is None
 
     con = _connect(duckdb_path)
@@ -108,7 +167,7 @@ def drover_handoff(
                     """SELECT ss.session_id, ss.agent_id, ss.ended_at,
                               ss.summary_md, ss.next_steps_md, ss.open_questions,
                               ss.files_touched, ss.status, ss.generator_model
-                         FROM session_summaries ss
+                         FROM canonical_session_summaries ss
                          JOIN tasks t ON ss.task_id = t.task_id
                         WHERE t.repo_owner = ? AND t.repo_name = ?
                           AND (? IS NULL OR t.branch = ?)
@@ -138,7 +197,7 @@ def drover_handoff(
                 con.execute(
                     """SELECT session_id, agent_id, ended_at, summary_md, next_steps_md,
                               open_questions, files_touched, status, generator_model
-                         FROM session_summaries
+                         FROM canonical_session_summaries
                         WHERE task_id = ?
                           AND session_id <> 'unknown_openclaw'
                         ORDER BY ended_at DESC
@@ -179,6 +238,10 @@ def drover_session_replay(
     last_n_turns: int = 30,
     include_empty: bool = False,
 ) -> dict:
+    resolution = _resolve(duckdb_path, session_id)
+    if resolution["status"] != "ok":
+        return resolution
+    session_id = resolution["session_id"]
     con = _connect(duckdb_path)
     try:
         where = ["session_id = ?"]
@@ -191,7 +254,7 @@ def drover_session_replay(
                  WHERE {" AND ".join(where)}
                ),
                {canonical_agent_events_cte(source="candidate_agent_events")}
-               SELECT id, timestamp, agent_id, event_type, role, content
+               SELECT id, timestamp, agent_id, event_type, role, content, source
                FROM canonical_agent_events
                ORDER BY timestamp DESC
                LIMIT ?""",
@@ -200,7 +263,9 @@ def drover_session_replay(
         events = _row_to_dict(cur)
     finally:
         con.close()
-    return {"session_id": session_id, "include_empty": include_empty, "events": events}
+    if not events:
+        return _missing(resolution)
+    return {**resolution, "include_empty": include_empty, "events": events}
 
 
 # --- drover_session_summary ---------------------------------------------------
@@ -210,7 +275,11 @@ def drover_session_summary(
     *,
     duckdb_path: Path,
     session_id: str,
-) -> Optional[dict]:
+) -> dict:
+    resolution = _resolve(duckdb_path, session_id)
+    if resolution["status"] != "ok":
+        return resolution
+    session_id = resolution.get("summary_session_id") or resolution["session_id"]
     con = _connect(duckdb_path)
     try:
         cur = con.execute(
@@ -222,9 +291,27 @@ def drover_session_summary(
             [session_id],
         )
         rows = _row_to_dict(cur)
+        job = (
+            con.execute(
+                "SELECT status FROM summarize_jobs WHERE session_id=?",
+                [resolution["session_id"]],
+            ).fetchone()
+            if not rows
+            else None
+        )
+
     finally:
         con.close()
-    return rows[0] if rows else None
+    if rows:
+        return {
+            **rows[0],
+            **resolution,
+            "status": rows[0]["status"],
+            "artifact_session_id": rows[0]["session_id"],
+        }
+    if job and job[0] == "insufficient_input":
+        return {**resolution, "status": "insufficient_input"}
+    return {**_missing(resolution), "summary_status": job[0] if job else "unavailable"}
 
 
 # --- drover_active_sessions ---------------------------------------------------
@@ -292,6 +379,7 @@ def drover_search(
     since: Optional[str] = None,
     limit: int = 50,
     default_since_days: int = 30,
+    session_id: Optional[str] = None,
 ) -> dict:
     """Content LIKE search across agent_events.
 
@@ -303,9 +391,15 @@ def drover_search(
     scans that can exhaust file descriptors. Pass `since` or a `repo`/`task_id`
     scope for explicit historical searches.
     """
-    scoped = bool(task_id or repo or since)
+    resolution = _resolve(duckdb_path, session_id) if session_id else None
+    if resolution and resolution["status"] != "ok":
+        return resolution
+    scoped = bool(task_id or repo or since or session_id)
     where = ["content IS NOT NULL", "lower(content) LIKE ?"]
     params: list[Any] = [f"%{query.lower()}%"]
+    if resolution:
+        where.append("session_id = ?")
+        params.append(resolution["session_id"])
     if task_id:
         where.append("task_id = ?")
         params.append(task_id)
@@ -342,7 +436,7 @@ def drover_search(
         WHERE {" AND ".join(where)}
       ),
       {canonical_agent_events_cte(source="candidate_agent_events")}
-      SELECT id, session_id, agent_id, timestamp, event_type, content
+      SELECT id, session_id, agent_id, timestamp, event_type, content, source
       FROM canonical_agent_events
       ORDER BY timestamp DESC
       LIMIT {int(limit)}
@@ -352,7 +446,15 @@ def drover_search(
         results = _row_to_dict(con.execute(sql, params))
     finally:
         con.close()
+    if resolution and not results:
+        return {
+            **resolution,
+            "status": "unavailable",
+            "reason": "no_matches",
+            "results": [],
+        }
     return {
+        "status": "ok",
         "query": query,
         "scoped": scoped,
         "since": since,
@@ -367,8 +469,9 @@ def drover_search(
 def drover_files_touched(
     *,
     duckdb_path: Path,
-    task_id: str,
+    task_id: Optional[str] = None,
     since: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
     """Return distinct file paths touched by Edit/Write/Bash tool_use blocks.
 
@@ -376,14 +479,17 @@ def drover_files_touched(
     ``tool_use_blocks`` entries, and pulls ``input.file_path`` /
     ``input.path``.
     """
-    where = ["task_id = ?"]
-    params: list[Any] = [task_id]
+    resolution = _resolve(duckdb_path, session_id) if session_id else None
+    if resolution and resolution["status"] != "ok":
+        return resolution
+    where = ["session_id = ?" if resolution else "task_id = ?"]
+    params: list[Any] = [resolution["session_id"] if resolution else task_id]
     if since:
         where.append("timestamp >= ?")
         params.append(since)
     sql = f"""
       WITH {canonical_agent_events_cte()}
-      SELECT DISTINCT raw_data
+      SELECT DISTINCT event_type, raw_data
       FROM canonical_agent_events
       WHERE {" AND ".join(where)} AND raw_data IS NOT NULL AND raw_data <> '{{}}'
     """
@@ -393,23 +499,12 @@ def drover_files_touched(
     finally:
         con.close()
 
-    files: set[str] = set()
-    for (raw,) in rows:
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        for block in data.get("tool_use_blocks", []) or []:
-            if not isinstance(block, dict):
-                continue
-            inp = block.get("input") or {}
-            for key in ("file_path", "path"):
-                v = inp.get(key)
-                if isinstance(v, str) and v:
-                    files.add(v)
-    return {"task_id": task_id, "files": sorted(files)}
+    from drover.server.summarizer.derive import compute_files_touched
+
+    files = compute_files_touched(
+        {"event_type": kind, "raw_data": raw} for kind, raw in rows
+    )
+    return {**(resolution or {}), "status": "ok", "task_id": task_id, "files": files}
 
 
 # --- drover_task_status -------------------------------------------------------
@@ -495,13 +590,13 @@ def drover_project_brief(
             """SELECT MAX(activity_at)
                  FROM (
                    SELECT TRY_CAST(ss.ended_at AS TIMESTAMP) AS activity_at
-                     FROM session_summaries ss
+                     FROM canonical_session_summaries ss
                      JOIN tasks t USING (task_id)
                     WHERE t.repo_owner = ? AND t.repo_name = ?
                       AND ss.session_id <> 'unknown_openclaw'
                    UNION ALL
                    SELECT TRY_CAST(ss.generated_at AS TIMESTAMP) AS activity_at
-                     FROM session_summaries ss
+                     FROM canonical_session_summaries ss
                      JOIN tasks t USING (task_id)
                     WHERE t.repo_owner = ? AND t.repo_name = ?
                       AND ss.session_id <> 'unknown_openclaw'
@@ -587,7 +682,7 @@ def drover_recent_sessions(
             """SELECT DISTINCT ss.session_id, ss.agent_id, ss.ended_at,
                       ss.summary_md, ss.next_steps_md, ss.open_questions,
                       ss.files_touched, ss.generator_model
-               FROM session_summaries ss
+               FROM canonical_session_summaries ss
                LEFT JOIN tasks t USING (task_id)
                WHERE ss.session_id <> 'unknown_openclaw'
                  AND (
@@ -752,7 +847,7 @@ def drover_resume_context(
                 con.execute(
                     """SELECT session_id, agent_id, ended_at, summary_md,
                               next_steps_md, open_questions, status, generator_model
-                         FROM session_summaries
+                         FROM canonical_session_summaries
                         WHERE session_id = ANY(?::VARCHAR[])
                         ORDER BY ended_at DESC NULLS LAST
                         LIMIT ?""",
@@ -964,6 +1059,7 @@ def drover_recall(
     repo_owner: Optional[str] = None,
     repo_name: Optional[str] = None,
     include_spans: bool = False,
+    session_id: Optional[str] = None,
 ) -> dict:
     """Return session summaries ranked by cosine similarity to ``query_embedding``.
 
@@ -976,10 +1072,16 @@ def drover_recall(
     Filters by ``(repo_owner, repo_name)`` if both are provided. Raw-span hits
     are only unioned in when the optional span integration is on (#473).
     """
+    resolution = _resolve(duckdb_path, session_id) if session_id else None
+    if resolution and resolution["status"] != "ok":
+        return resolution
     if not query_embedding:
         raise ValueError("recall: query_embedding is required (list[float])")
     where = ["se.embedding IS NOT NULL", "se.dim = ?"]
     params: list[Any] = [len(query_embedding)]
+    if resolution:
+        where.append("ss.session_id = ?")
+        params.append(resolution.get("summary_session_id") or resolution["session_id"])
     if repo_owner and repo_name:
         where.append(
             "ss.session_id IN (SELECT DISTINCT session_id FROM canonical_agent_events "
@@ -992,6 +1094,9 @@ def drover_recall(
     # recall for synthesized session-summary recall.
     span_where = ["spe.embedding IS NOT NULL", "spe.dim = ?"]
     span_params: list[Any] = [len(query_embedding)]
+    if resolution:
+        span_where.append("spe.session_id = ?")
+        span_params.append(resolution["session_id"])
     if repo_owner and repo_name:
         span_where.append("spe.repo_owner = ? AND spe.repo_name = ?")
         span_params.extend([repo_owner, repo_name])
@@ -1022,7 +1127,7 @@ def drover_recall(
                    NULL::VARCHAR AS source_text,
                    list_cosine_similarity(se.embedding::DOUBLE[], ?::DOUBLE[]) AS score
             FROM session_embeddings se
-            JOIN session_summaries ss USING (session_id)
+            JOIN canonical_session_summaries ss USING (session_id)
             WHERE {' AND '.join(where)}{span_hits if include_spans else ""}
         )
         SELECT source_type, session_id, span_id, agent_id, ended_at, summary_md,
@@ -1039,7 +1144,9 @@ def drover_recall(
         results = _row_to_dict(con.execute(sql, bound))
     finally:
         con.close()
-    return {"results": results, "limit": int(limit)}
+    if resolution and not results:
+        return _missing(resolution)
+    return {"status": "ok", "results": results, "limit": int(limit)}
 
 
 def drover_active_handoff(
@@ -1058,20 +1165,43 @@ def drover_active_handoff(
     """
     from drover.server.briefs.active import generate_active_brief
 
-    return generate_active_brief(
-        duckdb_path,
-        session_id,
-        backend=backend,
-        backend_config=backend_config,
-        max_age_seconds=max_age_seconds,
-    )
+    resolution = _resolve(duckdb_path, session_id)
+    if resolution["status"] != "ok":
+        return resolution
+    session_id = resolution["session_id"]
+    try:
+        return generate_active_brief(
+            duckdb_path,
+            session_id,
+            backend=backend,
+            backend_config=backend_config,
+            max_age_seconds=max_age_seconds,
+        )
+    except (RuntimeError, duckdb.Error):
+        return _missing(resolution)
 
 
 def drover_task_status(
     *,
     duckdb_path: Path,
-    task_id: str,
-) -> Optional[dict]:
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> dict:
+    if session_id:
+        resolution = _resolve(duckdb_path, session_id)
+        if resolution["status"] != "ok":
+            return resolution
+        con = _connect(duckdb_path)
+        try:
+            row = con.execute(
+                "SELECT task_id FROM agent_events WHERE session_id=? AND task_id IS NOT NULL LIMIT 1",
+                [resolution["session_id"]],
+            ).fetchone()
+        finally:
+            con.close()
+        if not row:
+            return _missing(resolution)
+        task_id = row[0]
     con = _connect(duckdb_path)
     try:
         task_rows = _row_to_dict(
@@ -1083,7 +1213,7 @@ def drover_task_status(
             )
         )
         if not task_rows:
-            return None
+            return {"status": "unknown", "task_id": task_id}
         # Refresh aggregates from views (don't trust tasks.session_count)
         ev = con.execute(
             f"""WITH {canonical_agent_events_cte()}
@@ -1095,7 +1225,7 @@ def drover_task_status(
         latest_summary = _row_to_dict(
             con.execute(
                 """SELECT session_id, agent_id, summary_md, ended_at
-               FROM session_summaries
+               FROM canonical_session_summaries
                WHERE task_id = ?
                ORDER BY ended_at DESC LIMIT 1""",
                 [task_id],

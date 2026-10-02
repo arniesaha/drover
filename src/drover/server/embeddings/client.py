@@ -17,7 +17,13 @@ from typing import Iterable, Optional
 import requests
 
 from drover.server.summarizer.backends.types import BackendError
-from drover.server.wol import GpuRig, GpuWakeError, ensure_gpu_awake, wait_for_ollama
+from drover.server.wol import (
+    GpuRig,
+    GpuWakeError,
+    _ollama_healthy,
+    ensure_gpu_awake,
+    wait_for_ollama,
+)
 
 log = logging.getLogger("drover.embeddings.client")
 
@@ -154,7 +160,7 @@ class EmbeddingBackendConfig:
     mac_ollama_url: Optional[str] = None
     gpu_rig: Optional[GpuRig] = None
     local_model: str = DEFAULT_EMBED_MODEL
-    mac_ollama_launchd_label: Optional[str] = DEFAULT_MAC_OLLAMA_LAUNCHD_LABEL
+    mac_ollama_launchd_label: Optional[str] = None
     mac_ollama_launchd_plist: Optional[str] = DEFAULT_MAC_OLLAMA_LAUNCHD_PLIST
     ollama_keep_alive: str = DEFAULT_OLLAMA_KEEP_ALIVE
 
@@ -213,7 +219,7 @@ class EmbeddingBackendConfig:
                 os.environ.get("DROVER_EMBEDDINGS_MAC_OLLAMA_LAUNCHD_LABEL")
                 or os.environ.get("NEXUS_EMBEDDINGS_MAC_OLLAMA_LAUNCHD_LABEL")
             )
-            or DEFAULT_MAC_OLLAMA_LAUNCHD_LABEL,
+            or None,
             mac_ollama_launchd_plist=mac_ollama_launchd_plist
             or (
                 os.environ.get("DROVER_EMBEDDINGS_MAC_OLLAMA_LAUNCHD_PLIST")
@@ -290,6 +296,9 @@ class OllamaEmbedder:
 
     def ensure_ready(self) -> None:
         if self.rig is None:
+            if _ollama_healthy(self.ollama_url):
+                self._awoken = True
+                return
             if self.launchd_label:
                 _launchctl_kickstart(self.launchd_label, self.launchd_plist)
                 wait_for_ollama(
