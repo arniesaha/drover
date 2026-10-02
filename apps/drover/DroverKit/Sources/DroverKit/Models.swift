@@ -279,7 +279,9 @@ public enum JSONValue: Sendable, Equatable, Decodable {
 public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashable {
     public var id: String        // host_id
     public var displayName: String
-    public var status: String    // "online"/"stale"/"offline"
+    /// Server-derived liveness: "online"/"stale"/"offline". Never re-derived
+    /// from `lastSeenAt` here; the hub owns the thresholds.
+    public var status: String
     public var connectionKind: String
     public var lastSeenAt: Date?
     /// Enabled preset names from capabilities. Metadata only: launch and
@@ -315,6 +317,7 @@ public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashabl
     private enum CodingKeys: String, CodingKey {
         case id = "host_id"
         case status
+        case liveness
         case connectionKind = "connection_kind"
         case lastSeenAt = "last_seen_at"
         case capabilities
@@ -328,7 +331,10 @@ public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashabl
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
-        status = (try? container.decode(String.self, forKey: .status)) ?? ""
+        // `liveness` is the explicit derived field; `status` carries the same
+        // value on current hubs and is the fallback for older ones.
+        status = (try? container.decode(String.self, forKey: .liveness))
+            ?? (try? container.decode(String.self, forKey: .status)) ?? ""
         connectionKind = (try? container.decode(String.self, forKey: .connectionKind)) ?? "direct"
         if let raw = try? container.decode(String.self, forKey: .lastSeenAt) {
             lastSeenAt = WireDate.parse(raw)
@@ -349,9 +355,8 @@ public struct HostSummary: Sendable, Identifiable, Decodable, Equatable, Hashabl
     }
 }
 
-/// Three-way host presence. Relay hosts are socket-truth online/offline
-/// (never stale); direct hosts are heartbeat-based online/stale (never
-/// offline). Unknown/empty statuses render as offline.
+/// Three-way host presence, as derived by the hub from heartbeat age for every
+/// connection kind. Unknown/empty/retired statuses render as offline.
 public enum HostPresence: String, Sendable {
     case online, stale, offline
 }

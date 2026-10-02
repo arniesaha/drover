@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Host liveness (online / stale / offline / retired) is derived from heartbeat
+  age in one helper and sent by the hub as `liveness` on `/harness/hosts`, so
+  fleet, provider capacity, launch pickers, content consent, MCP
+  `drover_fleet_status` (`host_liveness`), web and iOS agree. Relay hosts that
+  go dark now read stale, then offline, instead of staying online. Thresholds
+  are `DROVER_HOST_STALE_AFTER_SECONDS` (45) and
+  `DROVER_HOST_OFFLINE_AFTER_SECONDS` (600); see `docs/multi-host.md` (#474).
 - Span ingestion is an optional integration, off by default (#473). The OTLP
   receiver only starts with `[telemetry] spans_enabled = true`; with it off no
   span Parquet is read, no span embedding jobs are enqueued or claimed,

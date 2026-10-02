@@ -1187,3 +1187,22 @@ def test_fleet_status_excludes_retired_host_sessions(tmp_path):
     assert active[0]["session_id"] not in {
         session["session_id"] for session in result["active_sessions"]
     }
+
+
+def test_fleet_status_reports_host_liveness_from_heartbeat_age(tmp_path):
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = _seed_active_fleet(tmp_path, sessions=2)
+    sessions = mcp_tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
+    agent_id = sessions[0]["agent_id"]
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id=agent_id, display_name="H", kind="mac")
+    with registry._connect() as con:
+        con.execute(
+            "UPDATE harness_hosts SET last_seen_at = ? WHERE host_id = ?",
+            [datetime.now() - timedelta(days=3), agent_id],
+        )
+    rows = mcp_tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
+    assert {row["host_liveness"] for row in rows if row["agent_id"] == agent_id} == {
+        "offline"
+    }

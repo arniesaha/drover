@@ -128,6 +128,7 @@
     }
     .pill.fav { color: var(--warn); border-color: var(--warn); }
     .online { color: var(--ok); }
+    .stale { color: var(--warn, #b7791f); }
     .offline { color: var(--bad); }
     .disabled { opacity: 0.65; }
     .state { display: inline-flex; align-items: center; gap: 6px; font-weight: 650; white-space: nowrap; }
@@ -259,6 +260,12 @@
       return host && (host.tailscale_url || host.local_url) || "";
     }
 
+    // The server derives online / stale / offline from heartbeat age; never
+    // re-derive it here. Fall back to `status` only for an older hub.
+    function hostLiveness(host) {
+      return (host && (host.liveness || host.status)) || "offline";
+    }
+
     function hostById(id) {
       return (harnessState.hosts || []).find((host) => host.host_id === id);
     }
@@ -275,7 +282,7 @@
       );
       if (recent) return hostById(recent.host_id);
       const onlineFirst = (kind) =>
-        hosts.find((h) => h.kind === kind && h.status === "online") ||
+        hosts.find((h) => h.kind === kind && hostLiveness(h) === "online") ||
         hosts.find((h) => h.kind === kind);
       if (path.startsWith("/Users/")) return onlineFirst("macos");
       if (path.startsWith("/home/") || path.startsWith("/root") || path.startsWith("/tmp")) {
@@ -291,7 +298,7 @@
 
     function launchableReason(host) {
       if (!host) return "No connected machine for this path";
-      if (host.status !== "online") return `${host.display_name || host.host_id} is offline`;
+      if (hostLiveness(host) === "offline") return `${host.display_name || host.host_id} is offline`;
       if (!endpoint(host)) return "No reachable URL for this machine";
       if (!DroverCapabilities.launchTargets(host).length) {
         const summary = DroverCapabilities.hostSummary(host);
@@ -549,7 +556,7 @@ ${s.path}`;
               <strong>${esc(host.display_name || host.host_id)}</strong>
               <div class="muted">${esc(host.kind || "host")} · ${esc(host.host_id)}</div>
             </div>
-            <span class="${host.status === "online" ? "online" : "offline"}">${esc(host.status)}</span>
+            <span class="${hostLiveness(host)}">${esc(hostLiveness(host))}</span>
           </div>
           <div class="row" style="margin-top:12px">
             ${ready.map((item) => `<span class="pill">${esc(targetLabel(item))}</span>`).join("")}
