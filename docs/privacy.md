@@ -70,9 +70,7 @@ Drover can be configured with optional services chosen by the operator. For
 example, summaries and briefs can use a configured model provider or a locally
 installed CLI, and embeddings can use an OpenAI-compatible endpoint or local
 Ollama. Those providers receive the content submitted to their configured
-worker under their own terms. The optional Pond archive integration is
-loopback-only and read-only in the documented configuration; it is disabled by
-default.
+worker under their own terms.
 
 The iOS app does not create a separate publisher-run forwarding service for
 these integrations. Review every provider, proxy, backup target, and network

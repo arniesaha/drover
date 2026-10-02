@@ -24,19 +24,6 @@ _NATIVE_RECORD_FIELDS = frozenset(
     {"source_agent", "session_id", "updated_at", "size_bytes", "source_copies"}
 )
 _NATIVE_RECORD_FIELDS_V2 = _NATIVE_RECORD_FIELDS | {"source_fingerprint"}
-_POND_ROOT_FIELDS = frozenset(
-    {"kind", "schema_version", "captured_at", "pond_version", "records"}
-)
-_POND_RECORD_FIELDS = frozenset(
-    {
-        "session_id",
-        "source_agent",
-        "created_at",
-        "message_count",
-        "first_message_at",
-        "last_message_at",
-    }
-)
 _ELIGIBILITY_ROOT_FIELDS = frozenset(
     {
         "kind",
@@ -162,47 +149,6 @@ class NativeInventory:
 
 
 @dataclass(frozen=True, slots=True)
-class PondInventoryRecord:
-    session_id: str
-    source_agent: str
-    created_at: str
-    message_count: int
-    first_message_at: str | None
-    last_message_at: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class PondInventory:
-    schema_version: int
-    captured_at: str
-    pond_version: str
-    records: tuple[PondInventoryRecord, ...]
-
-    def to_wire(self) -> dict[str, Any]:
-        _validate_pond_inventory(self)
-        return {
-            "kind": "pond_session_inventory",
-            "schema_version": self.schema_version,
-            "captured_at": self.captured_at,
-            "pond_version": self.pond_version,
-            "records": [
-                {
-                    "session_id": record.session_id,
-                    "source_agent": record.source_agent,
-                    "created_at": record.created_at,
-                    "message_count": record.message_count,
-                    "first_message_at": record.first_message_at,
-                    "last_message_at": record.last_message_at,
-                }
-                for record in sorted(
-                    self.records,
-                    key=lambda record: (record.source_agent, record.session_id),
-                )
-            ],
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class SourceEligibilityReceipt:
     schema_version: int
     assessed_at: str
@@ -254,41 +200,6 @@ def _validate_native_inventory(inventory: NativeInventory) -> None:
                 raise _error("invalid", "source_fingerprint")
         else:
             _require_source_fingerprint(record.source_fingerprint)
-        key = (record.source_agent, record.session_id)
-        if key in seen:
-            raise _error("invalid", "records")
-        seen.add(key)
-
-
-def _validate_pond_record(record: PondInventoryRecord) -> None:
-    if type(record) is not PondInventoryRecord:
-        raise _error("invalid", "record")
-    _require_string(record.session_id, "session_id")
-    _require_string(record.source_agent, "source_agent")
-    _require_timestamp(record.created_at, "created_at")
-    message_count = _require_nonnegative_integer(record.message_count, "message_count")
-    timestamps = (record.first_message_at, record.last_message_at)
-    if message_count == 0:
-        if timestamps != (None, None):
-            raise _error("invalid", "message_timestamps")
-    else:
-        if None in timestamps:
-            raise _error("invalid", "message_timestamps")
-        _require_timestamp(record.first_message_at, "first_message_at")
-        _require_timestamp(record.last_message_at, "last_message_at")
-
-
-def _validate_pond_inventory(inventory: PondInventory) -> None:
-    if type(inventory) is not PondInventory or not isinstance(inventory.records, tuple):
-        raise _error("invalid", "inventory")
-    _require_schema_version(inventory.schema_version)
-    _require_timestamp(inventory.captured_at, "captured_at")
-    _require_string(inventory.pond_version, "pond_version")
-    if len(inventory.records) > MAX_INVENTORY_RECORDS:
-        raise _error("invalid", "records")
-    seen: set[tuple[str, str]] = set()
-    for record in inventory.records:
-        _validate_pond_record(record)
         key = (record.source_agent, record.session_id)
         if key in seen:
             raise _error("invalid", "records")
@@ -351,45 +262,6 @@ def _native_inventory_from_wire(payload: Any) -> NativeInventory:
         inventory.schema_version,
         inventory.captured_at,
         inventory.host_id,
-        tuple(
-            sorted(
-                inventory.records,
-                key=lambda record: (record.source_agent, record.session_id),
-            )
-        ),
-    )
-
-
-def _pond_inventory_from_wire(payload: Any) -> PondInventory:
-    root = _require_exact_fields(payload, _POND_ROOT_FIELDS, "root")
-    if root["kind"] != "pond_session_inventory":
-        raise _error("invalid", "kind")
-    records: list[PondInventoryRecord] = []
-    for value in _require_records(root["records"]):
-        record = _require_exact_fields(value, _POND_RECORD_FIELDS, "record")
-        records.append(
-            PondInventoryRecord(
-                session_id=_require_string(record["session_id"], "session_id"),
-                source_agent=_require_string(record["source_agent"], "source_agent"),
-                created_at=_require_timestamp(record["created_at"], "created_at"),
-                message_count=_require_nonnegative_integer(
-                    record["message_count"], "message_count"
-                ),
-                first_message_at=record["first_message_at"],
-                last_message_at=record["last_message_at"],
-            )
-        )
-    inventory = PondInventory(
-        schema_version=_require_schema_version(root["schema_version"]),
-        captured_at=_require_timestamp(root["captured_at"], "captured_at"),
-        pond_version=_require_string(root["pond_version"], "pond_version"),
-        records=tuple(records),
-    )
-    _validate_pond_inventory(inventory)
-    return PondInventory(
-        inventory.schema_version,
-        inventory.captured_at,
-        inventory.pond_version,
         tuple(
             sorted(
                 inventory.records,
@@ -607,11 +479,6 @@ def read_private_json(
 def load_native_inventory(path: str | Path) -> NativeInventory:
     """Load exactly one native-source inventory manifest."""
     return _native_inventory_from_wire(read_private_json(path))
-
-
-def load_pond_inventory(path: str | Path) -> PondInventory:
-    """Load exactly one Pond-session inventory manifest."""
-    return _pond_inventory_from_wire(read_private_json(path))
 
 
 def load_source_eligibility_receipt(path: str | Path) -> SourceEligibilityReceipt:

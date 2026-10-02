@@ -484,8 +484,7 @@ def test_cli_init_writes_default_config(tmp_path):
     cfg = load_config(target)
     assert cfg.control_store.backend == "postgres"
     assert cfg.control_store.dsn_env == "DROVER_CONTROL_DSN"
-    assert cfg.archive.enabled is False
-    assert cfg.archive.base_url == ""
+    assert not hasattr(cfg, "archive")
 
 
 def test_cli_init_can_explicitly_write_legacy_duckdb_config(tmp_path):
@@ -1823,18 +1822,17 @@ def test_setup_check_module_entrypoint_uses_spawn_safe_transport(tmp_path):
     assert "subprocess-test-token" not in result.stdout + result.stderr
 
 
-def test_archive_help_preserves_existing_commands_and_adds_backup():
+def test_archive_help_preserves_native_commands_without_pond():
     result = CliRunner().invoke(main, ["archive", "--help"])
 
     assert result.exit_code == 0
     for command in (
-        "backup",
-        "coverage",
-        "pond-inventory",
         "source-eligibility",
         "source-inventory",
     ):
         assert command in result.output
+    for removed in ("backup", "coverage", "pond-inventory"):
+        assert removed not in result.output
 
 
 def test_cli_export_bundle_requires_selector(tmp_path):

@@ -12,8 +12,6 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from drover.config import ArchiveConfig, default_config
-from drover.server.archive import SessionArchive
 from drover.server.mcp import tools as t
 from drover.server.recall_bundle import RecallBundleService
 from drover.server.summarizer.backends import SummarizerBackendConfig
@@ -27,8 +25,6 @@ def build_mcp_server(
     port: int = 7077,
     backend_config: Optional[SummarizerBackendConfig] = None,
     summarize_job_stream: object | None = None,
-    archive: SessionArchive | None = None,
-    archive_config: ArchiveConfig | None = None,
     spans_enabled: bool = False,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
@@ -45,8 +41,6 @@ def build_mcp_server(
     bcfg = backend_config
     recall_service = RecallBundleService(
         duckdb_path=db,
-        archive_config=archive_config or default_config().archive,
-        archive=archive,
     )
 
     @mcp.tool()
@@ -128,11 +122,10 @@ def build_mcp_server(
         limit: Optional[int] = None,
         max_context_chars: Optional[int] = None,
     ) -> dict:
-        """Return bounded native-harness archive recall plus scoped Drover context.
+        """Return bounded hub recall with scoped Drover context.
 
         ``since`` is an exact ``YYYY-MM-DD`` lower-bound date.
-        When the local archive is disabled, busy, or unavailable, return a
-        bounded Drover-only fallback.
+        Results identify their source as hub.
         """
         return recall_service.recall_bundle(
             query=query,
