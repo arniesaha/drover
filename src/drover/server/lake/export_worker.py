@@ -248,6 +248,10 @@ def export(spec, document, *, before_commit=None):
             con.execute(
                 "INSERT INTO lake.export_batch_receipts BY NAME SELECT * FROM new_receipt"
             )
+            con.execute(
+                "CALL lake.set_commit_message('drover-export', ?, extra_info => ?)",
+                [expected["batch_id"], receipt_hash(expected)],
+            )
             if before_commit:
                 before_commit()
             con.execute("COMMIT")

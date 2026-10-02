@@ -464,6 +464,9 @@ def _resolve_config(
         if path is None and allow_missing_default:
             cfg = default_config()
             configure_control_store(cfg.duckdb_path, cfg.control_store)
+            from drover.server.lake.serving import configure_analytics
+
+            configure_analytics(cfg.duckdb_path, cfg.analytics)
             return cfg
         raise click.ClickException(
             f"config does not exist: {p}; run drover-server init first"
@@ -473,6 +476,9 @@ def _resolve_config(
     # is deliberately absent from harnessd, which keeps its host-local DuckDB
     # store even when a hub has PostgreSQL credentials in its environment.
     configure_control_store(cfg.duckdb_path, cfg.control_store)
+    from drover.server.lake.serving import configure_analytics
+
+    configure_analytics(cfg.duckdb_path, cfg.analytics)
     return cfg
 
 
@@ -2678,14 +2684,15 @@ def run(
     outbox_exporter: ControlOutboxExporter | None = None
     if cfg.control_store.backend == "postgres":
         try:
-            outbox_exporter = ControlOutboxExporter(
-                control_path=cfg.duckdb_path,
-                analytical_path=cfg.duckdb_path,
-                parquet_dir=cfg.parquet_dir,
-            )
             with _startup_phase("start_control_outbox_exporter"):
-                outbox_exporter.start(shutdown_event=stop)
-            log.info("control outbox exporter ready")
+                from drover.server.lake.lifecycle import selected_exporter
+
+                outbox_exporter = selected_exporter(cfg)
+                if outbox_exporter is None:
+                    log.info("DuckLake exporter disabled until explicit activation")
+                else:
+                    outbox_exporter.start(shutdown_event=stop)
+                    log.info("control outbox exporter ready")
         except Exception:  # noqa: BLE001 - control remains available, export lags
             log.exception("control outbox exporter failed to start")
             outbox_exporter = None

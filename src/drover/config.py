@@ -322,6 +322,51 @@ class MemoryBudgetConfig:
             raise ValueError("memory.warn_fraction must be between zero and one")
 
 
+@dataclass(frozen=True, slots=True)
+class AnalyticsConfig:
+    """Explicit operator selection; neither lake reads nor export auto-enable."""
+
+    backend: str = "legacy"
+    exporter_enabled: bool = False
+    catalog_dsn_env: str = ""
+    exporter_dsn_env: str = ""
+    data_root: str = ""
+    extension_dir: str = ""
+    engine_sha256: str = ""
+    verification_sha256: str = ""
+    epoch: str = ""
+
+    def __post_init__(self):
+        if self.backend not in {"legacy", "ducklake"}:
+            raise ValueError("analytics.backend must be legacy or ducklake")
+        if type(self.exporter_enabled) is not bool:
+            raise ValueError("analytics.exporter_enabled must be boolean")
+        if self.exporter_enabled and self.backend != "ducklake":
+            raise ValueError("lake export requires analytics.backend=ducklake")
+        if self.backend == "ducklake":
+            for name in (
+                "catalog_dsn_env",
+                "data_root",
+                "extension_dir",
+                "engine_sha256",
+                "verification_sha256",
+                "epoch",
+            ):
+                if not getattr(self, name):
+                    raise ValueError(f"analytics.{name} is required for ducklake")
+            for name in ("data_root", "extension_dir"):
+                if not Path(getattr(self, name)).is_absolute():
+                    raise ValueError(f"analytics.{name} must be absolute")
+            for name in ("engine_sha256", "verification_sha256"):
+                if not re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)):
+                    raise ValueError(f"analytics.{name} must be SHA-256")
+            if self.exporter_enabled and (
+                not self.exporter_dsn_env
+                or self.exporter_dsn_env == self.catalog_dsn_env
+            ):
+                raise ValueError("lake export requires a separate exporter_dsn_env")
+
+
 @dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
@@ -448,6 +493,7 @@ class DroverConfig:
     # launch; worktree creation must not share a volume with slow bulk data.
     worktrees_dir: Path | None = None
     memory: MemoryBudgetConfig = MemoryBudgetConfig()
+    analytics: AnalyticsConfig = AnalyticsConfig()
     setup_check: SetupCheckConfig = SetupCheckConfig()
     # Optional span integration (AgentWeave proxy -> Tempo -> tempo-relay ->
     # OTLP :4317 -> Parquet spans/). Off by default since #473: spans only
@@ -459,6 +505,10 @@ class DroverConfig:
 
 
 _DEFAULTS = {
+    "analytics": {
+        name: getattr(AnalyticsConfig(), name)
+        for name in AnalyticsConfig.__dataclass_fields__
+    },
     "memory": {
         "rss_budget_bytes": 4 * 1024**3,
         "sample_interval_seconds": 1.0,
@@ -744,6 +794,7 @@ def _from_dict(d: dict) -> DroverConfig:
         ),
         setup_check=SetupCheckConfig(**d["setup_check"]),
         memory=MemoryBudgetConfig(**d["memory"]),
+        analytics=AnalyticsConfig(**d["analytics"]),
         control_store=control_store_config,
         runtime=runtime_config,
         analytics_boundary=AnalyticsBoundaryConfig(

@@ -104,9 +104,9 @@ control schemas, fresh catalog databases and small fixture lakes. It covers:
   explicit detection of advisory unlock on a still-open connection.
 
 Run in the foreground with verified extension artifacts and **without** an
-external `DROVER_TEST_POSTGRES_DSN` to use disposable infrastructure. Server
-routing, serving reads, daily maintenance and paired backup/restore are not part
-of this slice.
+external `DROVER_TEST_POSTGRES_DSN` to use disposable infrastructure. The follow-up [canonical serving slice](lake-serving.md) adds explicit server
+routing and separately opt-in lifecycle activation. Daily maintenance and paired
+backup/restore remain separate gates.
 
 Checkpoint validation: **12 exporter integration tests passed** as part of the
 foreground combined run: **81 passed, 3 skipped in 44.75 seconds**. The skips

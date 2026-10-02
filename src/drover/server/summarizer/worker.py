@@ -85,6 +85,10 @@ class _LeaseLost(Exception):
 
 
 def _open_summarizer_db(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
+    from drover.server.lake.serving import open_history, selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        return open_history(duckdb_path)
     return open_duckdb_connection(duckdb_path, role="summarizer")
 
 

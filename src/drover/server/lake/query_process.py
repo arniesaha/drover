@@ -149,6 +149,7 @@ def query(
     params: list | None = None,
     *,
     limits: QueryLimits = QueryLimits(),
+    serving: dict | None = None,
 ) -> dict:
     started_at = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="drover-lake-query-") as scratch:
@@ -165,6 +166,7 @@ def query(
                     "sql": sql,
                     "params": params or [],
                     "limits": asdict(limits),
+                    "serving": serving,
                 }
             )
         )
@@ -204,6 +206,36 @@ def _worker(request: dict) -> dict:
         statements = con.extract_statements(request["sql"])
         if len(statements) != 1 or str(statements[0].type) != "StatementType.SELECT":
             raise LakeError("analytics_read_query_required")
+        if serving := request.get("serving"):
+            con.execute("BEGIN TRANSACTION")
+            from .serving_proof import check_proof
+
+            check_proof(spec, con, serving["verification_sha256"])
+            con.execute(
+                "CREATE TEMP TABLE memory_session_identity(harness_session_id VARCHAR, native_session_id VARCHAR, summary_session_id VARCHAR)"
+            )
+            identities = serving.get("identities", [])
+            if len(identities) > 10000:
+                raise LakeError("analytics_identity_limit_exceeded")
+            if identities:
+                con.executemany(
+                    "INSERT INTO memory_session_identity VALUES (?,?,?)", identities
+                )
+            con.execute(
+                """CREATE TEMP VIEW agent_events AS
+                SELECT * EXCLUDE(timestamp,repo_owner,repo_name), TRY_CAST(timestamp AS TIMESTAMPTZ) AS timestamp,
+                  COALESCE(repo_owner, CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$._repo_owner') END) AS repo_owner,
+                  COALESCE(repo_name, CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$._repo_name') END) AS repo_name,
+                  CASE WHEN dedup_key_source='outbox' OR
+                    (CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$.source') END)='control'
+                    THEN 'control' ELSE 'native' END AS source
+                FROM lake.agent_events e WHERE dedup_key_source='outbox' OR
+                    (CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$.source') END)='control' OR NOT EXISTS (
+                  SELECT 1 FROM memory_session_identity m WHERE e.session_id IN (m.harness_session_id,m.native_session_id))"""
+            )
+            con.execute(
+                "CREATE TEMP VIEW control_memory_events AS SELECT * FROM agent_events WHERE source='control'"
+            )
         cursor = con.execute(request["sql"], request["params"])
         rows = []
         size = 0
@@ -214,7 +246,11 @@ def _worker(request: dict) -> dict:
                 raise LakeError("analytics_row_limit_exceeded")
             if size > limits.bytes:
                 raise LakeError("analytics_byte_limit_exceeded")
-        return {"columns": [c[0] for c in cursor.description], "rows": rows}
+        return {
+            "columns": [c[0] for c in cursor.description],
+            "types": [str(c[1]) for c in cursor.description],
+            "rows": rows,
+        }
 
 
 if __name__ == "__main__":

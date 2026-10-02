@@ -64,7 +64,23 @@ class RecallBundleService:
             "effective_chars": effective_chars,
             "retrieval_timestamp": retrieval_timestamp,
         }
-        return with_freshness(self._build_projected_bundle(**build_arguments))
+        from drover.server.lake.runtime import LakeError
+        from drover.server.lake.serving import selected_config
+
+        config = selected_config(self._duckdb_path)
+        try:
+            if config.backend == "ducklake" and _is_exact_repository(repo):
+                # This context still includes unported legacy tables. Never mix
+                # them into a selected lake result while their routing is gated.
+                raise LakeError("analytics_recall_context_not_ported")
+            return with_freshness(self._build_projected_bundle(**build_arguments))
+        except LakeError as exc:
+            return {
+                "status": "unavailable",
+                "analytics_backend": config.backend,
+                "analytics_epoch": config.epoch,
+                "reason": exc.code,
+            }
 
     def _build_projected_bundle(
         self,
@@ -132,6 +148,10 @@ class RecallBundleService:
             since=since,
             limit=limit,
         )
+        if keyword_result.get("status") == "unavailable":
+            from drover.server.lake.runtime import LakeError
+
+            raise LakeError(keyword_result.get("reason") or "analytics_unavailable")
         keyword_matches = [
             _project_keyword_match(
                 row,

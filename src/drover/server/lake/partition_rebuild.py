@@ -211,6 +211,13 @@ def _verify_jobs(spec, report, work):
 def _verify_days(spec, report, work):
     peak = 0
     results = {}
+    from .query_process import query
+
+    allowed_days = {item["day"] for item in report["days"]}
+    for table in ("agent_events", "agent_events_legacy_metadata"):
+        days = query(spec, f"SELECT DISTINCT date FROM lake.{table}")["rows"]
+        if any(row[0] not in allowed_days for row in days):
+            raise LakeError("lake_verification_unexpected_partition")
     for table in (*SCHEMAS, "agent_events_legacy_metadata"):
         jobs = []
         days = (
@@ -255,6 +262,31 @@ def _verify_days(spec, report, work):
 
 
 def verify_partitioned(spec):
+    from .fence import MutationFence
+    from .runtime import lake_connection
+    from .serving_proof import write_proof
+
+    with MutationFence(spec.dsn()) as fence:
+        with lake_connection(spec) as con:
+            snapshot = con.execute(
+                "SELECT max(snapshot_id) FROM lake.snapshots()"
+            ).fetchone()[0]
+        fence.check()
+        result = _verify_partitioned(spec)
+        fence.check()
+        with lake_connection(spec) as con:
+            if (
+                con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[
+                    0
+                ]
+                != snapshot
+            ):
+                raise LakeError("lake_verification_snapshot_changed")
+            write_proof(spec, con, result, fence=fence, snapshot=snapshot)
+        return result
+
+
+def _verify_partitioned(spec):
     started = time.monotonic()
     report_path = spec.data_root / "verification/report.json"
     if not report_path.is_file():

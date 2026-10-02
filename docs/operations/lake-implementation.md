@@ -41,12 +41,15 @@ boundary and drains already-validated commits before transferring ownership.
 
 The configuration options follow [DuckLake configuration](https://ducklake.select/docs/stable/duckdb/usage/configuration).
 
+The [canonical serving slice](lake-serving.md) adds explicit backend selection,
+verified-snapshot gates, disposable canonical memory reads and separately opt-in
+exporter lifecycle activation. Its legacy default does not activate a lake.
+
 ## Remaining release work
 
-- Activate the implemented control-outbox exporter through backend lifecycle
-  routing at cutover.
-- Complete backend configuration/routing through MCP, cockpit, summarizer and
-  PG task/fleet projections; legacy parity tests.
+- Complete remaining cockpit/activity reads, PG task-status projections, job
+  scheduling and legacy analytical writer removal; broader parity tests.
+- Renew verified serving checkpoints after sustained export/maintenance.
 - Daily fenced lifecycle operations and reader-safety tests.
 - Immutable catalog/files backup generations, verified fresh restore, and
   replacement of the planned section in `docs/backup.md`.
