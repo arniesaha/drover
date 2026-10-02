@@ -853,6 +853,19 @@ class AnalyticalStoreUnavailable(RuntimeError):
     """The analytical instance is recovering or this handle is obsolete."""
 
 
+class AnalyticalStoreLocked(duckdb.IOException):
+    """Another process owns the analytical file; retrying cannot help a CLI."""
+
+
+def analytical_lock_error(path: str | Path, exc: BaseException) -> str:
+    return (
+        f"Analytical DuckDB {str(path)!r} is locked by another process "
+        "(possibly the running hub). This command cannot open it, even read-only. "
+        "Use 'drover-server memory requeue' for PostgreSQL control sessions. "
+        f"Lock conflict: {exc}"
+    )
+
+
 class AnalyticalStoreBusy(TimeoutError):
     """A bounded analytical admission could not acquire the connect lock."""
 
@@ -1135,6 +1148,12 @@ def open_duckdb_connection(
         raise
     except Exception as exc:
         remember_connect_failure(duckdb_path, exc)
+        if _is_lock_conflict(exc):
+            # Cross-process ownership is permanent for this invocation. Never
+            # turn it into recovery/retry work or hide it behind a traceback.
+            raise AnalyticalStoreLocked(
+                analytical_lock_error(duckdb_path, exc)
+            ) from exc
         raise
     return con
 
