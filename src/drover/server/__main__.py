@@ -190,6 +190,7 @@ _REDIS_JOB_STREAM_SUFFIXES = {
     "embed_span": "embed_span",
 }
 
+
 def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
     """Return whether starting summarizer-like workers can make progress.
 
@@ -797,7 +798,6 @@ def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
         local_ollama_launchd_label=cfg.summarizer_local_ollama_launchd_label or None,
         local_ollama_launchd_plist=cfg.summarizer_local_ollama_launchd_plist or None,
     )
-
 
 
 def _build_runtime_mcp_server(

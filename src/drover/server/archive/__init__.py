@@ -1,5 +1,15 @@
 """Native history inventory and source eligibility utilities."""
 
+from drover.server.archive.errors import (
+    ArchiveDisabled,
+    ArchiveError,
+    ArchiveProtocolError,
+    ArchiveRequestRejected,
+    ArchiveResponseTooLarge,
+    ArchiveStorageUnavailable,
+    ArchiveTimeout,
+    ArchiveUnavailable,
+)
 from drover.server.archive.inventory import (
     NativeInventory,
     NativeInventoryRecord,
@@ -19,19 +29,6 @@ from drover.server.archive.source_eligibility import (
     assess_metadata_only_source,
     source_eligibility_summary,
 )
-
-from drover.server.archive.errors import (
-    ArchiveDisabled,
-    ArchiveError,
-    ArchiveProtocolError,
-    ArchiveRequestRejected,
-    ArchiveResponseTooLarge,
-    ArchiveStorageUnavailable,
-    ArchiveTimeout,
-    ArchiveUnavailable,
-)
-
-
 from drover.server.archive.types import (
     ArchiveMessage,
     ArchiveMessageNeighborhood,
@@ -43,7 +40,6 @@ from drover.server.archive.types import (
     ArchiveSession,
     SessionArchive,
 )
-
 
 __all__ = [
     "NativeInventory",
